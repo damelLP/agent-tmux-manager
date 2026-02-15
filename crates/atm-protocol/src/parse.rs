@@ -165,7 +165,7 @@ impl RawStatusLine {
 
         let data = StatusLineData {
             session_id: self.session_id.clone(),
-            model_id: String::new(), // Not used in update
+            model_id: String::new(),  // Not used in update
             model_display_name: None, // Not used in update
             cost_usd: cost.map(|c| c.total_cost_usd).unwrap_or(0.0),
             total_duration_ms: cost.map(|c| c.total_duration_ms).unwrap_or(0),
@@ -439,7 +439,10 @@ mod tests {
 
         let event: RawHookEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type(), Some(HookEventType::Notification));
-        assert_eq!(event.notification_type.as_deref(), Some("permission_prompt"));
+        assert_eq!(
+            event.notification_type.as_deref(),
+            Some("permission_prompt")
+        );
     }
 
     #[test]
@@ -583,7 +586,9 @@ mod tests {
         }"#;
 
         let raw: RawStatusLine = serde_json::from_str(json).unwrap();
-        let session = raw.to_session_domain().expect("should create with defaults");
+        let session = raw
+            .to_session_domain()
+            .expect("should create with defaults");
 
         assert_eq!(session.id.as_str(), "test-partial");
         assert!((session.cost.as_usd() - 0.0).abs() < 0.001);

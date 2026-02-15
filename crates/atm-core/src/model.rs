@@ -201,10 +201,7 @@ mod tests {
 
     #[test]
     fn test_model_parsing_haiku45() {
-        assert_eq!(
-            Model::from_id("claude-haiku-4-5-20251001"),
-            Model::Haiku45
-        );
+        assert_eq!(Model::from_id("claude-haiku-4-5-20251001"), Model::Haiku45);
         assert_eq!(Model::Haiku45.display_name(), "Haiku 4.5");
     }
 
@@ -244,7 +241,10 @@ mod tests {
     #[test]
     fn test_from_id_sonnet4_not_confused_with_sonnet45() {
         // "claude-sonnet-4-5" should match Sonnet45, not Sonnet4
-        assert_eq!(Model::from_id("claude-sonnet-4-5-20250929"), Model::Sonnet45);
+        assert_eq!(
+            Model::from_id("claude-sonnet-4-5-20250929"),
+            Model::Sonnet45
+        );
         // "claude-sonnet-4-20250514" should match Sonnet4
         assert_eq!(Model::from_id("claude-sonnet-4-20250514"), Model::Sonnet4);
     }

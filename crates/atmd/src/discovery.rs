@@ -297,7 +297,10 @@ fn check_claude_process(pid: u32) -> Option<ClaudeProcess> {
     let result = check_claude_via_cmdline(pid);
 
     if result.is_some() {
-        trace!(pid, "Detected Claude via cmdline fallback (exe check failed)");
+        trace!(
+            pid,
+            "Detected Claude via cmdline fallback (exe check failed)"
+        );
     }
 
     result
@@ -360,7 +363,11 @@ fn get_process_info(pid: u32) -> Option<ClaudeProcess> {
     // Try to find tmux pane for this process
     let tmux_pane = find_pane_for_pid(pid);
 
-    Some(ClaudeProcess { pid, cwd, tmux_pane })
+    Some(ClaudeProcess {
+        pid,
+        cwd,
+        tmux_pane,
+    })
 }
 
 // ============================================================================
@@ -601,7 +608,9 @@ mod tests {
 
     #[test]
     fn test_is_claude_path_versioned_install() {
-        assert!(is_claude_path("/home/user/.local/share/claude/versions/1.2.3/claude"));
+        assert!(is_claude_path(
+            "/home/user/.local/share/claude/versions/1.2.3/claude"
+        ));
         assert!(is_claude_path("~/.local/share/claude/versions/0.5.0/node"));
     }
 

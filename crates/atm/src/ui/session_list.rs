@@ -97,16 +97,12 @@ fn create_session_item(
         // Status icon (blinking for attention states)
         Span::styled(
             format!("{icon} "),
-            Style::default()
-                .fg(icon_color)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
         ),
         // Context percentage
         Span::styled(
             format!("{context_pct:>4.0}%"),
-            Style::default()
-                .fg(ctx_color)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ctx_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         // Short ID
@@ -131,15 +127,13 @@ fn create_session_item(
 /// Returns the background style for a session row.
 fn get_row_background_style(session: &SessionView, is_selected: bool) -> Style {
     // Priority: status background > critical context > selection
-    let bg_color = status_background(session.status).or(
-        if session.context_critical {
-            Some(Color::Rgb(40, 0, 0)) // Subtle red tint
-        } else if is_selected {
-            Some(Color::Rgb(30, 30, 40)) // Subtle selection highlight
-        } else {
-            None
-        },
-    );
+    let bg_color = status_background(session.status).or(if session.context_critical {
+        Some(Color::Rgb(40, 0, 0)) // Subtle red tint
+    } else if is_selected {
+        Some(Color::Rgb(30, 30, 40)) // Subtle selection highlight
+    } else {
+        None
+    });
 
     match bg_color {
         Some(color) => Style::default().bg(color),
@@ -240,9 +234,7 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "Lost connection to daemon",
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(format!("Retry attempt: {retry_count}")),
@@ -270,17 +262,16 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
         ),
     };
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(match state {
-                    AppState::Connected => Style::default().fg(Color::Yellow),
-                    AppState::Connecting => Style::default().fg(Color::Yellow),
-                    AppState::Disconnected { .. } => Style::default().fg(Color::Red),
-                }),
-        );
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(match state {
+                AppState::Connected => Style::default().fg(Color::Yellow),
+                AppState::Connecting => Style::default().fg(Color::Yellow),
+                AppState::Disconnected { .. } => Style::default().fg(Color::Red),
+            }),
+    );
 
     frame.render_widget(paragraph, area);
 }

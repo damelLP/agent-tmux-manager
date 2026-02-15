@@ -334,7 +334,10 @@ impl SessionDuration {
 
     /// Creates from total duration only.
     pub fn from_total_ms(total_ms: u64) -> Self {
-        Self { total_ms, api_ms: 0 }
+        Self {
+            total_ms,
+            api_ms: 0,
+        }
     }
 
     /// Returns total duration in milliseconds.
@@ -882,7 +885,10 @@ impl SessionInfrastructure {
         let Some(expected_start_time) = self.process_start_time else {
             // No start time recorded - just check if process exists via procfs
             let exists = procfs::process::Process::new(pid as i32).is_ok();
-            debug!(pid, exists, "is_process_alive: no start_time, checking procfs only");
+            debug!(
+                pid,
+                exists, "is_process_alive: no start_time, checking procfs only"
+            );
             return exists;
         };
 
@@ -901,7 +907,10 @@ impl SessionInfrastructure {
                 alive
             }
             None => {
-                debug!(pid, expected_start_time, "is_process_alive: process NOT FOUND in /proc");
+                debug!(
+                    pid,
+                    expected_start_time, "is_process_alive: process NOT FOUND in /proc"
+                );
                 false
             }
         }
@@ -1071,7 +1080,10 @@ impl SessionView {
             },
             status: session.status,
             status_label: session.status.label().to_string(),
-            activity_detail: session.current_activity.as_ref().map(|a| a.display().into_owned()),
+            activity_detail: session
+                .current_activity
+                .as_ref()
+                .map(|a| a.display().into_owned()),
             should_blink: session.status.should_blink(),
             status_icon: session.status.icon().to_string(),
             context_percentage: session.context.usage_percentage(),
@@ -1276,7 +1288,11 @@ mod tests {
 
         assert_eq!(session.status, SessionStatus::AttentionNeeded);
         assert_eq!(
-            session.current_activity.as_ref().map(|a| a.display()).as_deref(),
+            session
+                .current_activity
+                .as_ref()
+                .map(|a| a.display())
+                .as_deref(),
             Some("AskUserQuestion")
         );
 
@@ -1294,7 +1310,11 @@ mod tests {
 
         assert_eq!(session.status, SessionStatus::AttentionNeeded);
         assert_eq!(
-            session.current_activity.as_ref().map(|a| a.display()).as_deref(),
+            session
+                .current_activity
+                .as_ref()
+                .map(|a| a.display())
+                .as_deref(),
             Some("EnterPlanMode")
         );
     }
@@ -1308,7 +1328,11 @@ mod tests {
 
         assert_eq!(session.status, SessionStatus::Working);
         assert_eq!(
-            session.current_activity.as_ref().map(|a| a.display()).as_deref(),
+            session
+                .current_activity
+                .as_ref()
+                .map(|a| a.display())
+                .as_deref(),
             Some("Bash")
         );
 

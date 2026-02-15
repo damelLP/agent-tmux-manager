@@ -23,11 +23,7 @@ use ratatui::{
 /// * `frame` - The frame to render into
 /// * `area` - The rectangular area to fill
 /// * `session` - The session to display (or None for empty state)
-pub fn render_detail_panel_inline(
-    frame: &mut Frame,
-    area: Rect,
-    session: Option<&SessionView>,
-) {
+pub fn render_detail_panel_inline(frame: &mut Frame, area: Rect, session: Option<&SessionView>) {
     match session {
         Some(session) => {
             // Build the detail content (reuse existing logic)
@@ -80,11 +76,16 @@ fn build_detail_lines_inline(session: &SessionView) -> Vec<Line<'static>> {
 
     let status_style = Style::default()
         .fg(status_color(session.status))
-        .add_modifier(if matches!(session.status, SessionStatus::Working | SessionStatus::AttentionNeeded) {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
+        .add_modifier(
+            if matches!(
+                session.status,
+                SessionStatus::Working | SessionStatus::AttentionNeeded
+            ) {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            },
+        );
 
     let mut lines = vec![
         Line::from(""),

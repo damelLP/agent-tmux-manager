@@ -69,7 +69,10 @@ async fn test_register_and_remove() {
     handle.register(session).await.expect("should register");
 
     // Verify exists
-    assert!(handle.get_session(SessionId::new("remove-test")).await.is_some());
+    assert!(handle
+        .get_session(SessionId::new("remove-test"))
+        .await
+        .is_some());
 
     // Remove
     handle
@@ -78,7 +81,10 @@ async fn test_register_and_remove() {
         .expect("should remove");
 
     // Verify gone
-    assert!(handle.get_session(SessionId::new("remove-test")).await.is_none());
+    assert!(handle
+        .get_session(SessionId::new("remove-test"))
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -87,7 +93,10 @@ async fn test_duplicate_registration_fails() {
 
     // First registration succeeds
     let session1 = create_test_session("duplicate-test");
-    handle.register(session1).await.expect("first should succeed");
+    handle
+        .register(session1)
+        .await
+        .expect("first should succeed");
 
     // Second registration with same ID fails
     let session2 = create_test_session("duplicate-test");
@@ -152,7 +161,10 @@ async fn test_sessions_with_different_types() {
     assert_eq!(sessions.len(), 5);
 
     // Verify types are preserved
-    let explore = handle.get_session(SessionId::new("type-explore")).await.unwrap();
+    let explore = handle
+        .get_session(SessionId::new("type-explore"))
+        .await
+        .unwrap();
     assert_eq!(explore.agent_type, "explore");
 }
 
@@ -291,7 +303,10 @@ async fn test_capacity_limit() {
     let result = handle.register(overflow_session).await;
 
     assert!(
-        matches!(result, Err(RegistryError::RegistryFull { max: MAX_SESSIONS })),
+        matches!(
+            result,
+            Err(RegistryError::RegistryFull { max: MAX_SESSIONS })
+        ),
         "expected RegistryFull error with max={MAX_SESSIONS}, got {result:?}"
     );
 }
@@ -513,7 +528,10 @@ async fn test_hook_event_pre_tool_use() {
         .expect("should apply hook event");
 
     // Verify status changed to working
-    let view = handle.get_session(SessionId::new("hook-pre")).await.unwrap();
+    let view = handle
+        .get_session(SessionId::new("hook-pre"))
+        .await
+        .unwrap();
     assert_eq!(view.status_label, "working");
     assert_eq!(view.activity_detail, Some("Write".to_string()));
 }
@@ -681,7 +699,10 @@ async fn test_get_nonexistent_session_returns_none() {
 
     let result = handle.get_session(SessionId::new("nonexistent")).await;
 
-    assert!(result.is_none(), "should return None for nonexistent session");
+    assert!(
+        result.is_none(),
+        "should return None for nonexistent session"
+    );
 }
 
 // ============================================================================
@@ -699,7 +720,10 @@ async fn test_handle_cloning() {
 
     // Query via handle2
     let result = handle2.get_session(SessionId::new("clone-test")).await;
-    assert!(result.is_some(), "cloned handle should see registered session");
+    assert!(
+        result.is_some(),
+        "cloned handle should see registered session"
+    );
 
     // Both handles should be connected
     assert!(handle1.is_connected());

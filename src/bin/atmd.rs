@@ -173,8 +173,8 @@ fn main() -> Result<()> {
             if let Some(pid) = is_daemon_running() {
                 println!("Daemon is running (PID {pid})");
 
-                let socket_path = env::var("ATM_SOCKET")
-                    .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+                let socket_path =
+                    env::var("ATM_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
                 if PathBuf::from(&socket_path).exists() {
                     println!("Socket: {socket_path}");
                 }

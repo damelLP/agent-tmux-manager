@@ -497,11 +497,15 @@ impl DaemonClient {
             }
             DaemonMessage::SessionRemoved { session_id } => {
                 debug!(session_id = %session_id, "Session removed");
-                let _ = self.event_tx.send(Event::SessionRemoved(session_id.to_string()));
+                let _ = self
+                    .event_tx
+                    .send(Event::SessionRemoved(session_id.to_string()));
             }
             DaemonMessage::DiscoveryComplete { discovered, failed } => {
                 debug!(discovered, failed, "Discovery complete");
-                let _ = self.event_tx.send(Event::DiscoveryComplete { discovered, failed });
+                let _ = self
+                    .event_tx
+                    .send(Event::DiscoveryComplete { discovered, failed });
             }
             DaemonMessage::Pong { seq } => {
                 debug!(seq, "Received pong");
@@ -613,10 +617,7 @@ mod tests {
 
         let client = DaemonClient::with_defaults(tx, cmd_rx, cancel_token);
 
-        assert_eq!(
-            client.config.socket_path,
-            PathBuf::from("/tmp/atm.sock")
-        );
+        assert_eq!(client.config.socket_path, PathBuf::from("/tmp/atm.sock"));
     }
 
     // ------------------------------------------------------------------------

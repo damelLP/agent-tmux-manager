@@ -51,11 +51,10 @@ fn read_settings() -> Result<Value> {
         return Ok(json!({}));
     }
 
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
 
-    serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))
+    serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
 /// Writes Claude Code settings
@@ -69,8 +68,7 @@ fn write_settings(settings: &Value) -> Result<()> {
     }
 
     let content = serde_json::to_string_pretty(settings)?;
-    fs::write(&path, content)
-        .with_context(|| format!("Failed to write {}", path.display()))
+    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 /// Creates the statusLine configuration entry.
@@ -130,7 +128,8 @@ fn create_hook_entry(hook_type: &str) -> Value {
 /// Checks if atm hooks are already installed for a hook type
 fn has_atm_hook(hooks_array: &[Value]) -> bool {
     hooks_array.iter().any(|entry| {
-        entry.get("hooks")
+        entry
+            .get("hooks")
             .and_then(|h| h.as_array())
             .map(|hooks| {
                 hooks.iter().any(|hook| {
@@ -147,7 +146,8 @@ fn has_atm_hook(hooks_array: &[Value]) -> bool {
 /// Removes atm hooks from a hooks array
 fn remove_atm_hooks(hooks_array: &mut Vec<Value>) {
     hooks_array.retain(|entry| {
-        !entry.get("hooks")
+        !entry
+            .get("hooks")
             .and_then(|h| h.as_array())
             .map(|hooks| {
                 hooks.iter().any(|hook| {
@@ -221,13 +221,15 @@ pub fn setup() -> Result<()> {
         settings["hooks"] = json!({});
     }
 
-    let hooks = settings["hooks"].as_object_mut()
+    let hooks = settings["hooks"]
+        .as_object_mut()
         .context("hooks is not an object")?;
 
     let mut added = 0;
 
     for &hook_type in HOOK_TYPES {
-        let hooks_array = hooks.entry(hook_type)
+        let hooks_array = hooks
+            .entry(hook_type)
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .context("hook type is not an array")?;

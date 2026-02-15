@@ -3,6 +3,9 @@
 //! Implements a 3-state DFA parsing the vim grammar `[count] [motion]`,
 //! backed by a `VimKeyResolver` that maps `KeyEvent` to `KeyMeaning`.
 //!
+//! Pending states (count accumulation, `g` prefix) persist until the next
+//! keypress resolves or cancels them. There is no time-based timeout.
+//!
 //! All code follows the panic-free policy: saturating arithmetic,
 //! no unwrap/expect/panic.
 
@@ -61,12 +64,10 @@ pub(crate) enum KeyMeaning {
 
 /// The set of motions that can be preceded by an optional count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // GoToFirst is part of the DFA table, reachable only via `gg`
 pub(crate) enum MotionKind {
     Down,
     Up,
     GoToBottom,
-    GoToFirst,
     HalfPageDown,
     HalfPageUp,
 }
@@ -102,8 +103,8 @@ impl VimKeyResolver {
     /// Resolve a crossterm `KeyEvent` into a `KeyMeaning`.
     #[must_use]
     pub fn resolve(&self, key: &KeyEvent) -> KeyMeaning {
-        // Handle Ctrl combinations first.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Handle Ctrl combinations first (exact match to avoid triggering on Ctrl+Alt etc.).
+        if key.modifiers == KeyModifiers::CONTROL {
             return match key.code {
                 KeyCode::Char('d') => KeyMeaning::Motion(MotionKind::HalfPageDown),
                 KeyCode::Char('u') => KeyMeaning::Motion(MotionKind::HalfPageUp),
@@ -285,10 +286,6 @@ impl InputHandler {
     }
 
     /// Convert a motion + count into the appropriate `UiAction`.
-    ///
-    /// Note: `GoToFirst` is not reachable as a standalone motion from
-    /// `Ready`/`Count` — it only appears inside `PendingG` via `gg`. When
-    /// received here we return `None` to match the DFA table.
     fn motion_with_count(count: usize, kind: MotionKind) -> Option<UiAction> {
         match kind {
             MotionKind::Down => Some(UiAction::MoveDown(count)),
@@ -303,7 +300,6 @@ impl InputHandler {
             }
             MotionKind::HalfPageDown => Some(UiAction::HalfPageDown(count)),
             MotionKind::HalfPageUp => Some(UiAction::HalfPageUp(count)),
-            MotionKind::GoToFirst => None,
         }
     }
 }
@@ -685,5 +681,15 @@ mod tests {
     fn test_resolver_ctrl_g_is_unbound() {
         let r = VimKeyResolver;
         assert_eq!(r.resolve(&key_ctrl('g')), KeyMeaning::Unbound);
+    }
+
+    #[test]
+    fn test_resolver_ctrl_alt_d_is_unbound() {
+        let r = VimKeyResolver;
+        let ctrl_alt_d = KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+        );
+        assert_eq!(r.resolve(&ctrl_alt_d), KeyMeaning::Unbound);
     }
 }

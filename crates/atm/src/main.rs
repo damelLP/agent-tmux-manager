@@ -251,7 +251,8 @@ async fn run_event_loop(
         // Render the UI and capture viewport height for half-page navigation
         terminal.draw(|frame| {
             let layout = ui::layout::AppLayout::new(frame.area());
-            viewport_height = layout.list_area.height;
+            // The session list widget uses Borders::ALL, so subtract 2 to get the inner height
+            viewport_height = layout.list_area.height.saturating_sub(2);
             ui::render(frame, app);
         })?;
 

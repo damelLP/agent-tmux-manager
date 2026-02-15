@@ -83,12 +83,11 @@ pub fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         AppState::Disconnected { .. } => Style::default().fg(Color::Red),
     };
 
-    let header = Paragraph::new(header_line)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        );
+    let header = Paragraph::new(header_line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style),
+    );
 
     frame.render_widget(header, area);
 }
@@ -104,19 +103,26 @@ pub fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 /// * `area` - The rectangular area for the footer
 /// * `app` - Application state (used for pick_mode indicator)
 pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let key_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let sep_style = Style::default().fg(Color::DarkGray);
 
     // Check if we're in tmux for jump hint (use centralized function)
     let in_tmux = crate::tmux::is_in_tmux();
 
-    // Build hints based on context
+    // Build vim-style navigation hints
     let mut hints = vec![
-        Span::styled(" ^/k", key_style),
-        Span::raw(" up"),
-        Span::styled("  ", sep_style),
-        Span::styled("v/j", key_style),
-        Span::raw(" down"),
+        Span::styled(" j/\u{2193}", key_style),
+        Span::raw(" down  "),
+        Span::styled("k/\u{2191}", key_style),
+        Span::raw(" up  "),
+        Span::styled("gg", key_style),
+        Span::raw(" top  "),
+        Span::styled("G", key_style),
+        Span::raw(" end  "),
+        Span::styled("^d/^u", key_style),
+        Span::raw(" page"),
     ];
 
     // Show Enter/jump hint only when in tmux
@@ -128,21 +134,22 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     hints.push(Span::styled("  |  ", sep_style));
     hints.push(Span::styled("r", key_style));
-    hints.push(Span::raw(" rescan"));
-    hints.push(Span::styled("  |  ", sep_style));
+    hints.push(Span::raw(" rescan  "));
     hints.push(Span::styled("q", key_style));
     hints.push(Span::raw(" quit"));
 
     // Show pick mode indicator
     if app.pick_mode {
         hints.push(Span::styled("  |  ", sep_style));
-        hints.push(Span::styled("[pick mode]", Style::default().fg(Color::Yellow)));
+        hints.push(Span::styled(
+            "[pick mode]",
+            Style::default().fg(Color::Yellow),
+        ));
     }
 
     let footer_line = Line::from(hints);
 
-    let footer = Paragraph::new(footer_line)
-        .block(Block::default().borders(Borders::ALL));
+    let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
 
     frame.render_widget(footer, area);
 }

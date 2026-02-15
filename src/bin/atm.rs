@@ -25,7 +25,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use atm_core::SessionId;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -36,7 +35,8 @@ use atm_tui::app::App;
 use atm_tui::client::DaemonClient;
 use atm_tui::daemon;
 use atm_tui::error::{Result as TuiResult, TuiError};
-use atm_tui::input::{handle_key_event, Action, ClientCommand, Event};
+use atm_tui::input::{ClientCommand, Event};
+use atm_tui::keybinding::{InputHandler, UiAction};
 use atm_tui::setup;
 use atm_tui::tmux;
 use atm_tui::ui;
@@ -154,82 +154,105 @@ async fn run_event_loop(
 ) -> Result<()> {
     let tick_rate = Duration::from_millis(100);
 
+    // Vim keybinding handler (DFA state machine)
+    let mut handler = InputHandler::new();
+
+    // Viewport height for half-page navigation (updated each frame)
+    let mut viewport_height: u16 = 0;
+
     loop {
         app.tick();
-        terminal.draw(|frame| ui::render(frame, app))?;
+
+        // Render the UI and capture viewport height for half-page navigation
+        terminal.draw(|frame| {
+            let layout = ui::layout::AppLayout::new(frame.area());
+            viewport_height = layout.list_area.height;
+            ui::render(frame, app);
+        })?;
 
         let event = tokio::time::timeout(tick_rate, event_rx.recv()).await;
 
         match event {
-            Ok(Some(received_event)) => {
-                match received_event {
-                    Event::Key(key) => {
-                        let action = handle_key_event(key, app);
+            Ok(Some(received_event)) => match received_event {
+                Event::Key(key) => {
+                    if let Some(action) = handler.handle(key) {
                         match action {
-                            Action::Quit => {
+                            UiAction::Quit => {
+                                app.quit();
                                 info!("User requested quit");
                                 cancel_token.cancel();
                                 break;
                             }
-                            Action::Refresh => {
+                            UiAction::Refresh => {
                                 debug!("User requested refresh/discovery");
                                 if command_tx.send(ClientCommand::Discover).is_err() {
-                                    warn!("Failed to send discover command - client may be disconnected");
+                                    warn!("Failed to send discover command");
                                 }
                             }
-                            Action::JumpToSession(session_id) => {
-                                info!(session_id = %session_id, "Jump to session requested");
-
-                                let session_key = SessionId::new(&session_id);
-                                if let Some(session) = app.sessions.get(&session_key) {
+                            UiAction::JumpToSession => {
+                                if let Some(session) = app.selected_session() {
+                                    let session_id = session.id.clone();
+                                    info!(session_id = %session_id, "Jump to session");
                                     if let Some(ref pane_id) = session.tmux_pane {
-                                        match tmux::jump_to_pane(pane_id) {
+                                        let pane_id = pane_id.clone();
+                                        match tmux::jump_to_pane(&pane_id) {
                                             Ok(()) => {
-                                                info!(pane_id = %pane_id, "Jumped to tmux pane");
+                                                info!(pane_id = %pane_id, "Jumped to pane");
                                                 if app.pick_mode {
-                                                    info!("Pick mode: exiting after jump");
+                                                    info!("Pick mode: exiting");
                                                     cancel_token.cancel();
                                                     break;
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(error = %e, pane_id = %pane_id, "Failed to jump to pane");
+                                                warn!(error = %e, pane_id = %pane_id, "Failed to jump");
                                             }
                                         }
                                     } else {
-                                        debug!(session_id = %session_id, "Session has no tmux pane");
+                                        debug!(session_id = %session_id, "No tmux pane");
                                     }
-                                } else {
-                                    warn!(session_id = %session_id, "Session not found");
                                 }
                             }
-                            Action::None => {}
+                            UiAction::MoveDown(n) => app.select_down(n),
+                            UiAction::MoveUp(n) => app.select_up(n),
+                            UiAction::GoToRow(index) => app.select_go_to(index),
+                            UiAction::GoToLast => {
+                                let last = app.sessions.len().saturating_sub(1);
+                                app.select_go_to(last);
+                            }
+                            UiAction::GoToFirst => app.select_go_to(0),
+                            UiAction::HalfPageDown(n) => {
+                                app.select_half_page_down(n, viewport_height);
+                            }
+                            UiAction::HalfPageUp(n) => {
+                                app.select_half_page_up(n, viewport_height);
+                            }
                         }
                     }
-                    Event::Resize(_width, _height) => {
-                        debug!("Terminal resized");
-                    }
-                    Event::SessionUpdate(sessions) => {
-                        debug!(count = sessions.len(), "Received session update");
-                        app.update_sessions(sessions);
-                    }
-                    Event::SessionListReplace(sessions) => {
-                        debug!(count = sessions.len(), "Received full session list");
-                        app.replace_sessions(sessions);
-                    }
-                    Event::SessionRemoved(session_id) => {
-                        debug!(session_id = %session_id, "Session removed");
-                        app.remove_session(&session_id);
-                    }
-                    Event::DiscoveryComplete { discovered, failed } => {
-                        info!(discovered, failed, "Discovery complete");
-                    }
-                    Event::DaemonDisconnected => {
-                        warn!("Daemon disconnected");
-                        app.mark_disconnected();
-                    }
                 }
-            }
+                Event::Resize(_width, _height) => {
+                    debug!("Terminal resized");
+                }
+                Event::SessionUpdate(sessions) => {
+                    debug!(count = sessions.len(), "Received session update");
+                    app.update_sessions(sessions);
+                }
+                Event::SessionListReplace(sessions) => {
+                    debug!(count = sessions.len(), "Received full session list");
+                    app.replace_sessions(sessions);
+                }
+                Event::SessionRemoved(session_id) => {
+                    debug!(session_id = %session_id, "Session removed");
+                    app.remove_session(&session_id);
+                }
+                Event::DiscoveryComplete { discovered, failed } => {
+                    info!(discovered, failed, "Discovery complete");
+                }
+                Event::DaemonDisconnected => {
+                    warn!("Daemon disconnected");
+                    app.mark_disconnected();
+                }
+            },
             Ok(None) => {
                 warn!("Event channel closed");
                 break;
@@ -273,11 +296,7 @@ fn create_log_file() -> Option<std::fs::File> {
 
     let log_path = log_dir.join("tui.log");
 
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(file) => Some(file),
         Err(e) => {
             eprintln!("Warning: Failed to open log file {log_path:?}: {e}");
@@ -311,11 +330,10 @@ async fn main() -> Result<()> {
     if let Some(file) = log_file {
         let writer = Mutex::new(file);
 
-        let filter = EnvFilter::from_default_env().add_directive(
-            "atm=info"
-                .parse()
-                .unwrap_or_else(|_| tracing_subscriber::filter::Directive::from(tracing::Level::INFO)),
-        );
+        let filter =
+            EnvFilter::from_default_env().add_directive("atm=info".parse().unwrap_or_else(|_| {
+                tracing_subscriber::filter::Directive::from(tracing::Level::INFO)
+            }));
 
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -356,14 +374,22 @@ async fn main() -> Result<()> {
         App::new()
     };
 
-    let daemon_client = DaemonClient::with_defaults(event_tx.clone(), command_rx, cancel_token.clone());
+    let daemon_client =
+        DaemonClient::with_defaults(event_tx.clone(), command_rx, cancel_token.clone());
     let daemon_handle = tokio::spawn(async move {
         daemon_client.run().await;
     });
 
     let keyboard_handle = spawn_keyboard_task(event_tx, cancel_token.clone());
 
-    let result = run_event_loop(&mut terminal, &mut app, &mut event_rx, &command_tx, &cancel_token).await;
+    let result = run_event_loop(
+        &mut terminal,
+        &mut app,
+        &mut event_rx,
+        &command_tx,
+        &cancel_token,
+    )
+    .await;
 
     cancel_token.cancel();
 

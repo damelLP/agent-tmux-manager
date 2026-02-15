@@ -17,6 +17,7 @@ pub mod client;
 pub mod daemon;
 pub mod error;
 pub mod input;
+pub mod keybinding;
 pub mod setup;
 pub mod tmux;
 pub mod ui;

@@ -310,11 +310,8 @@ mod tests {
         };
         let _cloned = registered.clone();
 
-        let session = SessionDomain::new(
-            SessionId::new("test-2"),
-            AgentType::Explore,
-            Model::Sonnet4,
-        );
+        let session =
+            SessionDomain::new(SessionId::new("test-2"), AgentType::Explore, Model::Sonnet4);
         let updated = SessionEvent::Updated {
             session: Box::new(SessionView::from_domain(&session)),
         };

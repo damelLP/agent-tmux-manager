@@ -84,5 +84,4 @@ mod tests {
         assert_eq!(layout.detail_area.width, 56);
         assert_eq!(layout.detail_area.y, 3); // Starts after header
     }
-
 }

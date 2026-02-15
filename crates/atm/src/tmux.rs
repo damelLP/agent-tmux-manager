@@ -87,7 +87,12 @@ pub fn jump_to_pane(pane_id: &str) -> Result<(), TmuxError> {
     // Step 1: Get the pane's session and window information
     // Format: "pane_id session_name window_id"
     let list_output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id} #{session_name} #{window_id}"])
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{session_name} #{window_id}",
+        ])
         .output()
         .map_err(|e| TmuxError::CommandFailed(e.to_string()))?;
 

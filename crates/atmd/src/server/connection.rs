@@ -24,9 +24,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use atm_core::SessionId;
-use atm_protocol::{
-    ClientMessage, DaemonMessage, MessageType, ProtocolVersion, RawHookEvent,
-};
+use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion, RawHookEvent};
 
 use crate::discovery::{DiscoveryResult, DiscoveryService};
 use crate::registry::{RegistryHandle, SessionEvent};
@@ -202,8 +200,8 @@ impl ConnectionHandler {
         match msg.message {
             MessageType::Connect { client_id } => {
                 // Generate or use provided client ID
-                let assigned_id = client_id
-                    .unwrap_or_else(|| format!("client-{}", self.connection_number));
+                let assigned_id =
+                    client_id.unwrap_or_else(|| format!("client-{}", self.connection_number));
 
                 self.client_id = Some(assigned_id.clone());
 
@@ -394,15 +392,12 @@ impl ConnectionHandler {
     }
 
     /// Handles a hook event from Claude Code.
-    async fn handle_hook_event(
-        &mut self,
-        data: serde_json::Value,
-    ) -> Result<(), ConnectionError> {
+    async fn handle_hook_event(&mut self, data: serde_json::Value) -> Result<(), ConnectionError> {
         info!(client_id = ?self.client_id, "Received hook event data");
 
         // Parse the hook event
-        let raw_event: RawHookEvent = serde_json::from_value(data)
-            .map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+        let raw_event: RawHookEvent =
+            serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
 
         info!(
             session_id = %raw_event.session_id(),
@@ -416,9 +411,7 @@ impl ConnectionHandler {
         let event_type = raw_event.event_type().ok_or_else(|| {
             ConnectionError::ParseError(format!(
                 "Unknown hook event type: '{}' (session_id={}, tool_name={:?})",
-                raw_event.hook_event_name,
-                raw_event.session_id,
-                raw_event.tool_name
+                raw_event.hook_event_name, raw_event.session_id, raw_event.tool_name
             ))
         })?;
 
@@ -467,8 +460,8 @@ impl ConnectionHandler {
             });
         }
 
-        let msg: ClientMessage = serde_json::from_str(&line)
-            .map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+        let msg: ClientMessage =
+            serde_json::from_str(&line).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
 
         debug!(
             client_id = ?self.client_id,
@@ -486,15 +479,12 @@ impl ConnectionHandler {
 
         let mut writer = self.writer.lock().await;
 
-        match timeout(
-            WRITE_TIMEOUT,
-            async {
-                writer.write_all(json.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
-                Ok::<(), std::io::Error>(())
-            },
-        )
+        match timeout(WRITE_TIMEOUT, async {
+            writer.write_all(json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            Ok::<(), std::io::Error>(())
+        })
         .await
         {
             Ok(Ok(())) => Ok(()),
@@ -580,19 +570,17 @@ pub async fn send_event(
         }
     };
 
-    let json = serde_json::to_string(&msg).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+    let json =
+        serde_json::to_string(&msg).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
 
     let mut writer = writer.lock().await;
 
-    match timeout(
-        WRITE_TIMEOUT,
-        async {
-            writer.write_all(json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            Ok::<(), std::io::Error>(())
-        },
-    )
+    match timeout(WRITE_TIMEOUT, async {
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok::<(), std::io::Error>(())
+    })
     .await
     {
         Ok(Ok(())) => Ok(()),

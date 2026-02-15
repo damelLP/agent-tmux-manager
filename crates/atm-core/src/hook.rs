@@ -112,7 +112,11 @@ impl HookEventType {
     pub fn is_pre_event(&self) -> bool {
         matches!(
             self,
-            Self::PreToolUse | Self::SessionStart | Self::PreCompact | Self::SubagentStart | Self::Setup
+            Self::PreToolUse
+                | Self::SessionStart
+                | Self::PreCompact
+                | Self::SubagentStart
+                | Self::Setup
         )
     }
 
@@ -213,28 +217,64 @@ mod tests {
     #[test]
     fn test_hook_event_all_variants_parse() {
         // Tool events
-        assert_eq!(HookEventType::from_event_name("PreToolUse"), Some(HookEventType::PreToolUse));
-        assert_eq!(HookEventType::from_event_name("PostToolUse"), Some(HookEventType::PostToolUse));
-        assert_eq!(HookEventType::from_event_name("PostToolUseFailure"), Some(HookEventType::PostToolUseFailure));
+        assert_eq!(
+            HookEventType::from_event_name("PreToolUse"),
+            Some(HookEventType::PreToolUse)
+        );
+        assert_eq!(
+            HookEventType::from_event_name("PostToolUse"),
+            Some(HookEventType::PostToolUse)
+        );
+        assert_eq!(
+            HookEventType::from_event_name("PostToolUseFailure"),
+            Some(HookEventType::PostToolUseFailure)
+        );
 
         // User events
-        assert_eq!(HookEventType::from_event_name("UserPromptSubmit"), Some(HookEventType::UserPromptSubmit));
-        assert_eq!(HookEventType::from_event_name("Stop"), Some(HookEventType::Stop));
+        assert_eq!(
+            HookEventType::from_event_name("UserPromptSubmit"),
+            Some(HookEventType::UserPromptSubmit)
+        );
+        assert_eq!(
+            HookEventType::from_event_name("Stop"),
+            Some(HookEventType::Stop)
+        );
 
         // Subagent events
-        assert_eq!(HookEventType::from_event_name("SubagentStart"), Some(HookEventType::SubagentStart));
-        assert_eq!(HookEventType::from_event_name("SubagentStop"), Some(HookEventType::SubagentStop));
+        assert_eq!(
+            HookEventType::from_event_name("SubagentStart"),
+            Some(HookEventType::SubagentStart)
+        );
+        assert_eq!(
+            HookEventType::from_event_name("SubagentStop"),
+            Some(HookEventType::SubagentStop)
+        );
 
         // Session events
-        assert_eq!(HookEventType::from_event_name("SessionStart"), Some(HookEventType::SessionStart));
-        assert_eq!(HookEventType::from_event_name("SessionEnd"), Some(HookEventType::SessionEnd));
+        assert_eq!(
+            HookEventType::from_event_name("SessionStart"),
+            Some(HookEventType::SessionStart)
+        );
+        assert_eq!(
+            HookEventType::from_event_name("SessionEnd"),
+            Some(HookEventType::SessionEnd)
+        );
 
         // Context events
-        assert_eq!(HookEventType::from_event_name("PreCompact"), Some(HookEventType::PreCompact));
-        assert_eq!(HookEventType::from_event_name("Setup"), Some(HookEventType::Setup));
+        assert_eq!(
+            HookEventType::from_event_name("PreCompact"),
+            Some(HookEventType::PreCompact)
+        );
+        assert_eq!(
+            HookEventType::from_event_name("Setup"),
+            Some(HookEventType::Setup)
+        );
 
         // Notification
-        assert_eq!(HookEventType::from_event_name("Notification"), Some(HookEventType::Notification));
+        assert_eq!(
+            HookEventType::from_event_name("Notification"),
+            Some(HookEventType::Notification)
+        );
     }
 
     #[test]

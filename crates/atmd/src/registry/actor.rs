@@ -109,7 +109,10 @@ impl RegistryActor {
     /// Dispatches a command to the appropriate handler.
     fn handle_command(&mut self, cmd: RegistryCommand) {
         match cmd {
-            RegistryCommand::Register { session, respond_to } => {
+            RegistryCommand::Register {
+                session,
+                respond_to,
+            } => {
                 // Register command doesn't include PID - used mainly for testing
                 let result = self.handle_register(*session, None);
                 // Ignore send error - client may have dropped the receiver
@@ -132,7 +135,14 @@ impl RegistryActor {
                 tmux_pane,
                 respond_to,
             } => {
-                let result = self.handle_apply_hook_event(session_id, event_type, tool_name, notification_type, pid, tmux_pane);
+                let result = self.handle_apply_hook_event(
+                    session_id,
+                    event_type,
+                    tool_name,
+                    notification_type,
+                    pid,
+                    tmux_pane,
+                );
                 let _ = respond_to.send(result);
             }
             RegistryCommand::GetSession {
@@ -178,7 +188,11 @@ impl RegistryActor {
     /// Note: This is now primarily used for testing. Most sessions are
     /// registered via `handle_register_discovered` or status line updates.
     /// Without a PID, this creates a session that cannot be looked up by PID.
-    fn handle_register(&mut self, session: SessionDomain, pid: Option<u32>) -> Result<(), RegistryError> {
+    fn handle_register(
+        &mut self,
+        session: SessionDomain,
+        pid: Option<u32>,
+    ) -> Result<(), RegistryError> {
         // Check capacity
         if self.sessions_by_pid.len() >= MAX_SESSIONS {
             warn!(
@@ -718,16 +732,19 @@ impl RegistryActor {
         );
 
         // Publish removed event
-        let _ = self.event_publisher.send(SessionEvent::Removed {
-            session_id,
-            reason,
-        });
+        let _ = self
+            .event_publisher
+            .send(SessionEvent::Removed { session_id, reason });
 
         Ok(())
     }
 
     /// Handles removing a session by PID.
-    fn handle_remove_by_pid(&mut self, pid: u32, reason: RemovalReason) -> Result<(), RegistryError> {
+    fn handle_remove_by_pid(
+        &mut self,
+        pid: u32,
+        reason: RemovalReason,
+    ) -> Result<(), RegistryError> {
         let (session, _) = match self.sessions_by_pid.remove(&pid) {
             Some(entry) => entry,
             None => {
@@ -749,10 +766,9 @@ impl RegistryActor {
         );
 
         // Publish removed event
-        let _ = self.event_publisher.send(SessionEvent::Removed {
-            session_id,
-            reason,
-        });
+        let _ = self
+            .event_publisher
+            .send(SessionEvent::Removed { session_id, reason });
 
         Ok(())
     }
@@ -782,10 +798,7 @@ impl RegistryActor {
             return;
         }
 
-        info!(
-            count = to_remove.len(),
-            "Cleaning up dead-process sessions"
-        );
+        info!(count = to_remove.len(), "Cleaning up dead-process sessions");
 
         // Remove each session
         for (pid, session_id) in to_remove {
@@ -843,7 +856,11 @@ mod tests {
         )
     }
 
-    fn create_actor() -> (mpsc::Sender<RegistryCommand>, RegistryActor, broadcast::Receiver<SessionEvent>) {
+    fn create_actor() -> (
+        mpsc::Sender<RegistryCommand>,
+        RegistryActor,
+        broadcast::Receiver<SessionEvent>,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (event_tx, event_rx) = broadcast::channel(16);
         let actor = RegistryActor::new(cmd_rx, event_tx);
@@ -904,7 +921,10 @@ mod tests {
         actor.handle_command(cmd2);
 
         let result = rx2.await.unwrap();
-        assert!(matches!(result, Err(RegistryError::SessionAlreadyExists(_))));
+        assert!(matches!(
+            result,
+            Err(RegistryError::SessionAlreadyExists(_))
+        ));
         assert_eq!(actor.session_count(), 1);
     }
 
@@ -1150,7 +1170,10 @@ mod tests {
         });
 
         let result = rx.await.unwrap();
-        assert!(matches!(result, Err(RegistryError::RegistryFull { max: MAX_SESSIONS })));
+        assert!(matches!(
+            result,
+            Err(RegistryError::RegistryFull { max: MAX_SESSIONS })
+        ));
         assert_eq!(actor.session_count(), MAX_SESSIONS);
     }
 
@@ -1321,17 +1344,28 @@ mod tests {
         let mut found_registered = false;
         while let Ok(event) = event_rx.try_recv() {
             match event {
-                SessionEvent::Removed { reason: RemovalReason::Upgraded, .. } => {
+                SessionEvent::Removed {
+                    reason: RemovalReason::Upgraded,
+                    ..
+                } => {
                     found_removed = true;
                 }
-                SessionEvent::Registered { session_id, .. } if session_id.as_str() == "real-session-uuid" => {
+                SessionEvent::Registered { session_id, .. }
+                    if session_id.as_str() == "real-session-uuid" =>
+                {
                     found_registered = true;
                 }
                 _ => {}
             }
         }
-        assert!(found_removed, "Should have received Removed event with Upgraded reason");
-        assert!(found_registered, "Should have received Registered event for real session");
+        assert!(
+            found_removed,
+            "Should have received Removed event with Upgraded reason"
+        );
+        assert!(
+            found_registered,
+            "Should have received Registered event for real session"
+        );
     }
 
     #[tokio::test]
@@ -1379,7 +1413,11 @@ mod tests {
         assert!(result.is_ok());
 
         // CRITICAL: Should still have only 1 session, not 2!
-        assert_eq!(actor.session_count(), 1, "Should have 1 session, not duplicates");
+        assert_eq!(
+            actor.session_count(),
+            1,
+            "Should have 1 session, not duplicates"
+        );
 
         // The session should now have the real ID from the status line
         let (tx, rx) = oneshot::channel();
@@ -1400,6 +1438,9 @@ mod tests {
         };
         actor.handle_command(cmd);
         let old_session = rx.await.unwrap();
-        assert!(old_session.is_none(), "Old session ID should not exist anymore");
+        assert!(
+            old_session.is_none(),
+            "Old session ID should not exist anymore"
+        );
     }
 }

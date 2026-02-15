@@ -79,7 +79,12 @@ impl TestServer {
     }
 
     #[allow(dead_code)]
-    async fn connect_raw(&self) -> (BufReader<tokio::net::unix::OwnedReadHalf>, tokio::net::unix::OwnedWriteHalf) {
+    async fn connect_raw(
+        &self,
+    ) -> (
+        BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+    ) {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .expect("connect to server");
@@ -130,7 +135,9 @@ impl TestClient {
             let mut line = String::new();
             self.reader.read_line(&mut line).await.ok()?;
             serde_json::from_str(&line).ok()
-        }).await {
+        })
+        .await
+        {
             Ok(Some(msg)) => Some(msg),
             _ => None,
         }
@@ -147,7 +154,11 @@ impl TestClient {
 
 #[allow(dead_code)]
 fn create_test_session(id: &str) -> SessionDomain {
-    SessionDomain::new(SessionId::new(id), AgentType::GeneralPurpose, Model::Sonnet4)
+    SessionDomain::new(
+        SessionId::new(id),
+        AgentType::GeneralPurpose,
+        Model::Sonnet4,
+    )
 }
 
 // ============================================================================
@@ -219,11 +230,14 @@ async fn test_unknown_message_type_handled() {
     let mut client = server.connect().await;
 
     // First do proper handshake
-    client.handshake(Some("unknown-type-test".to_string())).await;
+    client
+        .handshake(Some("unknown-type-test".to_string()))
+        .await;
 
     // Now send message with unknown/invalid message type via raw bytes
     // (valid JSON structure but serde will fail to deserialize unknown variant)
-    let unknown = r#"{"protocol_version":{"major":1,"minor":0},"message":{"UnknownType":{"data":"test"}}}"#;
+    let unknown =
+        r#"{"protocol_version":{"major":1,"minor":0},"message":{"UnknownType":{"data":"test"}}}"#;
     client.send_raw(unknown.as_bytes()).await;
     client.send_raw(b"\n").await;
 
@@ -338,7 +352,9 @@ async fn test_rapid_status_updates() {
     let server = TestServer::spawn().await;
     let mut client = server.connect().await;
 
-    client.handshake(Some("rapid-update-test".to_string())).await;
+    client
+        .handshake(Some("rapid-update-test".to_string()))
+        .await;
 
     // Use the current process PID (a real PID that set_pid can validate)
     let current_pid = std::process::id();
@@ -367,7 +383,11 @@ async fn test_rapid_status_updates() {
     client.send(ClientMessage::list_sessions()).await;
     match client.recv().await {
         DaemonMessage::SessionList { sessions } => {
-            assert_eq!(sessions.len(), 1, "Should have 1 session from auto-registration");
+            assert_eq!(
+                sessions.len(),
+                1,
+                "Should have 1 session from auto-registration"
+            );
             // Last update should be reflected
             assert!(sessions[0].cost_usd > 0.4, "Cost should reflect updates");
         }
@@ -439,7 +459,9 @@ async fn test_client_continues_after_error() {
 
     let msg = ClientMessage {
         protocol_version: ProtocolVersion::CURRENT,
-        message: MessageType::StatusUpdate { data: invalid_status },
+        message: MessageType::StatusUpdate {
+            data: invalid_status,
+        },
     };
     client.send(msg).await;
 
@@ -578,7 +600,9 @@ async fn test_unsubscribe_when_not_subscribed() {
     client.handshake(None).await;
 
     // Unsubscribe without subscribing first - should not cause error
-    client.send(ClientMessage::new(MessageType::Unsubscribe)).await;
+    client
+        .send(ClientMessage::new(MessageType::Unsubscribe))
+        .await;
 
     // Should still work normally
     client.send(ClientMessage::ping(1)).await;

@@ -45,12 +45,7 @@ pub fn find_pane_for_pid(pid: u32) -> Option<String> {
     while depth < MAX_DEPTH {
         // Check if current PID matches any pane's shell PID
         if let Some(pane_id) = pane_pids.get(&current_pid) {
-            debug!(
-                pid,
-                pane_id,
-                depth,
-                "Found tmux pane for process"
-            );
+            debug!(pid, pane_id, depth, "Found tmux pane for process");
             return Some(pane_id.clone());
         }
 

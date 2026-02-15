@@ -6,8 +6,8 @@
 //! All code follows the panic-free policy: no `.unwrap()`, `.expect()`,
 //! `panic!()`, `unreachable!()`, `todo!()`, or direct indexing `[i]`.
 
-use chrono::{DateTime, Utc};
 use atm_core::{SessionId, SessionView};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -220,6 +220,46 @@ impl App {
         } else {
             self.selected_index = self.selected_index.saturating_sub(1);
         }
+    }
+
+    /// Moves selection down by `n`, clamping at the last session.
+    pub fn select_down(&mut self, n: usize) {
+        let session_count = self.sessions.len();
+        if session_count == 0 {
+            self.selected_index = 0;
+            return;
+        }
+        self.selected_index = self
+            .selected_index
+            .saturating_add(n)
+            .min(session_count.saturating_sub(1));
+    }
+
+    /// Moves selection up by `n`, clamping at the first session.
+    pub fn select_up(&mut self, n: usize) {
+        self.selected_index = self.selected_index.saturating_sub(n);
+    }
+
+    /// Jumps to absolute index, clamped to `[0, len-1]`.
+    pub fn select_go_to(&mut self, index: usize) {
+        let session_count = self.sessions.len();
+        if session_count == 0 {
+            self.selected_index = 0;
+            return;
+        }
+        self.selected_index = index.min(session_count.saturating_sub(1));
+    }
+
+    /// Moves down by `n * (viewport_height / 2)`, clamping at last session.
+    pub fn select_half_page_down(&mut self, n: usize, viewport_height: u16) {
+        let distance = n.saturating_mul((viewport_height as usize) / 2);
+        self.select_down(distance);
+    }
+
+    /// Moves up by `n * (viewport_height / 2)`, clamping at first session.
+    pub fn select_half_page_up(&mut self, n: usize, viewport_height: u16) {
+        let distance = n.saturating_mul((viewport_height as usize) / 2);
+        self.select_up(distance);
     }
 
     /// Advances the blink animation by one tick.
@@ -664,5 +704,95 @@ mod tests {
 
         app.update_sessions(vec![session1, session2]);
         assert_eq!(app.working_count(), 1);
+    }
+
+    // ------------------------------------------------------------------------
+    // Vim navigation clamping tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_select_down_empty_list() {
+        let mut app = App::new();
+        app.select_down(5);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_select_down_clamps_at_last() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            create_test_session("session-1", "2024-01-15T10:00:00Z"),
+            create_test_session("session-2", "2024-01-15T10:01:00Z"),
+            create_test_session("session-3", "2024-01-15T10:02:00Z"),
+        ]);
+        app.selected_index = 1;
+        app.select_down(10);
+        assert_eq!(app.selected_index, 2);
+    }
+
+    #[test]
+    fn test_select_up_clamps_at_first() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            create_test_session("session-1", "2024-01-15T10:00:00Z"),
+            create_test_session("session-2", "2024-01-15T10:01:00Z"),
+        ]);
+        app.selected_index = 1;
+        app.select_up(10);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_select_go_to_clamps_to_len() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            create_test_session("session-1", "2024-01-15T10:00:00Z"),
+            create_test_session("session-2", "2024-01-15T10:01:00Z"),
+        ]);
+        app.select_go_to(99);
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn test_select_go_to_empty_list() {
+        let mut app = App::new();
+        app.select_go_to(5);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_half_page_down_with_viewport_20() {
+        let mut app = App::new();
+        let sessions: Vec<_> = (0..12)
+            .map(|i| create_test_session(&format!("s{i}"), &format!("2024-01-15T10:{i:02}:00Z")))
+            .collect();
+        app.update_sessions(sessions);
+        app.selected_index = 0;
+        app.select_half_page_down(1, 20);
+        assert_eq!(app.selected_index, 10);
+    }
+
+    #[test]
+    fn test_half_page_up_with_viewport_20() {
+        let mut app = App::new();
+        let sessions: Vec<_> = (0..12)
+            .map(|i| create_test_session(&format!("s{i}"), &format!("2024-01-15T10:{i:02}:00Z")))
+            .collect();
+        app.update_sessions(sessions);
+        app.selected_index = 10;
+        app.select_half_page_up(1, 20);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_half_page_zero_viewport_is_noop() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            create_test_session("session-1", "2024-01-15T10:00:00Z"),
+            create_test_session("session-2", "2024-01-15T10:01:00Z"),
+        ]);
+        app.selected_index = 0;
+        app.select_half_page_down(3, 0);
+        assert_eq!(app.selected_index, 0);
     }
 }

@@ -256,7 +256,10 @@ impl ContextAnalyzer {
     }
 
     /// Estimates remaining "turns" based on average token usage per turn.
-    pub fn estimate_remaining_turns(context: &ContextUsage, avg_tokens_per_turn: u64) -> Option<u64> {
+    pub fn estimate_remaining_turns(
+        context: &ContextUsage,
+        avg_tokens_per_turn: u64,
+    ) -> Option<u64> {
         if avg_tokens_per_turn == 0 {
             return None;
         }
@@ -327,7 +330,10 @@ mod tests {
         };
         assert!(!normal.is_warning());
         assert!(!normal.is_critical());
-        assert_eq!(ContextAnalyzer::analyze(&normal), ContextWarningLevel::Normal);
+        assert_eq!(
+            ContextAnalyzer::analyze(&normal),
+            ContextWarningLevel::Normal
+        );
 
         // 80% usage
         let warning = ContextUsage {

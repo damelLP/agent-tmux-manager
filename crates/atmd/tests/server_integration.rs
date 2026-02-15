@@ -162,7 +162,11 @@ impl TestClient {
 
 /// Helper to create a test session.
 fn create_test_session(id: &str) -> SessionDomain {
-    SessionDomain::new(SessionId::new(id), AgentType::GeneralPurpose, Model::Sonnet4)
+    SessionDomain::new(
+        SessionId::new(id),
+        AgentType::GeneralPurpose,
+        Model::Sonnet4,
+    )
 }
 
 // ============================================================================
@@ -274,7 +278,9 @@ async fn test_subscribe_unsubscribe_flow() {
     }
 
     // Unsubscribe
-    client.send(ClientMessage::new(MessageType::Unsubscribe)).await;
+    client
+        .send(ClientMessage::new(MessageType::Unsubscribe))
+        .await;
 
     // Can still send other messages after unsubscribe
     client.send(ClientMessage::list_sessions()).await;
@@ -396,9 +402,7 @@ async fn test_max_clients_rejection() {
     // Connect and subscribe MAX_TUI_CLIENTS clients
     for i in 0..MAX_TUI_CLIENTS {
         let mut client = server.connect().await;
-        client
-            .handshake(Some(format!("client-{i}")))
-            .await;
+        client.handshake(Some(format!("client-{i}"))).await;
         client.send(ClientMessage::subscribe(None)).await;
         let _ = client.recv().await; // drain session list
         clients.push(client);

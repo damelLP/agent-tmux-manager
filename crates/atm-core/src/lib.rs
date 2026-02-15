@@ -22,7 +22,6 @@ pub use error::{DomainError, DomainResult};
 pub use hook::{is_interactive_tool, HookEventType};
 pub use model::{derive_display_name, Model};
 pub use session::{
-    ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId,
-    SessionInfrastructure, SessionStatus, SessionView, StatusLineData, ToolUseId, ToolUsageRecord,
-    TranscriptPath,
+    ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId, SessionInfrastructure,
+    SessionStatus, SessionView, StatusLineData, ToolUsageRecord, ToolUseId, TranscriptPath,
 };

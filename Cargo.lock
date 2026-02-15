@@ -90,7 +90,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "atm"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "atm-core",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "atm-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "procfs",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "atm-protocol"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "atm-core",
  "chrono",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "atm-tui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "atm-core",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "atmd"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "atm-core",

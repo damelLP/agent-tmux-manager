@@ -38,7 +38,9 @@
 
 mod connection;
 
-pub use connection::{ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter, SubscribersMap};
+pub use connection::{
+    ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter, SubscribersMap,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -303,10 +305,7 @@ impl DaemonServer {
 }
 
 /// Broadcasts an event to all subscribed clients.
-async fn broadcast_event(
-    subscribers: &SubscribersMap,
-    event: &SessionEvent,
-) {
+async fn broadcast_event(subscribers: &SubscribersMap, event: &SessionEvent) {
     // Get session_id from event for filtering
     let session_id = match event {
         SessionEvent::Registered { session_id, .. } => session_id,

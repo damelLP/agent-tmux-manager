@@ -200,7 +200,9 @@ impl DaemonMessage {
 
     /// Creates a session updated notification.
     pub fn session_updated(session: SessionView) -> Self {
-        Self::SessionUpdated { session: Box::new(session) }
+        Self::SessionUpdated {
+            session: Box::new(session),
+        }
     }
 
     /// Creates a session removed notification.
@@ -263,7 +265,10 @@ mod tests {
 
         match parsed.message {
             MessageType::Subscribe { session_id } => {
-                assert_eq!(session_id.map(|s| s.as_str().to_string()), Some("test-session".to_string()));
+                assert_eq!(
+                    session_id.map(|s| s.as_str().to_string()),
+                    Some("test-session".to_string())
+                );
             }
             _ => panic!("Expected Subscribe message"),
         }

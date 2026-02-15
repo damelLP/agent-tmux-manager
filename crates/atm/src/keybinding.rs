@@ -41,6 +41,8 @@ pub enum UiAction {
     Refresh,
     /// Quit the application.
     Quit,
+    /// Toggle the help popup.
+    ToggleHelp,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +156,7 @@ impl VimKeyResolver {
             'g' => KeyMeaning::GPrefix,
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
             'r' | 'R' => KeyMeaning::SimpleAction(UiAction::Refresh),
+            '?' => KeyMeaning::SimpleAction(UiAction::ToggleHelp),
             _ => KeyMeaning::Unbound,
         }
     }
@@ -691,5 +694,38 @@ mod tests {
             KeyModifiers::CONTROL.union(KeyModifiers::ALT),
         );
         assert_eq!(r.resolve(&ctrl_alt_d), KeyMeaning::Unbound);
+    }
+
+    // -----------------------------------------------------------------------
+    // ToggleHelp (?) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_question_mark_toggles_help() {
+        let mut h = InputHandler::new();
+        assert_eq!(
+            h.handle(key(KeyCode::Char('?'))),
+            Some(UiAction::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn test_resolver_question_mark_is_toggle_help() {
+        let r = VimKeyResolver;
+        assert_eq!(
+            r.resolve(&key(KeyCode::Char('?'))),
+            KeyMeaning::SimpleAction(UiAction::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn test_count_then_question_mark_discards_count() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('3'))), None);
+        // SimpleAction discards accumulated count
+        assert_eq!(
+            h.handle(key(KeyCode::Char('?'))),
+            Some(UiAction::ToggleHelp)
+        );
     }
 }

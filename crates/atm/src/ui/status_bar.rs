@@ -136,7 +136,9 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     hints.push(Span::styled("r", key_style));
     hints.push(Span::raw(" rescan  "));
     hints.push(Span::styled("q", key_style));
-    hints.push(Span::raw(" quit"));
+    hints.push(Span::raw(" quit  "));
+    hints.push(Span::styled("?", key_style));
+    hints.push(Span::raw(" help"));
 
     // Show pick mode indicator
     if app.pick_mode {

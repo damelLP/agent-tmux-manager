@@ -23,6 +23,7 @@
 //! The detail panel always shows the selected session's details.
 
 pub mod detail_panel;
+pub mod help_popup;
 pub mod layout;
 pub mod session_list;
 pub mod status_bar;
@@ -68,6 +69,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Render split view: session list (30%) | detail panel (70%)
     render_session_list(frame, layout.list_area, app);
     render_detail_panel_inline(frame, layout.detail_area, app.selected_session());
+
+    // Render help popup overlay (on top of everything)
+    if app.show_help {
+        help_popup::render_help_popup(frame, frame.area());
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +160,38 @@ mod tests {
         app.update_sessions(vec![create_test_session("session-1-abcdef")]);
 
         // Detail panel is always visible in split layout
+        terminal
+            .draw(|frame| {
+                render(frame, &app);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_with_help_popup_80x24() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.state = AppState::Connected;
+        app.show_help = true;
+        app.update_sessions(vec![create_test_session("session-1-abcdef")]);
+
+        terminal
+            .draw(|frame| {
+                render(frame, &app);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_with_help_popup_40x12() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.show_help = true;
+
         terminal
             .draw(|frame| {
                 render(frame, &app);

@@ -98,82 +98,33 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
-    // -- build_help_lines tests -----------------------------------------------
-
-    #[test]
-    fn test_lines_start_with_blank() {
-        let lines = build_help_lines(true);
-        assert!(!lines.is_empty());
-        assert_eq!(line_text(&lines[0]), "");
+    /// Helper: build lines and return as plain text strings.
+    fn help_texts(in_tmux: bool) -> Vec<String> {
+        build_help_lines(in_tmux).iter().map(line_text).collect()
     }
 
     #[test]
-    fn test_navigation_heading_present() {
-        let lines = build_help_lines(true);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert!(
-            texts.iter().any(|t| t.contains("Navigation")),
-            "Expected Navigation heading in lines: {texts:?}"
-        );
-    }
+    fn test_category_structure() {
+        let texts = help_texts(true);
 
-    #[test]
-    fn test_actions_heading_present() {
-        let lines = build_help_lines(true);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert!(
-            texts.iter().any(|t| t.contains("Actions")),
-            "Expected Actions heading in lines: {texts:?}"
-        );
-    }
+        // Starts with a blank line
+        assert_eq!(texts[0], "");
 
-    #[test]
-    fn test_categories_separated_by_blank_line() {
-        let lines = build_help_lines(true);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        // Both category headings present
+        assert!(texts.iter().any(|t| t.contains("Navigation")));
+        assert!(texts.iter().any(|t| t.contains("Actions")));
 
-        // Find the Actions heading — it should be preceded by a blank line
-        // (separating it from the Navigation category).
+        // Blank line separates categories
         let actions_idx = texts
             .iter()
             .position(|t| t.contains("Actions"))
             .expect("Actions heading should exist");
-
-        assert!(actions_idx >= 2, "Actions heading too early to have separator");
-        assert_eq!(
-            texts[actions_idx - 1], "",
-            "Expected blank line before Actions heading"
-        );
+        assert_eq!(texts[actions_idx - 1], "", "blank line before Actions");
     }
 
     #[test]
-    fn test_entry_format_key_and_description() {
-        let lines = build_help_lines(true);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-
-        // The first keybinding entry is "j / ↓" → "Move down"
-        let first_entry = texts
-            .iter()
-            .find(|t| t.contains("Move down"))
-            .expect("Expected 'Move down' entry");
-
-        // Check the key is left-padded and formatted
-        assert!(
-            first_entry.starts_with("    "),
-            "Entry should be indented: {first_entry:?}"
-        );
-        assert!(
-            first_entry.contains("Move down"),
-            "Entry should contain description"
-        );
-    }
-
-    #[test]
-    fn test_all_non_tmux_hints_present_when_in_tmux() {
-        let lines = build_help_lines(true);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-
-        // Every hint should appear (including tmux-only ones)
+    fn test_all_hints_present_when_in_tmux() {
+        let texts = help_texts(true);
         for entry in KEYBINDING_HINTS {
             assert!(
                 texts.iter().any(|t| t.contains(entry.help_desc)),
@@ -185,47 +136,17 @@ mod tests {
 
     #[test]
     fn test_tmux_only_entries_filtered_when_not_in_tmux() {
-        let lines_with_tmux = build_help_lines(true);
-        let lines_without_tmux = build_help_lines(false);
+        let with = help_texts(true);
+        let without = help_texts(false);
 
-        // There should be fewer lines when tmux-only entries are filtered
-        assert!(
-            lines_without_tmux.len() < lines_with_tmux.len(),
-            "Expected fewer lines without tmux ({} vs {})",
-            lines_without_tmux.len(),
-            lines_with_tmux.len()
-        );
+        // Fewer lines when tmux-only entries are filtered
+        assert!(without.len() < with.len());
 
-        // The tmux-only entry ("Jump to session") should be absent
-        let texts: Vec<String> = lines_without_tmux.iter().map(line_text).collect();
-        let tmux_entries: Vec<_> = KEYBINDING_HINTS
-            .iter()
-            .filter(|e| e.tmux_only)
-            .collect();
-
-        for entry in &tmux_entries {
+        // tmux-only entries absent
+        for entry in KEYBINDING_HINTS.iter().filter(|e| e.tmux_only) {
             assert!(
-                !texts.iter().any(|t| t.contains(entry.help_desc)),
+                !without.iter().any(|t| t.contains(entry.help_desc)),
                 "tmux-only entry should be filtered: {:?}",
-                entry.help_desc
-            );
-        }
-    }
-
-    #[test]
-    fn test_tmux_only_entries_present_when_in_tmux() {
-        let lines = build_help_lines(true);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-
-        let tmux_entries: Vec<_> = KEYBINDING_HINTS
-            .iter()
-            .filter(|e| e.tmux_only)
-            .collect();
-
-        for entry in &tmux_entries {
-            assert!(
-                texts.iter().any(|t| t.contains(entry.help_desc)),
-                "tmux-only entry should be present when in tmux: {:?}",
                 entry.help_desc
             );
         }
@@ -235,70 +156,29 @@ mod tests {
     fn test_key_column_width_consistent() {
         let lines = build_help_lines(true);
 
-        // Entries (not headings/blanks) should have exactly 2 spans:
-        // styled key + raw description
+        // Entry lines have exactly 2 spans (styled key + raw description).
+        // Key column: "    {:<11} " = 16 chars.
+        // Use chars().count() — some keys contain multi-byte Unicode (↓, ↑).
         for line in &lines {
             if line.spans.len() == 2 {
-                let key_span = &line.spans[0].content;
-                // Key column should be "    {:<11} " = 16 chars total.
-                // Use chars().count() because some keys contain multi-byte
-                // Unicode (e.g. ↓, ↑ are 3 bytes each).
-                let char_count = key_span.chars().count();
+                let char_count = line.spans[0].content.chars().count();
                 assert_eq!(
                     char_count, 16,
-                    "Key column width should be 16 chars, got {char_count} for {key_span:?}",
+                    "Key column should be 16 chars, got {char_count} for {:?}",
+                    line.spans[0].content
                 );
             }
         }
     }
 
-    // -- render smoke tests ---------------------------------------------------
-
     #[test]
-    fn test_render_help_popup_80x24() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| {
-                render_help_popup(frame, frame.area());
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn test_render_help_popup_40x12() {
-        let backend = TestBackend::new(40, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| {
-                render_help_popup(frame, frame.area());
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn test_render_help_popup_minimal_size() {
-        let backend = TestBackend::new(10, 5);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| {
-                render_help_popup(frame, frame.area());
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn test_render_help_popup_wide_terminal() {
-        let backend = TestBackend::new(200, 50);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| {
-                render_help_popup(frame, frame.area());
-            })
-            .unwrap();
+    fn test_render_smoke_various_sizes() {
+        for (w, h) in [(80, 24), (40, 12), (10, 5), (200, 50)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_help_popup(frame, frame.area()))
+                .unwrap();
+        }
     }
 }

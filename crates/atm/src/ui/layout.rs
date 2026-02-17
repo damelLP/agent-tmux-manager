@@ -59,9 +59,78 @@ impl AppLayout {
     }
 }
 
+/// Returns a centered popup `Rect` within the given `area`.
+///
+/// The popup occupies `percent_x`% of the width and `percent_y`% of the height,
+/// centered in `area`. Percentages are clamped to 100.
+///
+/// Uses clamping and saturating arithmetic so that the computed popup rectangle
+/// remains within the given area and within the valid `u16` range, even for
+/// extreme or degenerate inputs.
+#[must_use]
+pub fn centered_popup(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let px = percent_x.min(100);
+    let py = percent_y.min(100);
+
+    let popup_width = (area.width as u32 * px as u32 / 100) as u16;
+    let popup_height = (area.height as u32 * py as u32 / 100) as u16;
+
+    let x = area
+        .x
+        .saturating_add(area.width.saturating_sub(popup_width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(popup_height) / 2);
+
+    Rect::new(x, y, popup_width, popup_height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- centered_popup tests ------------------------------------------------
+
+    #[test]
+    fn test_centered_popup_50x50() {
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = centered_popup(50, 50, area);
+        assert_eq!(popup.width, 40);
+        assert_eq!(popup.height, 12);
+        assert_eq!(popup.x, 20);
+        assert_eq!(popup.y, 6);
+    }
+
+    #[test]
+    fn test_centered_popup_100x100() {
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = centered_popup(100, 100, area);
+        assert_eq!(popup.width, 80);
+        assert_eq!(popup.height, 24);
+        assert_eq!(popup.x, 0);
+        assert_eq!(popup.y, 0);
+    }
+
+    #[test]
+    fn test_centered_popup_zero_area() {
+        let area = Rect::new(0, 0, 0, 0);
+        let popup = centered_popup(50, 50, area);
+        assert_eq!(popup.width, 0);
+        assert_eq!(popup.height, 0);
+    }
+
+    #[test]
+    fn test_centered_popup_over_100_clamps() {
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = centered_popup(200, 150, area);
+        // Should behave like 100x100
+        assert_eq!(popup.width, 80);
+        assert_eq!(popup.height, 24);
+        assert_eq!(popup.x, 0);
+        assert_eq!(popup.y, 0);
+    }
+
+    // -- AppLayout tests -----------------------------------------------------
 
     #[test]
     fn test_app_layout_creation() {

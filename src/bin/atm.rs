@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{self, Event as CrosstermEvent},
+    event::{self, Event as CrosstermEvent, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -176,7 +176,25 @@ async fn run_event_loop(
         match event {
             Ok(Some(received_event)) => match received_event {
                 Event::Key(key) => {
-                    if let Some(action) = handler.handle(key) {
+                    // When help is visible, intercept keys before the DFA.
+                    // This is necessary because Esc maps to Quit in the DFA,
+                    // but we want it to dismiss help instead.
+                    if app.show_help {
+                        match key.code {
+                            KeyCode::Char('?') | KeyCode::Esc => {
+                                app.show_help = false;
+                                handler.reset();
+                            }
+                            KeyCode::Char('c')
+                                if key.modifiers == KeyModifiers::CONTROL =>
+                            {
+                                app.quit();
+                                cancel_token.cancel();
+                                break;
+                            }
+                            _ => {} // Swallow all other keys
+                        }
+                    } else if let Some(action) = handler.handle(key) {
                         match action {
                             UiAction::Quit => {
                                 app.quit();
@@ -227,6 +245,9 @@ async fn run_event_loop(
                             }
                             UiAction::HalfPageUp(n) => {
                                 app.select_half_page_up(n, viewport_height);
+                            }
+                            UiAction::ToggleHelp => {
+                                app.toggle_help();
                             }
                         }
                     }

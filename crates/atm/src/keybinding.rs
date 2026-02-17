@@ -41,7 +41,163 @@ pub enum UiAction {
     Refresh,
     /// Quit the application.
     Quit,
+    /// Toggle the help popup.
+    ToggleHelp,
 }
+
+// ---------------------------------------------------------------------------
+// Keybinding metadata (single source of truth for help/footer displays)
+// ---------------------------------------------------------------------------
+
+/// Category for grouping keybindings in the help popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintCategory {
+    /// Navigation bindings (movement, scrolling).
+    Navigation,
+    /// Action bindings (quit, refresh, jump, help).
+    Actions,
+}
+
+/// Metadata for a single keybinding, used by both the help popup and footer bar.
+///
+/// Entries where `footer_key` is empty are not shown in the footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeybindingHint {
+    /// Key display for the help popup (e.g., "j / \u{2193}").
+    pub help_key: &'static str,
+    /// Description for the help popup (e.g., "Move down").
+    pub help_desc: &'static str,
+    /// Key display for the footer bar (e.g., "j/\u{2193}"). Empty = not shown.
+    pub footer_key: &'static str,
+    /// Description for the footer bar (e.g., "down"). Empty = not shown.
+    pub footer_desc: &'static str,
+    /// Category for help popup grouping.
+    pub category: HintCategory,
+    /// Only show when running inside tmux.
+    pub tmux_only: bool,
+}
+
+/// All keybindings with display metadata, in presentation order.
+///
+/// This is the single source of truth consumed by both the help popup
+/// and the footer status bar. When adding a new keybinding to the DFA,
+/// add a corresponding entry here.
+pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
+    // -- Navigation ----------------------------------------------------------
+    KeybindingHint {
+        help_key: "j / \u{2193}",
+        help_desc: "Move down",
+        footer_key: "j/\u{2193}",
+        footer_desc: "down",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "k / \u{2191}",
+        help_desc: "Move up",
+        footer_key: "k/\u{2191}",
+        footer_desc: "up",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "0 / gg",
+        help_desc: "Go to top",
+        footer_key: "gg",
+        footer_desc: "top",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "G",
+        help_desc: "Go to bottom",
+        footer_key: "G",
+        footer_desc: "end",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "Ctrl-d",
+        help_desc: "Half page down",
+        footer_key: "^d/^u",
+        footer_desc: "page",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "Ctrl-u",
+        help_desc: "Half page up",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "Ngg",
+        help_desc: "Go to row N",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "Nj / Nk",
+        help_desc: "Move N rows",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    // -- Actions -------------------------------------------------------------
+    KeybindingHint {
+        help_key: "Enter",
+        help_desc: "Jump to session (tmux)",
+        footer_key: "Enter",
+        footer_desc: "jump",
+        category: HintCategory::Actions,
+        tmux_only: true,
+    },
+    KeybindingHint {
+        help_key: "r",
+        help_desc: "Rescan / refresh",
+        footer_key: "r",
+        footer_desc: "rescan",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "q",
+        help_desc: "Quit",
+        footer_key: "q",
+        footer_desc: "quit",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "?",
+        help_desc: "Toggle this help",
+        footer_key: "?",
+        footer_desc: "help",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "Esc",
+        help_desc: "Close help / quit",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "Ctrl-c",
+        help_desc: "Quit",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
+];
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -154,6 +310,7 @@ impl VimKeyResolver {
             'g' => KeyMeaning::GPrefix,
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
             'r' | 'R' => KeyMeaning::SimpleAction(UiAction::Refresh),
+            '?' => KeyMeaning::SimpleAction(UiAction::ToggleHelp),
             _ => KeyMeaning::Unbound,
         }
     }
@@ -691,5 +848,38 @@ mod tests {
             KeyModifiers::CONTROL.union(KeyModifiers::ALT),
         );
         assert_eq!(r.resolve(&ctrl_alt_d), KeyMeaning::Unbound);
+    }
+
+    // -----------------------------------------------------------------------
+    // ToggleHelp (?) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_question_mark_toggles_help() {
+        let mut h = InputHandler::new();
+        assert_eq!(
+            h.handle(key(KeyCode::Char('?'))),
+            Some(UiAction::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn test_resolver_question_mark_is_toggle_help() {
+        let r = VimKeyResolver;
+        assert_eq!(
+            r.resolve(&key(KeyCode::Char('?'))),
+            KeyMeaning::SimpleAction(UiAction::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn test_count_then_question_mark_discards_count() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('3'))), None);
+        // SimpleAction discards accumulated count
+        assert_eq!(
+            h.handle(key(KeyCode::Char('?'))),
+            Some(UiAction::ToggleHelp)
+        );
     }
 }

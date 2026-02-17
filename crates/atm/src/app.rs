@@ -72,6 +72,9 @@ pub struct App {
 
     /// Pick mode: exit after jumping to a session (fzf-style).
     pub pick_mode: bool,
+
+    /// Whether the help popup is currently visible.
+    pub show_help: bool,
 }
 
 impl Default for App {
@@ -92,6 +95,7 @@ impl App {
             blink_visible: true,
             tick_count: 0,
             pick_mode: false,
+            show_help: false,
         }
     }
 
@@ -277,6 +281,11 @@ impl App {
     /// Sets the quit flag to true, signaling the application should exit.
     pub fn quit(&mut self) {
         self.should_quit = true;
+    }
+
+    /// Toggles the help popup visibility.
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
     }
 
     /// Returns the number of sessions currently tracked.
@@ -782,6 +791,26 @@ mod tests {
         app.selected_index = 10;
         app.select_half_page_up(1, 20);
         assert_eq!(app.selected_index, 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Help popup tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_show_help_default_false() {
+        let app = App::new();
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn test_toggle_help() {
+        let mut app = App::new();
+        assert!(!app.show_help);
+        app.toggle_help();
+        assert!(app.show_help);
+        app.toggle_help();
+        assert!(!app.show_help);
     }
 
     #[test]

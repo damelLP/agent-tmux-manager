@@ -111,32 +111,37 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     // Check if we're in tmux for jump hint (use centralized function)
     let in_tmux = crate::tmux::is_in_tmux();
 
-    // Build vim-style navigation hints
-    let mut hints = vec![
-        Span::styled(" j/\u{2193}", key_style),
-        Span::raw(" down  "),
-        Span::styled("k/\u{2191}", key_style),
-        Span::raw(" up  "),
-        Span::styled("gg", key_style),
-        Span::raw(" top  "),
-        Span::styled("G", key_style),
-        Span::raw(" end  "),
-        Span::styled("^d/^u", key_style),
-        Span::raw(" page"),
-    ];
+    // Build footer hints from keybinding metadata
+    let mut hints = Vec::new();
+    let mut last_category = None;
 
-    // Show Enter/jump hint only when in tmux
-    if in_tmux {
-        hints.push(Span::styled("  |  ", sep_style));
-        hints.push(Span::styled("Enter", key_style));
-        hints.push(Span::raw(" jump"));
+    for entry in crate::keybinding::KEYBINDING_HINTS {
+        // Skip entries not shown in footer
+        if entry.footer_key.is_empty() {
+            continue;
+        }
+
+        // Skip tmux-only entries when not in tmux
+        if entry.tmux_only && !in_tmux {
+            continue;
+        }
+
+        // Add separator between categories
+        if let Some(prev) = last_category {
+            if prev != entry.category {
+                hints.push(Span::styled("  |  ", sep_style));
+            }
+        }
+        last_category = Some(entry.category);
+
+        // Add leading space before first entry
+        if hints.is_empty() {
+            hints.push(Span::styled(format!(" {}", entry.footer_key), key_style));
+        } else {
+            hints.push(Span::styled(entry.footer_key, key_style));
+        }
+        hints.push(Span::raw(format!(" {}  ", entry.footer_desc)));
     }
-
-    hints.push(Span::styled("  |  ", sep_style));
-    hints.push(Span::styled("r", key_style));
-    hints.push(Span::raw(" rescan  "));
-    hints.push(Span::styled("q", key_style));
-    hints.push(Span::raw(" quit"));
 
     // Show pick mode indicator
     if app.pick_mode {

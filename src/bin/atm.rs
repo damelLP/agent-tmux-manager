@@ -343,6 +343,9 @@ async fn run_event_loop(
                             UiAction::ToggleHelp => {
                                 app.toggle_help();
                             }
+                            UiAction::CollapseNode | UiAction::ExpandNode => {
+                                app.toggle_expand();
+                            }
                         }
                     }
                 }

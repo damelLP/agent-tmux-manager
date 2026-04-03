@@ -43,6 +43,10 @@ pub enum UiAction {
     Quit,
     /// Toggle the help popup.
     ToggleHelp,
+    /// Collapse the current tree node (or move to parent).
+    CollapseNode,
+    /// Expand the current tree node (or move to first child).
+    ExpandNode,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +312,8 @@ impl VimKeyResolver {
             'k' => KeyMeaning::Motion(MotionKind::Up),
             'G' => KeyMeaning::Motion(MotionKind::GoToBottom),
             'g' => KeyMeaning::GPrefix,
+            'h' => KeyMeaning::SimpleAction(UiAction::CollapseNode),
+            'l' => KeyMeaning::SimpleAction(UiAction::ExpandNode),
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
             'r' | 'R' => KeyMeaning::SimpleAction(UiAction::Refresh),
             '?' => KeyMeaning::SimpleAction(UiAction::ToggleHelp),

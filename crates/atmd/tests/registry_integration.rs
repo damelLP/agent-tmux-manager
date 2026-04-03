@@ -256,6 +256,9 @@ async fn test_event_subscription_hook_event_update() {
             None, // notification_type
             None, // pid
             None, // tmux_pane
+            None, // agent_id
+            None, // agent_type
+
         )
         .await
         .unwrap();
@@ -523,6 +526,9 @@ async fn test_hook_event_pre_tool_use() {
             None, // notification_type
             None, // pid
             None, // tmux_pane
+            None, // agent_id
+            None, // agent_type
+
         )
         .await
         .expect("should apply hook event");
@@ -553,6 +559,9 @@ async fn test_hook_event_post_tool_use() {
             None, // notification_type
             None, // pid
             None, // tmux_pane
+            None, // agent_id
+            None, // agent_type
+
         )
         .await
         .unwrap();
@@ -566,6 +575,9 @@ async fn test_hook_event_post_tool_use() {
             None, // notification_type
             None, // pid
             None, // tmux_pane
+            None, // agent_id
+            None, // agent_type
+
         )
         .await
         .expect("should apply hook event");
@@ -593,6 +605,9 @@ async fn test_hook_event_nonexistent_session() {
             None, // notification_type
             None, // pid
             None, // tmux_pane
+            None, // agent_id
+            None, // agent_type
+
         )
         .await;
 
@@ -623,6 +638,9 @@ async fn test_hook_event_session_end() {
             None, // notification_type
             None, // pid
             None, // tmux_pane
+            None, // agent_id
+            None, // agent_type
+
         )
         .await
         .expect("should apply SessionEnd event");
@@ -667,6 +685,9 @@ async fn test_hook_event_session_end_nonexistent() {
             None, // notification_type
             None, // pid
             None, // tmux_pane
+            None, // agent_id
+            None, // agent_type
+
         )
         .await;
 
@@ -876,5 +897,103 @@ async fn test_update_from_status_line_updates_existing() {
         view.cost_usd > 0.4,
         "cost should be updated to ~0.50, got {}",
         view.cost_usd
+    );
+}
+
+// ============================================================================
+// Phase 1: Subagent & Project Field Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_hook_event_forwards_agent_fields() {
+    let handle = spawn_registry();
+    let mut rx = handle.subscribe();
+
+    // Register a parent session
+    let session = create_test_session("parent-for-subagent");
+    handle.register(session).await.unwrap();
+
+    // Drain registered event
+    let _ = timeout(Duration::from_millis(100), rx.recv()).await;
+
+    // Send SubagentStart hook with agent_id and agent_type
+    handle
+        .apply_hook_event(
+            SessionId::new("parent-for-subagent"),
+            HookEventType::SubagentStart,
+            None,
+            None,
+            None,
+            None,
+            Some("subagent-001".to_string()),
+            Some("explore".to_string()),
+        )
+        .await
+        .expect("SubagentStart hook should succeed");
+
+    // The parent session should still be accessible and working
+    let view = handle
+        .get_session(SessionId::new("parent-for-subagent"))
+        .await
+        .expect("parent session should exist");
+    // SubagentStart is a pre-event, so session stays working
+    assert_eq!(view.status_label, "working");
+}
+
+#[tokio::test]
+async fn test_project_resolution_on_discovery() {
+    // This test verifies that project resolution functions work correctly
+    // when given a real git repo path. The functions are in atm-core and
+    // will be wired into the actor in a later phase.
+    use atm_core::{resolve_project_root, resolve_worktree_info};
+    use std::fs;
+
+    let handle = spawn_registry();
+
+    // Create a temp dir with a .git directory to simulate a git repo
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = dir.path().join("myproject");
+    fs::create_dir_all(repo_path.join(".git")).unwrap();
+    fs::create_dir_all(repo_path.join("src")).unwrap();
+    fs::write(repo_path.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    let working_dir = repo_path.join("src");
+    let cwd_str = working_dir.to_str().unwrap();
+
+    // Verify project resolution works
+    let project_root = resolve_project_root(cwd_str);
+    assert_eq!(
+        project_root,
+        Some(repo_path.to_string_lossy().to_string()),
+        "should resolve project root from subdirectory"
+    );
+
+    // Verify worktree info resolution
+    let (wt_path, branch) = resolve_worktree_info(repo_path.to_str().unwrap());
+    assert_eq!(wt_path, Some(repo_path.to_str().unwrap().to_string()));
+    assert_eq!(branch, Some("main".to_string()));
+
+    // Register a discovered session with this working directory
+    let current_pid = std::process::id();
+    handle
+        .register_discovered(
+            SessionId::new("project-test-session"),
+            current_pid,
+            working_dir.clone(),
+            None,
+        )
+        .await
+        .expect("discovery registration should succeed");
+
+    // Verify session was registered with working_directory populated
+    let view = handle
+        .get_session(SessionId::new("project-test-session"))
+        .await
+        .expect("session should exist");
+
+    // working_directory should be set from the discovery path
+    assert!(
+        view.working_directory.is_some(),
+        "working_directory should be populated from discovery"
     );
 }

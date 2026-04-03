@@ -571,6 +571,28 @@ pub struct SessionDomain {
     /// Tmux pane ID (e.g., "%5") if session is running in tmux
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tmux_pane: Option<String>,
+
+    /// Git project root (resolved from working_directory).
+    /// Shared across all worktrees of the same repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+
+    /// Git worktree path (specific checkout directory).
+    /// For the main checkout, this equals project_root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+
+    /// Git branch name for this worktree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+
+    /// Parent session ID (set when this session is a subagent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionId>,
+
+    /// Child subagent session IDs spawned by this session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_session_ids: Vec<SessionId>,
 }
 
 impl SessionDomain {
@@ -593,6 +615,11 @@ impl SessionDomain {
             working_directory: None,
             claude_code_version: None,
             tmux_pane: None,
+            project_root: None,
+            worktree_path: None,
+            worktree_branch: None,
+            parent_session_id: None,
+            child_session_ids: Vec::new(),
         }
     }
 
@@ -1057,6 +1084,26 @@ pub struct SessionView {
 
     /// Tmux pane ID (e.g., "%5") if session is running in tmux
     pub tmux_pane: Option<String>,
+
+    /// Git project root (for grouping in tree view)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+
+    /// Git worktree path
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+
+    /// Git branch name for this worktree
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+
+    /// Parent session ID (if this is a subagent)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionId>,
+
+    /// Child subagent session IDs
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_session_ids: Vec<SessionId>,
 }
 
 impl SessionView {
@@ -1109,6 +1156,11 @@ impl SessionView {
             started_at: session.started_at.to_rfc3339(),
             last_activity: session.last_activity.to_rfc3339(),
             tmux_pane: session.tmux_pane.clone(),
+            project_root: session.project_root.clone(),
+            worktree_path: session.worktree_path.clone(),
+            worktree_branch: session.worktree_branch.clone(),
+            parent_session_id: session.parent_session_id.clone(),
+            child_session_ids: session.child_session_ids.clone(),
         }
     }
 }
@@ -1414,5 +1466,38 @@ mod tests {
         assert_eq!(SessionStatus::Idle.icon(), "-");
         assert_eq!(SessionStatus::Working.icon(), ">");
         assert_eq!(SessionStatus::AttentionNeeded.icon(), "!");
+    }
+
+    #[test]
+    fn test_session_domain_new_fields_default() {
+        let session = create_test_session("test-defaults");
+        assert!(session.project_root.is_none());
+        assert!(session.worktree_path.is_none());
+        assert!(session.worktree_branch.is_none());
+        assert!(session.parent_session_id.is_none());
+        assert!(session.child_session_ids.is_empty());
+    }
+
+    #[test]
+    fn test_session_view_includes_new_fields() {
+        let mut session = create_test_session("test-view-fields");
+        session.project_root = Some("/home/user/project".to_string());
+        session.worktree_path = Some("/home/user/worktree".to_string());
+        session.worktree_branch = Some("feature-x".to_string());
+        session.parent_session_id = Some(SessionId::new("parent-123"));
+        session.child_session_ids = vec![
+            SessionId::new("child-1"),
+            SessionId::new("child-2"),
+        ];
+
+        let view = SessionView::from_domain(&session);
+
+        assert_eq!(view.project_root, Some("/home/user/project".to_string()));
+        assert_eq!(view.worktree_path, Some("/home/user/worktree".to_string()));
+        assert_eq!(view.worktree_branch, Some("feature-x".to_string()));
+        assert_eq!(view.parent_session_id, Some(SessionId::new("parent-123")));
+        assert_eq!(view.child_session_ids.len(), 2);
+        assert_eq!(view.child_session_ids[0].as_str(), "child-1");
+        assert_eq!(view.child_session_ids[1].as_str(), "child-2");
     }
 }

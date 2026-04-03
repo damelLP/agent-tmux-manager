@@ -309,6 +309,7 @@ mod tests {
             started_at: "2024-01-15T10:00:00Z".to_string(),
             last_activity: "2024-01-15T10:05:00Z".to_string(),
             tmux_pane: None,
+            ..Default::default()
         }
     }
 

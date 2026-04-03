@@ -144,6 +144,8 @@ impl RegistryHandle {
         notification_type: Option<String>,
         pid: Option<u32>,
         tmux_pane: Option<String>,
+        agent_id: Option<String>,
+        agent_type: Option<String>,
     ) -> Result<(), RegistryError> {
         let (tx, rx) = oneshot::channel();
 
@@ -155,6 +157,8 @@ impl RegistryHandle {
                 notification_type,
                 pid,
                 tmux_pane,
+                agent_id,
+                agent_type,
                 respond_to: tx,
             })
             .await
@@ -451,6 +455,8 @@ mod tests {
                 notification_type,
                 pid,
                 tmux_pane,
+                agent_id: _,
+                agent_type: _,
                 respond_to,
             }) = rx.recv().await
             {
@@ -474,6 +480,8 @@ mod tests {
                 None, // notification_type
                 Some(12345),
                 Some("%5".to_string()),
+                None, // agent_id
+                None, // agent_type
             )
             .await;
         assert!(result.is_ok());

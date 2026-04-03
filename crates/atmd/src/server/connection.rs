@@ -424,6 +424,8 @@ impl ConnectionHandler {
                 raw_event.notification_type,
                 raw_event.pid,
                 raw_event.tmux_pane,
+                raw_event.agent_id,
+                raw_event.agent_type,
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;

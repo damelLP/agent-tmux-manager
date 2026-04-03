@@ -12,6 +12,7 @@ pub mod cost;
 pub mod error;
 pub mod hook;
 pub mod model;
+pub mod project;
 pub mod session;
 
 // Re-exports for convenience
@@ -21,6 +22,7 @@ pub use cost::Money;
 pub use error::{DomainError, DomainResult};
 pub use hook::{is_interactive_tool, HookEventType};
 pub use model::{derive_display_name, Model};
+pub use project::{resolve_project_root, resolve_worktree_info};
 pub use session::{
     ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId, SessionInfrastructure,
     SessionStatus, SessionView, StatusLineData, ToolUsageRecord, ToolUseId, TranscriptPath,

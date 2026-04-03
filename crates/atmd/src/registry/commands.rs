@@ -83,6 +83,10 @@ pub enum RegistryCommand {
         pid: Option<u32>,
         /// Tmux pane ID if running in tmux
         tmux_pane: Option<String>,
+        /// Subagent agent ID (for SubagentStart/Stop events)
+        agent_id: Option<String>,
+        /// Subagent type (e.g., "explore", "plan")
+        agent_type: Option<String>,
         /// Channel to send the result
         respond_to: oneshot::Sender<Result<(), RegistryError>>,
     },

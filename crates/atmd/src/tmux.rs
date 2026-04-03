@@ -109,7 +109,7 @@ fn list_tmux_panes() -> Option<HashMap<u32, String>> {
 /// # Returns
 /// * `Some(ppid)` - The parent process ID
 /// * `None` - If the process doesn't exist or can't be read
-fn get_parent_pid(pid: u32) -> Option<u32> {
+pub(crate) fn get_parent_pid(pid: u32) -> Option<u32> {
     let stat_path = format!("/proc/{pid}/stat");
     let stat_content = fs::read_to_string(&stat_path).ok()?;
 
@@ -122,6 +122,26 @@ fn get_parent_pid(pid: u32) -> Option<u32> {
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     // fields[0] = state, fields[1] = ppid
     fields.get(1)?.parse().ok()
+}
+
+/// Returns the start time (in clock ticks since boot) for a process.
+///
+/// Reads field 22 (`starttime`) from `/proc/{pid}/stat`.
+/// Used to detect PID reuse: if a PID's start time changes,
+/// the original process has exited and the PID was reassigned.
+pub(crate) fn get_process_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let stat_content = fs::read_to_string(&stat_path).ok()?;
+
+    let close_paren = stat_content.rfind(')')?;
+    let after_comm = stat_content.get(close_paren + 1..)?;
+
+    // Fields after (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
+    // flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12)
+    // cutime(13) cstime(14) priority(15) nice(16) num_threads(17) itrealvalue(18)
+    // starttime(19)
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    fields.get(19)?.parse().ok()
 }
 
 /// Checks if tmux is available on the system.

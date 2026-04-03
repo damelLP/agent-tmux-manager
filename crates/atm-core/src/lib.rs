@@ -14,6 +14,7 @@ pub mod hook;
 pub mod model;
 pub mod project;
 pub mod session;
+pub mod tree;
 
 // Re-exports for convenience
 pub use agent::AgentType;
@@ -26,4 +27,7 @@ pub use project::{resolve_project_root, resolve_worktree_info};
 pub use session::{
     ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId, SessionInfrastructure,
     SessionStatus, SessionView, StatusLineData, ToolUsageRecord, ToolUseId, TranscriptPath,
+};
+pub use tree::{
+    all_node_ids, build_tree, flatten_tree, TreeNode, TreeNodeId, TreeRow, TreeRowKind,
 };

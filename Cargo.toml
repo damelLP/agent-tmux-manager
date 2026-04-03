@@ -15,6 +15,7 @@ resolver = "2"
 members = [
     "crates/atm-core",
     "crates/atm-protocol",
+    "crates/atm-tmux",
     "crates/atmd",
     "crates/atm",
 ]
@@ -76,6 +77,7 @@ tempfile = "3.14"
 # Internal crates (version required for crates.io, path for local dev)
 atm-core = { version = "0.1.1", path = "crates/atm-core" }
 atm-protocol = { version = "0.1.1", path = "crates/atm-protocol" }
+atm-tmux = { version = "0.1.1", path = "crates/atm-tmux" }
 atm-tui = { version = "0.1.1", path = "crates/atm" }
 atmd = { version = "0.1.1", path = "crates/atmd" }
 

@@ -1,0 +1,18 @@
+[package]
+name = "atm-tmux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Tmux CLI wrapper for the Agent Tmux Manager"
+
+[dependencies]
+async-trait = "0.1"
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

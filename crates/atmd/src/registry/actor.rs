@@ -474,6 +474,16 @@ impl RegistryActor {
                 raw_status.update_session(session);
                 infra.record_update();
 
+                // Resolve project/worktree if not yet set
+                if session.project_root.is_none() {
+                    if let Some(ref cwd) = session.working_directory {
+                        session.project_root = atm_core::resolve_project_root(cwd);
+                        let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
+                        session.worktree_path = wt_path;
+                        session.worktree_branch = wt_branch;
+                    }
+                }
+
                 debug!(
                     session_id = %session_id,
                     pid = pid,

@@ -85,6 +85,7 @@ atmd = { version = "0.1.1", path = "crates/atmd" }
 # Required for root package to compile the binaries
 atm-core = { workspace = true }
 atm-protocol = { workspace = true }
+atm-tmux = { workspace = true }
 atm-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -106,6 +106,7 @@ dependencies = [
  "anyhow",
  "atm-core",
  "atm-protocol",
+ "atm-tmux",
  "atm-tui",
  "atmd",
  "chrono",

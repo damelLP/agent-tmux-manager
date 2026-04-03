@@ -1,15 +1,20 @@
-//! ATM TUI - htop-style monitoring for Claude Code agents
+//! ATM — Agent Tmux Manager
 //!
-//! This binary provides a terminal user interface for monitoring
-//! Claude Code sessions across tmux windows.
+//! CLI + TUI for managing Claude Code agents in tmux.
 //!
 //! # Usage
 //!
 //! ```text
-//! atm          # Normal mode - stay running
-//! atm --pick   # Pick mode - exit after jumping to a session
-//! atm setup    # Configure Claude Code hooks
-//! atm uninstall # Remove hooks
+//! atm                        # Launch TUI dashboard
+//! atm --pick                 # Pick mode - exit after jumping to a session
+//! atm spawn                  # Spawn a new Claude agent
+//! atm kill <session-id>      # Kill an agent
+//! atm interrupt <session-id> # Send SIGINT to an agent
+//! atm send <session-id> <text> # Send text to agent pane
+//! atm list                   # List agents (tab-separated)
+//! atm status                 # One-line summary for tmux status bar
+//! atm setup                  # Configure Claude Code hooks
+//! atm uninstall              # Remove hooks
 //! ```
 
 use std::fs::{self, OpenOptions};
@@ -18,19 +23,24 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{self, Event as CrosstermEvent, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use atm_core::SessionView;
+use atm_protocol::{ClientMessage, DaemonMessage};
+use atm_tmux::{RealTmuxClient, TmuxClient};
 use atm_tui::app::App;
 use atm_tui::client::DaemonClient;
 use atm_tui::daemon;
@@ -45,10 +55,10 @@ use atm_tui::ui;
 // CLI Arguments
 // ============================================================================
 
-/// ATM TUI - htop-style monitoring for Claude Code agents
+/// ATM — Agent Tmux Manager for Claude Code
 #[derive(Parser, Debug)]
 #[command(name = "atm")]
-#[command(about = "Monitor Claude Code sessions in real-time")]
+#[command(about = "Manage and monitor Claude Code agents in tmux")]
 #[command(version)]
 struct Args {
     #[command(subcommand)]
@@ -65,6 +75,65 @@ enum Command {
     Setup,
     /// Remove atm hooks from Claude Code
     Uninstall,
+    /// Spawn a new Claude Code agent in a tmux pane
+    Spawn {
+        /// Model to use (e.g., opus, sonnet, haiku)
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+        /// Working directory for the new agent
+        #[arg(long, short = 'w')]
+        worktree: Option<String>,
+        /// Split direction: horizontal (top/bottom) or vertical (left/right)
+        #[arg(long, short = 'd', default_value = "horizontal")]
+        direction: SplitDirection,
+        /// Size of the new pane (e.g., "30%", "50%")
+        #[arg(long, short = 's', default_value = "50%")]
+        size: String,
+    },
+    /// Kill an agent and close its tmux pane
+    Kill {
+        /// Session ID (short form, e.g., "a1b2c3d4") or tmux pane ID (e.g., "%5")
+        target: String,
+    },
+    /// Send SIGINT to interrupt an agent's current turn
+    Interrupt {
+        /// Session ID (short form) or tmux pane ID
+        target: String,
+    },
+    /// Send text to an agent's tmux pane
+    Send {
+        /// Session ID (short form) or tmux pane ID
+        target: String,
+        /// Text to send
+        text: String,
+    },
+    /// List agents for scripting
+    List {
+        /// Output format
+        #[arg(long, short = 'f', default_value = "table")]
+        format: ListFormat,
+        /// Filter by status (working, idle, attention)
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by project name
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// One-line status summary (for tmux status bar)
+    Status,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum ListFormat {
+    Table,
+    Json,
+    Ids,
 }
 
 // ============================================================================
@@ -328,6 +397,301 @@ fn create_log_file() -> Option<std::fs::File> {
 }
 
 // ============================================================================
+// CLI Command Implementations
+// ============================================================================
+
+/// Fetches the current session list from the daemon via one-shot connection.
+async fn fetch_sessions() -> Result<Vec<SessionView>> {
+    let socket_path = PathBuf::from("/tmp/atm.sock");
+
+    let stream = UnixStream::connect(&socket_path)
+        .await
+        .context("Failed to connect to daemon. Is atmd running?")?;
+
+    let (reader, mut writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
+
+    /// Helper to send a JSON message followed by newline.
+    async fn send(writer: &mut tokio::net::unix::OwnedWriteHalf, msg: &ClientMessage) -> Result<()> {
+        let json = serde_json::to_string(msg).context("Failed to serialize message")?;
+        writer
+            .write_all(format!("{json}\n").as_bytes())
+            .await
+            .context("Failed to write to daemon")?;
+        Ok(())
+    }
+
+    // Step 1: Connect
+    send(&mut writer, &ClientMessage::connect(Some("atm-cli".to_string()))).await?;
+
+    // Step 2: Read Connected response, then send ListSessions
+    let mut sessions = Vec::new();
+    let mut line = String::new();
+    let deadline = Duration::from_secs(5);
+
+    loop {
+        line.clear();
+        let n = tokio::time::timeout(deadline, buf_reader.read_line(&mut line))
+            .await
+            .context("Timeout waiting for daemon response")?
+            .context("Failed to read from daemon")?;
+
+        if n == 0 {
+            break;
+        }
+
+        if let Ok(msg) = serde_json::from_str::<DaemonMessage>(line.trim()) {
+            match msg {
+                DaemonMessage::Connected { .. } => {
+                    // Now request the session list
+                    send(&mut writer, &ClientMessage::list_sessions()).await?;
+                    continue;
+                }
+                DaemonMessage::SessionList {
+                    sessions: sess_list,
+                } => {
+                    sessions = sess_list;
+                    break;
+                }
+                DaemonMessage::Rejected { reason, .. } => {
+                    bail!("Daemon rejected connection: {reason}");
+                }
+                DaemonMessage::Error { message, .. } => {
+                    bail!("Daemon error: {message}");
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    // Send disconnect
+    let disconnect_msg = ClientMessage::disconnect();
+    if let Ok(json) = serde_json::to_string(&disconnect_msg) {
+        let _ = writer.write_all(format!("{json}\n").as_bytes()).await;
+    }
+
+    Ok(sessions)
+}
+
+/// Resolves a target (session ID prefix or pane ID) to a tmux pane ID.
+fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
+    // If it starts with %, it's already a pane ID
+    if target.starts_with('%') {
+        return Ok(target.to_string());
+    }
+
+    // Search by session ID prefix
+    let matches: Vec<&SessionView> = sessions
+        .iter()
+        .filter(|s| s.id.as_str().starts_with(target) || s.id_short.starts_with(target))
+        .collect();
+
+    match matches.len() {
+        0 => bail!("No session matching '{target}'"),
+        1 => match &matches[0].tmux_pane {
+            Some(pane) => Ok(pane.clone()),
+            None => bail!("Session {} has no tmux pane", matches[0].id_short),
+        },
+        n => {
+            let ids: Vec<&str> = matches.iter().map(|s| s.id_short.as_str()).collect();
+            bail!("Ambiguous target '{target}' matches {n} sessions: {}", ids.join(", "))
+        }
+    }
+}
+
+async fn cmd_spawn(
+    model: Option<String>,
+    worktree: Option<String>,
+    direction: SplitDirection,
+    size: String,
+) -> Result<()> {
+    if !tmux::is_in_tmux() {
+        bail!("atm spawn requires running inside tmux");
+    }
+
+    let client = RealTmuxClient::new();
+
+    // Build the claude command
+    let mut claude_cmd = String::from("claude");
+    if let Some(ref m) = model {
+        claude_cmd.push_str(&format!(" --model {m}"));
+    }
+
+    // Determine working directory
+    let cwd = worktree
+        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()));
+
+    if let Some(ref dir) = cwd {
+        claude_cmd = format!("cd {dir} && {claude_cmd}");
+    }
+
+    // Get current pane to split from
+    let panes = client.list_panes().await.context("Failed to list tmux panes")?;
+    let current_pane = panes
+        .iter()
+        .find(|p| p.is_active)
+        .map(|p| p.pane_id.as_str())
+        .unwrap_or("%0");
+
+    let horizontal = matches!(direction, SplitDirection::Horizontal);
+
+    let new_pane = client
+        .split_window(current_pane, &size, horizontal, Some(&claude_cmd))
+        .await
+        .context("Failed to split tmux pane")?;
+
+    println!("{new_pane}");
+    Ok(())
+}
+
+async fn cmd_kill(target: String) -> Result<()> {
+    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
+    let sessions = fetch_sessions().await?;
+    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let client = RealTmuxClient::new();
+    client
+        .kill_pane(&pane_id)
+        .await
+        .context(format!("Failed to kill pane {pane_id}"))?;
+    println!("Killed {pane_id}");
+    Ok(())
+}
+
+async fn cmd_interrupt(target: String) -> Result<()> {
+    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
+    let sessions = fetch_sessions().await?;
+    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let client = RealTmuxClient::new();
+    // C-c sends SIGINT to the foreground process in the pane
+    client
+        .send_keys(&pane_id, "C-c")
+        .await
+        .context(format!("Failed to interrupt pane {pane_id}"))?;
+    println!("Interrupted {pane_id}");
+    Ok(())
+}
+
+async fn cmd_send(target: String, text: String) -> Result<()> {
+    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
+    let sessions = fetch_sessions().await?;
+    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let client = RealTmuxClient::new();
+    client
+        .send_keys(&pane_id, &text)
+        .await
+        .context(format!("Failed to send keys to pane {pane_id}"))?;
+    Ok(())
+}
+
+async fn cmd_list(
+    format: ListFormat,
+    status_filter: Option<String>,
+    project_filter: Option<String>,
+) -> Result<()> {
+    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
+    let sessions = fetch_sessions().await?;
+
+    // Apply filters
+    let filtered: Vec<&SessionView> = sessions
+        .iter()
+        .filter(|s| {
+            if let Some(ref status) = status_filter {
+                let matches = match status.to_lowercase().as_str() {
+                    "working" | "active" => s.status == atm_core::SessionStatus::Working,
+                    "idle" => s.status == atm_core::SessionStatus::Idle,
+                    "attention" | "waiting" => {
+                        s.status == atm_core::SessionStatus::AttentionNeeded
+                    }
+                    _ => true,
+                };
+                if !matches {
+                    return false;
+                }
+            }
+            if let Some(ref project) = project_filter {
+                if let Some(ref root) = s.project_root {
+                    if !root.contains(project.as_str()) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    match format {
+        ListFormat::Table => {
+            for s in &filtered {
+                let status = s.status_label.as_str();
+                let ctx = format!("{:.0}%", s.context_percentage);
+                let model = &s.model;
+                let project = s
+                    .project_root
+                    .as_deref()
+                    .and_then(|p| p.rsplit('/').find(|s| !s.is_empty()))
+                    .unwrap_or("-");
+                let branch = s.worktree_branch.as_deref().unwrap_or("");
+                let project_display = if branch.is_empty() {
+                    project.to_string()
+                } else {
+                    format!("{project}/{branch}")
+                };
+                let pane = s.tmux_pane.as_deref().unwrap_or("-");
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    s.id_short, status, ctx, model, project_display, pane
+                );
+            }
+        }
+        ListFormat::Json => {
+            let json = serde_json::to_string_pretty(&filtered)
+                .context("Failed to serialize sessions")?;
+            println!("{json}");
+        }
+        ListFormat::Ids => {
+            for s in &filtered {
+                println!("{}", s.id_short);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_status() -> Result<()> {
+    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
+    let sessions = fetch_sessions().await?;
+
+    let active = sessions
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status,
+                atm_core::SessionStatus::Working | atm_core::SessionStatus::Idle
+            )
+        })
+        .count();
+
+    let attention = sessions
+        .iter()
+        .filter(|s| s.status == atm_core::SessionStatus::AttentionNeeded)
+        .count();
+
+    let total_cost: f64 = sessions.iter().map(|s| s.cost_usd).sum();
+
+    let mut parts = vec![format!("{active}\u{2191}")]; // ↑
+    if attention > 0 {
+        parts.push(format!("{attention}!"));
+    }
+    parts.push(format!("${total_cost:.2}"));
+    println!("{}", parts.join(" "));
+
+    Ok(())
+}
+
+// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -342,6 +706,33 @@ async fn main() -> Result<()> {
         }
         Some(Command::Uninstall) => {
             return setup::uninstall();
+        }
+        Some(Command::Spawn {
+            model,
+            worktree,
+            direction,
+            size,
+        }) => {
+            return cmd_spawn(model, worktree, direction, size).await;
+        }
+        Some(Command::Kill { target }) => {
+            return cmd_kill(target).await;
+        }
+        Some(Command::Interrupt { target }) => {
+            return cmd_interrupt(target).await;
+        }
+        Some(Command::Send { target, text }) => {
+            return cmd_send(target, text).await;
+        }
+        Some(Command::List {
+            format,
+            status,
+            project,
+        }) => {
+            return cmd_list(format, status, project).await;
+        }
+        Some(Command::Status) => {
+            return cmd_status().await;
         }
         None => {}
     }

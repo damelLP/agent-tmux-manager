@@ -345,9 +345,7 @@ async fn run_event_loop(
                                 app.show_help = false;
                                 handler.reset();
                             }
-                            KeyCode::Char('c')
-                                if key.modifiers == KeyModifiers::CONTROL =>
-                            {
+                            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                                 app.quit();
                                 cancel_token.cancel();
                                 break;
@@ -433,7 +431,8 @@ async fn run_event_loop(
                                         let client = RealTmuxClient::new();
                                         info!(pane_id = %pane_id, "Interrupting agent");
                                         tokio::spawn(async move {
-                                            if let Err(e) = client.send_keys(&pane_id, "C-c").await {
+                                            if let Err(e) = client.send_keys(&pane_id, "C-c").await
+                                            {
                                                 warn!(error = %e, "Failed to interrupt");
                                             }
                                         });
@@ -449,10 +448,12 @@ async fn run_event_loop(
                                     let atm_pane = std::env::var("TMUX_PANE").ok();
                                     tokio::spawn(async move {
                                         let client = RealTmuxClient::new();
-                                        let panes = client.list_panes().await.ok().unwrap_or_default();
+                                        let panes =
+                                            client.list_panes().await.ok().unwrap_or_default();
                                         // Find the largest non-ATM pane in the same session
                                         // to split into (avoids splitting the narrow sidebar)
-                                        let current_session = atm_pane.as_deref()
+                                        let current_session = atm_pane
+                                            .as_deref()
                                             .and_then(|ap| panes.iter().find(|p| p.pane_id == ap))
                                             .map(|p| p.session_name.as_str());
                                         let target = panes
@@ -471,8 +472,13 @@ async fn run_event_loop(
                                         if let Some(ref dir) = cwd {
                                             cmd = format!("cd {dir} && {cmd}");
                                         }
-                                        match client.split_window(target, "50%", true, Some(&cmd)).await {
-                                            Ok(pane_id) => info!(pane_id = %pane_id, "Spawned new agent"),
+                                        match client
+                                            .split_window(target, "50%", true, Some(&cmd))
+                                            .await
+                                        {
+                                            Ok(pane_id) => {
+                                                info!(pane_id = %pane_id, "Spawned new agent")
+                                            }
                                             Err(e) => warn!(error = %e, "Failed to spawn agent"),
                                         }
                                     });
@@ -600,7 +606,10 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     let mut buf_reader = BufReader::new(reader);
 
     /// Helper to send a JSON message followed by newline.
-    async fn send(writer: &mut tokio::net::unix::OwnedWriteHalf, msg: &ClientMessage) -> Result<()> {
+    async fn send(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        msg: &ClientMessage,
+    ) -> Result<()> {
         let json = serde_json::to_string(msg).context("Failed to serialize message")?;
         writer
             .write_all(format!("{json}\n").as_bytes())
@@ -610,7 +619,11 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     }
 
     // Step 1: Connect
-    send(&mut writer, &ClientMessage::connect(Some("atm-cli".to_string()))).await?;
+    send(
+        &mut writer,
+        &ClientMessage::connect(Some("atm-cli".to_string())),
+    )
+    .await?;
 
     // Step 2: Read Connected response, then send ListSessions
     let mut sessions = Vec::new();
@@ -682,7 +695,10 @@ fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
         },
         n => {
             let ids: Vec<&str> = matches.iter().map(|s| s.id_short.as_str()).collect();
-            bail!("Ambiguous target '{target}' matches {n} sessions: {}", ids.join(", "))
+            bail!(
+                "Ambiguous target '{target}' matches {n} sessions: {}",
+                ids.join(", ")
+            )
         }
     }
 }
@@ -706,15 +722,21 @@ async fn cmd_spawn(
     }
 
     // Determine working directory
-    let cwd = worktree
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()));
+    let cwd = worktree.or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    });
 
     if let Some(ref dir) = cwd {
         claude_cmd = format!("cd {dir} && {claude_cmd}");
     }
 
     // Get current pane to split from
-    let panes = client.list_panes().await.context("Failed to list tmux panes")?;
+    let panes = client
+        .list_panes()
+        .await
+        .context("Failed to list tmux panes")?;
     let current_pane = panes
         .iter()
         .find(|p| p.is_active)
@@ -792,9 +814,7 @@ async fn cmd_list(
                 let matches = match status.to_lowercase().as_str() {
                     "working" | "active" => s.status == atm_core::SessionStatus::Working,
                     "idle" => s.status == atm_core::SessionStatus::Idle,
-                    "attention" | "waiting" => {
-                        s.status == atm_core::SessionStatus::AttentionNeeded
-                    }
+                    "attention" | "waiting" => s.status == atm_core::SessionStatus::AttentionNeeded,
                     _ => true,
                 };
                 if !matches {
@@ -839,8 +859,8 @@ async fn cmd_list(
             }
         }
         ListFormat::Json => {
-            let json = serde_json::to_string_pretty(&filtered)
-                .context("Failed to serialize sessions")?;
+            let json =
+                serde_json::to_string_pretty(&filtered).context("Failed to serialize sessions")?;
             println!("{json}");
         }
         ListFormat::Ids => {
@@ -853,12 +873,7 @@ async fn cmd_list(
     Ok(())
 }
 
-async fn cmd_reply(
-    target: String,
-    option: Option<usize>,
-    yes: bool,
-    no: bool,
-) -> Result<()> {
+async fn cmd_reply(target: String, option: Option<usize>, yes: bool, no: bool) -> Result<()> {
     daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
     let sessions = fetch_sessions().await?;
     let pane_id = resolve_pane_id(&sessions, &target)?;
@@ -866,7 +881,9 @@ async fn cmd_reply(
 
     if no {
         // Escape dismisses/cancels the prompt
-        client.send_keys(&pane_id, "Escape").await
+        client
+            .send_keys(&pane_id, "Escape")
+            .await
             .context("Failed to send Escape")?;
         println!("Sent Escape to {pane_id}");
         return Ok(());
@@ -874,7 +891,9 @@ async fn cmd_reply(
 
     if yes || option.is_none() {
         // Just press Enter to accept current selection
-        client.send_keys(&pane_id, "Enter").await
+        client
+            .send_keys(&pane_id, "Enter")
+            .await
             .context("Failed to send Enter")?;
         println!("Sent Enter to {pane_id}");
         return Ok(());
@@ -884,30 +903,42 @@ async fn cmd_reply(
     let desired = option.unwrap_or(1);
 
     // Capture the pane to find which option the cursor is on
-    let lines = client.capture_pane(&pane_id).await
+    let lines = client
+        .capture_pane(&pane_id)
+        .await
         .context("Failed to capture pane")?;
 
     let current = find_selected_option(&lines).unwrap_or(1);
 
     if desired == current {
         // Already on the right option, just press Enter
-        client.send_keys(&pane_id, "Enter").await
+        client
+            .send_keys(&pane_id, "Enter")
+            .await
             .context("Failed to send Enter")?;
     } else if desired > current {
         // Navigate down
         for _ in 0..(desired - current) {
-            client.send_keys(&pane_id, "Down").await
+            client
+                .send_keys(&pane_id, "Down")
+                .await
                 .context("Failed to send Down")?;
         }
-        client.send_keys(&pane_id, "Enter").await
+        client
+            .send_keys(&pane_id, "Enter")
+            .await
             .context("Failed to send Enter")?;
     } else {
         // Navigate up
         for _ in 0..(current - desired) {
-            client.send_keys(&pane_id, "Up").await
+            client
+                .send_keys(&pane_id, "Up")
+                .await
                 .context("Failed to send Up")?;
         }
-        client.send_keys(&pane_id, "Enter").await
+        client
+            .send_keys(&pane_id, "Enter")
+            .await
             .context("Failed to send Enter")?;
     }
 
@@ -1050,10 +1081,7 @@ fn extract_prompt(lines: &[String]) -> &[String] {
         }
 
         // Title block (☐/□/■)
-        if trimmed.starts_with('☐')
-            || trimmed.starts_with('□')
-            || trimmed.starts_with('■')
-        {
+        if trimmed.starts_with('☐') || trimmed.starts_with('□') || trimmed.starts_with('■') {
             start = i;
             break; // Title is the top of the prompt
         }
@@ -1091,7 +1119,9 @@ fn is_separator_line(trimmed: &str) -> bool {
     }
     let first_char = trimmed.chars().next().unwrap_or(' ');
     matches!(first_char, '─' | '━' | '═' | '┄' | '┈')
-        && trimmed.chars().all(|c| matches!(c, '─' | '━' | '═' | '┄' | '┈' | ' '))
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '─' | '━' | '═' | '┄' | '┈' | ' '))
 }
 
 #[cfg(test)]
@@ -1120,12 +1150,22 @@ mod prompt_tests {
         .collect();
 
         let prompt = extract_prompt(&lines);
-        let text = prompt.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("pineapple on pizza"), "should contain the question");
+        let text = prompt
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("pineapple on pizza"),
+            "should contain the question"
+        );
         assert!(text.contains("1. Yes"), "should contain option 1");
         assert!(text.contains("4. Chat"), "should contain option 4");
         assert!(text.contains("Enter to select"), "should contain footer");
-        assert!(!text.contains("previous output"), "should not contain earlier output");
+        assert!(
+            !text.contains("previous output"),
+            "should not contain earlier output"
+        );
     }
 
     #[test]
@@ -1146,9 +1186,7 @@ mod prompt_tests {
 
     #[test]
     fn test_fallback_when_no_prompt() {
-        let lines: Vec<String> = (0..20)
-            .map(|i| format!("line {i}"))
-            .collect();
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
 
         let prompt = extract_prompt(&lines);
         assert_eq!(prompt.len(), 15);
@@ -1248,9 +1286,19 @@ async fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Res
         }
     }
 
-    // ATM panel: launch filtered TUI
+    // ATM panel: swap to left side, then launch filtered TUI
     if let Some(atm_panes) = result.panes.get(&atm_tmux::layout::SlotRole::AtmPanel) {
         for pane in atm_panes {
+            // ATM pane was created on the right (split-window -h creates to the right).
+            // Swap it to the leftmost position so the sidebar is on the left.
+            let mut swap_cmd = std::process::Command::new("tmux");
+            if let Some(ref socket) = socket_name {
+                swap_cmd.arg("-L").arg(socket);
+            }
+            let _ = swap_cmd
+                .args(["swap-pane", "-s", pane, "-t", &format!("{session_name}:0.0")])
+                .output();
+
             let atm_cmd = format!("atm --tmux-session {session_name}");
             client
                 .send_keys(pane, &atm_cmd)
@@ -1367,21 +1415,38 @@ async fn main() -> Result<()> {
         }) => {
             return cmd_list(format, status, project).await;
         }
-        Some(Command::Peek { target, tail, prompt }) => {
+        Some(Command::Peek {
+            target,
+            tail,
+            prompt,
+        }) => {
             return cmd_peek(target, tail, prompt).await;
         }
-        Some(Command::Reply { target, option, yes, no }) => {
+        Some(Command::Reply {
+            target,
+            option,
+            yes,
+            no,
+        }) => {
             return cmd_reply(target, option, yes, no).await;
         }
         Some(Command::Status) => {
             return cmd_status().await;
         }
-        Some(Command::Workspace { name, isolate, editor }) => {
+        Some(Command::Workspace {
+            name,
+            isolate,
+            editor,
+        }) => {
             return cmd_workspace(name, isolate, editor).await;
         }
-        Some(Command::Layout { name, session, in_place }) => {
-            let layout = atm_tmux::layout::load_layout(&name, None)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Some(Command::Layout {
+            name,
+            session,
+            in_place,
+        }) => {
+            let layout =
+                atm_tmux::layout::load_layout(&name, None).map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let target = if let Some(ref session_name) = session {
                 atm_tmux::layout::LayoutTarget::NewSession(session_name.clone())
@@ -1467,9 +1532,9 @@ async fn main() -> Result<()> {
     let keyboard_handle = spawn_keyboard_task(event_tx.clone(), cancel_token.clone());
 
     // Spawn filter task if --tmux-session is set
-    let filter_handle = args.tmux_session.map(|session| {
-        spawn_filter_task(session, event_tx.clone(), cancel_token.clone())
-    });
+    let filter_handle = args
+        .tmux_session
+        .map(|session| spawn_filter_task(session, event_tx.clone(), cancel_token.clone()));
 
     // Create watch channel for selected pane ID and spawn capture polling task
     let (capture_pane_tx, capture_pane_rx) = tokio::sync::watch::channel(None::<String>);

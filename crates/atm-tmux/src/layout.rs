@@ -286,11 +286,18 @@ pub fn preset_grid() -> Layout {
 }
 
 /// Returns the built-in "workspace" layout:
-/// Narrow ATM sidebar on the left, workspace (agent 80% + shell 20%) on the right.
+/// Fixed-width ATM sidebar (30 cols) on the left, workspace on the right.
 ///
-/// ATM panel is the first child (inherits the full pane). The workspace
-/// then splits off to the right at 95% — leaving ATM with ~5% on the left.
-/// The workspace is further split into agent (top 80%) and shell (bottom 20%).
+/// Workspace is the first child (inherits full pane, gets split into
+/// agent 80% + shell 20%). ATM panel then splits off as a 30-column
+/// pane on the left using tmux's `-b` (before) flag — but since our
+/// split_window doesn't support `-b`, we handle this in cmd_workspace
+/// by splitting off ATM at 30 columns and then swapping panes.
+///
+/// Instead, we use the approach: workspace first, ATM splits off.
+/// The ATM split uses "30" (absolute columns, not percentage).
+/// tmux `split-window -h -l 30` from the workspace pane creates a
+/// 30-column pane to the right. We then swap it to the left in cmd_workspace.
 pub fn preset_workspace() -> Layout {
     Layout {
         name: "workspace".to_string(),
@@ -299,18 +306,10 @@ pub fn preset_workspace() -> Layout {
             size: "100%".to_string(),
             direction: SplitDirection::Horizontal,
             children: vec![
-                // ATM sidebar (first child, inherits full pane)
-                Slot {
-                    role: SlotRole::AtmPanel,
-                    size: "100%".to_string(),
-                    direction: SplitDirection::Horizontal,
-                    children: vec![],
-                    count: 1,
-                },
-                // Workspace splits off to the right, taking 95% of the width
+                // Workspace (first child, inherits full pane)
                 Slot {
                     role: SlotRole::Shell,
-                    size: "95%".to_string(),
+                    size: "100%".to_string(),
                     direction: SplitDirection::Vertical,
                     children: vec![
                         Slot {
@@ -330,6 +329,14 @@ pub fn preset_workspace() -> Layout {
                     ],
                     count: 1,
                 },
+                // ATM sidebar splits off at 30 columns
+                Slot {
+                    role: SlotRole::AtmPanel,
+                    size: "30".to_string(),
+                    direction: SplitDirection::Horizontal,
+                    children: vec![],
+                    count: 1,
+                },
             ],
             count: 1,
         },
@@ -337,7 +344,7 @@ pub fn preset_workspace() -> Layout {
 }
 
 /// Returns the built-in "workspace-editor" layout:
-/// Narrow ATM sidebar on the left, workspace with editor+agent (80%, side-by-side) over shell (20%).
+/// Fixed-width ATM sidebar (30 cols) on the left, workspace with editor+agent over shell.
 pub fn preset_workspace_editor() -> Layout {
     Layout {
         name: "workspace-editor".to_string(),
@@ -346,18 +353,10 @@ pub fn preset_workspace_editor() -> Layout {
             size: "100%".to_string(),
             direction: SplitDirection::Horizontal,
             children: vec![
-                // ATM sidebar (first child, inherits full pane)
-                Slot {
-                    role: SlotRole::AtmPanel,
-                    size: "100%".to_string(),
-                    direction: SplitDirection::Horizontal,
-                    children: vec![],
-                    count: 1,
-                },
-                // Workspace splits off to the right, taking 95% of the width
+                // Workspace (first child, inherits full pane)
                 Slot {
                     role: SlotRole::Shell,
-                    size: "95%".to_string(),
+                    size: "100%".to_string(),
                     direction: SplitDirection::Vertical,
                     children: vec![
                         Slot {
@@ -390,6 +389,14 @@ pub fn preset_workspace_editor() -> Layout {
                             count: 1,
                         },
                     ],
+                    count: 1,
+                },
+                // ATM sidebar splits off at 30 columns
+                Slot {
+                    role: SlotRole::AtmPanel,
+                    size: "30".to_string(),
+                    direction: SplitDirection::Horizontal,
+                    children: vec![],
                     count: 1,
                 },
             ],
@@ -472,9 +479,10 @@ fn apply_slot<'a>(
         }
 
         // Container: first child inherits current pane, subsequent children split off.
-        let first = slot.children.first().ok_or_else(|| {
-            TmuxError::ParseError("container slot has no children".to_string())
-        })?;
+        let first = slot
+            .children
+            .first()
+            .ok_or_else(|| TmuxError::ParseError("container slot has no children".to_string()))?;
 
         // Recurse into first child (it inherits the current pane)
         apply_slot(client, first, pane_id, result).await?;
@@ -701,14 +709,15 @@ name = "nope"
         let layout = preset_workspace();
         assert_eq!(layout.name, "workspace");
         assert_eq!(count_agent_slots(&layout.root), 1);
-        // Root has ATM panel + workspace container
+        // Root has workspace container + ATM panel
         assert_eq!(layout.root.children.len(), 2);
-        assert_eq!(layout.root.children[0].role, SlotRole::AtmPanel);
-        // Workspace container has agent + shell
-        let ws = &layout.root.children[1];
+        // Workspace container (first) has agent + shell
+        let ws = &layout.root.children[0];
         assert_eq!(ws.children.len(), 2);
         assert_eq!(ws.children[0].role, SlotRole::Agent);
         assert_eq!(ws.children[1].role, SlotRole::Shell);
+        // ATM panel is second (split off to right, then swapped to left)
+        assert_eq!(layout.root.children[1].role, SlotRole::AtmPanel);
     }
 
     #[test]
@@ -716,11 +725,10 @@ name = "nope"
         let layout = preset_workspace_editor();
         assert_eq!(layout.name, "workspace-editor");
         assert_eq!(count_agent_slots(&layout.root), 1);
-        // Root has ATM panel + workspace container
+        // Root has workspace container + ATM panel
         assert_eq!(layout.root.children.len(), 2);
-        assert_eq!(layout.root.children[0].role, SlotRole::AtmPanel);
-        // Workspace container has main container + shell
-        let ws = &layout.root.children[1];
+        // Workspace container (first) has main container + shell
+        let ws = &layout.root.children[0];
         assert_eq!(ws.children.len(), 2);
         // Main container has editor + agent
         let main = &ws.children[0];
@@ -728,6 +736,8 @@ name = "nope"
         assert_eq!(main.children[0].role, SlotRole::Editor);
         assert_eq!(main.children[1].role, SlotRole::Agent);
         assert_eq!(ws.children[1].role, SlotRole::Shell);
+        // ATM panel is second
+        assert_eq!(layout.root.children[1].role, SlotRole::AtmPanel);
     }
 
     #[test]
@@ -769,7 +779,10 @@ name = "nope"
 
         // Solo has no children — no splits should occur
         let calls = mock.calls();
-        assert!(calls.is_empty(), "solo layout should not produce any splits");
+        assert!(
+            calls.is_empty(),
+            "solo layout should not produce any splits"
+        );
 
         // One Agent pane recorded with the original pane ID
         let agent_panes = result.panes.get(&SlotRole::Agent).unwrap();

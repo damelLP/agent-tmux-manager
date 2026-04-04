@@ -36,7 +36,7 @@ use atmd::monitor::spawn_monitor_task;
 use atmd::registry::spawn_registry;
 use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
 
-/// ATM daemon - Claude Code session monitor
+/// ATM daemon - Claude Code session manager
 #[derive(Parser, Debug)]
 #[command(name = "atmd", version, about)]
 struct Args {

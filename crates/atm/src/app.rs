@@ -48,7 +48,7 @@ impl Default for AppState {
 /// Core application state for the ATM TUI.
 ///
 /// Manages connection state, session data, and UI state for the
-/// htop-style monitoring interface.
+/// htop-style management interface.
 #[derive(Debug, Clone)]
 pub struct App {
     /// Current connection state to the daemon.

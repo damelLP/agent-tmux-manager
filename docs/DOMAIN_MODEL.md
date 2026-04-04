@@ -1,4 +1,4 @@
-# Agent Tmux Monitor Domain Model
+# Agent Tmux Manager Domain Model
 
 > **Panic-Free Policy:** All code in this document follows the panic-free guidelines from `CLAUDE.md`.
 > No `.unwrap()`, `.expect()`, `panic!()`, `unreachable!()`, `todo!()`, or direct indexing `[i]` in production code.
@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document defines the domain model for Agent Tmux Monitor, an htop-style monitoring system for Claude Code agents. The model follows Domain-Driven Design (DDD) principles with clear separation between:
+This document defines the domain model for Agent Tmux Manager, an htop-style monitoring system for Claude Code agents. The model follows Domain-Driven Design (DDD) principles with clear separation between:
 
 - **Domain Layer**: Pure business logic, value objects, and aggregates
 - **Infrastructure Layer**: OS/system concerns, I/O, persistence
@@ -2043,7 +2043,7 @@ atm/
 ### atm-core/src/lib.rs
 
 ```rust
-//! Agent Tmux Monitor Core - Shared types for Claude Code monitoring
+//! Agent Tmux Manager Core - Shared types for Claude Code monitoring
 //!
 //! This crate provides the core domain types shared between
 //! the daemon (atmd) and TUI (atm).

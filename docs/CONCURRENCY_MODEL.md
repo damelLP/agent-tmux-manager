@@ -1,4 +1,4 @@
-# Agent Tmux Monitor Concurrency Model
+# Agent Tmux Manager Concurrency Model
 
 > **⚠️ Panic-Free Policy:** All code in this document follows the panic-free guidelines from `CLAUDE.md`.
 > No `.unwrap()`, `.expect()`, `panic!()`, or direct indexing in production code.
@@ -796,7 +796,7 @@ impl SessionRegistry {
 
 ## Idiomatic Async Patterns
 
-This section covers idiomatic async patterns in Rust/Tokio that Agent Tmux Monitor follows throughout its codebase.
+This section covers idiomatic async patterns in Rust/Tokio that Agent Tmux Manager follows throughout its codebase.
 
 ### Structured Concurrency with `tokio::select!`
 
@@ -1557,7 +1557,7 @@ async fn stress_test_high_message_rate() {
 
 ## Summary
 
-The Actor Model provides a robust, deadlock-free concurrency architecture for Agent Tmux Monitor:
+The Actor Model provides a robust, deadlock-free concurrency architecture for Agent Tmux Manager:
 
 1. **RegistryActor** owns all session data and processes commands sequentially
 2. **RegistryCommand** enum defines all possible operations with response channels

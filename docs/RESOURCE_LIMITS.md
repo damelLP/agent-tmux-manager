@@ -1,4 +1,4 @@
-# Agent Tmux Monitor Resource Limits
+# Agent Tmux Manager Resource Limits
 
 This document defines all resource limits for the ATM daemon to prevent unbounded growth and ensure stable operation.
 

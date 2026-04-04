@@ -1,4 +1,4 @@
-//! ATM Core - Shared types for Claude Code monitoring
+//! ATM Core - Shared types for Claude Code management
 //!
 //! This crate provides the core domain types shared between
 //! the daemon (atmd) and TUI (atm).

@@ -7,7 +7,7 @@ repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Real-time monitoring dashboard for Claude Code agents across tmux sessions"
+description = "Real-time management dashboard for Claude Code agents across tmux sessions"
 readme = "README.md"
 
 [workspace]
@@ -38,9 +38,9 @@ pkg-fmt = "tgz"
 version = "0.1.7"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/damelLP/agent-tmux-monitor"
+repository = "https://github.com/damelLP/agent-tmux-manager"
 authors = ["damelLP"]
-keywords = ["claude", "monitoring", "tmux", "tui", "agents"]
+keywords = ["claude", "management", "tmux", "tui", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]

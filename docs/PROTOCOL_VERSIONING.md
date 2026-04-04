@@ -1,4 +1,4 @@
-# Agent Tmux Monitor Protocol Versioning
+# Agent Tmux Manager Protocol Versioning
 
 > **⚠️ Panic-Free Policy:** All code in this document follows the panic-free guidelines from `CLAUDE.md`.
 > No `.unwrap()`, `.expect()`, `panic!()`, or direct indexing in production code.
@@ -588,7 +588,7 @@ impl From<v1::RegisterMessage> for v2::RegisterMessage {
 
 ```bash
 #!/bin/bash
-# Agent Tmux Monitor status line integration for Claude Code
+# Agent Tmux Manager status line integration for Claude Code
 # Protocol version: 1.0
 
 set -euo pipefail
@@ -699,7 +699,7 @@ exit 0  # Always exit 0 to avoid breaking Claude Code
 
 ```bash
 #!/bin/bash
-# Agent Tmux Monitor hooks integration for Claude Code
+# Agent Tmux Manager hooks integration for Claude Code
 # Protocol version: 1.0
 
 set -euo pipefail

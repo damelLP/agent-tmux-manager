@@ -59,7 +59,7 @@ use atm_tui::ui;
 /// ATM — Agent Tmux Manager for Claude Code
 #[derive(Parser, Debug)]
 #[command(name = "atm")]
-#[command(about = "Manage and monitor Claude Code agents in tmux")]
+#[command(about = "Manage Claude Code agents in tmux")]
 #[command(version)]
 struct Args {
     #[command(subcommand)]

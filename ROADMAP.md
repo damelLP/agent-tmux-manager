@@ -1,4 +1,4 @@
-# Agent Tmux Monitor — Roadmap
+# Agent Tmux Manager — Roadmap
 
 ## Status: v0.1.5 — MVP Complete, In Daily Use
 
@@ -20,20 +20,20 @@ Daemon-based architecture with Unix socket IPC, built in Rust with ratatui.
 
 ### Near-term
 
-- [ ] Projects — group sessions by CWD ([#2](https://github.com/damelLP/agent-tmux-monitor/issues/2))
-- [ ] Teams/Subagents — parent-child relationships ([#3](https://github.com/damelLP/agent-tmux-monitor/issues/3))
-- [ ] Filtering — by status, agent type, search ([#4](https://github.com/damelLP/agent-tmux-monitor/issues/4))
-- [ ] Preview pane — richer detail view ([#5](https://github.com/damelLP/agent-tmux-monitor/issues/5))
-- [ ] Vim navigation — gg, G, Ctrl-d/u, etc. ([#6](https://github.com/damelLP/agent-tmux-monitor/issues/6))
-- [ ] Session actions — kill with confirmation ([#7](https://github.com/damelLP/agent-tmux-monitor/issues/7))
-- [ ] Pre-select current pane — auto-highlight last session ([#8](https://github.com/damelLP/agent-tmux-monitor/issues/8))
+- [ ] Projects — group sessions by CWD ([#2](https://github.com/damelLP/agent-tmux-manager/issues/2))
+- [ ] Teams/Subagents — parent-child relationships ([#3](https://github.com/damelLP/agent-tmux-manager/issues/3))
+- [ ] Filtering — by status, agent type, search ([#4](https://github.com/damelLP/agent-tmux-manager/issues/4))
+- [ ] Preview pane — richer detail view ([#5](https://github.com/damelLP/agent-tmux-manager/issues/5))
+- [ ] Vim navigation — gg, G, Ctrl-d/u, etc. ([#6](https://github.com/damelLP/agent-tmux-manager/issues/6))
+- [ ] Session actions — kill with confirmation ([#7](https://github.com/damelLP/agent-tmux-manager/issues/7))
+- [ ] Pre-select current pane — auto-highlight last session ([#8](https://github.com/damelLP/agent-tmux-manager/issues/8))
 
 ### Later
 
-- [ ] Help screen — ? key ([#9](https://github.com/damelLP/agent-tmux-monitor/issues/9))
-- [ ] Config file — ~/.config/atm/config.toml ([#10](https://github.com/damelLP/agent-tmux-monitor/issues/10))
-- [ ] User documentation & README polish ([#11](https://github.com/damelLP/agent-tmux-monitor/issues/11))
-- [ ] Binary packaging / release automation ([#12](https://github.com/damelLP/agent-tmux-monitor/issues/12))
+- [ ] Help screen — ? key ([#9](https://github.com/damelLP/agent-tmux-manager/issues/9))
+- [ ] Config file — ~/.config/atm/config.toml ([#10](https://github.com/damelLP/agent-tmux-manager/issues/10))
+- [ ] User documentation & README polish ([#11](https://github.com/damelLP/agent-tmux-manager/issues/11))
+- [ ] Binary packaging / release automation ([#12](https://github.com/damelLP/agent-tmux-manager/issues/12))
 
 ## Architecture
 

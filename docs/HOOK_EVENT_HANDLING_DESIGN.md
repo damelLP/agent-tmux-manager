@@ -1,6 +1,6 @@
 # Hook Event Handling Design
 
-This document specifies how Claude Code hook events map to session states in agent-tmux-monitor.
+This document specifies how Claude Code hook events map to session states in agent-tmux-manager.
 
 ## SessionStatus: The Three Fundamental States
 

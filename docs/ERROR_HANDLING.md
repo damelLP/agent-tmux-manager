@@ -1,4 +1,4 @@
-# Agent Tmux Monitor Error Handling Strategy
+# Agent Tmux Manager Error Handling Strategy
 
 > **⚠️ Panic-Free Policy:** All code in this document follows the panic-free guidelines from `CLAUDE.md`.
 > No `.unwrap()`, `.expect()`, `panic!()`, or direct indexing in production code.
@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document defines the comprehensive error handling strategy for the Agent Tmux Monitor monitoring system. It covers error types, retry policies, graceful degradation, logging, and testing approaches across all components: daemon, TUI, and shell scripts.
+This document defines the comprehensive error handling strategy for the Agent Tmux Manager monitoring system. It covers error types, retry policies, graceful degradation, logging, and testing approaches across all components: daemon, TUI, and shell scripts.
 
 ---
 
@@ -39,7 +39,7 @@ This document defines the comprehensive error handling strategy for the Agent Tm
 
 ## thiserror vs anyhow
 
-Agent Tmux Monitor uses **both** crates for different purposes:
+Agent Tmux Manager uses **both** crates for different purposes:
 
 ### When to Use thiserror
 
@@ -395,7 +395,7 @@ Shell scripts used by Claude Code (status line and hooks) follow a strict exit c
 
 ```bash
 #!/bin/bash
-# Exit code semantics for Agent Tmux Monitor shell scripts
+# Exit code semantics for Agent Tmux Manager shell scripts
 #
 # EXIT CODES:
 #   0 = Success (or graceful degradation - ALWAYS USE FOR CLAUDE CODE)
@@ -1601,7 +1601,7 @@ pub fn user_message(error: &TuiError) -> UserMessage {
                 client_version, daemon_version
             ),
             suggestion: Some(
-                "Please update Agent Tmux Monitor:\n  cargo install atm --force".to_string()
+                "Please update Agent Tmux Manager:\n  cargo install atm --force".to_string()
             ),
             recoverable: false,
         },

@@ -1,4 +1,4 @@
-# Claude Development Guidelines for Agent Tmux Monitor
+# Claude Development Guidelines for Agent Tmux Manager
 
 ## Core Principles
 

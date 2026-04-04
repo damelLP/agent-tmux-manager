@@ -1,4 +1,4 @@
-# Agent Tmux Monitor Integration Test
+# Agent Tmux Manager Integration Test
 
 This directory contains **CORRECTED** test scripts to validate Claude Code's Status Line API and Hooks system.
 

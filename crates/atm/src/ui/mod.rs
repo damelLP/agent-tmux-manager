@@ -1,7 +1,7 @@
 //! UI rendering module for the ATM TUI.
 //!
 //! This module provides the complete rendering pipeline for the htop-style
-//! session monitoring interface. It orchestrates the layout and individual
+//! session management interface. It orchestrates the layout and individual
 //! widget rendering.
 //!
 //! # Layout Structure

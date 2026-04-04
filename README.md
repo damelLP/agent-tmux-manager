@@ -1,11 +1,11 @@
-# Agent Tmux Monitor (ATM)
+# Agent Tmux Manager (ATM)
 
-[![Build Status](https://github.com/damelLP/agent-tmux-monitor/actions/workflows/release.yml/badge.svg)](https://github.com/damelLP/agent-tmux-monitor/actions)
+[![Build Status](https://github.com/damelLP/agent-tmux-manager/actions/workflows/release.yml/badge.svg)](https://github.com/damelLP/agent-tmux-manager/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **⚠️ Warning:** This software was vibe coded by Claude while the author nodded along approvingly. It works surprisingly well, but if it summons a daemon (the other kind), you're on your own.
 
-**Real-time monitoring for Claude Code agents across tmux sessions.**
+**Real-time management for Claude Code agents across tmux sessions.**
 
 Know what your AI agents are doing, before they hit limits.
 
@@ -13,7 +13,7 @@ Know what your AI agents are doing, before they hit limits.
 
 ## Overview
 
-Agent Tmux Monitor provides a centralized, real-time dashboard for monitoring multiple Claude Code sessions. If you're running several Claude Code agents across tmux windows, ATM gives you instant visibility into:
+Agent Tmux Manager provides a centralized, real-time dashboard for monitoring multiple Claude Code sessions. If you're running several Claude Code agents across tmux windows, ATM gives you instant visibility into:
 
 - **Context usage** - See which sessions are approaching context limits
 - **Agent status** - Know when agents are thinking, waiting for permission, or idle
@@ -35,7 +35,7 @@ Agent Tmux Monitor provides a centralized, real-time dashboard for monitoring mu
 ### Quick Install (Recommended)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/damelLP/agent-tmux-monitor/main/scripts/install.sh | sh
+curl -sSL https://raw.githubusercontent.com/damelLP/agent-tmux-manager/main/scripts/install.sh | sh
 ```
 
 This downloads pre-built binaries, installs them to `~/.local/bin`, and configures Claude Code hooks automatically.
@@ -60,7 +60,7 @@ atm setup
 
 ### Manual Installation
 
-1. Download the latest release for your platform from [GitHub Releases](https://github.com/damelLP/agent-tmux-monitor/releases)
+1. Download the latest release for your platform from [GitHub Releases](https://github.com/damelLP/agent-tmux-manager/releases)
 
 2. Extract and install:
    ```bash
@@ -304,8 +304,8 @@ Contributions are welcome!
 
 ```bash
 # Clone repository
-git clone https://github.com/damelLP/agent-tmux-monitor.git
-cd agent-tmux-monitor
+git clone https://github.com/damelLP/agent-tmux-manager.git
+cd agent-tmux-manager
 
 # Build
 cargo build --release
@@ -321,7 +321,7 @@ cargo test --all
 ### Project Structure
 
 ```
-agent-tmux-monitor/
+agent-tmux-manager/
 ├── Cargo.toml           # Workspace root, defines both binaries
 ├── crates/
 │   ├── atm-core/        # Shared domain types and logic

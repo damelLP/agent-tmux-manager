@@ -1,6 +1,6 @@
 //! ATM TUI - Library modules
 //!
-//! This library provides the core TUI components for monitoring Claude Code sessions.
+//! This library provides the core TUI components for managing Claude Code sessions.
 //!
 //! # Architecture
 //!

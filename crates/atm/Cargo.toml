@@ -7,7 +7,7 @@ repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "TUI client library for ATM - Claude Code agent monitoring"
+description = "TUI client library for ATM - Claude Code agent management"
 readme = "../../README.md"
 
 [lib]

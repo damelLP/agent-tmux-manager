@@ -1237,10 +1237,7 @@ async fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Res
     // ATM panel: launch filtered TUI
     if let Some(atm_panes) = result.panes.get(&atm_tmux::layout::SlotRole::AtmPanel) {
         for pane in atm_panes {
-            let mut atm_cmd = format!("atm --tmux-session {session_name}");
-            if let Some(ref socket) = socket_name {
-                atm_cmd.push_str(&format!(" --tmux-socket {socket}"));
-            }
+            let atm_cmd = format!("atm --tmux-session {session_name}");
             client
                 .send_keys(pane, &atm_cmd)
                 .await

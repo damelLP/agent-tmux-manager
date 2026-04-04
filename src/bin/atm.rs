@@ -1235,14 +1235,21 @@ async fn cmd_status() -> Result<()> {
 // Workspace Command
 // ============================================================================
 
-async fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Result<()> {
-    // 1. Determine session name
+fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Result<()> {
+    const SIDEBAR_PCT: u32 = 16;
+    const SIDEBAR_MIN: u32 = 20;
+    const SIDEBAR_MAX: u32 = 40;
+
+    // 1. Determine session name, sanitized to safe characters
     let session_name = name.unwrap_or_else(|| {
         std::env::current_dir()
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .unwrap_or_else(|| "atm-workspace".to_string())
     });
+    if session_name.contains(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '.') {
+        bail!("Session name '{}' contains unsupported characters (use alphanumeric, -, _, .)", session_name);
+    }
 
     // 2. Build tmux base command args (handles --isolate socket)
     let socket_name = if isolate {
@@ -1261,48 +1268,125 @@ async fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Res
         let output = cmd.output().context("Failed to run tmux")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("tmux {} failed: {}", args.first().unwrap_or(&""), stderr.trim());
+            bail!("tmux {:?} failed: {}", args, stderr.trim());
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    // 3. Create session — the initial pane becomes the agent pane
+    // 3. Check if session already exists
+    let has_session = tmux_run(&socket_name, &["has-session", "-t", &session_name]);
+    if has_session.is_ok() {
+        if isolate {
+            bail!(
+                "Workspace '{}' already exists on socket 'atm-{}'. \
+                 Attach with: tmux -L atm-{} attach-session -t {}",
+                session_name, session_name, session_name, session_name
+            );
+        } else {
+            bail!(
+                "Workspace '{}' already exists. \
+                 Attach with: tmux attach-session -t {}",
+                session_name, session_name
+            );
+        }
+    }
+
+    // 4. Create session at current terminal size so absolute pane sizes
+    //    (like -l 30) are preserved when we attach later.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let cols_str = cols.to_string();
+    let rows_str = rows.to_string();
     let agent_pane = tmux_run(
         &socket_name,
-        &["new-session", "-d", "-s", &session_name, "-P", "-F", "#{pane_id}"],
+        &[
+            "new-session", "-d", "-s", &session_name,
+            "-x", &cols_str, "-y", &rows_str,
+            "-P", "-F", "#{pane_id}",
+        ],
     )?;
 
-    // 4. Split: ATM sidebar on the left (30 columns) using -hb (horizontal, before)
+    // 5. Split: ATM sidebar on the left — SIDEBAR_PCT% of width, clamped
+    let sidebar_width = (cols as u32 * SIDEBAR_PCT / 100)
+        .clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+        .to_string();
     let atm_pane = tmux_run(
         &socket_name,
-        &["split-window", "-hb", "-t", &agent_pane, "-l", "30", "-P", "-F", "#{pane_id}"],
+        &["split-window", "-hb", "-t", &agent_pane, "-l", &sidebar_width, "-P", "-F", "#{pane_id}"],
     )?;
 
-    // 5. Split: shell below the agent pane (20% height)
-    let _shell_pane = tmux_run(
+    // 6. Split: shell below the agent pane (20% height)
+    tmux_run(
         &socket_name,
         &["split-window", "-v", "-t", &agent_pane, "-l", "20%", "-P", "-F", "#{pane_id}"],
     )?;
 
-    // 6. If --editor: split agent pane horizontally, editor on the left
+    // 7. If --editor: split agent pane horizontally, editor on the left
     if editor {
-        let _editor_pane = tmux_run(
+        tmux_run(
             &socket_name,
             &["split-window", "-hb", "-t", &agent_pane, "-l", "50%", "-P", "-F", "#{pane_id}"],
         )?;
     }
 
-    // 7. Launch claude in agent pane
+    // 8. Launch claude in agent pane
     tmux_run(&socket_name, &["send-keys", "-t", &agent_pane, "claude", "Enter"])?;
 
-    // 8. Launch ATM TUI in sidebar (filtered to this session)
-    let atm_cmd = format!("atm --tmux-session {session_name}");
+    // 9. Tag the ATM pane so resize hooks can find it
+    tmux_run(&socket_name, &["select-pane", "-t", &atm_pane, "-T", "atm-sidebar"])?;
+
+    // 10. Launch ATM TUI in sidebar (filtered to this session)
+    let atm_cmd = format!("atm --tmux-session '{session_name}'");
     tmux_run(&socket_name, &["send-keys", "-t", &atm_pane, &atm_cmd, "Enter"])?;
 
-    // 9. Focus the agent pane
+    // 11. Auto-rescale sidebar on terminal resize + prefix-R keybinding.
+    //     Write a resize script to avoid tmux's $ escaping issues, then
+    //     point the hook and keybinding at it.
+    let tmux_prefix = match &socket_name {
+        Some(s) => format!("tmux -L {s}"),
+        None => "tmux".to_string(),
+    };
+    let script_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("atm");
+    std::fs::create_dir_all(&script_dir)?;
+    let script_path = script_dir.join(format!("resize-sidebar-{session_name}.sh"));
+    std::fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\n\
+             W=$({tmux} display-message -p '#{{window_width}}')\n\
+             S=$((W * {pct} / 100))\n\
+             [ $S -lt {min} ] && S={min}\n\
+             [ $S -gt {max} ] && S={max}\n\
+             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{pane_title}}'); do\n\
+               case $p in *:atm-sidebar) {tmux} resize-pane -t \"${{p%%:*}}\" -x \"$S\";; esac\n\
+             done\n",
+            tmux = tmux_prefix,
+            pct = SIDEBAR_PCT,
+            min = SIDEBAR_MIN,
+            max = SIDEBAR_MAX,
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let hook_cmd = format!("run-shell '{}'", script_path.display());
+    tmux_run(
+        &socket_name,
+        &["set-hook", "-t", &session_name, "after-resize-window", &hook_cmd],
+    )?;
+    // NOTE: bind-key is global; the last workspace created wins for prefix-R.
+    tmux_run(
+        &socket_name,
+        &["bind-key", "-T", "prefix", "R", &hook_cmd],
+    )?;
+
+    // 12. Focus the agent pane
     tmux_run(&socket_name, &["select-pane", "-t", &agent_pane])?;
 
-    // 10. Attach to the session
+    // 13. Attach to the session
     let mut attach = std::process::Command::new("tmux");
     if let Some(ref socket) = socket_name {
         attach.arg("-L").arg(socket);
@@ -1427,7 +1511,7 @@ async fn main() -> Result<()> {
             isolate,
             editor,
         }) => {
-            return cmd_workspace(name, isolate, editor).await;
+            return cmd_workspace(name, isolate, editor);
         }
         Some(Command::Layout {
             name,

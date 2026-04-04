@@ -289,7 +289,7 @@ pub fn preset_grid() -> Layout {
 /// Narrow ATM sidebar on the left, workspace (agent 80% + shell 20%) on the right.
 ///
 /// ATM panel is the first child (inherits the full pane). The workspace
-/// then splits off to the right at 85% — leaving ATM with ~15% on the left.
+/// then splits off to the right at 95% — leaving ATM with ~5% on the left.
 /// The workspace is further split into agent (top 80%) and shell (bottom 20%).
 pub fn preset_workspace() -> Layout {
     Layout {
@@ -307,10 +307,10 @@ pub fn preset_workspace() -> Layout {
                     children: vec![],
                     count: 1,
                 },
-                // Workspace splits off to the right, taking 85% of the width
+                // Workspace splits off to the right, taking 95% of the width
                 Slot {
                     role: SlotRole::Shell,
-                    size: "85%".to_string(),
+                    size: "95%".to_string(),
                     direction: SplitDirection::Vertical,
                     children: vec![
                         Slot {
@@ -354,10 +354,10 @@ pub fn preset_workspace_editor() -> Layout {
                     children: vec![],
                     count: 1,
                 },
-                // Workspace splits off to the right, taking 85% of the width
+                // Workspace splits off to the right, taking 95% of the width
                 Slot {
                     role: SlotRole::Shell,
-                    size: "85%".to_string(),
+                    size: "95%".to_string(),
                     direction: SplitDirection::Vertical,
                     children: vec![
                         Slot {

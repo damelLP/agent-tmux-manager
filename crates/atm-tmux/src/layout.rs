@@ -286,7 +286,11 @@ pub fn preset_grid() -> Layout {
 }
 
 /// Returns the built-in "workspace" layout:
-/// 5% left ATM sidebar, 95% right with agent (80%) over shell (20%).
+/// Narrow ATM sidebar on the left, workspace (agent 80% + shell 20%) on the right.
+///
+/// ATM panel is the first child (inherits the full pane). The workspace
+/// then splits off to the right at 85% — leaving ATM with ~15% on the left.
+/// The workspace is further split into agent (top 80%) and shell (bottom 20%).
 pub fn preset_workspace() -> Layout {
     Layout {
         name: "workspace".to_string(),
@@ -295,16 +299,18 @@ pub fn preset_workspace() -> Layout {
             size: "100%".to_string(),
             direction: SplitDirection::Horizontal,
             children: vec![
+                // ATM sidebar (first child, inherits full pane)
                 Slot {
                     role: SlotRole::AtmPanel,
-                    size: "5%".to_string(),
+                    size: "100%".to_string(),
                     direction: SplitDirection::Horizontal,
                     children: vec![],
                     count: 1,
                 },
+                // Workspace splits off to the right, taking 85% of the width
                 Slot {
                     role: SlotRole::Shell,
-                    size: "95%".to_string(),
+                    size: "85%".to_string(),
                     direction: SplitDirection::Vertical,
                     children: vec![
                         Slot {
@@ -331,7 +337,7 @@ pub fn preset_workspace() -> Layout {
 }
 
 /// Returns the built-in "workspace-editor" layout:
-/// 5% left ATM sidebar, 95% right with editor+agent (80%, side-by-side) over shell (20%).
+/// Narrow ATM sidebar on the left, workspace with editor+agent (80%, side-by-side) over shell (20%).
 pub fn preset_workspace_editor() -> Layout {
     Layout {
         name: "workspace-editor".to_string(),
@@ -340,16 +346,18 @@ pub fn preset_workspace_editor() -> Layout {
             size: "100%".to_string(),
             direction: SplitDirection::Horizontal,
             children: vec![
+                // ATM sidebar (first child, inherits full pane)
                 Slot {
                     role: SlotRole::AtmPanel,
-                    size: "5%".to_string(),
+                    size: "100%".to_string(),
                     direction: SplitDirection::Horizontal,
                     children: vec![],
                     count: 1,
                 },
+                // Workspace splits off to the right, taking 85% of the width
                 Slot {
                     role: SlotRole::Shell,
-                    size: "95%".to_string(),
+                    size: "85%".to_string(),
                     direction: SplitDirection::Vertical,
                     children: vec![
                         Slot {

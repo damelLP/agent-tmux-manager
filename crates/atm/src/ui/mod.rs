@@ -30,7 +30,7 @@ pub mod status_bar;
 pub mod theme;
 
 use crate::app::App;
-use layout::AppLayout;
+use layout::{AppLayout, CompactLayout};
 use ratatui::Frame;
 
 // Re-export commonly used items
@@ -68,9 +68,37 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Render split view: session list (30%) | detail panel (70%)
     render_session_list(frame, layout.list_area, app);
-    render_detail_panel_inline(frame, layout.detail_area, app.selected_session(), &app.captured_output);
+    render_detail_panel_inline(
+        frame,
+        layout.detail_area,
+        app.selected_session(),
+        &app.captured_output,
+    );
 
     // Render help popup overlay (on top of everything)
+    if app.show_help {
+        help_popup::render_help_popup(frame, frame.area());
+    }
+}
+
+/// Renders the compact sidebar TUI layout.
+///
+/// Vertical layout optimized for narrow (20-40 column) panes:
+/// header, full-width tree list (~70%), preview pane (~30%), 1-line footer.
+pub fn render_compact(frame: &mut Frame, app: &App) {
+    let layout = CompactLayout::new(frame.area());
+
+    render_header(frame, layout.header, app);
+    status_bar::render_compact_footer(frame, layout.footer, app);
+
+    session_list::render_compact_session_list(frame, layout.list_area, app);
+    detail_panel::render_compact_preview(
+        frame,
+        layout.preview_area,
+        app.selected_session(),
+        &app.captured_output,
+    );
+
     if app.show_help {
         help_popup::render_help_popup(frame, frame.area());
     }
@@ -211,6 +239,97 @@ mod tests {
         terminal
             .draw(|frame| {
                 render(frame, &app);
+            })
+            .unwrap();
+    }
+
+    // -- Compact rendering tests ----------------------------------------------
+
+    #[test]
+    fn test_render_compact_empty_30x40() {
+        let backend = TestBackend::new(30, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.compact = true;
+
+        terminal
+            .draw(|frame| {
+                render_compact(frame, &app);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_compact_with_sessions_30x40() {
+        let backend = TestBackend::new(30, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.compact = true;
+        app.state = AppState::Connected;
+        app.update_sessions(vec![
+            create_test_session("session-1-abcdef"),
+            create_test_session("session-2-ghijkl"),
+        ]);
+
+        terminal
+            .draw(|frame| {
+                render_compact(frame, &app);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_compact_minimum_size_20x12() {
+        let backend = TestBackend::new(20, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.compact = true;
+        app.state = AppState::Connected;
+        app.update_sessions(vec![create_test_session("session-1-abcdef")]);
+
+        terminal
+            .draw(|frame| {
+                render_compact(frame, &app);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_compact_with_capture() {
+        let backend = TestBackend::new(30, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.compact = true;
+        app.state = AppState::Connected;
+        app.update_sessions(vec![create_test_session("session-1-abcdef")]);
+        app.captured_output = vec![
+            "$ cargo test".to_string(),
+            "  Running 5 tests".to_string(),
+            "  test parse ... ok".to_string(),
+        ];
+
+        terminal
+            .draw(|frame| {
+                render_compact(frame, &app);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_compact_with_help_popup() {
+        let backend = TestBackend::new(30, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.compact = true;
+        app.show_help = true;
+
+        terminal
+            .draw(|frame| {
+                render_compact(frame, &app);
             })
             .unwrap();
     }

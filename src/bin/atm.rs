@@ -72,6 +72,10 @@ struct Args {
     /// Only show agents whose tmux pane belongs to this tmux session
     #[arg(long)]
     tmux_session: Option<String>,
+
+    /// Compact sidebar mode: vertical layout for narrow panes
+    #[arg(long)]
+    compact: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -325,10 +329,15 @@ async fn run_event_loop(
 
         // Render the UI and capture viewport height for half-page navigation
         terminal.draw(|frame| {
-            let layout = ui::layout::AppLayout::new(frame.area());
-            // The session list widget uses Borders::ALL, so subtract 2 to get the inner height
-            viewport_height = layout.list_area.height.saturating_sub(2);
-            ui::render(frame, app);
+            if app.compact {
+                let layout = ui::layout::CompactLayout::new(frame.area());
+                viewport_height = layout.list_area.height.saturating_sub(2);
+                ui::render_compact(frame, app);
+            } else {
+                let layout = ui::layout::AppLayout::new(frame.area());
+                viewport_height = layout.list_area.height.saturating_sub(2);
+                ui::render(frame, app);
+            }
         })?;
 
         let event = tokio::time::timeout(tick_rate, event_rx.recv()).await;
@@ -1335,7 +1344,7 @@ fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Result<()
     tmux_run(&socket_name, &["select-pane", "-t", &atm_pane, "-T", "atm-sidebar"])?;
 
     // 10. Launch ATM TUI in sidebar (filtered to this session)
-    let atm_cmd = format!("atm --tmux-session '{session_name}'");
+    let atm_cmd = format!("atm --compact --tmux-session '{session_name}'");
     tmux_run(&socket_name, &["send-keys", "-t", &atm_pane, &atm_cmd, "Enter"])?;
 
     // 11. Auto-rescale sidebar on terminal resize + prefix-R keybinding.
@@ -1595,6 +1604,7 @@ async fn main() -> Result<()> {
     } else {
         App::new()
     };
+    app.compact = args.compact;
 
     let daemon_client =
         DaemonClient::with_defaults(event_tx.clone(), command_rx, cancel_token.clone());

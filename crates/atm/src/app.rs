@@ -99,6 +99,9 @@ pub struct App {
 
     /// Pane IDs that belong to the filtered tmux session (populated by filter task).
     pub filter_pane_ids: HashSet<String>,
+
+    /// Compact mode: vertical layout optimized for narrow sidebar panes.
+    pub compact: bool,
 }
 
 impl Default for App {
@@ -127,6 +130,7 @@ impl App {
             capture_pane_id: None,
             tmux_session_filter: None,
             filter_pane_ids: HashSet::new(),
+            compact: false,
         }
     }
 

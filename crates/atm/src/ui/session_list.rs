@@ -34,8 +34,75 @@ pub fn render_session_list(frame: &mut Frame, area: Rect, app: &App) {
         .tree_rows
         .iter()
         .enumerate()
+        .map(|(idx, row)| create_tree_row_item(row, idx == app.selected_index, app.blink_visible))
+        .collect();
+
+    let title = format!(" Sessions ({}) ", app.session_count());
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::White)),
+    );
+
+    frame.render_widget(list, area);
+}
+
+/// Renders a compact session list for narrow sidebars.
+///
+/// Uses compressed agent rows showing only icon, context %, and name.
+/// Group rows (Project, Worktree, Team) reuse the standard group line.
+///
+/// # Arguments
+/// * `frame` - The frame to render into
+/// * `area` - The rectangular area for the session list
+/// * `app` - Application state containing tree data
+pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
+    if app.sessions.is_empty() {
+        render_empty_state(frame, area, &app.state);
+        return;
+    }
+
+    let inner_width = area.width.saturating_sub(2); // account for borders
+
+    let items: Vec<ListItem> = app
+        .tree_rows
+        .iter()
+        .enumerate()
         .map(|(idx, row)| {
-            create_tree_row_item(row, idx == app.selected_index, app.blink_visible)
+            let is_selected = idx == app.selected_index;
+            let indent = "  ".repeat(row.depth as usize);
+
+            let line = match &row.kind {
+                TreeRowKind::Project { name, .. } => {
+                    create_group_line(&indent, name, row, is_selected)
+                }
+                TreeRowKind::Worktree { branch, path, .. } => {
+                    let label = branch.as_deref().unwrap_or_else(|| {
+                        path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path)
+                    });
+                    create_group_line(&indent, label, row, is_selected)
+                }
+                TreeRowKind::Team { name } => {
+                    create_group_line(&indent, name, row, is_selected)
+                }
+                TreeRowKind::Agent { session } => {
+                    create_compact_agent_line(
+                        &indent, session, is_selected, app.blink_visible, inner_width,
+                    )
+                }
+            };
+
+            let bg_style = match &row.kind {
+                TreeRowKind::Agent { session } => {
+                    get_row_background_style(session, is_selected)
+                }
+                _ if is_selected => Style::default().bg(Color::Rgb(30, 30, 40)),
+                _ => Style::default(),
+            };
+
+            ListItem::new(line).style(bg_style)
         })
         .collect();
 
@@ -60,18 +127,14 @@ fn create_tree_row_item(
     let indent = "  ".repeat(row.depth as usize);
 
     let line = match &row.kind {
-        TreeRowKind::Project { name, .. } => {
-            create_group_line(&indent, name, row, is_selected)
-        }
+        TreeRowKind::Project { name, .. } => create_group_line(&indent, name, row, is_selected),
         TreeRowKind::Worktree { branch, path, .. } => {
-            let label = branch.as_deref().unwrap_or_else(|| {
-                path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path)
-            });
+            let label = branch
+                .as_deref()
+                .unwrap_or_else(|| path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path));
             create_group_line(&indent, label, row, is_selected)
         }
-        TreeRowKind::Team { name } => {
-            create_group_line(&indent, name, row, is_selected)
-        }
+        TreeRowKind::Team { name } => create_group_line(&indent, name, row, is_selected),
         TreeRowKind::Agent { session } => {
             create_agent_line(&indent, session, is_selected, blink_visible)
         }
@@ -87,12 +150,7 @@ fn create_tree_row_item(
 }
 
 /// Creates a line for a group header (Project, Worktree, Team).
-fn create_group_line(
-    indent: &str,
-    label: &str,
-    row: &TreeRow,
-    is_selected: bool,
-) -> Line<'static> {
+fn create_group_line(indent: &str, label: &str, row: &TreeRow, is_selected: bool) -> Line<'static> {
     let collapse_icon = if !row.has_children {
         " "
     } else if row.is_expanded {
@@ -183,6 +241,50 @@ fn create_agent_line(
             truncate_string(&session.model, 8),
             Style::default().fg(Color::White),
         ),
+    ];
+
+    Line::from(spans)
+}
+
+/// Creates a compact line for an agent row in narrow sidebars.
+///
+/// Format: `{selector}{indent}{icon} {ctx%} {name}`
+/// Name is resolved from worktree branch (preferred) or short ID (fallback),
+/// then adaptively truncated to fit `available_width`.
+fn create_compact_agent_line(
+    indent: &str,
+    session: &SessionView,
+    is_selected: bool,
+    blink_visible: bool,
+    available_width: u16,
+) -> Line<'static> {
+    let icon = status_icon(session.status, blink_visible);
+    let icon_color = status_color(session.status);
+    let ctx_color = context_color(session.context_percentage, session.context_critical);
+
+    let name = session.worktree_branch.as_deref()
+        .unwrap_or(&session.id_short);
+
+    let overhead = 9u16.saturating_add(indent.len() as u16);
+    let name_width = available_width.saturating_sub(overhead) as usize;
+    let truncated_name = truncate_string(name, name_width.max(1));
+
+    let spans = vec![
+        Span::styled(
+            if is_selected { ">" } else { " " },
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(indent.to_string()),
+        Span::styled(
+            format!("{icon} "),
+            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>4.0}%", session.context_percentage),
+            Style::default().fg(ctx_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(truncated_name, Style::default().fg(Color::White)),
     ];
 
     Line::from(spans)

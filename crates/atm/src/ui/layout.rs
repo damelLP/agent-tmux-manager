@@ -59,6 +59,59 @@ impl AppLayout {
     }
 }
 
+/// Compact sidebar layout — vertical split, no detail side panel.
+///
+/// Optimized for narrow (20-40 column) panes used as workspace sidebars.
+///
+/// ```text
+/// ┌─ Header ────────────┐  3 lines
+/// │ Tree list           │  ~70% of remaining
+/// ├─ Preview ───────────┤  ~30% of remaining
+/// │ (task + capture)    │
+/// ├─ Footer ────────────┤  1 line
+/// └─────────────────────┘
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct CompactLayout {
+    /// Header area for title and status
+    pub header: Rect,
+    /// Full-width tree list (~70% of content height)
+    pub list_area: Rect,
+    /// Full-width preview pane (~30% of content height)
+    pub preview_area: Rect,
+    /// Single-line footer ("? help")
+    pub footer: Rect,
+}
+
+impl CompactLayout {
+    /// Creates a new CompactLayout by splitting the given area vertically.
+    pub fn new(area: Rect) -> Self {
+        let [header, content, footer] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(6),   // Content (minimum 6 lines)
+                Constraint::Length(1), // Footer (compact: just "? help")
+            ])
+            .areas(area);
+
+        let [list_area, preview_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(70), // Tree list
+                Constraint::Percentage(30), // Preview (task + capture)
+            ])
+            .areas(content);
+
+        Self {
+            header,
+            list_area,
+            preview_area,
+            footer,
+        }
+    }
+}
+
 /// Returns a centered popup `Rect` within the given `area`.
 ///
 /// The popup occupies `percent_x`% of the width and `percent_y`% of the height,
@@ -152,5 +205,57 @@ mod tests {
         // Detail area should be 70% of content width (80 * 0.7 = 56)
         assert_eq!(layout.detail_area.width, 56);
         assert_eq!(layout.detail_area.y, 3); // Starts after header
+    }
+
+    // -- CompactLayout tests -------------------------------------------------
+
+    #[test]
+    fn test_compact_layout_30x40() {
+        let area = Rect::new(0, 0, 30, 40);
+        let layout = CompactLayout::new(area);
+
+        // Header: 3 lines at top
+        assert_eq!(layout.header.y, 0);
+        assert_eq!(layout.header.height, 3);
+
+        // Footer: 1 line at bottom
+        assert_eq!(layout.footer.height, 1);
+        assert_eq!(layout.footer.y + layout.footer.height, 40);
+
+        // List and preview share full width
+        assert_eq!(layout.list_area.width, 30);
+        assert_eq!(layout.preview_area.width, 30);
+
+        // Content = 40 - 3 (header) - 1 (footer) = 36 lines
+        // List ~70% = 25, Preview ~30% = 11
+        let content_height = layout.list_area.height + layout.preview_area.height;
+        assert_eq!(content_height, 36);
+        assert!(layout.list_area.height > layout.preview_area.height);
+    }
+
+    #[test]
+    fn test_compact_layout_20x12_minimum() {
+        let area = Rect::new(0, 0, 20, 12);
+        let layout = CompactLayout::new(area);
+
+        // Should not panic at minimum size
+        assert_eq!(layout.header.height, 3);
+        assert_eq!(layout.footer.height, 1);
+        assert!(layout.list_area.height >= 1);
+        assert!(layout.preview_area.height >= 1);
+    }
+
+    #[test]
+    fn test_compact_layout_40x60() {
+        let area = Rect::new(0, 0, 40, 60);
+        let layout = CompactLayout::new(area);
+
+        // Content = 60 - 3 - 1 = 56 lines
+        let content_height = layout.list_area.height + layout.preview_area.height;
+        assert_eq!(content_height, 56);
+
+        // 70% of 56 ≈ 39, 30% ≈ 17
+        assert!(layout.list_area.height >= 38);
+        assert!(layout.preview_area.height >= 16);
     }
 }

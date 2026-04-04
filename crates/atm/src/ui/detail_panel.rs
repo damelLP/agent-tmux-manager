@@ -227,6 +227,99 @@ fn build_progress_bar(percentage: f64, width: usize) -> String {
     )
 }
 
+/// Renders the compact preview pane: task context (2 lines) + terminal capture.
+pub fn render_compact_preview(
+    frame: &mut Frame,
+    area: Rect,
+    session: Option<&SessionView>,
+    captured_output: &[String],
+) {
+    if area.height < 3 {
+        // Not enough space for both sections — show capture only
+        render_terminal_capture(frame, area, captured_output);
+        return;
+    }
+
+    let [task_area, capture_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),  // Task context header
+            Constraint::Min(3),    // Terminal capture
+        ])
+        .areas(area);
+
+    render_task_context(frame, task_area, session);
+    render_terminal_capture(frame, capture_area, captured_output);
+}
+
+/// Renders task context in the compact preview (placeholder — shows session metadata).
+fn render_task_context(frame: &mut Frame, area: Rect, session: Option<&SessionView>) {
+    let lines: Vec<Line<'_>> = match session {
+        Some(s) => {
+            let status_line = match &s.activity_detail {
+                Some(detail) => format!("{} ({})", s.status_label, detail),
+                None => s.status_label.clone(),
+            };
+            vec![
+                Line::from(Span::styled(
+                    status_line,
+                    Style::default().fg(status_color(s.status)).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(vec![
+                    Span::styled(&s.model, Style::default().fg(Color::White)),
+                    Span::raw(" · "),
+                    Span::styled(&s.cost_display, Style::default().fg(Color::Green)),
+                    Span::raw(" · "),
+                    Span::styled(
+                        format!("{:.0}%", s.context_percentage),
+                        Style::default().fg(context_color(s.context_percentage, s.context_critical)),
+                    ),
+                ]),
+            ]
+        }
+        None => vec![
+            Line::from(Span::styled("No session selected", Style::default().fg(Color::DarkGray))),
+        ],
+    };
+
+    let block = Block::default()
+        .title(" Task ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Renders the terminal capture section (auto-scrolls to bottom).
+pub fn render_terminal_capture(
+    frame: &mut Frame,
+    area: Rect,
+    captured_output: &[String],
+) {
+    let block = Block::default()
+        .title(" Terminal ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    if captured_output.is_empty() {
+        let paragraph = Paragraph::new("").block(block);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let start = captured_output.len().saturating_sub(inner_height);
+    let visible_lines: Vec<Line<'_>> = captured_output
+        .iter()
+        .skip(start)
+        .map(|l| Line::from(Span::raw(l.as_str())))
+        .collect();
+
+    let paragraph = Paragraph::new(visible_lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

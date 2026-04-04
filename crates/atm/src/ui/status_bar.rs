@@ -159,6 +159,18 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(footer, area);
 }
 
+/// Renders a minimal single-line footer for compact mode.
+pub fn render_compact_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let text = if app.pick_mode {
+        "? help [pick]"
+    } else {
+        "? help"
+    };
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(paragraph, area);
+}
+
 /// Returns the display text and style for the given connection state.
 ///
 /// # Arguments

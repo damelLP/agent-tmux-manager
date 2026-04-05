@@ -5,8 +5,6 @@
 
 Real-time management for Claude Code agents across tmux sessions.
 
-![ATM Screenshot](assets/screenshot.png)
-
 ## What it does
 
 ATM gives you a live dashboard and CLI for every Claude Code agent running in tmux. See context usage, cost, model, and activity at a glance — and control agents without switching panes.

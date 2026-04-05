@@ -227,87 +227,81 @@ fn build_progress_bar(percentage: f64, width: usize) -> String {
     )
 }
 
-/// Renders the compact preview pane: summary of what the agent is working on.
+/// Renders the compact preview pane: beads task + prompt summary, then terminal capture.
 ///
-/// Content priority:
-/// - Line 1: Beads in-progress task title (if found in agent's working directory)
-/// - Remaining lines: First user prompt (truncated to fit)
-/// - Fallback: Status + model info if no prompt/task available
+/// Content:
+/// - Line 1: Beads in-progress task title (if found at project root)
+/// - Line 2+: First user prompt (word-wrapped, if available)
+/// - Remaining space: Terminal capture (auto-scrolls to bottom)
 pub fn render_compact_preview(
     frame: &mut Frame,
     area: Rect,
     session: Option<&SessionView>,
-    _captured_output: &[String],
+    captured_output: &[String],
 ) {
-    let block = Block::default()
-        .title(" Summary ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    let inner_height = area.height.saturating_sub(2) as usize; // borders eat 2 lines
-
-    let lines: Vec<Line<'_>> = match session {
+    // Build summary lines (beads task + first prompt)
+    let summary_lines: Vec<Line<'_>> = match session {
         Some(s) => {
             let mut result: Vec<Line<'_>> = Vec::new();
+            let width = area.width.saturating_sub(2) as usize;
 
-            // Line 1: Beads task title if available
-            let beads_title = s.working_directory.as_deref().and_then(|wd| {
-                // working_directory may be shortened for display ("...tail")
-                // Use the raw path from project_root or worktree_path as fallback
-                let dir = if wd.starts_with("...") {
-                    s.worktree_path.as_deref().or(s.project_root.as_deref())
-                } else {
-                    Some(wd)
-                };
-                dir.and_then(|d| {
-                    let tasks = atm_core::beads::find_in_progress_tasks(d);
+            // Beads task: try project_root first (where .beads/ lives), then worktree_path
+            let beads_title = s.project_root.as_deref()
+                .or(s.worktree_path.as_deref())
+                .and_then(|dir| {
+                    let tasks = atm_core::beads::find_in_progress_tasks(dir);
                     tasks.into_iter().next().map(|t| t.title)
-                })
-            });
+                });
 
             if let Some(ref title) = beads_title {
                 result.push(Line::from(Span::styled(
-                    truncate_to_width(title, area.width.saturating_sub(2) as usize),
+                    truncate_to_width(title, width),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )));
             }
 
-            // Remaining lines: first prompt
+            // First prompt (1-2 lines max to leave room for terminal)
             if let Some(ref prompt) = s.first_prompt {
-                let remaining = inner_height.saturating_sub(result.len());
-                if remaining > 0 {
-                    let width = area.width.saturating_sub(2) as usize;
-                    let wrapped = wrap_text(prompt, width);
-                    for line in wrapped.into_iter().take(remaining) {
-                        result.push(Line::from(Span::styled(
-                            line,
-                            Style::default().fg(Color::White),
-                        )));
-                    }
+                let prompt_lines = if beads_title.is_some() { 1 } else { 2 };
+                let wrapped = wrap_text(prompt, width);
+                for line in wrapped.into_iter().take(prompt_lines) {
+                    result.push(Line::from(Span::styled(
+                        line,
+                        Style::default().fg(Color::White),
+                    )));
                 }
-            }
-
-            // Fallback: if nothing to show, display status info
-            if result.is_empty() {
-                let status_line = match &s.activity_detail {
-                    Some(detail) => format!("{} ({})", s.status_label, detail),
-                    None => s.status_label.clone(),
-                };
-                result.push(Line::from(Span::styled(
-                    status_line,
-                    Style::default().fg(status_color(s.status)),
-                )));
             }
 
             result
         }
-        None => vec![
-            Line::from(Span::styled("No session selected", Style::default().fg(Color::DarkGray))),
-        ],
+        None => Vec::new(),
     };
 
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, area);
+    let summary_height = summary_lines.len() as u16;
+
+    if summary_height == 0 {
+        // No summary — give all space to terminal capture
+        render_terminal_capture(frame, area, captured_output);
+        return;
+    }
+
+    // Split area: summary on top, terminal capture below
+    let [summary_area, capture_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(summary_height + 2), // +2 for borders
+            Constraint::Min(3),
+        ])
+        .areas(area);
+
+    let block = Block::default()
+        .title(" Summary ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let paragraph = Paragraph::new(summary_lines).block(block);
+    frame.render_widget(paragraph, summary_area);
+
+    render_terminal_capture(frame, capture_area, captured_output);
 }
 
 /// Wraps text to fit within a given width, breaking on word boundaries.

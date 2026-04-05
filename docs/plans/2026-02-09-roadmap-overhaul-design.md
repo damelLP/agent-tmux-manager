@@ -22,7 +22,7 @@ No single source of truth for "where are we, what's next."
 Replaces both `ROADMAP.md` and `PROGRESS_TRACKER.md`. Structure:
 
 ```
-# Agent Tmux Monitor — Roadmap
+# Agent Tmux Manager — Roadmap
 
 ## Status: v0.1.3 — MVP Complete, In Daily Use
 

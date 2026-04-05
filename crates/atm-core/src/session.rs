@@ -1503,10 +1503,7 @@ mod tests {
         session.worktree_path = Some("/home/user/worktree".to_string());
         session.worktree_branch = Some("feature-x".to_string());
         session.parent_session_id = Some(SessionId::new("parent-123"));
-        session.child_session_ids = vec![
-            SessionId::new("child-1"),
-            SessionId::new("child-2"),
-        ];
+        session.child_session_ids = vec![SessionId::new("child-1"), SessionId::new("child-2")];
 
         let view = SessionView::from_domain(&session);
 

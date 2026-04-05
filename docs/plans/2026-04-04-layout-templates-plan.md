@@ -13,8 +13,8 @@ Add layout template system to ATM: TOML config parsing, 4 built-in presets, layo
 ## Task 1: Add `toml` workspace dependency
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/Cargo.toml` — add `toml = "0.8"` to `[workspace.dependencies]` and `[dependencies]`
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/Cargo.toml` — add `toml = { workspace = true }` to `[dependencies]`
+- `/home/damel/git/agent-tmux-manager/Cargo.toml` — add `toml = "0.8"` to `[workspace.dependencies]` and `[dependencies]`
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/Cargo.toml` — add `toml = { workspace = true }` to `[dependencies]`
 
 **What to do:**
 
@@ -40,10 +40,10 @@ toml = { workspace = true }
 ## Task 2: Layout types and TOML parsing
 
 **Files to create:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/layout.rs`
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/layout.rs`
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/lib.rs` — add `pub mod layout;`
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/lib.rs` — add `pub mod layout;`
 
 **What to do:**
 
@@ -160,7 +160,7 @@ pub mod layout;
 ## Task 3: Built-in preset layouts
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/layout.rs` — add preset functions
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/layout.rs` — add preset functions
 
 **What to do:**
 
@@ -259,10 +259,10 @@ Add unit tests:
 ## Task 4: Layout engine — `apply_layout`
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/layout.rs` — add `apply_layout` function
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/lib.rs` — add `new_session` to `TmuxClient` trait
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/client.rs` — implement `new_session` on `RealTmuxClient`
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/mock.rs` — implement `new_session` on `MockTmuxClient`
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/layout.rs` — add `apply_layout` function
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/lib.rs` — add `new_session` to `TmuxClient` trait
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/client.rs` — implement `new_session` on `RealTmuxClient`
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/mock.rs` — implement `new_session` on `MockTmuxClient`
 
 **What to do:**
 
@@ -379,7 +379,7 @@ Add unit tests with `MockTmuxClient`:
 ## Task 5: Config file loading
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm-tmux/src/layout.rs` — add `load_layout` function
+- `/home/damel/git/agent-tmux-manager/crates/atm-tmux/src/layout.rs` — add `load_layout` function
 
 **What to do:**
 
@@ -436,11 +436,11 @@ Add unit tests:
 ## Task 6: Live pane capture in TUI detail panel
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm/src/app.rs` — add `captured_output` field, capture polling logic
-- `/home/damel/git/agent-tmux-monitor/crates/atm/src/ui/detail_panel.rs` — render captured pane output
-- `/home/damel/git/agent-tmux-monitor/crates/atm/src/main.rs` — add capture tick event, wire up TmuxClient
-- `/home/damel/git/agent-tmux-monitor/crates/atm/src/input.rs` — add `CaptureUpdate` event variant
-- `/home/damel/git/agent-tmux-monitor/crates/atm/Cargo.toml` — add `atm-tmux` dependency
+- `/home/damel/git/agent-tmux-manager/crates/atm/src/app.rs` — add `captured_output` field, capture polling logic
+- `/home/damel/git/agent-tmux-manager/crates/atm/src/ui/detail_panel.rs` — render captured pane output
+- `/home/damel/git/agent-tmux-manager/crates/atm/src/main.rs` — add capture tick event, wire up TmuxClient
+- `/home/damel/git/agent-tmux-manager/crates/atm/src/input.rs` — add `CaptureUpdate` event variant
+- `/home/damel/git/agent-tmux-manager/crates/atm/Cargo.toml` — add `atm-tmux` dependency
 
 **What to do:**
 
@@ -593,7 +593,7 @@ atm-tmux = { workspace = true }
 ## Task 7: `atm layout` CLI subcommand
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm/src/main.rs` — add `Layout` subcommand to `Command` enum
+- `/home/damel/git/agent-tmux-manager/crates/atm/src/main.rs` — add `Layout` subcommand to `Command` enum
 
 **What to do:**
 
@@ -648,7 +648,7 @@ Some(Command::Layout { name, session, in_place }) => {
 ## Task 8: Ship tmux-bindings.conf
 
 **Files to modify:**
-- `/home/damel/git/agent-tmux-monitor/crates/atm/src/setup.rs` — add tmux bindings installation
+- `/home/damel/git/agent-tmux-manager/crates/atm/src/setup.rs` — add tmux bindings installation
 
 **What to do:**
 

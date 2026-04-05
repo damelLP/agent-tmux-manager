@@ -258,7 +258,6 @@ async fn test_event_subscription_hook_event_update() {
             None, // tmux_pane
             None, // agent_id
             None, // agent_type
-            None, // prompt
         )
         .await
         .unwrap();
@@ -528,7 +527,6 @@ async fn test_hook_event_pre_tool_use() {
             None, // tmux_pane
             None, // agent_id
             None, // agent_type
-            None, // prompt
         )
         .await
         .expect("should apply hook event");
@@ -561,7 +559,6 @@ async fn test_hook_event_post_tool_use() {
             None, // tmux_pane
             None, // agent_id
             None, // agent_type
-            None, // prompt
         )
         .await
         .unwrap();
@@ -577,7 +574,6 @@ async fn test_hook_event_post_tool_use() {
             None, // tmux_pane
             None, // agent_id
             None, // agent_type
-            None, // prompt
         )
         .await
         .expect("should apply hook event");
@@ -607,7 +603,6 @@ async fn test_hook_event_nonexistent_session() {
             None, // tmux_pane
             None, // agent_id
             None, // agent_type
-            None, // prompt
         )
         .await;
 
@@ -640,7 +635,6 @@ async fn test_hook_event_session_end() {
             None, // tmux_pane
             None, // agent_id
             None, // agent_type
-            None, // prompt
         )
         .await
         .expect("should apply SessionEnd event");
@@ -687,7 +681,6 @@ async fn test_hook_event_session_end_nonexistent() {
             None, // tmux_pane
             None, // agent_id
             None, // agent_type
-            None, // prompt
         )
         .await;
 
@@ -927,7 +920,6 @@ async fn test_hook_event_forwards_agent_fields() {
             None,
             Some("subagent-001".to_string()),
             Some("explore".to_string()),
-            None, // prompt
         )
         .await
         .expect("SubagentStart hook should succeed");

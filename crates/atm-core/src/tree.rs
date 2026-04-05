@@ -99,10 +99,9 @@ impl TreeNode {
             TreeNode::Project { children, .. }
             | TreeNode::Worktree { children, .. }
             | TreeNode::Team { children, .. } => children.iter().any(|c| c.needs_attention()),
-            TreeNode::Agent {
-                session,
-                subagents,
-            } => session.needs_attention || subagents.iter().any(|s| s.needs_attention()),
+            TreeNode::Agent { session, subagents } => {
+                session.needs_attention || subagents.iter().any(|s| s.needs_attention())
+            }
         }
     }
 
@@ -187,10 +186,7 @@ pub fn build_tree(sessions: &[SessionView]) -> Vec<TreeNode> {
         .collect();
 
     // Index sessions by ID for subagent lookup
-    let by_id: BTreeMap<&str, &SessionView> = sessions
-        .iter()
-        .map(|s| (s.id.as_str(), s))
-        .collect();
+    let by_id: BTreeMap<&str, &SessionView> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
 
     // Group top-level sessions by project_root
     // BTreeMap for deterministic alphabetical ordering
@@ -261,9 +257,7 @@ pub fn build_tree(sessions: &[SessionView]) -> Vec<TreeNode> {
             // Worktree grouping
             let mut worktree_nodes: Vec<TreeNode> = Vec::new();
             for (wt_path, wt_sessions) in &by_worktree {
-                let branch = wt_sessions
-                    .first()
-                    .and_then(|s| s.worktree_branch.clone());
+                let branch = wt_sessions.first().and_then(|s| s.worktree_branch.clone());
                 let path = wt_path
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
@@ -481,8 +475,20 @@ mod tests {
     #[test]
     fn test_single_worktree_skips_nesting() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/myapp", "/home/user/myapp", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("b", "/home/user/myapp", "/home/user/myapp", "main", "2026-01-01T00:01:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/myapp",
+                "/home/user/myapp",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "b",
+                "/home/user/myapp",
+                "/home/user/myapp",
+                "main",
+                "2026-01-01T00:01:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
 
@@ -502,8 +508,20 @@ mod tests {
     #[test]
     fn test_multiple_worktrees_adds_nesting() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/myapp", "/home/user/myapp", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("b", "/home/user/myapp", "/home/user/myapp-auth", "feature/auth", "2026-01-01T00:01:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/myapp",
+                "/home/user/myapp",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "b",
+                "/home/user/myapp",
+                "/home/user/myapp-auth",
+                "feature/auth",
+                "2026-01-01T00:01:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
 
@@ -523,8 +541,20 @@ mod tests {
     #[test]
     fn test_multiple_projects() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/app-a", "/home/user/app-a", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("b", "/home/user/app-b", "/home/user/app-b", "main", "2026-01-01T00:00:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/app-a",
+                "/home/user/app-a",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "b",
+                "/home/user/app-b",
+                "/home/user/app-b",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
 
@@ -569,7 +599,9 @@ mod tests {
                 // Single worktree → agents directly under project
                 assert_eq!(children.len(), 1, "child should be nested, not top-level");
                 match &children[0] {
-                    TreeNode::Agent { session, subagents, .. } => {
+                    TreeNode::Agent {
+                        session, subagents, ..
+                    } => {
                         assert_eq!(session.id.as_str(), "parent-1");
                         assert_eq!(subagents.len(), 1);
                         match &subagents[0] {
@@ -589,9 +621,27 @@ mod tests {
     #[test]
     fn test_agent_count() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/myapp", "/home/user/myapp", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("b", "/home/user/myapp", "/home/user/myapp", "main", "2026-01-01T00:01:00Z"),
-            make_session_in_project("c", "/home/user/myapp", "/home/user/myapp-wt", "dev", "2026-01-01T00:02:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/myapp",
+                "/home/user/myapp",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "b",
+                "/home/user/myapp",
+                "/home/user/myapp",
+                "main",
+                "2026-01-01T00:01:00Z",
+            ),
+            make_session_in_project(
+                "c",
+                "/home/user/myapp",
+                "/home/user/myapp-wt",
+                "dev",
+                "2026-01-01T00:02:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
 
@@ -618,15 +668,36 @@ mod tests {
         );
 
         let tree = build_tree(&[session, normal]);
-        assert!(tree[0].needs_attention(), "project should bubble up attention");
+        assert!(
+            tree[0].needs_attention(),
+            "project should bubble up attention"
+        );
     }
 
     #[test]
     fn test_agents_sorted_newest_first() {
         let sessions = vec![
-            make_session_in_project("old", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("new", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:05:00Z"),
-            make_session_in_project("mid", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:02:00Z"),
+            make_session_in_project(
+                "old",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "new",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:05:00Z",
+            ),
+            make_session_in_project(
+                "mid",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:02:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
 
@@ -658,8 +729,20 @@ mod tests {
     #[test]
     fn test_flatten_collapsed_project() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("b", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:01:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "b",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:01:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
         let rows = flatten_tree(&tree, &HashSet::new()); // nothing expanded
@@ -674,8 +757,20 @@ mod tests {
     #[test]
     fn test_flatten_expanded_project() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("b", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:01:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "b",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:01:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
 
@@ -695,8 +790,20 @@ mod tests {
     #[test]
     fn test_flatten_with_worktrees() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:00:00Z"),
-            make_session_in_project("b", "/home/user/app", "/home/user/app-wt", "dev", "2026-01-01T00:01:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
+            make_session_in_project(
+                "b",
+                "/home/user/app",
+                "/home/user/app-wt",
+                "dev",
+                "2026-01-01T00:01:00Z",
+            ),
         ];
         let tree = build_tree(&sessions);
 
@@ -758,9 +865,13 @@ mod tests {
 
     #[test]
     fn test_all_node_ids() {
-        let sessions = vec![
-            make_session_in_project("a", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:00:00Z"),
-        ];
+        let sessions = vec![make_session_in_project(
+            "a",
+            "/home/user/app",
+            "/home/user/app",
+            "main",
+            "2026-01-01T00:00:00Z",
+        )];
         let tree = build_tree(&sessions);
         let ids = all_node_ids(&tree);
 
@@ -772,7 +883,13 @@ mod tests {
     #[test]
     fn test_mixed_grouped_and_ungrouped() {
         let sessions = vec![
-            make_session_in_project("a", "/home/user/app", "/home/user/app", "main", "2026-01-01T00:00:00Z"),
+            make_session_in_project(
+                "a",
+                "/home/user/app",
+                "/home/user/app",
+                "main",
+                "2026-01-01T00:00:00Z",
+            ),
             make_session("orphan"),
         ];
         let tree = build_tree(&sessions);

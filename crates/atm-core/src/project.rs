@@ -119,11 +119,7 @@ mod tests {
     fn test_resolve_branch_name_attached() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
-        fs::write(
-            dir.path().join(".git/HEAD"),
-            "ref: refs/heads/main\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
 
         let branch = resolve_branch_name(dir.path());
         assert_eq!(branch, Some("main".to_string()));
@@ -133,11 +129,7 @@ mod tests {
     fn test_resolve_branch_name_detached() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
-        fs::write(
-            dir.path().join(".git/HEAD"),
-            "abc123def456789\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "abc123def456789\n").unwrap();
 
         let branch = resolve_branch_name(dir.path());
         assert_eq!(branch, Some("abc123de".to_string()));
@@ -147,11 +139,7 @@ mod tests {
     fn test_resolve_worktree_info_with_branch() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
-        fs::write(
-            dir.path().join(".git/HEAD"),
-            "ref: refs/heads/feature-x\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/feature-x\n").unwrap();
 
         let (wt_path, branch) = resolve_worktree_info(dir.path().to_str().unwrap());
         assert_eq!(wt_path, Some(dir.path().to_str().unwrap().to_string()));
@@ -162,7 +150,10 @@ mod tests {
     fn test_resolve_worktree_info_no_git() {
         let dir = tempfile::tempdir().unwrap();
         let (wt_path, branch) = resolve_worktree_info(dir.path().to_str().unwrap());
-        assert!(wt_path.is_none(), "worktree_path should be None outside git repo");
+        assert!(
+            wt_path.is_none(),
+            "worktree_path should be None outside git repo"
+        );
         assert!(branch.is_none(), "branch should be None outside git repo");
     }
 

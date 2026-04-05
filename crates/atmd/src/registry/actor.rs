@@ -18,7 +18,9 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use atm_core::{AgentType, HookEventType, SessionDomain, SessionId, SessionInfrastructure, SessionView};
+use atm_core::{
+    AgentType, HookEventType, SessionDomain, SessionId, SessionInfrastructure, SessionView,
+};
 use atm_protocol::RawStatusLine;
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};

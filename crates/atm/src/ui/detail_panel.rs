@@ -317,27 +317,74 @@ pub fn render_terminal_capture(
         return;
     }
 
-    let visible_lines: Vec<Line<'_>> = captured_output
+    // Strip ANSI escape codes from captured output for clean rendering.
+    // Terminal capture may contain color codes, cursor movement, etc.
+    let stripped: Vec<String> = captured_output
+        .iter()
+        .map(|l| strip_ansi_codes(l))
+        .collect();
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+
+    // Take only the last N lines to keep rendering fast, then let ratatui wrap
+    let tail_start = stripped.len().saturating_sub(inner_height * 3); // 3x headroom for wrapping
+    let visible_lines: Vec<Line<'_>> = stripped[tail_start..]
         .iter()
         .map(|l| Line::from(Span::raw(l.as_str())))
         .collect();
 
-    // Use wrap + scroll to bottom so long lines wrap and we auto-scroll
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let inner_height = area.height.saturating_sub(2) as usize;
-
-    // Estimate wrapped line count for scroll offset
-    let wrapped_count: usize = captured_output
-        .iter()
-        .map(|l| if l.is_empty() { 1 } else { (l.len().max(1) + inner_width - 1) / inner_width.max(1) })
-        .sum();
-    let scroll = wrapped_count.saturating_sub(inner_height) as u16;
+    // Scroll to bottom: use a large value, ratatui clamps it
+    let scroll = visible_lines.len().saturating_sub(1) as u16;
 
     let paragraph = Paragraph::new(visible_lines)
         .block(block)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// Strips ANSI escape sequences from a string.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... <final byte> sequences (CSI)
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // Consume parameter bytes (0x30-0x3F) and intermediate bytes (0x20-0x2F)
+                // until final byte (0x40-0x7E)
+                loop {
+                    match chars.peek() {
+                        Some(&c) if ('\x40'..='\x7e').contains(&c) => {
+                            chars.next(); // consume final byte
+                            break;
+                        }
+                        Some(_) => { chars.next(); }
+                        None => break,
+                    }
+                }
+            }
+            // Skip ESC ] ... ST sequences (OSC) — terminated by BEL or ESC \
+            else if chars.peek() == Some(&']') {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('\x07') => break, // BEL
+                        Some('\x1b') if chars.peek() == Some(&'\\') => {
+                            chars.next();
+                            break;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 #[cfg(test)]

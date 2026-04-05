@@ -6,7 +6,7 @@
 //! Each test spins up an isolated tmux server using a unique socket name
 //! and cleans it up on completion.
 
-use atm_tmux::{RealTmuxClient, TmuxClient};
+use atm_tmux::{PaneDirection, RealTmuxClient, TmuxClient};
 use std::process::Command;
 
 /// Unique socket name for test isolation.
@@ -23,7 +23,18 @@ fn test_socket() -> String {
 /// Starts an isolated tmux server and returns the socket name.
 fn start_tmux_server(socket: &str) -> bool {
     Command::new("tmux")
-        .args(["-L", socket, "new-session", "-d", "-s", "test", "-x", "200", "-y", "50"])
+        .args([
+            "-L",
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            "test",
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -71,7 +82,7 @@ async fn test_split_and_kill_real() {
 
     // Split the pane
     let new_pane = client
-        .split_window(initial_pane, "50%", true, None)
+        .split_window(initial_pane, "50%", PaneDirection::Below, None)
         .await
         .expect("split_window");
     assert!(new_pane.starts_with('%'), "pane ID should start with %");
@@ -144,7 +155,7 @@ async fn test_resize_pane_real() {
     let panes = client.list_panes().await.expect("list_panes");
     let initial = &panes[0].pane_id;
     let new_pane = client
-        .split_window(initial, "50%", false, None)
+        .split_window(initial, "50%", PaneDirection::Right, None)
         .await
         .expect("split_window");
 
@@ -165,10 +176,7 @@ async fn test_new_window_real() {
 
     let client = RealTmuxClient::with_socket(&socket);
 
-    let new_pane = client
-        .new_window("test", None)
-        .await
-        .expect("new_window");
+    let new_pane = client.new_window("test", None).await.expect("new_window");
     assert!(new_pane.starts_with('%'));
 
     // Should have panes in 2 windows now

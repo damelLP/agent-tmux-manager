@@ -51,8 +51,16 @@ pub enum UiAction {
     KillAgent,
     /// Interrupt the selected agent (SIGINT).
     InterruptAgent,
-    /// Spawn a new agent in the current project.
+    /// Spawn a new agent using smart placement (largest non-ATM pane, below).
     SpawnAgent,
+    /// Spawn a new agent to the left of the target pane.
+    SpawnAgentLeft,
+    /// Spawn a new agent to the right of the target pane.
+    SpawnAgentRight,
+    /// Spawn a new agent above the target pane.
+    SpawnAgentAbove,
+    /// Spawn a new agent below the target pane.
+    SpawnAgentBelow,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,10 +240,18 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
         tmux_only: true,
     },
     KeybindingHint {
-        help_key: "o",
-        help_desc: "Spawn new agent",
-        footer_key: "o",
+        help_key: "oo",
+        help_desc: "Spawn agent (smart placement)",
+        footer_key: "oo",
         footer_desc: "spawn",
+        category: HintCategory::Actions,
+        tmux_only: true,
+    },
+    KeybindingHint {
+        help_key: "oh/oj/ok/ol",
+        help_desc: "Spawn agent left/below/above/right",
+        footer_key: "",
+        footer_desc: "",
         category: HintCategory::Actions,
         tmux_only: true,
     },
@@ -256,6 +272,8 @@ pub(crate) enum KeyMeaning {
     GPrefix,
     /// The `d` prefix key (first `d` of `dd` kill).
     DPrefix,
+    /// The `o` prefix key for directional spawn.
+    OPrefix,
     /// A self-contained action that needs no count or prefix.
     SimpleAction(UiAction),
     /// A key we don't recognise.
@@ -283,6 +301,8 @@ enum InputState {
     PendingG { count: Option<usize> },
     /// Received a `d` prefix, waiting for second `d` to confirm kill.
     PendingD,
+    /// Received an `o` prefix, waiting for direction key (h/j/k/l).
+    PendingO,
 }
 
 impl Default for InputState {
@@ -357,7 +377,7 @@ impl VimKeyResolver {
             'd' => KeyMeaning::DPrefix,
             'h' => KeyMeaning::SimpleAction(UiAction::CollapseNode),
             'l' => KeyMeaning::SimpleAction(UiAction::ExpandNode),
-            'o' => KeyMeaning::SimpleAction(UiAction::SpawnAgent),
+            'o' => KeyMeaning::OPrefix,
             'x' => KeyMeaning::SimpleAction(UiAction::KillAgent),
             'I' => KeyMeaning::SimpleAction(UiAction::InterruptAgent),
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
@@ -431,11 +451,11 @@ impl InputHandler {
     #[must_use]
     pub fn handle(&mut self, key: KeyEvent) -> Option<UiAction> {
         let meaning = self.resolver.resolve(&key);
-        self.step(meaning)
+        self.step(meaning, &key)
     }
 
     /// Execute a single DFA transition.
-    fn step(&mut self, meaning: KeyMeaning) -> Option<UiAction> {
+    fn step(&mut self, meaning: KeyMeaning, key: &KeyEvent) -> Option<UiAction> {
         // Take ownership of current state, replacing with Ready (the most
         // common target).
         let prev = std::mem::replace(&mut self.state, InputState::Ready);
@@ -445,6 +465,7 @@ impl InputHandler {
             InputState::Count(n) => self.step_count(n, meaning),
             InputState::PendingG { count } => self.step_pending_g(count, meaning),
             InputState::PendingD => self.step_pending_d(meaning),
+            InputState::PendingO => self.step_pending_o(key),
         }
     }
 
@@ -462,6 +483,10 @@ impl InputHandler {
             }
             KeyMeaning::DPrefix => {
                 self.state = InputState::PendingD;
+                None
+            }
+            KeyMeaning::OPrefix => {
+                self.state = InputState::PendingO;
                 None
             }
             KeyMeaning::Motion(kind) => Self::motion_with_count(1, kind),
@@ -484,6 +509,11 @@ impl InputHandler {
             KeyMeaning::DPrefix => {
                 // Count before dd is ignored (kill is always single target)
                 self.state = InputState::PendingD;
+                None
+            }
+            KeyMeaning::OPrefix => {
+                // Count before o is ignored (spawn is always single)
+                self.state = InputState::PendingO;
                 None
             }
             KeyMeaning::Motion(kind) => Self::motion_with_count(n, kind),
@@ -510,6 +540,23 @@ impl InputHandler {
         match meaning {
             KeyMeaning::DPrefix => Some(UiAction::KillAgent),
             _ => None, // Cancel — return to Ready (already set by step())
+        }
+    }
+
+    /// Transitions from the `PendingO` state.
+    /// Direction key (h/j/k/l) selects directional spawn.
+    /// Second `o` confirms smart spawn (bare `oo`).
+    /// Any other key cancels, consistent with `PendingD`.
+    fn step_pending_o(&mut self, key: &KeyEvent) -> Option<UiAction> {
+        // Use the raw character to avoid semantic collisions (h/l are normally
+        // CollapseNode/ExpandNode, j/k are normally MoveDown/MoveUp).
+        match key.code {
+            KeyCode::Char('h') => Some(UiAction::SpawnAgentLeft),
+            KeyCode::Char('j') => Some(UiAction::SpawnAgentBelow),
+            KeyCode::Char('k') => Some(UiAction::SpawnAgentAbove),
+            KeyCode::Char('l') => Some(UiAction::SpawnAgentRight),
+            KeyCode::Char('o') => Some(UiAction::SpawnAgent), // oo → smart spawn
+            _ => None,                                        // Cancel — return to Ready
         }
     }
 
@@ -952,5 +999,112 @@ mod tests {
             h.handle(key(KeyCode::Char('?'))),
             Some(UiAction::ToggleHelp)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Directional spawn (o-prefix) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_o_enters_pending_state() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        assert!(h.is_pending());
+    }
+
+    #[test]
+    fn test_oh_spawns_left() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('h'))),
+            Some(UiAction::SpawnAgentLeft)
+        );
+        assert!(!h.is_pending());
+    }
+
+    #[test]
+    fn test_oj_spawns_below() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('j'))),
+            Some(UiAction::SpawnAgentBelow)
+        );
+    }
+
+    #[test]
+    fn test_ok_spawns_above() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('k'))),
+            Some(UiAction::SpawnAgentAbove)
+        );
+    }
+
+    #[test]
+    fn test_ol_spawns_right() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('l'))),
+            Some(UiAction::SpawnAgentRight)
+        );
+    }
+
+    #[test]
+    fn test_o_unknown_key_cancels() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        // Unrecognised key cancels the pending state
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert!(!h.is_pending());
+    }
+
+    #[test]
+    fn test_oo_spawns_smart() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('o'))),
+            Some(UiAction::SpawnAgent)
+        );
+    }
+
+    #[test]
+    fn test_o_esc_cancels() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        // Esc cancels, does not spawn
+        assert_eq!(h.handle(key(KeyCode::Esc)), None);
+        assert!(!h.is_pending());
+    }
+
+    #[test]
+    fn test_o_enter_cancels() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        // Enter cancels the o prefix, does not spawn
+        assert_eq!(h.handle(key(KeyCode::Enter)), None);
+        assert!(!h.is_pending());
+    }
+
+    #[test]
+    fn test_count_then_o_ignores_count() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('3'))), None);
+        assert_eq!(h.handle(key(KeyCode::Char('o'))), None);
+        assert!(h.is_pending());
+        assert_eq!(
+            h.handle(key(KeyCode::Char('h'))),
+            Some(UiAction::SpawnAgentLeft)
+        );
+    }
+
+    #[test]
+    fn test_o_resolver_returns_oprefix() {
+        let r = VimKeyResolver;
+        assert_eq!(r.resolve(&key(KeyCode::Char('o'))), KeyMeaning::OPrefix);
     }
 }

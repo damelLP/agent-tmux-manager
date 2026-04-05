@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tracing::{debug, trace};
 
-use crate::{PaneInfo, TmuxClient, TmuxError};
+use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
 
 /// Real tmux client that invokes the `tmux` CLI.
 ///
@@ -88,20 +88,28 @@ impl TmuxClient for RealTmuxClient {
         &self,
         target: &str,
         size: &str,
-        horizontal: bool,
+        direction: PaneDirection,
         command: Option<&str>,
     ) -> Result<String, TmuxError> {
-        let direction = if horizontal { "-v" } else { "-h" };
+        let (axis_flag, before) = match direction {
+            PaneDirection::Left => ("-h", true),
+            PaneDirection::Right => ("-h", false),
+            PaneDirection::Above => ("-v", true),
+            PaneDirection::Below => ("-v", false),
+        };
         let mut args = vec![
             "-t",
             target,
-            direction,
+            axis_flag,
             "-l",
             size,
-            "-P",       // print info about the new pane
+            "-P", // print info about the new pane
             "-F",
             "#{pane_id}",
         ];
+        if before {
+            args.push("-b");
+        }
         if let Some(cmd) = command {
             args.push(cmd);
         }
@@ -113,15 +121,11 @@ impl TmuxClient for RealTmuxClient {
                 "split-window returned empty pane ID".to_string(),
             ));
         }
-        debug!(%pane_id, "split-window created new pane");
+        debug!(%pane_id, ?direction, "split-window created new pane");
         Ok(pane_id)
     }
 
-    async fn new_window(
-        &self,
-        session: &str,
-        command: Option<&str>,
-    ) -> Result<String, TmuxError> {
+    async fn new_window(&self, session: &str, command: Option<&str>) -> Result<String, TmuxError> {
         let mut args = vec!["-t", session, "-P", "-F", "#{pane_id}"];
         if let Some(cmd) = command {
             args.push(cmd);
@@ -176,8 +180,12 @@ impl TmuxClient for RealTmuxClient {
                 continue;
             }
             let fields: Vec<&str> = line.split('\t').collect();
-            let Some(pane_id) = fields.get(0) else { continue };
-            let Some(session_name) = fields.get(1) else { continue };
+            let Some(pane_id) = fields.get(0) else {
+                continue;
+            };
+            let Some(session_name) = fields.get(1) else {
+                continue;
+            };
             let pane = PaneInfo {
                 pane_id: pane_id.to_string(),
                 session_name: session_name.to_string(),
@@ -198,11 +206,8 @@ impl TmuxClient for RealTmuxClient {
         height: &str,
         command: &str,
     ) -> Result<(), TmuxError> {
-        self.run_silent(
-            "display-popup",
-            &["-E", "-w", width, "-h", height, command],
-        )
-        .await
+        self.run_silent("display-popup", &["-E", "-w", width, "-h", height, command])
+            .await
     }
 
     async fn select_pane(&self, pane: &str) -> Result<(), TmuxError> {
@@ -231,6 +236,21 @@ impl TmuxClient for RealTmuxClient {
         }
         debug!(%pane_id, "new-session created");
         Ok(pane_id)
+    }
+
+    async fn get_pane_cwd(&self, pane: &str) -> Result<Option<String>, TmuxError> {
+        let output = self
+            .run(
+                "display-message",
+                &["-p", "-t", pane, "#{pane_current_path}"],
+            )
+            .await?;
+        let path = output.trim().to_string();
+        if path.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(path))
+        }
     }
 }
 

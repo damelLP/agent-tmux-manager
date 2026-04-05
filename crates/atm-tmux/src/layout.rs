@@ -489,11 +489,14 @@ fn apply_slot<'a>(
 
         // Split off remaining children
         for child in slot.children.iter().skip(1) {
-            // SplitDirection::Vertical means children stack top-to-bottom → horizontal=true (uses -v)
-            // SplitDirection::Horizontal means children sit left-to-right → horizontal=false (uses -h)
-            let horizontal = matches!(slot.direction, SplitDirection::Vertical);
+            // SplitDirection::Vertical means children stack top-to-bottom → Below
+            // SplitDirection::Horizontal means children sit left-to-right → Right
+            let direction = match slot.direction {
+                SplitDirection::Vertical => crate::PaneDirection::Below,
+                SplitDirection::Horizontal => crate::PaneDirection::Right,
+            };
             let new_pane = client
-                .split_window(pane_id, &child.size, horizontal, None)
+                .split_window(pane_id, &child.size, direction, None)
                 .await?;
             apply_slot(client, child, &new_pane, result).await?;
         }
@@ -815,24 +818,24 @@ name = "nope"
         let calls = mock.calls();
         assert_eq!(calls.len(), 2, "pair layout should produce 2 splits");
 
-        // First split: 2nd agent from the agent container (direction=Vertical → horizontal=true)
+        // First split: 2nd agent from the agent container (direction=Vertical → Below)
         assert!(matches!(
             &calls[0],
             MockCall::SplitWindow {
                 target,
                 size,
-                horizontal: true,
+                direction: crate::PaneDirection::Below,
                 command: None,
             } if target == "%1" && size == "50%"
         ));
 
-        // Second split: ATM panel from root (direction=Horizontal → horizontal=false)
+        // Second split: ATM panel from root (direction=Horizontal → Right)
         assert!(matches!(
             &calls[1],
             MockCall::SplitWindow {
                 target,
                 size,
-                horizontal: false,
+                direction: crate::PaneDirection::Right,
                 command: None,
             } if target == "%1" && size == "25%"
         ));

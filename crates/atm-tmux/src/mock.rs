@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{PaneInfo, TmuxClient, TmuxError};
+use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
 
 /// A recorded call to the mock tmux client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub enum MockCall {
     SplitWindow {
         target: String,
         size: String,
-        horizontal: bool,
+        direction: PaneDirection,
         command: Option<String>,
     },
     NewWindow {
@@ -48,6 +48,9 @@ pub enum MockCall {
     NewSession {
         name: String,
     },
+    GetPaneCwd {
+        pane: String,
+    },
 }
 
 /// Mock tmux client that records calls for test verification.
@@ -58,14 +61,14 @@ pub enum MockCall {
 /// # Example
 ///
 /// ```no_run
-/// use atm_tmux::{MockTmuxClient, TmuxClient};
+/// use atm_tmux::{MockTmuxClient, PaneDirection, TmuxClient};
 /// use atm_tmux::mock::MockCall;
 ///
 /// # async fn example() {
 /// let mock = MockTmuxClient::new();
 /// mock.set_next_pane_id("%10");
 ///
-/// let pane_id = mock.split_window("%5", "30%", true, None).await.unwrap();
+/// let pane_id = mock.split_window("%5", "30%", PaneDirection::Below, None).await.unwrap();
 /// assert_eq!(pane_id, "%10");
 ///
 /// let calls = mock.calls();
@@ -88,6 +91,8 @@ struct MockState {
     panes: Vec<PaneInfo>,
     /// Content returned by capture_pane, keyed by pane ID.
     pane_content: std::collections::HashMap<String, Vec<String>>,
+    /// Working directory returned by get_pane_cwd, keyed by pane ID.
+    pane_cwd: std::collections::HashMap<String, String>,
     /// If set, the next call will return this error.
     next_error: Option<TmuxError>,
 }
@@ -101,6 +106,7 @@ impl MockTmuxClient {
                 pane_id_queue: Vec::new(),
                 panes: Vec::new(),
                 pane_content: std::collections::HashMap::new(),
+                pane_cwd: std::collections::HashMap::new(),
                 next_error: None,
             })),
         }
@@ -124,6 +130,13 @@ impl MockTmuxClient {
     pub fn set_pane_content(&self, pane: &str, content: Vec<String>) {
         if let Ok(mut state) = self.inner.lock() {
             state.pane_content.insert(pane.to_string(), content);
+        }
+    }
+
+    /// Sets the working directory returned by `get_pane_cwd` for a specific pane.
+    pub fn set_pane_cwd(&self, pane: &str, cwd: &str) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.pane_cwd.insert(pane.to_string(), cwd.to_string());
         }
     }
 
@@ -196,24 +209,20 @@ impl TmuxClient for MockTmuxClient {
         &self,
         target: &str,
         size: &str,
-        horizontal: bool,
+        direction: PaneDirection,
         command: Option<&str>,
     ) -> Result<String, TmuxError> {
         let pane_id = self.next_pane_id();
         self.record(MockCall::SplitWindow {
             target: target.to_string(),
             size: size.to_string(),
-            horizontal,
+            direction,
             command: command.map(|s| s.to_string()),
         })?;
         Ok(pane_id)
     }
 
-    async fn new_window(
-        &self,
-        session: &str,
-        command: Option<&str>,
-    ) -> Result<String, TmuxError> {
+    async fn new_window(&self, session: &str, command: Option<&str>) -> Result<String, TmuxError> {
         let pane_id = self.next_pane_id();
         self.record(MockCall::NewWindow {
             session: session.to_string(),
@@ -297,6 +306,18 @@ impl TmuxClient for MockTmuxClient {
         })?;
         Ok(pane_id)
     }
+
+    async fn get_pane_cwd(&self, pane: &str) -> Result<Option<String>, TmuxError> {
+        self.record(MockCall::GetPaneCwd {
+            pane: pane.to_string(),
+        })?;
+        let cwd = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|state| state.pane_cwd.get(pane).cloned());
+        Ok(cwd)
+    }
 }
 
 #[cfg(test)]
@@ -309,7 +330,7 @@ mod tests {
         mock.set_next_pane_id("%10");
 
         let pane_id = mock
-            .split_window("%5", "30%", true, Some("claude"))
+            .split_window("%5", "30%", PaneDirection::Below, Some("claude"))
             .await
             .unwrap();
         assert_eq!(pane_id, "%10");
@@ -323,7 +344,7 @@ mod tests {
             &calls[0],
             MockCall::SplitWindow {
                 target,
-                horizontal: true,
+                direction: PaneDirection::Below,
                 ..
             } if target == "%5"
         ));
@@ -334,7 +355,10 @@ mod tests {
     #[tokio::test]
     async fn test_mock_default_pane_id() {
         let mock = MockTmuxClient::new();
-        let pane_id = mock.split_window("%1", "50%", false, None).await.unwrap();
+        let pane_id = mock
+            .split_window("%1", "50%", PaneDirection::Right, None)
+            .await
+            .unwrap();
         assert_eq!(pane_id, "%99");
     }
 
@@ -344,9 +368,15 @@ mod tests {
         mock.set_next_pane_id("%10");
         mock.set_next_pane_id("%11");
 
-        let p1 = mock.split_window("%1", "50%", false, None).await.unwrap();
+        let p1 = mock
+            .split_window("%1", "50%", PaneDirection::Right, None)
+            .await
+            .unwrap();
         let p2 = mock.new_window("sess", None).await.unwrap();
-        let p3 = mock.split_window("%1", "50%", false, None).await.unwrap();
+        let p3 = mock
+            .split_window("%1", "50%", PaneDirection::Right, None)
+            .await
+            .unwrap();
 
         assert_eq!(p1, "%10");
         assert_eq!(p2, "%11");

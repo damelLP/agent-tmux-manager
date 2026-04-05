@@ -92,9 +92,9 @@ enum Command {
         /// Working directory for the new agent
         #[arg(long, short = 'w')]
         worktree: Option<String>,
-        /// Split direction: horizontal (top/bottom) or vertical (left/right)
-        #[arg(long, short = 'd', default_value = "horizontal")]
-        direction: SplitDirection,
+        /// Split direction: left, right, above, below
+        #[arg(long, short = 'd', default_value = "below")]
+        direction: SpawnDirection,
         /// Size of the new pane (e.g., "30%", "50%")
         #[arg(long, short = 's', default_value = "50%")]
         size: String,
@@ -198,9 +198,22 @@ enum WorkspaceAction {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
-enum SplitDirection {
-    Horizontal,
-    Vertical,
+enum SpawnDirection {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+impl From<SpawnDirection> for atm_tmux::PaneDirection {
+    fn from(d: SpawnDirection) -> Self {
+        match d {
+            SpawnDirection::Left => atm_tmux::PaneDirection::Left,
+            SpawnDirection::Right => atm_tmux::PaneDirection::Right,
+            SpawnDirection::Above => atm_tmux::PaneDirection::Above,
+            SpawnDirection::Below => atm_tmux::PaneDirection::Below,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -465,12 +478,18 @@ async fn run_event_loop(
                                     }
                                 }
                             }
-                            UiAction::SpawnAgent => {
+                            UiAction::SpawnAgent
+                            | UiAction::SpawnAgentLeft
+                            | UiAction::SpawnAgentRight
+                            | UiAction::SpawnAgentAbove
+                            | UiAction::SpawnAgentBelow => {
                                 if tmux::is_in_tmux() {
-                                    let cwd = std::env::current_dir()
-                                        .ok()
-                                        .map(|p| p.to_string_lossy().to_string());
-                                    // Get the current ATM pane ID so we can avoid splitting it
+                                    let direction = match action {
+                                        UiAction::SpawnAgentLeft => atm_tmux::PaneDirection::Left,
+                                        UiAction::SpawnAgentRight => atm_tmux::PaneDirection::Right,
+                                        UiAction::SpawnAgentAbove => atm_tmux::PaneDirection::Above,
+                                        _ => atm_tmux::PaneDirection::Below,
+                                    };
                                     let atm_pane = std::env::var("TMUX_PANE").ok();
                                     tokio::spawn(async move {
                                         let client = RealTmuxClient::new();
@@ -485,25 +504,30 @@ async fn run_event_loop(
                                         let target = panes
                                             .iter()
                                             .filter(|p| {
-                                                // Same session
                                                 current_session.map_or(true, |s| p.session_name == s)
-                                                // Not the ATM pane
                                                 && atm_pane.as_deref() != Some(p.pane_id.as_str())
                                             })
                                             .max_by_key(|p| (p.width as u32) * (p.height as u32))
                                             .map(|p| p.pane_id.as_str())
                                             .or(panes.iter().find(|p| p.is_active).map(|p| p.pane_id.as_str()))
                                             .unwrap_or("%0");
+                                        // Query the target pane's cwd for the new agent
+                                        let cwd = client
+                                            .get_pane_cwd(target)
+                                            .await
+                                            .ok()
+                                            .flatten();
                                         let mut cmd = "claude".to_string();
                                         if let Some(ref dir) = cwd {
-                                            cmd = format!("cd {dir} && {cmd}");
+                                            let escaped = dir.replace('\'', "'\\''");
+                                            cmd = format!("cd '{escaped}' && {cmd}");
                                         }
                                         match client
-                                            .split_window(target, "50%", true, Some(&cmd))
+                                            .split_window(target, "50%", direction, Some(&cmd))
                                             .await
                                         {
                                             Ok(pane_id) => {
-                                                info!(pane_id = %pane_id, "Spawned new agent")
+                                                info!(pane_id = %pane_id, ?direction, "Spawned new agent")
                                             }
                                             Err(e) => warn!(error = %e, "Failed to spawn agent"),
                                         }
@@ -732,7 +756,7 @@ fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
 async fn cmd_spawn(
     model: Option<String>,
     worktree: Option<String>,
-    direction: SplitDirection,
+    direction: SpawnDirection,
     size: String,
 ) -> Result<()> {
     if !tmux::is_in_tmux() {
@@ -747,17 +771,6 @@ async fn cmd_spawn(
         claude_cmd.push_str(&format!(" --model {m}"));
     }
 
-    // Determine working directory
-    let cwd = worktree.or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
-    });
-
-    if let Some(ref dir) = cwd {
-        claude_cmd = format!("cd {dir} && {claude_cmd}");
-    }
-
     // Get current pane to split from
     let panes = client
         .list_panes()
@@ -769,10 +782,31 @@ async fn cmd_spawn(
         .map(|p| p.pane_id.as_str())
         .unwrap_or("%0");
 
-    let horizontal = matches!(direction, SplitDirection::Horizontal);
+    // Determine working directory: explicit worktree flag, or query the target pane's cwd
+    let cwd = if let Some(dir) = worktree {
+        Some(dir)
+    } else {
+        client
+            .get_pane_cwd(current_pane)
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+    };
 
+    if let Some(ref dir) = cwd {
+        // Quote the path to handle spaces and special characters safely
+        let escaped = dir.replace('\'', "'\\''");
+        claude_cmd = format!("cd '{escaped}' && {claude_cmd}");
+    }
+
+    let pane_dir: atm_tmux::PaneDirection = direction.into();
     let new_pane = client
-        .split_window(current_pane, &size, horizontal, Some(&claude_cmd))
+        .split_window(current_pane, &size, pane_dir, Some(&claude_cmd))
         .await
         .context("Failed to split tmux pane")?;
 

@@ -19,6 +19,24 @@ pub use mock::MockTmuxClient;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Direction for placing a new pane relative to the target pane.
+///
+/// Maps directly to tmux `split-window` flags:
+/// - `Left`  → `-h -b` (horizontal split, new pane before/left)
+/// - `Right` → `-h`    (horizontal split, new pane after/right)
+/// - `Above` → `-v -b` (vertical split, new pane before/above)
+/// - `Below` → `-v`    (vertical split, new pane after/below)
+///
+/// The `-b` (before) flag requires tmux 3.1+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneDirection {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
 /// Information about a single tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneInfo {
@@ -49,22 +67,23 @@ pub trait TmuxClient: Send + Sync {
     /// # Arguments
     /// * `target` — Target pane to split (e.g., "%5").
     /// * `size` — Size specification (e.g., "30%", "20").
-    /// * `horizontal` — If true, split horizontally (top/bottom); if false, vertically (left/right).
+    /// * `direction` — Where to place the new pane relative to the target.
     /// * `command` — Optional command to run in the new pane.
     async fn split_window(
         &self,
         target: &str,
         size: &str,
-        horizontal: bool,
+        direction: PaneDirection,
         command: Option<&str>,
     ) -> Result<String, TmuxError>;
 
+    /// Returns the current working directory of a pane, or `None` if unavailable.
+    ///
+    /// Queries tmux's `#{pane_current_path}` format variable.
+    async fn get_pane_cwd(&self, pane: &str) -> Result<Option<String>, TmuxError>;
+
     /// Creates a new window in the given session, returning the new pane ID.
-    async fn new_window(
-        &self,
-        session: &str,
-        command: Option<&str>,
-    ) -> Result<String, TmuxError>;
+    async fn new_window(&self, session: &str, command: Option<&str>) -> Result<String, TmuxError>;
 
     /// Kills (closes) a pane.
     async fn kill_pane(&self, pane: &str) -> Result<(), TmuxError>;

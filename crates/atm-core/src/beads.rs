@@ -11,6 +11,8 @@ pub struct BeadsTask {
     pub id: String,
     /// Issue title
     pub title: String,
+    /// Issue description
+    pub description: Option<String>,
 }
 
 /// Finds in-progress beads tasks in the given working directory.
@@ -44,8 +46,13 @@ pub fn find_in_progress_tasks(working_dir: &str) -> Vec<BeadsTask> {
                 .unwrap_or_default()
                 .to_string();
 
+            let description = val.get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
             if !id.is_empty() && !title.is_empty() {
-                tasks.push((updated_at, BeadsTask { id, title }));
+                tasks.push((updated_at, BeadsTask { id, title, description }));
             }
         }
     }

@@ -249,18 +249,24 @@ pub fn render_compact_preview(
             let mut result: Vec<Line<'_>> = Vec::new();
 
             // Beads task: try project_root first (where .beads/ lives), then worktree_path
-            let beads_title = s.project_root.as_deref()
+            let beads_task = s.project_root.as_deref()
                 .or(s.worktree_path.as_deref())
                 .and_then(|dir| {
                     let tasks = atm_core::beads::find_in_progress_tasks(dir);
-                    tasks.into_iter().next().map(|t| t.title)
+                    tasks.into_iter().next()
                 });
 
-            if let Some(title) = beads_title {
+            if let Some(ref task) = beads_task {
                 result.push(Line::from(Span::styled(
-                    title,
+                    task.title.clone(),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )));
+                if let Some(ref desc) = task.description {
+                    result.push(Line::from(Span::styled(
+                        desc.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
             }
 
             if let Some(ref prompt) = s.first_prompt {

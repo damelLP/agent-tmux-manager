@@ -22,6 +22,11 @@ on:
         required: false
         type: boolean
         default: true
+      publish_atm_tmux:
+        description: 'Publish crate: atm-tmux'
+        required: false
+        type: boolean
+        default: true
       publish_atm_tui:
         description: 'Publish crate: atm-tui'
         required: false
@@ -155,16 +160,17 @@ jobs:
           EVENT_JSON="$GITHUB_EVENT_PATH"
 
           # Keep the same ordering you used originally.
-          ORIGINAL_ORDER=("atm-core" "atm-protocol" "atm-tui" "atmd" "atm")
+          ORIGINAL_ORDER=("atm-core" "atm-protocol" "atm-tmux" "atmd" "atm-tui" "atm")
 
           selected=()
           # Using jq (available on GitHub ubuntu runners) to read the dispatch inputs
-          for box in publish_atm_core publish_atm_protocol publish_atm_tui publish_atmd publish_atm; do
+          for box in publish_atm_core publish_atm_protocol publish_atm_tmux publish_atm_tui publish_atmd publish_atm; do
             val=$(jq -r --arg k "$box" '.inputs[$k] // "false"' "$EVENT_JSON" 2>/dev/null || echo "false")
             if [ "$(echo "$val" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
               case "$box" in
                 publish_atm_core) selected+=("atm-core");;
                 publish_atm_protocol) selected+=("atm-protocol");;
+                publish_atm_tmux) selected+=("atm-tmux");;
                 publish_atm_tui) selected+=("atm-tui");;
                 publish_atmd) selected+=("atmd");;
                 publish_atm) selected+=("atm");;

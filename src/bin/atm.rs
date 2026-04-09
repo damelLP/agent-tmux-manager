@@ -98,6 +98,9 @@ enum Command {
         /// Size of the new pane (e.g., "30%", "50%")
         #[arg(long, short = 's', default_value = "50%")]
         size: String,
+        /// Target pane to split from (e.g., "%5"). Passed by tmux keybindings via #{pane_id}.
+        #[arg(long, short = 't')]
+        target_pane: Option<String>,
     },
     /// Kill an agent and close its tmux pane
     Kill {
@@ -767,6 +770,7 @@ async fn cmd_spawn(
     worktree: Option<String>,
     direction: SpawnDirection,
     size: String,
+    target_pane: Option<String>,
 ) -> Result<()> {
     if !tmux::is_in_tmux() {
         bail!("atm spawn requires running inside tmux");
@@ -781,14 +785,13 @@ async fn cmd_spawn(
     }
 
     // Get current pane to split from.
-    // Prefer $TMUX_PANE which tmux sets to the calling pane's ID in run-shell.
-    // Fall back to is_active heuristic only when env var is unavailable.
-    let tmux_pane_env = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty());
+    // Prefer --target-pane (passed by tmux keybindings via #{pane_id}).
+    // Fall back to is_active heuristic for manual CLI invocations.
     let panes = client
         .list_panes()
         .await
         .context("Failed to list tmux panes")?;
-    let current_pane = tmux_pane_env
+    let current_pane = target_pane
         .as_deref()
         .or_else(|| {
             panes
@@ -1744,8 +1747,9 @@ async fn main() -> Result<()> {
             worktree,
             direction,
             size,
+            target_pane,
         }) => {
-            return cmd_spawn(model, worktree, direction, size).await;
+            return cmd_spawn(model, worktree, direction, size, target_pane).await;
         }
         Some(Command::Kill { target }) => {
             return cmd_kill(target).await;

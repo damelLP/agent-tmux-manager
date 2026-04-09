@@ -202,13 +202,13 @@ fn install_tmux_bindings() -> Result<()> {
 # Source this in your .tmux.conf: source-file ~/.config/atm/tmux-bindings.conf
 
 # Spawn a new Claude agent (default: below current pane)
-bind C-n run-shell "atm spawn"
+bind C-n run-shell "atm spawn --target-pane #{pane_id}"
 
 # Directional agent spawn (vim-style: h=left, j=below, k=above, l=right)
-bind C-h run-shell "atm spawn --direction left"
-bind C-j run-shell "atm spawn --direction below"
-bind C-k run-shell "atm spawn --direction above"
-bind C-l run-shell "atm spawn --direction right"
+bind C-h run-shell "atm spawn --direction left --target-pane #{pane_id}"
+bind C-j run-shell "atm spawn --direction below --target-pane #{pane_id}"
+bind C-k run-shell "atm spawn --direction above --target-pane #{pane_id}"
+bind C-l run-shell "atm spawn --direction right --target-pane #{pane_id}"
 
 # Toggle ATM sidebar panel
 bind C-a run-shell "atm toggle-panel"

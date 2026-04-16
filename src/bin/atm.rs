@@ -409,6 +409,9 @@ async fn run_event_loop(
                                 }
                             }
                             UiAction::JumpToSession => {
+                                // Enter on a group row expands it if collapsed
+                                // (open_fold is a no-op on already-expanded
+                                // groups); on leaf rows, jump to the pane.
                                 if let Some(session) = app.selected_session() {
                                     let session_id = session.id.clone();
                                     info!(session_id = %session_id, "Jump to session");
@@ -430,6 +433,11 @@ async fn run_event_loop(
                                     } else {
                                         debug!(session_id = %session_id, "No tmux pane");
                                     }
+                                } else {
+                                    // Group row — toggle so Enter can close
+                                    // an expanded group as well as open a
+                                    // collapsed one.
+                                    app.toggle_fold();
                                 }
                             }
                             UiAction::MoveDown(n) => app.select_down(n),
@@ -449,9 +457,11 @@ async fn run_event_loop(
                             UiAction::ToggleHelp => {
                                 app.toggle_help();
                             }
-                            UiAction::CollapseNode | UiAction::ExpandNode => {
-                                app.toggle_expand();
-                            }
+                            UiAction::ExpandNode => app.open_fold(),
+                            UiAction::CloseFold => app.close_fold(),
+                            UiAction::ToggleFold => app.toggle_fold(),
+                            UiAction::CollapseAllFolds => app.collapse_all(),
+                            UiAction::ExpandAllFolds => app.expand_all(),
                             UiAction::KillAgent => {
                                 if let Some(session) = app.selected_session() {
                                     if let Some(ref pane_id) = session.tmux_pane {

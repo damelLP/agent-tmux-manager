@@ -43,10 +43,19 @@ pub enum UiAction {
     Quit,
     /// Toggle the help popup.
     ToggleHelp,
-    /// Collapse the current tree node (or move to parent).
-    CollapseNode,
-    /// Expand the current tree node (or move to first child).
+    /// Expand the current tree node if collapsed (bound to `h`, `l`, `zo`).
+    /// Never closes a fold — closing is reserved for z-chords.
     ExpandNode,
+    /// Collapse all fold groups (`zM`).
+    CollapseAllFolds,
+    /// Expand all fold groups (`zR`).
+    ExpandAllFolds,
+    /// Close the fold at the cursor (`zc`). Vim-strict: no-op on collapsed
+    /// groups; on a leaf, walks up to the nearest ancestor and closes it.
+    CloseFold,
+    /// Toggle the fold at the cursor (`za`). On a leaf, walks up to the
+    /// nearest ancestor and toggles that.
+    ToggleFold,
     /// Kill the selected agent and close its tmux pane.
     KillAgent,
     /// Interrupt the selected agent (SIGINT).
@@ -169,7 +178,7 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
     // -- Actions -------------------------------------------------------------
     KeybindingHint {
         help_key: "Enter",
-        help_desc: "Jump to session (tmux)",
+        help_desc: "Jump to session (leaf) / toggle fold (group)",
         footer_key: "Enter",
         footer_desc: "jump",
         category: HintCategory::Actions,
@@ -217,9 +226,25 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
     },
     KeybindingHint {
         help_key: "h / l",
-        help_desc: "Collapse / Expand tree",
+        help_desc: "Expand collapsed group (open-only)",
         footer_key: "h/l",
-        footer_desc: "fold",
+        footer_desc: "open",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "zc/zo/za",
+        help_desc: "Close / Open / Toggle fold (vim)",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "zM / zR",
+        help_desc: "Collapse all / Expand all folds",
+        footer_key: "zM/zR",
+        footer_desc: "fold*",
         category: HintCategory::Navigation,
         tmux_only: false,
     },
@@ -274,6 +299,8 @@ pub(crate) enum KeyMeaning {
     DPrefix,
     /// The `o` prefix key for directional spawn.
     OPrefix,
+    /// The `z` prefix key for vim-style fold commands.
+    ZPrefix,
     /// A self-contained action that needs no count or prefix.
     SimpleAction(UiAction),
     /// A key we don't recognise.
@@ -303,6 +330,8 @@ enum InputState {
     PendingD,
     /// Received an `o` prefix, waiting for direction key (h/j/k/l).
     PendingO,
+    /// Received a `z` prefix, waiting for a fold command (M/R/c/o/a).
+    PendingZ,
 }
 
 impl Default for InputState {
@@ -375,9 +404,11 @@ impl VimKeyResolver {
             'G' => KeyMeaning::Motion(MotionKind::GoToBottom),
             'g' => KeyMeaning::GPrefix,
             'd' => KeyMeaning::DPrefix,
-            'h' => KeyMeaning::SimpleAction(UiAction::CollapseNode),
-            'l' => KeyMeaning::SimpleAction(UiAction::ExpandNode),
+            // `h` and `l` both open a collapsed fold. They never close —
+            // the z-chord family owns all close/toggle semantics.
+            'h' | 'l' => KeyMeaning::SimpleAction(UiAction::ExpandNode),
             'o' => KeyMeaning::OPrefix,
+            'z' => KeyMeaning::ZPrefix,
             'x' => KeyMeaning::SimpleAction(UiAction::KillAgent),
             'I' => KeyMeaning::SimpleAction(UiAction::InterruptAgent),
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
@@ -466,6 +497,7 @@ impl InputHandler {
             InputState::PendingG { count } => self.step_pending_g(count, meaning),
             InputState::PendingD => self.step_pending_d(meaning),
             InputState::PendingO => self.step_pending_o(key),
+            InputState::PendingZ => self.step_pending_z(key),
         }
     }
 
@@ -487,6 +519,10 @@ impl InputHandler {
             }
             KeyMeaning::OPrefix => {
                 self.state = InputState::PendingO;
+                None
+            }
+            KeyMeaning::ZPrefix => {
+                self.state = InputState::PendingZ;
                 None
             }
             KeyMeaning::Motion(kind) => Self::motion_with_count(1, kind),
@@ -514,6 +550,11 @@ impl InputHandler {
             KeyMeaning::OPrefix => {
                 // Count before o is ignored (spawn is always single)
                 self.state = InputState::PendingO;
+                None
+            }
+            KeyMeaning::ZPrefix => {
+                // Count before z is ignored (fold commands take no count)
+                self.state = InputState::PendingZ;
                 None
             }
             KeyMeaning::Motion(kind) => Self::motion_with_count(n, kind),
@@ -549,7 +590,7 @@ impl InputHandler {
     /// Any other key cancels, consistent with `PendingD`.
     fn step_pending_o(&mut self, key: &KeyEvent) -> Option<UiAction> {
         // Use the raw character to avoid semantic collisions (h/l are normally
-        // CollapseNode/ExpandNode, j/k are normally MoveDown/MoveUp).
+        // ExpandNode, j/k are normally MoveDown/MoveUp).
         match key.code {
             KeyCode::Char('h') => Some(UiAction::SpawnAgentLeft),
             KeyCode::Char('j') => Some(UiAction::SpawnAgentBelow),
@@ -557,6 +598,28 @@ impl InputHandler {
             KeyCode::Char('l') => Some(UiAction::SpawnAgentRight),
             KeyCode::Char('o') => Some(UiAction::SpawnAgent), // oo → smart spawn
             _ => None,                                        // Cancel — return to Ready
+        }
+    }
+
+    /// Transitions from the `PendingZ` state.
+    /// Implements vim fold chords with strict directional semantics:
+    ///
+    /// - `zM`/`zR`: bulk collapse/expand
+    /// - `zc`: close-only (never opens; walks up on leaves)
+    /// - `zo`: open-only — same semantics as `h`/`l`, so reuses `ExpandNode`
+    /// - `za`: toggle (walks up on leaves)
+    ///
+    /// Any other key cancels, consistent with `PendingD`/`PendingO`.
+    fn step_pending_z(&mut self, key: &KeyEvent) -> Option<UiAction> {
+        // Use raw character to avoid semantic collisions — notably `R` which
+        // normally means Refresh, and `o` which normally starts an OPrefix chord.
+        match key.code {
+            KeyCode::Char('M') => Some(UiAction::CollapseAllFolds),
+            KeyCode::Char('R') => Some(UiAction::ExpandAllFolds),
+            KeyCode::Char('c') => Some(UiAction::CloseFold),
+            KeyCode::Char('o') => Some(UiAction::ExpandNode),
+            KeyCode::Char('a') => Some(UiAction::ToggleFold),
+            _ => None, // Cancel — return to Ready
         }
     }
 
@@ -792,8 +855,8 @@ mod tests {
         let mut h = InputHandler::new();
         assert_eq!(h.handle(key(KeyCode::Char('3'))), None);
         assert!(h.is_pending());
-        // 'z' is Unbound → resets state, emits None.
-        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        // 'w' is Unbound → resets state, emits None.
+        assert_eq!(h.handle(key(KeyCode::Char('w'))), None);
         assert!(!h.is_pending());
     }
 
@@ -806,6 +869,118 @@ mod tests {
         // Second gg
         assert_eq!(h.handle(key(KeyCode::Char('g'))), None);
         assert_eq!(h.handle(key(KeyCode::Char('g'))), Some(UiAction::GoToFirst));
+    }
+
+    // -----------------------------------------------------------------------
+    // z-prefix vim fold chords
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_z_alone_is_pending() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert!(h.is_pending());
+    }
+
+    #[test]
+    fn test_zm_collapses_all_folds() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('M'))),
+            Some(UiAction::CollapseAllFolds)
+        );
+        assert!(!h.is_pending());
+    }
+
+    #[test]
+    fn test_zr_expands_all_folds() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('R'))),
+            Some(UiAction::ExpandAllFolds)
+        );
+        assert!(!h.is_pending());
+    }
+
+    #[test]
+    fn test_zc_emits_close_fold() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('c'))),
+            Some(UiAction::CloseFold)
+        );
+    }
+
+    #[test]
+    fn test_zo_emits_expand_node() {
+        // `zo` is open-only — same semantics as `h`/`l`, so reuses ExpandNode.
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('o'))),
+            Some(UiAction::ExpandNode)
+        );
+    }
+
+    #[test]
+    fn test_za_emits_toggle_fold() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('a'))),
+            Some(UiAction::ToggleFold)
+        );
+    }
+
+    #[test]
+    fn test_h_and_l_both_emit_expand_node() {
+        // Both h and l now act as open-only (expand collapsed, else no-op).
+        let mut h = InputHandler::new();
+        assert_eq!(
+            h.handle(key(KeyCode::Char('h'))),
+            Some(UiAction::ExpandNode)
+        );
+        assert_eq!(
+            h.handle(key(KeyCode::Char('l'))),
+            Some(UiAction::ExpandNode)
+        );
+    }
+
+    #[test]
+    fn test_z_lowercase_m_does_not_collapse() {
+        // Case-sensitive: lowercase 'm' is not bound in PendingZ, so the
+        // chord cancels without emitting an action. Matches vim exactly.
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(h.handle(key(KeyCode::Char('m'))), None);
+        assert!(!h.is_pending());
+    }
+
+    #[test]
+    fn test_z_unknown_key_cancels() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        // 'q' would normally quit, but in PendingZ it cancels silently.
+        assert_eq!(h.handle(key(KeyCode::Char('q'))), None);
+        assert!(!h.is_pending());
+        // After cancel, 'q' alone should still quit.
+        assert_eq!(h.handle(key(KeyCode::Char('q'))), Some(UiAction::Quit));
+    }
+
+    #[test]
+    fn test_count_before_z_is_discarded() {
+        // vim ignores counts on fold commands; our DFA should transition into
+        // PendingZ and drop the pending count.
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(key(KeyCode::Char('3'))), None);
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(
+            h.handle(key(KeyCode::Char('M'))),
+            Some(UiAction::CollapseAllFolds)
+        );
     }
 
     #[test]

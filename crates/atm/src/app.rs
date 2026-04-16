@@ -224,25 +224,138 @@ impl App {
             self.expanded = all_node_ids(&self.tree);
         }
 
-        self.tree_rows = flatten_tree(&self.tree, &self.expanded);
+        self.reflatten();
         self.clamp_selection();
     }
 
-    /// Toggles expand/collapse for the currently selected node.
-    pub fn toggle_expand(&mut self) {
-        if let Some(row) = self.tree_rows.get(self.selected_index) {
-            if row.has_children {
-                let node_id = row.node_id.clone();
-                if self.expanded.contains(&node_id) {
-                    self.expanded.remove(&node_id);
-                } else {
-                    self.expanded.insert(node_id);
-                }
-                // Re-flatten with new expand state
-                self.tree_rows = flatten_tree(&self.tree, &self.expanded);
-                self.clamp_selection();
+    /// Collapses every fold group in the tree (vim `zM`).
+    ///
+    /// Clears the expanded set so only top-level projects are visible,
+    /// then moves the cursor to the top-level ancestor of the previous
+    /// selection so the user stays oriented.
+    pub fn collapse_all(&mut self) {
+        let anchor = self.top_level_ancestor_id();
+        self.expanded.clear();
+        self.reflatten();
+        if let Some(id) = anchor {
+            if let Some(pos) = self.tree_rows.iter().position(|r| r.node_id == id) {
+                self.selected_index = pos;
             }
         }
+        self.clamp_selection();
+    }
+
+    /// Expands every fold group in the tree (vim `zR`).
+    pub fn expand_all(&mut self) {
+        self.expanded = all_node_ids(&self.tree);
+        self.reflatten();
+    }
+
+    /// Opens the fold at the cursor (vim `zo`, also bound to `h` and `l`).
+    ///
+    /// If the selected row is a collapsed group, expands it. Otherwise
+    /// (expanded group or leaf) this is a no-op. Never closes a fold.
+    pub fn open_fold(&mut self) {
+        if let Some(row) = self.tree_rows.get(self.selected_index) {
+            if row.has_children && !self.expanded.contains(&row.node_id) {
+                let id = row.node_id.clone();
+                self.expanded.insert(id);
+                self.reflatten();
+            }
+        }
+    }
+
+    /// Closes the fold at the cursor (vim `zc`).
+    ///
+    /// - Expanded group → collapses it.
+    /// - Leaf (agent) → walks up to the nearest ancestor group and closes it
+    ///   (matches vim's `zc` on a non-fold line).
+    /// - Collapsed group → no-op (vim behavior — there's no fold to close
+    ///   below the cursor).
+    pub fn close_fold(&mut self) {
+        let target = match self.tree_rows.get(self.selected_index) {
+            Some(row) if row.has_children && self.expanded.contains(&row.node_id) => {
+                Some(row.node_id.clone())
+            }
+            Some(row) if !row.has_children => self.nearest_ancestor_id(self.selected_index),
+            _ => None,
+        };
+        if let Some(id) = target {
+            self.set_node_expanded(&id, false);
+        }
+    }
+
+    /// Toggles the fold at the cursor (vim `za`, also `Enter` on groups).
+    ///
+    /// On a group: flips its expand state. On a leaf: walks up to the
+    /// nearest ancestor and toggles that — symmetric with `close_fold`.
+    /// (Note: `Enter` only reaches this method for group rows — leaf
+    /// rows are routed to the jump-to-session path.)
+    pub fn toggle_fold(&mut self) {
+        let target = match self.tree_rows.get(self.selected_index) {
+            Some(row) if row.has_children => Some(row.node_id.clone()),
+            Some(_) => self.nearest_ancestor_id(self.selected_index),
+            None => None,
+        };
+        if let Some(id) = target {
+            let want = !self.expanded.contains(&id);
+            self.set_node_expanded(&id, want);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Fold helpers
+    // ------------------------------------------------------------------
+
+    /// Sets a single node's expanded state, re-flattens, moves the cursor
+    /// to that node, and clamps. Used by `close_fold` and `toggle_fold`
+    /// (both of which may mutate selection via the walk-up path).
+    fn set_node_expanded(&mut self, id: &TreeNodeId, expanded: bool) {
+        if expanded {
+            self.expanded.insert(id.clone());
+        } else {
+            self.expanded.remove(id);
+        }
+        self.reflatten();
+        if let Some(pos) = self.tree_rows.iter().position(|r| &r.node_id == id) {
+            self.selected_index = pos;
+        }
+        self.clamp_selection();
+    }
+
+    /// Re-flattens the tree from current expanded state.
+    fn reflatten(&mut self) {
+        self.tree_rows = flatten_tree(&self.tree, &self.expanded);
+    }
+
+    /// Returns the node_id of the nearest row strictly above `index` with
+    /// smaller depth — the parent in the DFS-ordered tree.
+    fn nearest_ancestor_id(&self, index: usize) -> Option<TreeNodeId> {
+        let current_depth = self.tree_rows.get(index)?.depth;
+        if current_depth == 0 {
+            return None;
+        }
+        self.tree_rows
+            .iter()
+            .take(index)
+            .rev()
+            .find(|r| r.depth < current_depth)
+            .map(|r| r.node_id.clone())
+    }
+
+    /// Returns the top-level (depth == 0) ancestor's node_id for the
+    /// current selection.
+    fn top_level_ancestor_id(&self) -> Option<TreeNodeId> {
+        let row = self.tree_rows.get(self.selected_index)?;
+        if row.depth == 0 {
+            return Some(row.node_id.clone());
+        }
+        self.tree_rows
+            .iter()
+            .take(self.selected_index)
+            .rev()
+            .find(|r| r.depth == 0)
+            .map(|r| r.node_id.clone())
     }
 
     /// Clamps the selected_index to a valid range based on current row count.
@@ -938,5 +1051,276 @@ mod tests {
         app.selected_index = 0;
         app.select_half_page_down(3, 0);
         assert_eq!(app.selected_index, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Vim fold commands (zM/zR/zc/zo/za)
+    // ------------------------------------------------------------------
+
+    /// Creates a session under a specific project root.
+    fn session_in(id: &str, started_at: &str, project_root: &str) -> SessionView {
+        let mut s = create_test_session(id, started_at);
+        s.project_root = Some(project_root.to_string());
+        s
+    }
+
+    /// Builds an app with two projects containing two agents each.
+    /// Resulting tree (fully expanded): proj-a, agent, agent, proj-b, agent, agent.
+    fn app_two_projects() -> App {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            session_in("sess-a1", "2024-01-15T10:00:00Z", "/repos/proj-a"),
+            session_in("sess-a2", "2024-01-15T10:01:00Z", "/repos/proj-a"),
+            session_in("sess-b1", "2024-01-15T10:02:00Z", "/repos/proj-b"),
+            session_in("sess-b2", "2024-01-15T10:03:00Z", "/repos/proj-b"),
+        ]);
+        app
+    }
+
+    #[test]
+    fn test_collapse_all_shows_only_top_level_rows() {
+        let mut app = app_two_projects();
+        assert!(app.tree_rows.len() > 2, "tree should start expanded");
+
+        app.collapse_all();
+
+        // Only the two project rows remain, and both are at depth 0.
+        assert_eq!(app.tree_rows.len(), 2);
+        assert!(app.tree_rows.iter().all(|r| r.depth == 0));
+    }
+
+    #[test]
+    fn test_collapse_all_reselects_top_level_ancestor() {
+        let mut app = app_two_projects();
+        // Find an agent row in proj-b and select it.
+        let (agent_idx, agent_id) = app
+            .tree_rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| match &r.node_id {
+                TreeNodeId::Agent(id) if id.as_str() == "sess-b1" => Some((i, r.node_id.clone())),
+                _ => None,
+            })
+            .expect("sess-b1 must be in tree");
+        let _ = agent_id;
+        app.selected_index = agent_idx;
+
+        app.collapse_all();
+
+        // Selection should now point at the proj-b project row.
+        let selected = &app.tree_rows[app.selected_index];
+        match &selected.node_id {
+            TreeNodeId::Project(root) => assert_eq!(root, "/repos/proj-b"),
+            other => panic!("expected proj-b project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expand_all_populates_expanded_set() {
+        let mut app = app_two_projects();
+        app.collapse_all();
+        assert_eq!(app.tree_rows.len(), 2);
+
+        app.expand_all();
+
+        // Tree should be back to fully-expanded size (2 projects + 4 agents).
+        assert_eq!(app.tree_rows.len(), 6);
+    }
+
+    // ------------------------------------------------------------------
+    // open_fold (h / l / zo)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_open_fold_expands_collapsed_group() {
+        let mut app = app_two_projects();
+        app.collapse_all();
+        app.selected_index = 0;
+        let proj_a = TreeNodeId::Project("/repos/proj-a".to_string());
+
+        app.open_fold();
+
+        assert!(app.expanded.contains(&proj_a));
+        assert!(app.tree_rows.len() > 2);
+    }
+
+    #[test]
+    fn test_open_fold_on_expanded_group_is_noop() {
+        let mut app = app_two_projects();
+        app.selected_index = 0; // expanded proj-a
+        let rows_before = app.tree_rows.len();
+        let expanded_before = app.expanded.clone();
+
+        app.open_fold();
+
+        assert_eq!(app.tree_rows.len(), rows_before);
+        assert_eq!(app.expanded, expanded_before);
+    }
+
+    #[test]
+    fn test_open_fold_on_leaf_is_noop() {
+        let mut app = app_two_projects();
+        let agent_idx = app
+            .tree_rows
+            .iter()
+            .position(|r| matches!(r.node_id, TreeNodeId::Agent(_)))
+            .expect("at least one agent row");
+        app.selected_index = agent_idx;
+        let expanded_before = app.expanded.clone();
+
+        app.open_fold();
+
+        assert_eq!(app.expanded, expanded_before);
+    }
+
+    // ------------------------------------------------------------------
+    // close_fold (zc) — vim-strict directional semantics
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_close_fold_closes_expanded_group() {
+        let mut app = app_two_projects();
+        app.selected_index = 0;
+        let proj_id = app.tree_rows[0].node_id.clone();
+
+        app.close_fold();
+
+        assert!(!app.expanded.contains(&proj_id));
+    }
+
+    #[test]
+    fn test_close_fold_on_collapsed_group_is_noop() {
+        // Vim: `zc` on an already-closed fold does nothing.
+        let mut app = app_two_projects();
+        app.collapse_all();
+        app.selected_index = 0;
+        let rows_before = app.tree_rows.len();
+        let expanded_before = app.expanded.clone();
+
+        app.close_fold();
+
+        assert_eq!(app.tree_rows.len(), rows_before);
+        assert_eq!(app.expanded, expanded_before);
+    }
+
+    #[test]
+    fn test_close_fold_on_leaf_walks_up_to_parent() {
+        let mut app = app_two_projects();
+        let agent_idx = app
+            .tree_rows
+            .iter()
+            .position(|r| matches!(&r.node_id, TreeNodeId::Agent(id) if id.as_str() == "sess-a1"))
+            .expect("sess-a1 must exist");
+        app.selected_index = agent_idx;
+
+        app.close_fold();
+
+        let proj_a = TreeNodeId::Project("/repos/proj-a".to_string());
+        assert!(!app.expanded.contains(&proj_a));
+        // Selection moved to the collapsed parent.
+        match &app.tree_rows[app.selected_index].node_id {
+            TreeNodeId::Project(root) => assert_eq!(root, "/repos/proj-a"),
+            other => panic!("expected proj-a, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // toggle_fold (za)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_toggle_fold_on_expanded_group_closes() {
+        let mut app = app_two_projects();
+        app.selected_index = 0;
+        let id = app.tree_rows[0].node_id.clone();
+
+        app.toggle_fold();
+        assert!(!app.expanded.contains(&id));
+    }
+
+    #[test]
+    fn test_toggle_fold_on_collapsed_group_opens() {
+        let mut app = app_two_projects();
+        app.collapse_all();
+        app.selected_index = 0;
+        let id = app.tree_rows[0].node_id.clone();
+
+        app.toggle_fold();
+        assert!(app.expanded.contains(&id));
+    }
+
+    #[test]
+    fn test_toggle_fold_on_leaf_toggles_parent() {
+        let mut app = app_two_projects();
+        let agent_idx = app
+            .tree_rows
+            .iter()
+            .position(|r| matches!(&r.node_id, TreeNodeId::Agent(id) if id.as_str() == "sess-a1"))
+            .expect("sess-a1 must exist");
+        app.selected_index = agent_idx;
+        let proj_a = TreeNodeId::Project("/repos/proj-a".to_string());
+
+        app.toggle_fold();
+        assert!(!app.expanded.contains(&proj_a));
+
+        // Selection now on the collapsed parent; toggling reopens it.
+        app.toggle_fold();
+        assert!(app.expanded.contains(&proj_a));
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end: InputHandler → UiAction → App dispatch
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_z_chord_wires_through_end_to_end() {
+        // Mirrors the dispatch in src/bin/atm.rs.
+        use crate::keybinding::{InputHandler, UiAction};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let dispatch = |app: &mut App, action: UiAction| match action {
+            UiAction::CollapseAllFolds => app.collapse_all(),
+            UiAction::ExpandAllFolds => app.expand_all(),
+            UiAction::ExpandNode => app.open_fold(),
+            UiAction::CloseFold => app.close_fold(),
+            UiAction::ToggleFold => app.toggle_fold(),
+            _ => {}
+        };
+
+        let mut app = app_two_projects();
+        let mut h = InputHandler::new();
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let rows_before = app.tree_rows.len();
+
+        // zM collapses everything.
+        assert!(h.handle(key('z')).is_none());
+        let action = h.handle(key('M')).expect("zM emits action");
+        assert_eq!(action, UiAction::CollapseAllFolds);
+        dispatch(&mut app, action);
+        assert_eq!(app.tree_rows.len(), 2);
+
+        // Cursor on collapsed proj-a; zo → ExpandNode → open_fold → expand.
+        app.selected_index = 0;
+        assert!(h.handle(key('z')).is_none());
+        let action = h.handle(key('o')).expect("zo emits action");
+        assert_eq!(action, UiAction::ExpandNode);
+        dispatch(&mut app, action);
+        let proj_a = TreeNodeId::Project("/repos/proj-a".to_string());
+        assert!(app.expanded.contains(&proj_a));
+
+        // zc on the now-expanded proj-a closes it (vim-strict close-only).
+        app.selected_index = 0;
+        assert!(h.handle(key('z')).is_none());
+        let action = h.handle(key('c')).expect("zc emits action");
+        assert_eq!(action, UiAction::CloseFold);
+        dispatch(&mut app, action);
+        assert!(!app.expanded.contains(&proj_a));
+
+        // zR expands everything.
+        assert!(h.handle(key('z')).is_none());
+        let action = h.handle(key('R')).expect("zR emits action");
+        assert_eq!(action, UiAction::ExpandAllFolds);
+        dispatch(&mut app, action);
+        assert_eq!(app.tree_rows.len(), rows_before);
     }
 }

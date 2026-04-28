@@ -1302,7 +1302,7 @@ fn default_session_name() -> String {
         .unwrap_or_else(|| "atm-workspace".to_string())
 }
 
-/// Write the resize-sidebar script and install the after-resize-window hook + prefix-R keybinding.
+/// Write the resize-sidebar script and install the after-resize-window hook + prefix keybindings.
 fn install_resize_hooks(socket: &Option<String>, session_name: &str) -> Result<()> {
     let tmux_prefix = match socket {
         Some(s) => format!("tmux -L {s}"),
@@ -1348,6 +1348,7 @@ fn install_resize_hooks(socket: &Option<String>, session_name: &str) -> Result<(
     )?;
     // NOTE: bind-key is global; the last workspace created wins for prefix-R.
     tmux_run(socket, &["bind-key", "-T", "prefix", "R", &hook_cmd])?;
+    tmux_run(socket, &["bind-key", "-T", "prefix", "a", "select-pane", "-t", "0"])?;
     Ok(())
 }
 

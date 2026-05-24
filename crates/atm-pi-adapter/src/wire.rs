@@ -8,7 +8,8 @@
 //! forwards `{ event: <name>, payload: <object> }` to atmd. We
 //! deserialize that envelope here.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 
 use crate::event::PiEventType;
 
@@ -29,13 +30,13 @@ pub struct RawPiEvent {
 
     // === Fields injected by the TS extension ===
     /// Session id (resolved from pi's session manager at emission time).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub session_id: Option<String>,
     /// Pi process pid (so atmd can correlate to /proc).
     #[serde(default)]
     pub pid: Option<u32>,
     /// Tmux pane id when running inside tmux.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub tmux_pane: Option<String>,
 }
 
@@ -48,9 +49,17 @@ pub struct RawPiEvent {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PiPayload {
     // === Tool events (tool_execution_start/end, tool_call, tool_result) ===
-    #[serde(rename = "toolName", default)]
+    #[serde(
+        rename = "toolName",
+        default,
+        deserialize_with = "deserialize_optional_stringish"
+    )]
     pub tool_name: Option<String>,
-    #[serde(rename = "toolCallId", default)]
+    #[serde(
+        rename = "toolCallId",
+        default,
+        deserialize_with = "deserialize_optional_stringish"
+    )]
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub args: Option<serde_json::Value>,
@@ -64,19 +73,19 @@ pub struct PiPayload {
     pub is_error: Option<bool>,
 
     // === Session lifecycle (session_start, session_shutdown) ===
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub reason: Option<String>,
 
     // === Input event (interactive prompt) ===
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub source: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub text: Option<String>,
 
     // === Model select ===
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub provider: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub model: Option<String>,
 
     // === Context event (carries cost/tokens) ===
@@ -97,8 +106,46 @@ pub struct PiPayload {
     /// Title/prompt of the dialog that just opened. Some extensions
     /// (pi-amplike) include the bash command being gated; the title
     /// surfaces in the TUI's activity-detail field.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub title: Option<String>,
+}
+
+fn deserialize_optional_stringish<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(string_from_value))
+}
+
+fn string_from_value(value: Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => non_empty(s),
+        Value::Number(n) => non_empty(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Array(_) => None,
+        Value::Object(map) => [
+            "id",
+            "session_id",
+            "sessionId",
+            "text",
+            "title",
+            "label",
+            "name",
+            "value",
+        ]
+        .iter()
+        .find_map(|key| map.get(*key).cloned().and_then(string_from_value)),
+    }
+}
+
+fn non_empty(s: String) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 #[cfg(test)]
@@ -201,5 +248,52 @@ mod tests {
         let json = r#"{"event": "future_pi_event", "payload": {}}"#;
         let raw: RawPiEvent = serde_json::from_str(json).unwrap();
         assert_eq!(raw.event, PiEventType::Other("future_pi_event".to_string()));
+    }
+
+    #[test]
+    fn stringish_fields_accept_object_ids() {
+        // Regression shape for atmd log error:
+        // `Parse error: invalid type: map, expected a string` from pi-atm.
+        // Some pi extension/runtime fields are object-like even when ATM only
+        // needs their stable string id. The adapter should not drop the entire
+        // event on that schema drift.
+        let json = r#"{
+            "event": "model_select",
+            "session_id": {"id": "019e3c43-c15a-740c-9a59-8faba2531283"},
+            "tmux_pane": {"id": "%28"},
+            "payload": {
+                "type":"model_select",
+                "provider": {"id":"anthropic"},
+                "model": {"id":"claude-sonnet-4-6"}
+            }
+        }"#;
+
+        let raw: RawPiEvent = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            raw.session_id.as_deref(),
+            Some("019e3c43-c15a-740c-9a59-8faba2531283")
+        );
+        assert_eq!(raw.tmux_pane.as_deref(), Some("%28"));
+        assert_eq!(raw.payload.provider.as_deref(), Some("anthropic"));
+        assert_eq!(raw.payload.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn stringish_payload_fields_drop_unlabeled_objects_instead_of_failing_parse() {
+        let json = r#"{
+            "event": "input",
+            "payload": {
+                "type": "input",
+                "text": {"content": [{"type": "text", "text": "hello"}]},
+                "source": "interactive"
+            }
+        }"#;
+
+        let raw: RawPiEvent = serde_json::from_str(json).unwrap();
+
+        assert_eq!(raw.event, PiEventType::Input);
+        assert_eq!(raw.payload.text, None);
+        assert_eq!(raw.payload.source.as_deref(), Some("interactive"));
     }
 }

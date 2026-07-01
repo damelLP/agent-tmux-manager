@@ -97,6 +97,10 @@ impl RealTmuxClient {
 
 #[async_trait]
 impl TmuxClient for RealTmuxClient {
+    async fn raw_command(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError> {
+        self.run(subcommand, args).await
+    }
+
     async fn split_window(
         &self,
         target: &str,

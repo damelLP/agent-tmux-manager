@@ -62,6 +62,12 @@ pub struct PaneInfo {
 /// calls for test assertions.
 #[async_trait]
 pub trait TmuxClient: Send + Sync {
+    /// Runs a tmux subcommand and returns stdout.
+    ///
+    /// This is the common escape hatch for commands that do not yet deserve
+    /// a dedicated trait method. Prefer typed methods for shared workflows.
+    async fn raw_command(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError>;
+
     /// Splits a pane, returning the new pane ID (e.g., "%7").
     ///
     /// # Arguments

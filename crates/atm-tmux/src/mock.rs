@@ -11,6 +11,10 @@ use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
 /// A recorded call to the mock tmux client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockCall {
+    RawCommand {
+        subcommand: String,
+        args: Vec<String>,
+    },
     SplitWindow {
         target: String,
         size: String,
@@ -205,6 +209,14 @@ impl Default for MockTmuxClient {
 
 #[async_trait]
 impl TmuxClient for MockTmuxClient {
+    async fn raw_command(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError> {
+        self.record(MockCall::RawCommand {
+            subcommand: subcommand.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        })?;
+        Ok(String::new())
+    }
+
     async fn split_window(
         &self,
         target: &str,

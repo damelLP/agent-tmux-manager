@@ -899,62 +899,14 @@ fn non_empty_str(s: &str) -> Option<String> {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("atm/config.toml"))
-}
-
-fn default_config_text() -> &'static str {
-    r#"# ATM configuration
-#
-# The default harness is used when `atm spawn` omits `--harness`.
-[harness]
-default = "claude"
-
-# Per-harness defaults override built-ins when no env override is set.
-# Environment precedence: ATM_SPAWN_<HARNESS>_BIN/ARGS, then
-# ATM_SPAWN_BIN/ARGS, then this file, then built-in defaults.
-#
-# Example: make `atm spawn` launch pi through mise:
-# [harness]
-# default = "pi"
-#
-# [harness.pi]
-# binary = "mise"
-# default_args = ["x", "pi"]
-#
-# Example: define a custom harness:
-# [harness.custom]
-# binary = "custom-agent"
-# default_args = ["--profile", "atm"]
-# model_flag = "--model-id"
-"#
-}
-
-fn ensure_default_config_file(path: &std::path::Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
-    }
-    fs::write(path, default_config_text())
-        .with_context(|| format!("Failed to write default config {}", path.display()))
-}
-
 fn load_atm_config() -> Result<AtmConfig> {
-    let Some(path) = config_path() else {
+    let Some(path) = setup::atm_config_path() else {
         return Ok(AtmConfig::default());
     };
     if !path.exists() {
-        if let Err(e) = ensure_default_config_file(&path) {
-            warn!(
-                error = %e,
-                path = %path.display(),
-                "Failed to create default config; continuing with built-in defaults"
-            );
-            return Ok(AtmConfig::default());
-        }
+        // Missing config is not an error: fall back to built-in defaults silently.
+        // `atm setup` is the only writer of this file.
+        return Ok(AtmConfig::default());
     }
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config {}", path.display()))?;
@@ -2299,6 +2251,26 @@ mod cli_tests {
         assert!(message.contains("claude"));
         assert!(message.contains("pi"));
     }
+
+    #[test]
+    fn load_atm_config_is_silent_when_file_absent() {
+        let config_home = IsolatedConfigHome::new();
+        let expected_path = super::setup::atm_config_path()
+            .expect("XDG_CONFIG_HOME is set, atm_config_path should resolve");
+
+        let config = super::load_atm_config().unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(
+            !expected_path.exists(),
+            "load_atm_config must not create {} as a side effect",
+            expected_path.display()
+        );
+        assert!(
+            config.harness.default.is_none(),
+            "missing config file should yield default AtmConfig"
+        );
+        drop(config_home);
+    }
 }
 
 #[cfg(test)]
@@ -2439,12 +2411,16 @@ mod spawn_command_tests {
         pi_args.unset();
         std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
 
-        // 1. Unset env/config → default to single-quoted "claude" and
-        //    auto-create a starter config file.
+        // 1. Unset env/config → default to single-quoted "claude".
         //    `'claude'` is identical to bare `claude` for execve;
         //    quoting just removes shell-parsing surprises elsewhere.
+        //    spawn must NOT materialize the user's config.toml — that's
+        //    the job of `atm setup`. (beads agent-tmux-manager-6fb)
         assert_eq!(build_spawn_command(None, None), "'claude'");
-        assert!(config_dir.path().join("atm/config.toml").exists());
+        assert!(
+            !config_dir.path().join("atm/config.toml").exists(),
+            "spawn must not create atm/config.toml as a side effect"
+        );
 
         // 2. Empty value is treated as unset.
         bin.set("");

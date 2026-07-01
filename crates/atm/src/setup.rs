@@ -13,6 +13,7 @@
 //!   Mirrors how pi-amplike documents local-dev installs.
 
 use std::fs;
+use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -403,6 +404,60 @@ fn remove_hook_script() -> Result<bool> {
     }
 }
 
+/// Returns the path to atm's own configuration file (`$XDG_CONFIG_HOME/atm/config.toml`).
+pub fn atm_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("atm/config.toml"))
+}
+
+fn default_atm_config_text() -> &'static str {
+    r#"# ATM configuration
+#
+# The default harness is used when `atm spawn` omits `--harness`.
+[harness]
+default = "claude"
+
+# Per-harness defaults override built-ins when no env override is set.
+# Environment precedence: ATM_SPAWN_<HARNESS>_BIN/ARGS, then
+# ATM_SPAWN_BIN/ARGS, then this file, then built-in defaults.
+#
+# Example: make `atm spawn` launch pi through mise:
+# [harness]
+# default = "pi"
+#
+# [harness.pi]
+# binary = "mise"
+# default_args = ["x", "pi"]
+#
+# Example: define a custom harness:
+# [harness.custom]
+# binary = "custom-agent"
+# default_args = ["--profile", "atm"]
+# model_flag = "--model-id"
+"#
+}
+
+/// Writes the default atm config to `path` if it does not already exist.
+///
+/// Idempotent: an existing file is left untouched so user edits are preserved.
+/// Reports back whether the file was newly created.
+pub fn ensure_default_atm_config(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
+    }
+    match fs::write(path, default_atm_config_text()) {
+        Ok(()) => Ok(true),
+        // Lost a race with another writer — treat as already-present.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => {
+            Err(e).with_context(|| format!("Failed to write default config {}", path.display()))
+        }
+    }
+}
+
 /// Installs atm integration for every detected coding-agent harness.
 pub fn setup() -> Result<()> {
     println!("Setting up ATM...\n");
@@ -440,6 +495,17 @@ pub fn setup() -> Result<()> {
     // Step N: Install tmux keybindings (vendor-neutral).
     println!();
     install_tmux_bindings()?;
+
+    // Step N+1: Materialize atm's own config.toml so users have a documented
+    // starting point. Spawn no longer auto-creates this; setup is the only
+    // writer.
+    if let Some(path) = atm_config_path() {
+        print!("\nWriting atm config to {}... ", path.display());
+        match ensure_default_atm_config(&path)? {
+            true => println!("created"),
+            false => println!("already present (preserved)"),
+        }
+    }
 
     println!("\nNext step:");
     println!("  Run: atm");
@@ -601,4 +667,48 @@ pub fn uninstall() -> Result<()> {
 
     println!("\nATM uninstalled successfully!");
     Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{default_atm_config_text, ensure_default_atm_config};
+    use std::fs;
+
+    #[test]
+    fn creates_config_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+
+        let created = ensure_default_atm_config(&path).unwrap();
+
+        assert!(created, "expected newly-created config to report true");
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, default_atm_config_text());
+    }
+
+    #[test]
+    fn preserves_existing_user_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let user_content = "[harness]\ndefault = \"pi\"\n# my custom edits\n";
+        fs::write(&path, user_content).unwrap();
+
+        let created = ensure_default_atm_config(&path).unwrap();
+
+        assert!(!created, "existing file must not be reported as created");
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, user_content, "user edits must be preserved");
+    }
+
+    #[test]
+    fn second_call_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let first = ensure_default_atm_config(&path).unwrap();
+        let second = ensure_default_atm_config(&path).unwrap();
+
+        assert!(first);
+        assert!(!second);
+    }
 }

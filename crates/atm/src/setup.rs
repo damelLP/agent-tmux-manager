@@ -452,7 +452,9 @@ pub fn ensure_default_atm_config(path: &Path) -> Result<bool> {
         Ok(()) => Ok(true),
         // Lost a race with another writer — treat as already-present.
         Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("Failed to write default config {}", path.display())),
+        Err(e) => {
+            Err(e).with_context(|| format!("Failed to write default config {}", path.display()))
+        }
     }
 }
 

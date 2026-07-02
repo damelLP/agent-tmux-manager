@@ -794,6 +794,14 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Builds a shell-safe `tmux` command prefix for generated hook scripts.
+fn tmux_shell_prefix(socket: Option<String>) -> String {
+    match socket {
+        Some(s) => format!("tmux -L {}", shell_quote(&s)),
+        None => "tmux".to_string(),
+    }
+}
+
 /// Build the shell command string sent to a freshly-split tmux pane.
 ///
 /// Honors spawn override environment variables (all treat empty as unset):
@@ -1557,11 +1565,7 @@ async fn install_resize_hooks<C>(
 where
     C: TmuxClient + ?Sized,
 {
-    let effective_socket = effective_tmux_socket(socket);
-    let tmux_prefix = match effective_socket {
-        Some(s) => format!("tmux -L {s}"),
-        None => "tmux".to_string(),
-    };
+    let tmux_prefix = tmux_shell_prefix(effective_tmux_socket(socket));
     let script_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("atm");
@@ -1663,11 +1667,7 @@ async fn install_new_window_hook<C>(
 where
     C: TmuxClient + ?Sized,
 {
-    let effective_socket = effective_tmux_socket(socket);
-    let tmux_prefix = match effective_socket {
-        Some(s) => format!("tmux -L {s}"),
-        None => "tmux".to_string(),
-    };
+    let tmux_prefix = tmux_shell_prefix(effective_tmux_socket(socket));
     let script_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("atm");
@@ -2402,6 +2402,24 @@ mod prompt_tests {
         let lines: Vec<String> = vec![];
         let prompt = extract_prompt(&lines);
         assert!(prompt.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shell_quote_tests {
+    use super::tmux_shell_prefix;
+
+    #[test]
+    fn tmux_shell_prefix_quotes_socket_label() {
+        assert_eq!(tmux_shell_prefix(None), "tmux");
+        assert_eq!(
+            tmux_shell_prefix(Some("sock with spaces".to_string())),
+            "tmux -L 'sock with spaces'"
+        );
+        assert_eq!(
+            tmux_shell_prefix(Some("sock'; touch /tmp/pwned #".to_string())),
+            "tmux -L 'sock'\\''; touch /tmp/pwned #'"
+        );
     }
 }
 

@@ -2,6 +2,7 @@
 //!
 //! Records all method calls and returns configurable results.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -94,9 +95,11 @@ struct MockState {
     /// Panes returned by list_panes.
     panes: Vec<PaneInfo>,
     /// Content returned by capture_pane, keyed by pane ID.
-    pane_content: std::collections::HashMap<String, Vec<String>>,
+    pane_content: HashMap<String, Vec<String>>,
     /// Working directory returned by get_pane_cwd, keyed by pane ID.
-    pane_cwd: std::collections::HashMap<String, String>,
+    pane_cwd: HashMap<String, String>,
+    /// Queue of stdout strings returned by raw_command.
+    raw_command_outputs: VecDeque<String>,
     /// If set, the next call will return this error.
     next_error: Option<TmuxError>,
 }
@@ -109,8 +112,9 @@ impl MockTmuxClient {
                 calls: Vec::new(),
                 pane_id_queue: Vec::new(),
                 panes: Vec::new(),
-                pane_content: std::collections::HashMap::new(),
-                pane_cwd: std::collections::HashMap::new(),
+                pane_content: HashMap::new(),
+                pane_cwd: HashMap::new(),
+                raw_command_outputs: VecDeque::new(),
                 next_error: None,
             })),
         }
@@ -141,6 +145,13 @@ impl MockTmuxClient {
     pub fn set_pane_cwd(&self, pane: &str, cwd: &str) {
         if let Ok(mut state) = self.inner.lock() {
             state.pane_cwd.insert(pane.to_string(), cwd.to_string());
+        }
+    }
+
+    /// Queues stdout to be returned by the next `raw_command` call.
+    pub fn set_next_raw_output(&self, output: &str) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.raw_command_outputs.push_back(output.to_string());
         }
     }
 
@@ -199,6 +210,15 @@ impl MockTmuxClient {
             })
             .unwrap_or_else(|| "%99".to_string())
     }
+
+    /// Pops the next raw command output, defaulting to an empty string.
+    fn next_raw_output(&self) -> String {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut state| state.raw_command_outputs.pop_front())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for MockTmuxClient {
@@ -210,11 +230,12 @@ impl Default for MockTmuxClient {
 #[async_trait]
 impl TmuxClient for MockTmuxClient {
     async fn raw_command(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError> {
+        let output = self.next_raw_output();
         self.record(MockCall::RawCommand {
             subcommand: subcommand.to_string(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
         })?;
-        Ok(String::new())
+        Ok(output)
     }
 
     async fn split_window(
@@ -393,6 +414,37 @@ mod tests {
         assert_eq!(p1, "%10");
         assert_eq!(p2, "%11");
         assert_eq!(p3, "%99"); // exhausted queue
+    }
+
+    #[tokio::test]
+    async fn test_mock_raw_command_output_queue() {
+        let mock = MockTmuxClient::new();
+        mock.set_next_raw_output("%1\n%2\n");
+        mock.set_next_raw_output("second");
+
+        let first = mock
+            .raw_command("list-panes", &["-F", "#{pane_id}"])
+            .await
+            .unwrap();
+        let second = mock
+            .raw_command("display-message", &["-p", "x"])
+            .await
+            .unwrap();
+        let third = mock
+            .raw_command("display-message", &["-p", "y"])
+            .await
+            .unwrap();
+
+        assert_eq!(first, "%1\n%2\n");
+        assert_eq!(second, "second");
+        assert_eq!(third, "");
+
+        let calls = mock.calls();
+        assert!(matches!(
+            &calls[0],
+            MockCall::RawCommand { subcommand, args }
+                if subcommand == "list-panes" && args == &vec!["-F".to_string(), "#{pane_id}".to_string()]
+        ));
     }
 
     #[tokio::test]

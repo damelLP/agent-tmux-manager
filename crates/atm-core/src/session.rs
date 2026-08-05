@@ -988,9 +988,9 @@ impl SessionInfrastructure {
 
         let Some(expected_start_time) = self.process_start_time else {
             // No start time recorded - just check if the process exists
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let exists = procfs::process::Process::new(pid as i32).is_ok();
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let exists = process_exists(pid);
             debug!(
                 pid,
@@ -1091,7 +1091,7 @@ fn activity_for_needs_input(reason: &NeedsInputReason) -> ActivityDetail {
 /// of a process and unique enough to detect PID reuse.
 ///
 /// Returns `None` if the process doesn't exist or can't be read.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_process_start_time(pid: u32) -> Option<u64> {
     let process = procfs::process::Process::new(pid as i32).ok()?;
     let stat = process.stat().ok()?;
@@ -1100,12 +1100,12 @@ fn read_process_start_time(pid: u32) -> Option<u64> {
 
 /// Reads the process start time using the `sysinfo` crate.
 ///
-/// procfs is Linux-only, so non-Linux platforms (e.g. macOS) fall back to
-/// `sysinfo`, which reports start time as seconds since the Unix epoch.
-/// The absolute value differs from procfs's clock-tick encoding, but it is
-/// still stable for the lifetime of a process and thus usable for PID-reuse
-/// detection.
-#[cfg(not(target_os = "linux"))]
+/// procfs only supports Linux and Android, so other platforms (e.g.
+/// macOS) fall back to `sysinfo`, which reports start time as seconds
+/// since the Unix epoch. The absolute value differs from procfs's
+/// clock-tick encoding, but it is still stable for the lifetime of a
+/// process and thus usable for PID-reuse detection.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn read_process_start_time(pid: u32) -> Option<u64> {
     use sysinfo::{Pid, ProcessesToUpdate, System};
     let sys_pid = Pid::from_u32(pid);
@@ -1115,7 +1115,7 @@ fn read_process_start_time(pid: u32) -> Option<u64> {
 }
 
 /// Checks whether a process with the given PID currently exists.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn process_exists(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessesToUpdate, System};
     let sys_pid = Pid::from_u32(pid);

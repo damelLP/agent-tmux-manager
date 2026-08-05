@@ -22,9 +22,12 @@ impl RawCopilotHookEvent {
     /// `LifecycleEvent`.
     ///
     /// Returns `None` if `hook_event_name` does not match a known
-    /// Copilot event, or if a tool-shaped event is missing
-    /// `tool_name` (malformed — mirrors the other adapters' guard
-    /// against fabricating phantom tool-call records).
+    /// Copilot event, or if a tool-shaped event (`preToolUse`,
+    /// `postToolUse`, `postToolUseFailure`, `permissionRequest`) is
+    /// missing `tool_name` (malformed — mirrors the other adapters'
+    /// guard against fabricating phantom tool-call records, and keeps
+    /// `permissionRequest` consistent since it also relies on
+    /// `tool_name` for its `NeedsInput` label).
     pub fn to_lifecycle_event(&self) -> Option<LifecycleEvent> {
         let ev = self.event_type()?;
         let needs_tool = matches!(
@@ -32,6 +35,7 @@ impl RawCopilotHookEvent {
             CopilotEventType::PreToolUse
                 | CopilotEventType::PostToolUse
                 | CopilotEventType::PostToolUseFailure
+                | CopilotEventType::PermissionRequest
         );
         let tool_name = self.tool_name.as_deref().unwrap_or("");
         if needs_tool && tool_name.is_empty() {
@@ -123,7 +127,12 @@ mod tests {
 
     #[test]
     fn tool_shaped_events_without_tool_name_return_none() {
-        for name in ["preToolUse", "postToolUse", "postToolUseFailure"] {
+        for name in [
+            "preToolUse",
+            "postToolUse",
+            "postToolUseFailure",
+            "permissionRequest",
+        ] {
             assert_eq!(raw(name).to_lifecycle_event(), None);
         }
     }

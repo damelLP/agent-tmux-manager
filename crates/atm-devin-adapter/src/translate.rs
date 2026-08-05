@@ -47,12 +47,20 @@ impl RawDevinHookEvent {
     /// `LifecycleEvent`.
     ///
     /// Returns `None` if `hook_event_name` does not match a known
-    /// Devin event, or if a tool-shaped event is missing `tool_name`
+    /// Devin event, or if a tool-shaped event (`PreToolUse`,
+    /// `PostToolUse`, `PermissionRequest`) is missing `tool_name`
     /// (malformed — mirrors `atm_claude_adapter`'s guard against
-    /// fabricating phantom tool-call records).
+    /// fabricating phantom tool-call records, and keeps
+    /// `PermissionRequest` consistent since it also relies on
+    /// `tool_name` for its `NeedsInput` label).
     pub fn to_lifecycle_event(&self) -> Option<LifecycleEvent> {
         let ev = self.event_type()?;
-        let needs_tool = matches!(ev, DevinEventType::PreToolUse | DevinEventType::PostToolUse);
+        let needs_tool = matches!(
+            ev,
+            DevinEventType::PreToolUse
+                | DevinEventType::PostToolUse
+                | DevinEventType::PermissionRequest
+        );
         let tool_name = self.tool_name.as_deref().unwrap_or("");
         if needs_tool && tool_name.is_empty() {
             return None;
@@ -170,7 +178,7 @@ mod tests {
 
     #[test]
     fn tool_shaped_event_without_tool_name_returns_none() {
-        for name in ["PreToolUse", "PostToolUse"] {
+        for name in ["PreToolUse", "PostToolUse", "PermissionRequest"] {
             assert_eq!(raw(name).to_lifecycle_event(), None);
             let mut empty = raw(name);
             empty.tool_name = Some(String::new());

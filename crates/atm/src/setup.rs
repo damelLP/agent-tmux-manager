@@ -607,8 +607,11 @@ pub fn setup() -> Result<()> {
         if devin { "✓" } else { "✗" },
         if devin { "" } else { " not present" }
     );
+    let copilot_home_display = copilot_home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.copilot".to_string());
     println!(
-        "  {} Copilot CLI  (~/.copilot/{})",
+        "  {} Copilot CLI  ({copilot_home_display}/{})",
         if copilot { "✓" } else { "✗" },
         if copilot { "" } else { " not present" }
     );
@@ -848,10 +851,12 @@ fn setup_copilot() -> Result<()> {
         } else {
             // Copilot invokes the same script for every event array,
             // so the event name is passed as an argument — see
-            // atm-copilot-hook and atm_copilot_adapter::wire.
+            // atm-copilot-hook and atm_copilot_adapter::wire. Quote
+            // the script path so a space in $HOME (or an unusual
+            // install location) doesn't split into the wrong argv.
             hooks_array.push(json!({
                 "type": "command",
-                "command": format!("{command_path} {hook_type}"),
+                "command": format!("'{command_path}' {hook_type}"),
             }));
             added += 1;
             println!("    {hook_type} - added");

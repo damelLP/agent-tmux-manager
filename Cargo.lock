@@ -138,6 +138,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atm-copilot-adapter"
+version = "0.2.3"
+dependencies = [
+ "atm-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "atm-core"
 version = "0.2.3"
 dependencies = [
@@ -149,6 +158,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "atm-devin-adapter"
+version = "0.2.3"
+dependencies = [
+ "atm-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -216,7 +234,9 @@ version = "0.2.3"
 dependencies = [
  "anyhow",
  "atm-claude-adapter",
+ "atm-copilot-adapter",
  "atm-core",
+ "atm-devin-adapter",
  "atm-pi-adapter",
  "atm-protocol",
  "chrono",

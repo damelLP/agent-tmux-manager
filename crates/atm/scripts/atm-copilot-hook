@@ -1,0 +1,108 @@
+#!/bin/bash
+# ATM Hook - GitHub Copilot CLI hook handler
+#
+# Copilot CLI's per-event hook payload (see
+# https://docs.github.com/en/copilot/reference/hooks-reference) does not
+# include a "which event is this" field — the event kind is implied by
+# which array in hooks.json the command was registered under. atm's
+# generated ~/.copilot/hooks/atm.json therefore invokes this script with
+# the event name as $1 for every event array, and this script injects it
+# into the JSON envelope as `hookEventName` before forwarding to atmd —
+# see atm_copilot_adapter::wire for the receiving side.
+#
+# CRITICAL: This script MUST:
+# - Always exit 0 (never break Copilot CLI)
+# - Be non-blocking
+# - Handle daemon unavailability gracefully
+# - Be portable: Linux and macOS both run Copilot CLI, so process-tree
+#   walking uses `ps` rather than assuming /proc exists.
+
+set -o pipefail
+
+EVENT_NAME="${1:-}"
+SOCKET="${ATM_SOCKET:-/tmp/atm.sock}"
+DEBUG="${ATM_DEBUG:-0}"
+
+log_debug() {
+    if [ "$DEBUG" = "1" ]; then
+        echo "$(date -Iseconds 2>/dev/null || date) [atm-copilot-hook] $1" >> /tmp/atm-hook.log
+    fi
+}
+
+find_copilot_pid() {
+    local pid=$PPID
+    local copilot_pid=""
+    local depth=0
+    local max_depth=15
+
+    while [ "$depth" -lt "$max_depth" ] && [ -n "$pid" ] && [ "$pid" != "1" ] && [ "$pid" != "0" ]; do
+        local comm
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')
+        comm=$(basename "$comm" 2>/dev/null || echo "$comm")
+        [ "$comm" = "copilot" ] && copilot_pid=$pid
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        depth=$((depth + 1))
+    done
+
+    echo "${copilot_pid:-}"
+}
+
+if [ -z "$EVENT_NAME" ]; then
+    log_debug "No event name argument passed"
+    exit 0
+fi
+
+if [ ! -S "$SOCKET" ]; then
+    log_debug "Socket not found: $SOCKET"
+    exit 0
+fi
+
+input=$(cat)
+if [ -z "$input" ]; then
+    input="{}"
+fi
+
+SESSION_ID=$(echo "$input" | jq -r '.sessionId // empty' 2>/dev/null)
+if [ -z "$SESSION_ID" ]; then
+    log_debug "No sessionId in input for $EVENT_NAME"
+    exit 0
+fi
+
+log_debug "Hook: $EVENT_NAME for session $SESSION_ID"
+
+COPILOT_PID=$(find_copilot_pid)
+
+CONNECT_MSG=$(cat <<EOF
+{"protocol_version":{"major":1,"minor":0},"type":"connect","client_id":"copilot-hook-$SESSION_ID-$$"}
+EOF
+)
+
+TMUX_PANE_ID="${TMUX_PANE:-}"
+EXTRA_JSON=$(jq -cn --arg event "$EVENT_NAME" '{hookEventName: $event}')
+[ -n "$COPILOT_PID" ] && EXTRA_JSON=$(echo "$EXTRA_JSON" | jq -c --argjson pid "$COPILOT_PID" '. + {pid: $pid}')
+[ -n "$TMUX_PANE_ID" ] && EXTRA_JSON=$(echo "$EXTRA_JSON" | jq -c --arg tmux_pane "$TMUX_PANE_ID" '. + {tmuxPane: $tmux_pane}')
+
+DATA_MSG=$(jq -c --argjson extra "$EXTRA_JSON" '{
+    "protocol_version": {"major": 1, "minor": 0},
+    "type": "copilot_event",
+    "data": (. + $extra)
+}' <<< "$input" 2>/dev/null)
+
+if [ -z "$DATA_MSG" ] || [ "$DATA_MSG" = "null" ]; then
+    log_debug "Failed to build message"
+    exit 0
+fi
+
+if command -v socat &>/dev/null; then
+    { echo "$CONNECT_MSG"; echo "$DATA_MSG"; } | socat -t0.1 - "UNIX-CONNECT:$SOCKET" >/dev/null 2>&1 || {
+        log_debug "Failed to send via socat"
+    }
+else
+    { echo "$CONNECT_MSG"; echo "$DATA_MSG"; } | nc -U "$SOCKET" >/dev/null 2>&1 || {
+        log_debug "Failed to send via nc"
+    }
+fi
+
+log_debug "Message sent successfully"
+
+exit 0

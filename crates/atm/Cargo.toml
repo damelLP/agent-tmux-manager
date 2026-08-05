@@ -31,6 +31,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 dirs = "5.0"
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

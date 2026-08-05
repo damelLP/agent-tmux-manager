@@ -96,7 +96,11 @@ fn remove_pid_file() {
 }
 
 fn is_process_running(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let sys_pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+    system.process(sys_pid).is_some()
 }
 
 fn is_daemon_running() -> Option<u32> {

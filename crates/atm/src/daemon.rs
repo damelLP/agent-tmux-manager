@@ -31,7 +31,11 @@ fn read_pid() -> Option<u32> {
 
 /// Checks if a process with the given PID is running.
 fn is_process_running(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let sys_pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+    system.process(sys_pid).is_some()
 }
 
 /// Checks if the daemon is currently running.

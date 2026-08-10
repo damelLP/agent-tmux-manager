@@ -24,6 +24,12 @@ use serde_json::{json, Value};
 /// The atm-hook bash script content (Claude Code), embedded at compile time.
 const ATM_HOOK_SCRIPT: &str = include_str!("../scripts/atm-hook");
 
+/// The atm-devin-hook bash script content (Devin CLI), embedded at compile time.
+const ATM_DEVIN_HOOK_SCRIPT: &str = include_str!("../scripts/atm-devin-hook");
+
+/// The atm-copilot-hook bash script content (GitHub Copilot CLI), embedded at compile time.
+const ATM_COPILOT_HOOK_SCRIPT: &str = include_str!("../scripts/atm-copilot-hook");
+
 /// The pi-atm TypeScript extension content, embedded at compile time.
 /// pi loads `.ts` files directly via `@mariozechner/jiti`.
 const PI_ATM_EXTENSION: &str = include_str!("../assets/pi-atm/extensions/pi-atm.ts");
@@ -50,16 +56,83 @@ const HOOK_TYPES: &[&str] = &[
     "PermissionRequest",
 ];
 
+/// Devin CLI hook types atm wires up.
+/// See: https://docs.devin.ai/cli/extensibility/hooks/overview
+const DEVIN_HOOK_TYPES: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "UserPromptSubmit",
+    "Stop",
+    "PostCompaction",
+    "SessionStart",
+    "SessionEnd",
+];
+
+/// Copilot CLI hook types atm wires up (hooks.json event keys — camelCase).
+/// See: https://docs.github.com/en/copilot/reference/hooks-reference
+const COPILOT_HOOK_TYPES: &[&str] = &[
+    "preToolUse",
+    "postToolUse",
+    "postToolUseFailure",
+    "permissionRequest",
+    "userPromptSubmitted",
+    "sessionStart",
+    "sessionEnd",
+];
+
 /// Returns the path to Claude Code settings.json
 fn claude_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
-/// Returns the path to the atm-hook script
+/// Returns the path to Devin CLI's user-wide config file.
+///
+/// Devin CLI hardcodes `~/.config/devin/config.json` on both macOS and
+/// Linux (only Windows differs, using `%APPDATA%\devin\config.json`) —
+/// unlike `dirs::config_dir()`, which resolves to
+/// `~/Library/Application Support` on macOS. So this is built from
+/// `home_dir()` directly rather than reusing `dirs::config_dir()`.
+fn devin_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".config").join("devin").join("config.json"))
+}
+
+/// Returns Copilot CLI's home directory: `$COPILOT_HOME` if set,
+/// otherwise `~/.copilot`.
+fn copilot_home_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("COPILOT_HOME") {
+        let path = PathBuf::from(dir);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".copilot"))
+}
+
+/// Returns the path to atm's standalone Copilot CLI user-level hooks file.
+fn copilot_hooks_file_path() -> Option<PathBuf> {
+    copilot_home_dir().map(|h| h.join("hooks").join("atm.json"))
+}
+
+/// Returns the path to the atm-hook script (Claude Code).
 fn hook_script_path() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(".local").join("bin").join("atm-hook"))
         .unwrap_or_else(|| PathBuf::from("/usr/local/bin/atm-hook"))
+}
+
+/// Returns the path to the atm-devin-hook script.
+fn devin_hook_script_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".local").join("bin").join("atm-devin-hook"))
+        .unwrap_or_else(|| PathBuf::from("/usr/local/bin/atm-devin-hook"))
+}
+
+/// Returns the path to the atm-copilot-hook script.
+fn copilot_hook_script_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".local").join("bin").join("atm-copilot-hook"))
+        .unwrap_or_else(|| PathBuf::from("/usr/local/bin/atm-copilot-hook"))
 }
 
 /// Reads a JSON file at `path`, returning an empty object if the file
@@ -121,13 +194,13 @@ fn has_atm_status_line(status_line: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Creates a hook entry for the given hook type.
+/// Creates a hook entry for the given hook type, in Claude Code /
+/// Devin CLI's shared `{matcher, hooks: [{type, command}]}` shape.
 ///
 /// Hook types that filter by tool name use a matcher, others don't.
-fn create_hook_entry(hook_type: &str) -> Value {
-    let hook_path = hook_script_path();
-    let command = hook_path.to_string_lossy().to_string();
-
+/// `command` is the full command line to run (typically an installed
+/// hook script's path).
+fn create_hook_entry(hook_type: &str, command: &str) -> Value {
     // Tool-related hooks use a matcher to filter by tool name
     let needs_matcher = matches!(
         hook_type,
@@ -153,8 +226,10 @@ fn create_hook_entry(hook_type: &str) -> Value {
     }
 }
 
-/// Checks if atm hooks are already installed for a hook type
-fn has_atm_hook(hooks_array: &[Value]) -> bool {
+/// Checks if a hook entries array already contains a command matching
+/// `marker` (a distinguishing substring of an atm-installed hook
+/// script's path, e.g. `"atm-hook"`, `"atm-devin-hook"`).
+fn has_atm_hook(hooks_array: &[Value], marker: &str) -> bool {
     hooks_array.iter().any(|entry| {
         entry
             .get("hooks")
@@ -163,7 +238,7 @@ fn has_atm_hook(hooks_array: &[Value]) -> bool {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains("atm-hook"))
+                        .map(|cmd| cmd.contains(marker))
                         .unwrap_or(false)
                 })
             })
@@ -171,8 +246,9 @@ fn has_atm_hook(hooks_array: &[Value]) -> bool {
     })
 }
 
-/// Removes atm hooks from a hooks array
-fn remove_atm_hooks(hooks_array: &mut Vec<Value>) {
+/// Removes hook entries matching `marker` from a hooks array (see
+/// [`has_atm_hook`]).
+fn remove_atm_hooks(hooks_array: &mut Vec<Value>, marker: &str) {
     hooks_array.retain(|entry| {
         !entry
             .get("hooks")
@@ -181,7 +257,7 @@ fn remove_atm_hooks(hooks_array: &mut Vec<Value>) {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains("atm-hook"))
+                        .map(|cmd| cmd.contains(marker))
                         .unwrap_or(false)
                 })
             })
@@ -189,32 +265,47 @@ fn remove_atm_hooks(hooks_array: &mut Vec<Value>) {
     });
 }
 
-/// Installs the atm-hook script to ~/.local/bin/
+/// Installs a hook script to `path` with the given `content`.
 ///
-/// Creates the directory if it doesn't exist and sets executable permissions.
-fn install_hook_script() -> Result<()> {
-    let hook_path = hook_script_path();
-
+/// Creates the parent directory if it doesn't exist and sets
+/// executable permissions. Shared by the Claude Code, Devin CLI, and
+/// Copilot CLI hook scripts — each vendor just supplies its own path
+/// and embedded script content.
+fn install_hook_script_at(path: &Path, content: &str) -> Result<()> {
     // Create parent directory if needed
-    if let Some(parent) = hook_path.parent() {
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
     // Write the script
-    fs::write(&hook_path, ATM_HOOK_SCRIPT)
-        .with_context(|| format!("Failed to write {}", hook_path.display()))?;
+    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))?;
 
     // Make executable on Unix
     #[cfg(unix)]
     {
-        let mut perms = fs::metadata(&hook_path)?.permissions();
+        let mut perms = fs::metadata(path)?.permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms)
-            .with_context(|| format!("Failed to set permissions on {}", hook_path.display()))?;
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
     }
 
     Ok(())
+}
+
+/// Installs the atm-hook script (Claude Code) to ~/.local/bin/.
+fn install_hook_script() -> Result<()> {
+    install_hook_script_at(&hook_script_path(), ATM_HOOK_SCRIPT)
+}
+
+/// Installs the atm-devin-hook script (Devin CLI) to ~/.local/bin/.
+fn install_devin_hook_script() -> Result<()> {
+    install_hook_script_at(&devin_hook_script_path(), ATM_DEVIN_HOOK_SCRIPT)
+}
+
+/// Installs the atm-copilot-hook script (Copilot CLI) to ~/.local/bin/.
+fn install_copilot_hook_script() -> Result<()> {
+    install_hook_script_at(&copilot_hook_script_path(), ATM_COPILOT_HOOK_SCRIPT)
 }
 
 /// Installs the ATM tmux keybindings file to ~/.config/atm/tmux-bindings.conf.
@@ -281,6 +372,25 @@ fn detect_pi() -> bool {
     dirs::home_dir()
         .map(|h| h.join(".pi/agent").exists())
         .unwrap_or(false)
+}
+
+/// True if Devin CLI appears to be installed for this user.
+///
+/// Devin CLI creates `~/.config/devin/` on first run regardless of
+/// where its binary lives, mirroring the Claude Code / pi detection
+/// strategy above.
+fn detect_devin() -> bool {
+    devin_config_path()
+        .and_then(|p| p.parent().map(Path::exists))
+        .unwrap_or(false)
+}
+
+/// True if Copilot CLI appears to be installed for this user.
+///
+/// Copilot CLI creates its home directory (`~/.copilot`, or
+/// `$COPILOT_HOME` if set) on first run.
+fn detect_copilot() -> bool {
+    copilot_home_dir().map(|p| p.exists()).unwrap_or(false)
 }
 
 // ============================================================================
@@ -391,17 +501,29 @@ fn uninstall_pi_extension() -> Result<bool> {
     Ok(changed)
 }
 
-/// Removes the atm-hook script from ~/.local/bin/
-fn remove_hook_script() -> Result<bool> {
-    let hook_path = hook_script_path();
-
-    if hook_path.exists() {
-        fs::remove_file(&hook_path)
-            .with_context(|| format!("Failed to remove {}", hook_path.display()))?;
+/// Removes a hook script at `path`, if present.
+fn remove_hook_script_at(path: &Path) -> Result<bool> {
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()))?;
         Ok(true)
     } else {
         Ok(false)
     }
+}
+
+/// Removes the atm-hook script (Claude Code) from ~/.local/bin/.
+fn remove_hook_script() -> Result<bool> {
+    remove_hook_script_at(&hook_script_path())
+}
+
+/// Removes the atm-devin-hook script from ~/.local/bin/.
+fn remove_devin_hook_script() -> Result<bool> {
+    remove_hook_script_at(&devin_hook_script_path())
+}
+
+/// Removes the atm-copilot-hook script from ~/.local/bin/.
+fn remove_copilot_hook_script() -> Result<bool> {
+    remove_hook_script_at(&copilot_hook_script_path())
 }
 
 /// Returns the path to atm's own configuration file (`$XDG_CONFIG_HOME/atm/config.toml`).
@@ -466,6 +588,8 @@ pub fn setup() -> Result<()> {
     // will (and won't) be configured.
     let claude = detect_claude_code();
     let pi = detect_pi();
+    let devin = detect_devin();
+    let copilot = detect_copilot();
 
     println!("Detected coding agents:");
     println!(
@@ -478,9 +602,24 @@ pub fn setup() -> Result<()> {
         if pi { "✓" } else { "✗" },
         if pi { "" } else { " not present" }
     );
+    println!(
+        "  {} Devin CLI    (~/.config/devin/{})",
+        if devin { "✓" } else { "✗" },
+        if devin { "" } else { " not present" }
+    );
+    let copilot_home_display = copilot_home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.copilot".to_string());
+    println!(
+        "  {} Copilot CLI  ({copilot_home_display}/{})",
+        if copilot { "✓" } else { "✗" },
+        if copilot { "" } else { " not present" }
+    );
 
-    if !claude && !pi {
-        println!("\nNo supported agent installations found. Install Claude Code or pi first.");
+    if !claude && !pi && !devin && !copilot {
+        println!(
+            "\nNo supported agent installations found. Install Claude Code, pi, Devin CLI, or Copilot CLI first."
+        );
         return Ok(());
     }
 
@@ -490,6 +629,14 @@ pub fn setup() -> Result<()> {
 
     if pi {
         setup_pi()?;
+    }
+
+    if devin {
+        setup_devin()?;
+    }
+
+    if copilot {
+        setup_copilot()?;
     }
 
     // Step N: Install tmux keybindings (vendor-neutral).
@@ -533,6 +680,7 @@ fn setup_claude_code() -> Result<()> {
         .context("hooks is not an object")?;
 
     let mut added = 0;
+    let command = hook_path.to_string_lossy().to_string();
 
     for &hook_type in HOOK_TYPES {
         let hooks_array = hooks
@@ -541,10 +689,10 @@ fn setup_claude_code() -> Result<()> {
             .as_array_mut()
             .context("hook type is not an array")?;
 
-        if has_atm_hook(hooks_array) {
+        if has_atm_hook(hooks_array, "atm-hook") {
             println!("    {hook_type} - already configured");
         } else {
-            hooks_array.push(create_hook_entry(hook_type));
+            hooks_array.push(create_hook_entry(hook_type, &command));
             added += 1;
             println!("    {hook_type} - added");
         }
@@ -593,6 +741,137 @@ fn setup_pi() -> Result<()> {
     Ok(())
 }
 
+/// Wires `atm-devin-hook` into Devin CLI's `~/.config/devin/config.json`.
+///
+/// Devin CLI's hook config format is the same
+/// `{matcher, hooks: [{type, command}]}` shape Claude Code uses (see
+/// module docs), so this reuses [`create_hook_entry`] /
+/// [`has_atm_hook`] / [`remove_atm_hooks`] with a distinct
+/// `"atm-devin-hook"` marker.
+fn setup_devin() -> Result<()> {
+    println!("\nConfiguring Devin CLI...");
+    let hook_path = devin_hook_script_path();
+    print!("  Installing hook script to {}... ", hook_path.display());
+    install_devin_hook_script()?;
+    println!("done");
+
+    let path = devin_config_path().context("Could not determine home directory")?;
+    let mut config = read_json_file_or_empty(&path)?;
+    if !config.is_object() {
+        config = json!({});
+    }
+    if config.get("hooks").is_none() {
+        config["hooks"] = json!({});
+    }
+
+    let hooks = config["hooks"]
+        .as_object_mut()
+        .context("hooks is not an object")?;
+
+    let mut added = 0;
+    let command = hook_path.to_string_lossy().to_string();
+
+    for &hook_type in DEVIN_HOOK_TYPES {
+        let hooks_array = hooks
+            .entry(hook_type)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .context("hook type is not an array")?;
+
+        if has_atm_hook(hooks_array, "atm-devin-hook") {
+            println!("    {hook_type} - already configured");
+        } else {
+            hooks_array.push(create_hook_entry(hook_type, &command));
+            added += 1;
+            println!("    {hook_type} - added");
+        }
+    }
+
+    if added > 0 {
+        write_json_file_pretty(&path, &config)?;
+        println!("  Devin CLI configuration written.");
+    } else {
+        println!("  Devin CLI already configured.");
+    }
+    Ok(())
+}
+
+/// Checks if a Copilot-style flat hook-entries array already contains
+/// a command matching `marker`.
+///
+/// Unlike Claude/Devin's `{matcher, hooks: [...]}` nesting, Copilot's
+/// `hooks.json` format is a flat array of `{type, command, ...}`
+/// objects per event.
+fn has_atm_copilot_hook(hooks_array: &[Value], marker: &str) -> bool {
+    hooks_array.iter().any(|hook| {
+        hook.get("command")
+            .and_then(|c| c.as_str())
+            .map(|cmd| cmd.contains(marker))
+            .unwrap_or(false)
+    })
+}
+
+/// Wires `atm-copilot-hook` into Copilot CLI's standalone user-level
+/// hooks file (`~/.copilot/hooks/atm.json`).
+fn setup_copilot() -> Result<()> {
+    println!("\nConfiguring Copilot CLI...");
+    let hook_path = copilot_hook_script_path();
+    print!("  Installing hook script to {}... ", hook_path.display());
+    install_copilot_hook_script()?;
+    println!("done");
+
+    let path = copilot_hooks_file_path().context("Could not determine Copilot CLI home dir")?;
+    let mut config = read_json_file_or_empty(&path)?;
+    if !config.is_object() {
+        config = json!({"version": 1});
+    }
+    if config.get("version").is_none() {
+        config["version"] = json!(1);
+    }
+    if config.get("hooks").is_none() {
+        config["hooks"] = json!({});
+    }
+
+    let hooks = config["hooks"]
+        .as_object_mut()
+        .context("hooks is not an object")?;
+
+    let mut added = 0;
+    let command_path = hook_path.to_string_lossy().to_string();
+
+    for &hook_type in COPILOT_HOOK_TYPES {
+        let hooks_array = hooks
+            .entry(hook_type)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .context("hook type is not an array")?;
+
+        if has_atm_copilot_hook(hooks_array, "atm-copilot-hook") {
+            println!("    {hook_type} - already configured");
+        } else {
+            // Copilot invokes the same script for every event array,
+            // so the event name is passed as an argument — see
+            // atm-copilot-hook and atm_copilot_adapter::wire. Quote
+            // the script path so a space in $HOME (or an unusual
+            // install location) doesn't split into the wrong argv.
+            hooks_array.push(json!({
+                "type": "command",
+                "command": format!("'{command_path}' {hook_type}"),
+            }));
+            added += 1;
+            println!("    {hook_type} - added");
+        }
+    }
+
+    if added > 0 {
+        write_json_file_pretty(&path, &config)?;
+        println!("  Copilot CLI configuration written.");
+    } else {
+        println!("  Copilot CLI already configured.");
+    }
+    Ok(())
+}
+
 /// Removes atm hooks from Claude Code settings and the hook script
 pub fn uninstall() -> Result<()> {
     println!("Uninstalling ATM...\n");
@@ -606,7 +885,7 @@ pub fn uninstall() -> Result<()> {
         for &hook_type in HOOK_TYPES {
             if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
                 let before = hooks_array.len();
-                remove_atm_hooks(hooks_array);
+                remove_atm_hooks(hooks_array, "atm-hook");
                 let after = hooks_array.len();
 
                 if before != after {
@@ -665,7 +944,73 @@ pub fn uninstall() -> Result<()> {
         }
     }
 
+    // Step 5: Remove Devin CLI hooks and hook script
+    uninstall_devin()?;
+
+    // Step 6: Remove Copilot CLI hooks and hook script
+    uninstall_copilot()?;
+
     println!("\nATM uninstalled successfully!");
+    Ok(())
+}
+
+/// Removes atm hooks from Devin CLI's config and the atm-devin-hook script.
+fn uninstall_devin() -> Result<()> {
+    if let Some(path) = devin_config_path() {
+        if path.exists() {
+            let mut config = read_json_file_or_empty(&path)?;
+            let mut removed = 0;
+            if let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+                for &hook_type in DEVIN_HOOK_TYPES {
+                    if let Some(hooks_array) =
+                        hooks.get_mut(hook_type).and_then(|h| h.as_array_mut())
+                    {
+                        let before = hooks_array.len();
+                        remove_atm_hooks(hooks_array, "atm-devin-hook");
+                        let after = hooks_array.len();
+                        removed += before - after;
+                        if hooks_array.is_empty() {
+                            hooks.remove(hook_type);
+                        }
+                    }
+                }
+                if removed > 0 {
+                    write_json_file_pretty(&path, &config)?;
+                }
+            }
+            println!(
+                "\nRemoved {removed} Devin CLI hook{} from {}",
+                if removed == 1 { "" } else { "s" },
+                path.display()
+            );
+        }
+    }
+
+    print!("Removing atm-devin-hook script... ");
+    if remove_devin_hook_script()? {
+        println!("done");
+    } else {
+        println!("not found");
+    }
+    Ok(())
+}
+
+/// Removes atm's standalone Copilot CLI hooks file and hook script.
+fn uninstall_copilot() -> Result<()> {
+    if let Some(path) = copilot_hooks_file_path() {
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove {}", path.display()))?;
+            println!("\nRemoved Copilot CLI hooks file {}", path.display());
+        }
+    }
+
+    print!("Removing atm-copilot-hook script... ");
+    if remove_copilot_hook_script()? {
+        println!("done");
+    } else {
+        println!("not found");
+    }
     Ok(())
 }
 

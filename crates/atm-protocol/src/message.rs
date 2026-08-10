@@ -36,6 +36,22 @@ pub enum MessageType {
         data: serde_json::Value,
     },
 
+    /// Hook event from Devin CLI (raw `RawDevinHookEvent` payload).
+    /// Translated by `atm-devin-adapter` at the daemon boundary.
+    /// Symmetric with [`Self::HookEvent`].
+    DevinEvent {
+        /// The raw hook event JSON (to be parsed)
+        data: serde_json::Value,
+    },
+
+    /// Hook event from GitHub Copilot CLI (raw `RawCopilotHookEvent`
+    /// payload). Translated by `atm-copilot-adapter` at the daemon
+    /// boundary. Symmetric with [`Self::HookEvent`].
+    CopilotEvent {
+        /// The raw hook event JSON (to be parsed)
+        data: serde_json::Value,
+    },
+
     /// Request current session list
     ListSessions,
 
@@ -100,6 +116,16 @@ impl ClientMessage {
     /// Creates a pi event message (raw pi-extension payload).
     pub fn pi_event(data: serde_json::Value) -> Self {
         Self::new(MessageType::PiEvent { data })
+    }
+
+    /// Creates a Devin CLI hook event message (Devin raw payload).
+    pub fn devin_event(data: serde_json::Value) -> Self {
+        Self::new(MessageType::DevinEvent { data })
+    }
+
+    /// Creates a Copilot CLI hook event message (Copilot raw payload).
+    pub fn copilot_event(data: serde_json::Value) -> Self {
+        Self::new(MessageType::CopilotEvent { data })
     }
 
     /// Creates a list sessions request.

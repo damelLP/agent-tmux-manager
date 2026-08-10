@@ -7,7 +7,7 @@ Real-time management for coding agents across tmux sessions.
 
 ## What it does
 
-ATM gives you a live dashboard and CLI for coding agents running in tmux, including Claude Code and pi. See context usage, cost, model, and activity at a glance — and control agents without switching panes.
+ATM gives you a live dashboard and CLI for coding agents running in tmux, including Claude Code, pi, Devin CLI, and GitHub Copilot CLI. See context usage, cost, model, and activity at a glance — and control agents without switching panes.
 
 - **Dashboard** — real-time TUI with session tree, context bars, cost tracking, and live terminal capture
 - **Agent control** — spawn, kill, interrupt, send text, and reply to prompts from the CLI
@@ -40,6 +40,8 @@ Sessions appear as you use supported coding-agent harnesses. Press `Enter` to ju
 ```bash
 atm spawn -m opus -d right         # spawn default harness with model and direction
 atm spawn --harness pi             # spawn a specific harness
+atm spawn --harness devin          # spawn Devin CLI
+atm spawn --harness copilot        # spawn GitHub Copilot CLI
 ATM_SPAWN_PI_BIN=mise ATM_SPAWN_PI_ARGS='x pi' atm spawn --harness pi
 ```
 
@@ -73,10 +75,10 @@ atm layout pair                    # two agents + ATM sidebar
 ## How it works
 
 ```
-Claude Code / pi  ──hook/extension──▶  atmd (daemon)  ◀──socket──  atm (TUI/CLI)
+Claude Code / pi / Devin CLI / Copilot CLI  ──hook/extension──▶  atmd (daemon)  ◀──socket──  atm (TUI/CLI)
 ```
 
-`atm setup` registers supported harness integrations (Claude Code hooks and the pi extension). Harness events are forwarded to the `atmd` daemon over a Unix socket, and `atm` connects for real-time display.
+`atm setup` registers supported harness integrations (Claude Code hooks, the pi extension, Devin CLI hooks, and Copilot CLI hooks). Harness events are forwarded to the `atmd` daemon over a Unix socket, and `atm` connects for real-time display.
 
 ## Documentation
 

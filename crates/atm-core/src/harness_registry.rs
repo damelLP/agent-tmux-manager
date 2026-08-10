@@ -111,6 +111,17 @@ const GEMINI_MATCHERS: &[ProcessMatcher] = &[
     ProcessMatcher::Contains("gemini-cli"),
 ];
 
+const DEVIN_MATCHERS: &[ProcessMatcher] = &[
+    ProcessMatcher::Exact("devin"),
+    ProcessMatcher::Suffix("/devin"),
+    ProcessMatcher::Contains("devin/cli/"),
+];
+
+const COPILOT_MATCHERS: &[ProcessMatcher] = &[
+    ProcessMatcher::Exact("copilot"),
+    ProcessMatcher::Suffix("/copilot"),
+];
+
 /// Built-in harness definitions.
 pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
     HarnessDefinition {
@@ -195,6 +206,34 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         version_args: &["--version"],
         process_matchers: GEMINI_MATCHERS,
         discovery_enabled: false,
+        allow_bare_cmdline_match: true,
+    },
+    HarnessDefinition {
+        id: "devin",
+        aliases: &["devin-cli"],
+        display_name: "Devin CLI",
+        harness: Harness::Devin,
+        binary: "devin",
+        default_args: &[],
+        model_flag: Some("--model"),
+        prompt_mode: PromptMode::KeystrokeInjection,
+        version_args: &["version"],
+        process_matchers: DEVIN_MATCHERS,
+        discovery_enabled: true,
+        allow_bare_cmdline_match: true,
+    },
+    HarnessDefinition {
+        id: "copilot",
+        aliases: &["copilot-cli", "gh-copilot"],
+        display_name: "GitHub Copilot CLI",
+        harness: Harness::Copilot,
+        binary: "copilot",
+        default_args: &[],
+        model_flag: Some("--model"),
+        prompt_mode: PromptMode::KeystrokeInjection,
+        version_args: &["--version"],
+        process_matchers: COPILOT_MATCHERS,
+        discovery_enabled: true,
         allow_bare_cmdline_match: true,
     },
 ];

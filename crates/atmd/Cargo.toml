@@ -24,6 +24,8 @@ atm-core = { workspace = true }
 atm-protocol = { workspace = true }
 atm-claude-adapter = { workspace = true }
 atm-pi-adapter = { workspace = true }
+atm-devin-adapter = { workspace = true }
+atm-copilot-adapter = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

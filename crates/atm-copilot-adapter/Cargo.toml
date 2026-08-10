@@ -1,0 +1,15 @@
+[package]
+name = "atm-copilot-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "GitHub Copilot CLI adapter for ATM — translates Copilot CLI raw hook events into vendor-neutral LifecycleEvent"
+
+[dependencies]
+atm-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

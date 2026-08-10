@@ -1,0 +1,103 @@
+#!/bin/bash
+# ATM Hook - Devin CLI hook handler
+# Handles all Devin CLI hook events: PreToolUse, PostToolUse, etc.
+#
+# Devin CLI's hook envelope (https://docs.devin.ai/cli/extensibility/hooks/overview)
+# already carries `hook_event_name` and `session_id` on stdin, so unlike
+# atm-copilot-hook this script doesn't need an event-name argument.
+#
+# CRITICAL: This script MUST:
+# - Always exit 0 (never break Devin CLI)
+# - Be non-blocking
+# - Handle daemon unavailability gracefully
+# - Be portable: Linux and macOS both run Devin CLI, so process-tree
+#   walking uses `ps` rather than assuming /proc exists.
+
+set -o pipefail
+
+SOCKET="${ATM_SOCKET:-/tmp/atm.sock}"
+DEBUG="${ATM_DEBUG:-0}"
+
+log_debug() {
+    if [ "$DEBUG" = "1" ]; then
+        echo "$(date -Iseconds 2>/dev/null || date) [atm-devin-hook] $1" >> /tmp/atm-hook.log
+    fi
+}
+
+# Find the actual Devin CLI process by walking up the process tree via
+# `ps` (works on Linux and macOS, unlike /proc-based walks).
+find_devin_pid() {
+    local pid=$PPID
+    local devin_pid=""
+    local depth=0
+    local max_depth=15
+
+    while [ "$depth" -lt "$max_depth" ] && [ -n "$pid" ] && [ "$pid" != "1" ] && [ "$pid" != "0" ]; do
+        local comm
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')
+        comm=$(basename "$comm" 2>/dev/null || echo "$comm")
+        [ "$comm" = "devin" ] && devin_pid=$pid
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        depth=$((depth + 1))
+    done
+
+    echo "${devin_pid:-}"
+}
+
+if [ ! -S "$SOCKET" ]; then
+    log_debug "Socket not found: $SOCKET"
+    exit 0
+fi
+
+input=$(cat)
+
+if [ -z "$input" ]; then
+    log_debug "Empty input received"
+    exit 0
+fi
+
+SESSION_ID=$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null)
+if [ -z "$SESSION_ID" ]; then
+    log_debug "No session_id in input"
+    exit 0
+fi
+
+HOOK_EVENT=$(echo "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)
+log_debug "Hook: $HOOK_EVENT for session $SESSION_ID"
+
+DEVIN_PID=$(find_devin_pid)
+
+CONNECT_MSG=$(cat <<EOF
+{"protocol_version":{"major":1,"minor":0},"type":"connect","client_id":"devin-hook-$SESSION_ID-$$"}
+EOF
+)
+
+TMUX_PANE_ID="${TMUX_PANE:-}"
+EXTRA_JSON="{}"
+[ -n "$DEVIN_PID" ] && EXTRA_JSON=$(echo "$EXTRA_JSON" | jq -c --argjson pid "$DEVIN_PID" '. + {pid: $pid}')
+[ -n "$TMUX_PANE_ID" ] && EXTRA_JSON=$(echo "$EXTRA_JSON" | jq -c --arg tmux_pane "$TMUX_PANE_ID" '. + {tmux_pane: $tmux_pane}')
+
+DATA_MSG=$(jq -c --argjson extra "$EXTRA_JSON" '{
+    "protocol_version": {"major": 1, "minor": 0},
+    "type": "devin_event",
+    "data": (. + $extra)
+}' <<< "$input" 2>/dev/null)
+
+if [ -z "$DATA_MSG" ] || [ "$DATA_MSG" = "null" ]; then
+    log_debug "Failed to build message"
+    exit 0
+fi
+
+if command -v socat &>/dev/null; then
+    { echo "$CONNECT_MSG"; echo "$DATA_MSG"; } | socat -t0.1 - "UNIX-CONNECT:$SOCKET" >/dev/null 2>&1 || {
+        log_debug "Failed to send via socat"
+    }
+else
+    { echo "$CONNECT_MSG"; echo "$DATA_MSG"; } | nc -w 1 -U "$SOCKET" >/dev/null 2>&1 || {
+        log_debug "Failed to send via nc"
+    }
+fi
+
+log_debug "Message sent successfully"
+
+exit 0

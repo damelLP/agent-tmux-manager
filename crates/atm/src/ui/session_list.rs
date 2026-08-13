@@ -262,11 +262,12 @@ fn harness_label(harness: &str) -> &str {
     }
 }
 
-/// Per-harness badge color so users can scan the list for pi sessions
-/// at a glance.
+/// Per-harness badge color so users can scan the list for non-Claude
+/// sessions at a glance.
 fn harness_color(harness: &str) -> Color {
     match harness {
         "pi" => Color::Magenta,
+        "codex" => Color::Cyan,
         "claude" | "" => Color::Yellow,
         _ => Color::DarkGray,
     }

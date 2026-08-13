@@ -138,6 +138,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atm-codex-adapter"
+version = "0.2.3"
+dependencies = [
+ "atm-claude-adapter",
+ "atm-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "atm-core"
 version = "0.2.3"
 dependencies = [
@@ -216,6 +226,7 @@ version = "0.2.3"
 dependencies = [
  "anyhow",
  "atm-claude-adapter",
+ "atm-codex-adapter",
  "atm-core",
  "atm-pi-adapter",
  "atm-protocol",

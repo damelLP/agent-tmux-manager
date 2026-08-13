@@ -1,0 +1,130 @@
+#!/bin/bash
+# ATM Codex Hook - Unified Codex CLI hook handler
+# Handles all Codex hook events: PreToolUse, PermissionRequest, Stop, etc.
+#
+# CRITICAL: This script MUST:
+# - Always exit 0 with no stdout (never break Codex; a silent exit-0
+#   hook is neutral for PermissionRequest — verified against codex-cli
+#   0.146.1: the approval dialog still renders normally)
+# - Be non-blocking (100ms timeout)
+# - Handle daemon unavailability gracefully
+
+set -o pipefail
+
+SOCKET="${ATM_SOCKET:-/tmp/atm.sock}"
+DEBUG="${ATM_DEBUG:-0}"
+
+# Debug logging (disabled by default)
+log_debug() {
+    if [ "$DEBUG" = "1" ]; then
+        echo "$(date -Iseconds) [atm-codex-hook] $1" >> /tmp/atm-codex-hook.log
+    fi
+}
+
+# Find the actual Codex process by walking up the process tree.
+# Codex is a node wrapper spawning a native binary; the hook's direct
+# parent has comm "codex" in practice, but walking the tree (like
+# atm-hook does for Claude) stays robust if intermediate shells appear.
+# Returns the PID of the last (highest) "codex" process found.
+find_codex_pid() {
+    local pid=$PPID
+    local codex_pid=""
+    local depth=0
+    local max_depth=15
+
+    while [ "$depth" -lt "$max_depth" ] && [ "$pid" != "1" ] && [ -n "$pid" ]; do
+        local comm
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || break
+        log_debug "Tree walk: depth=$depth pid=$pid comm=$comm"
+        [ "$comm" = "codex" ] && codex_pid=$pid
+        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
+        depth=$((depth + 1))
+    done
+
+    echo "${codex_pid:-}"
+}
+
+# Quick check - daemon available?
+if [ ! -S "$SOCKET" ]; then
+    log_debug "Socket not found: $SOCKET"
+    exit 0
+fi
+
+# Read hook event JSON from stdin (single read, not a loop!)
+input=$(cat)
+
+if [ -z "$input" ]; then
+    log_debug "Empty input received"
+    exit 0
+fi
+
+log_debug "Received: ${input:0:200}..."
+
+# Find the actual Codex process PID by walking the process tree
+CODEX_PID=$(find_codex_pid)
+if [ -z "$CODEX_PID" ]; then
+    log_debug "ERROR: Codex process not found in process tree (started from PPID=$PPID)"
+    exit 0
+fi
+log_debug "Resolved Codex PID: $CODEX_PID (walked from PPID=$PPID)"
+
+# Codex always sends hook_event_name and session_id (unlike Claude,
+# there is no statusline message shape to disambiguate).
+HOOK_EVENT=$(echo "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)
+SESSION_ID=$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null)
+
+if [ -z "$SESSION_ID" ] || [ -z "$HOOK_EVENT" ]; then
+    log_debug "Missing session_id or hook_event_name in input"
+    exit 0
+fi
+
+log_debug "Hook: $HOOK_EVENT for session $SESSION_ID"
+
+# Build protocol messages
+CONNECT_MSG=$(cat <<EOF
+{"protocol_version":{"major":1,"minor":0},"type":"connect","client_id":"codex-hook-$SESSION_ID-$$"}
+EOF
+)
+
+# Add PID and tmux pane to the data
+TMUX_PANE_ID="${TMUX_PANE:-}"
+if [ -n "$TMUX_PANE_ID" ]; then
+    DATA_MSG=$(jq -c --argjson pid "$CODEX_PID" --arg tmux_pane "$TMUX_PANE_ID" '{
+        "protocol_version": {"major": 1, "minor": 0},
+        "type": "codex_event",
+        "data": (. + {pid: $pid, tmux_pane: $tmux_pane})
+    }' <<< "$input" 2>/dev/null)
+else
+    DATA_MSG=$(jq -c --argjson pid "$CODEX_PID" '{
+        "protocol_version": {"major": 1, "minor": 0},
+        "type": "codex_event",
+        "data": (. + {pid: $pid})
+    }' <<< "$input" 2>/dev/null)
+fi
+
+if [ -z "$DATA_MSG" ] || [ "$DATA_MSG" = "null" ]; then
+    log_debug "Failed to build message"
+    exit 0
+fi
+
+# Send messages to daemon with timeout (non-blocking)
+if command -v socat &>/dev/null; then
+    {
+        echo "$CONNECT_MSG"
+        echo "$DATA_MSG"
+    } | timeout 0.1 socat -t0.1 - "UNIX-CONNECT:$SOCKET" >/dev/null 2>&1 || {
+        log_debug "Failed to send via socat"
+    }
+else
+    {
+        echo "$CONNECT_MSG"
+        echo "$DATA_MSG"
+    } | timeout 0.1 nc -U "$SOCKET" >/dev/null 2>&1 || {
+        log_debug "Failed to send via nc"
+    }
+fi
+
+log_debug "Message sent successfully"
+
+# ALWAYS exit 0 - never break Codex
+exit 0

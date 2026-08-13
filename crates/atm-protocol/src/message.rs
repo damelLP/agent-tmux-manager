@@ -36,6 +36,14 @@ pub enum MessageType {
         data: serde_json::Value,
     },
 
+    /// Hook event from the Codex CLI (raw `RawCodexEvent` payload).
+    /// Translated by `atm-codex-adapter` at the daemon boundary.
+    /// Symmetric with [`Self::HookEvent`] and [`Self::PiEvent`].
+    CodexEvent {
+        /// The raw codex event JSON (to be parsed)
+        data: serde_json::Value,
+    },
+
     /// Request current session list
     ListSessions,
 
@@ -100,6 +108,11 @@ impl ClientMessage {
     /// Creates a pi event message (raw pi-extension payload).
     pub fn pi_event(data: serde_json::Value) -> Self {
         Self::new(MessageType::PiEvent { data })
+    }
+
+    /// Creates a codex event message (raw Codex hook payload).
+    pub fn codex_event(data: serde_json::Value) -> Self {
+        Self::new(MessageType::CodexEvent { data })
     }
 
     /// Creates a list sessions request.
@@ -269,6 +282,28 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"connected\""));
         assert!(json.contains("\"client_id\":\"client-123\""));
+    }
+
+    #[test]
+    fn test_codex_event_roundtrip() {
+        let original = ClientMessage::codex_event(serde_json::json!({
+            "session_id": "s-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash"
+        }));
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"type\":\"codex_event\""));
+
+        let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+        match parsed.message {
+            MessageType::CodexEvent { data } => {
+                assert_eq!(
+                    data.get("hook_event_name").and_then(|v| v.as_str()),
+                    Some("PreToolUse")
+                );
+            }
+            _ => panic!("Expected CodexEvent message"),
+        }
     }
 
     #[test]

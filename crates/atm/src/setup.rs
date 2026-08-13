@@ -1,7 +1,7 @@
 //! Setup for ATM integrations across coding-agent harnesses.
 //!
-//! Detects which harnesses are installed (Claude Code, pi, future) and
-//! wires the matching hook for each:
+//! Detects which harnesses are installed (Claude Code, pi, Codex CLI,
+//! future) and wires the matching hook for each:
 //!
 //! - **Claude Code**: writes the `atm-hook` bash script to
 //!   `~/.local/bin/`, then registers it in `~/.claude/settings.json`'s
@@ -11,6 +11,12 @@
 //!   `"packages/pi-atm"` to `~/.pi/agent/settings.json`'s `packages`
 //!   array (the entry is resolved relative to pi's `agentDir`).
 //!   Mirrors how pi-amplike documents local-dev installs.
+//! - **Codex CLI**: writes the `atm-codex-hook` bash script to
+//!   `~/.local/bin/`, then registers it for every Codex hook event in
+//!   `~/.codex/hooks.json`'s `hooks` object (5s timeout per hook; no
+//!   statusLine equivalent exists). Codex requires a one-time trust
+//!   approval of non-managed hooks — `setup_codex` prints the `/hooks`
+//!   instruction for this.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -23,6 +29,9 @@ use serde_json::{json, Value};
 
 /// The atm-hook bash script content (Claude Code), embedded at compile time.
 const ATM_HOOK_SCRIPT: &str = include_str!("../scripts/atm-hook");
+
+/// The atm-codex-hook bash script content (Codex CLI), embedded at compile time.
+const ATM_CODEX_HOOK_SCRIPT: &str = include_str!("../scripts/atm-codex-hook");
 
 /// The pi-atm TypeScript extension content, embedded at compile time.
 /// pi loads `.ts` files directly via `@mariozechner/jiti`.
@@ -50,9 +59,39 @@ const HOOK_TYPES: &[&str] = &[
     "PermissionRequest",
 ];
 
+/// All Codex CLI hook types, per the official hooks documentation
+/// (validated against codex-cli 0.146.1). Unlike Claude, Codex has no
+/// `PostToolUseFailure`/`Setup`/`Notification`; it adds
+/// `PermissionRequest` and `PostCompact`.
+const CODEX_HOOK_TYPES: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "UserPromptSubmit",
+    "SessionStart",
+    "SessionEnd",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+];
+
 /// Returns the path to Claude Code settings.json
 fn claude_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
+}
+
+/// Returns the path to Codex's hooks.json
+fn codex_hooks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
+}
+
+/// Returns the path to the atm-codex-hook script
+fn codex_hook_script_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".local").join("bin").join("atm-codex-hook"))
+        .unwrap_or_else(|| PathBuf::from("/usr/local/bin/atm-codex-hook"))
 }
 
 /// Returns the path to the atm-hook script
@@ -153,8 +192,11 @@ fn create_hook_entry(hook_type: &str) -> Value {
     }
 }
 
-/// Checks if atm hooks are already installed for a hook type
-fn has_atm_hook(hooks_array: &[Value]) -> bool {
+/// Checks if a hook entry whose command contains `marker` is present
+/// in a hooks array. `marker` is the vendor script's basename
+/// (`atm-hook`, `atm-codex-hook`); the two never substring-match each
+/// other, and each lives in a different vendor settings file anyway.
+fn has_hook_command_marker(hooks_array: &[Value], marker: &str) -> bool {
     hooks_array.iter().any(|entry| {
         entry
             .get("hooks")
@@ -163,7 +205,7 @@ fn has_atm_hook(hooks_array: &[Value]) -> bool {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains("atm-hook"))
+                        .map(|cmd| cmd.contains(marker))
                         .unwrap_or(false)
                 })
             })
@@ -171,8 +213,8 @@ fn has_atm_hook(hooks_array: &[Value]) -> bool {
     })
 }
 
-/// Removes atm hooks from a hooks array
-fn remove_atm_hooks(hooks_array: &mut Vec<Value>) {
+/// Removes entries whose command contains `marker` from a hooks array.
+fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) {
     hooks_array.retain(|entry| {
         !entry
             .get("hooks")
@@ -181,7 +223,7 @@ fn remove_atm_hooks(hooks_array: &mut Vec<Value>) {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains("atm-hook"))
+                        .map(|cmd| cmd.contains(marker))
                         .unwrap_or(false)
                 })
             })
@@ -189,32 +231,35 @@ fn remove_atm_hooks(hooks_array: &mut Vec<Value>) {
     });
 }
 
-/// Installs the atm-hook script to ~/.local/bin/
-///
-/// Creates the directory if it doesn't exist and sets executable permissions.
-fn install_hook_script() -> Result<()> {
-    let hook_path = hook_script_path();
-
-    // Create parent directory if needed
-    if let Some(parent) = hook_path.parent() {
+/// Writes `content` to `path` (creating parent directories as needed)
+/// and marks it executable.
+fn install_executable_script(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    // Write the script
-    fs::write(&hook_path, ATM_HOOK_SCRIPT)
-        .with_context(|| format!("Failed to write {}", hook_path.display()))?;
+    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))?;
 
-    // Make executable on Unix
     #[cfg(unix)]
     {
-        let mut perms = fs::metadata(&hook_path)?.permissions();
+        let mut perms = fs::metadata(path)?.permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms)
-            .with_context(|| format!("Failed to set permissions on {}", hook_path.display()))?;
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
     }
 
     Ok(())
+}
+
+/// Removes the script at `path`, reporting whether it existed.
+fn remove_script_file(path: &Path) -> Result<bool> {
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Installs the ATM tmux keybindings file to ~/.config/atm/tmux-bindings.conf.
@@ -281,6 +326,52 @@ fn detect_pi() -> bool {
     dirs::home_dir()
         .map(|h| h.join(".pi/agent").exists())
         .unwrap_or(false)
+}
+
+/// True if the Codex CLI appears to be installed for this user.
+///
+/// Codex creates `~/.codex/` on first run (auth.json, config.toml,
+/// sessions/), regardless of where its binary lives.
+fn detect_codex() -> bool {
+    dirs::home_dir()
+        .map(|h| h.join(".codex").exists())
+        .unwrap_or(false)
+}
+
+// ============================================================================
+// Codex setup
+// ============================================================================
+
+/// Reads Codex's hooks.json. Returns an empty object if not present.
+fn read_codex_hooks() -> Result<Value> {
+    let path = codex_hooks_path().context("Could not determine home directory")?;
+    read_json_file_or_empty(&path)
+}
+
+/// Writes Codex's hooks.json
+fn write_codex_hooks(hooks: &Value) -> Result<()> {
+    let path = codex_hooks_path().context("Could not determine home directory")?;
+    write_json_file_pretty(&path, hooks)
+}
+
+/// Creates a Codex hook entry for the given hook type.
+///
+/// Shape validated against codex-cli 0.146.1: entries live under a
+/// top-level `hooks` object keyed by event name; omitting `matcher`
+/// fires for all tools. Codex clamps the SessionEnd hook timeout to
+/// 3s; 5s is a comfortable ceiling for the fire-and-forget script
+/// everywhere else.
+fn create_codex_hook_entry() -> Value {
+    let hook_path = codex_hook_script_path();
+    let command = hook_path.to_string_lossy().to_string();
+
+    json!({
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": 5
+        }]
+    })
 }
 
 // ============================================================================
@@ -391,19 +482,6 @@ fn uninstall_pi_extension() -> Result<bool> {
     Ok(changed)
 }
 
-/// Removes the atm-hook script from ~/.local/bin/
-fn remove_hook_script() -> Result<bool> {
-    let hook_path = hook_script_path();
-
-    if hook_path.exists() {
-        fs::remove_file(&hook_path)
-            .with_context(|| format!("Failed to remove {}", hook_path.display()))?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
 /// Returns the path to atm's own configuration file (`$XDG_CONFIG_HOME/atm/config.toml`).
 pub fn atm_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("atm/config.toml"))
@@ -466,6 +544,7 @@ pub fn setup() -> Result<()> {
     // will (and won't) be configured.
     let claude = detect_claude_code();
     let pi = detect_pi();
+    let codex = detect_codex();
 
     println!("Detected coding agents:");
     println!(
@@ -478,9 +557,16 @@ pub fn setup() -> Result<()> {
         if pi { "✓" } else { "✗" },
         if pi { "" } else { " not present" }
     );
+    println!(
+        "  {} Codex CLI    (~/.codex/{})",
+        if codex { "✓" } else { "✗" },
+        if codex { "" } else { " not present" }
+    );
 
-    if !claude && !pi {
-        println!("\nNo supported agent installations found. Install Claude Code or pi first.");
+    if !claude && !pi && !codex {
+        println!(
+            "\nNo supported agent installations found. Install Claude Code, pi, or Codex first."
+        );
         return Ok(());
     }
 
@@ -490,6 +576,10 @@ pub fn setup() -> Result<()> {
 
     if pi {
         setup_pi()?;
+    }
+
+    if codex {
+        setup_codex()?;
     }
 
     // Step N: Install tmux keybindings (vendor-neutral).
@@ -518,7 +608,7 @@ fn setup_claude_code() -> Result<()> {
     println!("\nConfiguring Claude Code...");
     let hook_path = hook_script_path();
     print!("  Installing hook script to {}... ", hook_path.display());
-    install_hook_script()?;
+    install_executable_script(&hook_path, ATM_HOOK_SCRIPT)?;
     println!("done");
 
     let mut settings = read_settings()?;
@@ -541,7 +631,7 @@ fn setup_claude_code() -> Result<()> {
             .as_array_mut()
             .context("hook type is not an array")?;
 
-        if has_atm_hook(hooks_array) {
+        if has_hook_command_marker(hooks_array, "atm-hook") {
             println!("    {hook_type} - already configured");
         } else {
             hooks_array.push(create_hook_entry(hook_type));
@@ -593,6 +683,60 @@ fn setup_pi() -> Result<()> {
     Ok(())
 }
 
+/// Wires `atm-codex-hook` into Codex's `~/.codex/hooks.json`.
+fn setup_codex() -> Result<()> {
+    println!("\nConfiguring Codex CLI...");
+    let hook_path = codex_hook_script_path();
+    print!("  Installing hook script to {}... ", hook_path.display());
+    install_executable_script(&hook_path, ATM_CODEX_HOOK_SCRIPT)?;
+    println!("done");
+
+    // A corrupted or hand-edited hooks.json that isn't an object would
+    // make the indexing below panic; replace any non-object root with
+    // `{}` (mirrors the guard in install_pi_extension).
+    let mut settings = read_codex_hooks()?;
+    if !settings.is_object() {
+        settings = json!({});
+    }
+
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = json!({});
+    }
+
+    let hooks = settings["hooks"]
+        .as_object_mut()
+        .context("hooks is not an object in codex hooks.json")?;
+
+    let mut added = 0;
+
+    for &hook_type in CODEX_HOOK_TYPES {
+        let hooks_array = hooks
+            .entry(hook_type)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .context("hook type is not an array")?;
+
+        if has_hook_command_marker(hooks_array, "atm-codex-hook") {
+            println!("    {hook_type} - already configured");
+        } else {
+            hooks_array.push(create_codex_hook_entry());
+            added += 1;
+            println!("    {hook_type} - added");
+        }
+    }
+
+    if added > 0 {
+        write_codex_hooks(&settings)?;
+        println!("  Codex configuration written.");
+        println!("\n  IMPORTANT: Codex requires one-time trust approval for hooks");
+        println!("  it did not create. Launch codex and run: /hooks");
+        println!("  then approve the atm-codex-hook entries when prompted.");
+    } else {
+        println!("  Codex already configured.");
+    }
+    Ok(())
+}
+
 /// Removes atm hooks from Claude Code settings and the hook script
 pub fn uninstall() -> Result<()> {
     println!("Uninstalling ATM...\n");
@@ -606,7 +750,7 @@ pub fn uninstall() -> Result<()> {
         for &hook_type in HOOK_TYPES {
             if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
                 let before = hooks_array.len();
-                remove_atm_hooks(hooks_array);
+                remove_hook_command_marker(hooks_array, "atm-hook");
                 let after = hooks_array.len();
 
                 if before != after {
@@ -649,7 +793,7 @@ pub fn uninstall() -> Result<()> {
     // Step 3: Remove the hook script
     let hook_path = hook_script_path();
     print!("\nRemoving hook script {}... ", hook_path.display());
-    if remove_hook_script()? {
+    if remove_script_file(&hook_script_path())? {
         println!("done");
     } else {
         println!("not found");
@@ -665,8 +809,108 @@ pub fn uninstall() -> Result<()> {
         }
     }
 
+    // Step 5: Remove Codex hooks and the codex hook script
+    if detect_codex() {
+        println!("\nRemoving Codex hooks...");
+        let mut codex_settings = read_codex_hooks()?;
+        let mut codex_removed = 0;
+        if let Some(hooks) = codex_settings
+            .get_mut("hooks")
+            .and_then(|h| h.as_object_mut())
+        {
+            for &hook_type in CODEX_HOOK_TYPES {
+                if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
+                    let before = hooks_array.len();
+                    remove_hook_command_marker(hooks_array, "atm-codex-hook");
+                    let after = hooks_array.len();
+
+                    if before != after {
+                        codex_removed += before - after;
+                        println!("  {hook_type} - removed");
+                    }
+
+                    if hooks_array.is_empty() {
+                        hooks.remove(hook_type);
+                    }
+                }
+            }
+
+            if codex_removed > 0 {
+                write_codex_hooks(&codex_settings)?;
+            }
+        }
+        if codex_removed == 0 {
+            println!("  No hooks found");
+        }
+
+        print!(
+            "Removing codex hook script {}... ",
+            codex_hook_script_path().display()
+        );
+        if remove_script_file(&codex_hook_script_path())? {
+            println!("done");
+        } else {
+            println!("not found");
+        }
+    }
+
     println!("\nATM uninstalled successfully!");
     Ok(())
+}
+
+#[cfg(test)]
+mod codex_hook_tests {
+    use super::{create_codex_hook_entry, has_hook_command_marker, remove_hook_command_marker};
+    use serde_json::json;
+
+    const MARKER: &str = "atm-codex-hook";
+
+    #[test]
+    fn hook_entry_shape_matches_codex_hooks_json_schema() {
+        let entry = create_codex_hook_entry();
+        // Validated shape: {"hooks": [{"type": "command", "command": ..., "timeout": 5}]}
+        let hooks = entry.get("hooks").and_then(|h| h.as_array()).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(
+            hooks[0].get("type").and_then(|t| t.as_str()),
+            Some("command")
+        );
+        assert!(hooks[0]
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("atm-codex-hook")));
+        assert_eq!(hooks[0].get("timeout").and_then(|t| t.as_u64()), Some(5));
+        // No matcher key: omitting it fires for all tools (spike-verified).
+        assert!(entry.get("matcher").is_none());
+    }
+
+    #[test]
+    fn detects_and_removes_only_atm_entries() {
+        let user_entry = json!({
+            "hooks": [{"type": "command", "command": "/usr/bin/my-own-hook"}]
+        });
+        let mut hooks_array = vec![user_entry.clone(), create_codex_hook_entry()];
+
+        assert!(has_hook_command_marker(&hooks_array, MARKER));
+        remove_hook_command_marker(&mut hooks_array, MARKER);
+        assert!(!has_hook_command_marker(&hooks_array, MARKER));
+        assert_eq!(
+            hooks_array,
+            vec![user_entry],
+            "user's own hook entries must be preserved"
+        );
+    }
+
+    #[test]
+    fn install_is_idempotent_at_the_entry_level() {
+        let mut hooks_array = vec![create_codex_hook_entry()];
+        // Mirrors setup_codex's guard: an already-present entry is not
+        // duplicated.
+        if !has_hook_command_marker(&hooks_array, MARKER) {
+            hooks_array.push(create_codex_hook_entry());
+        }
+        assert_eq!(hooks_array.len(), 1);
+    }
 }
 
 #[cfg(test)]

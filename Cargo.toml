@@ -18,6 +18,7 @@ members = [
     "crates/atm-tmux",
     "crates/atm-claude-adapter",
     "crates/atm-pi-adapter",
+    "crates/atm-codex-adapter",
     "crates/atmd",
     "crates/atm",
 ]
@@ -84,6 +85,7 @@ atm-protocol = { version = "0.2.3", path = "crates/atm-protocol" }
 atm-tmux = { version = "0.2.3", path = "crates/atm-tmux" }
 atm-claude-adapter = { version = "0.2.3", path = "crates/atm-claude-adapter" }
 atm-pi-adapter = { version = "0.2.3", path = "crates/atm-pi-adapter" }
+atm-codex-adapter = { version = "0.2.3", path = "crates/atm-codex-adapter" }
 atm-tui = { version = "0.2.3", path = "crates/atm" }
 atmd = { version = "0.2.3", path = "crates/atmd" }
 

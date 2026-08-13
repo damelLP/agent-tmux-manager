@@ -716,6 +716,6 @@ mod tests {
             .filter(|definition| definition.discovery_enabled)
             .map(|definition| definition.id)
             .collect();
-        assert_eq!(enabled, vec!["claude", "pi"]);
+        assert_eq!(enabled, vec!["claude", "pi", "codex"]);
     }
 }

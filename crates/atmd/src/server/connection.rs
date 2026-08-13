@@ -24,6 +24,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use atm_claude_adapter::RawHookEvent;
+use atm_codex_adapter::RawCodexEvent;
 use atm_core::SessionId;
 use atm_pi_adapter::RawPiEvent;
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
@@ -282,6 +283,10 @@ impl ConnectionHandler {
                 self.handle_pi_event(data).await?;
             }
 
+            MessageType::CodexEvent { data } => {
+                self.handle_codex_event(data).await?;
+            }
+
             MessageType::ListSessions => {
                 let sessions = self.registry.get_all_sessions().await;
                 self.send_message(DaemonMessage::session_list(sessions))
@@ -509,6 +514,64 @@ impl ConnectionHandler {
                 atm_core::Harness::Pi,
                 raw_event.pid,
                 raw_event.tmux_pane,
+            )
+            .await
+            .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Handles a hook event from the Codex CLI.
+    ///
+    /// Symmetric with [`Self::handle_hook_event`] (Claude) and
+    /// [`Self::handle_pi_event`] — parses raw codex-shaped JSON via
+    /// `atm-codex-adapter`, translates into a vendor-neutral
+    /// `LifecycleEvent`, and forwards to the registry. Codex always
+    /// sends a `session_id` (like Claude, unlike pi), so no
+    /// pending-from-pid fallback is needed here.
+    async fn handle_codex_event(&mut self, data: serde_json::Value) -> Result<(), ConnectionError> {
+        debug!(client_id = ?self.client_id, "Received codex event data");
+
+        let raw_event: RawCodexEvent =
+            serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+
+        debug!(
+            session_id = %raw_event.session_id(),
+            event_type = ?raw_event.event_type(),
+            pid = ?raw_event.pid,
+            tmux_pane = ?raw_event.tmux_pane,
+            "Processing codex event"
+        );
+
+        // Same suppression contract as the Claude/pi handlers:
+        // `to_lifecycle_event` returns `None` for unknown event names
+        // (a future Codex event we don't translate yet) and for
+        // known-but-malformed payloads (PreToolUse/PostToolUse without
+        // a tool_name). Log at debug and move on.
+        let lifecycle = match raw_event.to_lifecycle_event() {
+            Some(le) => le,
+            None => {
+                debug!(
+                    hook_event_name = %raw_event.hook_event_name,
+                    event_type = ?raw_event.event_type(),
+                    tool_name = ?raw_event.tool_name,
+                    "codex event suppressed by adapter"
+                );
+                return Ok(());
+            }
+        };
+
+        let session_id = raw_event.session_id();
+        let pid = raw_event.pid;
+        let tmux_pane = raw_event.tmux_pane.clone();
+
+        self.registry
+            .apply_lifecycle_event(
+                session_id,
+                lifecycle,
+                atm_core::Harness::Codex,
+                pid,
+                tmux_pane,
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;

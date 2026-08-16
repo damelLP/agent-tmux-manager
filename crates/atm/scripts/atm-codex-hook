@@ -25,7 +25,7 @@ log_debug() {
 # Codex is a node wrapper spawning a native binary; the hook's direct
 # parent has comm "codex" in practice, but walking the tree (like
 # atm-hook does for Claude) stays robust if intermediate shells appear.
-# Returns the PID of the last (highest) "codex" process found.
+# Returns the PID of the first (nearest) "codex" process found.
 find_codex_pid() {
     local pid=$PPID
     local codex_pid=""
@@ -36,7 +36,10 @@ find_codex_pid() {
         local comm
         comm=$(cat "/proc/$pid/comm" 2>/dev/null) || break
         log_debug "Tree walk: depth=$depth pid=$pid comm=$comm"
-        [ "$comm" = "codex" ] && codex_pid=$pid
+        if [ "$comm" = "codex" ]; then
+            codex_pid=$pid
+            break
+        fi
         pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
         depth=$((depth + 1))
     done

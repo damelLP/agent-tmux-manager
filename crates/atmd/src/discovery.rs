@@ -328,10 +328,10 @@ fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
 /// matches via a path-like cmdline argument, its native child via
 /// `/proc/{pid}/exe`), which would register one agent as two sessions.
 ///
-/// Winner selection mirrors the vendor hook scripts' PID resolution
-/// (walk the tree, prefer processes whose `comm` equals the harness
-/// binary, keep the topmost) so the session created by discovery is the
-/// same one later hook events reconcile onto — never a ghost.
+/// A pair is collapsed only when one member's `comm` equals the harness
+/// binary and the other's does not. That is evidence of the observed
+/// wrapper/native shape; ancestry alone is insufficient because one real
+/// agent can launch another agent of the same harness.
 ///
 /// Ancestry is only collapsed *within* a harness: an agent spawning a
 /// different vendor's agent (e.g. Claude driving a Codex) stays two
@@ -357,25 +357,14 @@ fn dedupe_wrapper_chains(matches: Vec<ProcessMatch>) -> Vec<DiscoveredProcess> {
         .collect()
 }
 
-/// True if `a` should be kept in place of `b`: same harness, related by
-/// ancestry, and outranking `b` (comm-matching beats non-matching;
-/// within the same class the ancestor wins).
+/// True if `a` is the binary member of a same-harness wrapper/native pair.
 fn supersedes(a: &ProcessMatch, b: &ProcessMatch) -> bool {
-    if a.process.harness != b.process.harness {
+    if a.process.harness != b.process.harness || !a.comm_is_binary || b.comm_is_binary {
         return false;
     }
     let a_is_ancestor = b.ancestor_pids.contains(&a.process.pid);
     let b_is_ancestor = a.ancestor_pids.contains(&b.process.pid);
-    if !a_is_ancestor && !b_is_ancestor {
-        return false;
-    }
-    match (a.comm_is_binary, b.comm_is_binary) {
-        (true, false) => true,
-        (false, true) => false,
-        // Same comm class: the topmost process wins, matching the hook
-        // scripts' walk-up-and-keep-highest PID resolution.
-        _ => a_is_ancestor,
-    }
+    a_is_ancestor || b_is_ancestor
 }
 
 /// Reads the parent PID from `/proc/{pid}/stat`.
@@ -891,19 +880,19 @@ mod tests {
     }
 
     #[test]
-    fn chain_where_both_comm_match_keeps_topmost() {
-        // If wrapper and child BOTH have the binary comm, the hook
-        // scripts' walk keeps the highest one — discovery must agree.
-        let parent = fake_match(100, Harness::ClaudeCode, vec![50, 1], true);
-        let child = fake_match(200, Harness::ClaudeCode, vec![100, 50, 1], true);
-        assert_eq!(kept_pids(vec![parent, child]), vec![100]);
+    fn nested_same_harness_binary_processes_are_all_kept() {
+        for harness in [Harness::ClaudeCode, Harness::Pi, Harness::Codex] {
+            let parent = fake_match(100, harness, vec![50, 1], true);
+            let child = fake_match(200, harness, vec![100, 50, 1], true);
+            assert_eq!(kept_pids(vec![parent, child]), vec![100, 200]);
+        }
     }
 
     #[test]
-    fn chain_without_any_comm_match_keeps_topmost() {
+    fn related_nonbinary_matches_are_all_kept() {
         let parent = fake_match(100, Harness::Codex, vec![50, 1], false);
         let child = fake_match(200, Harness::Codex, vec![100, 50, 1], false);
-        assert_eq!(kept_pids(vec![parent, child]), vec![100]);
+        assert_eq!(kept_pids(vec![parent, child]), vec![100, 200]);
     }
 
     #[test]

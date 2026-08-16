@@ -564,17 +564,35 @@ impl ConnectionHandler {
         let session_id = raw_event.session_id();
         let pid = raw_event.pid;
         let tmux_pane = raw_event.tmux_pane.clone();
+        let model = raw_event.model.clone();
+        let ends_session = matches!(lifecycle, atm_core::LifecycleEvent::SessionEnd { .. });
 
         self.registry
             .apply_lifecycle_event(
-                session_id,
+                session_id.clone(),
                 lifecycle,
                 atm_core::Harness::Codex,
                 pid,
-                tmux_pane,
+                tmux_pane.clone(),
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+
+        if !ends_session && model.is_some() {
+            self.registry
+                .apply_lifecycle_event(
+                    session_id,
+                    atm_core::LifecycleEvent::ProviderModelChange {
+                        provider: None,
+                        model,
+                    },
+                    atm_core::Harness::Codex,
+                    pid,
+                    tmux_pane,
+                )
+                .await
+                .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        }
 
         Ok(())
     }

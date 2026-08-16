@@ -1162,6 +1162,36 @@ fn codex_event_json(
 }
 
 #[tokio::test]
+async fn test_e2e_codex_session_start_applies_model() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let session_id = SessionId::new("e2e-codex-model");
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "SessionStart",
+            serde_json::json!({
+                "source": "startup",
+                "model": "gpt-5.6-sol",
+                "pid": std::process::id()
+            }),
+        )))
+        .await;
+
+    sleep(Duration::from_millis(50)).await;
+
+    let view = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("SessionStart should create the session");
+    assert_eq!(view.model, "gpt-5.6-sol");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_e2e_codex_pre_tool_use_translates_to_tool_call_start() {
     let (server, registry) = TestServer::spawn_with_registry().await;
     let mut client = server.connect().await;

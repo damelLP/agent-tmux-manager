@@ -1134,6 +1134,308 @@ async fn test_e2e_pi_suppressed_event_does_not_panic_or_disrupt() {
     server.shutdown().await;
 }
 
+// ============================================================================
+// Codex Event → LifecycleEvent translation (end-to-end)
+//
+// Symmetric with the Claude and pi blocks above: drives real Codex raw
+// hook JSON (shapes captured from codex-cli 0.146.1 during the
+// 2026-08-10 spike) over the wire via `ClientMessage::codex_event` and
+// asserts on the resulting session state.
+// ============================================================================
+
+/// Builds a raw Codex hook-event JSON payload for the given session.
+fn codex_event_json(
+    session_id: &str,
+    event_name: &str,
+    extras: serde_json::Value,
+) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": event_name,
+    });
+    if let (Some(map), Some(extras)) = (obj.as_object_mut(), extras.as_object()) {
+        for (k, v) in extras {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    obj
+}
+
+#[tokio::test]
+async fn test_e2e_codex_session_start_applies_model() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let session_id = SessionId::new("e2e-codex-model");
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "SessionStart",
+            serde_json::json!({
+                "source": "startup",
+                "model": "gpt-5.6-sol",
+                "pid": std::process::id()
+            }),
+        )))
+        .await;
+
+    sleep(Duration::from_millis(50)).await;
+
+    let view = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("SessionStart should create the session");
+    assert_eq!(view.model, "gpt-5.6-sol");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_codex_event_applies_transcript_token_usage() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let transcript_dir = tempfile::tempdir().expect("create transcript directory");
+    let transcript_path = transcript_dir.path().join("rollout.jsonl");
+    std::fs::write(
+        &transcript_path,
+        concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"total_tokens\":94375},",
+            "\"last_token_usage\":{\"total_tokens\":25298},",
+            "\"model_context_window\":258400}}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
+        ),
+    )
+    .expect("write transcript");
+
+    let session_id = SessionId::new("e2e-codex-context");
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "SessionStart",
+            serde_json::json!({
+                "source": "startup",
+                "model": "gpt-5.6-sol",
+                "pid": std::process::id(),
+                "transcript_path": transcript_path
+            }),
+        )))
+        .await;
+
+    sleep(Duration::from_millis(50)).await;
+
+    let view = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("SessionStart should create the session");
+    assert!((view.context_percentage - 9.790_247).abs() < 0.001);
+    assert_eq!(view.context_display, "9.8% (25K/258K)");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_codex_pre_tool_use_translates_to_tool_call_start() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let session_id = SessionId::new("e2e-codex-tool");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "PreToolUse",
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+                "tool_use_id": "exec-0faab0a6"
+            }),
+        )))
+        .await;
+
+    sleep(Duration::from_millis(50)).await;
+
+    let view = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("session should still exist");
+    assert_eq!(
+        view.status_label, "working",
+        "PreToolUse(Bash) should translate to ToolCallStart -> Working"
+    );
+    assert_eq!(view.activity_detail, Some("Bash".into()));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_codex_permission_request_becomes_needs_input() {
+    // The load-bearing Codex-specific case: a vendor-signaled
+    // permission gate (not inferred from an interactive-tool
+    // allowlist) must flip the session to needs-input.
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let session_id = SessionId::new("e2e-codex-perm");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+
+    // Spike-verified ordering: PreToolUse fires first for the same
+    // gated call, then PermissionRequest.
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "PreToolUse",
+            serde_json::json!({"tool_name": "Bash"}),
+        )))
+        .await;
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "PermissionRequest",
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "touch x"}
+            }),
+        )))
+        .await;
+
+    sleep(Duration::from_millis(50)).await;
+
+    let view = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("session should still exist");
+    assert_eq!(
+        view.status_label, "needs input",
+        "PermissionRequest should translate to NeedsInput(PermissionGate) -> AttentionNeeded"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_codex_stop_translates_to_idle() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let session_id = SessionId::new("e2e-codex-stop");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "PreToolUse",
+            serde_json::json!({"tool_name": "Bash"}),
+        )))
+        .await;
+    sleep(Duration::from_millis(50)).await;
+
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "Stop",
+            serde_json::json!({"stop_hook_active": false, "last_assistant_message": "done"}),
+        )))
+        .await;
+    sleep(Duration::from_millis(50)).await;
+
+    let view = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("session should still exist after Stop");
+    assert_eq!(
+        view.status_label, "idle",
+        "Stop should translate to WorkingEnd -> Idle"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_codex_session_end_removes_session() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let session_id = SessionId::new("e2e-codex-end");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+
+    assert!(registry.get_session(session_id.clone()).await.is_some());
+
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "SessionEnd",
+            serde_json::json!({"reason": "other"}),
+        )))
+        .await;
+    sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        registry.get_session(session_id.clone()).await.is_none(),
+        "SessionEnd should remove the session from the registry"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_codex_malformed_tool_event_is_suppressed() {
+    // PreToolUse without a tool_name is dropped by the adapter guard.
+    // The connection layer should accept it silently and leave session
+    // state unchanged.
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let session_id = SessionId::new("e2e-codex-malformed");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+
+    let before = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("exists");
+
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "PreToolUse",
+            serde_json::json!({}),
+        )))
+        .await;
+    sleep(Duration::from_millis(50)).await;
+
+    let after = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("still exists");
+    assert_eq!(before.status_label, after.status_label);
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_concurrent_ping_pong() {
     let server = TestServer::spawn().await;

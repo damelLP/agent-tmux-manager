@@ -152,7 +152,9 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         prompt_mode: PromptMode::KeystrokeInjection,
         version_args: &["--version"],
         process_matchers: CODEX_MATCHERS,
-        discovery_enabled: false,
+        // Enabled since atm-codex-adapter landed: hook events flow via
+        // atm-codex-hook, so discovered codex sessions get live status.
+        discovery_enabled: true,
         allow_bare_cmdline_match: true,
     },
     HarnessDefinition {

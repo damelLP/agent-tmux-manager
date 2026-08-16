@@ -24,6 +24,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use atm_claude_adapter::RawHookEvent;
+use atm_codex_adapter::RawCodexEvent;
 use atm_core::SessionId;
 use atm_pi_adapter::RawPiEvent;
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
@@ -57,6 +58,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Write timeout (10 seconds)
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Token usage is optional metadata and must never delay hook handling.
+const CODEX_TRANSCRIPT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Unique identifier for this connection
 type ClientId = String;
@@ -280,6 +284,10 @@ impl ConnectionHandler {
 
             MessageType::PiEvent { data } => {
                 self.handle_pi_event(data).await?;
+            }
+
+            MessageType::CodexEvent { data } => {
+                self.handle_codex_event(data).await?;
             }
 
             MessageType::ListSessions => {
@@ -512,6 +520,126 @@ impl ConnectionHandler {
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Handles a hook event from the Codex CLI.
+    ///
+    /// Symmetric with [`Self::handle_hook_event`] (Claude) and
+    /// [`Self::handle_pi_event`] — parses raw codex-shaped JSON via
+    /// `atm-codex-adapter`, translates into a vendor-neutral
+    /// `LifecycleEvent`, and forwards to the registry. Codex always
+    /// sends a `session_id` (like Claude, unlike pi), so no
+    /// pending-from-pid fallback is needed here.
+    async fn handle_codex_event(&mut self, data: serde_json::Value) -> Result<(), ConnectionError> {
+        debug!(client_id = ?self.client_id, "Received codex event data");
+
+        let raw_event: RawCodexEvent =
+            serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+
+        debug!(
+            session_id = %raw_event.session_id(),
+            event_type = ?raw_event.event_type(),
+            pid = ?raw_event.pid,
+            tmux_pane = ?raw_event.tmux_pane,
+            "Processing codex event"
+        );
+
+        // Same suppression contract as the Claude/pi handlers:
+        // `to_lifecycle_event` returns `None` for unknown event names
+        // (a future Codex event we don't translate yet) and for
+        // known-but-malformed payloads (PreToolUse/PostToolUse without
+        // a tool_name). Log at debug and move on.
+        let lifecycle = match raw_event.to_lifecycle_event() {
+            Some(le) => le,
+            None => {
+                debug!(
+                    hook_event_name = %raw_event.hook_event_name,
+                    event_type = ?raw_event.event_type(),
+                    tool_name = ?raw_event.tool_name,
+                    "codex event suppressed by adapter"
+                );
+                return Ok(());
+            }
+        };
+
+        let session_id = raw_event.session_id();
+        let pid = raw_event.pid;
+        let tmux_pane = raw_event.tmux_pane.clone();
+        let model = raw_event.model.clone();
+        let transcript_path = raw_event.transcript_path.clone();
+        let ends_session = matches!(lifecycle, atm_core::LifecycleEvent::SessionEnd { .. });
+
+        self.registry
+            .apply_lifecycle_event(
+                session_id.clone(),
+                lifecycle,
+                atm_core::Harness::Codex,
+                pid,
+                tmux_pane.clone(),
+            )
+            .await
+            .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+
+        if !ends_session && model.is_some() {
+            self.registry
+                .apply_lifecycle_event(
+                    session_id.clone(),
+                    atm_core::LifecycleEvent::ProviderModelChange {
+                        provider: None,
+                        model,
+                    },
+                    atm_core::Harness::Codex,
+                    pid,
+                    tmux_pane.clone(),
+                )
+                .await
+                .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        }
+
+        // Codex has no status-line hook, but its rollout transcript
+        // currently persists token_count records. Read only a bounded
+        // tail on the blocking pool and treat every parsing/I/O failure
+        // as unavailable metadata: lifecycle handling must still win.
+        if !ends_session {
+            let usage = match transcript_path.filter(|path| !path.is_empty()) {
+                Some(path) => {
+                    let task = tokio::task::spawn_blocking(move || {
+                        atm_codex_adapter::read_token_usage(path)
+                    });
+                    match timeout(CODEX_TRANSCRIPT_READ_TIMEOUT, task).await {
+                        Ok(Ok(Ok(usage))) => usage,
+                        Ok(Ok(Err(error))) => {
+                            debug!(%error, "Codex transcript token usage unavailable");
+                            None
+                        }
+                        Ok(Err(error)) => {
+                            debug!(%error, "Codex transcript reader task failed");
+                            None
+                        }
+                        Err(_) => {
+                            warn!("Codex transcript token usage read timed out");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            if let Some(usage) = usage {
+                self.registry
+                    .apply_lifecycle_event(
+                        session_id,
+                        usage.to_lifecycle_event(),
+                        atm_core::Harness::Codex,
+                        pid,
+                        tmux_pane,
+                    )
+                    .await
+                    .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+            }
+        }
 
         Ok(())
     }

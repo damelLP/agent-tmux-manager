@@ -196,10 +196,18 @@ pub enum LifecycleEvent {
     /// (Claude: `auto`/`manual`).
     ContextCompactStart { trigger: Option<String> },
 
-    /// Periodic context-usage update (tokens used, accumulated cost).
-    /// Either field may be `None` if the vendor doesn't expose it.
+    /// Periodic context-usage update.
+    ///
+    /// `tokens` is the cumulative session total. Vendors that expose
+    /// the active request/context separately can also provide
+    /// `current_tokens` and its `context_window_size`. Every field is
+    /// optional because vendors expose different subsets.
     ContextUpdate {
         tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window_size: Option<u32>,
         cost_usd: Option<f64>,
     },
 
@@ -302,6 +310,8 @@ mod tests {
             },
             LifecycleEvent::ContextUpdate {
                 tokens: Some(1024),
+                current_tokens: Some(512),
+                context_window_size: Some(200_000),
                 cost_usd: Some(0.05),
             },
             LifecycleEvent::ProviderModelChange {
@@ -326,6 +336,23 @@ mod tests {
             let back: LifecycleEvent = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(ev, back, "roundtrip failed: {json}");
         }
+    }
+
+    #[test]
+    fn context_update_deserializes_legacy_shape() {
+        let event: LifecycleEvent =
+            serde_json::from_str(r#"{"type":"context_update","tokens":1024,"cost_usd":null}"#)
+                .expect("deserialize legacy context update");
+
+        assert_eq!(
+            event,
+            LifecycleEvent::ContextUpdate {
+                tokens: Some(1024),
+                current_tokens: None,
+                context_window_size: None,
+                cost_usd: None,
+            }
+        );
     }
 
     #[test]

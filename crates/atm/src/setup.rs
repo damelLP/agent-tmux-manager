@@ -809,7 +809,7 @@ pub fn uninstall() -> Result<()> {
         }
     }
 
-    // Step 5: Remove Codex hooks and the codex hook script
+    // Step 5: Remove Codex hooks if configured
     if detect_codex() {
         println!("\nRemoving Codex hooks...");
         let mut codex_settings = read_codex_hooks()?;
@@ -842,16 +842,18 @@ pub fn uninstall() -> Result<()> {
         if codex_removed == 0 {
             println!("  No hooks found");
         }
+    }
 
-        print!(
-            "Removing codex hook script {}... ",
-            codex_hook_script_path().display()
-        );
-        if remove_script_file(&codex_hook_script_path())? {
-            println!("done");
-        } else {
-            println!("not found");
-        }
+    // The script can remain after ~/.codex is removed, so clean it up
+    // independently of Codex installation detection.
+    print!(
+        "\nRemoving codex hook script {}... ",
+        codex_hook_script_path().display()
+    );
+    if remove_script_file(&codex_hook_script_path())? {
+        println!("done");
+    } else {
+        println!("not found");
     }
 
     println!("\nATM uninstalled successfully!");

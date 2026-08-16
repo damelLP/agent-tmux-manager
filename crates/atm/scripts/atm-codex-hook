@@ -40,7 +40,10 @@ find_codex_pid() {
             codex_pid=$pid
             break
         fi
-        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
+        local proc_stat after_comm _state _rest
+        proc_stat=$(cat "/proc/$pid/stat" 2>/dev/null) || break
+        after_comm=${proc_stat##*)}
+        read -r _state pid _rest <<< "$after_comm" || break
         depth=$((depth + 1))
     done
 

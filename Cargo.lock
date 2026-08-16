@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "atm"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "atm-core",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "atm-claude-adapter"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "atm-core",
  "serde",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "atm-codex-adapter"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "atm-claude-adapter",
  "atm-core",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "atm-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "procfs",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "atm-pi-adapter"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "atm-claude-adapter",
  "atm-core",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "atm-protocol"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "atm-core",
  "chrono",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "atm-tmux"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "dirs",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "atm-tui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "atm-core",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "atmd"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "atm-claude-adapter",

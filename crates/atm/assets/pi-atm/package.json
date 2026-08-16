@@ -1,6 +1,6 @@
 {
   "name": "pi-atm",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "pi extension that forwards lifecycle events to the ATM daemon for monitoring in the ATM TUI",
   "type": "module",
   "files": ["extensions/", "README.md", "LICENSE"],

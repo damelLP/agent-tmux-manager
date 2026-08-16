@@ -30,8 +30,10 @@
 //! - `PostToolUse` carries **no error signal**: `tool_response` is a
 //!   plain string of raw output with no `is_error`/`success` field, so
 //!   `ToolCallEnd.is_error` is always `false` for Codex.
-//! - Codex has no status-line equivalent, so no `ContextUpdate`
-//!   (tokens/cost) events are produced for Codex sessions.
+//! - Codex has no status-line equivalent. Context usage is read
+//!   defensively from the bounded tail of the rollout transcript path
+//!   included in hook events; unavailable or changed transcript data
+//!   never prevents the hook event itself from being processed.
 //! - `PreToolUse` fires *before* `PermissionRequest` for the same gated
 //!   call, and a `PreToolUse` may arrive with no matching `PostToolUse`
 //!   (aborted call) — downstream state handles both orderings.
@@ -39,13 +41,16 @@
 //! ## Layers
 //!
 //! - [`event`] — `CodexEventType` enum (the 11 Codex hook event names)
+//! - [`transcript`] — bounded, best-effort rollout token-usage reader
 //! - [`wire`] — `RawCodexEvent` struct (deserialized JSON Codex sends
 //!   on stdin to the hook script)
 //! - [`translate`] — translation from raw event to `LifecycleEvent`
 
 pub mod event;
+pub mod transcript;
 pub mod translate;
 pub mod wire;
 
 pub use event::CodexEventType;
+pub use transcript::{read_token_usage, CodexTokenUsage};
 pub use wire::RawCodexEvent;

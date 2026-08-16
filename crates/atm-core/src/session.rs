@@ -761,31 +761,38 @@ impl SessionDomain {
                 self.status = SessionStatus::Working;
                 self.current_activity = Some(ActivityDetail::with_context("Compacting"));
             }
-            LifecycleEvent::ContextUpdate { tokens, cost_usd } => {
-                // Pi (and future vendors) emit cumulative cost/tokens
-                // through this variant — there's no "status line"
-                // periodic update like Claude. Fold the values into
-                // the same `Session.cost` / `Session.context` fields
-                // the Claude path uses, so the TUI displays them
-                // identically regardless of vendor.
+            LifecycleEvent::ContextUpdate {
+                tokens,
+                current_tokens,
+                context_window_size,
+                cost_usd,
+            } => {
+                // Vendors without a Claude-style status line emit the
+                // context data they expose through this variant. Fold
+                // it into the same fields the Claude path uses so the
+                // TUI renders every harness consistently.
                 if let Some(c) = cost_usd {
                     self.cost = Money::from_usd(*c);
                 }
                 if let Some(t) = tokens {
-                    // Pi reports cumulative total tokens for the
-                    // session. The TUI's percentage display reads
-                    // `context_tokens()` which sums Claude's
-                    // current_input + cache_read + cache_creation —
-                    // none of which pi populates. To make pi sessions
-                    // surface a non-zero context bar, mirror pi's
-                    // cumulative figure into `current_input_tokens`
-                    // (the largest summand of `context_tokens()`).
-                    // Also keep `total_input_tokens` set for the
-                    // detail-panel "total tokens" display, even though
-                    // it doesn't affect the percentage.
-                    let count = TokenCount::new(*t);
-                    self.context.current_input_tokens = count;
-                    self.context.total_input_tokens = count;
+                    // ContextUpdate carries one cumulative aggregate,
+                    // rather than an input/output breakdown. Store it
+                    // in the input bucket so `total_tokens()` retains
+                    // the correct aggregate.
+                    self.context.total_input_tokens = TokenCount::new(*t);
+                    self.context.total_output_tokens = TokenCount::default();
+                }
+                // Pi only exposes the cumulative figure, so retain the
+                // historical fallback. Codex supplies a distinct active
+                // context count and does not need that approximation.
+                if let Some(t) = current_tokens.or(*tokens) {
+                    self.context.current_input_tokens = TokenCount::new(t);
+                    self.context.current_output_tokens = TokenCount::default();
+                    self.context.cache_creation_tokens = TokenCount::default();
+                    self.context.cache_read_tokens = TokenCount::default();
+                }
+                if let Some(size) = context_window_size.filter(|size| *size > 0) {
+                    self.context.context_window_size = size;
                 }
                 // Status unchanged: cost/token updates don't
                 // imply a state transition.
@@ -1441,6 +1448,39 @@ mod tests {
     fn test_session_id_pending_pid_returns_none_for_invalid_pid() {
         let id = SessionId::new("pending-not-a-number");
         assert_eq!(id.pending_pid(), None);
+    }
+
+    #[test]
+    fn lifecycle_context_update_tracks_current_and_cumulative_tokens() {
+        let mut session = create_test_session("test-context-update");
+
+        session.apply_lifecycle_event(&LifecycleEvent::ContextUpdate {
+            tokens: Some(94_375),
+            current_tokens: Some(25_298),
+            context_window_size: Some(258_400),
+            cost_usd: None,
+        });
+
+        assert_eq!(session.context.total_tokens().as_u64(), 94_375);
+        assert_eq!(session.context.context_tokens().as_u64(), 25_298);
+        assert_eq!(session.context.context_window_size, 258_400);
+        assert!((session.context.usage_percentage() - 9.790_247).abs() < 0.001);
+    }
+
+    #[test]
+    fn lifecycle_context_update_keeps_cumulative_fallback_for_pi() {
+        let mut session = create_test_session("test-context-update-fallback");
+
+        session.apply_lifecycle_event(&LifecycleEvent::ContextUpdate {
+            tokens: Some(1_143),
+            current_tokens: None,
+            context_window_size: None,
+            cost_usd: Some(0.00709),
+        });
+
+        assert_eq!(session.context.total_tokens().as_u64(), 1_143);
+        assert_eq!(session.context.context_tokens().as_u64(), 1_143);
+        assert_eq!(session.cost.as_usd(), 0.00709);
     }
 
     #[test]

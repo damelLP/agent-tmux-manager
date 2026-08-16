@@ -16,3 +16,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 atm-claude-adapter = { workspace = true }
+tempfile = { workspace = true }

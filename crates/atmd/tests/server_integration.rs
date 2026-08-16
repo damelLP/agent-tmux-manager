@@ -1192,6 +1192,52 @@ async fn test_e2e_codex_session_start_applies_model() {
 }
 
 #[tokio::test]
+async fn test_e2e_codex_event_applies_transcript_token_usage() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let transcript_dir = tempfile::tempdir().expect("create transcript directory");
+    let transcript_path = transcript_dir.path().join("rollout.jsonl");
+    std::fs::write(
+        &transcript_path,
+        concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"total_tokens\":94375},",
+            "\"last_token_usage\":{\"total_tokens\":25298},",
+            "\"model_context_window\":258400}}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
+        ),
+    )
+    .expect("write transcript");
+
+    let session_id = SessionId::new("e2e-codex-context");
+    client
+        .send(ClientMessage::codex_event(codex_event_json(
+            session_id.as_str(),
+            "SessionStart",
+            serde_json::json!({
+                "source": "startup",
+                "model": "gpt-5.6-sol",
+                "pid": std::process::id(),
+                "transcript_path": transcript_path
+            }),
+        )))
+        .await;
+
+    sleep(Duration::from_millis(50)).await;
+
+    let view = registry
+        .get_session(session_id.clone())
+        .await
+        .expect("SessionStart should create the session");
+    assert!((view.context_percentage - 9.790_247).abs() < 0.001);
+    assert_eq!(view.context_display, "9.8% (25K/258K)");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_e2e_codex_pre_tool_use_translates_to_tool_call_start() {
     let (server, registry) = TestServer::spawn_with_registry().await;
     let mut client = server.connect().await;

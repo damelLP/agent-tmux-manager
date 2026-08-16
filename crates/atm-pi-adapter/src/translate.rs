@@ -226,7 +226,12 @@ impl RawPiEvent {
                 if tokens.is_none() && cost_usd.is_none() {
                     return None;
                 }
-                LifecycleEvent::ContextUpdate { tokens, cost_usd }
+                LifecycleEvent::ContextUpdate {
+                    tokens,
+                    current_tokens: None,
+                    context_window_size: None,
+                    cost_usd,
+                }
             }
 
             // High-frequency / internal events that don't have a useful
@@ -335,8 +340,15 @@ mod tests {
             },
         );
         match e.to_lifecycle_event() {
-            Some(LifecycleEvent::ContextUpdate { tokens, cost_usd }) => {
+            Some(LifecycleEvent::ContextUpdate {
+                tokens,
+                current_tokens,
+                context_window_size,
+                cost_usd,
+            }) => {
                 assert_eq!(tokens, Some(1143));
+                assert_eq!(current_tokens, None);
+                assert_eq!(context_window_size, None);
                 assert_eq!(cost_usd, Some(0.00709));
             }
             other => panic!("expected ContextUpdate, got {other:?}"),

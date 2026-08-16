@@ -59,6 +59,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// Write timeout (10 seconds)
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Token usage is optional metadata and must never delay hook handling.
+const CODEX_TRANSCRIPT_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Unique identifier for this connection
 type ClientId = String;
 
@@ -565,6 +568,7 @@ impl ConnectionHandler {
         let pid = raw_event.pid;
         let tmux_pane = raw_event.tmux_pane.clone();
         let model = raw_event.model.clone();
+        let transcript_path = raw_event.transcript_path.clone();
         let ends_session = matches!(lifecycle, atm_core::LifecycleEvent::SessionEnd { .. });
 
         self.registry
@@ -581,17 +585,60 @@ impl ConnectionHandler {
         if !ends_session && model.is_some() {
             self.registry
                 .apply_lifecycle_event(
-                    session_id,
+                    session_id.clone(),
                     atm_core::LifecycleEvent::ProviderModelChange {
                         provider: None,
                         model,
                     },
                     atm_core::Harness::Codex,
                     pid,
-                    tmux_pane,
+                    tmux_pane.clone(),
                 )
                 .await
                 .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        }
+
+        // Codex has no status-line hook, but its rollout transcript
+        // currently persists token_count records. Read only a bounded
+        // tail on the blocking pool and treat every parsing/I/O failure
+        // as unavailable metadata: lifecycle handling must still win.
+        if !ends_session {
+            let usage = match transcript_path.filter(|path| !path.is_empty()) {
+                Some(path) => {
+                    let task = tokio::task::spawn_blocking(move || {
+                        atm_codex_adapter::read_token_usage(path)
+                    });
+                    match timeout(CODEX_TRANSCRIPT_READ_TIMEOUT, task).await {
+                        Ok(Ok(Ok(usage))) => usage,
+                        Ok(Ok(Err(error))) => {
+                            debug!(%error, "Codex transcript token usage unavailable");
+                            None
+                        }
+                        Ok(Err(error)) => {
+                            debug!(%error, "Codex transcript reader task failed");
+                            None
+                        }
+                        Err(_) => {
+                            warn!("Codex transcript token usage read timed out");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            if let Some(usage) = usage {
+                self.registry
+                    .apply_lifecycle_event(
+                        session_id,
+                        usage.to_lifecycle_event(),
+                        atm_core::Harness::Codex,
+                        pid,
+                        tmux_pane,
+                    )
+                    .await
+                    .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+            }
         }
 
         Ok(())

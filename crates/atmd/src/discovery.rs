@@ -252,16 +252,37 @@ impl DiscoveryService {
 // Blocking Filesystem Operations
 // ============================================================================
 
+/// Maximum parent-chain depth walked when collecting ancestor PIDs.
+const MAX_ANCESTOR_WALK: usize = 25;
+
+/// A matched process plus the process-tree context needed to dedupe
+/// wrapper/child pairs (see [`dedupe_wrapper_chains`]).
+#[derive(Debug, Clone)]
+struct ProcessMatch {
+    process: DiscoveredProcess,
+    /// Ancestor PIDs, nearest first, bounded by `MAX_ANCESTOR_WALK`.
+    ancestor_pids: Vec<u32>,
+    /// True if `/proc/{pid}/comm` equals the matched definition's
+    /// binary name — the same test the vendor hook scripts use to
+    /// resolve the agent PID they report to the daemon.
+    comm_is_binary: bool,
+}
+
 /// Scans /proc for coding-agent processes.
 ///
 /// Single pass: for each PID, dispatches through the built-in harness
 /// registry. The first matching definition wins. Adding a new built-in
 /// harness means adding one data record in atm-core; no caller changes.
 ///
+/// Launcher-wrapper chains (e.g. Codex's `node .../bin/codex` wrapper
+/// spawning the native `codex` binary) can match twice — once via
+/// cmdline, once via exe. A dedupe pass collapses each such chain to
+/// one process so a single agent never yields two sessions.
+///
 /// This function performs blocking I/O and should be called via
 /// `spawn_blocking`.
 fn scan_agent_processes() -> Result<Vec<DiscoveredProcess>, DiscoveryError> {
-    let mut processes = Vec::new();
+    let mut matches = Vec::new();
 
     // Read /proc directory
     let proc_dir =
@@ -277,20 +298,120 @@ fn scan_agent_processes() -> Result<Vec<DiscoveredProcess>, DiscoveryError> {
             Err(_) => continue,
         };
 
-        if let Some(process) = detect_agent_process(pid) {
-            processes.push(process);
+        if let Some(process_match) = detect_agent_process(pid) {
+            matches.push(process_match);
         }
     }
 
-    Ok(processes)
+    Ok(dedupe_wrapper_chains(matches))
 }
 
 /// Tries each registered harness detector against `pid`. Returns the
-/// first match or `None`.
-fn detect_agent_process(pid: u32) -> Option<DiscoveredProcess> {
+/// first match (with process-tree context for dedupe) or `None`.
+fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
     builtin_harnesses()
         .filter(|definition| definition.discovery_enabled)
-        .find_map(|definition| check_harness_process(pid, definition))
+        .find_map(|definition| {
+            check_harness_process(pid, definition).map(|process| ProcessMatch {
+                comm_is_binary: process_comm(pid).as_deref() == Some(definition.binary),
+                ancestor_pids: collect_ancestor_pids(pid),
+                process,
+            })
+        })
+}
+
+/// Collapses ancestor/descendant chains of same-harness matches down to
+/// a single process each.
+///
+/// A launcher wrapper and the agent binary it spawns can both satisfy a
+/// harness's matchers (observed live with Codex: the node wrapper
+/// matches via a path-like cmdline argument, its native child via
+/// `/proc/{pid}/exe`), which would register one agent as two sessions.
+///
+/// Winner selection mirrors the vendor hook scripts' PID resolution
+/// (walk the tree, prefer processes whose `comm` equals the harness
+/// binary, keep the topmost) so the session created by discovery is the
+/// same one later hook events reconcile onto — never a ghost.
+///
+/// Ancestry is only collapsed *within* a harness: an agent spawning a
+/// different vendor's agent (e.g. Claude driving a Codex) stays two
+/// sessions, as it should.
+fn dedupe_wrapper_chains(matches: Vec<ProcessMatch>) -> Vec<DiscoveredProcess> {
+    let keep: Vec<bool> = (0..matches.len())
+        .map(|i| !(0..matches.len()).any(|j| j != i && supersedes(&matches[j], &matches[i])))
+        .collect();
+
+    matches
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(m, kept)| {
+            if !kept {
+                debug!(
+                    pid = m.process.pid,
+                    harness = %m.process.harness,
+                    "Suppressing duplicate discovery of launcher-wrapper chain member"
+                );
+            }
+            kept.then_some(m.process)
+        })
+        .collect()
+}
+
+/// True if `a` should be kept in place of `b`: same harness, related by
+/// ancestry, and outranking `b` (comm-matching beats non-matching;
+/// within the same class the ancestor wins).
+fn supersedes(a: &ProcessMatch, b: &ProcessMatch) -> bool {
+    if a.process.harness != b.process.harness {
+        return false;
+    }
+    let a_is_ancestor = b.ancestor_pids.contains(&a.process.pid);
+    let b_is_ancestor = a.ancestor_pids.contains(&b.process.pid);
+    if !a_is_ancestor && !b_is_ancestor {
+        return false;
+    }
+    match (a.comm_is_binary, b.comm_is_binary) {
+        (true, false) => true,
+        (false, true) => false,
+        // Same comm class: the topmost process wins, matching the hook
+        // scripts' walk-up-and-keep-highest PID resolution.
+        _ => a_is_ancestor,
+    }
+}
+
+/// Reads the parent PID from `/proc/{pid}/stat`.
+///
+/// The comm field (field 2) may contain spaces and parentheses, so the
+/// ppid is parsed from after the *last* `)` — the kernel-documented
+/// safe way to split this file.
+fn read_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    // Fields after comm: state, ppid, ...
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Collects ancestor PIDs (nearest first), stopping at init or after
+/// `MAX_ANCESTOR_WALK` hops.
+fn collect_ancestor_pids(pid: u32) -> Vec<u32> {
+    let mut ancestors = Vec::new();
+    let mut current = pid;
+    for _ in 0..MAX_ANCESTOR_WALK {
+        match read_parent_pid(current) {
+            Some(ppid) if ppid > 1 => {
+                ancestors.push(ppid);
+                current = ppid;
+            }
+            _ => break,
+        }
+    }
+    ancestors
+}
+
+/// Reads `/proc/{pid}/comm`, trimmed.
+fn process_comm(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Checks if a PID matches a built-in harness definition.
@@ -717,5 +838,90 @@ mod tests {
             .map(|definition| definition.id)
             .collect();
         assert_eq!(enabled, vec!["claude", "pi", "codex"]);
+    }
+
+    // ========================================================================
+    // Wrapper-chain dedupe
+    // ========================================================================
+
+    fn fake_match(
+        pid: u32,
+        harness: Harness,
+        ancestor_pids: Vec<u32>,
+        comm_is_binary: bool,
+    ) -> ProcessMatch {
+        ProcessMatch {
+            process: DiscoveredProcess {
+                pid,
+                cwd: PathBuf::from("/work"),
+                tmux_pane: Some("%1".to_string()),
+                harness,
+            },
+            ancestor_pids,
+            comm_is_binary,
+        }
+    }
+
+    fn kept_pids(matches: Vec<ProcessMatch>) -> Vec<u32> {
+        let mut pids: Vec<u32> = dedupe_wrapper_chains(matches)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    #[test]
+    fn codex_wrapper_and_native_child_collapse_to_native() {
+        // The live-observed shape: node wrapper (comm "node"/"MainThread")
+        // matched via cmdline, native child (comm "codex") matched via exe.
+        // The hook script reports the native child's PID, so discovery
+        // must keep exactly that one.
+        let wrapper = fake_match(100, Harness::Codex, vec![50, 1], false);
+        let native = fake_match(200, Harness::Codex, vec![100, 50, 1], true);
+        assert_eq!(kept_pids(vec![wrapper, native]), vec![200]);
+    }
+
+    #[test]
+    fn independent_same_harness_processes_are_all_kept() {
+        // Two unrelated codex sessions (no ancestry link) must both stay.
+        let a = fake_match(100, Harness::Codex, vec![50, 1], true);
+        let b = fake_match(300, Harness::Codex, vec![60, 1], true);
+        assert_eq!(kept_pids(vec![a, b]), vec![100, 300]);
+    }
+
+    #[test]
+    fn chain_where_both_comm_match_keeps_topmost() {
+        // If wrapper and child BOTH have the binary comm, the hook
+        // scripts' walk keeps the highest one — discovery must agree.
+        let parent = fake_match(100, Harness::ClaudeCode, vec![50, 1], true);
+        let child = fake_match(200, Harness::ClaudeCode, vec![100, 50, 1], true);
+        assert_eq!(kept_pids(vec![parent, child]), vec![100]);
+    }
+
+    #[test]
+    fn chain_without_any_comm_match_keeps_topmost() {
+        let parent = fake_match(100, Harness::Codex, vec![50, 1], false);
+        let child = fake_match(200, Harness::Codex, vec![100, 50, 1], false);
+        assert_eq!(kept_pids(vec![parent, child]), vec![100]);
+    }
+
+    #[test]
+    fn cross_harness_ancestry_is_never_deduped() {
+        // An agent spawning a different vendor's agent (e.g. Claude
+        // driving a codex) is two real sessions, not a wrapper chain.
+        let claude = fake_match(100, Harness::ClaudeCode, vec![50, 1], true);
+        let codex = fake_match(200, Harness::Codex, vec![100, 50, 1], true);
+        assert_eq!(kept_pids(vec![claude, codex]), vec![100, 200]);
+    }
+
+    #[test]
+    fn three_deep_chain_with_comm_match_in_middle_keeps_it() {
+        // wrapper -> real binary -> matched grandchild helper: the
+        // comm-matching member wins over both relatives.
+        let wrapper = fake_match(100, Harness::Codex, vec![1], false);
+        let real = fake_match(200, Harness::Codex, vec![100, 1], true);
+        let helper = fake_match(300, Harness::Codex, vec![200, 100, 1], false);
+        assert_eq!(kept_pids(vec![wrapper, real, helper]), vec![200]);
     }
 }

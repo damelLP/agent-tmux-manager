@@ -7,6 +7,7 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - .github/workflows/release.yml
   workflow_dispatch:
     inputs:
       publish_crates:
@@ -38,6 +39,11 @@ on:
         default: true
       publish_atm_pi_adapter:
         description: 'Publish crate: atm-pi-adapter'
+        required: false
+        type: boolean
+        default: true
+      publish_atm_codex_adapter:
+        description: 'Publish crate: atm-codex-adapter'
         required: false
         type: boolean
         default: true
@@ -269,12 +275,12 @@ jobs:
           EVENT_JSON="$GITHUB_EVENT_PATH"
 
           # Publish crates in dependency order so crates.io can resolve internal dependencies.
-          ORIGINAL_ORDER=("atm-core" "atm-protocol" "atm-tmux" "atm-claude-adapter" "atm-pi-adapter" "atmd" "atm-tui" "atm")
+          ORIGINAL_ORDER=("atm-core" "atm-protocol" "atm-tmux" "atm-claude-adapter" "atm-pi-adapter" "atm-codex-adapter" "atmd" "atm-tui" "atm")
 
           selected=()
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             # Using jq (available on GitHub ubuntu runners) to read the dispatch inputs.
-            for box in publish_atm_core publish_atm_protocol publish_atm_tmux publish_atm_claude_adapter publish_atm_pi_adapter publish_atm_tui publish_atmd publish_atm; do
+            for box in publish_atm_core publish_atm_protocol publish_atm_tmux publish_atm_claude_adapter publish_atm_pi_adapter publish_atm_codex_adapter publish_atm_tui publish_atmd publish_atm; do
               val=$(jq -r --arg k "$box" '.inputs[$k] // "false"' "$EVENT_JSON" 2>/dev/null || echo "false")
               if [ "$(echo "$val" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
                 case "$box" in
@@ -283,6 +289,7 @@ jobs:
                   publish_atm_tmux) selected+=("atm-tmux");;
                   publish_atm_claude_adapter) selected+=("atm-claude-adapter");;
                   publish_atm_pi_adapter) selected+=("atm-pi-adapter");;
+                  publish_atm_codex_adapter) selected+=("atm-codex-adapter");;
                   publish_atm_tui) selected+=("atm-tui");;
                   publish_atmd) selected+=("atmd");;
                   publish_atm) selected+=("atm");;

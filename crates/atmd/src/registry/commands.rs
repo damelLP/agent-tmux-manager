@@ -7,7 +7,9 @@
 //!
 //! All types are designed for async message passing and follow the panic-free policy.
 
-use atm_core::{AgentType, Harness, LifecycleEvent, SessionDomain, SessionId, SessionView};
+use atm_core::{
+    AgentType, ChildAgentRef, Harness, LifecycleEvent, SessionDomain, SessionId, SessionView,
+};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -85,8 +87,23 @@ pub enum RegistryCommand {
         pid: Option<u32>,
         /// Tmux pane ID if running in tmux
         tmux_pane: Option<String>,
+        /// When the vendor tags the event with the in-process child
+        /// agent it originated from (Claude `agent_id`), the registry
+        /// routes it to that child's session instead of `session_id`.
+        child_agent: Option<ChildAgentRef>,
         /// Channel to send the result
         respond_to: oneshot::Sender<Result<(), RegistryError>>,
+    },
+
+    /// Record that child agent `agent_id` answers to the human `name`
+    /// it was spawned with (Claude Agent tool `name` argument, paired
+    /// with the `agentId` in the tool response), so teammate events
+    /// that only carry a name can be routed to its session.
+    RegisterChildAlias {
+        /// Name given to the Agent tool.
+        name: String,
+        /// Vendor agent id from the tool response.
+        agent_id: String,
     },
 
     /// Get a single session by ID.

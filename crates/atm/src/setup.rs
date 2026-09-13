@@ -57,6 +57,9 @@ const HOOK_TYPES: &[&str] = &[
     "SubagentStop",
     "PreCompact",
     "PermissionRequest",
+    "TeammateIdle",
+    "TaskCreated",
+    "TaskCompleted",
 ];
 
 /// All Codex CLI hook types, per the official hooks documentation

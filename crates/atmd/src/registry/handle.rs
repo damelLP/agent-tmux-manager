@@ -137,6 +137,23 @@ impl RegistryHandle {
         pid: Option<u32>,
         tmux_pane: Option<String>,
     ) -> Result<(), RegistryError> {
+        self.apply_lifecycle_event_from(session_id, event, harness, pid, tmux_pane, None)
+            .await
+    }
+
+    /// Like [`Self::apply_lifecycle_event`], but tags the event with the
+    /// in-process child agent it came from (Claude subagents and
+    /// teammates share the parent's process and `session_id`), so the
+    /// registry routes it to the child's own session.
+    pub async fn apply_lifecycle_event_from(
+        &self,
+        session_id: SessionId,
+        event: LifecycleEvent,
+        harness: Harness,
+        pid: Option<u32>,
+        tmux_pane: Option<String>,
+        child_agent: Option<atm_core::ChildAgentRef>,
+    ) -> Result<(), RegistryError> {
         let (tx, rx) = oneshot::channel();
 
         self.sender
@@ -146,12 +163,31 @@ impl RegistryHandle {
                 harness,
                 pid,
                 tmux_pane,
+                child_agent,
                 respond_to: tx,
             })
             .await
             .map_err(|_| RegistryError::ChannelClosed)?;
 
         rx.await.map_err(|_| RegistryError::ChannelClosed)?
+    }
+
+    /// Records that child agent `agent_id` answers to `name` (the Agent
+    /// tool `name` argument), so teammate events that only carry a name
+    /// can be routed to its session. Fire-and-forget.
+    ///
+    /// # Errors
+    ///
+    /// - `RegistryError::ChannelClosed` if the actor has shut down
+    pub async fn register_child_alias(
+        &self,
+        name: String,
+        agent_id: String,
+    ) -> Result<(), RegistryError> {
+        self.sender
+            .send(RegistryCommand::RegisterChildAlias { name, agent_id })
+            .await
+            .map_err(|_| RegistryError::ChannelClosed)
     }
 
     /// Get a single session by ID.
@@ -443,6 +479,7 @@ mod tests {
                 harness,
                 pid,
                 tmux_pane,
+                child_agent: _,
                 respond_to,
             }) = rx.recv().await
             {

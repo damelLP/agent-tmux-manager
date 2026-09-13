@@ -48,6 +48,18 @@ pub struct RawHookEvent {
     // === Stop Events (Stop, SubagentStop) ===
     #[serde(default)]
     pub stop_hook_active: Option<bool>,
+    /// Final assistant text of the turn (Claude Code 2.1.2xx+).
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
+    /// Background tasks still running when the turn ended. Kept as raw
+    /// JSON (observed as an array) and only counted, so a future shape
+    /// change cannot make the whole event fail to parse.
+    #[serde(default)]
+    pub background_tasks: Option<serde_json::Value>,
+    /// Scheduled cron / wakeup tasks registered on the session. Same
+    /// raw-JSON treatment as `background_tasks`.
+    #[serde(default)]
+    pub session_crons: Option<serde_json::Value>,
 
     // === Subagent Events (SubagentStart, SubagentStop) ===
     #[serde(default)]
@@ -76,6 +88,24 @@ pub struct RawHookEvent {
     pub notification_type: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+
+    // === Agent teams (TeammateIdle, TaskCreated, TaskCompleted) ===
+    // Verified against the Claude Code 2.1.267 hook schemas: these
+    // events name the teammate rather than carrying its `agent_id`.
+    /// Teammate the event is about (the `name` given to the Agent tool).
+    #[serde(default)]
+    pub teammate_name: Option<String>,
+    /// Deprecated upstream (sessions have one implicit team); carried
+    /// only so a future removal cannot break parsing.
+    #[serde(default)]
+    pub team_name: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Task title; emitted top-level by `TaskCreated` / `TaskCompleted`.
+    #[serde(default)]
+    pub task_subject: Option<String>,
+    #[serde(default)]
+    pub task_description: Option<String>,
 }
 
 impl RawHookEvent {

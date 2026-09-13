@@ -447,17 +447,49 @@ impl ConnectionHandler {
         let session_id = raw_event.session_id();
         let pid = raw_event.pid;
         let tmux_pane = raw_event.tmux_pane.clone();
+        // Hooks fired inside a subagent or in-process teammate carry
+        // the parent's session_id plus agent_id/agent_type; the registry
+        // uses the tag to route the event to the child's own session.
+        let child_agent = raw_event.child_agent();
+        let background = raw_event.background_activity();
 
         self.registry
-            .apply_lifecycle_event(
-                session_id,
+            .apply_lifecycle_event_from(
+                session_id.clone(),
                 lifecycle,
                 atm_core::Harness::ClaudeCode,
                 pid,
-                tmux_pane,
+                tmux_pane.clone(),
+                child_agent,
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+
+        // `Stop` also reports what the agent left running (background
+        // tasks, scheduled wakeups). Apply it as a follow-up so the idle
+        // state can say what the agent is still waiting on.
+        if let Some(activity) = background {
+            self.registry
+                .apply_lifecycle_event(
+                    session_id,
+                    activity,
+                    atm_core::Harness::ClaudeCode,
+                    pid,
+                    tmux_pane,
+                )
+                .await
+                .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        }
+
+        // A named `Agent` spawn reports its agent id in the tool
+        // response; remember the pairing so `TeammateIdle` and task
+        // events, which only name the teammate, reach its session.
+        if let Some((name, agent_id)) = raw_event.child_alias() {
+            self.registry
+                .register_child_alias(name, agent_id)
+                .await
+                .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        }
 
         Ok(())
     }

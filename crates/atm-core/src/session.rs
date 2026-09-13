@@ -603,6 +603,16 @@ pub struct SessionDomain {
     /// First user prompt (captured from the first UserPromptSubmit hook event).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_prompt: Option<String>,
+
+    /// Background tasks the agent left running at its last turn end
+    /// (Claude `Stop.background_tasks`).
+    #[serde(default)]
+    pub background_tasks: u32,
+
+    /// Scheduled cron / wakeup tasks registered at its last turn end
+    /// (Claude `Stop.session_crons`).
+    #[serde(default)]
+    pub scheduled_tasks: u32,
 }
 
 impl SessionDomain {
@@ -632,6 +642,8 @@ impl SessionDomain {
             parent_session_id: None,
             child_session_ids: Vec::new(),
             first_prompt: None,
+            background_tasks: 0,
+            scheduled_tasks: 0,
         }
     }
 
@@ -830,6 +842,21 @@ impl SessionDomain {
                 // Child-session correlation is tracked by the registry
                 // (subagent pending-list); status remains Working.
                 self.status = SessionStatus::Working;
+            }
+            LifecycleEvent::BackgroundActivity {
+                running_tasks,
+                scheduled_tasks,
+            } => {
+                self.background_tasks = *running_tasks;
+                self.scheduled_tasks = *scheduled_tasks;
+                // Arrives right after `WorkingEnd`. Replace the bare
+                // "idle" with what the agent is still waiting on, so
+                // "is it stuck?" has an answer without a new UI field.
+                if self.status == SessionStatus::Idle {
+                    self.current_activity =
+                        background_activity_label(*running_tasks, *scheduled_tasks)
+                            .map(|label| ActivityDetail::with_context(&label));
+                }
             }
         }
     }
@@ -1083,9 +1110,30 @@ fn activity_for_needs_input(reason: &NeedsInputReason) -> ActivityDetail {
             match kind {
                 NotificationKind::PermissionPrompt => ActivityDetail::with_context("Permission"),
                 NotificationKind::ElicitationDialog => ActivityDetail::with_context("MCP Input"),
+                NotificationKind::AgentNeedsInput => {
+                    ActivityDetail::with_context("Agent needs input")
+                }
                 other => ActivityDetail::with_context(other.as_str()),
             }
         }
+    }
+}
+
+/// Activity label for an idle agent that still has work in flight,
+/// e.g. `2 bg tasks, 1 scheduled`. `None` when nothing is running.
+fn background_activity_label(running: u32, scheduled: u32) -> Option<String> {
+    let mut parts = Vec::with_capacity(2);
+    if running > 0 {
+        let plural = if running == 1 { "" } else { "s" };
+        parts.push(format!("{running} bg task{plural}"));
+    }
+    if scheduled > 0 {
+        parts.push(format!("{scheduled} scheduled"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
     }
 }
 
@@ -1880,5 +1928,54 @@ mod tests {
             Some("/home/user/repo"),
             "should preserve existing cwd when incoming is None"
         );
+    }
+
+    #[test]
+    fn background_activity_labels_idle_session() {
+        let mut session = create_test_session("bg");
+        session.apply_lifecycle_event(&LifecycleEvent::WorkingEnd);
+        session.apply_lifecycle_event(&LifecycleEvent::BackgroundActivity {
+            running_tasks: 2,
+            scheduled_tasks: 1,
+        });
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!((session.background_tasks, session.scheduled_tasks), (2, 1));
+        assert_eq!(
+            session
+                .current_activity
+                .as_ref()
+                .map(|a| a.display().into_owned()),
+            Some("2 bg tasks, 1 scheduled".to_string())
+        );
+
+        // Nothing left running: idle stays bare.
+        session.apply_lifecycle_event(&LifecycleEvent::WorkingEnd);
+        session.apply_lifecycle_event(&LifecycleEvent::BackgroundActivity {
+            running_tasks: 0,
+            scheduled_tasks: 0,
+        });
+        assert!(session.current_activity.is_none());
+    }
+
+    #[test]
+    fn background_activity_does_not_relabel_working_session() {
+        let mut session = create_test_session("bg-working");
+        session.apply_lifecycle_event(&LifecycleEvent::ToolCallStart {
+            name: crate::Tool::Bash,
+            tool_use_id: None,
+            input: None,
+        });
+        session.apply_lifecycle_event(&LifecycleEvent::BackgroundActivity {
+            running_tasks: 1,
+            scheduled_tasks: 0,
+        });
+        assert_eq!(session.status, SessionStatus::Working);
+        assert_eq!(session.background_tasks, 1);
+        let label = session
+            .current_activity
+            .as_ref()
+            .map(|a| a.display().into_owned())
+            .unwrap_or_default();
+        assert!(label.contains("Bash"), "tool activity kept, got {label:?}");
     }
 }

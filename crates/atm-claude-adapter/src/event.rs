@@ -24,11 +24,17 @@ const HOOK_EVENT_VARIANTS: &[(ClaudeEventType, &str)] = &[
     (ClaudeEventType::PreCompact, "PreCompact"),
     (ClaudeEventType::Setup, "Setup"),
     (ClaudeEventType::Notification, "Notification"),
+    (ClaudeEventType::PermissionRequest, "PermissionRequest"),
+    (ClaudeEventType::TeammateIdle, "TeammateIdle"),
+    (ClaudeEventType::TaskCreated, "TaskCreated"),
+    (ClaudeEventType::TaskCompleted, "TaskCompleted"),
 ];
 
 /// Types of hook events from Claude Code.
 ///
-/// All 12 Claude Code hook events, based on official documentation.
+/// The Claude Code hook events ATM subscribes to, based on the official
+/// hooks reference. Claude emits more (e.g. `PostToolBatch`,
+/// `ConfigChange`); unknown names translate to `None` and are dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ClaudeEventType {
@@ -67,6 +73,19 @@ pub enum ClaudeEventType {
     // === Notifications ===
     /// Informational notification
     Notification,
+
+    // === Permission ===
+    /// A tool call needs a permission decision (fires immediately,
+    /// unlike `Notification(permission_prompt)` which waits ~6s).
+    PermissionRequest,
+
+    // === Agent Teams ===
+    /// A teammate is about to go idle
+    TeammateIdle,
+    /// A shared task-list entry was created via `TaskCreate`
+    TaskCreated,
+    /// A shared task-list entry was marked completed
+    TaskCompleted,
 }
 
 impl ClaudeEventType {
@@ -211,6 +230,17 @@ mod tests {
             ClaudeEventType::from_event_name("Notification"),
             Some(ClaudeEventType::Notification)
         );
+
+        // Permission + agent-team events
+        for (name, expected) in [
+            ("PermissionRequest", ClaudeEventType::PermissionRequest),
+            ("TeammateIdle", ClaudeEventType::TeammateIdle),
+            ("TaskCreated", ClaudeEventType::TaskCreated),
+            ("TaskCompleted", ClaudeEventType::TaskCompleted),
+        ] {
+            assert_eq!(ClaudeEventType::from_event_name(name), Some(expected));
+            assert_eq!(expected.as_str(), name);
+        }
     }
 
     #[test]

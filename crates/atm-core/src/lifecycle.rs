@@ -47,14 +47,6 @@ pub enum NotificationKind {
     ElicitationDialog,
     /// Claude idle prompt — agent has gone idle.
     IdlePrompt,
-    /// Claude: a background agent or teammate is waiting on the user.
-    AgentNeedsInput,
-    /// Claude: a background agent or teammate finished.
-    AgentCompleted,
-    /// Claude `TaskCreated` hook (agent-team shared task list).
-    TaskCreated,
-    /// Claude `TaskCompleted` hook (agent-team shared task list).
-    TaskCompleted,
     /// Claude one-time `Setup` hook (renamed from raw event).
     Setup,
     /// Generic informational notification.
@@ -71,10 +63,6 @@ impl NotificationKind {
             Self::PermissionPrompt => "permission_prompt",
             Self::ElicitationDialog => "elicitation_dialog",
             Self::IdlePrompt => "idle_prompt",
-            Self::AgentNeedsInput => "agent_needs_input",
-            Self::AgentCompleted => "agent_completed",
-            Self::TaskCreated => "task_created",
-            Self::TaskCompleted => "task_completed",
             Self::Setup => "setup",
             Self::Info => "info",
             Self::Other(s) => s.as_str(),
@@ -96,10 +84,6 @@ impl NotificationKind {
             "permission_prompt" => Self::PermissionPrompt,
             "elicitation_dialog" => Self::ElicitationDialog,
             "idle_prompt" => Self::IdlePrompt,
-            "agent_needs_input" => Self::AgentNeedsInput,
-            "agent_completed" => Self::AgentCompleted,
-            "task_created" => Self::TaskCreated,
-            "task_completed" => Self::TaskCompleted,
             "setup" => Self::Setup,
             "info" => Self::Info,
             _ => return None,
@@ -149,28 +133,6 @@ pub enum NeedsInputReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
-}
-
-/// Identifies the child agent an event originated from or is about,
-/// for vendors that run children in-process and tag their events.
-/// Claude sets `agent_id` / `agent_type` on every hook fired inside a
-/// subagent, and names the teammate (`teammate_name`) on team events.
-/// At least one of `id` / `name` is set. The registry routes the event
-/// to the child's session instead of the parent's, resolving names
-/// through the aliases it records from spawning calls, scoped to the
-/// parent session because names only need to be unique within one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChildAgentRef {
-    /// Vendor correlation id, matching `ChildSessionStart::id`, when
-    /// the event carries one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    /// Human name the child was spawned with, when the event carries
-    /// one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Free-form role tag (Claude `agent_type`), when known.
-    pub role: Option<String>,
 }
 
 /// Vendor-neutral lifecycle event.
@@ -270,26 +232,8 @@ pub enum LifecycleEvent {
         role: Option<String>,
     },
 
-    /// A child session finished. `reason` is a vendor stop reason and
-    /// `last_message` the child's final assistant text, each only when
-    /// the vendor exposes it. No current adapter emits `reason`: Claude
-    /// Code 2.1.267's `SubagentStop` carries `last_assistant_message`
-    /// but no stop reason (see the claude-adapter fixture).
-    ChildSessionEnd {
-        id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        last_message: Option<String>,
-    },
-
-    /// Snapshot of work the agent left running when its turn ended
-    /// (Claude `Stop.background_tasks` / `session_crons`). Lets the UI
-    /// say "idle, 2 background tasks" instead of just "idle".
-    BackgroundActivity {
-        running_tasks: u32,
-        scheduled_tasks: u32,
-    },
+    /// A child session finished.
+    ChildSessionEnd { id: Option<String> },
 }
 
 impl LifecycleEvent {
@@ -384,12 +328,6 @@ mod tests {
             },
             LifecycleEvent::ChildSessionEnd {
                 id: Some("agent-1".into()),
-                reason: Some("end_turn".into()),
-                last_message: Some("done".into()),
-            },
-            LifecycleEvent::BackgroundActivity {
-                running_tasks: 2,
-                scheduled_tasks: 1,
             },
         ];
 
@@ -418,24 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn child_session_end_deserializes_legacy_shape() {
-        // Daemons and adapters built before `reason` / `last_message`
-        // existed emit only `id`; both new fields must default.
-        let event: LifecycleEvent =
-            serde_json::from_str(r#"{"type":"child_session_end","id":"agent-1"}"#)
-                .expect("deserialize legacy child end");
-
-        assert_eq!(
-            event,
-            LifecycleEvent::ChildSessionEnd {
-                id: Some("agent-1".into()),
-                reason: None,
-                last_message: None,
-            }
-        );
-    }
-
-    #[test]
     fn terminal_and_starting_classification() {
         assert!(LifecycleEvent::WorkingEnd.is_terminal_for_turn());
         assert!(LifecycleEvent::Idle.is_terminal_for_turn());
@@ -458,16 +378,6 @@ mod tests {
             serde_json::from_str::<NotificationKind>("\"permission_prompt\"").unwrap(),
             NotificationKind::PermissionPrompt
         );
-        // Orchestration kinds added with Claude Code 2.1.198+.
-        for (kind, wire) in [
-            (NotificationKind::AgentNeedsInput, "agent_needs_input"),
-            (NotificationKind::AgentCompleted, "agent_completed"),
-            (NotificationKind::TaskCreated, "task_created"),
-            (NotificationKind::TaskCompleted, "task_completed"),
-        ] {
-            assert_eq!(NotificationKind::from(wire), kind);
-            assert_eq!(kind.as_str(), wire);
-        }
     }
 
     #[test]

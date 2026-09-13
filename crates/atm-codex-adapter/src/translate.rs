@@ -99,8 +99,6 @@ impl RawCodexEvent {
             },
             CodexEventType::SubagentStop => LifecycleEvent::ChildSessionEnd {
                 id: self.agent_id.clone(),
-                reason: None,
-                last_message: None,
             },
             CodexEventType::SessionStart => LifecycleEvent::SessionStart {
                 source: self.source.clone(),
@@ -294,8 +292,6 @@ mod tests {
             stop.to_lifecycle_event(),
             Some(LifecycleEvent::ChildSessionEnd {
                 id: Some("a-1".into()),
-                reason: None,
-                last_message: None,
             })
         );
     }

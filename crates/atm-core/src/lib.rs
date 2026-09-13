@@ -30,7 +30,7 @@ pub use harness_registry::{
     builtin_harness_ids_display, builtin_harnesses, default_harness_definition,
     find_harness_definition, HarnessDefinition, ProcessMatcher, PromptMode,
 };
-pub use lifecycle::{ChildAgentRef, LifecycleEvent, NeedsInputReason, NotificationKind};
+pub use lifecycle::{LifecycleEvent, NeedsInputReason, NotificationKind};
 pub use model::{derive_display_name, Model};
 pub use project::{resolve_project_root, resolve_worktree_info};
 pub use session::{

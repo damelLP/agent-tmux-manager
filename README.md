@@ -78,51 +78,6 @@ Claude Code / pi / Codex  ──hook/extension──▶  atmd (daemon)  ◀─�
 
 `atm setup` registers supported harness integrations (Claude Code hooks, the pi extension, and Codex CLI hooks). Harness events are forwarded to the `atmd` daemon over a Unix socket, and `atm` connects for real-time display. Codex context usage is read on a best-effort basis from the rollout transcript supplied with hook events; a missing or changed transcript never blocks lifecycle updates. Codex requires a one-time trust approval of the installed hooks: run `/hooks` inside codex after `atm setup`.
 
-## Daemon socket
-
-`atmd` listens on a Unix socket at `/tmp/atm.sock` by default. Set `ATM_SOCKET` to move it. The daemon, the `atm` TUI and CLI, the Claude Code and Codex hooks, and the pi extension all read the same variable, and `atm` forwards it to the daemon it auto-starts, so one exported value keeps every component on the same socket:
-
-```bash
-export ATM_SOCKET=/run/user/1000/atm/atm.sock
-atm                    # starts atmd on that socket if it is not running
-atmd status            # prints the socket path once the daemon is up
-```
-
-The daemon creates the socket's parent directory on start. An empty `ATM_SOCKET` is treated as unset. Hooks read the variable from the agent's environment, which inherits from the tmux server, so export it before starting tmux or set it globally with `tmux set-environment -g ATM_SOCKET <path>`.
-
-### Running agents in a devcontainer
-
-Run `atm` and `atmd` on the host as usual and let harnesses inside the container report to the host daemon through a bind mount. Three things need to line up:
-
-1. **Share the socket by directory, not by file.** A bind-mounted socket file pins one inode: when the host daemon restarts it recreates the socket and the container keeps the dead one. Point `ATM_SOCKET` at a file inside a mounted directory on both sides, and start the host daemon before the container so the directory exists. The container user needs write access to the socket; matching the host UID is the simplest way.
-2. **Share the host PID namespace.** The daemon keys sessions by PID and checks liveness through `/proc`, so a container-private PID namespace leaves it unable to tell when an agent exits. `--pid=host` makes container PIDs and host PIDs the same.
-3. **Forward the tmux pane into each exec.** tmux sets `TMUX_PANE` in every pane. Pass it through so the hook can tell the daemon which host pane the agent runs in; jump, send, kill, and the other CLI actions all target that pane.
-
-```jsonc
-// .devcontainer/devcontainer.json
-{
-  "runArgs": ["--pid=host"],
-  "mounts": [
-    "source=/run/user/1000/atm,target=/run/atm,type=bind"
-  ],
-  "containerEnv": {
-    "ATM_SOCKET": "/run/atm/atm.sock"
-  },
-  // Mount the workspace at its host path so project grouping, which the
-  // host daemon resolves with git, sees the same directory.
-  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
-  "workspaceFolder": "${localWorkspaceFolder}"
-}
-```
-
-```bash
-# From any host tmux pane; each pane forwards its own id
-docker exec -it -e TMUX_PANE="$TMUX_PANE" <container> claude
-devcontainer exec --workspace-folder . --remote-env TMUX_PANE="$TMUX_PANE" -- claude
-```
-
-Inside the container the hook needs `jq` and either `socat` or `nc`, and the hook script must exist at the path recorded in Claude Code's settings (`~/.local/bin/atm-hook` by default). If the container home differs from the host home, run `atm setup` inside the container once. Set `ATM_DEBUG=1` in the container to log hook activity to `/tmp/atm-hook.log` when sessions do not appear.
-
 ## Documentation
 
 See the **[Wiki](https://github.com/damelLP/agent-tmux-manager/wiki)** for the full user guide, tmux integration, architecture, and troubleshooting.

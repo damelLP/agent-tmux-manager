@@ -30,7 +30,7 @@ use atm_pi_adapter::RawPiEvent;
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 
 use crate::discovery::{DiscoveryResult, DiscoveryService};
-use crate::registry::{RegistryHandle, SessionEvent};
+use crate::registry::{LifecycleContext, RegistryHandle, SessionEvent};
 
 /// Type alias for subscriber writer handle
 pub type SubscriberWriter = Arc<Mutex<BufWriter<OwnedWriteHalf>>>;
@@ -447,49 +447,26 @@ impl ConnectionHandler {
         let session_id = raw_event.session_id();
         let pid = raw_event.pid;
         let tmux_pane = raw_event.tmux_pane.clone();
-        // Hooks fired inside a subagent or in-process teammate carry
-        // the parent's session_id plus agent_id/agent_type; the registry
-        // uses the tag to route the event to the child's own session.
-        let child_agent = raw_event.child_agent();
-        let background = raw_event.background_activity();
+        let (child_id, child_name, child_role) = raw_event.child_agent().unwrap_or_default();
+        let context = LifecycleContext {
+            child_id,
+            child_name,
+            child_role,
+            child_alias: raw_event.child_alias(),
+            background_activity: raw_event.background_activity(),
+        };
 
         self.registry
-            .apply_lifecycle_event_from(
-                session_id.clone(),
+            .apply_lifecycle_event_with_context(
+                session_id,
                 lifecycle,
                 atm_core::Harness::ClaudeCode,
                 pid,
-                tmux_pane.clone(),
-                child_agent,
+                tmux_pane,
+                context,
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
-
-        // `Stop` also reports what the agent left running (background
-        // tasks, scheduled wakeups). Apply it as a follow-up so the idle
-        // state can say what the agent is still waiting on.
-        if let Some(activity) = background {
-            self.registry
-                .apply_lifecycle_event(
-                    session_id,
-                    activity,
-                    atm_core::Harness::ClaudeCode,
-                    pid,
-                    tmux_pane,
-                )
-                .await
-                .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
-        }
-
-        // A named `Agent` spawn reports its agent id in the tool
-        // response; remember the pairing so `TeammateIdle` and task
-        // events, which only name the teammate, reach its session.
-        if let Some((name, agent_id)) = raw_event.child_alias() {
-            self.registry
-                .register_child_alias(raw_event.session_id(), name, agent_id)
-                .await
-                .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
-        }
 
         Ok(())
     }

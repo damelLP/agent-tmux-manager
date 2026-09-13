@@ -34,7 +34,7 @@ mod commands;
 mod handle;
 
 pub use actor::{RegistryActor, MAX_SESSIONS};
-pub use commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
+pub use commands::{LifecycleContext, RegistryCommand, RegistryError, RemovalReason, SessionEvent};
 pub use handle::RegistryHandle;
 
 /// Channel buffer sizes

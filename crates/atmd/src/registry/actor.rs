@@ -107,10 +107,13 @@ pub struct RegistryActor {
     /// routes their tagged events and removes them when they finish.
     children_by_agent_id: HashMap<String, u32>,
 
-    /// Human names of in-process children (Agent tool `name`) → vendor
-    /// agent id, recorded from the spawning call's response. Teammate
-    /// events name the teammate instead of carrying its agent id.
-    child_aliases: HashMap<String, String>,
+    /// `(parent session, name)` → child key, for in-process children
+    /// known by the human name they were spawned with (Agent tool
+    /// `name`). Teammate events name the teammate instead of carrying
+    /// its agent id, and names are only unique within a session, hence
+    /// the parent in the key. The value is a vendor agent id, or a
+    /// name-placeholder key when the child was seen by name first.
+    child_aliases: HashMap<(SessionId, String), String>,
 }
 
 impl RegistryActor {
@@ -209,8 +212,12 @@ impl RegistryActor {
                 let result = self.handle_remove(session_id, RemovalReason::Explicit);
                 let _ = respond_to.send(result);
             }
-            RegistryCommand::RegisterChildAlias { name, agent_id } => {
-                self.handle_register_child_alias(name, agent_id);
+            RegistryCommand::RegisterChildAlias {
+                parent,
+                name,
+                agent_id,
+            } => {
+                self.handle_register_child_alias(&parent, &name, &agent_id);
             }
             RegistryCommand::CleanupStale => {
                 self.handle_cleanup_stale();
@@ -829,33 +836,13 @@ impl RegistryActor {
             _ => {}
         }
 
-        // Events tagged with the child agent they were fired from are
-        // the child's own activity (tool calls, permission waits, idle)
-        // and must not repaint the parent. `ChildSessionStart` / `End`
-        // are excluded upstream because they are *about* the child.
+        // Events tagged with the child agent they were fired from (or
+        // are about) are the child's own activity and must not repaint
+        // the parent. `ChildSessionStart` / `End` are excluded upstream
+        // because they are *about* the child.
         if let Some(child) = child_agent.as_ref() {
-            // Teammate events carry a name; resolve it to the agent id
-            // recorded from the spawning call when we have one.
-            let key = self
-                .child_aliases
-                .get(&child.id)
-                .cloned()
-                .unwrap_or_else(|| child.id.clone());
-            let child_pid = self.children_by_agent_id.get(&key).copied().or_else(|| {
-                // Missed `SubagentStart` (daemon restart, dropped
-                // hook): materialize the child from its first event.
-                target_pid.and_then(|parent_pid| {
-                    self.ensure_child_session(parent_pid, &key, child.role.as_deref(), harness)
-                })
-            });
-            match child_pid {
-                Some(cp) => self.apply_to_session(cp, &event, tool_name.as_deref(), None),
-                None => warn!(
-                    agent = %child.id,
-                    session_id = %session_id,
-                    event = ?event,
-                    "Dropping child agent event: no session could be created for it"
-                ),
+            if let Some(parent_pid) = target_pid {
+                self.route_child_event(parent_pid, child, &event, tool_name.as_deref(), harness);
             }
             // A child's event must never repaint the parent.
             return Ok(());
@@ -1068,34 +1055,135 @@ impl RegistryActor {
         Some(child_pid)
     }
 
-    /// Records `name` → `agent_id` for an in-process child. If the child
-    /// was first seen through a name-only event (so it lives under the
-    /// name), re-key it to the agent id so both kinds of events meet.
-    fn handle_register_child_alias(&mut self, name: String, agent_id: String) {
-        if name.is_empty() || agent_id.is_empty() || name == agent_id {
+    /// Applies an event tagged with a child reference to that child's
+    /// session, creating the session if this is the first sight of it.
+    ///
+    /// Resolution order: the vendor agent id when the event carries one
+    /// (recording the name → id pairing if it carries both), otherwise
+    /// the name through this parent's aliases, otherwise a placeholder
+    /// keyed by name and parent. A child owned by another parent is
+    /// never touched: names repeat across sessions, and a vendor id
+    /// must not be repainted from a different session either.
+    fn route_child_event(
+        &mut self,
+        parent_pid: u32,
+        child: &ChildAgentRef,
+        event: &LifecycleEvent,
+        tool_name: Option<&str>,
+        harness: atm_core::Harness,
+    ) {
+        let Some(parent_id) = self
+            .sessions_by_pid
+            .get(&parent_pid)
+            .map(|(parent, _)| parent.id.clone())
+        else {
             return;
-        }
-        if !self.children_by_agent_id.contains_key(&agent_id) {
-            if let Some(pid) = self.children_by_agent_id.remove(&name) {
-                self.children_by_agent_id.insert(agent_id.clone(), pid);
-            } else {
-                // Nothing to alias: the child already finished (a
-                // foreground Agent call reports its id only after
-                // SubagentStop) or never registered.
-                return;
+        };
+
+        let key = match (&child.id, &child.name) {
+            (Some(id), name) => {
+                if let Some(name) = name {
+                    self.handle_register_child_alias(&parent_id, name, id);
+                }
+                id.clone()
             }
+            (None, Some(name)) => self
+                .child_aliases
+                .get(&(parent_id.clone(), name.clone()))
+                .cloned()
+                .unwrap_or_else(|| name_placeholder_key(&parent_id, name)),
+            (None, None) => return,
+        };
+
+        let child_pid = self.children_by_agent_id.get(&key).copied().or_else(|| {
+            // Missed `SubagentStart` (daemon restart, dropped hook,
+            // or a name-only event before the spawn reported its
+            // id): materialize the child from this event.
+            let pid =
+                self.ensure_child_session(parent_pid, &key, child.role.as_deref(), harness)?;
+            if let Some(name) = &child.name {
+                self.child_aliases
+                    .insert((parent_id.clone(), name.clone()), key.clone());
+            }
+            Some(pid)
+        });
+
+        match child_pid {
+            Some(cp) => {
+                let owned = self
+                    .sessions_by_pid
+                    .get(&cp)
+                    .is_some_and(|(s, _)| s.parent_session_id.as_ref() == Some(&parent_id));
+                if owned {
+                    self.apply_to_session(cp, event, tool_name, None);
+                } else {
+                    warn!(
+                        child = %key,
+                        session_id = %parent_id,
+                        "Dropping child agent event: the child belongs to another session"
+                    );
+                }
+            }
+            None => warn!(
+                child = %key,
+                session_id = %parent_id,
+                event = ?event,
+                "Dropping child agent event: no session could be created for it"
+            ),
         }
-        debug!(name, agent_id, "Child agent alias recorded");
-        self.child_aliases.insert(name, agent_id);
     }
 
-    /// Drops index entries for children no longer in the registry.
+    /// Records `(parent, name)` → `agent_id`. Kept even before the child
+    /// registers: hooks arrive over separate connections, so the
+    /// spawning call's response can land before `SubagentStart`. If the
+    /// child was first seen by name (a placeholder), it is re-keyed to
+    /// the agent id; if both a placeholder and the id-keyed child exist,
+    /// the placeholder is folded away.
+    fn handle_register_child_alias(&mut self, parent: &SessionId, name: &str, agent_id: &str) {
+        let name = name.trim();
+        let agent_id = agent_id.trim();
+        if name.is_empty() || agent_id.is_empty() {
+            return;
+        }
+        let alias_key = (parent.clone(), name.to_string());
+        if self
+            .child_aliases
+            .get(&alias_key)
+            .is_some_and(|known| known == agent_id)
+        {
+            return;
+        }
+
+        let placeholder = name_placeholder_key(parent, name);
+        if let Some(pid) = self.children_by_agent_id.remove(&placeholder) {
+            if self.children_by_agent_id.contains_key(agent_id) {
+                if let Some((stale, _)) = self.sessions_by_pid.remove(&pid) {
+                    self.session_id_to_pid.remove(&stale.id);
+                    self.unlink_child_from_parent(&stale);
+                    let _ = self.event_publisher.send(SessionEvent::Removed {
+                        session_id: stale.id,
+                        reason: RemovalReason::Upgraded,
+                    });
+                }
+            } else {
+                self.children_by_agent_id.insert(agent_id.to_string(), pid);
+            }
+        }
+
+        debug!(parent = %parent, name, agent_id, "Child agent alias recorded");
+        self.child_aliases.insert(alias_key, agent_id.to_string());
+    }
+
+    /// Drops index entries for children no longer in the registry, and
+    /// aliases whose parent session is gone. Aliases for children that
+    /// have not registered yet are kept on purpose.
     fn prune_child_indexes(&mut self) {
         let sessions = &self.sessions_by_pid;
         self.children_by_agent_id
             .retain(|_, pid| sessions.contains_key(pid));
-        let children = &self.children_by_agent_id;
-        self.child_aliases.retain(|_, id| children.contains_key(id));
+        let parents = &self.session_id_to_pid;
+        self.child_aliases
+            .retain(|(parent, _), _| parents.contains_key(parent));
     }
 
     /// Removes the in-process child for `agent_id` after the vendor
@@ -1205,12 +1293,16 @@ impl RegistryActor {
             .children_by_agent_id
             .iter()
             .filter(|(_, child_pid)| {
-                self.sessions_by_pid
-                    .get(*child_pid)
-                    .is_some_and(|(child, _)| {
-                        child.parent_session_id.as_ref() == Some(&parent_id)
-                            && child.status == atm_core::SessionStatus::Working
-                    })
+                // Process-backed children run on their own; only
+                // in-process ones can be orphaned by a missed stop.
+                **child_pid >= SYNTHETIC_PID_BASE
+                    && self
+                        .sessions_by_pid
+                        .get(*child_pid)
+                        .is_some_and(|(child, _)| {
+                            child.parent_session_id.as_ref() == Some(&parent_id)
+                                && child.status == atm_core::SessionStatus::Working
+                        })
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -1358,6 +1450,10 @@ impl RegistryActor {
                     });
                 }
             }
+
+            // Index the real child under its agent id too, so id- or
+            // name-tagged events keep reaching it.
+            self.children_by_agent_id.insert(agent_id.clone(), pid);
 
             // Link parent to child
             if let Some((parent_session, _)) = self.sessions_by_pid.get_mut(&pending.parent_pid) {
@@ -1531,6 +1627,12 @@ fn build_session_from_pid(
         session.working_directory = Some(cwd_str);
     }
     session
+}
+
+/// Key and session id for a child known only by name, unique per
+/// parent so the same teammate name in two sessions cannot collide.
+fn name_placeholder_key(parent: &SessionId, name: &str) -> String {
+    format!("{name}@{}", parent.short())
 }
 
 /// Agent type for an in-process child. A subagent spawned as
@@ -2845,11 +2947,37 @@ mod tests {
         )
     }
 
-    fn child_ref(id: &str, role: &str) -> Option<ChildAgentRef> {
+    fn by_id(id: &str, role: &str) -> Option<ChildAgentRef> {
         Some(ChildAgentRef {
-            id: id.into(),
+            id: Some(id.into()),
+            name: None,
             role: Some(role.into()),
         })
+    }
+
+    fn by_name(name: &str) -> Option<ChildAgentRef> {
+        Some(ChildAgentRef {
+            id: None,
+            name: Some(name.into()),
+            role: Some("teammate".into()),
+        })
+    }
+
+    fn register_parent(actor: &mut RegistryActor, id: &str) -> SessionId {
+        let (tx, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Register {
+            session: Box::new(create_test_session(id)),
+            respond_to: tx,
+        });
+        SessionId::new(id)
+    }
+
+    fn alias(actor: &mut RegistryActor, parent: &SessionId, name: &str, agent_id: &str) {
+        actor.handle_command(RegistryCommand::RegisterChildAlias {
+            parent: parent.clone(),
+            name: name.into(),
+            agent_id: agent_id.into(),
+        });
     }
 
     /// Registers a parent and sends `ChildSessionStart` for `agent_id`.
@@ -2924,7 +3052,7 @@ mod tests {
             LifecycleEvent::NeedsInput {
                 reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
             },
-            child_ref("agent-1", "explore"),
+            by_id("agent-1", "explore"),
         );
         actor.handle_command(cmd);
 
@@ -2937,22 +3065,18 @@ mod tests {
     #[tokio::test]
     async fn child_event_without_start_materializes_child() {
         let (_, mut actor, _) = create_actor();
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::Register {
-            session: Box::new(create_test_session("parent")),
-            respond_to: tx,
-        });
+        let parent_id = register_parent(&mut actor, "parent");
 
         // Daemon missed SubagentStart: the child's first tool event
         // still creates a session for it.
         let (cmd, _) = lifecycle_cmd(
-            &SessionId::new("parent"),
+            &parent_id,
             LifecycleEvent::ToolCallStart {
                 name: Tool::Read,
                 tool_use_id: None,
                 input: None,
             },
-            child_ref("late-agent", "code-reviewer"),
+            by_id("late-agent", "code-reviewer"),
         );
         actor.handle_command(cmd);
 
@@ -2966,7 +3090,7 @@ mod tests {
             "child carries its own activity, got {:?}",
             child.activity_detail
         );
-        assert_eq!(child.parent_session_id, Some(SessionId::new("parent")));
+        assert_eq!(child.parent_session_id, Some(parent_id));
         let parent = view_of(&actor, "parent").expect("parent");
         assert_eq!(parent.child_session_ids, vec![SessionId::new("late-agent")]);
     }
@@ -3039,11 +3163,7 @@ mod tests {
         let (_, mut actor, _) = create_actor();
         let parent_id = spawn_parent_with_child(&mut actor, "parent", "agent-1").await;
         // A teammate that reported idle must survive the sweep.
-        let (cmd, _) = lifecycle_cmd(
-            &parent_id,
-            LifecycleEvent::Idle,
-            child_ref("mate-1", "worker"),
-        );
+        let (cmd, _) = lifecycle_cmd(&parent_id, LifecycleEvent::Idle, by_id("mate-1", "worker"));
         actor.handle_command(cmd);
         assert_eq!(actor.session_count(), 3);
 
@@ -3172,17 +3292,10 @@ mod tests {
     async fn alias_routes_name_only_teammate_events() {
         let (_, mut actor, _) = create_actor();
         let parent_id = spawn_parent_with_child(&mut actor, "lead", "agent-1").await;
-        actor.handle_command(RegistryCommand::RegisterChildAlias {
-            name: "reviewer".into(),
-            agent_id: "agent-1".into(),
-        });
+        alias(&mut actor, &parent_id, "reviewer", "agent-1");
 
         // TeammateIdle only names the teammate.
-        let (cmd, _) = lifecycle_cmd(
-            &parent_id,
-            LifecycleEvent::Idle,
-            child_ref("reviewer", "teammate"),
-        );
+        let (cmd, _) = lifecycle_cmd(&parent_id, LifecycleEvent::Idle, by_name("reviewer"));
         actor.handle_command(cmd);
 
         assert_eq!(
@@ -3199,30 +3312,18 @@ mod tests {
     #[tokio::test]
     async fn name_first_child_is_rekeyed_when_alias_arrives() {
         let (_, mut actor, _) = create_actor();
-        let parent_id = SessionId::new("lead");
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::Register {
-            session: Box::new(create_test_session("lead")),
-            respond_to: tx,
-        });
+        let parent_id = register_parent(&mut actor, "lead");
 
-        // First sight of the teammate is a name-only event.
-        let (cmd, _) = lifecycle_cmd(
-            &parent_id,
-            LifecycleEvent::Idle,
-            child_ref("mate", "teammate"),
-        );
+        // First sight of the teammate is a name-only event: a placeholder
+        // keyed by name and parent appears.
+        let (cmd, _) = lifecycle_cmd(&parent_id, LifecycleEvent::Idle, by_name("mate"));
         actor.handle_command(cmd);
-        assert_eq!(
-            view_of(&actor, "mate").map(|v| v.agent_type),
-            Some("teammate".to_string())
-        );
+        let placeholder = view_of(&actor, "mate@lead").expect("placeholder");
+        assert_eq!(placeholder.agent_type, "teammate");
+        assert_eq!(placeholder.parent_session_id, Some(parent_id.clone()));
 
         // Then the spawning call reports its agent id.
-        actor.handle_command(RegistryCommand::RegisterChildAlias {
-            name: "mate".into(),
-            agent_id: "a-9".into(),
-        });
+        alias(&mut actor, &parent_id, "mate", "a-9");
         // Events keyed by agent id now land on the same session...
         let (cmd, _) = lifecycle_cmd(
             &parent_id,
@@ -3231,12 +3332,12 @@ mod tests {
                 tool_use_id: None,
                 input: None,
             },
-            child_ref("a-9", "worker"),
+            by_id("a-9", "worker"),
         );
         actor.handle_command(cmd);
         assert_eq!(actor.session_count(), 2);
         assert_eq!(
-            view_of(&actor, "mate").map(|v| v.status),
+            view_of(&actor, "mate@lead").map(|v| v.status),
             Some(atm_core::SessionStatus::Working)
         );
         // ...and SubagentStop by agent id removes it.
@@ -3250,7 +3351,7 @@ mod tests {
             None,
         );
         actor.handle_command(cmd);
-        assert!(view_of(&actor, "mate").is_none());
+        assert!(view_of(&actor, "mate@lead").is_none());
         assert_eq!(actor.session_count(), 1);
     }
 
@@ -3259,40 +3360,132 @@ mod tests {
         let (_, mut actor, _) = create_actor();
         // Fill the registry so no child can be created.
         for i in 0..MAX_SESSIONS {
-            let (tx, _) = oneshot::channel();
-            actor.handle_command(RegistryCommand::Register {
-                session: Box::new(create_test_session(&format!("s-{i}"))),
-                respond_to: tx,
-            });
+            register_parent(&mut actor, &format!("s-{i}"));
         }
         assert_eq!(actor.session_count(), MAX_SESSIONS);
         let parent_id = SessionId::new("s-0");
 
-        let (cmd, rx) = lifecycle_cmd(
-            &parent_id,
-            LifecycleEvent::Idle,
-            child_ref("ghost", "teammate"),
-        );
+        let (cmd, rx) = lifecycle_cmd(&parent_id, LifecycleEvent::Idle, by_name("ghost"));
         actor.handle_command(cmd);
         assert!(rx.await.unwrap().is_ok());
-
         assert_eq!(actor.session_count(), MAX_SESSIONS);
-        let parent = view_of(&actor, "s-0").expect("parent");
-        assert_eq!(
-            parent.status,
-            atm_core::SessionStatus::Idle,
-            "registered fixtures start idle; the point is no child was created"
-        );
-        // Prove the event was not applied: a NeedsInput would have flipped it.
+
+        // Prove the event was not applied to the parent: a NeedsInput
+        // would have flipped it from the idle it starts in.
         let (cmd, _) = lifecycle_cmd(
             &parent_id,
             LifecycleEvent::NeedsInput {
                 reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
             },
-            child_ref("ghost", "teammate"),
+            by_name("ghost"),
         );
         actor.handle_command(cmd);
         let parent = view_of(&actor, "s-0").expect("parent");
         assert_eq!(parent.status, atm_core::SessionStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn alias_before_registration_is_kept() {
+        let (_, mut actor, _) = create_actor();
+        let parent_id = register_parent(&mut actor, "lead");
+        // PostToolUse(Agent) can be processed before SubagentStart: the
+        // pairing must survive until the child registers.
+        alias(&mut actor, &parent_id, "reviewer", "a-1");
+        assert_eq!(actor.session_count(), 1);
+
+        let (cmd, _) = lifecycle_cmd(
+            &parent_id,
+            LifecycleEvent::ChildSessionStart {
+                id: Some("a-1".into()),
+                role: Some("worker".into()),
+            },
+            None,
+        );
+        actor.handle_command(cmd);
+        let (cmd, _) = lifecycle_cmd(&parent_id, LifecycleEvent::Idle, by_name("reviewer"));
+        actor.handle_command(cmd);
+
+        assert_eq!(
+            actor.session_count(),
+            2,
+            "name event must not create a second child"
+        );
+        assert_eq!(
+            view_of(&actor, "a-1").map(|v| v.status),
+            Some(atm_core::SessionStatus::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_are_scoped_to_the_parent_session() {
+        let (_, mut actor, _) = create_actor();
+        let lead_a = spawn_parent_with_child(&mut actor, "lead-a", "agent-a").await;
+        let lead_b = spawn_parent_with_child(&mut actor, "lead-b", "agent-b").await;
+        alias(&mut actor, &lead_a, "reviewer", "agent-a");
+        alias(&mut actor, &lead_b, "reviewer", "agent-b");
+
+        // The same teammate name in two sessions resolves per session.
+        let (cmd, _) = lifecycle_cmd(
+            &lead_a,
+            LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
+            },
+            by_name("reviewer"),
+        );
+        actor.handle_command(cmd);
+        assert_eq!(
+            view_of(&actor, "agent-a").map(|v| v.status),
+            Some(atm_core::SessionStatus::AttentionNeeded)
+        );
+        assert_eq!(
+            view_of(&actor, "agent-b").map(|v| v.status),
+            Some(atm_core::SessionStatus::Working)
+        );
+        assert_eq!(actor.session_count(), 4);
+
+        // An id-tagged event from the wrong session never repaints a
+        // child it does not own.
+        let (cmd, _) = lifecycle_cmd(&lead_b, LifecycleEvent::Idle, by_id("agent-a", "explore"));
+        actor.handle_command(cmd);
+        assert_eq!(
+            view_of(&actor, "agent-a").map(|v| v.status),
+            Some(atm_core::SessionStatus::AttentionNeeded)
+        );
+
+        // Ending one lead drops only its aliases; the other still routes.
+        let (cmd, rx) = lifecycle_cmd(&lead_a, LifecycleEvent::SessionEnd { reason: None }, None);
+        actor.handle_command(cmd);
+        assert!(rx.await.unwrap().is_ok());
+        let (cmd, _) = lifecycle_cmd(&lead_b, LifecycleEvent::Idle, by_name("reviewer"));
+        actor.handle_command(cmd);
+        assert_eq!(actor.session_count(), 2);
+        assert_eq!(
+            view_of(&actor, "agent-b").map(|v| v.status),
+            Some(atm_core::SessionStatus::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_folds_into_registered_child_when_alias_arrives() {
+        let (_, mut actor, _) = create_actor();
+        let parent_id = spawn_parent_with_child(&mut actor, "lead", "a-1").await;
+        // A name-only event lands before the pairing is known.
+        let (cmd, _) = lifecycle_cmd(&parent_id, LifecycleEvent::Idle, by_name("reviewer"));
+        actor.handle_command(cmd);
+        assert_eq!(actor.session_count(), 3, "placeholder created");
+
+        alias(&mut actor, &parent_id, "reviewer", "a-1");
+        assert_eq!(actor.session_count(), 2, "placeholder folded away");
+        assert!(view_of(&actor, "reviewer@lead").is_none());
+        let parent = view_of(&actor, "lead").expect("lead");
+        assert_eq!(parent.child_session_ids, vec![SessionId::new("a-1")]);
+
+        let (cmd, _) = lifecycle_cmd(&parent_id, LifecycleEvent::Idle, by_name("reviewer"));
+        actor.handle_command(cmd);
+        assert_eq!(
+            view_of(&actor, "a-1").map(|v| v.status),
+            Some(atm_core::SessionStatus::Idle)
+        );
+        assert_eq!(actor.session_count(), 2);
     }
 }

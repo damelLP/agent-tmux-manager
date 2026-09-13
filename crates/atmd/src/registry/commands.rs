@@ -100,6 +100,9 @@ pub enum RegistryCommand {
     /// with the `agentId` in the tool response), so teammate events
     /// that only carry a name can be routed to its session.
     RegisterChildAlias {
+        /// Session that spawned the child; names are only unique
+        /// within it.
+        parent: SessionId,
         /// Name given to the Agent tool.
         name: String,
         /// Vendor agent id from the tool response.

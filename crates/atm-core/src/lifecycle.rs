@@ -151,15 +151,24 @@ pub enum NeedsInputReason {
     },
 }
 
-/// Identifies the child agent an event originated from, for vendors
-/// that run children in-process and tag their events (Claude sets
-/// `agent_id` / `agent_type` on every hook fired inside a subagent or
-/// teammate). The registry uses it to route the event to the child's
-/// session instead of the parent's.
+/// Identifies the child agent an event originated from or is about,
+/// for vendors that run children in-process and tag their events.
+/// Claude sets `agent_id` / `agent_type` on every hook fired inside a
+/// subagent, and names the teammate (`teammate_name`) on team events.
+/// At least one of `id` / `name` is set. The registry routes the event
+/// to the child's session instead of the parent's, resolving names
+/// through the aliases it records from spawning calls, scoped to the
+/// parent session because names only need to be unique within one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildAgentRef {
-    /// Vendor correlation id, matching `ChildSessionStart::id`.
-    pub id: String,
+    /// Vendor correlation id, matching `ChildSessionStart::id`, when
+    /// the event carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Human name the child was spawned with, when the event carries
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Free-form role tag (Claude `agent_type`), when known.
     pub role: Option<String>,
 }
@@ -261,10 +270,11 @@ pub enum LifecycleEvent {
         role: Option<String>,
     },
 
-    /// A child session finished. `reason` is the vendor stop reason
-    /// (Claude `stop_reason`: `end_turn`, `max_turns`, `user_interrupt`,
-    /// `error`) and `last_message` the child's final assistant text,
-    /// when the vendor exposes them.
+    /// A child session finished. `reason` is a vendor stop reason and
+    /// `last_message` the child's final assistant text, each only when
+    /// the vendor exposes it. No current adapter emits `reason`: Claude
+    /// Code 2.1.267's `SubagentStop` carries `last_assistant_message`
+    /// but no stop reason (see the claude-adapter fixture).
     ChildSessionEnd {
         id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

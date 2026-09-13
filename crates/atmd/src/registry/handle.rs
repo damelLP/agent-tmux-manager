@@ -181,11 +181,16 @@ impl RegistryHandle {
     /// - `RegistryError::ChannelClosed` if the actor has shut down
     pub async fn register_child_alias(
         &self,
+        parent: SessionId,
         name: String,
         agent_id: String,
     ) -> Result<(), RegistryError> {
         self.sender
-            .send(RegistryCommand::RegisterChildAlias { name, agent_id })
+            .send(RegistryCommand::RegisterChildAlias {
+                parent,
+                name,
+                agent_id,
+            })
             .await
             .map_err(|_| RegistryError::ChannelClosed)
     }

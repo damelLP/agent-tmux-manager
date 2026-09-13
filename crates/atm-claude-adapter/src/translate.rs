@@ -50,23 +50,27 @@ impl RawHookEvent {
     /// `Agent` call (see [`Self::child_alias`]).
     pub fn child_agent(&self) -> Option<ChildAgentRef> {
         let ev = self.event_type()?;
-        let by_id = || {
-            non_empty(self.agent_id.as_deref()).map(|id| ChildAgentRef {
-                id,
-                role: self.agent_type.clone(),
-            })
-        };
+        let id = non_empty(self.agent_id.as_deref());
         match ev {
             ClaudeEventType::SubagentStart | ClaudeEventType::SubagentStop => None,
             ClaudeEventType::TeammateIdle
             | ClaudeEventType::TaskCreated
-            | ClaudeEventType::TaskCompleted => by_id().or_else(|| {
-                non_empty(self.teammate_name.as_deref()).map(|name| ChildAgentRef {
-                    id: name,
-                    role: Some(TEAMMATE_ROLE.to_string()),
-                })
+            | ClaudeEventType::TaskCompleted => {
+                let name = non_empty(self.teammate_name.as_deref());
+                if id.is_none() && name.is_none() {
+                    return None;
+                }
+                let role = self
+                    .agent_type
+                    .clone()
+                    .or_else(|| Some(TEAMMATE_ROLE.to_string()));
+                Some(ChildAgentRef { id, name, role })
+            }
+            _ => id.map(|id| ChildAgentRef {
+                id: Some(id),
+                name: None,
+                role: self.agent_type.clone(),
             }),
-            _ => by_id(),
         }
     }
 
@@ -634,14 +638,23 @@ mod tests {
         assert_eq!(
             idle.child_agent(),
             Some(ChildAgentRef {
-                id: "reviewer".into(),
+                id: None,
+                name: Some("reviewer".into()),
                 role: Some("teammate".into()),
             })
         );
-        // Should a future version add agent_id, it wins over the name.
+        // Should a future version add agent_id, both are carried so the
+        // registry can record the pairing.
         idle.agent_id = Some("a1b2".into());
         idle.agent_type = Some("worker".into());
-        assert_eq!(idle.child_agent().map(|c| c.id), Some("a1b2".to_string()));
+        assert_eq!(
+            idle.child_agent(),
+            Some(ChildAgentRef {
+                id: Some("a1b2".into()),
+                name: Some("reviewer".into()),
+                role: Some("worker".into()),
+            })
+        );
         // A TeammateIdle that names nobody is dropped, never idling the lead.
         assert_eq!(raw("TeammateIdle").to_lifecycle_event(), None);
 
@@ -658,7 +671,7 @@ mod tests {
             })
         );
         assert_eq!(
-            created.child_agent().map(|c| c.id),
+            created.child_agent().and_then(|c| c.name),
             Some("reviewer".to_string())
         );
 
@@ -734,7 +747,8 @@ mod tests {
         assert_eq!(
             inside.child_agent(),
             Some(ChildAgentRef {
-                id: "ab0ba21136290a8f9".into(),
+                id: Some("ab0ba21136290a8f9".into()),
+                name: None,
                 role: Some("general-purpose".into()),
             })
         );
@@ -855,7 +869,7 @@ mod tests {
                 }),
             ) => {
                 assert_eq!(a, b);
-                assert_eq!(a, child.id);
+                assert_eq!(Some(a), child.id);
                 assert_eq!(last_message.as_deref(), Some("subagent-hello"));
             }
             other => panic!("unexpected child lifecycle: {other:?}"),

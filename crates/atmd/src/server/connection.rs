@@ -486,7 +486,7 @@ impl ConnectionHandler {
         // events, which only name the teammate, reach its session.
         if let Some((name, agent_id)) = raw_event.child_alias() {
             self.registry
-                .register_child_alias(name, agent_id)
+                .register_child_alias(raw_event.session_id(), name, agent_id)
                 .await
                 .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
         }

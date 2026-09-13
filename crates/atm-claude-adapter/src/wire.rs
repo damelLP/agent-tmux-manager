@@ -48,6 +48,10 @@ pub struct RawHookEvent {
     // === Stop Events (Stop, SubagentStop) ===
     #[serde(default)]
     pub stop_hook_active: Option<bool>,
+    #[serde(default)]
+    pub background_tasks: Option<serde_json::Value>,
+    #[serde(default)]
+    pub session_crons: Option<serde_json::Value>,
 
     // === Subagent Events (SubagentStart, SubagentStop) ===
     #[serde(default)]
@@ -76,6 +80,12 @@ pub struct RawHookEvent {
     pub notification_type: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+
+    // === Agent teams ===
+    #[serde(default)]
+    pub teammate_name: Option<String>,
+    #[serde(default)]
+    pub task_subject: Option<String>,
 }
 
 impl RawHookEvent {

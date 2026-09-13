@@ -30,7 +30,7 @@ use atm_pi_adapter::RawPiEvent;
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 
 use crate::discovery::{DiscoveryResult, DiscoveryService};
-use crate::registry::{RegistryHandle, SessionEvent};
+use crate::registry::{LifecycleContext, RegistryHandle, SessionEvent};
 
 /// Type alias for subscriber writer handle
 pub type SubscriberWriter = Arc<Mutex<BufWriter<OwnedWriteHalf>>>;
@@ -447,14 +447,23 @@ impl ConnectionHandler {
         let session_id = raw_event.session_id();
         let pid = raw_event.pid;
         let tmux_pane = raw_event.tmux_pane.clone();
+        let (child_id, child_name, child_role) = raw_event.child_agent().unwrap_or_default();
+        let context = LifecycleContext {
+            child_id,
+            child_name,
+            child_role,
+            child_alias: raw_event.child_alias(),
+            background_activity: raw_event.background_activity(),
+        };
 
         self.registry
-            .apply_lifecycle_event(
+            .apply_lifecycle_event_with_context(
                 session_id,
                 lifecycle,
                 atm_core::Harness::ClaudeCode,
                 pid,
                 tmux_pane,
+                context,
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;

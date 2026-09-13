@@ -24,11 +24,15 @@ const HOOK_EVENT_VARIANTS: &[(ClaudeEventType, &str)] = &[
     (ClaudeEventType::PreCompact, "PreCompact"),
     (ClaudeEventType::Setup, "Setup"),
     (ClaudeEventType::Notification, "Notification"),
+    (ClaudeEventType::PermissionRequest, "PermissionRequest"),
+    (ClaudeEventType::TeammateIdle, "TeammateIdle"),
+    (ClaudeEventType::TaskCreated, "TaskCreated"),
+    (ClaudeEventType::TaskCompleted, "TaskCompleted"),
 ];
 
 /// Types of hook events from Claude Code.
 ///
-/// All 12 Claude Code hook events, based on official documentation.
+/// Claude Code hook events ATM subscribes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ClaudeEventType {
@@ -67,6 +71,14 @@ pub enum ClaudeEventType {
     // === Notifications ===
     /// Informational notification
     Notification,
+    /// A tool call needs a permission decision.
+    PermissionRequest,
+    /// A teammate is about to go idle.
+    TeammateIdle,
+    /// A shared task-list entry was created.
+    TaskCreated,
+    /// A shared task-list entry was completed.
+    TaskCompleted,
 }
 
 impl ClaudeEventType {

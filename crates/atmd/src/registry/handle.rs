@@ -159,6 +159,7 @@ impl RegistryHandle {
         context: LifecycleContext,
     ) -> Result<(), RegistryError> {
         let (tx, rx) = oneshot::channel();
+
         self.sender
             .send(RegistryCommand::ApplyLifecycleEvent {
                 session_id,
@@ -171,6 +172,7 @@ impl RegistryHandle {
             })
             .await
             .map_err(|_| RegistryError::ChannelClosed)?;
+
         rx.await.map_err(|_| RegistryError::ChannelClosed)?
     }
 

@@ -722,8 +722,6 @@ impl RegistryActor {
             return Ok(());
         }
 
-        let tool_name = tool_name_from_event(&event);
-
         // Pending → real upgrade: a session discovered via /proc starts
         // life as `pending-{pid}`. The first vendor-adapter event with
         // a real session_id is our signal to reconcile, mirroring the
@@ -739,114 +737,61 @@ impl RegistryActor {
             }
         }
 
-        if let Some(parent_pid) = target_pid.filter(|pid| self.sessions_by_pid.contains_key(pid)) {
-            if self.prepare_child_event(parent_pid, &event, harness, &context) {
-                return Ok(());
-            }
-        }
-
-        let (session, infra) = match target_pid.and_then(|p| self.sessions_by_pid.get_mut(&p)) {
-            Some(entry) => entry,
-            None => {
-                // Session doesn't exist yet - this is normal due to race conditions.
-                // With PID as primary key, we can create the session now if we have a PID.
-                if let Some(p) = pid {
-                    if p != 0 {
-                        debug!(
-                            session_id = %session_id,
-                            pid = p,
-                            event = ?event,
-                            "Creating session from lifecycle event"
-                        );
-                        // Read cwd from /proc/{pid}/cwd so a session created
-                        // via a vendor adapter event lands grouped under the
-                        // right project / branch from frame one. Without this,
-                        // lifecycle-event-created sessions fall into the
-                        // "Other" tree bucket because working_directory is None.
-                        let proc_cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok();
-                        use atm_core::Model;
-                        let session = build_session_from_pid(
-                            session_id.clone(),
-                            AgentType::GeneralPurpose,
-                            Model::Unknown,
-                            harness,
-                            tmux_pane.clone(),
-                            proc_cwd,
-                        );
-
-                        let mut infra = SessionInfrastructure::new();
-                        infra.set_pid(p);
-
-                        self.sessions_by_pid.insert(p, (session, infra));
-                        self.session_id_to_pid.insert(session_id.clone(), p);
-
-                        let routed = self.prepare_child_event(p, &event, harness, &context);
-                        if let Some((session, infra)) = self.sessions_by_pid.get_mut(&p) {
-                            if !routed {
-                                session.apply_lifecycle_event(&event);
-                                session.set_first_prompt_from_event(&event);
-                                if let Some(name) = tool_name.as_deref() {
-                                    infra.record_tool_use(name, None);
-                                }
-                            }
-
-                            let view = SessionView::from_domain(session);
-                            let _ = self.event_publisher.send(SessionEvent::Registered {
-                                session_id: session_id.clone(),
-                                agent_type: session.agent_type.clone(),
-                            });
-                            let _ = self.event_publisher.send(SessionEvent::Updated {
-                                session: Box::new(view),
-                            });
-                        }
-
-                        if !routed {
-                            self.apply_background_activity(p, context.background_activity);
-                        }
-                        self.try_correlate_subagent(&session_id, p);
-
-                        return Ok(());
-                    }
-                }
-
-                debug!(
-                    session_id = %session_id,
-                    event = ?event,
-                    "Lifecycle event for non-existent session without PID, ignoring"
-                );
-                return Ok(());
-            }
+        let existing = target_pid.filter(|p| self.sessions_by_pid.contains_key(p));
+        let Some(p) = existing.or(pid.filter(|p| *p != 0)) else {
+            debug!(
+                session_id = %session_id,
+                event = ?event,
+                "Lifecycle event for non-existent session without PID, ignoring"
+            );
+            return Ok(());
         };
-
-        session.apply_lifecycle_event(&event);
-        session.set_first_prompt_from_event(&event);
-
-        if tmux_pane.is_some() && session.tmux_pane.is_none() {
-            session.tmux_pane = tmux_pane;
+        if existing.is_none() {
+            // Session doesn't exist yet - this is normal due to race conditions.
+            // With PID as primary key, we can create the session now if we have a PID.
+            debug!(
+                session_id = %session_id,
+                pid = p,
+                event = ?event,
+                "Creating session from lifecycle event"
+            );
+            // Read cwd from /proc/{pid}/cwd so a session created
+            // via a vendor adapter event lands grouped under the
+            // right project / branch from frame one. Without this,
+            // lifecycle-event-created sessions fall into the
+            // "Other" tree bucket because working_directory is None.
+            let proc_cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok();
+            let session = build_session_from_pid(
+                session_id.clone(),
+                AgentType::GeneralPurpose,
+                atm_core::Model::Unknown,
+                harness,
+                tmux_pane.clone(),
+                proc_cwd,
+            );
+            let mut infra = SessionInfrastructure::new();
+            infra.set_pid(p);
+            self.sessions_by_pid.insert(p, (session, infra));
+            self.session_id_to_pid.insert(session_id.clone(), p);
+            let _ = self.event_publisher.send(SessionEvent::Registered {
+                session_id: session_id.clone(),
+                agent_type: AgentType::GeneralPurpose,
+            });
+            self.try_correlate_subagent(&session_id, p);
         }
 
-        debug!(
-            session_id = %session.id,
-            event = ?event,
-            new_status = %session.status,
-            "Lifecycle event applied"
-        );
-
-        if let Some(name) = tool_name.as_deref() {
-            infra.record_tool_use(name, None);
-        }
-
-        let view = SessionView::from_domain(session);
-        let _ = self.event_publisher.send(SessionEvent::Updated {
-            session: Box::new(view),
-        });
-
-        if let Some(pid) = target_pid {
-            self.apply_background_activity(pid, context.background_activity);
+        if !self.prepare_child_event(p, &event, harness, &context) {
+            self.apply_to_session(p, &event, tmux_pane);
+            self.apply_background_activity(p, context.background_activity);
         }
         Ok(())
     }
 
+    /// Child bookkeeping for an event received on `parent_pid`: learns
+    /// name→id aliases, tracks `ChildSessionStart`/`End`, and applies an
+    /// event emitted by an in-process child to that child.
+    ///
+    /// Returns `true` when the event was routed to a child.
     fn prepare_child_event(
         &mut self,
         parent_pid: u32,
@@ -880,39 +825,61 @@ impl RegistryActor {
                     },
                 ));
                 let child_id = self.child_id_for(&parent_id, agent_id, false);
-                if let Some(pid) =
-                    self.ensure_child_session(parent_pid, &child_id, role.as_deref(), harness)
-                {
-                    if let Some((child, _)) = self.sessions_by_pid.get(&pid) {
-                        self.child_refs
-                            .insert((parent_id.clone(), agent_id.clone()), child.id.clone());
-                    }
-                }
+                self.ensure_child_session(parent_pid, child_id, role.as_deref(), harness);
             }
             LifecycleEvent::ChildSessionEnd { id: Some(agent_id) } => {
                 self.pending_subagents.retain(|(id, _)| id != agent_id);
                 let child_id = self.child_id_for(&parent_id, agent_id, false);
-                self.remove_child(&parent_id, &child_id, RemovalReason::SessionEnded);
+                let _ = self.handle_remove(child_id, RemovalReason::SessionEnded);
             }
             _ => {}
         }
-        if context.child_id.is_some() || context.child_name.is_some() {
-            self.route_child_event(parent_pid, context, event, harness);
-            true
-        } else {
-            false
+        let (reference, is_name) = match (&context.child_id, &context.child_name) {
+            (Some(id), _) => (id, false),
+            (None, Some(name)) => (name, true),
+            (None, None) => return false,
+        };
+        let child_id = self.child_id_for(&parent_id, reference, is_name);
+        let role = context.child_role.as_deref();
+        if let Some(pid) = self.ensure_child_session(parent_pid, child_id, role, harness) {
+            self.apply_to_session(pid, event, None);
+        }
+        true
+    }
+
+    /// Publishes the current view of the session stored under `pid`.
+    fn publish_updated(&self, pid: u32) {
+        if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
+            let _ = self.event_publisher.send(SessionEvent::Updated {
+                session: Box::new(SessionView::from_domain(session)),
+            });
         }
     }
 
-    fn apply_background_activity(&mut self, pid: u32, activity: Option<(u32, u32)>) {
-        if let Some((running, scheduled)) = activity {
-            self.set_background_activity(pid, running, scheduled);
-            if running == 0 {
-                self.sweep_children(pid);
-            }
+    /// Applies `event` to the session stored under `pid` and publishes it.
+    fn apply_to_session(&mut self, pid: u32, event: &LifecycleEvent, tmux_pane: Option<String>) {
+        let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) else {
+            return;
+        };
+        session.apply_lifecycle_event(event);
+        session.set_first_prompt_from_event(event);
+        if tmux_pane.is_some() && session.tmux_pane.is_none() {
+            session.tmux_pane = tmux_pane;
         }
+        if let Some(name) = tool_name_from_event(event) {
+            infra.record_tool_use(&name, None);
+        }
+        debug!(
+            session_id = %session.id,
+            event = ?event,
+            new_status = %session.status,
+            "Lifecycle event applied"
+        );
+        self.publish_updated(pid);
     }
 
+    /// Resolves a vendor child reference (agent id, or teammate name when
+    /// `is_name`) to its child session id under `parent`.
     fn child_id_for(&self, parent: &SessionId, reference: &str, is_name: bool) -> SessionId {
         self.child_refs
             .get(&(parent.clone(), reference.to_string()))
@@ -926,283 +893,125 @@ impl RegistryActor {
             })
     }
 
-    fn child_pid(&self, parent: &SessionId, child_id: &SessionId) -> Option<u32> {
-        self.session_id_to_pid
-            .get(child_id)
-            .copied()
-            .filter(|pid| {
-                self.sessions_by_pid
-                    .get(pid)
-                    .is_some_and(|(child, _)| child.parent_session_id.as_ref() == Some(parent))
-            })
-            .or_else(|| {
-                self.sessions_by_pid.iter().find_map(|(pid, (child, _))| {
-                    (child.id == *child_id && child.parent_session_id.as_ref() == Some(parent))
-                        .then_some(*pid)
-                })
-            })
+    /// The in-process (synthetic, no real pid) session with this id, if any.
+    fn synthetic_child(&self, id: &SessionId) -> Option<&SessionDomain> {
+        let (session, infra) = self.sessions_by_pid.get(self.session_id_to_pid.get(id)?)?;
+        infra.pid.is_none().then_some(session)
     }
 
+    /// Returns the pid of `child_id`, creating it as an in-process child of
+    /// `parent_pid` when it does not exist yet.
     fn ensure_child_session(
         &mut self,
         parent_pid: u32,
-        child_id: &SessionId,
+        child_id: SessionId,
         role: Option<&str>,
         harness: atm_core::Harness,
     ) -> Option<u32> {
-        let parent_id = self
-            .sessions_by_pid
-            .get(&parent_pid)
-            .map(|(parent, _)| parent.id.clone())?;
-        if let Some(pid) = self.session_id_to_pid.get(child_id).copied() {
-            return self.child_pid(&parent_id, child_id).map(|_| pid);
+        if let Some(pid) = self.session_id_to_pid.get(&child_id) {
+            return Some(*pid);
         }
-        if self.sessions_by_pid.len() >= MAX_SESSIONS {
-            return None;
-        }
-
-        let mut child = {
-            let (parent, _) = self.sessions_by_pid.get(&parent_pid)?;
-            let mut child =
-                SessionDomain::new(child_id.clone(), child_agent_type(role), parent.model);
-            child.harness = harness;
-            child.model_display_override = parent.model_display_override.clone();
-            child.tmux_pane = parent.tmux_pane.clone();
-            child.working_directory = parent.working_directory.clone();
-            child.project_root = parent.project_root.clone();
-            child.worktree_path = parent.worktree_path.clone();
-            child.worktree_branch = parent.worktree_branch.clone();
-            child.parent_session_id = Some(parent_id.clone());
-            child
-        };
+        let (parent, _) = self.sessions_by_pid.get(&parent_pid)?;
+        let mut child = SessionDomain::new(child_id.clone(), child_agent_type(role), parent.model);
+        child.harness = harness;
+        child.model_display_override = parent.model_display_override.clone();
+        child.tmux_pane = parent.tmux_pane.clone();
+        child.working_directory = parent.working_directory.clone();
+        child.project_root = parent.project_root.clone();
+        child.worktree_path = parent.worktree_path.clone();
+        child.worktree_branch = parent.worktree_branch.clone();
+        child.parent_session_id = Some(parent.id.clone());
         child.apply_lifecycle_event(&LifecycleEvent::WorkingStart);
-        let child_pid = self.generate_synthetic_pid();
-        let agent_type = child.agent_type.clone();
-        let child_view = SessionView::from_domain(&child);
-        self.sessions_by_pid
-            .insert(child_pid, (child, SessionInfrastructure::new()));
-        self.session_id_to_pid.insert(child_id.clone(), child_pid);
-
-        let parent_view = self
-            .sessions_by_pid
-            .get_mut(&parent_pid)
-            .map(|(parent, _)| {
-                if !parent.child_session_ids.contains(child_id) {
-                    parent.child_session_ids.push(child_id.clone());
-                }
-                SessionView::from_domain(parent)
-            });
-        let _ = self.event_publisher.send(SessionEvent::Registered {
-            session_id: child_id.clone(),
-            agent_type,
-        });
-        let _ = self.event_publisher.send(SessionEvent::Updated {
-            session: Box::new(child_view),
-        });
-        if let Some(session) = parent_view {
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(session),
-            });
+        // Without a real pid the registry assigns a synthetic one that
+        // `set_pid` rejects, so `infra.pid` stays `None` and stale-process
+        // cleanup never sweeps the child.
+        self.handle_register(child, None).ok()?;
+        let child_pid = self.session_id_to_pid.get(&child_id).copied()?;
+        if let Some((parent, _)) = self.sessions_by_pid.get_mut(&parent_pid) {
+            parent.child_session_ids.push(child_id);
         }
+        self.publish_updated(child_pid);
+        self.publish_updated(parent_pid);
         Some(child_pid)
     }
 
-    fn route_child_event(
-        &mut self,
-        parent_pid: u32,
-        context: &LifecycleContext,
-        event: &LifecycleEvent,
-        harness: atm_core::Harness,
-    ) {
-        let Some(parent_id) = self
-            .sessions_by_pid
-            .get(&parent_pid)
-            .map(|(parent, _)| parent.id.clone())
-        else {
-            return;
-        };
-        let (reference, is_name) = match (&context.child_id, &context.child_name) {
-            (Some(id), _) => (id, false),
-            (None, Some(name)) => (name, true),
-            (None, None) => return,
-        };
-        let child_id = self.child_id_for(&parent_id, reference, is_name);
-        let Some(child_pid) = self.ensure_child_session(
-            parent_pid,
-            &child_id,
-            context.child_role.as_deref(),
-            harness,
-        ) else {
-            return;
-        };
-        let actual_id = self
-            .sessions_by_pid
-            .get(&child_pid)
-            .map(|(child, _)| child.id.clone())
-            .unwrap_or(child_id);
-        for reference in [&context.child_id, &context.child_name]
-            .into_iter()
-            .flatten()
-        {
-            self.child_refs
-                .insert((parent_id.clone(), reference.clone()), actual_id.clone());
+    /// Maps a teammate `name` and its `agent_id` to one child session under
+    /// `parent`, retiring a name-only placeholder the alias supersedes.
+    fn register_child_alias(&mut self, parent: &SessionId, name: &str, agent_id: &str) {
+        let target = self.child_id_for(parent, agent_id, false);
+        let placeholder = self.child_id_for(parent, name, true);
+        if placeholder != target && self.synthetic_child(&placeholder).is_some() {
+            let _ = self.handle_remove(placeholder, RemovalReason::Upgraded);
         }
-        self.apply_to_session(child_pid, event, None);
+        for reference in [name, agent_id] {
+            self.child_refs
+                .insert((parent.clone(), reference.to_string()), target.clone());
+        }
     }
 
-    fn register_child_alias(&mut self, parent: &SessionId, name: &str, agent_id: &str) {
-        let name = name.trim();
-        let agent_id = agent_id.trim();
-        if name.is_empty() || agent_id.is_empty() {
+    /// After a parent `Stop`: sweeps in-process children still marked
+    /// working once nothing runs in the background (their `SubagentStop`
+    /// never arrived), and shows remaining background work on the parent.
+    fn apply_background_activity(&mut self, pid: u32, activity: Option<(u32, u32)>) {
+        let Some((running, scheduled)) = activity else {
             return;
-        }
-        let named = self
-            .child_refs
-            .get(&(parent.clone(), name.to_string()))
-            .cloned();
-        let identified = self
-            .child_refs
-            .get(&(parent.clone(), agent_id.to_string()))
-            .cloned()
-            .or_else(|| {
-                let id = SessionId::new(agent_id);
-                self.child_pid(parent, &id).map(|_| id)
-            });
-        let target = identified
-            .clone()
-            .or_else(|| named.clone())
-            .unwrap_or_else(|| SessionId::new(agent_id));
-
-        if let Some(stale) = named.filter(|id| id != &target) {
-            if let Some(pid) = self.child_pid(parent, &stale) {
-                let synthetic = self
-                    .sessions_by_pid
-                    .get(&pid)
-                    .is_some_and(|(_, infra)| infra.pid.is_none());
-                if synthetic {
-                    self.remove_child(parent, &stale, RemovalReason::Upgraded);
+        };
+        if running == 0 {
+            let child_ids = self
+                .sessions_by_pid
+                .get(&pid)
+                .map(|(parent, _)| parent.child_session_ids.clone())
+                .unwrap_or_default();
+            for id in child_ids {
+                let working = self
+                    .synthetic_child(&id)
+                    .is_some_and(|child| child.status == atm_core::SessionStatus::Working);
+                if working {
+                    let _ = self.handle_remove(id, RemovalReason::SessionEnded);
                 }
             }
         }
-        self.child_refs
-            .insert((parent.clone(), name.to_string()), target.clone());
-        self.child_refs
-            .insert((parent.clone(), agent_id.to_string()), target);
-    }
-
-    fn remove_child(&mut self, parent: &SessionId, child_id: &SessionId, reason: RemovalReason) {
-        if let Some(pid) = self.child_pid(parent, child_id) {
-            let _ = self.handle_remove_by_pid(pid, reason);
-        }
-    }
-
-    fn apply_to_session(&mut self, pid: u32, event: &LifecycleEvent, tmux_pane: Option<String>) {
-        let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) else {
-            return;
-        };
-        session.apply_lifecycle_event(event);
-        session.set_first_prompt_from_event(event);
-        if tmux_pane.is_some() && session.tmux_pane.is_none() {
-            session.tmux_pane = tmux_pane;
-        }
-        if let Some(name) = tool_name_from_event(event) {
-            infra.record_tool_use(&name, None);
-        }
-        let _ = self.event_publisher.send(SessionEvent::Updated {
-            session: Box::new(SessionView::from_domain(session)),
-        });
-    }
-
-    fn sweep_children(&mut self, parent_pid: u32) {
-        let Some((parent_id, child_ids)) = self
-            .sessions_by_pid
-            .get(&parent_pid)
-            .map(|(parent, _)| (parent.id.clone(), parent.child_session_ids.clone()))
-        else {
-            return;
-        };
-        let stale: Vec<_> = child_ids
-            .into_iter()
-            .filter(|id| {
-                self.child_pid(&parent_id, id).is_some_and(|pid| {
-                    self.sessions_by_pid
-                        .get(&pid)
-                        .is_some_and(|(child, infra)| {
-                            infra.pid.is_none() && child.status == atm_core::SessionStatus::Working
-                        })
-                })
-            })
-            .collect();
-        for child_id in stale {
-            self.remove_child(&parent_id, &child_id, RemovalReason::SessionEnded);
-        }
-    }
-
-    fn set_background_activity(&mut self, pid: u32, running: u32, scheduled: u32) {
-        let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) else {
-            return;
-        };
-        let mut parts = Vec::with_capacity(2);
+        let mut parts = Vec::new();
         if running > 0 {
-            parts.push(format!(
-                "{running} bg task{}",
-                if running == 1 { "" } else { "s" }
-            ));
+            let plural = if running == 1 { "" } else { "s" };
+            parts.push(format!("{running} bg task{plural}"));
         }
         if scheduled > 0 {
             parts.push(format!("{scheduled} scheduled"));
         }
-        if !parts.is_empty() && session.status == atm_core::SessionStatus::Idle {
-            session.current_activity =
-                Some(atm_core::ActivityDetail::with_context(&parts.join(", ")));
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(SessionView::from_domain(session)),
-            });
+        let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) else {
+            return;
+        };
+        if parts.is_empty() || session.status != atm_core::SessionStatus::Idle {
+            return;
         }
+        session.current_activity = Some(atm_core::ActivityDetail::with_context(&parts.join(", ")));
+        self.publish_updated(pid);
     }
 
+    /// Unlinks a session that just left the registry from its children and
+    /// parent, removing in-process children with it.
     fn detach_removed_session(&mut self, session: &SessionDomain, reason: RemovalReason) {
-        let children: Vec<_> = session
-            .child_session_ids
-            .iter()
-            .filter_map(|id| {
-                self.session_id_to_pid.get(id).copied().map(|pid| {
-                    let synthetic = self
-                        .sessions_by_pid
-                        .get(&pid)
-                        .is_some_and(|(_, infra)| infra.pid.is_none());
-                    (id.clone(), pid, synthetic)
-                })
-            })
-            .collect();
-        for (id, pid, synthetic) in children {
-            if synthetic {
-                self.sessions_by_pid.remove(&pid);
-                self.session_id_to_pid.remove(&id);
-                let _ = self.event_publisher.send(SessionEvent::Removed {
-                    session_id: id,
-                    reason,
-                });
-            } else if let Some((child, _)) = self.sessions_by_pid.get_mut(&pid) {
-                child.parent_session_id = None;
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(SessionView::from_domain(child)),
-                });
+        for id in &session.child_session_ids {
+            if self.synthetic_child(id).is_some() {
+                let _ = self.handle_remove(id.clone(), reason);
+            } else if let Some(pid) = self.session_id_to_pid.get(id).copied() {
+                if let Some((child, _)) = self.sessions_by_pid.get_mut(&pid) {
+                    child.parent_session_id = None;
+                }
+                self.publish_updated(pid);
             }
         }
-
-        if let Some(parent_pid) = session
+        if let Some(pid) = session
             .parent_session_id
             .as_ref()
             .and_then(|id| self.session_id_to_pid.get(id))
             .copied()
         {
-            if let Some((parent, _)) = self.sessions_by_pid.get_mut(&parent_pid) {
+            if let Some((parent, _)) = self.sessions_by_pid.get_mut(&pid) {
                 parent.child_session_ids.retain(|id| id != &session.id);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(SessionView::from_domain(parent)),
-                });
             }
+            self.publish_updated(pid);
         }
         self.child_refs
             .retain(|(parent, _), child| parent != &session.id && child != &session.id);
@@ -1330,26 +1139,11 @@ impl RegistryActor {
                 "Correlated subagent with discovered session"
             );
 
+            // The real process supersedes any in-process placeholder that
+            // `ChildSessionStart` created for this agent id.
             let placeholder_id = self.child_id_for(&pending.parent_session_id, &agent_id, false);
-            if let Some(placeholder_pid) =
-                self.child_pid(&pending.parent_session_id, &placeholder_id)
-            {
-                let synthetic = self
-                    .sessions_by_pid
-                    .get(&placeholder_pid)
-                    .is_some_and(|(_, infra)| infra.pid.is_none());
-                if synthetic && placeholder_pid != pid {
-                    self.sessions_by_pid.remove(&placeholder_pid);
-                    self.session_id_to_pid.remove(&placeholder_id);
-                    let _ = self.event_publisher.send(SessionEvent::Removed {
-                        session_id: placeholder_id.clone(),
-                        reason: RemovalReason::Upgraded,
-                    });
-                }
-            }
-            self.session_id_to_pid.insert(session_id.clone(), pid);
-            for ((parent, _), child) in &mut self.child_refs {
-                if parent == &pending.parent_session_id && child == &placeholder_id {
+            for child in self.child_refs.values_mut() {
+                if *child == placeholder_id {
                     *child = session_id.clone();
                 }
             }
@@ -1357,15 +1151,13 @@ impl RegistryActor {
                 (pending.parent_session_id.clone(), agent_id),
                 session_id.clone(),
             );
+            if self.synthetic_child(&placeholder_id).is_some() {
+                let _ = self.handle_remove(placeholder_id, RemovalReason::Upgraded);
+            }
 
             // Link parent to child
             if let Some((parent_session, _)) = self.sessions_by_pid.get_mut(&pending.parent_pid) {
-                parent_session
-                    .child_session_ids
-                    .retain(|id| id != &placeholder_id);
-                if !parent_session.child_session_ids.contains(session_id) {
-                    parent_session.child_session_ids.push(session_id.clone());
-                }
+                parent_session.child_session_ids.push(session_id.clone());
             }
 
             // Link child to parent (move, no clone — pending is owned)
@@ -2802,13 +2594,12 @@ mod tests {
     }
 
     fn register_test_session(actor: &mut RegistryActor, id: &str) -> SessionId {
-        let session_id = SessionId::new(id);
         let (respond_to, _) = oneshot::channel();
         actor.handle_command(RegistryCommand::Register {
             session: Box::new(create_test_session(id)),
             respond_to,
         });
-        session_id
+        SessionId::new(id)
     }
 
     fn apply_with_context(
@@ -2845,6 +2636,17 @@ mod tests {
         );
     }
 
+    fn needs_input_from(actor: &mut RegistryActor, parent: &SessionId, context: LifecycleContext) {
+        apply_with_context(
+            actor,
+            parent,
+            LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
+            },
+            context,
+        );
+    }
+
     #[test]
     fn in_process_child_lifecycle_and_event_routing() {
         let (_, mut actor, _) = create_actor();
@@ -2860,12 +2662,9 @@ mod tests {
         assert_eq!(child.tmux_pane.as_deref(), Some("%7"));
         assert_eq!(child.project_root.as_deref(), Some("/repo"));
 
-        apply_with_context(
+        needs_input_from(
             &mut actor,
             &parent,
-            LifecycleEvent::NeedsInput {
-                reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
-            },
             LifecycleContext {
                 child_id: Some("agent-1".into()),
                 child_role: Some("general-purpose".into()),
@@ -2898,52 +2697,39 @@ mod tests {
         let (_, mut actor, _) = create_actor();
         let first = register_test_session(&mut actor, "lead-a");
         let second = register_test_session(&mut actor, "lead-b");
+        let alias = |agent_id: &str| LifecycleContext {
+            child_alias: Some(("reviewer".into(), agent_id.into())),
+            ..LifecycleContext::default()
+        };
+        let by_name = || LifecycleContext {
+            child_name: Some("reviewer".into()),
+            child_role: Some("teammate".into()),
+            ..LifecycleContext::default()
+        };
 
+        // Alias before the child starts.
         apply_with_context(
             &mut actor,
             &first,
             LifecycleEvent::WorkingStart,
-            LifecycleContext {
-                child_alias: Some(("reviewer".into(), "agent-a".into())),
-                ..LifecycleContext::default()
-            },
+            alias("agent-a"),
         );
         start_child(&mut actor, &first, "agent-a");
 
-        apply_with_context(
-            &mut actor,
-            &second,
-            LifecycleEvent::Idle,
-            LifecycleContext {
-                child_name: Some("reviewer".into()),
-                child_role: Some("teammate".into()),
-                ..LifecycleContext::default()
-            },
-        );
+        // Name-only event before the alias: placeholder is upgraded away.
+        apply_with_context(&mut actor, &second, LifecycleEvent::Idle, by_name());
         assert!(session_view(&actor, "reviewer@lead-b").is_some());
         apply_with_context(
             &mut actor,
             &second,
             LifecycleEvent::WorkingStart,
-            LifecycleContext {
-                child_alias: Some(("reviewer".into(), "agent-b".into())),
-                ..LifecycleContext::default()
-            },
+            alias("agent-b"),
         );
         start_child(&mut actor, &second, "agent-b");
+        assert!(session_view(&actor, "reviewer@lead-b").is_none());
 
-        for (parent, expected) in [(&first, "agent-a"), (&second, "reviewer@lead-b")] {
-            apply_with_context(
-                &mut actor,
-                parent,
-                LifecycleEvent::NeedsInput {
-                    reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
-                },
-                LifecycleContext {
-                    child_name: Some("reviewer".into()),
-                    ..LifecycleContext::default()
-                },
-            );
+        for (parent, expected) in [(&first, "agent-a"), (&second, "agent-b")] {
+            needs_input_from(&mut actor, parent, by_name());
             assert_eq!(
                 session_view(&actor, expected).map(|view| view.status),
                 Some(atm_core::SessionStatus::AttentionNeeded)
@@ -2990,28 +2776,28 @@ mod tests {
         let (_, mut actor, _) = create_actor();
         let parent = register_test_session(&mut actor, "lead");
         start_child(&mut actor, &parent, "agent-1");
+        let stop = |activity| LifecycleContext {
+            background_activity: Some(activity),
+            ..LifecycleContext::default()
+        };
+
         apply_with_context(
             &mut actor,
             &parent,
             LifecycleEvent::WorkingEnd,
-            LifecycleContext {
-                background_activity: Some((2, 1)),
-                ..LifecycleContext::default()
-            },
+            stop((2, 1)),
         );
         assert!(session_view(&actor, "agent-1").is_some());
         assert_eq!(
             session_view(&actor, "lead").and_then(|view| view.activity_detail),
             Some("2 bg tasks, 1 scheduled".into())
         );
+
         apply_with_context(
             &mut actor,
             &parent,
             LifecycleEvent::WorkingEnd,
-            LifecycleContext {
-                background_activity: Some((0, 0)),
-                ..LifecycleContext::default()
-            },
+            stop((0, 0)),
         );
         assert!(session_view(&actor, "agent-1").is_none());
     }

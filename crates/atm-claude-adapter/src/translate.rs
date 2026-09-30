@@ -85,9 +85,8 @@ impl RawHookEvent {
         });
         Some(detail.map_or(tool.clone(), |detail| {
             let detail = detail.trim();
-            let truncated = detail.chars().count() > PERMISSION_LABEL_MAX_CHARS;
             let mut label: String = detail.chars().take(PERMISSION_LABEL_MAX_CHARS).collect();
-            if truncated {
+            if label.len() < detail.len() {
                 label.push('…');
             }
             format!("{tool}: {label}")

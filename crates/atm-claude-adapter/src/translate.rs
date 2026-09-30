@@ -5,12 +5,35 @@
 //! types. The daemon calls this at the connection boundary and
 //! everything downstream sees only `LifecycleEvent`.
 
-use atm_core::{LifecycleEvent, NeedsInputReason, NotificationKind, Tool};
+use atm_core::{
+    AgentType, BackgroundActivity, ChildAgent, ChildAlias, ChildRef, LifecycleContext,
+    LifecycleEvent, NeedsInputReason, NotificationKind, Tool,
+};
+use serde::Deserialize;
 
 use crate::event::ClaudeEventType;
 use crate::wire::RawHookEvent;
 
 const PERMISSION_LABEL_MAX_CHARS: usize = 60;
+
+/// `tool_input` keys that say what a gated tool is about to touch, in
+/// lookup order: Bash `command`, Read/Write/Edit `file_path`, Glob/Grep
+/// `path`, WebFetch `url`, Agent `description`.
+const PERMISSION_DETAIL_KEYS: &[&str] = &["command", "file_path", "path", "url", "description"];
+
+/// The part of an `Agent` call's `tool_input` the alias needs.
+#[derive(Deserialize)]
+struct AgentSpawnInput {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// The part of a completed `Agent` call's `tool_response` the alias needs.
+#[derive(Deserialize)]
+struct AgentSpawnResponse {
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
+}
 
 fn non_empty(value: Option<&str>) -> Option<String> {
     value
@@ -20,8 +43,20 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 }
 
 impl RawHookEvent {
-    /// Child id, teammate name, and role for an event emitted by an in-process child.
-    pub fn child_agent(&self) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    /// Routing metadata the daemon needs alongside the lifecycle event:
+    /// which in-process child emitted it, an alias learned from a spawn
+    /// response, and background work reported on `Stop`.
+    pub fn lifecycle_context(&self) -> LifecycleContext {
+        LifecycleContext {
+            child: self.child_agent(),
+            child_alias: self.child_alias(),
+            background_activity: self.background_activity(),
+        }
+    }
+
+    /// The in-process child this event belongs to, when a child rather
+    /// than the parent session emitted it.
+    fn child_agent(&self) -> Option<ChildAgent> {
         let event = self.event_type()?;
         if matches!(
             event,
@@ -29,40 +64,46 @@ impl RawHookEvent {
         ) {
             return None;
         }
-        let id = non_empty(self.agent_id.as_deref());
-        let name = matches!(
+        let teammate_event = matches!(
             event,
             ClaudeEventType::TeammateIdle
                 | ClaudeEventType::TaskCreated
                 | ClaudeEventType::TaskCompleted
-        )
-        .then(|| non_empty(self.teammate_name.as_deref()))
-        .flatten();
-        (id.is_some() || name.is_some()).then(|| {
-            let role = self
-                .agent_type
-                .clone()
-                .or_else(|| name.as_ref().map(|_| "teammate".into()));
-            (id, name, role)
+        );
+        let id = non_empty(self.agent_id.as_deref());
+        let name = teammate_event
+            .then(|| non_empty(self.teammate_name.as_deref()))
+            .flatten();
+        let agent_type = match non_empty(self.agent_type.as_deref()) {
+            Some(role) => AgentType::for_child(Some(&role)),
+            None if name.is_some() => AgentType::Teammate,
+            None => AgentType::Subagent,
+        };
+        let reference = id.map(ChildRef::Id).or_else(|| name.map(ChildRef::Name))?;
+        Some(ChildAgent {
+            reference,
+            agent_type,
         })
     }
 
-    /// Name and id reported by a completed named `Agent` spawn.
-    pub fn child_alias(&self) -> Option<(String, String)> {
-        if self.event_type() != Some(ClaudeEventType::PostToolUse)
-            || self.tool_name.as_deref() != Some("Agent")
+    /// Name and id reported by a completed named child spawn.
+    fn child_alias(&self) -> Option<ChildAlias> {
+        if self.event_type()? != ClaudeEventType::PostToolUse
+            || !Tool::from(self.tool_name.as_deref()?).is_subagent_spawn()
         {
             return None;
         }
-        Some((
-            non_empty(self.tool_input.as_ref()?.get("name")?.as_str())?,
-            non_empty(self.tool_response.as_ref()?.get("agentId")?.as_str())?,
-        ))
+        let input = AgentSpawnInput::deserialize(self.tool_input.as_ref()?).ok()?;
+        let response = AgentSpawnResponse::deserialize(self.tool_response.as_ref()?).ok()?;
+        Some(ChildAlias {
+            name: non_empty(input.name.as_deref())?,
+            id: non_empty(response.agent_id.as_deref())?,
+        })
     }
 
     /// Background and scheduled work reported by a parent `Stop`.
-    pub fn background_activity(&self) -> Option<(u32, u32)> {
-        if self.event_type() != Some(ClaudeEventType::Stop)
+    fn background_activity(&self) -> Option<BackgroundActivity> {
+        if self.event_type()? != ClaudeEventType::Stop
             || (self.background_tasks.is_none() && self.session_crons.is_none())
         {
             return None;
@@ -73,13 +114,16 @@ impl RawHookEvent {
                 .and_then(serde_json::Value::as_array)
                 .map_or(0, |items| u32::try_from(items.len()).unwrap_or(u32::MAX))
         };
-        Some((count(&self.background_tasks), count(&self.session_crons)))
+        Some(BackgroundActivity {
+            running: count(&self.background_tasks),
+            scheduled: count(&self.session_crons),
+        })
     }
 
     fn permission_label(&self) -> Option<String> {
         let tool = non_empty(self.tool_name.as_deref())?;
         let detail = self.tool_input.as_ref().and_then(|input| {
-            ["command", "file_path", "path", "url", "description"]
+            PERMISSION_DETAIL_KEYS
                 .iter()
                 .find_map(|key| input.get(key)?.as_str())
         });
@@ -192,9 +236,9 @@ impl RawHookEvent {
                         },
                     },
                     Some(NotificationKind::IdlePrompt) => LifecycleEvent::Idle,
-                    Some(k) if k.as_str() == "agent_needs_input" => LifecycleEvent::NeedsInput {
+                    Some(NotificationKind::AgentNeedsInput) => LifecycleEvent::NeedsInput {
                         reason: NeedsInputReason::Notification {
-                            kind: k,
+                            kind: NotificationKind::AgentNeedsInput,
                             label: self.message.clone(),
                         },
                     },
@@ -214,15 +258,14 @@ impl RawHookEvent {
                 self.child_agent()?;
                 LifecycleEvent::Idle
             }
-            ClaudeEventType::TaskCreated | ClaudeEventType::TaskCompleted => {
-                LifecycleEvent::Notification {
-                    message: non_empty(self.task_subject.as_deref()),
-                    kind: Some(NotificationKind::from(match ev {
-                        ClaudeEventType::TaskCreated => "task_created",
-                        _ => "task_completed",
-                    })),
-                }
-            }
+            ClaudeEventType::TaskCreated => LifecycleEvent::Notification {
+                message: non_empty(self.task_subject.as_deref()),
+                kind: Some(NotificationKind::TaskCreated),
+            },
+            ClaudeEventType::TaskCompleted => LifecycleEvent::Notification {
+                message: non_empty(self.task_subject.as_deref()),
+                kind: Some(NotificationKind::TaskCompleted),
+            },
         })
     }
 }
@@ -513,7 +556,7 @@ mod tests {
         assert_eq!(routed, ["PreToolUse", "PostToolUse"]);
         assert!(events
             .iter()
-            .any(|event| event.background_activity() == Some((0, 0))));
+            .any(|event| event.background_activity() == Some(BackgroundActivity::default())));
     }
 
     #[test]
@@ -523,7 +566,10 @@ mod tests {
         assert_eq!(idle.to_lifecycle_event(), Some(LifecycleEvent::Idle));
         assert_eq!(
             idle.child_agent(),
-            Some((None, Some("reviewer".into()), Some("teammate".into())))
+            Some(ChildAgent {
+                reference: ChildRef::Name("reviewer".into()),
+                agent_type: AgentType::Teammate,
+            })
         );
 
         let mut spawn = raw("PostToolUse");
@@ -532,7 +578,22 @@ mod tests {
         spawn.tool_response = Some(serde_json::json!({"agentId": "agent-1"}));
         assert_eq!(
             spawn.child_alias(),
-            Some(("reviewer".into(), "agent-1".into()))
+            Some(ChildAlias {
+                name: "reviewer".into(),
+                id: "agent-1".into(),
+            })
+        );
+
+        let mut tool = raw("PreToolUse");
+        tool.tool_name = Some("Bash".into());
+        tool.agent_id = Some("agent-1".into());
+        tool.agent_type = Some("general-purpose".into());
+        assert_eq!(
+            tool.child_agent(),
+            Some(ChildAgent {
+                reference: ChildRef::Id("agent-1".into()),
+                agent_type: AgentType::Subagent,
+            })
         );
     }
 

@@ -19,14 +19,12 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use atm_core::{
-    AgentType, LifecycleEvent, NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure,
-    SessionView,
+    AgentType, BackgroundActivity, ChildAlias, ChildRef, LifecycleContext, LifecycleEvent,
+    NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure, SessionView,
 };
 use atm_protocol::RawStatusLine;
 
-use super::commands::{
-    LifecycleContext, RegistryCommand, RegistryError, RemovalReason, SessionEvent,
-};
+use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
 
 // ============================================================================
 // Resource Limits (from RESOURCE_LIMITS.md)
@@ -98,8 +96,9 @@ pub struct RegistryActor {
     /// are pending, the oldest match wins.
     pending_subagents: Vec<(String, PendingSubagent)>,
 
-    /// Parent-scoped vendor ids and teammate names mapped to child session ids.
-    child_refs: HashMap<(SessionId, String), SessionId>,
+    /// Parent-scoped child references mapped to the child session ids they
+    /// resolved to, learned from aliases and subagent correlation.
+    child_refs: HashMap<(SessionId, ChildRef), SessionId>,
 }
 
 impl RegistryActor {
@@ -806,8 +805,8 @@ impl RegistryActor {
         else {
             return false;
         };
-        if let Some((name, agent_id)) = &context.child_alias {
-            self.register_child_alias(&parent_id, name, agent_id);
+        if let Some(alias) = &context.child_alias {
+            self.register_child_alias(&parent_id, alias);
         }
         match event {
             LifecycleEvent::ChildSessionStart {
@@ -820,28 +819,27 @@ impl RegistryActor {
                         parent_session_id: parent_id.clone(),
                         parent_pid,
                         parent_start_time: crate::tmux::get_process_start_time(parent_pid),
-                        agent_type: child_agent_type(role.as_deref()),
+                        agent_type: AgentType::for_child(role.as_deref()),
                         created_at: Instant::now(),
                     },
                 ));
-                let child_id = self.child_id_for(&parent_id, agent_id, false);
-                self.ensure_child_session(parent_pid, child_id, role.as_deref(), harness);
+                let child_id = self.child_id_for(&parent_id, &ChildRef::Id(agent_id.clone()));
+                let agent_type = AgentType::for_child(role.as_deref());
+                self.ensure_child_session(parent_pid, child_id, agent_type, harness);
             }
             LifecycleEvent::ChildSessionEnd { id: Some(agent_id) } => {
                 self.pending_subagents.retain(|(id, _)| id != agent_id);
-                let child_id = self.child_id_for(&parent_id, agent_id, false);
+                let child_id = self.child_id_for(&parent_id, &ChildRef::Id(agent_id.clone()));
                 let _ = self.handle_remove(child_id, RemovalReason::SessionEnded);
             }
             _ => {}
         }
-        let (reference, is_name) = match (&context.child_id, &context.child_name) {
-            (Some(id), _) => (id, false),
-            (None, Some(name)) => (name, true),
-            (None, None) => return false,
+        let Some(child) = &context.child else {
+            return false;
         };
-        let child_id = self.child_id_for(&parent_id, reference, is_name);
-        let role = context.child_role.as_deref();
-        if let Some(pid) = self.ensure_child_session(parent_pid, child_id, role, harness) {
+        let child_id = self.child_id_for(&parent_id, &child.reference);
+        let agent_type = child.agent_type.clone();
+        if let Some(pid) = self.ensure_child_session(parent_pid, child_id, agent_type, harness) {
             self.apply_to_session(pid, event, None);
         }
         true
@@ -878,18 +876,16 @@ impl RegistryActor {
         self.publish_updated(pid);
     }
 
-    /// Resolves a vendor child reference (agent id, or teammate name when
-    /// `is_name`) to its child session id under `parent`.
-    fn child_id_for(&self, parent: &SessionId, reference: &str, is_name: bool) -> SessionId {
+    /// Resolves a vendor child reference to its session id under `parent`:
+    /// the id an alias or subagent correlation mapped it to, else the
+    /// reference's own default id.
+    fn child_id_for(&self, parent: &SessionId, reference: &ChildRef) -> SessionId {
         self.child_refs
-            .get(&(parent.clone(), reference.to_string()))
+            .get(&(parent.clone(), reference.clone()))
             .cloned()
-            .unwrap_or_else(|| {
-                SessionId::new(if is_name {
-                    format!("{reference}@{parent}")
-                } else {
-                    reference.to_string()
-                })
+            .unwrap_or_else(|| match reference {
+                ChildRef::Id(id) => SessionId::new(id),
+                ChildRef::Name(name) => SessionId::scoped(name, parent),
             })
     }
 
@@ -905,14 +901,14 @@ impl RegistryActor {
         &mut self,
         parent_pid: u32,
         child_id: SessionId,
-        role: Option<&str>,
+        agent_type: AgentType,
         harness: atm_core::Harness,
     ) -> Option<u32> {
         if let Some(pid) = self.session_id_to_pid.get(&child_id) {
             return Some(*pid);
         }
         let (parent, _) = self.sessions_by_pid.get(&parent_pid)?;
-        let mut child = SessionDomain::new(child_id.clone(), child_agent_type(role), parent.model);
+        let mut child = SessionDomain::new(child_id.clone(), agent_type, parent.model);
         child.harness = harness;
         child.model_display_override = parent.model_display_override.clone();
         child.tmux_pane = parent.tmux_pane.clone();
@@ -935,28 +931,30 @@ impl RegistryActor {
         Some(child_pid)
     }
 
-    /// Maps a teammate `name` and its `agent_id` to one child session under
+    /// Maps a child's name and agent id to one child session under
     /// `parent`, retiring a name-only placeholder the alias supersedes.
-    fn register_child_alias(&mut self, parent: &SessionId, name: &str, agent_id: &str) {
-        let target = self.child_id_for(parent, agent_id, false);
-        let placeholder = self.child_id_for(parent, name, true);
+    fn register_child_alias(&mut self, parent: &SessionId, alias: &ChildAlias) {
+        let by_id = ChildRef::Id(alias.id.clone());
+        let by_name = ChildRef::Name(alias.name.clone());
+        let target = self.child_id_for(parent, &by_id);
+        let placeholder = self.child_id_for(parent, &by_name);
         if placeholder != target && self.synthetic_child(&placeholder).is_some() {
             let _ = self.handle_remove(placeholder, RemovalReason::Upgraded);
         }
-        for reference in [name, agent_id] {
+        for reference in [by_name, by_id] {
             self.child_refs
-                .insert((parent.clone(), reference.to_string()), target.clone());
+                .insert((parent.clone(), reference), target.clone());
         }
     }
 
     /// After a parent `Stop`: sweeps in-process children still marked
     /// working once nothing runs in the background (their `SubagentStop`
     /// never arrived), and shows remaining background work on the parent.
-    fn apply_background_activity(&mut self, pid: u32, activity: Option<(u32, u32)>) {
-        let Some((running, scheduled)) = activity else {
+    fn apply_background_activity(&mut self, pid: u32, activity: Option<BackgroundActivity>) {
+        let Some(activity) = activity else {
             return;
         };
-        if running == 0 {
+        if activity.is_quiet() {
             let child_ids = self
                 .sessions_by_pid
                 .get(&pid)
@@ -971,21 +969,16 @@ impl RegistryActor {
                 }
             }
         }
-        let mut parts = Vec::new();
-        if running > 0 {
-            let plural = if running == 1 { "" } else { "s" };
-            parts.push(format!("{running} bg task{plural}"));
-        }
-        if scheduled > 0 {
-            parts.push(format!("{scheduled} scheduled"));
-        }
+        let Some(summary) = activity.summary() else {
+            return;
+        };
         let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) else {
             return;
         };
-        if parts.is_empty() || session.status != atm_core::SessionStatus::Idle {
+        if session.status != atm_core::SessionStatus::Idle {
             return;
         }
-        session.current_activity = Some(atm_core::ActivityDetail::with_context(&parts.join(", ")));
+        session.current_activity = Some(atm_core::ActivityDetail::with_context(&summary));
         self.publish_updated(pid);
     }
 
@@ -1141,14 +1134,15 @@ impl RegistryActor {
 
             // The real process supersedes any in-process placeholder that
             // `ChildSessionStart` created for this agent id.
-            let placeholder_id = self.child_id_for(&pending.parent_session_id, &agent_id, false);
+            let placeholder_id =
+                self.child_id_for(&pending.parent_session_id, &ChildRef::Id(agent_id.clone()));
             for child in self.child_refs.values_mut() {
                 if *child == placeholder_id {
                     *child = session_id.clone();
                 }
             }
             self.child_refs.insert(
-                (pending.parent_session_id.clone(), agent_id),
+                (pending.parent_session_id.clone(), ChildRef::Id(agent_id)),
                 session_id.clone(),
             );
             if self.synthetic_child(&placeholder_id).is_some() {
@@ -1329,16 +1323,6 @@ fn build_session_from_pid(
     session
 }
 
-fn child_agent_type(role: Option<&str>) -> AgentType {
-    match role.map(str::trim).filter(|role| !role.is_empty()) {
-        Some(role) => match AgentType::from_subagent_type(role) {
-            AgentType::GeneralPurpose => AgentType::Custom(role.to_string()),
-            agent_type => agent_type,
-        },
-        None => AgentType::Custom("subagent".to_string()),
-    }
-}
-
 /// Extracts a tool name from a `LifecycleEvent`, when present.
 ///
 /// Used to record tool usage on the session's infrastructure record.
@@ -1380,6 +1364,7 @@ fn is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atm_core::ChildAgent;
     use atm_core::{AgentType, Model, Tool};
     use tokio::sync::oneshot;
 
@@ -2666,8 +2651,10 @@ mod tests {
             &mut actor,
             &parent,
             LifecycleContext {
-                child_id: Some("agent-1".into()),
-                child_role: Some("general-purpose".into()),
+                child: Some(ChildAgent {
+                    reference: ChildRef::Id("agent-1".into()),
+                    agent_type: AgentType::Subagent,
+                }),
                 ..LifecycleContext::default()
             },
         );
@@ -2698,12 +2685,17 @@ mod tests {
         let first = register_test_session(&mut actor, "lead-a");
         let second = register_test_session(&mut actor, "lead-b");
         let alias = |agent_id: &str| LifecycleContext {
-            child_alias: Some(("reviewer".into(), agent_id.into())),
+            child_alias: Some(ChildAlias {
+                name: "reviewer".into(),
+                id: agent_id.into(),
+            }),
             ..LifecycleContext::default()
         };
         let by_name = || LifecycleContext {
-            child_name: Some("reviewer".into()),
-            child_role: Some("teammate".into()),
+            child: Some(ChildAgent {
+                reference: ChildRef::Name("reviewer".into()),
+                agent_type: AgentType::Teammate,
+            }),
             ..LifecycleContext::default()
         };
 
@@ -2776,29 +2768,19 @@ mod tests {
         let (_, mut actor, _) = create_actor();
         let parent = register_test_session(&mut actor, "lead");
         start_child(&mut actor, &parent, "agent-1");
-        let stop = |activity| LifecycleContext {
-            background_activity: Some(activity),
+        let stop = |running, scheduled| LifecycleContext {
+            background_activity: Some(BackgroundActivity { running, scheduled }),
             ..LifecycleContext::default()
         };
 
-        apply_with_context(
-            &mut actor,
-            &parent,
-            LifecycleEvent::WorkingEnd,
-            stop((2, 1)),
-        );
+        apply_with_context(&mut actor, &parent, LifecycleEvent::WorkingEnd, stop(2, 1));
         assert!(session_view(&actor, "agent-1").is_some());
         assert_eq!(
             session_view(&actor, "lead").and_then(|view| view.activity_detail),
             Some("2 bg tasks, 1 scheduled".into())
         );
 
-        apply_with_context(
-            &mut actor,
-            &parent,
-            LifecycleEvent::WorkingEnd,
-            stop((0, 0)),
-        );
+        apply_with_context(&mut actor, &parent, LifecycleEvent::WorkingEnd, stop(0, 0));
         assert!(session_view(&actor, "agent-1").is_none());
     }
 }

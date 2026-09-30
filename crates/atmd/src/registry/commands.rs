@@ -7,24 +7,11 @@
 //!
 //! All types are designed for async message passing and follow the panic-free policy.
 
-use atm_core::{AgentType, Harness, LifecycleEvent, SessionDomain, SessionId, SessionView};
+use atm_core::{
+    AgentType, Harness, LifecycleContext, LifecycleEvent, SessionDomain, SessionId, SessionView,
+};
 use thiserror::Error;
 use tokio::sync::oneshot;
-
-/// Optional routing metadata attached to a lifecycle event.
-#[derive(Debug, Default)]
-pub struct LifecycleContext {
-    /// Vendor id of the in-process child that emitted the event.
-    pub child_id: Option<String>,
-    /// Parent-scoped teammate name when no id is present.
-    pub child_name: Option<String>,
-    /// Vendor role used when materializing a missing child.
-    pub child_role: Option<String>,
-    /// Name-to-id pair learned from the child spawn response.
-    pub child_alias: Option<(String, String)>,
-    /// Background and scheduled work reported when the parent turn stops.
-    pub background_activity: Option<(u32, u32)>,
-}
 
 // ============================================================================
 // Registry Commands

@@ -28,6 +28,13 @@ pub enum AgentType {
     /// File search/analysis subagent
     FileSearch,
 
+    /// In-process child spawned by a parent session with no more
+    /// specific role (Claude `Agent` tool).
+    Subagent,
+
+    /// Named member of an agent team, addressed by name under its lead.
+    Teammate,
+
     /// Custom or unknown agent type
     Custom(String),
 }
@@ -41,6 +48,8 @@ impl AgentType {
             Self::Plan => "plan",
             Self::CodeReviewer => "review",
             Self::FileSearch => "search",
+            Self::Subagent => "subagent",
+            Self::Teammate => "teammate",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -53,6 +62,8 @@ impl AgentType {
             Self::Plan => "Planner",
             Self::CodeReviewer => "Code Reviewer",
             Self::FileSearch => "File Search",
+            Self::Subagent => "Subagent",
+            Self::Teammate => "Teammate",
             Self::Custom(_) => "Custom",
         }
     }
@@ -65,7 +76,25 @@ impl AgentType {
             "plan" | "planner" => Self::Plan,
             "code-reviewer" | "code_reviewer" | "codereview" => Self::CodeReviewer,
             "file-search" | "file_search" | "filesearch" => Self::FileSearch,
+            "subagent" => Self::Subagent,
+            "teammate" => Self::Teammate,
             _ => Self::Custom(s.to_string()),
+        }
+    }
+
+    /// Type for an in-process child described by a vendor `role`.
+    ///
+    /// A `general-purpose` child is a plain [`Subagent`](Self::Subagent):
+    /// `GeneralPurpose` means a main session, and a child must not be
+    /// mistaken for one.
+    #[must_use]
+    pub fn for_child(role: Option<&str>) -> Self {
+        match role.map(str::trim).filter(|role| !role.is_empty()) {
+            None => Self::Subagent,
+            Some(role) => match Self::from_subagent_type(role) {
+                Self::GeneralPurpose => Self::Subagent,
+                agent_type => agent_type,
+            },
         }
     }
 }
@@ -90,6 +119,22 @@ mod tests {
         assert_eq!(
             AgentType::from_subagent_type("custom-agent"),
             AgentType::Custom("custom-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn child_role_never_yields_a_main_agent() {
+        assert_eq!(AgentType::for_child(None), AgentType::Subagent);
+        assert_eq!(AgentType::for_child(Some("  ")), AgentType::Subagent);
+        assert_eq!(
+            AgentType::for_child(Some("general-purpose")),
+            AgentType::Subagent
+        );
+        assert_eq!(AgentType::for_child(Some("teammate")), AgentType::Teammate);
+        assert_eq!(AgentType::for_child(Some("explore")), AgentType::Explore);
+        assert_eq!(
+            AgentType::for_child(Some("triage")),
+            AgentType::Custom("triage".to_string())
         );
     }
 

@@ -12,9 +12,9 @@
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use atm_core::{Harness, LifecycleEvent, SessionDomain, SessionId, SessionView};
+use atm_core::{Harness, LifecycleContext, LifecycleEvent, SessionDomain, SessionId, SessionView};
 
-use super::commands::{LifecycleContext, RegistryCommand, RegistryError, SessionEvent};
+use super::commands::{RegistryCommand, RegistryError, SessionEvent};
 
 // ============================================================================
 // Registry Handle

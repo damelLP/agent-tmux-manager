@@ -22,7 +22,7 @@
 //! This module is pure logic with no TUI dependency, enabling reuse
 //! in the future web UI.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{SessionId, SessionView};
 
@@ -182,15 +182,30 @@ pub fn build_tree(sessions: &[SessionView]) -> Vec<TreeNode> {
         return Vec::new();
     }
 
-    // Separate parent-level sessions from subagents
+    let by_id: BTreeMap<&str, &SessionView> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+
+    // Separate parent-level sessions from subagents. A child whose parent
+    // isn't in the list stays top-level rather than being hidden.
     let child_ids: HashSet<&SessionId> = sessions
         .iter()
-        .filter(|s| s.parent_session_id.is_some())
+        .filter(|s| {
+            s.parent_session_id
+                .as_ref()
+                .is_some_and(|p| by_id.contains_key(p.as_str()))
+        })
         .map(|s| &s.id)
         .collect();
 
-    // Index sessions by ID for subagent lookup
-    let by_id: BTreeMap<&str, &SessionView> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+    // Index children by parent, oldest first (spawn order)
+    let mut children_by_parent: HashMap<&SessionId, Vec<&SessionView>> = HashMap::new();
+    for session in sessions {
+        if let Some(parent) = &session.parent_session_id {
+            children_by_parent.entry(parent).or_default().push(session);
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    }
 
     // Group top-level sessions by project_root
     // BTreeMap for deterministic alphabetical ordering
@@ -219,10 +234,10 @@ pub fn build_tree(sessions: &[SessionView]) -> Vec<TreeNode> {
 
         // Build agent nodes (with subagent nesting)
         let make_agent_node = |session: &SessionView| -> TreeNode {
-            let subagents: Vec<TreeNode> = session
-                .child_session_ids
-                .iter()
-                .filter_map(|child_id| by_id.get(child_id.as_str()))
+            let subagents: Vec<TreeNode> = children_by_parent
+                .get(&session.id)
+                .into_iter()
+                .flatten()
                 .map(|child| TreeNode::Agent {
                     session: (*child).clone(),
                     subagents: Vec::new(), // No recursive subagent nesting for now
@@ -620,6 +635,112 @@ mod tests {
             }
             _ => panic!("expected Project"),
         }
+    }
+
+    #[test]
+    fn test_orphaned_child_is_top_level() {
+        let mut child = make_session_in_project(
+            "child-1",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:01Z",
+        );
+        child.parent_session_id = Some(SessionId::new("missing-parent"));
+
+        let tree = build_tree(&[child]);
+
+        assert_eq!(tree.len(), 1);
+        match &tree[0] {
+            TreeNode::Project { children, .. } => {
+                assert_eq!(children.len(), 1, "orphan should be shown, not hidden");
+                match &children[0] {
+                    TreeNode::Agent { session, .. } => {
+                        assert_eq!(session.id.as_str(), "child-1");
+                    }
+                    _ => panic!("expected Agent"),
+                }
+            }
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn test_child_nested_by_own_parent_id() {
+        // Parent doesn't list the child (e.g. a separate teammate process).
+        let parent = make_session_in_project(
+            "parent-1",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:00Z",
+        );
+        let mut child = make_session_in_project(
+            "child-1",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:01Z",
+        );
+        child.parent_session_id = Some(SessionId::new("parent-1"));
+
+        let tree = build_tree(&[parent, child]);
+
+        match &tree[0] {
+            TreeNode::Project { children, .. } => {
+                assert_eq!(children.len(), 1, "child should be nested, not top-level");
+                match &children[0] {
+                    TreeNode::Agent { subagents, .. } => assert_eq!(subagents.len(), 1),
+                    _ => panic!("expected Agent"),
+                }
+            }
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn test_children_ordered_by_spawn_time() {
+        let parent = make_session_in_project(
+            "parent-1",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:00Z",
+        );
+        let mut first = make_session_in_project(
+            "first",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:01Z",
+        );
+        first.parent_session_id = Some(SessionId::new("parent-1"));
+        let mut second = make_session_in_project(
+            "second",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:02Z",
+        );
+        second.parent_session_id = Some(SessionId::new("parent-1"));
+
+        // Input order is arbitrary (the TUI passes HashMap values).
+        let tree = build_tree(&[second, parent, first]);
+
+        let TreeNode::Project { children, .. } = &tree[0] else {
+            panic!("expected Project");
+        };
+        let TreeNode::Agent { subagents, .. } = &children[0] else {
+            panic!("expected Agent");
+        };
+        let ids: Vec<&str> = subagents
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Agent { session, .. } => Some(session.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["first", "second"]);
     }
 
     #[test]

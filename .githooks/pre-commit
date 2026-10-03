@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fast check on every commit; full verification runs on pre-push.
+exec cargo fmt --all -- --check

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env -u CLAUDE_PROJECT_DIR bash \"$(git rev-parse --show-toplevel)/.claude/hooks/ensure-git-hooks.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

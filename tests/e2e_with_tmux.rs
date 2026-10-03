@@ -823,6 +823,66 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         "created workspace should start with exactly one sidebar; panes: {initial_panes:?}"
     );
 
+    // Regression: the resize script (prefix-R / after-resize-window) must
+    // find the sidebar after the shell overwrites its pane title (e.g.
+    // oh-my-zsh auto-title renames it to the running `atm --compact ...`).
+    let sidebar_pane = initial_panes
+        .iter()
+        .find(|p| p.is_sidebar)
+        .map(|p| p.pane_id.clone())
+        .expect("sidebar pane present");
+    tmux_run_capture(
+        create_tmux.label(),
+        &["select-pane", "-t", &sidebar_pane, "-T", "atm --compact"],
+    )
+    .expect("overwrite sidebar pane title");
+    let window_width: u32 = tmux_run_capture(
+        create_tmux.label(),
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &sidebar_pane,
+            "#{window_width}",
+        ],
+    )
+    .expect("read window width")
+    .trim()
+    .parse()
+    .expect("window width is a number");
+    let expected_width = (window_width * 16 / 100).clamp(20, 40);
+    let skewed_width = (expected_width + 5).to_string();
+    tmux_run_capture(
+        create_tmux.label(),
+        &["resize-pane", "-t", &sidebar_pane, "-x", &skewed_width],
+    )
+    .expect("skew sidebar width");
+    let resize_script = create_data_dir
+        .path()
+        .join("atm")
+        .join(format!("resize-sidebar-{create_session_name}.sh"));
+    tmux_run_capture(
+        create_tmux.label(),
+        &["run-shell", &resize_script.display().to_string()],
+    )
+    .expect("run resize script");
+    let resized_width = tmux_run_capture(
+        create_tmux.label(),
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &sidebar_pane,
+            "#{pane_width}",
+        ],
+    )
+    .expect("read sidebar width");
+    assert_eq!(
+        resized_width.trim(),
+        expected_width.to_string(),
+        "resize script should restore the sidebar width even after its pane title changed"
+    );
+
     let mut cmd = Command::new("tmux");
     cmd.args([
         "-L",
@@ -1022,7 +1082,6 @@ async fn atm_atmd_tmux_end_to_end() {
 #[derive(Debug)]
 struct PaneEntry {
     window_id: String,
-    #[allow(dead_code)]
     pane_id: String,
     is_sidebar: bool,
 }

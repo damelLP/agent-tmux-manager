@@ -138,12 +138,14 @@ const CODEX_MATCHERS: &[ProcessMatcher] = &[
 /// may be reparented to init). Sandboxed tool commands run as
 /// `.../codex-linux-sandbox` -> `bwrap ... <release>/bin/codex ...` ->
 /// `codex-linux-sandbox` (comm `codex`); `bwrap` matches via that path
-/// argument. Executable excludes bind to argv0 and `app-server` to argv1,
-/// so an initial prompt (`codex [PROMPT]`) never hides a TUI.
+/// argument. Executable excludes bind to argv0, so an initial prompt
+/// (`codex [PROMPT]`) never hits them; `app-server` binds to argv1, where
+/// codex always parses it as the subcommand.
 const CODEX_EXCLUDES: &[ArgvExclude] = &[
     ArgvExclude::Subcommand(ProcessMatcher::Exact("app-server")),
     ArgvExclude::Command(ProcessMatcher::Suffix("codex-linux-sandbox")),
     ArgvExclude::Command(ProcessMatcher::Exact("bwrap")),
+    ArgvExclude::Command(ProcessMatcher::Suffix("/bwrap")),
 ];
 
 const AMP_MATCHERS: &[ProcessMatcher] =
@@ -364,6 +366,7 @@ mod tests {
         assert!(excluded(1, "app-server"));
         assert!(excluded(0, "codex-linux-sandbox"));
         assert!(excluded(0, "bwrap"));
+        assert!(excluded(0, "/usr/bin/bwrap"));
         assert!(!excluded(1, "exec"));
         assert!(!excluded(1, "resume"));
         assert!(!excluded(

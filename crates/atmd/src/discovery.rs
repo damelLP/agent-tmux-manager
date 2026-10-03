@@ -962,6 +962,15 @@ mod tests {
                 "--sandbox-policy-cwd",
                 "/tmp",
             ],
+            // Same stage when bwrap is launched by absolute path.
+            vec![
+                "/usr/bin/bwrap",
+                "--as-pid-1",
+                "--",
+                CODEX_DAEMON_BIN,
+                "--sandbox-policy-cwd",
+                "/tmp",
+            ],
             // Tool-call sandbox stages; exe is CODEX_DAEMON_BIN for both.
             vec![
                 "/home/damel/.codex/tmp/arg0/codex-arg0TbkqL8/codex-linux-sandbox",

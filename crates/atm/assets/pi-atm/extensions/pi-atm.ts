@@ -28,7 +28,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const SOCKET = process.env.ATM_SOCKET ?? "/tmp/atm.sock";
+const SOCKET = process.env.ATM_SOCKET || "/tmp/atm.sock";
 const DEBUG = process.env.ATM_DEBUG === "1";
 
 /**

@@ -25,6 +25,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use atm_claude_adapter::ClaudeEventType;
+use atm_codex_adapter::CodexEventType;
 use serde_json::{json, Value};
 
 /// The atm-hook bash script content (Claude Code), embedded at compile time.
@@ -41,41 +43,6 @@ const PI_ATM_EXTENSION: &str = include_str!("../assets/pi-atm/extensions/pi-atm.
 /// at the `pi.extensions` array (not `main`) to discover extension
 /// files within an installed package.
 const PI_ATM_PACKAGE_JSON: &str = include_str!("../assets/pi-atm/package.json");
-
-/// All valid Claude Code hook types.
-/// See: https://docs.anthropic.com/en/docs/claude-code/hooks
-const HOOK_TYPES: &[&str] = &[
-    "PreToolUse",
-    "PostToolUse",
-    "PostToolUseFailure",
-    "Notification",
-    "UserPromptSubmit",
-    "SessionStart",
-    "SessionEnd",
-    "Stop",
-    "SubagentStart",
-    "SubagentStop",
-    "PreCompact",
-    "PermissionRequest",
-];
-
-/// All Codex CLI hook types, per the official hooks documentation
-/// (validated against codex-cli 0.146.1). Unlike Claude, Codex has no
-/// `PostToolUseFailure`/`Setup`/`Notification`; it adds
-/// `PermissionRequest` and `PostCompact`.
-const CODEX_HOOK_TYPES: &[&str] = &[
-    "PreToolUse",
-    "PostToolUse",
-    "PermissionRequest",
-    "UserPromptSubmit",
-    "SessionStart",
-    "SessionEnd",
-    "Stop",
-    "SubagentStart",
-    "SubagentStop",
-    "PreCompact",
-    "PostCompact",
-];
 
 /// Returns the path to Claude Code settings.json
 fn claude_settings_path() -> Option<PathBuf> {
@@ -624,7 +591,7 @@ fn setup_claude_code() -> Result<()> {
 
     let mut added = 0;
 
-    for &hook_type in HOOK_TYPES {
+    for hook_type in ClaudeEventType::hook_names() {
         let hooks_array = hooks
             .entry(hook_type)
             .or_insert_with(|| json!([]))
@@ -709,7 +676,7 @@ fn setup_codex() -> Result<()> {
 
     let mut added = 0;
 
-    for &hook_type in CODEX_HOOK_TYPES {
+    for hook_type in CodexEventType::hook_names() {
         let hooks_array = hooks
             .entry(hook_type)
             .or_insert_with(|| json!([]))
@@ -747,7 +714,7 @@ pub fn uninstall() -> Result<()> {
 
     let mut removed = 0;
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for &hook_type in HOOK_TYPES {
+        for hook_type in ClaudeEventType::hook_names() {
             if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
                 let before = hooks_array.len();
                 remove_hook_command_marker(hooks_array, "atm-hook");
@@ -818,7 +785,7 @@ pub fn uninstall() -> Result<()> {
             .get_mut("hooks")
             .and_then(|h| h.as_object_mut())
         {
-            for &hook_type in CODEX_HOOK_TYPES {
+            for hook_type in CodexEventType::hook_names() {
                 if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
                     let before = hooks_array.len();
                     remove_hook_command_marker(hooks_array, "atm-codex-hook");

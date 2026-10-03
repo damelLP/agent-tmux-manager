@@ -5,12 +5,138 @@
 //! types. The daemon calls this at the connection boundary and
 //! everything downstream sees only `LifecycleEvent`.
 
-use atm_core::{LifecycleEvent, NeedsInputReason, NotificationKind, Tool};
+use atm_core::{
+    AgentType, BackgroundActivity, ChildAgent, ChildAlias, ChildRef, LifecycleContext,
+    LifecycleEvent, NeedsInputReason, NotificationKind, Tool,
+};
+use serde::Deserialize;
 
 use crate::event::ClaudeEventType;
 use crate::wire::RawHookEvent;
 
+const PERMISSION_LABEL_MAX_CHARS: usize = 60;
+
+/// `tool_input` keys that say what a gated tool is about to touch, in
+/// lookup order: Bash `command`, Read/Write/Edit `file_path`, Glob/Grep
+/// `path`, WebFetch `url`, Agent `description`.
+const PERMISSION_DETAIL_KEYS: &[&str] = &["command", "file_path", "path", "url", "description"];
+
+/// The part of an `Agent` call's `tool_input` the alias needs.
+#[derive(Deserialize)]
+struct AgentSpawnInput {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// The part of a completed `Agent` call's `tool_response` the alias needs.
+#[derive(Deserialize)]
+struct AgentSpawnResponse {
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 impl RawHookEvent {
+    /// Routing metadata the daemon needs alongside the lifecycle event:
+    /// which in-process child emitted it, an alias learned from a spawn
+    /// response, and background work reported on `Stop`.
+    pub fn lifecycle_context(&self) -> LifecycleContext {
+        LifecycleContext {
+            child: self.child_agent(),
+            child_alias: self.child_alias(),
+            background_activity: self.background_activity(),
+        }
+    }
+
+    /// The in-process child this event belongs to, when a child rather
+    /// than the parent session emitted it.
+    fn child_agent(&self) -> Option<ChildAgent> {
+        let event = self.event_type()?;
+        if matches!(
+            event,
+            ClaudeEventType::SubagentStart | ClaudeEventType::SubagentStop
+        ) {
+            return None;
+        }
+        let teammate_event = matches!(
+            event,
+            ClaudeEventType::TeammateIdle
+                | ClaudeEventType::TaskCreated
+                | ClaudeEventType::TaskCompleted
+        );
+        let id = non_empty(self.agent_id.as_deref());
+        let name = teammate_event
+            .then(|| non_empty(self.teammate_name.as_deref()))
+            .flatten();
+        let agent_type = match non_empty(self.agent_type.as_deref()) {
+            Some(role) => AgentType::for_child(Some(&role)),
+            None if name.is_some() => AgentType::Teammate,
+            None => AgentType::Subagent,
+        };
+        let reference = id.map(ChildRef::Id).or_else(|| name.map(ChildRef::Name))?;
+        Some(ChildAgent {
+            reference,
+            agent_type,
+        })
+    }
+
+    /// Name and id reported by a completed named child spawn.
+    fn child_alias(&self) -> Option<ChildAlias> {
+        if self.event_type()? != ClaudeEventType::PostToolUse
+            || !Tool::from(self.tool_name.as_deref()?).is_subagent_spawn()
+        {
+            return None;
+        }
+        let input = AgentSpawnInput::deserialize(self.tool_input.as_ref()?).ok()?;
+        let response = AgentSpawnResponse::deserialize(self.tool_response.as_ref()?).ok()?;
+        Some(ChildAlias {
+            name: non_empty(input.name.as_deref())?,
+            id: non_empty(response.agent_id.as_deref())?,
+        })
+    }
+
+    /// Background and scheduled work reported by a parent `Stop`.
+    fn background_activity(&self) -> Option<BackgroundActivity> {
+        if self.event_type()? != ClaudeEventType::Stop
+            || (self.background_tasks.is_none() && self.session_crons.is_none())
+        {
+            return None;
+        }
+        let count = |value: &Option<serde_json::Value>| {
+            value
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, |items| u32::try_from(items.len()).unwrap_or(u32::MAX))
+        };
+        Some(BackgroundActivity {
+            running: count(&self.background_tasks),
+            scheduled: count(&self.session_crons),
+        })
+    }
+
+    fn permission_label(&self) -> Option<String> {
+        let tool = non_empty(self.tool_name.as_deref())?;
+        let detail = self.tool_input.as_ref().and_then(|input| {
+            PERMISSION_DETAIL_KEYS
+                .iter()
+                .find_map(|key| input.get(key)?.as_str())
+        });
+        Some(detail.map_or(tool.clone(), |detail| {
+            let detail = detail.trim();
+            let mut label: String = detail.chars().take(PERMISSION_LABEL_MAX_CHARS).collect();
+            if label.len() < detail.len() {
+                label.push('…');
+            }
+            format!("{tool}: {label}")
+        }))
+    }
+
     /// Translates this Claude raw event into a vendor-neutral
     /// `LifecycleEvent`.
     ///
@@ -110,12 +236,36 @@ impl RawHookEvent {
                         },
                     },
                     Some(NotificationKind::IdlePrompt) => LifecycleEvent::Idle,
+                    Some(NotificationKind::AgentNeedsInput) => LifecycleEvent::NeedsInput {
+                        reason: NeedsInputReason::Notification {
+                            kind: NotificationKind::AgentNeedsInput,
+                            label: self.message.clone(),
+                        },
+                    },
                     _ => LifecycleEvent::Notification {
                         message: self.message.clone(),
                         kind,
                     },
                 }
             }
+            ClaudeEventType::PermissionRequest => LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::Notification {
+                    kind: NotificationKind::PermissionPrompt,
+                    label: self.permission_label(),
+                },
+            },
+            ClaudeEventType::TeammateIdle => {
+                self.child_agent()?;
+                LifecycleEvent::Idle
+            }
+            ClaudeEventType::TaskCreated => LifecycleEvent::Notification {
+                message: non_empty(self.task_subject.as_deref()),
+                kind: Some(NotificationKind::TaskCreated),
+            },
+            ClaudeEventType::TaskCompleted => LifecycleEvent::Notification {
+                message: non_empty(self.task_subject.as_deref()),
+                kind: Some(NotificationKind::TaskCompleted),
+            },
         })
     }
 }
@@ -138,6 +288,8 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             stop_hook_active: None,
+            background_tasks: None,
+            session_crons: None,
             agent_id: None,
             agent_type: None,
             agent_transcript_path: None,
@@ -148,6 +300,8 @@ mod tests {
             custom_instructions: None,
             notification_type: None,
             message: None,
+            teammate_name: None,
+            task_subject: None,
         }
     }
 
@@ -382,5 +536,96 @@ mod tests {
     fn unknown_event_returns_none() {
         let e = raw("NotARealEvent");
         assert_eq!(e.to_lifecycle_event(), None);
+    }
+
+    #[test]
+    fn captured_subagent_run_preserves_routing_contract() {
+        let events: Vec<RawHookEvent> =
+            include_str!("../tests/fixtures/claude_subagent_run_2.1.267.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("fixture line"))
+                .collect();
+        assert!(events
+            .iter()
+            .all(|event| event.to_lifecycle_event().is_some()));
+        let routed: Vec<_> = events
+            .iter()
+            .filter(|event| event.child_agent().is_some())
+            .map(|event| event.hook_event_name.as_str())
+            .collect();
+        assert_eq!(routed, ["PreToolUse", "PostToolUse"]);
+        assert!(events
+            .iter()
+            .any(|event| event.background_activity() == Some(BackgroundActivity::default())));
+    }
+
+    #[test]
+    fn teammate_metadata_and_alias_are_extracted() {
+        let mut idle = raw("TeammateIdle");
+        idle.teammate_name = Some("reviewer".into());
+        assert_eq!(idle.to_lifecycle_event(), Some(LifecycleEvent::Idle));
+        assert_eq!(
+            idle.child_agent(),
+            Some(ChildAgent {
+                reference: ChildRef::Name("reviewer".into()),
+                agent_type: AgentType::Teammate,
+            })
+        );
+
+        let mut spawn = raw("PostToolUse");
+        spawn.tool_name = Some("Agent".into());
+        spawn.tool_input = Some(serde_json::json!({"name": "reviewer"}));
+        spawn.tool_response = Some(serde_json::json!({"agentId": "agent-1"}));
+        assert_eq!(
+            spawn.child_alias(),
+            Some(ChildAlias {
+                name: "reviewer".into(),
+                id: "agent-1".into(),
+            })
+        );
+
+        let mut tool = raw("PreToolUse");
+        tool.tool_name = Some("Bash".into());
+        tool.agent_id = Some("agent-1".into());
+        tool.agent_type = Some("general-purpose".into());
+        assert_eq!(
+            tool.child_agent(),
+            Some(ChildAgent {
+                reference: ChildRef::Id("agent-1".into()),
+                agent_type: AgentType::Subagent,
+            })
+        );
+    }
+
+    #[test]
+    fn new_orchestration_signals_translate() {
+        let mut permission = raw("PermissionRequest");
+        permission.tool_name = Some("Bash".into());
+        permission.tool_input = Some(serde_json::json!({"command": "cargo test"}));
+        assert!(matches!(
+            permission.to_lifecycle_event(),
+            Some(LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::Notification {
+                    label: Some(label), ..
+                }
+            }) if label == "Bash: cargo test"
+        ));
+
+        let mut notification = raw("Notification");
+        notification.notification_type = Some("agent_needs_input".into());
+        notification.message = Some("reviewer needs input".into());
+        assert!(matches!(
+            notification.to_lifecycle_event(),
+            Some(LifecycleEvent::NeedsInput { .. })
+        ));
+
+        let mut task = raw("TaskCompleted");
+        task.task_subject = Some("Review changes".into());
+        assert!(matches!(
+            task.to_lifecycle_event(),
+            Some(LifecycleEvent::Notification {
+                message: Some(message), ..
+            }) if message == "Review changes"
+        ));
     }
 }

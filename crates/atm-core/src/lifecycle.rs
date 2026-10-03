@@ -28,7 +28,7 @@
 //! so the well-known set is defined once and the open tail of MCP /
 //! vendor-specific names lives in `Tool::Other(String)`.
 
-use crate::Tool;
+use crate::{AgentType, Tool};
 use serde::{Deserialize, Serialize};
 
 /// Sub-kind of a notification, for the cases the daemon special-cases.
@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 /// Pi doesn't use these strings — its permission gating is extension-
 /// mediated and surfaces via `NeedsInputReason::PermissionGate`. The
 /// known variants here are Claude `Notification(notification_type)`
-/// values plus the `setup` synthetic kind we emit when translating
-/// Claude's one-time `Setup` hook event.
+/// values plus the synthetic kinds we emit when translating Claude hook
+/// events that carry no `notification_type` of their own (`Setup`,
+/// `TaskCreated`, `TaskCompleted`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(into = "String", from = "String")]
 pub enum NotificationKind {
@@ -47,8 +48,15 @@ pub enum NotificationKind {
     ElicitationDialog,
     /// Claude idle prompt — agent has gone idle.
     IdlePrompt,
+    /// Claude `agent_needs_input` — an in-process child or teammate is
+    /// waiting on the user.
+    AgentNeedsInput,
     /// Claude one-time `Setup` hook (renamed from raw event).
     Setup,
+    /// Claude `TaskCreated` hook — a shared task-list entry was added.
+    TaskCreated,
+    /// Claude `TaskCompleted` hook — a shared task-list entry finished.
+    TaskCompleted,
     /// Generic informational notification.
     Info,
     /// Any other notification kind (vendor-specific, future kinds).
@@ -63,7 +71,10 @@ impl NotificationKind {
             Self::PermissionPrompt => "permission_prompt",
             Self::ElicitationDialog => "elicitation_dialog",
             Self::IdlePrompt => "idle_prompt",
+            Self::AgentNeedsInput => "agent_needs_input",
             Self::Setup => "setup",
+            Self::TaskCreated => "task_created",
+            Self::TaskCompleted => "task_completed",
             Self::Info => "info",
             Self::Other(s) => s.as_str(),
         }
@@ -84,7 +95,10 @@ impl NotificationKind {
             "permission_prompt" => Self::PermissionPrompt,
             "elicitation_dialog" => Self::ElicitationDialog,
             "idle_prompt" => Self::IdlePrompt,
+            "agent_needs_input" => Self::AgentNeedsInput,
             "setup" => Self::Setup,
+            "task_created" => Self::TaskCreated,
+            "task_completed" => Self::TaskCompleted,
             "info" => Self::Info,
             _ => return None,
         })
@@ -256,6 +270,84 @@ impl LifecycleEvent {
     }
 }
 
+// ============================================================================
+// Routing metadata
+// ============================================================================
+
+/// How a parent's vendor events refer to one of its in-process children.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ChildRef {
+    /// Vendor-assigned agent id (Claude `agent_id`).
+    Id(String),
+    /// Teammate name (Claude `teammate_name`). Only meaningful under its
+    /// parent, so two leads may each have a `reviewer`.
+    Name(String),
+}
+
+/// The in-process child that emitted an event on its parent's connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildAgent {
+    /// How the parent's events refer to this child.
+    pub reference: ChildRef,
+    /// Type the child gets if it has to be materialized on first sight.
+    pub agent_type: AgentType,
+}
+
+/// Name-to-id pair reported when a named child spawn completes, so
+/// name-keyed and id-keyed events land on the same child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildAlias {
+    /// Name the parent chose for the child.
+    pub name: String,
+    /// Id the vendor assigned to it.
+    pub id: String,
+}
+
+/// Background and scheduled work a parent reports when its turn stops.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackgroundActivity {
+    /// Background tasks still running.
+    pub running: u32,
+    /// Scheduled jobs registered for the session.
+    pub scheduled: u32,
+}
+
+impl BackgroundActivity {
+    /// True when nothing runs in the background, so in-process children
+    /// still marked working can be presumed finished.
+    #[must_use]
+    pub fn is_quiet(&self) -> bool {
+        self.running == 0
+    }
+
+    /// Short human summary, or `None` when there is nothing to show.
+    #[must_use]
+    pub fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.running > 0 {
+            let plural = if self.running == 1 { "" } else { "s" };
+            parts.push(format!("{} bg task{plural}", self.running));
+        }
+        if self.scheduled > 0 {
+            parts.push(format!("{} scheduled", self.scheduled));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// Routing metadata that rides alongside a [`LifecycleEvent`] without
+/// being part of it: which in-process child the event belongs to, plus
+/// parent-level bookkeeping learned from the same vendor payload.
+#[derive(Debug, Clone, Default)]
+pub struct LifecycleContext {
+    /// Set when an in-process child, not the parent, emitted the event.
+    pub child: Option<ChildAgent>,
+    /// Alias learned from a completed named child spawn.
+    pub child_alias: Option<ChildAlias>,
+    /// Background work reported by a parent turn stop.
+    pub background_activity: Option<BackgroundActivity>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +481,37 @@ mod tests {
             serde_json::from_str::<NotificationKind>(&json).unwrap(),
             custom
         );
+    }
+
+    #[test]
+    fn orchestration_kinds_are_known_not_other() {
+        for (kind, wire) in [
+            (NotificationKind::AgentNeedsInput, "agent_needs_input"),
+            (NotificationKind::TaskCreated, "task_created"),
+            (NotificationKind::TaskCompleted, "task_completed"),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(NotificationKind::from(wire), kind);
+        }
+    }
+
+    #[test]
+    fn background_activity_summary() {
+        let quiet = BackgroundActivity::default();
+        assert!(quiet.is_quiet());
+        assert_eq!(quiet.summary(), None);
+
+        let busy = BackgroundActivity {
+            running: 2,
+            scheduled: 1,
+        };
+        assert!(!busy.is_quiet());
+        assert_eq!(busy.summary().as_deref(), Some("2 bg tasks, 1 scheduled"));
+
+        let one = BackgroundActivity {
+            running: 1,
+            scheduled: 0,
+        };
+        assert_eq!(one.summary().as_deref(), Some("1 bg task"));
     }
 }

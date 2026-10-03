@@ -44,6 +44,12 @@ impl SessionId {
         Self(format!("{PENDING_SESSION_PREFIX}{pid}"))
     }
 
+    /// Id for a child known only by a name that is unique under `parent`
+    /// (an agent-team teammate before its agent id is learned).
+    pub fn scoped(name: &str, parent: &SessionId) -> Self {
+        Self(format!("{name}@{}", parent.0))
+    }
+
     /// Checks if this is a pending session ID (not yet associated with real session).
     #[must_use]
     pub fn is_pending(&self) -> bool {
@@ -827,8 +833,8 @@ impl SessionDomain {
                 // `Notification`, after translation.
             }
             LifecycleEvent::ChildSessionStart { .. } | LifecycleEvent::ChildSessionEnd { .. } => {
-                // Child-session correlation is tracked by the registry
-                // (subagent pending-list); status remains Working.
+                // Children are tracked by the registry as in-process sessions;
+                // status remains Working.
                 self.status = SessionStatus::Working;
             }
         }
@@ -1083,6 +1089,7 @@ fn activity_for_needs_input(reason: &NeedsInputReason) -> ActivityDetail {
             match kind {
                 NotificationKind::PermissionPrompt => ActivityDetail::with_context("Permission"),
                 NotificationKind::ElicitationDialog => ActivityDetail::with_context("MCP Input"),
+                NotificationKind::AgentNeedsInput => ActivityDetail::with_context("Agent Input"),
                 other => ActivityDetail::with_context(other.as_str()),
             }
         }

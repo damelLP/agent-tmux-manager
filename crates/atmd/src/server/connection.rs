@@ -449,12 +449,13 @@ impl ConnectionHandler {
         let tmux_pane = raw_event.tmux_pane.clone();
 
         self.registry
-            .apply_lifecycle_event(
+            .apply_lifecycle_event_with_context(
                 session_id,
                 lifecycle,
                 atm_core::Harness::ClaudeCode,
                 pid,
                 tmux_pane,
+                raw_event.lifecycle_context(),
             )
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;

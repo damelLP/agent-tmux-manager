@@ -7,7 +7,9 @@
 //!
 //! All types are designed for async message passing and follow the panic-free policy.
 
-use atm_core::{AgentType, Harness, LifecycleEvent, SessionDomain, SessionId, SessionView};
+use atm_core::{
+    AgentType, Harness, LifecycleContext, LifecycleEvent, SessionDomain, SessionId, SessionView,
+};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -85,6 +87,8 @@ pub enum RegistryCommand {
         pid: Option<u32>,
         /// Tmux pane ID if running in tmux
         tmux_pane: Option<String>,
+        /// Optional in-process child routing metadata.
+        context: LifecycleContext,
         /// Channel to send the result
         respond_to: oneshot::Sender<Result<(), RegistryError>>,
     },

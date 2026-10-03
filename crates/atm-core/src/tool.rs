@@ -37,7 +37,10 @@ pub enum Tool {
     Edit,
     Grep,
     Glob,
+    /// `Task` — the subagent-spawning tool before it was renamed `Agent`.
     Task,
+    /// `Agent` — spawns an in-process subagent or teammate.
+    Agent,
     WebSearch,
     WebFetch,
     TodoWrite,
@@ -66,6 +69,13 @@ impl Tool {
         )
     }
 
+    /// True for the tool whose completion reports a spawned in-process
+    /// child (`Agent`, formerly `Task`).
+    #[must_use]
+    pub fn is_subagent_spawn(&self) -> bool {
+        matches!(self, Self::Task | Self::Agent)
+    }
+
     /// Canonical wire-format string for this tool.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -80,6 +90,7 @@ impl Tool {
             Self::Grep => "Grep",
             Self::Glob => "Glob",
             Self::Task => "Task",
+            Self::Agent => "Agent",
             Self::WebSearch => "WebSearch",
             Self::WebFetch => "WebFetch",
             Self::TodoWrite => "TodoWrite",
@@ -112,6 +123,7 @@ impl Tool {
             "Grep" => Self::Grep,
             "Glob" => Self::Glob,
             "Task" => Self::Task,
+            "Agent" => Self::Agent,
             "WebSearch" => Self::WebSearch,
             "WebFetch" => Self::WebFetch,
             "TodoWrite" => Self::TodoWrite,
@@ -175,6 +187,7 @@ mod tests {
             Tool::Grep,
             Tool::Glob,
             Tool::Task,
+            Tool::Agent,
             Tool::WebSearch,
             Tool::WebFetch,
             Tool::TodoWrite,
@@ -212,6 +225,7 @@ mod tests {
             Tool::Grep,
             Tool::Glob,
             Tool::Task,
+            Tool::Agent,
             Tool::WebSearch,
             Tool::WebFetch,
             Tool::TodoWrite,
@@ -224,6 +238,14 @@ mod tests {
                 "{not_interactive} should not be interactive"
             );
         }
+    }
+
+    #[test]
+    fn subagent_spawn_covers_both_tool_names() {
+        assert!(Tool::from("Agent").is_subagent_spawn());
+        assert!(Tool::from("Task").is_subagent_spawn());
+        assert!(!Tool::Bash.is_subagent_spawn());
+        assert!(!Tool::from("agent").is_subagent_spawn());
     }
 
     #[test]

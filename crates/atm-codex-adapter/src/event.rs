@@ -116,6 +116,14 @@ impl CodexEventType {
             .find(|(_, s)| *s == name)
             .map(|(v, _)| *v)
     }
+
+    /// Hook event names ATM subscribes to, in registration order.
+    ///
+    /// `atm setup` registers exactly these, so the adapter's vocabulary
+    /// and the hooks installed in the harness cannot drift apart.
+    pub fn hook_names() -> impl Iterator<Item = &'static str> {
+        HOOK_EVENT_VARIANTS.iter().map(|(_, name)| *name)
+    }
 }
 
 impl fmt::Display for CodexEventType {

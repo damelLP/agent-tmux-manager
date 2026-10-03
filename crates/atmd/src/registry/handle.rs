@@ -12,7 +12,7 @@
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use atm_core::{Harness, LifecycleEvent, SessionDomain, SessionId, SessionView};
+use atm_core::{Harness, LifecycleContext, LifecycleEvent, SessionDomain, SessionId, SessionView};
 
 use super::commands::{RegistryCommand, RegistryError, SessionEvent};
 
@@ -137,6 +137,27 @@ impl RegistryHandle {
         pid: Option<u32>,
         tmux_pane: Option<String>,
     ) -> Result<(), RegistryError> {
+        self.apply_lifecycle_event_with_context(
+            session_id,
+            event,
+            harness,
+            pid,
+            tmux_pane,
+            LifecycleContext::default(),
+        )
+        .await
+    }
+
+    /// Apply a lifecycle event with in-process child routing metadata.
+    pub async fn apply_lifecycle_event_with_context(
+        &self,
+        session_id: SessionId,
+        event: LifecycleEvent,
+        harness: Harness,
+        pid: Option<u32>,
+        tmux_pane: Option<String>,
+        context: LifecycleContext,
+    ) -> Result<(), RegistryError> {
         let (tx, rx) = oneshot::channel();
 
         self.sender
@@ -146,6 +167,7 @@ impl RegistryHandle {
                 harness,
                 pid,
                 tmux_pane,
+                context,
                 respond_to: tx,
             })
             .await
@@ -443,6 +465,7 @@ mod tests {
                 harness,
                 pid,
                 tmux_pane,
+                context: _,
                 respond_to,
             }) = rx.recv().await
             {

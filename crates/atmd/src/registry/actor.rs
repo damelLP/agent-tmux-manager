@@ -12,15 +12,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use atm_core::{
-    AgentType, LifecycleEvent, NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure,
-    SessionView,
+    AgentType, BackgroundActivity, ChildAlias, ChildRef, LifecycleContext, LifecycleEvent,
+    NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure, SessionView,
 };
 use atm_protocol::RawStatusLine;
 
@@ -36,24 +35,6 @@ pub const MAX_SESSIONS: usize = 100;
 // ============================================================================
 // Registry Actor
 // ============================================================================
-
-/// A pending subagent awaiting correlation with a discovered session.
-///
-/// When a SubagentStart hook arrives, we record the parent session and agent metadata.
-/// Later, when the child session registers (via discovery or hook), we correlate them.
-#[derive(Debug)]
-struct PendingSubagent {
-    /// Session ID of the parent that spawned this subagent
-    parent_session_id: SessionId,
-    /// PID of the parent session (cached for ancestry check)
-    parent_pid: u32,
-    /// Process start time of the parent PID (to detect PID reuse)
-    parent_start_time: Option<u64>,
-    /// Type of agent (explore, plan, etc.)
-    agent_type: AgentType,
-    /// When this entry was created (for TTL cleanup)
-    created_at: Instant,
-}
 
 /// The registry actor - owns all session state.
 ///
@@ -91,10 +72,9 @@ pub struct RegistryActor {
     /// Event publisher for real-time updates to TUI clients
     event_publisher: broadcast::Sender<SessionEvent>,
 
-    /// Pending subagent correlations awaiting child session discovery.
-    /// Uses Vec for deterministic FIFO ordering — when multiple subagents
-    /// are pending, the oldest match wins.
-    pending_subagents: Vec<(String, PendingSubagent)>,
+    /// Parent-scoped child references mapped to the child session ids they
+    /// resolved to, learned from aliases.
+    child_refs: HashMap<(SessionId, ChildRef), SessionId>,
 }
 
 impl RegistryActor {
@@ -113,7 +93,7 @@ impl RegistryActor {
             sessions_by_pid: HashMap::new(),
             session_id_to_pid: HashMap::new(),
             event_publisher,
-            pending_subagents: Vec::new(),
+            child_refs: HashMap::new(),
         }
     }
 
@@ -160,10 +140,12 @@ impl RegistryActor {
                 harness,
                 pid,
                 tmux_pane,
+                context,
                 respond_to,
             } => {
-                let result =
-                    self.handle_apply_lifecycle_event(session_id, event, harness, pid, tmux_pane);
+                let result = self.handle_apply_lifecycle_event(
+                    session_id, event, harness, pid, tmux_pane, context,
+                );
                 let _ = respond_to.send(result);
             }
             RegistryCommand::GetSession {
@@ -354,6 +336,11 @@ impl RegistryActor {
             // duration, etc.) — only refresh cwd and git info from the new discovery.
             let old_id = existing_session.id.clone();
             let cwd_str = cwd.to_string_lossy().to_string();
+            let session_id = if !old_id.is_pending() && session_id.is_pending() {
+                old_id.clone()
+            } else {
+                session_id
+            };
 
             // Update session_id to match the new discovery
             existing_session.id = session_id.clone();
@@ -440,9 +427,6 @@ impl RegistryActor {
                 session: Box::new(view),
             });
         }
-
-        // Try to correlate with pending subagent
-        self.try_correlate_subagent(&session_id, pid);
 
         Ok(())
     }
@@ -681,8 +665,8 @@ impl RegistryActor {
     /// With PID as primary key, we can look up by PID when available.
     ///
     /// Special cases:
-    /// - `SessionEnd` immediately removes the session from the registry.
-    /// - `ChildSessionStart`/`ChildSessionEnd` track subagent correlation.
+    /// - An untagged `SessionEnd` immediately removes the session from the registry.
+    /// - `ChildSessionStart`/`ChildSessionEnd` create and remove in-process children.
     fn handle_apply_lifecycle_event(
         &mut self,
         session_id: SessionId,
@@ -690,58 +674,12 @@ impl RegistryActor {
         harness: atm_core::Harness,
         pid: Option<u32>,
         tmux_pane: Option<String>,
+        context: LifecycleContext,
     ) -> Result<(), RegistryError> {
-        // Subagent correlation: ChildSessionStart records, ChildSessionEnd removes.
-        match &event {
-            LifecycleEvent::ChildSessionStart {
-                id: Some(aid),
-                role,
-            } => {
-                let resolved_parent_pid = pid
-                    .or_else(|| self.session_id_to_pid.get(&session_id).copied())
-                    .unwrap_or(0);
+        let target_pid = pid.or_else(|| self.session_id_to_pid.get(&session_id).copied());
 
-                let parent_sid = if resolved_parent_pid != 0 {
-                    self.sessions_by_pid
-                        .get(&resolved_parent_pid)
-                        .map(|(s, _)| s.id.clone())
-                        .unwrap_or_else(|| session_id.clone())
-                } else {
-                    session_id.clone()
-                };
-
-                let parent_start_time = if resolved_parent_pid != 0 {
-                    crate::tmux::get_process_start_time(resolved_parent_pid)
-                } else {
-                    None
-                };
-
-                let child_agent_type = role
-                    .as_deref()
-                    .map(AgentType::from_subagent_type)
-                    .unwrap_or_default();
-
-                self.pending_subagents.push((
-                    aid.clone(),
-                    PendingSubagent {
-                        parent_session_id: parent_sid,
-                        parent_pid: resolved_parent_pid,
-                        parent_start_time,
-                        agent_type: child_agent_type,
-                        created_at: Instant::now(),
-                    },
-                ));
-            }
-            LifecycleEvent::ChildSessionEnd { id: Some(aid) } => {
-                self.pending_subagents.retain(|(id, _)| id != aid);
-            }
-            _ => {}
-        }
-
-        // SessionEnd: remove session immediately.
-        if matches!(event, LifecycleEvent::SessionEnd { .. }) {
-            let target_pid = pid.or_else(|| self.session_id_to_pid.get(&session_id).copied());
-
+        // Untagged SessionEnd: remove session immediately.
+        if context.child.is_none() && matches!(event, LifecycleEvent::SessionEnd { .. }) {
             if let Some(p) = target_pid {
                 if self.sessions_by_pid.contains_key(&p) {
                     info!(
@@ -760,11 +698,6 @@ impl RegistryActor {
             return Ok(());
         }
 
-        let tool_name = tool_name_from_event(&event);
-
-        // Find session by PID first (preferred), then by session_id
-        let target_pid = pid.or_else(|| self.session_id_to_pid.get(&session_id).copied());
-
         // Pending → real upgrade: a session discovered via /proc starts
         // life as `pending-{pid}`. The first vendor-adapter event with
         // a real session_id is our signal to reconcile, mirroring the
@@ -780,97 +713,258 @@ impl RegistryActor {
             }
         }
 
-        let (session, infra) = match target_pid.and_then(|p| self.sessions_by_pid.get_mut(&p)) {
-            Some(entry) => entry,
-            None => {
-                // Session doesn't exist yet - this is normal due to race conditions.
-                // With PID as primary key, we can create the session now if we have a PID.
-                if let Some(p) = pid {
-                    if p != 0 {
-                        debug!(
-                            session_id = %session_id,
-                            pid = p,
-                            event = ?event,
-                            "Creating session from lifecycle event"
-                        );
-                        // Read cwd from /proc/{pid}/cwd so a session created
-                        // via a vendor adapter event lands grouped under the
-                        // right project / branch from frame one. Without this,
-                        // lifecycle-event-created sessions fall into the
-                        // "Other" tree bucket because working_directory is None.
-                        let proc_cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok();
-                        use atm_core::Model;
-                        let session = build_session_from_pid(
-                            session_id.clone(),
-                            AgentType::GeneralPurpose,
-                            Model::Unknown,
-                            harness,
-                            tmux_pane.clone(),
-                            proc_cwd,
-                        );
-
-                        let mut infra = SessionInfrastructure::new();
-                        infra.set_pid(p);
-
-                        self.sessions_by_pid.insert(p, (session, infra));
-                        self.session_id_to_pid.insert(session_id.clone(), p);
-
-                        if let Some((session, infra)) = self.sessions_by_pid.get_mut(&p) {
-                            session.apply_lifecycle_event(&event);
-                            session.set_first_prompt_from_event(&event);
-                            if let Some(name) = tool_name.as_deref() {
-                                infra.record_tool_use(name, None);
-                            }
-
-                            let view = SessionView::from_domain(session);
-                            let _ = self.event_publisher.send(SessionEvent::Registered {
-                                session_id: session_id.clone(),
-                                agent_type: session.agent_type.clone(),
-                            });
-                            let _ = self.event_publisher.send(SessionEvent::Updated {
-                                session: Box::new(view),
-                            });
-                        }
-
-                        self.try_correlate_subagent(&session_id, p);
-
-                        return Ok(());
-                    }
-                }
-
-                debug!(
-                    session_id = %session_id,
-                    event = ?event,
-                    "Lifecycle event for non-existent session without PID, ignoring"
-                );
-                return Ok(());
-            }
+        let existing = target_pid.filter(|p| self.sessions_by_pid.contains_key(p));
+        let Some(p) = existing.or(pid.filter(|p| *p != 0)) else {
+            debug!(
+                session_id = %session_id,
+                event = ?event,
+                "Lifecycle event for non-existent session without PID, ignoring"
+            );
+            return Ok(());
         };
+        if existing.is_none() {
+            // Session doesn't exist yet - this is normal due to race conditions.
+            // With PID as primary key, we can create the session now if we have a PID.
+            debug!(
+                session_id = %session_id,
+                pid = p,
+                event = ?event,
+                "Creating session from lifecycle event"
+            );
+            // Read cwd from /proc/{pid}/cwd so a session created
+            // via a vendor adapter event lands grouped under the
+            // right project / branch from frame one. Without this,
+            // lifecycle-event-created sessions fall into the
+            // "Other" tree bucket because working_directory is None.
+            let proc_cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok();
+            let session = build_session_from_pid(
+                session_id.clone(),
+                AgentType::GeneralPurpose,
+                atm_core::Model::Unknown,
+                harness,
+                tmux_pane.clone(),
+                proc_cwd,
+            );
+            let mut infra = SessionInfrastructure::new();
+            infra.set_pid(p);
+            self.sessions_by_pid.insert(p, (session, infra));
+            self.session_id_to_pid.insert(session_id.clone(), p);
+            let _ = self.event_publisher.send(SessionEvent::Registered {
+                session_id: session_id.clone(),
+                agent_type: AgentType::GeneralPurpose,
+            });
+        }
 
-        session.apply_lifecycle_event(&event);
-        session.set_first_prompt_from_event(&event);
+        if !self.prepare_child_event(p, &event, harness, &context) {
+            self.apply_to_session(p, &event, tmux_pane);
+            self.apply_background_activity(p, context.background_activity);
+        }
+        Ok(())
+    }
 
+    /// Child bookkeeping for an event received on `parent_pid`: learns
+    /// name→id aliases, tracks `ChildSessionStart`/`End`, and applies an
+    /// event emitted by an in-process child to that child.
+    ///
+    /// Returns `true` when the event was routed to a child.
+    fn prepare_child_event(
+        &mut self,
+        parent_pid: u32,
+        event: &LifecycleEvent,
+        harness: atm_core::Harness,
+        context: &LifecycleContext,
+    ) -> bool {
+        let Some(parent_id) = self
+            .sessions_by_pid
+            .get(&parent_pid)
+            .map(|(parent, _)| parent.id.clone())
+        else {
+            return false;
+        };
+        if let Some(alias) = &context.child_alias {
+            self.register_child_alias(&parent_id, alias);
+        }
+        match event {
+            LifecycleEvent::ChildSessionStart {
+                id: Some(agent_id),
+                role,
+            } => {
+                let child_id = self.child_id_for(&parent_id, &ChildRef::Id(agent_id.clone()));
+                let agent_type = AgentType::for_child(role.as_deref());
+                self.ensure_child_session(parent_pid, child_id, agent_type, harness);
+            }
+            LifecycleEvent::ChildSessionEnd { id: Some(agent_id) } => {
+                let child_id = self.child_id_for(&parent_id, &ChildRef::Id(agent_id.clone()));
+                let _ = self.handle_remove(child_id, RemovalReason::SessionEnded);
+            }
+            _ => {}
+        }
+        let Some(child) = &context.child else {
+            return false;
+        };
+        let child_id = self.child_id_for(&parent_id, &child.reference);
+        let agent_type = child.agent_type.clone();
+        if let Some(pid) = self.ensure_child_session(parent_pid, child_id, agent_type, harness) {
+            self.apply_to_session(pid, event, None);
+        }
+        true
+    }
+
+    /// Publishes the current view of the session stored under `pid`.
+    fn publish_updated(&self, pid: u32) {
+        if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
+            let _ = self.event_publisher.send(SessionEvent::Updated {
+                session: Box::new(SessionView::from_domain(session)),
+            });
+        }
+    }
+
+    /// Applies `event` to the session stored under `pid` and publishes it.
+    fn apply_to_session(&mut self, pid: u32, event: &LifecycleEvent, tmux_pane: Option<String>) {
+        let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) else {
+            return;
+        };
+        session.apply_lifecycle_event(event);
+        session.set_first_prompt_from_event(event);
         if tmux_pane.is_some() && session.tmux_pane.is_none() {
             session.tmux_pane = tmux_pane;
         }
-
+        if let Some(name) = tool_name_from_event(event) {
+            infra.record_tool_use(&name, None);
+        }
         debug!(
             session_id = %session.id,
             event = ?event,
             new_status = %session.status,
             "Lifecycle event applied"
         );
+        self.publish_updated(pid);
+    }
 
-        if let Some(name) = tool_name.as_deref() {
-            infra.record_tool_use(name, None);
+    /// Resolves a vendor child reference to its session id under `parent`:
+    /// the id an alias mapped it to, else the reference's own default id.
+    fn child_id_for(&self, parent: &SessionId, reference: &ChildRef) -> SessionId {
+        self.child_refs
+            .get(&(parent.clone(), reference.clone()))
+            .cloned()
+            .unwrap_or_else(|| match reference {
+                ChildRef::Id(id) => SessionId::new(id),
+                ChildRef::Name(name) => SessionId::scoped(name, parent),
+            })
+    }
+
+    /// The in-process (synthetic, no real pid) session with this id, if any.
+    fn synthetic_child(&self, id: &SessionId) -> Option<&SessionDomain> {
+        let (session, infra) = self.sessions_by_pid.get(self.session_id_to_pid.get(id)?)?;
+        infra.pid.is_none().then_some(session)
+    }
+
+    /// Returns the pid of `child_id`, creating it as an in-process child of
+    /// `parent_pid` when it does not exist yet.
+    fn ensure_child_session(
+        &mut self,
+        parent_pid: u32,
+        child_id: SessionId,
+        agent_type: AgentType,
+        harness: atm_core::Harness,
+    ) -> Option<u32> {
+        if let Some(pid) = self.session_id_to_pid.get(&child_id) {
+            return Some(*pid);
         }
+        let (parent, _) = self.sessions_by_pid.get(&parent_pid)?;
+        let mut child = SessionDomain::new(child_id.clone(), agent_type, parent.model);
+        child.harness = harness;
+        child.model_display_override = parent.model_display_override.clone();
+        child.tmux_pane = parent.tmux_pane.clone();
+        child.working_directory = parent.working_directory.clone();
+        child.project_root = parent.project_root.clone();
+        child.worktree_path = parent.worktree_path.clone();
+        child.worktree_branch = parent.worktree_branch.clone();
+        child.parent_session_id = Some(parent.id.clone());
+        child.apply_lifecycle_event(&LifecycleEvent::WorkingStart);
+        // Without a real pid the registry assigns a synthetic one that
+        // `set_pid` rejects, so `infra.pid` stays `None` and stale-process
+        // cleanup never sweeps the child.
+        self.handle_register(child, None).ok()?;
+        let child_pid = self.session_id_to_pid.get(&child_id).copied()?;
+        if let Some((parent, _)) = self.sessions_by_pid.get_mut(&parent_pid) {
+            parent.child_session_ids.push(child_id);
+        }
+        self.publish_updated(child_pid);
+        self.publish_updated(parent_pid);
+        Some(child_pid)
+    }
 
-        let view = SessionView::from_domain(session);
-        let _ = self.event_publisher.send(SessionEvent::Updated {
-            session: Box::new(view),
-        });
+    /// Maps a child's name and agent id to one child session under
+    /// `parent`, retiring a name-only placeholder the alias supersedes.
+    fn register_child_alias(&mut self, parent: &SessionId, alias: &ChildAlias) {
+        let by_id = ChildRef::Id(alias.id.clone());
+        let by_name = ChildRef::Name(alias.name.clone());
+        let target = self.child_id_for(parent, &by_id);
+        let placeholder = self.child_id_for(parent, &by_name);
+        if placeholder != target && self.synthetic_child(&placeholder).is_some() {
+            let _ = self.handle_remove(placeholder, RemovalReason::Upgraded);
+        }
+        for reference in [by_name, by_id] {
+            self.child_refs
+                .insert((parent.clone(), reference), target.clone());
+        }
+    }
 
-        Ok(())
+    /// After a parent `Stop`: sweeps in-process children still marked
+    /// working once nothing runs in the background (their `SubagentStop`
+    /// never arrived), and shows remaining background work on the parent.
+    fn apply_background_activity(&mut self, pid: u32, activity: Option<BackgroundActivity>) {
+        let Some(activity) = activity else {
+            return;
+        };
+        if activity.is_quiet() {
+            let child_ids = self
+                .sessions_by_pid
+                .get(&pid)
+                .map(|(parent, _)| parent.child_session_ids.clone())
+                .unwrap_or_default();
+            for id in child_ids {
+                let working = self
+                    .synthetic_child(&id)
+                    .is_some_and(|child| child.status == atm_core::SessionStatus::Working);
+                if working {
+                    let _ = self.handle_remove(id, RemovalReason::SessionEnded);
+                }
+            }
+        }
+        let Some(summary) = activity.summary() else {
+            return;
+        };
+        let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) else {
+            return;
+        };
+        if session.status != atm_core::SessionStatus::Idle {
+            return;
+        }
+        session.current_activity = Some(atm_core::ActivityDetail::with_context(&summary));
+        self.publish_updated(pid);
+    }
+
+    /// Unlinks a session that just left the registry from its children and
+    /// parent, removing in-process children with it.
+    fn detach_removed_session(&mut self, session: &SessionDomain, reason: RemovalReason) {
+        for id in &session.child_session_ids {
+            let _ = self.handle_remove(id.clone(), reason);
+        }
+        if let Some(pid) = session
+            .parent_session_id
+            .as_ref()
+            .and_then(|id| self.session_id_to_pid.get(id))
+            .copied()
+        {
+            if let Some((parent, _)) = self.sessions_by_pid.get_mut(&pid) {
+                parent.child_session_ids.retain(|id| id != &session.id);
+            }
+            self.publish_updated(pid);
+        }
+        self.child_refs
+            .retain(|(parent, _), child| parent != &session.id && child != &session.id);
     }
 
     /// Handles getting a single session by ID.
@@ -900,7 +994,9 @@ impl RegistryActor {
             None => return Err(RegistryError::SessionNotFound(session_id)),
         };
 
-        self.sessions_by_pid.remove(&pid);
+        if let Some((session, _)) = self.sessions_by_pid.remove(&pid) {
+            self.detach_removed_session(&session, reason);
+        }
 
         info!(
             session_id = %session_id,
@@ -935,6 +1031,7 @@ impl RegistryActor {
 
         let session_id = session.id.clone();
         self.session_id_to_pid.remove(&session_id);
+        self.detach_removed_session(&session, reason);
 
         info!(
             session_id = %session_id,
@@ -952,68 +1049,11 @@ impl RegistryActor {
         Ok(())
     }
 
-    /// Attempts to correlate a newly registered session with a pending subagent.
-    ///
-    /// Uses PID ancestry to check if the new session's process is a child of
-    /// a known parent session's process. If matched, links parent and child
-    /// session IDs and removes the pending entry.
-    ///
-    /// # Blocking I/O
-    ///
-    /// Calls `is_descendant_of` which reads `/proc/{pid}/stat` (up to 20 times).
-    /// These are pseudo-filesystem reads served from kernel memory (~1μs each),
-    /// well under Tokio's acceptable sync threshold. If this proves problematic
-    /// on exotic filesystems, move resolution to `spawn_blocking`.
-    fn try_correlate_subagent(&mut self, session_id: &SessionId, pid: u32) {
-        // Find matching pending subagent (FIFO order — Vec guarantees oldest-first)
-        let matched_index = self.pending_subagents.iter().position(|(_, pending)| {
-            if pending.created_at.elapsed() >= Duration::from_secs(30) || pending.parent_pid == 0 {
-                return false;
-            }
-            // Verify the parent PID hasn't been reused by checking start time
-            let start_time_matches = match pending.parent_start_time {
-                Some(expected) => {
-                    crate::tmux::get_process_start_time(pending.parent_pid) == Some(expected)
-                }
-                // If we couldn't capture start time originally, skip reuse check
-                None => true,
-            };
-            start_time_matches && is_descendant_of(pid, pending.parent_pid)
-        });
-
-        if let Some(index) = matched_index {
-            let (agent_id, pending) = self.pending_subagents.remove(index);
-
-            info!(
-                child_session_id = %session_id,
-                parent_session_id = %pending.parent_session_id,
-                agent_id = %agent_id,
-                agent_type = %pending.agent_type,
-                "Correlated subagent with discovered session"
-            );
-
-            // Link parent to child
-            if let Some((parent_session, _)) = self.sessions_by_pid.get_mut(&pending.parent_pid) {
-                parent_session.child_session_ids.push(session_id.clone());
-            }
-
-            // Link child to parent (move, no clone — pending is owned)
-            if let Some((child_session, _)) = self.sessions_by_pid.get_mut(&pid) {
-                child_session.parent_session_id = Some(pending.parent_session_id);
-                child_session.agent_type = pending.agent_type;
-            }
-        }
-    }
-
     /// Handles cleanup of dead-process sessions.
     ///
     /// Removes sessions whose Claude Code process has terminated
     /// (PID no longer exists or was reused by a different process).
     fn handle_cleanup_stale(&mut self) {
-        // Clean up expired pending subagent correlations
-        self.pending_subagents
-            .retain(|(_, p)| p.created_at.elapsed() < Duration::from_secs(30));
-
         let now = Utc::now();
 
         // Collect PIDs to remove: only sessions whose process has died
@@ -1048,8 +1088,11 @@ impl RegistryActor {
                 })
                 .unwrap_or_default();
 
-            self.sessions_by_pid.remove(&pid);
+            let removed = self.sessions_by_pid.remove(&pid);
             self.session_id_to_pid.remove(&session_id);
+            if let Some((session, _)) = removed {
+                self.detach_removed_session(&session, RemovalReason::ProcessDied);
+            }
 
             // Use warn! so it shows up without RUST_LOG=debug
             warn!(
@@ -1121,12 +1164,6 @@ impl RegistryActor {
     pub fn session_count(&self) -> usize {
         self.sessions_by_pid.len()
     }
-
-    /// Returns the number of pending subagent correlations (for testing).
-    #[cfg(test)]
-    pub fn pending_subagent_count(&self) -> usize {
-        self.pending_subagents.len()
-    }
 }
 
 /// Builds a fresh `SessionDomain` for a newly-observed PID and resolves
@@ -1180,30 +1217,10 @@ fn tool_name_from_event(event: &LifecycleEvent) -> Option<String> {
     }
 }
 
-/// Check if `pid` is a descendant of `ancestor_pid` by walking /proc.
-///
-/// Walks up the process tree via parent PID lookups, with a max depth
-/// of 20 to prevent infinite loops in case of circular references.
-fn is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
-    let mut current = pid;
-    for _ in 0..20 {
-        if current == ancestor_pid {
-            return true;
-        }
-        if current <= 1 {
-            return false;
-        }
-        match crate::tmux::get_parent_pid(current) {
-            Some(ppid) => current = ppid,
-            None => return false,
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atm_core::ChildAgent;
     use atm_core::{AgentType, Model, Tool};
     use tokio::sync::oneshot;
 
@@ -1422,6 +1439,7 @@ mod tests {
             harness: atm_core::Harness::Unknown,
             pid: None,
             tmux_pane: None,
+            context: LifecycleContext::default(),
             respond_to: tx,
         });
 
@@ -1465,6 +1483,7 @@ mod tests {
             harness: atm_core::Harness::Unknown,
             pid: None,
             tmux_pane: None,
+            context: LifecycleContext::default(),
             respond_to: tx,
         });
 
@@ -1497,6 +1516,7 @@ mod tests {
             harness: atm_core::Harness::Unknown,
             pid: None,
             tmux_pane: None,
+            context: LifecycleContext::default(),
             respond_to: tx,
         });
 
@@ -1767,6 +1787,7 @@ mod tests {
             harness: atm_core::Harness::Pi,
             pid: Some(current_pid),
             tmux_pane: None,
+            context: LifecycleContext::default(),
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();
@@ -1846,6 +1867,7 @@ mod tests {
             harness: atm_core::Harness::Pi,
             pid: Some(current_pid),
             tmux_pane: None,
+            context: LifecycleContext::default(),
             respond_to: tx,
         });
         let _ = rx.await.unwrap();
@@ -1860,214 +1882,6 @@ mod tests {
             rx.await.unwrap().is_some(),
             "real id must not be renamed by another real id"
         );
-    }
-
-    #[tokio::test]
-    async fn test_subagent_start_records_pending() {
-        let (_, mut actor, _) = create_actor();
-
-        // Register a parent session
-        let session = create_test_session("parent-session");
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::Register {
-            session: Box::new(session),
-            respond_to: tx,
-        });
-
-        assert_eq!(actor.pending_subagent_count(), 0);
-
-        // Send SubagentStart hook event with agent_id
-        let (tx, rx) = oneshot::channel();
-        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
-            session_id: SessionId::new("parent-session"),
-            event: LifecycleEvent::ChildSessionStart {
-                id: Some("agent-abc-123".into()),
-                role: Some("explore".into()),
-            },
-            harness: atm_core::Harness::Unknown,
-            pid: None,
-            tmux_pane: None,
-            respond_to: tx,
-        });
-
-        let result = rx.await.unwrap();
-        assert!(result.is_ok());
-        assert_eq!(actor.pending_subagent_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_subagent_stop_clears_pending() {
-        let (_, mut actor, _) = create_actor();
-
-        // Register a parent session
-        let session = create_test_session("parent-session");
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::Register {
-            session: Box::new(session),
-            respond_to: tx,
-        });
-
-        // Send SubagentStart
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
-            session_id: SessionId::new("parent-session"),
-            event: LifecycleEvent::ChildSessionStart {
-                id: Some("agent-xyz-456".into()),
-                role: Some("plan".into()),
-            },
-            harness: atm_core::Harness::Unknown,
-            pid: None,
-            tmux_pane: None,
-            respond_to: tx,
-        });
-        assert_eq!(actor.pending_subagent_count(), 1);
-
-        // Send SubagentStop with same agent_id
-        let (tx, rx) = oneshot::channel();
-        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
-            session_id: SessionId::new("parent-session"),
-            event: LifecycleEvent::ChildSessionEnd {
-                id: Some("agent-xyz-456".into()),
-            },
-            harness: atm_core::Harness::Unknown,
-            pid: None,
-            tmux_pane: None,
-            respond_to: tx,
-        });
-
-        let result = rx.await.unwrap();
-        assert!(result.is_ok());
-        assert_eq!(actor.pending_subagent_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_pending_subagent_ttl_cleanup() {
-        let (_, mut actor, _) = create_actor();
-
-        // Register a parent session
-        let session = create_test_session("parent-session");
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::Register {
-            session: Box::new(session),
-            respond_to: tx,
-        });
-
-        // Send SubagentStart to create a pending entry
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
-            session_id: SessionId::new("parent-session"),
-            event: LifecycleEvent::ChildSessionStart {
-                id: Some("agent-expired".into()),
-                role: Some("explore".into()),
-            },
-            harness: atm_core::Harness::Unknown,
-            pid: None,
-            tmux_pane: None,
-            respond_to: tx,
-        });
-        assert_eq!(actor.pending_subagent_count(), 1);
-
-        // Manually expire the pending entry by replacing created_at with a past instant
-        // The TTL is 30 seconds, so we need to go back at least 31 seconds
-        if let Some((_, pending)) = actor
-            .pending_subagents
-            .iter_mut()
-            .find(|(id, _)| id == "agent-expired")
-        {
-            pending.created_at = Instant::now() - Duration::from_secs(31);
-        }
-
-        // Trigger cleanup (which also cleans pending subagents)
-        actor.handle_command(RegistryCommand::CleanupStale);
-
-        // Pending entry should be removed by TTL cleanup
-        assert_eq!(actor.pending_subagent_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_subagent_correlation_links_parent_child() {
-        let (_, mut actor, _) = create_actor();
-
-        let parent_pid = std::process::id();
-        let parent_id = SessionId::new("parent-session");
-
-        // Register parent session via discovery
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::RegisterDiscovered {
-            session_id: parent_id.clone(),
-            pid: parent_pid,
-            cwd: std::path::PathBuf::from("/home/user/project"),
-            tmux_pane: None,
-            harness: atm_core::Harness::Unknown,
-            respond_to: tx,
-        });
-
-        // Send SubagentStart to create a pending correlation entry
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
-            session_id: parent_id.clone(),
-            event: LifecycleEvent::ChildSessionStart {
-                id: Some("sub-agent-001".into()),
-                role: Some("explore".into()),
-            },
-            harness: atm_core::Harness::Unknown,
-            pid: Some(parent_pid),
-            tmux_pane: None,
-            respond_to: tx,
-        });
-        assert_eq!(actor.pending_subagent_count(), 1);
-
-        // Spawn a real child process so we have a descendant PID
-        let mut child = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("failed to spawn sleep process");
-        let child_pid = child.id();
-
-        // Register the child session via discovery — this triggers try_correlate_subagent
-        let child_id = SessionId::new("child-session");
-        let (tx, _) = oneshot::channel();
-        actor.handle_command(RegistryCommand::RegisterDiscovered {
-            session_id: child_id.clone(),
-            pid: child_pid,
-            cwd: std::path::PathBuf::from("/home/user/project"),
-            tmux_pane: None,
-            harness: atm_core::Harness::Unknown,
-            respond_to: tx,
-        });
-
-        // The pending subagent should be consumed by correlation
-        // because child_pid is a descendant of parent_pid (our process)
-        assert_eq!(
-            actor.pending_subagent_count(),
-            0,
-            "Pending subagent should be consumed by correlation"
-        );
-
-        // Verify parent → child link
-        if let Some((parent_session, _)) = actor.sessions_by_pid.get(&parent_pid) {
-            assert!(
-                parent_session.child_session_ids.contains(&child_id),
-                "Parent should list child in child_session_ids"
-            );
-        } else {
-            panic!("Parent session not found");
-        }
-
-        // Verify child → parent link
-        if let Some((child_session, _)) = actor.sessions_by_pid.get(&child_pid) {
-            assert_eq!(
-                child_session.parent_session_id.as_ref(),
-                Some(&parent_id),
-                "Child should reference parent_session_id"
-            );
-        } else {
-            panic!("Child session not found");
-        }
-
-        // Clean up the sleep process
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     #[tokio::test]
@@ -2313,10 +2127,10 @@ mod tests {
         });
         rx.await.unwrap().unwrap();
 
-        // Verify metadata preserved under new session_id
+        // Verify metadata preserved under the real session_id
         let (tx, rx) = oneshot::channel();
         actor.handle_command(RegistryCommand::GetSession {
-            session_id: SessionId::new("pending-rescan"),
+            session_id: SessionId::new("real-id"),
             respond_to: tx,
         });
         let view = rx.await.unwrap().unwrap();
@@ -2326,14 +2140,17 @@ mod tests {
             view.cost_usd
         );
 
-        // Old session_id should no longer exist
+        // The rescan's pending session_id should not enter the index
         let (tx, rx) = oneshot::channel();
         actor.handle_command(RegistryCommand::GetSession {
-            session_id: SessionId::new("real-id"),
+            session_id: SessionId::new("pending-rescan"),
             respond_to: tx,
         });
-        let old = rx.await.unwrap();
-        assert!(old.is_none(), "old session_id should be removed from index");
+        let pending = rx.await.unwrap();
+        assert!(
+            pending.is_none(),
+            "real session_id should not be downgraded"
+        );
     }
 
     #[tokio::test]
@@ -2405,5 +2222,197 @@ mod tests {
             Some(repo_b.to_str().unwrap()),
             "project_root should point to repo_b"
         );
+    }
+
+    fn register_test_session(actor: &mut RegistryActor, id: &str) -> SessionId {
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Register {
+            session: Box::new(create_test_session(id)),
+            respond_to,
+        });
+        SessionId::new(id)
+    }
+
+    fn apply_with_context(
+        actor: &mut RegistryActor,
+        parent: &SessionId,
+        event: LifecycleEvent,
+        context: LifecycleContext,
+    ) {
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: parent.clone(),
+            event,
+            harness: atm_core::Harness::ClaudeCode,
+            pid: None,
+            tmux_pane: None,
+            context,
+            respond_to,
+        });
+    }
+
+    fn session_view(actor: &RegistryActor, id: &str) -> Option<SessionView> {
+        actor.handle_get_session(&SessionId::new(id))
+    }
+
+    fn start_child(actor: &mut RegistryActor, parent: &SessionId, id: &str) {
+        apply_with_context(
+            actor,
+            parent,
+            LifecycleEvent::ChildSessionStart {
+                id: Some(id.into()),
+                role: Some("general-purpose".into()),
+            },
+            LifecycleContext::default(),
+        );
+    }
+
+    fn needs_input_from(actor: &mut RegistryActor, parent: &SessionId, context: LifecycleContext) {
+        apply_with_context(
+            actor,
+            parent,
+            LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
+            },
+            context,
+        );
+    }
+
+    #[test]
+    fn in_process_child_lifecycle_and_event_routing() {
+        let (_, mut actor, _) = create_actor();
+        let parent = register_test_session(&mut actor, "lead");
+        if let Some((session, _)) = actor.sessions_by_pid.values_mut().next() {
+            session.tmux_pane = Some("%7".into());
+            session.project_root = Some("/repo".into());
+        }
+
+        start_child(&mut actor, &parent, "agent-1");
+        let child = session_view(&actor, "agent-1").expect("child created");
+        assert_eq!(child.parent_session_id, Some(parent.clone()));
+        assert_eq!(child.tmux_pane.as_deref(), Some("%7"));
+        assert_eq!(child.project_root.as_deref(), Some("/repo"));
+
+        let child_context = LifecycleContext {
+            child: Some(ChildAgent {
+                reference: ChildRef::Id("agent-1".into()),
+                agent_type: AgentType::Subagent,
+            }),
+            ..LifecycleContext::default()
+        };
+        needs_input_from(&mut actor, &parent, child_context.clone());
+        assert_eq!(
+            session_view(&actor, "agent-1").map(|view| view.status),
+            Some(atm_core::SessionStatus::AttentionNeeded)
+        );
+        assert_eq!(
+            session_view(&actor, "lead").map(|view| view.status),
+            Some(atm_core::SessionStatus::Working)
+        );
+
+        apply_with_context(
+            &mut actor,
+            &parent,
+            LifecycleEvent::SessionEnd { reason: None },
+            child_context,
+        );
+        assert!(session_view(&actor, "lead").is_some());
+
+        apply_with_context(
+            &mut actor,
+            &parent,
+            LifecycleEvent::ChildSessionEnd {
+                id: Some("agent-1".into()),
+            },
+            LifecycleContext::default(),
+        );
+        assert!(session_view(&actor, "agent-1").is_none());
+        assert!(session_view(&actor, "lead").is_some_and(|view| view.child_session_ids.is_empty()));
+    }
+
+    #[test]
+    fn teammate_alias_handles_both_arrival_orders_and_is_parent_scoped() {
+        let (_, mut actor, _) = create_actor();
+        let first = register_test_session(&mut actor, "lead-a");
+        let second = register_test_session(&mut actor, "lead-b");
+        let alias = |agent_id: &str| LifecycleContext {
+            child_alias: Some(ChildAlias {
+                name: "reviewer".into(),
+                id: agent_id.into(),
+            }),
+            ..LifecycleContext::default()
+        };
+        let by_name = || LifecycleContext {
+            child: Some(ChildAgent {
+                reference: ChildRef::Name("reviewer".into()),
+                agent_type: AgentType::Teammate,
+            }),
+            ..LifecycleContext::default()
+        };
+
+        // Alias before the child starts.
+        apply_with_context(
+            &mut actor,
+            &first,
+            LifecycleEvent::WorkingStart,
+            alias("agent-a"),
+        );
+        start_child(&mut actor, &first, "agent-a");
+
+        // Name-only event before the alias: placeholder is upgraded away.
+        apply_with_context(&mut actor, &second, LifecycleEvent::Idle, by_name());
+        assert!(session_view(&actor, "reviewer@lead-b").is_some());
+        apply_with_context(
+            &mut actor,
+            &second,
+            LifecycleEvent::WorkingStart,
+            alias("agent-b"),
+        );
+        start_child(&mut actor, &second, "agent-b");
+        assert!(session_view(&actor, "reviewer@lead-b").is_none());
+
+        for (parent, expected) in [(&first, "agent-a"), (&second, "agent-b")] {
+            needs_input_from(&mut actor, parent, by_name());
+            assert_eq!(
+                session_view(&actor, expected).map(|view| view.status),
+                Some(atm_core::SessionStatus::AttentionNeeded)
+            );
+        }
+        assert_eq!(actor.session_count(), 4);
+    }
+
+    #[test]
+    fn parent_cleanup_cascades_to_children() {
+        let (_, mut actor, _) = create_actor();
+        let parent = register_test_session(&mut actor, "lead");
+        start_child(&mut actor, &parent, "synthetic");
+
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Remove {
+            session_id: parent,
+            respond_to,
+        });
+        assert!(session_view(&actor, "synthetic").is_none());
+    }
+
+    #[test]
+    fn quiet_stop_sweeps_children_but_busy_stop_keeps_them() {
+        let (_, mut actor, _) = create_actor();
+        let parent = register_test_session(&mut actor, "lead");
+        start_child(&mut actor, &parent, "agent-1");
+        let stop = |running, scheduled| LifecycleContext {
+            background_activity: Some(BackgroundActivity { running, scheduled }),
+            ..LifecycleContext::default()
+        };
+
+        apply_with_context(&mut actor, &parent, LifecycleEvent::WorkingEnd, stop(2, 1));
+        assert!(session_view(&actor, "agent-1").is_some());
+        assert_eq!(
+            session_view(&actor, "lead").and_then(|view| view.activity_detail),
+            Some("2 bg tasks, 1 scheduled".into())
+        );
+
+        apply_with_context(&mut actor, &parent, LifecycleEvent::WorkingEnd, stop(0, 0));
+        assert!(session_view(&actor, "agent-1").is_none());
     }
 }

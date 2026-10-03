@@ -202,6 +202,8 @@ name = "atm-tui"
 version = "0.2.4"
 dependencies = [
  "anyhow",
+ "atm-claude-adapter",
+ "atm-codex-adapter",
  "atm-core",
  "atm-protocol",
  "atm-tmux",

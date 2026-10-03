@@ -1579,8 +1579,8 @@ where
              S=$((W * {pct} / 100))\n\
              [ $S -lt {min} ] && S={min}\n\
              [ $S -gt {max} ] && S={max}\n\
-             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{pane_title}}'); do\n\
-               case $p in *:atm-sidebar) {tmux} resize-pane -t \"${{p%%:*}}\" -x \"$S\";; esac\n\
+             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{@atm-sidebar}}'); do\n\
+               case $p in *:1) {tmux} resize-pane -t \"${{p%%:*}}\" -x \"$S\";; esac\n\
              done\n",
             tmux = tmux_prefix,
             pct = SIDEBAR_PCT,
@@ -1641,7 +1641,7 @@ where
         ],
     )
     .await?;
-    // Tag with both a pane title (for resize script) and a user option (for reliable detection).
+    // Tag with both a pane title (cosmetic) and a user option (for reliable detection).
     // Pane titles can be overwritten by the shell if ATM crashes; @atm-sidebar persists.
     tmux_run(
         client,

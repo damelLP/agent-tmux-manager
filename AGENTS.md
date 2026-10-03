@@ -148,7 +148,7 @@ them with `/hooks`.
 
 | Rule | Enforced by |
 |---|---|
-| No force push, no local `cargo publish` | deny rules (Claude + Codex) |
+| No force push, no `--no-verify`, no local `cargo publish` | deny rules (Claude + Codex) |
 | Formatting | `cargo fmt --check` — pre-commit, CI |
 | Lints, warnings | `clippy -D warnings` — pre-push, CI |
 | Tests pass | `cargo test --workspace` — pre-push, CI |

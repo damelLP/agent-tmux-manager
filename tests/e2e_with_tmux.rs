@@ -883,6 +883,59 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         "resize script should restore the sidebar width even after its pane title changed"
     );
 
+    // Regression: prefix-a must focus the sidebar even after a layout
+    // change moves it away from pane index 0.
+    let other_pane = initial_panes
+        .iter()
+        .find(|p| !p.is_sidebar)
+        .map(|p| p.pane_id.clone())
+        .expect("non-sidebar pane present");
+    tmux_run_capture(
+        create_tmux.label(),
+        &["swap-pane", "-s", &sidebar_pane, "-t", &other_pane],
+    )
+    .expect("swap sidebar out of index 0");
+    tmux_run_capture(create_tmux.label(), &["select-pane", "-t", &other_pane])
+        .expect("focus non-sidebar pane");
+    // tmux 3.7 `list-keys` ignores a key filter, so find the binding line
+    // and run its command via source-file (as a keypress would).
+    let prefix_keys =
+        tmux_run_capture(create_tmux.label(), &["list-keys", "-T", "prefix"]).expect("list keys");
+    let prefix_a_cmd = prefix_keys
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            (parts.next() == Some("bind-key")
+                && parts.next() == Some("-T")
+                && parts.next() == Some("prefix")
+                && parts.next() == Some("a"))
+            .then(|| parts.collect::<Vec<_>>().join(" "))
+        })
+        .expect("prefix-a binding installed");
+    let prefix_a_file = create_data_dir.path().join("prefix-a.conf");
+    std::fs::write(&prefix_a_file, &prefix_a_cmd).expect("write prefix-a command");
+    tmux_run_capture(
+        create_tmux.label(),
+        &["source-file", &prefix_a_file.display().to_string()],
+    )
+    .expect("run prefix-a command");
+    let active_pane = tmux_run_capture(
+        create_tmux.label(),
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &create_session_name,
+            "#{pane_id}",
+        ],
+    )
+    .expect("read active pane");
+    assert_eq!(
+        active_pane.trim(),
+        sidebar_pane,
+        "prefix-a ({prefix_a_cmd}) should focus the sidebar after it left index 0"
+    );
+
     let mut cmd = Command::new("tmux");
     cmd.args([
         "-L",

@@ -10,6 +10,8 @@
 //!     INSTA_UPDATE=always cargo test -p atm-tui --test ui_snapshots
 //! Then visually inspect the diff (`cargo insta review`) before committing.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
+
 use std::sync::Mutex;
 
 use atm_core::{SessionId, SessionStatus, SessionView};

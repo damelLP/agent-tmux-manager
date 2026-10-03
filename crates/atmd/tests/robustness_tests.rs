@@ -9,6 +9,8 @@
 //!
 //! Per CLAUDE.md: Tests CAN use `.unwrap()` and `.expect()` - this is allowed.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
+
 use std::path::PathBuf;
 use std::time::Duration;
 

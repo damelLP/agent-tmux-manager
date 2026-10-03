@@ -23,6 +23,9 @@ members = [
     "crates/atm",
 ]
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "atm"
 path = "src/bin/atm.rs"
@@ -36,6 +39,11 @@ path = "src/bin/atmd.rs"
 pkg-url = "{ repo }/releases/download/v{ version }/atm-{ target }.tar.gz"
 bin-dir = "atm-{ version }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
+
+[workspace.lints.clippy]
+# Production code must not panic (AGENTS.md principle 4); tests may (clippy.toml).
+unwrap_used = "warn"
+expect_used = "warn"
 
 [workspace.package]
 version = "0.2.4"

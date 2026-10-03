@@ -11,6 +11,8 @@
 //! cargo run -p atm-pi-adapter --example parity_demo
 //! ```
 
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
+
 use atm_claude_adapter::RawHookEvent;
 use atm_core::{AgentType, Model, SessionDomain, SessionId};
 use atm_pi_adapter::RawPiEvent;

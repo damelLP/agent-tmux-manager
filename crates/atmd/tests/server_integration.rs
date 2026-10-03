@@ -6,6 +6,8 @@
 //! Per CLAUDE.md: Tests CAN use `.unwrap()` and `.expect()` - this is allowed.
 //! We test the panic-free behavior of production code through assertions.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
+
 use std::path::PathBuf;
 use std::time::Duration;
 

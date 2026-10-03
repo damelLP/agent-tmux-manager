@@ -13,3 +13,6 @@ description = "Claude Code adapter for ATM — translates Claude raw hook events
 atm-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

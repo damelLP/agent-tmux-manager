@@ -21,3 +21,6 @@ procfs = "0.17"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

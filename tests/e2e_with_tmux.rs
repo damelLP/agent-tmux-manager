@@ -811,6 +811,10 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         "after-resize-window hook should be installed after create; got: {installed_hooks}"
     );
     assert!(
+        installed_hooks.contains("after-resize-pane"),
+        "after-resize-pane hook should be installed after create; got: {installed_hooks}"
+    );
+    assert!(
         installed_hooks.contains("after-new-window"),
         "after-new-window hook should be installed after create; got: {installed_hooks}"
     );
@@ -882,6 +886,70 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         expected_width.to_string(),
         "resize script should restore the sidebar width even after its pane title changed"
     );
+
+    // Regression: Claude Code agent teams (tmux mode, verified against
+    // 2.1.288 `createTeammatePaneWithLeader`/`rebalancePanesWithLeader`)
+    // treat the first listed pane (our sidebar) as the leader: they split a
+    // later pane, apply `main-vertical`, then resize the first pane to 30%.
+    // The after-resize-pane hook must put the sidebar back.
+    let window_target = format!("{create_session_name}:0");
+    for _teammate in 0..2 {
+        let window_panes = tmux_run_capture(
+            create_tmux.label(),
+            &["list-panes", "-t", &window_target, "-F", "#{pane_id}"],
+        )
+        .expect("list window panes");
+        let others: Vec<&str> = window_panes.lines().skip(1).collect();
+        let split_target = others[(others.len() - 1) / 2];
+        let split_dir = if others.len() % 2 == 1 { "-v" } else { "-h" };
+        tmux_run_capture(
+            create_tmux.label(),
+            &["split-window", "-d", "-t", split_target, split_dir],
+        )
+        .expect("split teammate pane");
+        tmux_run_capture(
+            create_tmux.label(),
+            &["select-layout", "-t", &window_target, "main-vertical"],
+        )
+        .expect("apply main-vertical");
+        let first_pane = tmux_run_capture(
+            create_tmux.label(),
+            &["list-panes", "-t", &window_target, "-F", "#{pane_id}"],
+        )
+        .expect("list window panes")
+        .lines()
+        .next()
+        .expect("window has a pane")
+        .to_string();
+        tmux_run_capture(
+            create_tmux.label(),
+            &["resize-pane", "-t", &first_pane, "-x", "30%"],
+        )
+        .expect("resize first pane to 30%");
+    }
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    loop {
+        let width = tmux_run_capture(
+            create_tmux.label(),
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &sidebar_pane,
+                "#{pane_width}",
+            ],
+        )
+        .expect("read sidebar width after teammate spawn");
+        if width.trim() == expected_width.to_string() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after-resize-pane hook should restore sidebar width {expected_width} after Claude's rebalance; got {}",
+            width.trim()
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
 
     // Regression: prefix-a must focus the sidebar even after a layout
     // change moves it away from pane index 0.

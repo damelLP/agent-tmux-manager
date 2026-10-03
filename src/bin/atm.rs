@@ -1579,8 +1579,8 @@ where
              S=$((W * {pct} / 100))\n\
              [ $S -lt {min} ] && S={min}\n\
              [ $S -gt {max} ] && S={max}\n\
-             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{@atm-sidebar}}'); do\n\
-               case $p in *:1) {tmux} resize-pane -t \"${{p%%:*}}\" -x \"$S\";; esac\n\
+             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{@atm-sidebar}}:#{{pane_width}}'); do\n\
+               case $p in *:1:$S) ;; *:1:*) {tmux} resize-pane -t \"${{p%%:*}}\" -x \"$S\";; esac\n\
              done\n",
             tmux = tmux_prefix,
             pct = SIDEBAR_PCT,
@@ -1594,17 +1594,12 @@ where
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
     let hook_cmd = format!("run-shell '{}'", script_path.display());
-    tmux_run(
-        client,
-        &[
-            "set-hook",
-            "-t",
-            session_name,
-            "after-resize-window",
-            &hook_cmd,
-        ],
-    )
-    .await?;
+    // after-resize-pane undoes Claude Code teammate rebalances, which resize
+    // the first pane (our sidebar) to 30%. The script skips sidebars already
+    // at width, so its own resize-pane doesn't re-trigger it forever.
+    for hook in ["after-resize-window", "after-resize-pane"] {
+        tmux_run(client, &["set-hook", "-t", session_name, hook, &hook_cmd]).await?;
+    }
     // NOTE: bind-key is global; the last workspace created wins for prefix-R.
     tmux_run(client, &["bind-key", "-T", "prefix", "R", &hook_cmd]).await?;
     // Focus the window's `@atm-sidebar` pane; pane indexes shift with layout changes.

@@ -811,6 +811,10 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         "after-resize-window hook should be installed after create; got: {installed_hooks}"
     );
     assert!(
+        installed_hooks.contains("after-resize-pane"),
+        "after-resize-pane hook should be installed after create; got: {installed_hooks}"
+    );
+    assert!(
         installed_hooks.contains("after-new-window"),
         "after-new-window hook should be installed after create; got: {installed_hooks}"
     );
@@ -882,6 +886,145 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         expected_width.to_string(),
         "resize script should restore the sidebar width even after its pane title changed"
     );
+
+    // Regression: Claude Code agent teams (tmux mode, verified against
+    // 2.1.288 `createTeammatePaneWithLeader`/`rebalancePanesWithLeader`)
+    // treat the first listed pane (our sidebar) as the leader: they split a
+    // later pane, apply `main-vertical`, then resize the first pane to 30%.
+    // The after-resize-pane hook must put the sidebar back.
+    let window_target = format!("{create_session_name}:0");
+    for _teammate in 0..2 {
+        let window_panes = tmux_run_capture(
+            create_tmux.label(),
+            &["list-panes", "-t", &window_target, "-F", "#{pane_id}"],
+        )
+        .expect("list window panes");
+        let others: Vec<&str> = window_panes.lines().skip(1).collect();
+        let split_target = others[(others.len() - 1) / 2];
+        let split_dir = if others.len() % 2 == 1 { "-v" } else { "-h" };
+        tmux_run_capture(
+            create_tmux.label(),
+            &["split-window", "-d", "-t", split_target, split_dir],
+        )
+        .expect("split teammate pane");
+        tmux_run_capture(
+            create_tmux.label(),
+            &["select-layout", "-t", &window_target, "main-vertical"],
+        )
+        .expect("apply main-vertical");
+        let first_pane = tmux_run_capture(
+            create_tmux.label(),
+            &["list-panes", "-t", &window_target, "-F", "#{pane_id}"],
+        )
+        .expect("list window panes")
+        .lines()
+        .next()
+        .expect("window has a pane")
+        .to_string();
+        tmux_run_capture(
+            create_tmux.label(),
+            &["resize-pane", "-t", &first_pane, "-x", "30%"],
+        )
+        .expect("resize first pane to 30%");
+    }
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    loop {
+        let width = tmux_run_capture(
+            create_tmux.label(),
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &sidebar_pane,
+                "#{pane_width}",
+            ],
+        )
+        .expect("read sidebar width after teammate spawn");
+        if width.trim() == expected_width.to_string() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after-resize-pane hook should restore sidebar width {expected_width} after Claude's rebalance; got {}",
+            width.trim()
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+
+    // Below-target widths are restored too when attainable: in windows under
+    // ~67 cols Claude's 30% is narrower than the 20-col minimum target.
+    let read_sidebar = |format: &str| {
+        tmux_run_capture(
+            create_tmux.label(),
+            &["display-message", "-p", "-t", &sidebar_pane, format],
+        )
+        .expect("read sidebar format")
+        .trim()
+        .to_string()
+    };
+    let narrow_width = (expected_width - 5).to_string();
+    tmux_run_capture(
+        create_tmux.label(),
+        &["resize-pane", "-t", &sidebar_pane, "-x", &narrow_width],
+    )
+    .expect("narrow sidebar below target");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    while read_sidebar("#{pane_width}") != expected_width.to_string() {
+        assert!(
+            Instant::now() < deadline,
+            "after-resize-pane hook should restore a below-target sidebar to {expected_width}; got {}",
+            read_sidebar("#{pane_width}")
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+
+    // A window too narrow for the target width: the hook's own resize-pane
+    // re-fires it, so it must give up after its retry cap instead of looping.
+    tmux_run_capture(
+        create_tmux.label(),
+        &["resize-window", "-t", &create_session_name, "-x", "15"],
+    )
+    .expect("shrink window below sidebar minimum");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    while read_sidebar("#{@atm-sidebar-tries}")
+        .parse::<u32>()
+        .unwrap_or(0)
+        < 5
+    {
+        assert!(
+            Instant::now() < deadline,
+            "hook should reach its retry cap in a too-small window; tries={}",
+            read_sidebar("#{@atm-sidebar-tries}")
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        read_sidebar("#{@atm-sidebar-tries}"),
+        "5",
+        "hook should stop retrying at the cap, not keep re-firing itself"
+    );
+    let full_width = window_width.to_string();
+    tmux_run_capture(
+        create_tmux.label(),
+        &[
+            "resize-window",
+            "-t",
+            &create_session_name,
+            "-x",
+            &full_width,
+        ],
+    )
+    .expect("restore window width");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    while read_sidebar("#{pane_width}:#{@atm-sidebar-tries}") != format!("{expected_width}:") {
+        assert!(
+            Instant::now() < deadline,
+            "sidebar should recover (width:tries) after the window grows; got {}",
+            read_sidebar("#{pane_width}:#{@atm-sidebar-tries}")
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
 
     // Regression: prefix-a must focus the sidebar even after a layout
     // change moves it away from pane index 0.

@@ -951,6 +951,37 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         tokio::time::sleep(SESSION_POLL_INTERVAL).await;
     }
 
+    // Shrink mode (after-resize-pane) must leave a narrower sidebar alone:
+    // that no-op is what ends the hook's self-retriggering when a tiny
+    // window can't fit the target width. Plain run-shell waits for the script.
+    let narrow_width = (expected_width - 5).to_string();
+    tmux_run_capture(
+        create_tmux.label(),
+        &["resize-pane", "-t", &sidebar_pane, "-x", &narrow_width],
+    )
+    .expect("narrow sidebar below target");
+    tmux_run_capture(
+        create_tmux.label(),
+        &["run-shell", &format!("{} shrink", resize_script.display())],
+    )
+    .expect("run resize script in shrink mode");
+    let shrink_width = tmux_run_capture(
+        create_tmux.label(),
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &sidebar_pane,
+            "#{pane_width}",
+        ],
+    )
+    .expect("read sidebar width after shrink-mode run");
+    assert_eq!(
+        shrink_width.trim(),
+        narrow_width,
+        "shrink mode should not widen a sidebar narrower than the target"
+    );
+
     // Regression: prefix-a must focus the sidebar even after a layout
     // change moves it away from pane index 0.
     let other_pane = initial_panes

@@ -11,11 +11,10 @@
 //! cargo run -p atm-pi-adapter --example parity_demo
 //! ```
 
-#![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
-
 use atm_claude_adapter::RawHookEvent;
 use atm_core::{AgentType, Model, SessionDomain, SessionId};
 use atm_pi_adapter::RawPiEvent;
+use std::error::Error;
 
 fn fresh_session() -> SessionDomain {
     SessionDomain::new(
@@ -25,7 +24,7 @@ fn fresh_session() -> SessionDomain {
     )
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     println!("=== Parity demo: same op, two vendors ===\n");
     println!("For each case we feed equivalent wire payloads into the two");
     println!("adapters' `to_lifecycle_event()` translators, and also apply the");
@@ -48,7 +47,7 @@ fn main() {
             "input": {"command": "ls /tmp"}
         }
     }"#;
-    show_pair("Case 1: Tool call start (Bash)", claude_json, pi_json);
+    show_pair("Case 1: Tool call start (Bash)", claude_json, pi_json)?;
 
     // ---- CASE 2: session-end with reason ----
     let claude_json = r#"{
@@ -60,7 +59,7 @@ fn main() {
         "event": "session_shutdown",
         "payload": {"type": "session_shutdown", "reason": "clear"}
     }"#;
-    show_pair("Case 2: Session end with reason", claude_json, pi_json);
+    show_pair("Case 2: Session end with reason", claude_json, pi_json)?;
 
     // ---- CASE 3: needs-input (the vendor-asymmetric one) ----
     // Claude: explicit Notification(permission_prompt)
@@ -83,7 +82,7 @@ fn main() {
         "Case 3: Needs-input (different paths, same state)",
         claude_json,
         pi_json,
-    );
+    )?;
 
     // ---- CASE 4: provider/model change (pi-only event) ----
     println!("──────────────────────────────────────────────────────────────────");
@@ -96,20 +95,25 @@ fn main() {
             "model": "gpt-5.5"
         }
     }"#;
-    let pi: RawPiEvent = serde_json::from_str(pi_json).unwrap();
+    let pi: RawPiEvent = serde_json::from_str(pi_json)?;
     println!("  pi    : {pi_json}");
     println!("    →   {:?}", pi.to_lifecycle_event());
     println!("  claude: (no equivalent — pi is provider-agnostic by design)");
     println!();
+    Ok(())
 }
 
-fn show_pair(label: &str, claude_json: &str, pi_json: &str) {
+fn show_pair(label: &str, claude_json: &str, pi_json: &str) -> Result<(), Box<dyn Error>> {
     println!("──────────────────────────────────────────────────────────────────");
     println!("{label}");
-    let claude: RawHookEvent = serde_json::from_str(claude_json).unwrap();
-    let pi: RawPiEvent = serde_json::from_str(pi_json).unwrap();
-    let claude_le = claude.to_lifecycle_event().expect("claude translates");
-    let pi_le = pi.to_lifecycle_event().expect("pi translates");
+    let claude: RawHookEvent = serde_json::from_str(claude_json)?;
+    let pi: RawPiEvent = serde_json::from_str(pi_json)?;
+    let claude_le = claude
+        .to_lifecycle_event()
+        .ok_or("claude event did not translate")?;
+    let pi_le = pi
+        .to_lifecycle_event()
+        .ok_or("pi event did not translate")?;
 
     println!("  claude → {claude_le:?}");
     println!("  pi     → {pi_le:?}");
@@ -152,4 +156,5 @@ fn show_pair(label: &str, claude_json: &str, pi_json: &str) {
         println!("  ≠ downstream state differs");
     }
     println!();
+    Ok(())
 }

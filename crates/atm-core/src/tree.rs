@@ -182,15 +182,19 @@ pub fn build_tree(sessions: &[SessionView]) -> Vec<TreeNode> {
         return Vec::new();
     }
 
-    // Separate parent-level sessions from subagents
+    let by_id: BTreeMap<&str, &SessionView> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+
+    // Separate parent-level sessions from subagents. A child whose parent
+    // isn't in the list stays top-level rather than being hidden.
     let child_ids: HashSet<&SessionId> = sessions
         .iter()
-        .filter(|s| s.parent_session_id.is_some())
+        .filter(|s| {
+            s.parent_session_id
+                .as_ref()
+                .is_some_and(|p| by_id.contains_key(p.as_str()))
+        })
         .map(|s| &s.id)
         .collect();
-
-    // Index sessions by ID for subagent lookup
-    let by_id: BTreeMap<&str, &SessionView> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
 
     // Group top-level sessions by project_root
     // BTreeMap for deterministic alphabetical ordering
@@ -219,10 +223,9 @@ pub fn build_tree(sessions: &[SessionView]) -> Vec<TreeNode> {
 
         // Build agent nodes (with subagent nesting)
         let make_agent_node = |session: &SessionView| -> TreeNode {
-            let subagents: Vec<TreeNode> = session
-                .child_session_ids
+            let subagents: Vec<TreeNode> = sessions
                 .iter()
-                .filter_map(|child_id| by_id.get(child_id.as_str()))
+                .filter(|child| child.parent_session_id.as_ref() == Some(&session.id))
                 .map(|child| TreeNode::Agent {
                     session: (*child).clone(),
                     subagents: Vec::new(), // No recursive subagent nesting for now
@@ -615,6 +618,67 @@ mod tests {
                             _ => panic!("expected Agent subagent"),
                         }
                     }
+                    _ => panic!("expected Agent"),
+                }
+            }
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn test_orphaned_child_is_top_level() {
+        let mut child = make_session_in_project(
+            "child-1",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:01Z",
+        );
+        child.parent_session_id = Some(SessionId::new("missing-parent"));
+
+        let tree = build_tree(&[child]);
+
+        assert_eq!(tree.len(), 1);
+        match &tree[0] {
+            TreeNode::Project { children, .. } => {
+                assert_eq!(children.len(), 1, "orphan should be shown, not hidden");
+                match &children[0] {
+                    TreeNode::Agent { session, .. } => {
+                        assert_eq!(session.id.as_str(), "child-1");
+                    }
+                    _ => panic!("expected Agent"),
+                }
+            }
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn test_child_nested_by_own_parent_id() {
+        // Parent doesn't list the child (e.g. a separate teammate process).
+        let parent = make_session_in_project(
+            "parent-1",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:00Z",
+        );
+        let mut child = make_session_in_project(
+            "child-1",
+            "/home/user/myapp",
+            "/home/user/myapp",
+            "main",
+            "2026-01-01T00:00:01Z",
+        );
+        child.parent_session_id = Some(SessionId::new("parent-1"));
+
+        let tree = build_tree(&[parent, child]);
+
+        match &tree[0] {
+            TreeNode::Project { children, .. } => {
+                assert_eq!(children.len(), 1, "child should be nested, not top-level");
+                match &children[0] {
+                    TreeNode::Agent { subagents, .. } => assert_eq!(subagents.len(), 1),
                     _ => panic!("expected Agent"),
                 }
             }

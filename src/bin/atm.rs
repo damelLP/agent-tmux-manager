@@ -1607,9 +1607,18 @@ where
     .await?;
     // NOTE: bind-key is global; the last workspace created wins for prefix-R.
     tmux_run(client, &["bind-key", "-T", "prefix", "R", &hook_cmd]).await?;
+    // Focus the window's `@atm-sidebar` pane; pane indexes shift with layout changes.
     tmux_run(
         client,
-        &["bind-key", "-T", "prefix", "a", "select-pane", "-t", "0"],
+        &[
+            "bind-key",
+            "-T",
+            "prefix",
+            "a",
+            "run-shell",
+            "-C",
+            "select-pane -t '#{P:#{?#{@atm-sidebar},#{pane_id},}}'",
+        ],
     )
     .await?;
     Ok(())

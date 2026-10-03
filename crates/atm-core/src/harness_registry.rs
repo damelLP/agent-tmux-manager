@@ -41,6 +41,31 @@ impl ProcessMatcher {
     }
 }
 
+/// A [`ProcessMatcher`] bound to one argv position, used to exclude
+/// processes that match a harness but are not sessions.
+///
+/// Only the command (argv0) and subcommand (argv1) can be targeted, so
+/// positional data such as a prompt is never compared against an
+/// executable-name exclude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgvExclude {
+    /// Matches argv0, the executable.
+    Command(ProcessMatcher),
+    /// Matches argv1, the subcommand.
+    Subcommand(ProcessMatcher),
+}
+
+impl ArgvExclude {
+    /// Returns true if `arg`, found at `argv_index`, satisfies this exclude.
+    #[must_use]
+    pub fn matches(&self, argv_index: usize, arg: &str) -> bool {
+        match self {
+            Self::Command(matcher) => argv_index == 0 && matcher.matches(arg),
+            Self::Subcommand(matcher) => argv_index == 1 && matcher.matches(arg),
+        }
+    }
+}
+
 /// Metadata for a CLI coding-agent harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HarnessDefinition {
@@ -64,13 +89,13 @@ pub struct HarnessDefinition {
     pub version_args: &'static [&'static str],
     /// Process path/argv matchers used by discovery.
     pub process_matchers: &'static [ProcessMatcher],
-    /// Matchers for processes that satisfy `process_matchers` but are not
+    /// Excludes for processes that satisfy `process_matchers` but are not
     /// agent sessions (e.g. a harness's background daemon).
     ///
-    /// Tested against argv0 and argv1 only (the command and its
-    /// subcommand), so positional data such as a prompt never excludes a
-    /// real session. Any match vetoes discovery for this harness.
-    pub process_excludes: &'static [ProcessMatcher],
+    /// Each exclude targets argv0 or argv1 (see [`ArgvExclude`]), so
+    /// positional data such as a prompt never excludes a real session.
+    /// Any match vetoes discovery for this harness.
+    pub process_excludes: &'static [ArgvExclude],
     /// Whether this harness should be detected by daemon `/proc` discovery.
     ///
     /// Keep this false until a harness has an adapter/status source, otherwise
@@ -111,12 +136,12 @@ const CODEX_MATCHERS: &[ProcessMatcher] = &[
 /// may be reparented to init). Sandboxed tool commands run as
 /// `.../codex-linux-sandbox` -> `bwrap ... <release>/bin/codex ...` ->
 /// `codex-linux-sandbox` (comm `codex`); `bwrap` matches via that path
-/// argument. Interactive TUIs and `codex exec` have none of these as
-/// argv0/argv1, so they are still discovered.
-const CODEX_EXCLUDES: &[ProcessMatcher] = &[
-    ProcessMatcher::Exact("app-server"),
-    ProcessMatcher::Suffix("codex-linux-sandbox"),
-    ProcessMatcher::Exact("bwrap"),
+/// argument. Executable excludes bind to argv0 and `app-server` to argv1,
+/// so an initial prompt (`codex [PROMPT]`) never hides a TUI.
+const CODEX_EXCLUDES: &[ArgvExclude] = &[
+    ArgvExclude::Subcommand(ProcessMatcher::Exact("app-server")),
+    ArgvExclude::Command(ProcessMatcher::Suffix("codex-linux-sandbox")),
+    ArgvExclude::Command(ProcessMatcher::Exact("bwrap")),
 ];
 
 const AMP_MATCHERS: &[ProcessMatcher] =
@@ -328,14 +353,35 @@ mod tests {
     #[test]
     fn codex_excludes_cover_app_server_daemon() {
         let codex = find_harness_definition("codex").unwrap_or(default_harness_definition());
-        let excluded = |arg: &str| codex.process_excludes.iter().any(|m| m.matches(arg));
-        assert!(excluded("app-server"));
-        assert!(excluded("codex-linux-sandbox"));
-        assert!(excluded("bwrap"));
-        assert!(!excluded("exec"));
-        assert!(!excluded("resume"));
+        let excluded = |index: usize, arg: &str| {
+            codex
+                .process_excludes
+                .iter()
+                .any(|exclude| exclude.matches(index, arg))
+        };
+        assert!(excluded(1, "app-server"));
+        assert!(excluded(0, "codex-linux-sandbox"));
+        assert!(excluded(0, "bwrap"));
+        assert!(!excluded(1, "exec"));
+        assert!(!excluded(1, "resume"));
         assert!(!excluded(
+            0,
             "/home/u/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex"
         ));
+        // `codex [PROMPT]`: a prompt in argv1 never hits an executable exclude.
+        assert!(!excluded(1, "bwrap"));
+        assert!(!excluded(1, "Explain codex-linux-sandbox"));
+    }
+
+    #[test]
+    fn argv_exclude_matches_only_its_position() {
+        let command = ArgvExclude::Command(ProcessMatcher::Exact("bwrap"));
+        assert!(command.matches(0, "bwrap"));
+        assert!(!command.matches(1, "bwrap"));
+
+        let subcommand = ArgvExclude::Subcommand(ProcessMatcher::Exact("app-server"));
+        assert!(subcommand.matches(1, "app-server"));
+        assert!(!subcommand.matches(0, "app-server"));
+        assert!(!subcommand.matches(2, "app-server"));
     }
 }

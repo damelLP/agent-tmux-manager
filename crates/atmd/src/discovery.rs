@@ -521,20 +521,21 @@ fn is_excluded_process(pid: u32, definition: &'static HarnessDefinition) -> bool
 }
 
 /// True if argv0 or argv1 of a NUL-separated `/proc/{pid}/cmdline`
-/// satisfies one of the definition's `process_excludes`. Later arguments
-/// are ignored so positional data (e.g. a prompt) can never hide a real
-/// session. The positional limit is applied before UTF-8 decoding so a
-/// non-UTF-8 argument cannot shift argv2 into the checked window.
+/// satisfies one of the definition's `process_excludes` at that position.
+/// Later arguments are ignored so positional data (e.g. a prompt) can
+/// never hide a real session. Positions are assigned before UTF-8
+/// decoding so a non-UTF-8 argument cannot shift another into its slot.
 fn cmdline_is_excluded(cmdline: &[u8], definition: &HarnessDefinition) -> bool {
     cmdline
         .split(|&b| b == 0)
         .take(2)
-        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
-        .any(|arg| {
+        .enumerate()
+        .filter_map(|(index, bytes)| std::str::from_utf8(bytes).ok().map(|arg| (index, arg)))
+        .any(|(index, arg)| {
             definition
                 .process_excludes
                 .iter()
-                .any(|matcher| matcher.matches(arg))
+                .any(|exclude| exclude.matches(index, arg))
         })
 }
 
@@ -873,7 +874,10 @@ mod tests {
         let base = atm_core::find_harness_definition("claude")
             .unwrap_or_else(atm_core::default_harness_definition);
         let definition = HarnessDefinition {
-            process_excludes: &[atm_core::ProcessMatcher::Exact("daemon")],
+            process_excludes: &[
+                atm_core::ArgvExclude::Command(atm_core::ProcessMatcher::Exact("daemon")),
+                atm_core::ArgvExclude::Subcommand(atm_core::ProcessMatcher::Exact("daemon")),
+            ],
             ..*base
         };
         assert!(cmdline_is_excluded(b"claude\0daemon\0", &definition));
@@ -888,7 +892,10 @@ mod tests {
         let base = atm_core::find_harness_definition("claude")
             .unwrap_or_else(atm_core::default_harness_definition);
         let definition = HarnessDefinition {
-            process_excludes: &[atm_core::ProcessMatcher::Exact("daemon")],
+            process_excludes: &[
+                atm_core::ArgvExclude::Command(atm_core::ProcessMatcher::Exact("daemon")),
+                atm_core::ArgvExclude::Subcommand(atm_core::ProcessMatcher::Exact("daemon")),
+            ],
             ..*base
         };
         // argv1 is invalid UTF-8; the prompt "daemon" in argv2 must stay
@@ -982,6 +989,10 @@ mod tests {
             vec![CODEX_NATIVE_BIN, "resume"],
             vec!["codex", "exec", "fix the app-server tests"],
             vec!["codex", "exec", "app-server"],
+            // `codex [PROMPT]`: an initial prompt sits in argv1.
+            vec!["codex", "bwrap"],
+            vec!["codex", "Explain codex-linux-sandbox"],
+            vec![CODEX_NATIVE_BIN, "codex-linux-sandbox"],
         ] {
             assert!(codex_cmdline_discovered(&argv), "{argv:?}");
         }
@@ -997,6 +1008,32 @@ mod tests {
             codex
         ));
         assert!(!codex_cmdline_discovered(&[CODEX_CODE_MODE_HOST]));
+    }
+
+    #[test]
+    fn argv_excludes_only_apply_at_their_position() {
+        let base = atm_core::find_harness_definition("claude")
+            .unwrap_or_else(atm_core::default_harness_definition);
+        let command_only = HarnessDefinition {
+            process_excludes: &[atm_core::ArgvExclude::Command(
+                atm_core::ProcessMatcher::Exact("sandbox"),
+            )],
+            ..*base
+        };
+        assert!(cmdline_is_excluded(b"sandbox\0--flag\0", &command_only));
+        // An initial prompt in argv1 must not hit an executable exclude.
+        assert!(!cmdline_is_excluded(b"claude\0sandbox\0", &command_only));
+
+        let subcommand_only = HarnessDefinition {
+            process_excludes: &[atm_core::ArgvExclude::Subcommand(
+                atm_core::ProcessMatcher::Exact("daemon"),
+            )],
+            ..*base
+        };
+        assert!(cmdline_is_excluded(b"claude\0daemon\0", &subcommand_only));
+        assert!(!cmdline_is_excluded(b"daemon\0", &subcommand_only));
+        // A non-UTF-8 argv0 must not shift argv1 into the command slot.
+        assert!(!cmdline_is_excluded(b"\xff\0sandbox\0", &command_only));
     }
 
     // ========================================================================

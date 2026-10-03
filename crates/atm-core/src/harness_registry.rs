@@ -64,6 +64,13 @@ pub struct HarnessDefinition {
     pub version_args: &'static [&'static str],
     /// Process path/argv matchers used by discovery.
     pub process_matchers: &'static [ProcessMatcher],
+    /// Matchers for processes that satisfy `process_matchers` but are not
+    /// agent sessions (e.g. a harness's background daemon).
+    ///
+    /// Tested against argv0 and argv1 only (the command and its
+    /// subcommand), so positional data such as a prompt never excludes a
+    /// real session. Any match vetoes discovery for this harness.
+    pub process_excludes: &'static [ProcessMatcher],
     /// Whether this harness should be detected by daemon `/proc` discovery.
     ///
     /// Keep this false until a harness has an adapter/status source, otherwise
@@ -126,6 +133,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         process_matchers: CLAUDE_MATCHERS,
         discovery_enabled: true,
         allow_bare_cmdline_match: true,
+        process_excludes: &[],
     },
     HarnessDefinition {
         id: "pi",
@@ -140,6 +148,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         process_matchers: PI_MATCHERS,
         discovery_enabled: true,
         allow_bare_cmdline_match: false,
+        process_excludes: &[],
     },
     HarnessDefinition {
         id: "codex",
@@ -156,6 +165,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         // atm-codex-hook, so discovered codex sessions get live status.
         discovery_enabled: true,
         allow_bare_cmdline_match: true,
+        process_excludes: &[],
     },
     HarnessDefinition {
         id: "amp",
@@ -170,6 +180,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         process_matchers: AMP_MATCHERS,
         discovery_enabled: false,
         allow_bare_cmdline_match: true,
+        process_excludes: &[],
     },
     HarnessDefinition {
         id: "qwen",
@@ -184,6 +195,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         process_matchers: QWEN_MATCHERS,
         discovery_enabled: false,
         allow_bare_cmdline_match: true,
+        process_excludes: &[],
     },
     HarnessDefinition {
         id: "gemini",
@@ -198,6 +210,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         process_matchers: GEMINI_MATCHERS,
         discovery_enabled: false,
         allow_bare_cmdline_match: true,
+        process_excludes: &[],
     },
 ];
 
@@ -230,6 +243,7 @@ const FALLBACK_HARNESS_DEFINITION: HarnessDefinition = HarnessDefinition {
     process_matchers: &[],
     discovery_enabled: false,
     allow_bare_cmdline_match: false,
+    process_excludes: &[],
 };
 
 /// Finds a built-in harness definition by canonical id or alias.

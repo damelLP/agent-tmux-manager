@@ -413,6 +413,10 @@ fn check_harness_process(
     pid: u32,
     definition: &'static HarnessDefinition,
 ) -> Option<DiscoveredProcess> {
+    if !definition.process_excludes.is_empty() && is_excluded_process(pid, definition) {
+        return None;
+    }
+
     if let Some(process) = check_via_exe(pid, definition) {
         return Some(process);
     }
@@ -497,6 +501,39 @@ fn cmdline_arg_matches_definition(
         .process_matchers
         .iter()
         .any(|matcher| matcher.matches(arg))
+}
+
+/// True if `/proc/{pid}/cmdline` hits one of the definition's
+/// `process_excludes` (see [`argv_is_excluded`]).
+fn is_excluded_process(pid: u32, definition: &'static HarnessDefinition) -> bool {
+    let Ok(cmdline_bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv: Vec<&str> = cmdline_bytes
+        .split(|&b| b == 0)
+        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+        .collect();
+    let excluded = argv_is_excluded(&argv, definition);
+    if excluded {
+        debug!(
+            pid,
+            harness = definition.id,
+            "Skipping process excluded by harness definition"
+        );
+    }
+    excluded
+}
+
+/// True if argv0 or argv1 satisfies one of the definition's
+/// `process_excludes`. Later arguments are ignored so positional data
+/// (e.g. a prompt) can never hide a real session.
+fn argv_is_excluded(argv: &[&str], definition: &HarnessDefinition) -> bool {
+    argv.iter().take(2).any(|arg| {
+        definition
+            .process_excludes
+            .iter()
+            .any(|matcher| matcher.matches(arg))
+    })
 }
 
 /// Gets process info (cwd, tmux pane) for a PID.
@@ -827,6 +864,21 @@ mod tests {
             .map(|definition| definition.id)
             .collect();
         assert_eq!(enabled, vec!["claude", "pi", "codex"]);
+    }
+
+    #[test]
+    fn argv_excludes_only_consider_command_and_subcommand() {
+        let base = atm_core::find_harness_definition("claude")
+            .unwrap_or_else(atm_core::default_harness_definition);
+        let definition = HarnessDefinition {
+            process_excludes: &[atm_core::ProcessMatcher::Exact("daemon")],
+            ..*base
+        };
+        assert!(argv_is_excluded(&["claude", "daemon"], &definition));
+        assert!(argv_is_excluded(&["daemon"], &definition));
+        assert!(!argv_is_excluded(&["claude", "-p", "daemon"], &definition));
+        assert!(!argv_is_excluded(&["claude"], &definition));
+        assert!(!argv_is_excluded(&[], &definition));
     }
 
     // ========================================================================

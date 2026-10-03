@@ -22,6 +22,16 @@ prefix_rule(
     justification = "Force pushes rewrite shared history. Use a normal push.",
 )
 prefix_rule(
+    pattern = ["git", "commit", ["--no-verify", "-n"]],
+    decision = "forbidden",
+    justification = "Skipping the git hooks hides failures. Fix what the hook reports.",
+)
+prefix_rule(
+    pattern = ["git", "push", "--no-verify"],
+    decision = "forbidden",
+    justification = "Skipping the git hooks hides failures. Fix what the hook reports.",
+)
+prefix_rule(
     pattern = ["gh", ["repo", "issue"], "delete"],
     decision = "forbidden",
     justification = "Repositories and issues must not be deleted by routine agent work.",

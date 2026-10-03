@@ -1,0 +1,9 @@
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[features]
+hooks = true
+
+[shell_environment_policy.set]
+# The user-level Langfuse forwarder reads this project resource attribute too.
+OTEL_RESOURCE_ATTRIBUTES = "project=agent-tmux-manager"

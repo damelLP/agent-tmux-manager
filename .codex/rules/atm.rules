@@ -1,0 +1,33 @@
+# Match the routine command permissions in .claude/settings.json.
+# These rules allow trusted project commands to run outside the sandbox.
+prefix_rule(
+    pattern = ["cargo", ["fmt", "clippy", "test", "build", "check"]],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = ["git", ["status", "diff", "log", "show", "add", "commit", "switch", "fetch", "pull", "push", "worktree"]],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = ["gh", "issue", ["view", "list"]],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = ["gh", "pr", ["view", "list", "create", "checks", "diff"]],
+    decision = "allow",
+)
+prefix_rule(
+    pattern = ["git", "push", ["--force", "-f", "--force-with-lease"]],
+    decision = "forbidden",
+    justification = "Force pushes rewrite shared history. Use a normal push.",
+)
+prefix_rule(
+    pattern = ["gh", ["repo", "issue"], "delete"],
+    decision = "forbidden",
+    justification = "Repositories and issues must not be deleted by routine agent work.",
+)
+prefix_rule(
+    pattern = ["cargo", "publish"],
+    decision = "forbidden",
+    justification = "Crates are published only by the release workflow, in dependency order.",
+)

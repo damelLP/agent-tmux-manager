@@ -135,6 +135,9 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 
 ### What enforces what
 
+Git hooks live in `.githooks/`. Agent sessions activate them automatically
+(SessionStart); humans run `git config core.hooksPath .githooks` once.
+
 If a check fails, fix the cause; never bypass it. `--no-verify`,
 `git commit -n`, changing `core.hooksPath`, and force pushes are blocked for
 agents (`.claude/hooks/guard-git.sh`). If you believe a check is wrong, stop
@@ -150,9 +153,11 @@ hooks, restart the session and trust them with `/hooks`. Test the guard with
 |---|---|
 | No hook bypass, no force push | `guard-git.sh` (Claude + Codex), deny rules |
 | No local `cargo publish` | deny rules (release workflow publishes) |
-| Formatting | `cargo fmt --check` — CI |
-| Lints, warnings | `clippy -D warnings` — CI |
-| Tests pass | `cargo test --workspace` — CI |
+| Formatting | `cargo fmt --check` — pre-commit, CI |
+| No files > 500 KB | pre-commit |
+| Conventional commit subjects ≤ 72 chars, with a body | commit-msg |
+| Lints, warnings | `clippy -D warnings` — pre-push, CI |
+| Tests pass | `cargo test --workspace` — pre-push, CI |
 | No panics in production code | review only (not yet linted) |
 | Vendor isolation, crate deps | review only |
 | Release publish order | review only (`release.yml`) |

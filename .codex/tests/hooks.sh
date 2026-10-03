@@ -5,8 +5,28 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
+session="$(jq -er '.hooks.SessionStart[0].hooks[0].command' "$root/.codex/hooks.json")"
 guard="$(jq -er '.hooks.PreToolUse[0].hooks[0].command' "$root/.codex/hooks.json")"
 [[ "$(jq -r '.hooks.PreToolUse[0].matcher' "$root/.codex/hooks.json")" == Bash ]]
+
+# Given a checkout with spaces, when startup runs below its root without
+# Claude's environment, then the versioned Git hooks activate, idempotently.
+checkout="$scratch/checkout with spaces"
+mkdir -p "$checkout/.claude/hooks" "$checkout/app/src"
+git init --quiet "$checkout"
+cp "$root/.claude/hooks/ensure-git-hooks.sh" "$checkout/.claude/hooks/"
+other="$scratch/other checkout"
+git init --quiet "$other"
+(
+    cd "$checkout/app/src"
+    CLAUDE_PROJECT_DIR="$other" bash -c "$session"
+    [[ "$(git config --local --get core.hooksPath)" == .githooks ]]
+    unset CLAUDE_PROJECT_DIR
+    bash -c "$session"
+    bash -c "$session"
+)
+[[ "$(git -C "$checkout" config --get core.hooksPath)" == .githooks ]]
+[[ -z "$(git -C "$other" config --local --get core.hooksPath || true)" ]]
 
 run_guard() {
     local command=$1 expected=$2 actual=0

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Enforces Conventional Commits (AGENTS.md §4).
+set -euo pipefail
+
+subject=$(head -n1 "$1")
+case "$subject" in
+    "Merge "* | "Revert "* | "fixup! "* | "squash! "*) exit 0 ;;
+esac
+
+pattern='^(feat|fix|refactor|perf|test|docs|build|ci|chore|style|revert)(\([a-z0-9-]+\))?!?: [^ ].*$'
+if [[ ! $subject =~ $pattern ]]; then
+    echo "commit-msg: subject must follow Conventional Commits, e.g. 'fix(tmux): handle missing pane'." >&2
+    echo "  got: $subject" >&2
+    exit 1
+fi
+if ((${#subject} > 72)); then
+    echo "commit-msg: subject is ${#subject} chars; keep it to 72 or fewer." >&2
+    exit 1
+fi
+
+# Commit bodies are the project's progress log (AGENTS.md §4): a fresh session
+# recovers context from `git log`, so every commit says what changed and why.
+# Stop at the scissors line: `git commit -v` appends the diff below it.
+body=$(tail -n +2 "$1" | sed '/^# -\{8,\} >8 -\{8,\}$/,$d' | grep -vE '^[[:space:]]*(#|$)' | grep -viE '^[a-z-]+: .+@|^Co-Authored-By:' || true)
+if [[ -z $body ]]; then
+    echo "commit-msg: add a body (after a blank line) summarising what changed and why." >&2
+    exit 1
+fi

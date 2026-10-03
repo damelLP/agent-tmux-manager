@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Full verification before anything leaves the machine; mirrors CI (.github/workflows/ci.yml).
+set -euo pipefail
+cargo clippy --workspace --all-targets --quiet -- -D warnings
+exec cargo test --workspace --quiet

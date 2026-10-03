@@ -37,6 +37,15 @@
 //! - `PreToolUse` fires *before* `PermissionRequest` for the same gated
 //!   call, and a `PreToolUse` may arrive with no matching `PostToolUse`
 //!   (aborted call) — downstream state handles both orderings.
+//! - Process discovery (codex-cli 0.160.0, 2026-10-03): a shared
+//!   app-server daemon runs the same `codex` binary as
+//!   `codex app-server --listen unix:// --managed-daemon` and
+//!   `codex app-server daemon pid-update-loop` (survives
+//!   `codex app-server daemon stop`, may be reparented to init).
+//!   Sandboxed tool calls run the same binary as `codex-linux-sandbox`
+//!   inside `bwrap` (whose argv names the codex binary). None are
+//!   sessions; the codex `HarnessDefinition` in `atm-core` excludes them
+//!   via `process_excludes`.
 //!
 //! ## Layers
 //!

@@ -102,6 +102,23 @@ const CODEX_MATCHERS: &[ProcessMatcher] = &[
     ProcessMatcher::Contains("codex-cli"),
 ];
 
+/// Codex processes that look like the agent but are not sessions.
+///
+/// Verified live against codex-cli 0.160.0 (2026-10-03): the shared
+/// app-server daemon runs the same `codex` binary (comm `codex`) as
+/// `<release>/bin/codex app-server --listen unix:// --managed-daemon` and
+/// `<release>/bin/codex app-server daemon pid-update-loop` (long-lived,
+/// may be reparented to init). Sandboxed tool commands run as
+/// `.../codex-linux-sandbox` -> `bwrap ... <release>/bin/codex ...` ->
+/// `codex-linux-sandbox` (comm `codex`); `bwrap` matches via that path
+/// argument. Interactive TUIs and `codex exec` have none of these as
+/// argv0/argv1, so they are still discovered.
+const CODEX_EXCLUDES: &[ProcessMatcher] = &[
+    ProcessMatcher::Exact("app-server"),
+    ProcessMatcher::Suffix("codex-linux-sandbox"),
+    ProcessMatcher::Exact("bwrap"),
+];
+
 const AMP_MATCHERS: &[ProcessMatcher] =
     &[ProcessMatcher::Exact("amp"), ProcessMatcher::Suffix("/amp")];
 
@@ -165,7 +182,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         // atm-codex-hook, so discovered codex sessions get live status.
         discovery_enabled: true,
         allow_bare_cmdline_match: true,
-        process_excludes: &[],
+        process_excludes: CODEX_EXCLUDES,
     },
     HarnessDefinition {
         id: "amp",
@@ -306,5 +323,19 @@ mod tests {
         assert!(pi.process_matchers.iter().any(|m| m.matches("/usr/bin/pi")));
         assert!(pi.discovery_enabled);
         assert!(!pi.allow_bare_cmdline_match);
+    }
+
+    #[test]
+    fn codex_excludes_cover_app_server_daemon() {
+        let codex = find_harness_definition("codex").unwrap_or(default_harness_definition());
+        let excluded = |arg: &str| codex.process_excludes.iter().any(|m| m.matches(arg));
+        assert!(excluded("app-server"));
+        assert!(excluded("codex-linux-sandbox"));
+        assert!(excluded("bwrap"));
+        assert!(!excluded("exec"));
+        assert!(!excluded("resume"));
+        assert!(!excluded(
+            "/home/u/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex"
+        ));
     }
 }

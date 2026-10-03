@@ -900,6 +900,105 @@ mod tests {
         assert!(!cmdline_is_excluded(b"\xff\0claude\0daemon\0", &definition));
     }
 
+    // Real cmdlines observed live with codex-cli 0.160.0 (2026-10-03).
+    const CODEX_DAEMON_BIN: &str = "/home/damel/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex";
+    const CODEX_CODE_MODE_HOST: &str = "/home/damel/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex-code-mode-host";
+    const CODEX_NODE_WRAPPER: &str = "/home/damel/.nvm/versions/node/v25.2.1/bin/codex";
+    const CODEX_NATIVE_BIN: &str = "/home/damel/.nvm/versions/node/v25.2.1/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
+
+    fn codex_definition() -> &'static HarnessDefinition {
+        atm_core::find_harness_definition("codex")
+            .unwrap_or_else(atm_core::default_harness_definition)
+    }
+
+    /// Encodes argv the way `/proc/{pid}/cmdline` stores it.
+    fn proc_cmdline(argv: &[&str]) -> Vec<u8> {
+        argv.iter()
+            .flat_map(|arg| arg.bytes().chain(std::iter::once(0)))
+            .collect()
+    }
+
+    /// Mirrors discovery's cmdline decision: not excluded and some
+    /// non-flag argument matches the definition.
+    fn codex_cmdline_discovered(argv: &[&str]) -> bool {
+        let codex = codex_definition();
+        !cmdline_is_excluded(&proc_cmdline(argv), codex)
+            && argv.iter().enumerate().any(|(i, arg)| {
+                !arg.starts_with('-') && cmdline_arg_matches_definition(i, arg, codex)
+            })
+    }
+
+    #[test]
+    fn codex_app_server_daemon_processes_are_excluded() {
+        let codex = codex_definition();
+        for argv in [
+            vec![
+                CODEX_DAEMON_BIN,
+                "app-server",
+                "--listen",
+                "unix://",
+                "--managed-daemon",
+            ],
+            vec![CODEX_DAEMON_BIN, "app-server", "daemon", "pid-update-loop"],
+            // Real bwrap stage of a sandboxed tool call (abridged): it
+            // names the codex binary as a path argument.
+            vec![
+                "bwrap",
+                "--as-pid-1",
+                "--new-session",
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--",
+                CODEX_DAEMON_BIN,
+                "--sandbox-policy-cwd",
+                "/tmp",
+            ],
+            // Tool-call sandbox stages; exe is CODEX_DAEMON_BIN for both.
+            vec![
+                "/home/damel/.codex/tmp/arg0/codex-arg0TbkqL8/codex-linux-sandbox",
+                "--sandbox-policy-cwd",
+                "/home/damel/code/baliyo",
+            ],
+            vec![
+                "codex-linux-sandbox",
+                "--sandbox-policy-cwd",
+                "/home/damel/code/baliyo",
+                "--apply-seccomp-then-exec",
+            ],
+        ] {
+            assert!(cmdline_is_excluded(&proc_cmdline(&argv), codex), "{argv:?}");
+            assert!(!codex_cmdline_discovered(&argv), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn codex_tui_and_exec_processes_are_still_discovered() {
+        for argv in [
+            vec!["node", CODEX_NODE_WRAPPER],
+            vec![CODEX_NATIVE_BIN],
+            vec![CODEX_NATIVE_BIN, "--disable", "daemon_auto_start"],
+            vec![CODEX_NATIVE_BIN, "resume"],
+            vec!["codex", "exec", "fix the app-server tests"],
+            vec!["codex", "exec", "app-server"],
+        ] {
+            assert!(codex_cmdline_discovered(&argv), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn codex_code_mode_host_is_not_matched_without_an_exclude() {
+        // The daemon's code-mode host never satisfies CODEX_MATCHERS, so
+        // it needs no exclude entry.
+        let codex = codex_definition();
+        assert!(!cmdline_is_excluded(
+            &proc_cmdline(&[CODEX_CODE_MODE_HOST]),
+            codex
+        ));
+        assert!(!codex_cmdline_discovered(&[CODEX_CODE_MODE_HOST]));
+    }
+
     // ========================================================================
     // Wrapper-chain dedupe
     // ========================================================================

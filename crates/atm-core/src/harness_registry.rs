@@ -44,9 +44,11 @@ impl ProcessMatcher {
 /// A [`ProcessMatcher`] bound to one argv position, used to exclude
 /// processes that match a harness but are not sessions.
 ///
-/// Only the command (argv0) and subcommand (argv1) can be targeted, so
-/// positional data such as a prompt is never compared against an
-/// executable-name exclude.
+/// Only the command (argv0) and subcommand (argv1) can be targeted.
+/// Arguments after argv1 are never checked, and a `Command` exclude never
+/// sees argv1. argv1 can still be a prompt for CLIs that accept one there
+/// (e.g. `codex [PROMPT]`), so a `Subcommand` exclude should only name a
+/// value the CLI always parses as a subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgvExclude {
     /// Matches argv0, the executable.
@@ -92,9 +94,9 @@ pub struct HarnessDefinition {
     /// Excludes for processes that satisfy `process_matchers` but are not
     /// agent sessions (e.g. a harness's background daemon).
     ///
-    /// Each exclude targets argv0 or argv1 (see [`ArgvExclude`]), so
-    /// positional data such as a prompt never excludes a real session.
-    /// Any match vetoes discovery for this harness.
+    /// Each exclude targets argv0 or argv1 (see [`ArgvExclude`] for how
+    /// that interacts with prompts passed as argv1). Any match vetoes
+    /// discovery for this harness.
     pub process_excludes: &'static [ArgvExclude],
     /// Whether this harness should be detected by daemon `/proc` discovery.
     ///

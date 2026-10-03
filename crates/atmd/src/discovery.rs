@@ -521,10 +521,10 @@ fn is_excluded_process(pid: u32, definition: &'static HarnessDefinition) -> bool
 }
 
 /// True if argv0 or argv1 of a NUL-separated `/proc/{pid}/cmdline`
-/// satisfies one of the definition's `process_excludes` at that position.
-/// Later arguments are ignored so positional data (e.g. a prompt) can
-/// never hide a real session. Positions are assigned before UTF-8
-/// decoding so a non-UTF-8 argument cannot shift another into its slot.
+/// satisfies one of the definition's `process_excludes` at that position
+/// (see [`atm_core::ArgvExclude`]). Arguments after argv1 are never
+/// checked. Positions are assigned before UTF-8 decoding so a non-UTF-8
+/// argument cannot shift another into its slot.
 fn cmdline_is_excluded(cmdline: &[u8], definition: &HarnessDefinition) -> bool {
     cmdline
         .split(|&b| b == 0)

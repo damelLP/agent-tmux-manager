@@ -266,6 +266,10 @@ struct ProcessMatch {
     /// binary name — the same test the vendor hook scripts use to
     /// resolve the agent PID they report to the daemon.
     comm_is_binary: bool,
+    /// True if the definition's `process_excludes` mark this process as
+    /// not a session. Excluded matches still take part in dedupe, so they
+    /// suppress their own launcher wrappers, but are never reported.
+    excluded: bool,
 }
 
 /// Scans /proc for coding-agent processes.
@@ -277,7 +281,9 @@ struct ProcessMatch {
 /// Launcher-wrapper chains (e.g. Codex's `node .../bin/codex` wrapper
 /// spawning the native `codex` binary) can match twice — once via
 /// cmdline, once via exe. A dedupe pass collapses each such chain to
-/// one process so a single agent never yields two sessions.
+/// one process so a single agent never yields two sessions. Excluded
+/// processes join that pass and are dropped afterwards, so a wrapper
+/// whose native child is excluded is dropped too.
 ///
 /// This function performs blocking I/O and should be called via
 /// `spawn_blocking`.
@@ -307,7 +313,9 @@ fn scan_agent_processes() -> Result<Vec<DiscoveredProcess>, DiscoveryError> {
 }
 
 /// Tries each registered harness detector against `pid`. Returns the
-/// first match (with process-tree context for dedupe) or `None`.
+/// first match (with process-tree context for dedupe) or `None`. A match
+/// hit by the definition's `process_excludes` is returned flagged as
+/// excluded rather than skipped (see [`dedupe_wrapper_chains`]).
 fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
     builtin_harnesses()
         .filter(|definition| definition.discovery_enabled)
@@ -315,6 +323,8 @@ fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
             check_harness_process(pid, definition).map(|process| ProcessMatch {
                 comm_is_binary: process_comm(pid).as_deref() == Some(definition.binary),
                 ancestor_pids: collect_ancestor_pids(pid),
+                excluded: !definition.process_excludes.is_empty()
+                    && is_excluded_process(pid, definition),
                 process,
             })
         })
@@ -336,9 +346,21 @@ fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
 /// Ancestry is only collapsed *within* a harness: an agent spawning a
 /// different vendor's agent (e.g. Claude driving a Codex) stays two
 /// sessions, as it should.
+///
+/// Excluded matches can supersede (so e.g. `node .../bin/codex
+/// app-server` is dropped along with its excluded native child) but are
+/// never kept themselves.
 fn dedupe_wrapper_chains(matches: Vec<ProcessMatch>) -> Vec<DiscoveredProcess> {
-    let keep: Vec<bool> = (0..matches.len())
-        .map(|i| !(0..matches.len()).any(|j| j != i && supersedes(&matches[j], &matches[i])))
+    let keep: Vec<bool> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            !b.excluded
+                && !matches
+                    .iter()
+                    .enumerate()
+                    .any(|(j, a)| j != i && supersedes(a, b))
+        })
         .collect();
 
     matches
@@ -413,10 +435,6 @@ fn check_harness_process(
     pid: u32,
     definition: &'static HarnessDefinition,
 ) -> Option<DiscoveredProcess> {
-    if !definition.process_excludes.is_empty() && is_excluded_process(pid, definition) {
-        return None;
-    }
-
     if let Some(process) = check_via_exe(pid, definition) {
         return Some(process);
     }
@@ -907,6 +925,118 @@ mod tests {
         assert!(!cmdline_is_excluded(b"\xff\0claude\0daemon\0", &definition));
     }
 
+    // Real cmdlines observed live with codex-cli 0.160.0 (2026-10-03).
+    const CODEX_DAEMON_BIN: &str = "/home/damel/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex";
+    const CODEX_CODE_MODE_HOST: &str = "/home/damel/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex-code-mode-host";
+    const CODEX_NODE_WRAPPER: &str = "/home/damel/.nvm/versions/node/v25.2.1/bin/codex";
+    const CODEX_NATIVE_BIN: &str = "/home/damel/.nvm/versions/node/v25.2.1/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
+
+    fn codex_definition() -> &'static HarnessDefinition {
+        atm_core::find_harness_definition("codex")
+            .unwrap_or_else(atm_core::default_harness_definition)
+    }
+
+    /// Encodes argv the way `/proc/{pid}/cmdline` stores it.
+    fn proc_cmdline(argv: &[&str]) -> Vec<u8> {
+        argv.iter()
+            .flat_map(|arg| arg.bytes().chain(std::iter::once(0)))
+            .collect()
+    }
+
+    /// Mirrors discovery's cmdline decision: not excluded and some
+    /// non-flag argument matches the definition.
+    fn codex_cmdline_discovered(argv: &[&str]) -> bool {
+        let codex = codex_definition();
+        !cmdline_is_excluded(&proc_cmdline(argv), codex)
+            && argv.iter().enumerate().any(|(i, arg)| {
+                !arg.starts_with('-') && cmdline_arg_matches_definition(i, arg, codex)
+            })
+    }
+
+    #[test]
+    fn codex_app_server_daemon_processes_are_excluded() {
+        let codex = codex_definition();
+        for argv in [
+            vec![
+                CODEX_DAEMON_BIN,
+                "app-server",
+                "--listen",
+                "unix://",
+                "--managed-daemon",
+            ],
+            vec![CODEX_DAEMON_BIN, "app-server", "daemon", "pid-update-loop"],
+            // Real bwrap stage of a sandboxed tool call (abridged): it
+            // names the codex binary as a path argument.
+            vec![
+                "bwrap",
+                "--as-pid-1",
+                "--new-session",
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--",
+                CODEX_DAEMON_BIN,
+                "--sandbox-policy-cwd",
+                "/tmp",
+            ],
+            // Same stage when bwrap is launched by absolute path.
+            vec![
+                "/usr/bin/bwrap",
+                "--as-pid-1",
+                "--",
+                CODEX_DAEMON_BIN,
+                "--sandbox-policy-cwd",
+                "/tmp",
+            ],
+            // Tool-call sandbox stages; exe is CODEX_DAEMON_BIN for both.
+            vec![
+                "/home/damel/.codex/tmp/arg0/codex-arg0TbkqL8/codex-linux-sandbox",
+                "--sandbox-policy-cwd",
+                "/home/damel/code/baliyo",
+            ],
+            vec![
+                "codex-linux-sandbox",
+                "--sandbox-policy-cwd",
+                "/home/damel/code/baliyo",
+                "--apply-seccomp-then-exec",
+            ],
+        ] {
+            assert!(cmdline_is_excluded(&proc_cmdline(&argv), codex), "{argv:?}");
+            assert!(!codex_cmdline_discovered(&argv), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn codex_tui_and_exec_processes_are_still_discovered() {
+        for argv in [
+            vec!["node", CODEX_NODE_WRAPPER],
+            vec![CODEX_NATIVE_BIN],
+            vec![CODEX_NATIVE_BIN, "--disable", "daemon_auto_start"],
+            vec![CODEX_NATIVE_BIN, "resume"],
+            vec!["codex", "exec", "fix the app-server tests"],
+            vec!["codex", "exec", "app-server"],
+            // `codex [PROMPT]`: an initial prompt sits in argv1.
+            vec!["codex", "bwrap"],
+            vec!["codex", "Explain codex-linux-sandbox"],
+            vec![CODEX_NATIVE_BIN, "codex-linux-sandbox"],
+        ] {
+            assert!(codex_cmdline_discovered(&argv), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn codex_code_mode_host_is_not_matched_without_an_exclude() {
+        // The daemon's code-mode host never satisfies CODEX_MATCHERS, so
+        // it needs no exclude entry.
+        let codex = codex_definition();
+        assert!(!cmdline_is_excluded(
+            &proc_cmdline(&[CODEX_CODE_MODE_HOST]),
+            codex
+        ));
+        assert!(!codex_cmdline_discovered(&[CODEX_CODE_MODE_HOST]));
+    }
+
     #[test]
     fn argv_excludes_only_apply_at_their_position() {
         let base = atm_core::find_harness_definition("claude")
@@ -952,6 +1082,19 @@ mod tests {
             },
             ancestor_pids,
             comm_is_binary,
+            excluded: false,
+        }
+    }
+
+    fn excluded_match(
+        pid: u32,
+        harness: Harness,
+        ancestor_pids: Vec<u32>,
+        comm_is_binary: bool,
+    ) -> ProcessMatch {
+        ProcessMatch {
+            excluded: true,
+            ..fake_match(pid, harness, ancestor_pids, comm_is_binary)
         }
     }
 
@@ -962,6 +1105,33 @@ mod tests {
             .collect();
         pids.sort_unstable();
         pids
+    }
+
+    #[test]
+    fn wrapper_of_excluded_native_child_is_dropped_too() {
+        // Live shape (codex-cli 0.160.0): `node .../bin/codex app-server`
+        // (comm MainThread, matched via cmdline path) spawns the native
+        // `.../bin/codex app-server` (comm codex, excluded at argv1).
+        let wrapper = fake_match(100, Harness::Codex, vec![1], false);
+        let native = excluded_match(200, Harness::Codex, vec![100, 1], true);
+        assert!(kept_pids(vec![wrapper, native]).is_empty());
+    }
+
+    #[test]
+    fn excluded_match_is_never_reported_on_its_own() {
+        let daemon = excluded_match(200, Harness::Codex, vec![1], true);
+        assert!(kept_pids(vec![daemon]).is_empty());
+    }
+
+    #[test]
+    fn excluded_binary_does_not_suppress_a_real_binary_session() {
+        // A TUI (comm codex) that launched the app-server daemon (comm
+        // codex, excluded) is still a session; the TUI's own wrapper still
+        // collapses into it.
+        let wrapper = fake_match(90, Harness::Codex, vec![1], false);
+        let tui = fake_match(100, Harness::Codex, vec![90, 1], true);
+        let daemon = excluded_match(200, Harness::Codex, vec![100, 90, 1], true);
+        assert_eq!(kept_pids(vec![wrapper, tui, daemon]), vec![100]);
     }
 
     #[test]

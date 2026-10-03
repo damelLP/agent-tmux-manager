@@ -28,7 +28,7 @@ pub use error::{DomainError, DomainResult};
 pub use harness::Harness;
 pub use harness_registry::{
     builtin_harness_ids_display, builtin_harnesses, default_harness_definition,
-    find_harness_definition, HarnessDefinition, ProcessMatcher, PromptMode,
+    find_harness_definition, ArgvExclude, HarnessDefinition, ProcessMatcher, PromptMode,
 };
 pub use lifecycle::{
     BackgroundActivity, ChildAgent, ChildAlias, ChildRef, LifecycleContext, LifecycleEvent,

@@ -833,8 +833,8 @@ impl SessionDomain {
                 // `Notification`, after translation.
             }
             LifecycleEvent::ChildSessionStart { .. } | LifecycleEvent::ChildSessionEnd { .. } => {
-                // Child-session correlation is tracked by the registry
-                // (subagent pending-list); status remains Working.
+                // Children are tracked by the registry as in-process sessions;
+                // status remains Working.
                 self.status = SessionStatus::Working;
             }
         }

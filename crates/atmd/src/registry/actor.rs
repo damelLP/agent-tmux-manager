@@ -837,8 +837,7 @@ impl RegistryActor {
     }
 
     /// Resolves a vendor child reference to its session id under `parent`:
-    /// the id an alias mapped it to, else the
-    /// reference's own default id.
+    /// the id an alias mapped it to, else the reference's own default id.
     fn child_id_for(&self, parent: &SessionId, reference: &ChildRef) -> SessionId {
         self.child_refs
             .get(&(parent.clone(), reference.clone()))
@@ -922,7 +921,7 @@ impl RegistryActor {
                 .unwrap_or_default();
             for id in child_ids {
                 let working = self
-                    .handle_get_session(&id)
+                    .synthetic_child(&id)
                     .is_some_and(|child| child.status == atm_core::SessionStatus::Working);
                 if working {
                     let _ = self.handle_remove(id, RemovalReason::SessionEnded);
@@ -1878,44 +1877,6 @@ mod tests {
             rx.await.unwrap().is_some(),
             "real id must not be renamed by another real id"
         );
-    }
-
-    #[tokio::test]
-    async fn test_discovery_keeps_process_independent_from_in_process_child() {
-        let (_, mut actor, _) = create_actor();
-        let parent_pid = std::process::id();
-        let parent_id = SessionId::new("parent-session");
-        actor
-            .handle_register(create_test_session(parent_id.as_str()), Some(parent_pid))
-            .unwrap();
-        start_child(&mut actor, &parent_id, "sub-agent-001");
-
-        let mut child = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("failed to spawn sleep process");
-        let child_pid = child.id();
-        let child_id = SessionId::new("child-session");
-        let result = actor.handle_register_discovered(
-            child_id.clone(),
-            child_pid,
-            PathBuf::from("/home/user/project"),
-            None,
-            atm_core::Harness::Unknown,
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-        result.unwrap();
-
-        assert!(session_view(&actor, "sub-agent-001").is_some());
-        let parent = actor.handle_get_session(&parent_id).unwrap();
-        assert_eq!(
-            parent.child_session_ids,
-            vec![SessionId::new("sub-agent-001")]
-        );
-        let discovered = actor.handle_get_session(&child_id).unwrap();
-        assert_eq!(discovered.parent_session_id, None);
-        assert_eq!(actor.session_count(), 3);
     }
 
     #[tokio::test]

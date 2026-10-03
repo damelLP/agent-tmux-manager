@@ -152,7 +152,8 @@ them with `/hooks`.
 | Formatting | `cargo fmt --check` — pre-commit, CI |
 | Lints, warnings | `clippy -D warnings` — pre-push, CI |
 | Tests pass | `cargo test --workspace` — pre-push, CI |
-| No panics in production code | review only (not yet linted) |
+| No `unwrap`/`expect` in production code | `clippy::unwrap_used`/`expect_used` — pre-push, CI (tests exempt via `clippy.toml`) |
+| No other panics (`panic!`, indexing, ...) | review only |
 | Vendor isolation, crate deps | review only |
 | Release publish order | review only (`release.yml`) |
 

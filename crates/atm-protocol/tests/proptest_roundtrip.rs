@@ -7,6 +7,8 @@
 //! `PartialEq` on the protocol types (which contain `serde_json::Value` and
 //! boxed `SessionView` payloads).
 
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
+
 use atm_core::{SessionId, SessionStatus, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use proptest::prelude::*;

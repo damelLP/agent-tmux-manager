@@ -48,6 +48,7 @@
 //! gating the file lets `cargo check`/`cargo test` pass cleanly on
 //! Windows runners instead of spewing missing-symbol errors.
 #![cfg(unix)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

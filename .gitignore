@@ -28,3 +28,6 @@ Thumbs.db
 # Git worktrees
 .worktrees/
 docs/plans/
+
+# Local agent-to-agent coordination state
+.a2a/

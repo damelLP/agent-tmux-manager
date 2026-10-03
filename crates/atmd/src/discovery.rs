@@ -413,6 +413,10 @@ fn check_harness_process(
     pid: u32,
     definition: &'static HarnessDefinition,
 ) -> Option<DiscoveredProcess> {
+    if !definition.process_excludes.is_empty() && is_excluded_process(pid, definition) {
+        return None;
+    }
+
     if let Some(process) = check_via_exe(pid, definition) {
         return Some(process);
     }
@@ -497,6 +501,41 @@ fn cmdline_arg_matches_definition(
         .process_matchers
         .iter()
         .any(|matcher| matcher.matches(arg))
+}
+
+/// True if `/proc/{pid}/cmdline` hits one of the definition's
+/// `process_excludes` (see [`cmdline_is_excluded`]).
+fn is_excluded_process(pid: u32, definition: &'static HarnessDefinition) -> bool {
+    let Ok(cmdline_bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let excluded = cmdline_is_excluded(&cmdline_bytes, definition);
+    if excluded {
+        debug!(
+            pid,
+            harness = definition.id,
+            "Skipping process excluded by harness definition"
+        );
+    }
+    excluded
+}
+
+/// True if argv0 or argv1 of a NUL-separated `/proc/{pid}/cmdline`
+/// satisfies one of the definition's `process_excludes`. Later arguments
+/// are ignored so positional data (e.g. a prompt) can never hide a real
+/// session. The positional limit is applied before UTF-8 decoding so a
+/// non-UTF-8 argument cannot shift argv2 into the checked window.
+fn cmdline_is_excluded(cmdline: &[u8], definition: &HarnessDefinition) -> bool {
+    cmdline
+        .split(|&b| b == 0)
+        .take(2)
+        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+        .any(|arg| {
+            definition
+                .process_excludes
+                .iter()
+                .any(|matcher| matcher.matches(arg))
+        })
 }
 
 /// Gets process info (cwd, tmux pane) for a PID.
@@ -827,6 +866,38 @@ mod tests {
             .map(|definition| definition.id)
             .collect();
         assert_eq!(enabled, vec!["claude", "pi", "codex"]);
+    }
+
+    #[test]
+    fn cmdline_excludes_only_consider_command_and_subcommand() {
+        let base = atm_core::find_harness_definition("claude")
+            .unwrap_or_else(atm_core::default_harness_definition);
+        let definition = HarnessDefinition {
+            process_excludes: &[atm_core::ProcessMatcher::Exact("daemon")],
+            ..*base
+        };
+        assert!(cmdline_is_excluded(b"claude\0daemon\0", &definition));
+        assert!(cmdline_is_excluded(b"daemon\0", &definition));
+        assert!(!cmdline_is_excluded(b"claude\0-p\0daemon\0", &definition));
+        assert!(!cmdline_is_excluded(b"claude\0", &definition));
+        assert!(!cmdline_is_excluded(b"", &definition));
+    }
+
+    #[test]
+    fn non_utf8_argv_does_not_shift_later_args_into_exclude_window() {
+        let base = atm_core::find_harness_definition("claude")
+            .unwrap_or_else(atm_core::default_harness_definition);
+        let definition = HarnessDefinition {
+            process_excludes: &[atm_core::ProcessMatcher::Exact("daemon")],
+            ..*base
+        };
+        // argv1 is invalid UTF-8; the prompt "daemon" in argv2 must stay
+        // outside the checked window.
+        assert!(!cmdline_is_excluded(
+            b"claude\0\xff\xfe\0daemon\0",
+            &definition
+        ));
+        assert!(!cmdline_is_excluded(b"\xff\0claude\0daemon\0", &definition));
     }
 
     // ========================================================================

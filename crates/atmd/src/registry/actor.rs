@@ -660,7 +660,7 @@ impl RegistryActor {
     /// With PID as primary key, we can look up by PID when available.
     ///
     /// Special cases:
-    /// - `SessionEnd` immediately removes the session from the registry.
+    /// - An untagged `SessionEnd` immediately removes the session from the registry.
     /// - `ChildSessionStart`/`ChildSessionEnd` create and remove in-process children.
     fn handle_apply_lifecycle_event(
         &mut self,
@@ -673,8 +673,8 @@ impl RegistryActor {
     ) -> Result<(), RegistryError> {
         let target_pid = pid.or_else(|| self.session_id_to_pid.get(&session_id).copied());
 
-        // SessionEnd: remove session immediately.
-        if matches!(event, LifecycleEvent::SessionEnd { .. }) {
+        // Untagged SessionEnd: remove session immediately.
+        if context.child.is_none() && matches!(event, LifecycleEvent::SessionEnd { .. }) {
             if let Some(p) = target_pid {
                 if self.sessions_by_pid.contains_key(&p) {
                     info!(
@@ -2285,17 +2285,14 @@ mod tests {
         assert_eq!(child.tmux_pane.as_deref(), Some("%7"));
         assert_eq!(child.project_root.as_deref(), Some("/repo"));
 
-        needs_input_from(
-            &mut actor,
-            &parent,
-            LifecycleContext {
-                child: Some(ChildAgent {
-                    reference: ChildRef::Id("agent-1".into()),
-                    agent_type: AgentType::Subagent,
-                }),
-                ..LifecycleContext::default()
-            },
-        );
+        let child_context = LifecycleContext {
+            child: Some(ChildAgent {
+                reference: ChildRef::Id("agent-1".into()),
+                agent_type: AgentType::Subagent,
+            }),
+            ..LifecycleContext::default()
+        };
+        needs_input_from(&mut actor, &parent, child_context.clone());
         assert_eq!(
             session_view(&actor, "agent-1").map(|view| view.status),
             Some(atm_core::SessionStatus::AttentionNeeded)
@@ -2304,6 +2301,14 @@ mod tests {
             session_view(&actor, "lead").map(|view| view.status),
             Some(atm_core::SessionStatus::Working)
         );
+
+        apply_with_context(
+            &mut actor,
+            &parent,
+            LifecycleEvent::SessionEnd { reason: None },
+            child_context,
+        );
+        assert!(session_view(&actor, "lead").is_some());
 
         apply_with_context(
             &mut actor,

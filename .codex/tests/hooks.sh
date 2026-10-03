@@ -47,6 +47,7 @@ run_guard() {
 
 # Given a shell call, when it bypasses Git hooks or force-pushes, then the
 # guard rejects it. These are hook inputs; none of these commands execute.
+# shellcheck disable=SC2016 # literal $(...) is the input under test
 for command in \
     'git commit --no-verify -m test' \
     'git push --no-v' \
@@ -57,7 +58,17 @@ for command in \
     'git push --force origin main' \
     'git push origin main -f' \
     'git push origin --force-with-lease main' \
-    'git push origin +main'; do
+    'git push origin +main' \
+    'git commit -nm test' \
+    'cd crates && git commit --no-verify -m test' \
+    'cargo test; git push -f' \
+    'env FOO=1 /usr/bin/git commit -n -m test' \
+    'git -C repo push origin +main' \
+    'git config --local core.hooksPath /tmp/empty' \
+    'git config --unset core.hooksPath' \
+    'git --config-env=core.hooksPath=EMPTY commit -m test' \
+    'echo $(git push -f)' \
+    $'git commit -F - <<EOF\nmessage\nEOF\ngit push -f'; do
     run_guard "$command" 2
 done
 
@@ -66,7 +77,14 @@ for command in \
     'git status --short' \
     'git diff --check' \
     'git commit -m test' \
-    'git push origin main'; do
+    'git push origin main' \
+    'git commit -m "explain why --no-verify is blocked"' \
+    'git log --oneline -n 5' \
+    'git push --force-if-includes origin main' \
+    'git status && grep -n x .githooks/commit-msg' \
+    'git config --get core.hooksPath' \
+    $'git commit -F - <<\'EOF\'\nfix: thing\n\nWhy -n and --no-verify are blocked.\nEOF' \
+    $'cat <<-EOF\n\tgit push --force\n\tEOF\ngit status'; do
     run_guard "$command" 0
 done
 

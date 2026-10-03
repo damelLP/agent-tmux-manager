@@ -1579,9 +1579,16 @@ where
              S=$((W * {pct} / 100))\n\
              [ $S -lt {min} ] && S={min}\n\
              [ $S -gt {max} ] && S={max}\n\
-             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{@atm-sidebar}}:#{{pane_width}}'); do\n\
-               case $p in *:1:$S) ;; *:1:*) [ \"$1\" = shrink ] && [ \"${{p##*:}}\" -lt \"$S\" ] \
-                 || {tmux} resize-pane -t \"${{p%%:*}}\" -x \"$S\";; esac\n\
+             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{@atm-sidebar}}:#{{pane_width}}:#{{@atm-sidebar-tries}}'); do\n\
+               id=${{p%%:*}}; n=${{p##*:}}\n\
+               case $p in\n\
+                 *:1:$S:*) [ -n \"$n\" ] && {tmux} set-option -pu -t \"$id\" @atm-sidebar-tries;;\n\
+                 *:1:*) if [ \"$1\" = hook ]; then\n\
+                     [ \"${{n:-0}}\" -ge 5 ] && continue\n\
+                     {tmux} set-option -p -t \"$id\" @atm-sidebar-tries $((${{n:-0}} + 1))\n\
+                   fi\n\
+                   {tmux} resize-pane -t \"$id\" -x \"$S\";;\n\
+               esac\n\
              done\n",
             tmux = tmux_prefix,
             pct = SIDEBAR_PCT,
@@ -1607,10 +1614,10 @@ where
     )
     .await?;
     // Undo Claude Code teammate rebalances, which resize the first pane (our
-    // sidebar) to 30%. Shrink-only: the script's own resize-pane re-fires this
-    // hook, and a sidebar that can't reach the target width (tiny window) is
-    // always narrower than it, so the loop ends.
-    let shrink_cmd = format!("run-shell '{} shrink'", script_path.display());
+    // sidebar) to 30%. The script's own resize-pane re-fires this hook, so in
+    // `hook` mode it stops after 5 tries that don't reach the target width
+    // (e.g. a window too small to fit it); reaching the target resets the count.
+    let pane_hook_cmd = format!("run-shell '{} hook'", script_path.display());
     tmux_run(
         client,
         &[
@@ -1618,7 +1625,7 @@ where
             "-t",
             session_name,
             "after-resize-pane",
-            &shrink_cmd,
+            &pane_hook_cmd,
         ],
     )
     .await?;

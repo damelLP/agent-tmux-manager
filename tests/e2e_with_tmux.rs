@@ -951,36 +951,80 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         tokio::time::sleep(SESSION_POLL_INTERVAL).await;
     }
 
-    // Shrink mode (after-resize-pane) must leave a narrower sidebar alone:
-    // that no-op is what ends the hook's self-retriggering when a tiny
-    // window can't fit the target width. Plain run-shell waits for the script.
+    // Below-target widths are restored too when attainable: in windows under
+    // ~67 cols Claude's 30% is narrower than the 20-col minimum target.
+    let read_sidebar = |format: &str| {
+        tmux_run_capture(
+            create_tmux.label(),
+            &["display-message", "-p", "-t", &sidebar_pane, format],
+        )
+        .expect("read sidebar format")
+        .trim()
+        .to_string()
+    };
     let narrow_width = (expected_width - 5).to_string();
     tmux_run_capture(
         create_tmux.label(),
         &["resize-pane", "-t", &sidebar_pane, "-x", &narrow_width],
     )
     .expect("narrow sidebar below target");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    while read_sidebar("#{pane_width}") != expected_width.to_string() {
+        assert!(
+            Instant::now() < deadline,
+            "after-resize-pane hook should restore a below-target sidebar to {expected_width}; got {}",
+            read_sidebar("#{pane_width}")
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+
+    // A window too narrow for the target width: the hook's own resize-pane
+    // re-fires it, so it must give up after its retry cap instead of looping.
     tmux_run_capture(
         create_tmux.label(),
-        &["run-shell", &format!("{} shrink", resize_script.display())],
+        &["resize-window", "-t", &create_session_name, "-x", "15"],
     )
-    .expect("run resize script in shrink mode");
-    let shrink_width = tmux_run_capture(
+    .expect("shrink window below sidebar minimum");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    while read_sidebar("#{@atm-sidebar-tries}")
+        .parse::<u32>()
+        .unwrap_or(0)
+        < 5
+    {
+        assert!(
+            Instant::now() < deadline,
+            "hook should reach its retry cap in a too-small window; tries={}",
+            read_sidebar("#{@atm-sidebar-tries}")
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        read_sidebar("#{@atm-sidebar-tries}"),
+        "5",
+        "hook should stop retrying at the cap, not keep re-firing itself"
+    );
+    let full_width = window_width.to_string();
+    tmux_run_capture(
         create_tmux.label(),
         &[
-            "display-message",
-            "-p",
+            "resize-window",
             "-t",
-            &sidebar_pane,
-            "#{pane_width}",
+            &create_session_name,
+            "-x",
+            &full_width,
         ],
     )
-    .expect("read sidebar width after shrink-mode run");
-    assert_eq!(
-        shrink_width.trim(),
-        narrow_width,
-        "shrink mode should not widen a sidebar narrower than the target"
-    );
+    .expect("restore window width");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    while read_sidebar("#{pane_width}:#{@atm-sidebar-tries}") != format!("{expected_width}:") {
+        assert!(
+            Instant::now() < deadline,
+            "sidebar should recover (width:tries) after the window grows; got {}",
+            read_sidebar("#{pane_width}:#{@atm-sidebar-tries}")
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
 
     // Regression: prefix-a must focus the sidebar even after a layout
     // change moves it away from pane index 0.

@@ -10,18 +10,6 @@
           }
         ]
       }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.claude/hooks/guard-git.sh\"",
-            "timeout": 5
-          }
-        ]
-      }
     ]
   }
 }

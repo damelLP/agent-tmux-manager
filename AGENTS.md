@@ -138,24 +138,18 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 Git hooks live in `.githooks/`. Agent sessions activate them automatically
 (SessionStart); humans run `git config core.hooksPath .githooks` once.
 
-If a check fails, fix the cause; never bypass it. `--no-verify`,
-`git commit -n`, changing `core.hooksPath`, and force pushes are blocked for
-agents (`.claude/hooks/guard-git.sh`). If you believe a check is wrong, stop
-and ask the user.
+If a check fails, fix the cause; never bypass it (no `--no-verify`, no
+force push). If you believe a check is wrong, stop and ask the user.
 
 Codex loads `.codex/config.toml`, `.codex/hooks.json`, and `.codex/rules/`
-for trusted checkouts. Its hook reuses the Claude guard script; its command
-rules mirror `.claude/settings.json` — change both together. After changing
-hooks, restart the session and trust them with `/hooks`. Test the guard with
-`bash .codex/tests/hooks.sh`.
+for trusted checkouts. Its command rules mirror `.claude/settings.json` —
+change both together. After changing hooks, restart the session and trust
+them with `/hooks`.
 
 | Rule | Enforced by |
 |---|---|
-| No hook bypass, no force push | `guard-git.sh` (Claude + Codex), deny rules |
-| No local `cargo publish` | deny rules (release workflow publishes) |
+| No force push, no local `cargo publish` | deny rules (Claude + Codex) |
 | Formatting | `cargo fmt --check` — pre-commit, CI |
-| No files > 500 KB | pre-commit |
-| Conventional commit subjects ≤ 72 chars, with a body | commit-msg |
 | Lints, warnings | `clippy -D warnings` — pre-push, CI |
 | Tests pass | `cargo test --workspace` — pre-push, CI |
 | No panics in production code | review only (not yet linted) |

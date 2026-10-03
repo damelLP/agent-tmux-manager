@@ -1159,6 +1159,8 @@ impl RegistryActor {
                 child_session.parent_session_id = Some(pending.parent_session_id);
                 child_session.agent_type = pending.agent_type;
             }
+            self.publish_updated(pending.parent_pid);
+            self.publish_updated(pid);
         }
     }
 
@@ -2152,6 +2154,49 @@ mod tests {
 
         // Pending entry should be removed by TTL cleanup
         assert_eq!(actor.pending_subagent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_subagent_correlation_publishes_final_parent_child_views() {
+        let (_, mut actor, _) = create_actor();
+        let parent_pid = std::process::id();
+        let parent_id = SessionId::new("parent-session");
+        actor
+            .handle_register(create_test_session(parent_id.as_str()), Some(parent_pid))
+            .unwrap();
+        start_child(&mut actor, &parent_id, "sub-agent-001");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("failed to spawn sleep process");
+        let child_pid = child.id();
+        let child_id = SessionId::new("child-session");
+        let mut event_rx = actor.event_publisher.subscribe();
+        let result = actor.handle_register_discovered(
+            child_id.clone(),
+            child_pid,
+            PathBuf::from("/home/user/project"),
+            None,
+            atm_core::Harness::Unknown,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        result.unwrap();
+
+        let mut final_views = HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let SessionEvent::Updated { session } = event {
+                final_views.insert(session.id.clone(), session);
+            }
+        }
+        let parent = final_views
+            .get(&parent_id)
+            .expect("parent update published");
+        assert_eq!(parent.child_session_ids, vec![child_id.clone()]);
+        let child = final_views.get(&child_id).expect("child update published");
+        assert_eq!(child.parent_session_id, Some(parent_id));
+        assert_eq!(child.agent_type, AgentType::Subagent.short_name());
     }
 
     #[tokio::test]

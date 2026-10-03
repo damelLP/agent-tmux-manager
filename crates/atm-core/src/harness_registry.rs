@@ -41,6 +41,33 @@ impl ProcessMatcher {
     }
 }
 
+/// A [`ProcessMatcher`] bound to one argv position, used to exclude
+/// processes that match a harness but are not sessions.
+///
+/// Only the command (argv0) and subcommand (argv1) can be targeted.
+/// Arguments after argv1 are never checked, and a `Command` exclude never
+/// sees argv1. argv1 can still be a prompt for CLIs that accept one there
+/// (e.g. `codex [PROMPT]`), so a `Subcommand` exclude should only name a
+/// value the CLI always parses as a subcommand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgvExclude {
+    /// Matches argv0, the executable.
+    Command(ProcessMatcher),
+    /// Matches argv1, the subcommand.
+    Subcommand(ProcessMatcher),
+}
+
+impl ArgvExclude {
+    /// Returns true if `arg`, found at `argv_index`, satisfies this exclude.
+    #[must_use]
+    pub fn matches(&self, argv_index: usize, arg: &str) -> bool {
+        match self {
+            Self::Command(matcher) => argv_index == 0 && matcher.matches(arg),
+            Self::Subcommand(matcher) => argv_index == 1 && matcher.matches(arg),
+        }
+    }
+}
+
 /// Metadata for a CLI coding-agent harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HarnessDefinition {
@@ -64,13 +91,13 @@ pub struct HarnessDefinition {
     pub version_args: &'static [&'static str],
     /// Process path/argv matchers used by discovery.
     pub process_matchers: &'static [ProcessMatcher],
-    /// Matchers for processes that satisfy `process_matchers` but are not
+    /// Excludes for processes that satisfy `process_matchers` but are not
     /// agent sessions (e.g. a harness's background daemon).
     ///
-    /// Tested against argv0 and argv1 only (the command and its
-    /// subcommand), so positional data such as a prompt never excludes a
-    /// real session. Any match vetoes discovery for this harness.
-    pub process_excludes: &'static [ProcessMatcher],
+    /// Each exclude targets argv0 or argv1 (see [`ArgvExclude`] for how
+    /// that interacts with prompts passed as argv1). Any match vetoes
+    /// discovery for this harness.
+    pub process_excludes: &'static [ArgvExclude],
     /// Whether this harness should be detected by daemon `/proc` discovery.
     ///
     /// Keep this false until a harness has an adapter/status source, otherwise
@@ -306,5 +333,17 @@ mod tests {
         assert!(pi.process_matchers.iter().any(|m| m.matches("/usr/bin/pi")));
         assert!(pi.discovery_enabled);
         assert!(!pi.allow_bare_cmdline_match);
+    }
+
+    #[test]
+    fn argv_exclude_matches_only_its_position() {
+        let command = ArgvExclude::Command(ProcessMatcher::Exact("bwrap"));
+        assert!(command.matches(0, "bwrap"));
+        assert!(!command.matches(1, "bwrap"));
+
+        let subcommand = ArgvExclude::Subcommand(ProcessMatcher::Exact("app-server"));
+        assert!(subcommand.matches(1, "app-server"));
+        assert!(!subcommand.matches(0, "app-server"));
+        assert!(!subcommand.matches(2, "app-server"));
     }
 }

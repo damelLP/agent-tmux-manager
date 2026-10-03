@@ -336,6 +336,11 @@ impl RegistryActor {
             // duration, etc.) — only refresh cwd and git info from the new discovery.
             let old_id = existing_session.id.clone();
             let cwd_str = cwd.to_string_lossy().to_string();
+            let session_id = if !old_id.is_pending() && session_id.is_pending() {
+                old_id.clone()
+            } else {
+                session_id
+            };
 
             // Update session_id to match the new discovery
             existing_session.id = session_id.clone();
@@ -2122,10 +2127,10 @@ mod tests {
         });
         rx.await.unwrap().unwrap();
 
-        // Verify metadata preserved under new session_id
+        // Verify metadata preserved under the real session_id
         let (tx, rx) = oneshot::channel();
         actor.handle_command(RegistryCommand::GetSession {
-            session_id: SessionId::new("pending-rescan"),
+            session_id: SessionId::new("real-id"),
             respond_to: tx,
         });
         let view = rx.await.unwrap().unwrap();
@@ -2135,14 +2140,17 @@ mod tests {
             view.cost_usd
         );
 
-        // Old session_id should no longer exist
+        // The rescan's pending session_id should not enter the index
         let (tx, rx) = oneshot::channel();
         actor.handle_command(RegistryCommand::GetSession {
-            session_id: SessionId::new("real-id"),
+            session_id: SessionId::new("pending-rescan"),
             respond_to: tx,
         });
-        let old = rx.await.unwrap();
-        assert!(old.is_none(), "old session_id should be removed from index");
+        let pending = rx.await.unwrap();
+        assert!(
+            pending.is_none(),
+            "real session_id should not be downgraded"
+        );
     }
 
     #[tokio::test]

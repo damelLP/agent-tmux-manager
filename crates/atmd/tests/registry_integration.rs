@@ -1187,11 +1187,10 @@ async fn test_rescan_preserves_metadata_for_existing_pid() {
         .unwrap();
 
     // Session should still be accessible and metadata preserved
-    // Note: session_id will have been updated to the new pending id
     let view = handle
-        .get_session(SessionId::new("pending-rescan"))
+        .get_session(SessionId::new("real-session-id"))
         .await
-        .expect("session should exist under new id");
+        .expect("session should keep its real id");
     assert!(
         view.cost_usd > 1.0,
         "cost should be preserved after rescan (~1.50), got {}",

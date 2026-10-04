@@ -31,6 +31,9 @@ pub fn matches(session: &SessionView, query: &str) -> bool {
         Some(session.id_short.as_str()),
         session.project_root.as_deref(),
         session.worktree_branch.as_deref(),
+        // `working_directory` is a shortened display suffix; the full
+        // worktree path covers the part it cuts off.
+        session.worktree_path.as_deref(),
         session.working_directory.as_deref(),
     ]
     .into_iter()
@@ -97,6 +100,16 @@ mod tests {
         assert!(matches(&s, "needs in"));
         assert!(matches(&s, "login"));
         assert!(!matches(&s, "pi-agent"));
+    }
+
+    #[test]
+    fn matches_full_worktree_path_beyond_truncated_cwd() {
+        // SessionView shortens working_directory to its last 27 bytes.
+        let mut s = session("a", None);
+        s.working_directory = Some("...rees/feature-with-long-name".to_string());
+        s.worktree_path =
+            Some("/home/user/client-acme/.worktrees/feature-with-long-name".to_string());
+        assert!(matches(&s, "client-acme"));
     }
 
     #[test]

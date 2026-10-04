@@ -592,14 +592,15 @@ async fn run_event_loop(
                                 }
                             }
                         }
+                    }
 
-                        // After any action, check if selected pane changed
-                        let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
-                        if app.capture_pane_id != new_pane {
-                            app.capture_pane_id.clone_from(&new_pane);
-                            app.captured_output.clear();
-                            let _ = capture_pane_tx.send(new_pane);
-                        }
+                    // After any key (actions, search edits, filter clear),
+                    // check if selected pane changed
+                    let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
+                    if app.capture_pane_id != new_pane {
+                        app.capture_pane_id.clone_from(&new_pane);
+                        app.captured_output.clear();
+                        let _ = capture_pane_tx.send(new_pane);
                     }
                 }
                 Event::CaptureUpdate { pane_id, lines } => {

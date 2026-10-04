@@ -109,8 +109,9 @@ pub struct App {
     pub filter_matches: Option<HashSet<SessionId>>,
 
     /// Fold state saved when a filter starts, restored when it ends.
-    /// `Some` exactly while a filter is active.
-    pre_filter_expanded: Option<HashSet<TreeNodeId>>,
+    /// `Some` exactly while a filter is active; `Some(None)` when the filter
+    /// started before any tree was built, so there is no fold state to keep.
+    pre_filter_expanded: Option<Option<HashSet<TreeNodeId>>>,
 }
 
 impl Default for App {
@@ -230,6 +231,7 @@ impl App {
         } else {
             self.sessions.values().cloned().collect()
         };
+        let previous_matches = self.filter_matches.take();
         self.filter_matches = if self.filter_query.is_empty() {
             None
         } else {
@@ -243,6 +245,19 @@ impl App {
         // On first build, expand everything so the tree starts open
         if self.expanded.is_empty() && !self.tree.is_empty() {
             self.expanded = all_node_ids(&self.tree);
+        }
+
+        // Open the groups around sessions that just started matching, so a
+        // live update never leaves a match hidden in a collapsed fold.
+        if let Some(matched) = &self.filter_matches {
+            for id in matched {
+                if previous_matches.as_ref().is_some_and(|p| p.contains(id)) {
+                    continue;
+                }
+                if let Some(path) = ancestor_ids(&self.tree, &TreeNodeId::Agent(id.clone())) {
+                    self.expanded.extend(path);
+                }
+            }
         }
 
         self.reflatten();
@@ -299,8 +314,8 @@ impl App {
         // Open the selection's ancestors in the unfiltered tree; it can have
         // group levels (e.g. worktrees) that the filtered tree skipped.
         // Assigned after the rebuild, which expands everything when the set
-        // is empty.
-        let mut expanded = saved;
+        // is empty. With no saved state, open everything like a first build.
+        let mut expanded = saved.unwrap_or_else(|| all_node_ids(&self.tree));
         if let Some(path) = selected
             .as_ref()
             .and_then(|id| ancestor_ids(&self.tree, id))
@@ -328,7 +343,7 @@ impl App {
     /// never hidden in a collapsed fold, and selects the first match.
     fn apply_filter_change(&mut self) {
         if self.pre_filter_expanded.is_none() {
-            self.pre_filter_expanded = Some(self.expanded.clone());
+            self.pre_filter_expanded = Some((!self.tree.is_empty()).then(|| self.expanded.clone()));
         }
         self.rebuild_tree();
         self.expanded.extend(all_node_ids(&self.tree));
@@ -900,6 +915,41 @@ mod tests {
         ]);
 
         assert_eq!(agent_ids(&app), vec!["late"]);
+    }
+
+    #[test]
+    fn test_filter_opens_collapsed_group_when_session_starts_matching() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        a.harness = "qq".to_string();
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a, b.clone()]);
+        app.set_node_expanded(&TreeNodeId::Project("/p/beta".to_string()), false);
+        // No prefix of "qq" matches bbb, so typing never opens beta.
+        type_query(&mut app, "qq");
+        app.confirm_search();
+
+        b.harness = "qq".to_string();
+        app.update_sessions(vec![b]);
+
+        assert_eq!(agent_ids(&app), vec!["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn test_clear_filter_started_before_sessions_loaded_opens_all() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        type_query(&mut app, "aaa");
+        app.update_sessions(vec![a, b]);
+
+        app.clear_filter();
+
+        assert_eq!(agent_ids(&app), vec!["aaa", "bbb"]);
     }
 
     #[test]

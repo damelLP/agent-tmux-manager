@@ -16,6 +16,7 @@ pub mod app;
 pub mod client;
 pub mod daemon;
 pub mod error;
+pub mod filter;
 pub mod input;
 pub mod keybinding;
 pub mod setup;

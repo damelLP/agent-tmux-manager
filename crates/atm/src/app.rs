@@ -97,6 +97,16 @@ pub struct App {
 
     /// Compact mode: vertical layout optimized for narrow sidebar panes.
     pub compact: bool,
+
+    /// Free-text filter query (empty = no filter). Applied live while typing.
+    pub filter_query: String,
+
+    /// Whether the `/` search prompt is open and capturing keystrokes.
+    pub search_active: bool,
+
+    /// Sessions matching `filter_query`, or `None` when no filter is active.
+    /// Visible sessions outside this set are shown only as context.
+    pub filter_matches: Option<HashSet<SessionId>>,
 }
 
 impl Default for App {
@@ -126,6 +136,9 @@ impl App {
             tmux_session_filter: None,
             filter_pane_ids: HashSet::new(),
             compact: false,
+            filter_query: String::new(),
+            search_active: false,
+            filter_matches: None,
         }
     }
 
@@ -194,7 +207,7 @@ impl App {
     /// On first build (no expanded nodes yet), expands all nodes so the
     /// tree starts fully open.
     fn rebuild_tree(&mut self) {
-        let sessions: Vec<SessionView> = if self.tmux_session_filter.is_some() {
+        let mut sessions: Vec<SessionView> = if self.tmux_session_filter.is_some() {
             if self.filter_pane_ids.is_empty() {
                 // Filter is set but pane IDs not loaded yet — show empty
                 Vec::new()
@@ -212,6 +225,14 @@ impl App {
         } else {
             self.sessions.values().cloned().collect()
         };
+        self.filter_matches = if self.filter_query.is_empty() {
+            None
+        } else {
+            let refs: Vec<&SessionView> = sessions.iter().collect();
+            let selection = crate::filter::select(&refs, &self.filter_query);
+            sessions.retain(|s| selection.visible.contains(&s.id));
+            Some(selection.matched)
+        };
         self.tree = build_tree(&sessions);
 
         // On first build, expand everything so the tree starts open
@@ -220,6 +241,71 @@ impl App {
         }
 
         self.reflatten();
+        self.clamp_selection();
+    }
+
+    /// Opens the `/` search prompt, keeping any existing query for editing.
+    pub fn start_search(&mut self) {
+        self.search_active = true;
+    }
+
+    /// Closes the search prompt and keeps the current filter applied.
+    pub fn confirm_search(&mut self) {
+        self.search_active = false;
+    }
+
+    /// Appends a character to the filter query.
+    pub fn push_search_char(&mut self, c: char) {
+        self.filter_query.push(c);
+        self.apply_filter_change();
+    }
+
+    /// Removes the last character from the filter query.
+    pub fn pop_search_char(&mut self) {
+        if self.filter_query.pop().is_some() {
+            self.apply_filter_change();
+        }
+    }
+
+    /// Closes the search prompt and removes the filter, keeping the cursor
+    /// on the row that was selected.
+    pub fn clear_filter(&mut self) {
+        self.search_active = false;
+        if !self.filter_query.is_empty() {
+            let selected = self
+                .tree_rows
+                .get(self.selected_index)
+                .map(|r| r.node_id.clone());
+            self.filter_query.clear();
+            self.rebuild_tree();
+            if let Some(pos) =
+                selected.and_then(|id| self.tree_rows.iter().position(|r| r.node_id == id))
+            {
+                self.selected_index = pos;
+            }
+        }
+    }
+
+    /// Returns true if the session is shown only as an ancestor of a match.
+    pub fn is_filter_context(&self, id: &SessionId) -> bool {
+        self.filter_matches
+            .as_ref()
+            .is_some_and(|matched| !matched.contains(id))
+    }
+
+    /// Rebuilds after a query edit, expanding every group so matches are
+    /// never hidden in a collapsed fold, and selects the first match.
+    fn apply_filter_change(&mut self) {
+        self.rebuild_tree();
+        self.expanded.extend(all_node_ids(&self.tree));
+        self.reflatten();
+        if let Some(matched) = &self.filter_matches {
+            if let Some(pos) = self.tree_rows.iter().position(|r| {
+                matches!(&r.kind, TreeRowKind::Agent { session } if matched.contains(&session.id))
+            }) {
+                self.selected_index = pos;
+            }
+        }
         self.clamp_selection();
     }
 
@@ -580,6 +666,116 @@ mod tests {
             tmux_pane: None,
             ..Default::default()
         }
+    }
+
+    fn type_query(app: &mut App, query: &str) {
+        app.start_search();
+        for c in query.chars() {
+            app.push_search_char(c);
+        }
+    }
+
+    fn agent_ids(app: &App) -> Vec<&str> {
+        app.tree_rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                TreeRowKind::Agent { session } => Some(session.id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_filter_keeps_lead_as_context_for_matching_child() {
+        let lead = create_test_session("lead", "2024-01-15T10:00:00Z");
+        let mut mate = create_test_session("mate", "2024-01-15T10:01:00Z");
+        mate.parent_session_id = Some(lead.id.clone());
+        mate.harness = "codex".to_string();
+        let other = create_test_session("other", "2024-01-15T10:02:00Z");
+        let mut app = App::new();
+        app.update_sessions(vec![lead, mate, other]);
+
+        type_query(&mut app, "codex");
+
+        assert_eq!(agent_ids(&app), vec!["lead", "mate"]);
+        let mate_row = app.tree_rows.iter().find(
+            |r| matches!(&r.kind, TreeRowKind::Agent { session } if session.id.as_str() == "mate"),
+        );
+        assert_eq!(mate_row.map(|r| r.depth), Some(2), "mate stays nested");
+        assert!(app.is_filter_context(&SessionId::new("lead")));
+        assert!(!app.is_filter_context(&SessionId::new("mate")));
+        assert_eq!(
+            app.selected_session().map(|s| s.id.as_str()),
+            Some("mate"),
+            "first match is selected"
+        );
+    }
+
+    #[test]
+    fn test_filter_expands_collapsed_groups_holding_matches() {
+        let mut app = App::new();
+        app.update_sessions(vec![create_test_session("s1", "2024-01-15T10:00:00Z")]);
+        app.collapse_all();
+        assert!(agent_ids(&app).is_empty());
+
+        type_query(&mut app, "s1");
+
+        assert_eq!(agent_ids(&app), vec!["s1"]);
+    }
+
+    #[test]
+    fn test_clear_filter_restores_all_sessions() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            create_test_session("aaa", "2024-01-15T10:00:00Z"),
+            create_test_session("bbb", "2024-01-15T10:01:00Z"),
+        ]);
+        type_query(&mut app, "aaa");
+        app.confirm_search();
+        assert!(!app.search_active);
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+
+        app.clear_filter();
+
+        assert!(app.filter_matches.is_none());
+        assert!(!app.is_filter_context(&SessionId::new("aaa")));
+        assert_eq!(agent_ids(&app).len(), 2);
+        assert_eq!(
+            app.selected_session().map(|s| s.id.as_str()),
+            Some("aaa"),
+            "cursor stays on the session picked while filtered"
+        );
+    }
+
+    #[test]
+    fn test_backspace_to_empty_removes_filter() {
+        let mut app = App::new();
+        app.update_sessions(vec![create_test_session("aaa", "2024-01-15T10:00:00Z")]);
+        type_query(&mut app, "zz");
+        assert!(agent_ids(&app).is_empty());
+
+        app.pop_search_char();
+        app.pop_search_char();
+        app.pop_search_char(); // extra pop on empty query is a no-op
+
+        assert!(app.search_active, "prompt stays open");
+        assert!(app.filter_matches.is_none());
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+    }
+
+    #[test]
+    fn test_filter_applies_to_sessions_arriving_later() {
+        let mut app = App::new();
+        type_query(&mut app, "codex");
+        let mut late = create_test_session("late", "2024-01-15T10:00:00Z");
+        late.harness = "codex".to_string();
+
+        app.update_sessions(vec![
+            late,
+            create_test_session("plain", "2024-01-15T10:01:00Z"),
+        ]);
+
+        assert_eq!(agent_ids(&app), vec!["late"]);
     }
 
     #[test]

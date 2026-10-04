@@ -75,6 +75,7 @@ pub fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" - Agent Tmux Manager | "),
         Span::styled(status_text, status_style),
         Span::styled(stats_display, Style::default().fg(Color::DarkGray)),
+        Span::styled(filter_indicator(app), Style::default().fg(Color::Yellow)),
     ]);
 
     let border_style = match app.state {
@@ -152,6 +153,13 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    if app.search_active {
+        hints = vec![
+            Span::styled(format!(" /{}\u{258c}", app.filter_query), key_style),
+            Span::styled("  Enter keep  Esc clear", sep_style),
+        ];
+    }
+
     let footer_line = Line::from(hints);
 
     let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
@@ -161,13 +169,32 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Renders a minimal single-line footer for compact mode.
 pub fn render_compact_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if app.pick_mode {
-        "? help [pick]"
+    let text = if app.search_active {
+        format!("/{}\u{258c}", app.filter_query)
+    } else if app.filter_matches.is_some() {
+        filter_indicator(app).trim_start_matches(" | ").to_string()
+    } else if app.pick_mode {
+        "? help [pick]".to_string()
     } else {
-        "? help"
+        "? help".to_string()
     };
     let paragraph = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
+}
+
+/// Returns ` | /query N/M` while a filter is active, else an empty string.
+///
+/// N counts matching sessions; M counts every session the TUI knows about.
+fn filter_indicator(app: &App) -> String {
+    match &app.filter_matches {
+        Some(matched) => format!(
+            " | /{} {}/{}",
+            app.filter_query,
+            matched.len(),
+            app.session_count()
+        ),
+        None => String::new(),
+    }
 }
 
 /// Returns the display text and style for the given connection state.

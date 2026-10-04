@@ -8,7 +8,7 @@ use crate::ui::theme::{context_color, status_background, status_color, status_ic
 use atm_core::{SessionView, TreeRow, TreeRowKind};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
@@ -34,7 +34,10 @@ pub fn render_session_list(frame: &mut Frame, area: Rect, app: &App) {
         .tree_rows
         .iter()
         .enumerate()
-        .map(|(idx, row)| create_tree_row_item(row, idx == app.selected_index, app.blink_visible))
+        .map(|(idx, row)| {
+            let item = create_tree_row_item(row, idx == app.selected_index, app.blink_visible);
+            dim_if_filter_context(item, row, app)
+        })
         .collect();
 
     let title = format!(" Sessions ({}) ", app.session_count());
@@ -100,7 +103,7 @@ pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
                 _ => Style::default(),
             };
 
-            ListItem::new(line).style(bg_style)
+            dim_if_filter_context(ListItem::new(line).style(bg_style), row, app)
         })
         .collect();
 
@@ -114,6 +117,14 @@ pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     frame.render_widget(list, area);
+}
+
+/// Dims an agent row shown only as the ancestor of a filter match.
+fn dim_if_filter_context<'a>(item: ListItem<'a>, row: &TreeRow, app: &App) -> ListItem<'a> {
+    match &row.kind {
+        TreeRowKind::Agent { session } if app.is_filter_context(&session.id) => item.dim(),
+        _ => item,
+    }
 }
 
 /// Creates a list item for a single tree row.

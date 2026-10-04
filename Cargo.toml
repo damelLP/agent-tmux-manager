@@ -46,7 +46,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/damelLP/agent-tmux-manager"
@@ -88,14 +88,14 @@ tempfile = "3.14"
 insta = "1"
 
 # Internal crates (version required for crates.io, path for local dev)
-atm-core = { version = "0.2.5", path = "crates/atm-core" }
-atm-protocol = { version = "0.2.5", path = "crates/atm-protocol" }
-atm-tmux = { version = "0.2.5", path = "crates/atm-tmux" }
-atm-claude-adapter = { version = "0.2.5", path = "crates/atm-claude-adapter" }
-atm-pi-adapter = { version = "0.2.5", path = "crates/atm-pi-adapter" }
-atm-codex-adapter = { version = "0.2.5", path = "crates/atm-codex-adapter" }
-atm-tui = { version = "0.2.5", path = "crates/atm" }
-atmd = { version = "0.2.5", path = "crates/atmd" }
+atm-core = { version = "0.2.6", path = "crates/atm-core" }
+atm-protocol = { version = "0.2.6", path = "crates/atm-protocol" }
+atm-tmux = { version = "0.2.6", path = "crates/atm-tmux" }
+atm-claude-adapter = { version = "0.2.6", path = "crates/atm-claude-adapter" }
+atm-pi-adapter = { version = "0.2.6", path = "crates/atm-pi-adapter" }
+atm-codex-adapter = { version = "0.2.6", path = "crates/atm-codex-adapter" }
+atm-tui = { version = "0.2.6", path = "crates/atm" }
+atmd = { version = "0.2.6", path = "crates/atmd" }
 
 [dependencies]
 # Required for root package to compile the binaries

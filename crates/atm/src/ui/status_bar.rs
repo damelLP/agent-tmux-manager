@@ -75,7 +75,6 @@ pub fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" - Agent Tmux Manager | "),
         Span::styled(status_text, status_style),
         Span::styled(stats_display, Style::default().fg(Color::DarkGray)),
-        Span::styled(filter_indicator(app), Style::default().fg(Color::Yellow)),
     ]);
 
     let border_style = match app.state {
@@ -153,6 +152,21 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Lead with the active filter so narrow terminals clip hints, not it.
+    if app.filter_matches.is_some() {
+        hints.splice(
+            0..0,
+            [
+                Span::styled(
+                    format!(" {}", filter_indicator(app)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                // The first hint brings its own leading space.
+                Span::styled("  | ", sep_style),
+            ],
+        );
+    }
+
     if app.search_active {
         hints = vec![
             Span::styled(format!(" /{}\u{258c}", app.filter_query), key_style),
@@ -172,7 +186,7 @@ pub fn render_compact_footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = if app.search_active {
         format!("/{}\u{258c}", app.filter_query)
     } else if app.filter_matches.is_some() {
-        filter_indicator(app).trim_start_matches(" | ").to_string()
+        filter_indicator(app)
     } else if app.pick_mode {
         "? help [pick]".to_string()
     } else {
@@ -182,13 +196,13 @@ pub fn render_compact_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-/// Returns ` | /query N/M` while a filter is active, else an empty string.
+/// Returns `/query N/M` while a filter is active, else an empty string.
 ///
 /// N counts matching sessions; M counts every session the TUI knows about.
 fn filter_indicator(app: &App) -> String {
     match &app.filter_matches {
         Some(matched) => format!(
-            " | /{} {}/{}",
+            "/{} {}/{}",
             app.filter_query,
             matched.len(),
             app.session_count()

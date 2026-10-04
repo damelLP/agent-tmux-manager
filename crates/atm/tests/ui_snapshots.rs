@@ -543,10 +543,15 @@ fn session_list_filter_dims_context_lead() {
 }
 
 #[test]
-fn header_with_active_filter() {
-    let app = make_filtered_app();
-    let buf = render_buffer(100, 3, |frame, area| {
-        render_header(frame, area, &app);
+fn footer_with_active_filter_80_cols() {
+    // After Enter closes the prompt, the filter must stay visible at a
+    // normal width; it leads the footer so hints clip instead.
+    let buf = with_tmux(|| {
+        let mut app = make_filtered_app();
+        app.confirm_search();
+        render_buffer(80, 3, |frame, area| {
+            render_footer(frame, area, &app);
+        })
     });
     insta::assert_debug_snapshot!(buf);
 }

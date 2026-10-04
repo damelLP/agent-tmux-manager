@@ -288,26 +288,33 @@ impl App {
     /// selected row and the groups around it open (like vim after a search).
     /// No-op when no filter is active.
     fn end_filter(&mut self) {
-        let Some(mut saved) = self.pre_filter_expanded.take() else {
+        let Some(saved) = self.pre_filter_expanded.take() else {
             return;
         };
-        let selected = self.tree_rows.get(self.selected_index).map(|row| {
-            let mut depth = row.depth;
-            for r in self.tree_rows.iter().take(self.selected_index).rev() {
-                if r.depth < depth {
-                    saved.insert(r.node_id.clone());
-                    depth = r.depth;
-                }
-            }
-            row.node_id.clone()
-        });
-        self.expanded = saved;
+        let selected = self
+            .tree_rows
+            .get(self.selected_index)
+            .map(|r| r.node_id.clone());
         self.rebuild_tree();
+        // Open the selection's ancestors in the unfiltered tree; it can have
+        // group levels (e.g. worktrees) that the filtered tree skipped.
+        // Assigned after the rebuild, which expands everything when the set
+        // is empty.
+        let mut expanded = saved;
+        if let Some(path) = selected
+            .as_ref()
+            .and_then(|id| ancestor_ids(&self.tree, id))
+        {
+            expanded.extend(path);
+        }
+        self.expanded = expanded;
+        self.reflatten();
         if let Some(pos) =
             selected.and_then(|id| self.tree_rows.iter().position(|r| r.node_id == id))
         {
             self.selected_index = pos;
         }
+        self.clamp_selection();
     }
 
     /// Returns true if the session is shown only as an ancestor of a match.
@@ -655,6 +662,25 @@ impl App {
     }
 }
 
+/// Returns the IDs of the groups enclosing `target`, outermost first, or
+/// `None` if `target` is not in the tree.
+fn ancestor_ids(tree: &[TreeNode], target: &TreeNodeId) -> Option<Vec<TreeNodeId>> {
+    tree.iter().find_map(|node| {
+        if &node.node_id() == target {
+            return Some(Vec::new());
+        }
+        let children = match node {
+            TreeNode::Project { children, .. }
+            | TreeNode::Worktree { children, .. }
+            | TreeNode::Team { children, .. } => children,
+            TreeNode::Agent { subagents, .. } => subagents,
+        };
+        let mut path = ancestor_ids(children, target)?;
+        path.insert(0, node.node_id());
+        Some(path)
+    })
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -795,6 +821,32 @@ mod tests {
             .expanded
             .contains(&TreeNodeId::Project("/p/beta".to_string())));
         assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("aaa"));
+    }
+
+    #[test]
+    fn test_clear_filter_reopens_worktree_hidden_while_filtered() {
+        // Two worktrees: filtering to one drops the worktree level (single
+        // worktree), so the collapsed worktree never appears while filtered.
+        let wt = |id: &str, path: &str, t: &str| {
+            let mut s = create_test_session(id, t);
+            s.project_root = Some("/p".to_string());
+            s.worktree_path = Some(path.to_string());
+            s
+        };
+        let mut app = App::new();
+        app.update_sessions(vec![
+            wt("aaa", "/p", "2024-01-15T10:00:00Z"),
+            wt("bbb", "/p/.worktrees/feat", "2024-01-15T10:01:00Z"),
+        ]);
+        let feat = TreeNodeId::Worktree("/p/.worktrees/feat".to_string());
+        app.set_node_expanded(&feat, false);
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+
+        type_query(&mut app, "bbb");
+        app.clear_filter();
+
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("bbb"));
+        assert!(app.expanded.contains(&feat));
     }
 
     #[test]

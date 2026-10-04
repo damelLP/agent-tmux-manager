@@ -64,11 +64,10 @@ impl RawHookEvent {
         ) {
             return None;
         }
+        // `TeammateIdle` is absent: its `teammate_name` names the sender.
         let teammate_event = matches!(
             event,
-            ClaudeEventType::TeammateIdle
-                | ClaudeEventType::TaskCreated
-                | ClaudeEventType::TaskCompleted
+            ClaudeEventType::TaskCreated | ClaudeEventType::TaskCompleted
         );
         let id = non_empty(self.agent_id.as_deref());
         let name = teammate_event
@@ -254,10 +253,7 @@ impl RawHookEvent {
                     label: self.permission_label(),
                 },
             },
-            ClaudeEventType::TeammateIdle => {
-                self.child_agent()?;
-                LifecycleEvent::Idle
-            }
+            ClaudeEventType::TeammateIdle => LifecycleEvent::Idle,
             ClaudeEventType::TaskCreated => LifecycleEvent::Notification {
                 message: non_empty(self.task_subject.as_deref()),
                 kind: Some(NotificationKind::TaskCreated),
@@ -561,11 +557,18 @@ mod tests {
 
     #[test]
     fn teammate_metadata_and_alias_are_extracted() {
+        // Captured from a tmux teammate's own session (2.1.288): the
+        // name is the sender's, so the event idles that session itself.
         let mut idle = raw("TeammateIdle");
-        idle.teammate_name = Some("reviewer".into());
+        idle.teammate_name = Some("waiter".into());
+        idle.agent_type = Some("general-purpose".into());
         assert_eq!(idle.to_lifecycle_event(), Some(LifecycleEvent::Idle));
+        assert_eq!(idle.child_agent(), None);
+
+        let mut task = raw("TaskCompleted");
+        task.teammate_name = Some("reviewer".into());
         assert_eq!(
-            idle.child_agent(),
+            task.child_agent(),
             Some(ChildAgent {
                 reference: ChildRef::Name("reviewer".into()),
                 agent_type: AgentType::Teammate,

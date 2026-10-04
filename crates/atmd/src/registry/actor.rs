@@ -24,6 +24,7 @@ use atm_core::{
 use atm_protocol::RawStatusLine;
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
+use crate::discovery::read_parent_session_id;
 
 // ============================================================================
 // Resource Limits (from RESOURCE_LIMITS.md)
@@ -396,6 +397,7 @@ impl RegistryActor {
             harness,
             tmux_pane,
             Some(cwd),
+            read_parent_session_id(pid, harness),
         );
         let agent_type = session.agent_type.clone();
 
@@ -744,6 +746,7 @@ impl RegistryActor {
                 harness,
                 tmux_pane.clone(),
                 proc_cwd,
+                read_parent_session_id(p, harness),
             );
             let mut infra = SessionInfrastructure::new();
             infra.set_pid(p);
@@ -1176,6 +1179,8 @@ impl RegistryActor {
 ///
 /// When `cwd` is `None` (e.g., `/proc/{pid}/cwd` read failed) the
 /// project/worktree/working_directory fields are left at their defaults.
+/// `parent_session_id` nests a separate-process child (e.g. a tmux-mode
+/// teammate) under the session that spawned it.
 fn build_session_from_pid(
     session_id: SessionId,
     agent_type: AgentType,
@@ -1183,10 +1188,12 @@ fn build_session_from_pid(
     harness: atm_core::Harness,
     tmux_pane: Option<String>,
     cwd: Option<PathBuf>,
+    parent_session_id: Option<SessionId>,
 ) -> SessionDomain {
     let mut session = SessionDomain::new(session_id, agent_type, model);
     session.harness = harness;
     session.tmux_pane = tmux_pane;
+    session.parent_session_id = parent_session_id;
     if let Some(cwd) = cwd {
         // Note: resolve_* are local stat() calls walking up ~5 dirs (~5μs),
         // acceptable inline per Tokio guidelines for sub-100μs sync work.
@@ -2393,6 +2400,63 @@ mod tests {
             respond_to,
         });
         assert!(session_view(&actor, "synthetic").is_none());
+    }
+
+    /// A tmux-mode teammate is its own process whose argv names the lead
+    /// via `--parent-session-id`. Uses a real process so the
+    /// `/proc/{pid}/cmdline` read is exercised.
+    #[test]
+    fn process_teammate_links_to_lead_from_cmdline_and_outlives_it() {
+        let (_, mut actor, _) = create_actor();
+        let lead = register_test_session(&mut actor, "lead-1");
+        // The `read` builtin blocks sh itself on stdin: no child process
+        // that could outlive `kill`, and no exec to replace the argv.
+        let mut process = std::process::Command::new("sh")
+            .args(["-c", "read _", "claude", "--parent-session-id"])
+            .arg(lead.as_str())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fake teammate");
+        // Until exec completes, the child's cmdline is still the test's.
+        let cmdline = format!("/proc/{}/cmdline", process.id());
+        let flag = b"--parent-session-id";
+        for _ in 0..200 {
+            let exec_done = std::fs::read(&cmdline)
+                .is_ok_and(|argv| argv.windows(flag.len()).any(|w| w == flag));
+            if exec_done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new("teammate-1"),
+            event: LifecycleEvent::WorkingStart,
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(process.id()),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        let teammate = session_view(&actor, "teammate-1");
+        let lead_view = session_view(&actor, "lead-1");
+
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Remove {
+            session_id: lead.clone(),
+            respond_to,
+        });
+        let survived = session_view(&actor, "teammate-1").is_some();
+        let _ = process.kill();
+        let _ = process.wait();
+
+        assert_eq!(teammate.and_then(|view| view.parent_session_id), Some(lead));
+        assert!(lead_view.is_some_and(|view| view.child_session_ids.is_empty()));
+        assert!(
+            survived,
+            "removing the lead must not remove a process teammate"
+        );
     }
 
     #[test]

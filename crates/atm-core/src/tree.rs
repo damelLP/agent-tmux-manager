@@ -232,22 +232,25 @@ pub fn build_tree(sessions: &[SessionView]) -> Vec<TreeNode> {
             extract_project_name(project_root)
         };
 
-        // Build agent nodes (with subagent nesting)
-        let make_agent_node = |session: &SessionView| -> TreeNode {
+        // Build agent nodes with descendants at any depth (e.g. lead >
+        // process teammate > its in-process subagent). Terminates: each
+        // session has one parent, so no cycle is reachable from a root.
+        fn agent_node(
+            session: &SessionView,
+            children_by_parent: &HashMap<&SessionId, Vec<&SessionView>>,
+        ) -> TreeNode {
             let subagents: Vec<TreeNode> = children_by_parent
                 .get(&session.id)
                 .into_iter()
                 .flatten()
-                .map(|child| TreeNode::Agent {
-                    session: (*child).clone(),
-                    subagents: Vec::new(), // No recursive subagent nesting for now
-                })
+                .map(|child| agent_node(child, children_by_parent))
                 .collect();
             TreeNode::Agent {
                 session: session.clone(),
                 subagents,
             }
-        };
+        }
+        let make_agent_node = |session: &SessionView| agent_node(session, &children_by_parent);
 
         // Group by worktree within this project
         let mut by_worktree: BTreeMap<Option<&str>, Vec<&SessionView>> = BTreeMap::new();
@@ -635,6 +638,38 @@ mod tests {
             }
             _ => panic!("expected Project"),
         }
+    }
+
+    /// Lead > tmux teammate (own process) > the teammate's in-process
+    /// subagent: the grandchild must render, and its attention bubble up.
+    #[test]
+    fn test_grandchild_is_nested_and_visible() {
+        let lead = make_session("lead");
+        let mut teammate = make_session("teammate");
+        teammate.parent_session_id = Some(SessionId::new("lead"));
+        let mut subagent = make_session("subagent");
+        subagent.parent_session_id = Some(SessionId::new("teammate"));
+        subagent.needs_attention = true;
+
+        let tree = build_tree(&[lead, teammate, subagent]);
+        let rows = flatten_tree(&tree, &all_node_ids(&tree));
+        let agents: Vec<(&str, u8)> = rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                TreeRowKind::Agent { session } => Some((session.id.as_str(), row.depth)),
+                _ => None,
+            })
+            .collect();
+        let lead_depth = agents.first().map(|(_, depth)| *depth).unwrap_or_default();
+        assert_eq!(
+            agents,
+            [
+                ("lead", lead_depth),
+                ("teammate", lead_depth + 1),
+                ("subagent", lead_depth + 2),
+            ]
+        );
+        assert!(tree.iter().all(TreeNode::needs_attention));
     }
 
     #[test]

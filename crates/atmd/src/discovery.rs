@@ -557,6 +557,25 @@ fn cmdline_is_excluded(cmdline: &[u8], definition: &HarnessDefinition) -> bool {
         })
 }
 
+/// The spawning session's id (e.g. an agent-team lead's), read from
+/// `/proc/{pid}/cmdline` via the harness's `parent_session_flag`.
+pub(crate) fn read_parent_session_id(pid: u32, harness: Harness) -> Option<SessionId> {
+    let flag = builtin_harnesses()
+        .find(|definition| definition.harness == harness)?
+        .parent_session_flag?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    cmdline_flag_value(&cmdline, flag).map(SessionId::new)
+}
+
+/// The non-empty argument after `flag` in a NUL-separated cmdline.
+fn cmdline_flag_value<'a>(cmdline: &'a [u8], flag: &str) -> Option<&'a str> {
+    let mut args = cmdline.split(|&b| b == 0);
+    args.find(|arg| *arg == flag.as_bytes())?;
+    std::str::from_utf8(args.next()?)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
 /// Gets process info (cwd, tmux pane) for a PID.
 fn get_process_info(pid: u32, harness: Harness) -> Option<DiscoveredProcess> {
     // Read working directory
@@ -951,6 +970,47 @@ mod tests {
             && argv.iter().enumerate().any(|(i, arg)| {
                 !arg.starts_with('-') && cmdline_arg_matches_definition(i, arg, codex)
             })
+    }
+
+    /// Real tmux-mode teammate argv, Claude Code 2.1.288 (2026-10-04);
+    /// `--settings` value elided.
+    #[test]
+    fn claude_teammate_cmdline_yields_lead_session_id() {
+        let flag = atm_core::find_harness_definition("claude")
+            .and_then(|definition| definition.parent_session_flag)
+            .expect("claude declares parent_session_flag");
+        let teammate = proc_cmdline(&[
+            "/tmp/.tmpy921TZ/claude/versions/2.1.288",
+            "--agent-id",
+            "waiter@session-ae223ce3",
+            "--agent-name",
+            "waiter",
+            "--team-name",
+            "session-ae223ce3",
+            "--agent-color",
+            "green",
+            "--parent-session-id",
+            "ae223ce3-e66f-4c6b-971d-194a9b7c583a",
+            "--agent-type",
+            "general-purpose",
+            "--permission-mode",
+            "auto",
+            "--model",
+            "claude-opus-5-5",
+        ]);
+        assert_eq!(
+            cmdline_flag_value(&teammate, flag),
+            Some("ae223ce3-e66f-4c6b-971d-194a9b7c583a")
+        );
+        assert_eq!(cmdline_flag_value(&proc_cmdline(&["claude"]), flag), None);
+        assert_eq!(
+            cmdline_flag_value(&proc_cmdline(&["claude", flag]), flag),
+            None
+        );
+        assert_eq!(
+            cmdline_flag_value(&proc_cmdline(&["claude", flag, ""]), flag),
+            None
+        );
     }
 
     #[test]

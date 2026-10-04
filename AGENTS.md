@@ -22,10 +22,13 @@ These govern every unit of work. Follow them literally.
 ### 2. If it doesn't fit, stop and ask
 
 - A change **doesn't fit** if finishing it would require any of:
-  - changing a public type or function in `atm-core` or `atm-protocol` that
-    other crates depend on (or changing the wire format);
+  - changing the shape of a public type or the signature of a public
+    function in `atm-core` or `atm-protocol` that other crates depend on
+    (or changing the wire format);
   - moving or renaming existing files, types or crates;
   - teaching a vendor-neutral crate about a specific harness.
+- A behaviour-only fix to a public function in those crates fits. Name it
+  in the PR description and check every caller.
 - When a change doesn't fit, **do not do the refactor yourself**, however
   small. Stop, describe the refactor needed, and ask the user.
 - A refactor is its own unit of work. It **must not change behaviour**:
@@ -47,6 +50,13 @@ hooks, tmux). Their real behaviour beats docs, and docs beat assumptions.
   only; `PreToolUse` instead). Checking first saved weeks of rework.
 - Vendor behaviour changes between releases. Note the harness version you
   verified against, and re-check old findings before relying on them.
+- **After building, see it work once.** A change that depends on harness
+  behaviour is not done until it has run against the real harness (real
+  `atmd`, real session). If you can't run it, list it under "Not verified"
+  in the PR.
+- **"Can't happen" is a claim to check.** Before leaving a known limit
+  unfixed, name the real case you checked. If you only reasoned about it,
+  write "unverified".
 
 ### 4. Panic-free core, explicit contracts
 
@@ -167,8 +177,13 @@ them with `/hooks`.
   rejected. Don't silently reverse a past decision; find it with
   `git log --grep "<topic>"` or `gh pr list --state merged --search "<topic>"`,
   link it, and say why it no longer holds.
-- **Before opening a PR,** review your diff (`/code-review`). Fix the
-  findings, or explain them in the PR.
+- **Open PRs as drafts** (`gh pr create --draft`). Before marking one
+  ready, review it with `/code-review <PR#>` and fix or explain the
+  findings. A reviewer that could not read the diff has not reviewed it.
+  Say in the PR what the reviewer read and ran. Ready also means
+  principle 3's "see it work once" is done or listed under "Not verified".
+- **Stacked PRs:** retarget the child to `main` before merging the parent.
+  Never delete a branch that another open PR is based on.
 
 ### Working in small contexts
 

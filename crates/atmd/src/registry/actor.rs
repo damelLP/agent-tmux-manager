@@ -2415,6 +2415,17 @@ mod tests {
             .arg(lead.as_str())
             .spawn()
             .expect("spawn fake teammate");
+        // Until exec completes, the child's cmdline is still the test's.
+        let cmdline = format!("/proc/{}/cmdline", process.id());
+        let flag = b"--parent-session-id";
+        for _ in 0..200 {
+            let exec_done = std::fs::read(&cmdline)
+                .is_ok_and(|argv| argv.windows(flag.len()).any(|w| w == flag));
+            if exec_done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         let (respond_to, _) = oneshot::channel();
         actor.handle_command(RegistryCommand::ApplyLifecycleEvent {

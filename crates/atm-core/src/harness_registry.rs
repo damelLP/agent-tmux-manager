@@ -85,6 +85,9 @@ pub struct HarnessDefinition {
     pub default_args: &'static [&'static str],
     /// Flag used to set the model, when supported.
     pub model_flag: Option<&'static str>,
+    /// Flag whose value, in a session process's argv, is the session id
+    /// of the session that spawned it (e.g. an agent-team lead).
+    pub parent_session_flag: Option<&'static str>,
     /// How to pass an initial prompt, when/if spawn grows that option.
     pub prompt_mode: PromptMode,
     /// Arguments used for installation/version probing.
@@ -174,6 +177,8 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         binary: "claude",
         default_args: &[],
         model_flag: Some("--model"),
+        // Verified against Claude Code 2.1.288 tmux-mode teammates.
+        parent_session_flag: Some("--parent-session-id"),
         prompt_mode: PromptMode::KeystrokeInjection,
         version_args: &["--version"],
         process_matchers: CLAUDE_MATCHERS,
@@ -189,6 +194,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         binary: "pi",
         default_args: &[],
         model_flag: Some("--model"),
+        parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
         version_args: &["--version"],
         process_matchers: PI_MATCHERS,
@@ -204,6 +210,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         binary: "codex",
         default_args: &[],
         model_flag: None,
+        parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
         version_args: &["--version"],
         process_matchers: CODEX_MATCHERS,
@@ -221,6 +228,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         binary: "amp",
         default_args: &[],
         model_flag: None,
+        parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
         version_args: &["--version"],
         process_matchers: AMP_MATCHERS,
@@ -236,6 +244,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         binary: "qwen",
         default_args: &[],
         model_flag: None,
+        parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
         version_args: &["--version"],
         process_matchers: QWEN_MATCHERS,
@@ -251,6 +260,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         binary: "gemini",
         default_args: &[],
         model_flag: None,
+        parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
         version_args: &["--version"],
         process_matchers: GEMINI_MATCHERS,
@@ -284,6 +294,7 @@ const FALLBACK_HARNESS_DEFINITION: HarnessDefinition = HarnessDefinition {
     binary: "claude",
     default_args: &[],
     model_flag: None,
+    parent_session_flag: None,
     prompt_mode: PromptMode::Unsupported,
     version_args: &[],
     process_matchers: &[],

@@ -2409,10 +2409,12 @@ mod tests {
     fn process_teammate_links_to_lead_from_cmdline_and_outlives_it() {
         let (_, mut actor, _) = create_actor();
         let lead = register_test_session(&mut actor, "lead-1");
-        // `; :` stops sh from exec-ing sleep, which would replace the argv.
+        // The `read` builtin blocks sh itself on stdin: no child process
+        // that could outlive `kill`, and no exec to replace the argv.
         let mut process = std::process::Command::new("sh")
-            .args(["-c", "sleep 30; :", "claude", "--parent-session-id"])
+            .args(["-c", "read _", "claude", "--parent-session-id"])
             .arg(lead.as_str())
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("spawn fake teammate");
         // Until exec completes, the child's cmdline is still the test's.

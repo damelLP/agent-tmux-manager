@@ -840,6 +840,20 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
         .register(create_test_session(teammate.as_str()))
         .await
         .expect("register teammate session");
+    // Start working, so the idle assert below proves the hook landed.
+    client
+        .send(ClientMessage::hook_event(hook_event_json(
+            teammate.as_str(),
+            "PreToolUse",
+            serde_json::json!({"tool_name": "Bash"}),
+        )))
+        .await;
+    sleep(Duration::from_millis(50)).await;
+    let working = registry.get_session(teammate.clone()).await;
+    assert_eq!(
+        working.map(|view| view.status_label),
+        Some("working".into())
+    );
 
     let payload = serde_json::json!({
         "session_id": "34d56705-0907-49a6-8785-e72091a93178",

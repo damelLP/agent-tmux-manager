@@ -390,6 +390,19 @@ mod tests {
     }
 
     #[test]
+    fn only_claude_declares_parent_session_flag() {
+        for definition in builtin_harnesses() {
+            let expected = (definition.id == "claude").then_some("--parent-session-id");
+            assert_eq!(
+                definition.parent_session_flag, expected,
+                "{}",
+                definition.id
+            );
+        }
+        assert_eq!(FALLBACK_HARNESS_DEFINITION.parent_session_flag, None);
+    }
+
+    #[test]
     fn argv_exclude_matches_only_its_position() {
         let command = ArgvExclude::Command(ProcessMatcher::Exact("bwrap"));
         assert!(command.matches(0, "bwrap"));

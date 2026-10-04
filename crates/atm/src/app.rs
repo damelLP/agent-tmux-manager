@@ -107,6 +107,10 @@ pub struct App {
     /// Sessions matching `filter_query`, or `None` when no filter is active.
     /// Visible sessions outside this set are shown only as context.
     pub filter_matches: Option<HashSet<SessionId>>,
+
+    /// Fold state saved when a filter starts, restored when it ends.
+    /// `Some` exactly while a filter is active.
+    pre_filter_expanded: Option<HashSet<TreeNodeId>>,
 }
 
 impl Default for App {
@@ -139,6 +143,7 @@ impl App {
             filter_query: String::new(),
             search_active: false,
             filter_matches: None,
+            pre_filter_expanded: None,
         }
     }
 
@@ -262,27 +267,46 @@ impl App {
 
     /// Removes the last character from the filter query.
     pub fn pop_search_char(&mut self) {
-        if self.filter_query.pop().is_some() {
+        if self.filter_query.pop().is_none() {
+            return;
+        }
+        if self.filter_query.is_empty() {
+            self.end_filter();
+        } else {
             self.apply_filter_change();
         }
     }
 
-    /// Closes the search prompt and removes the filter, keeping the cursor
-    /// on the row that was selected.
+    /// Closes the search prompt and removes the filter.
     pub fn clear_filter(&mut self) {
         self.search_active = false;
-        if !self.filter_query.is_empty() {
-            let selected = self
-                .tree_rows
-                .get(self.selected_index)
-                .map(|r| r.node_id.clone());
-            self.filter_query.clear();
-            self.rebuild_tree();
-            if let Some(pos) =
-                selected.and_then(|id| self.tree_rows.iter().position(|r| r.node_id == id))
-            {
-                self.selected_index = pos;
+        self.filter_query.clear();
+        self.end_filter();
+    }
+
+    /// Restores the fold state saved when the filter started, keeping the
+    /// selected row and the groups around it open (like vim after a search).
+    /// No-op when no filter is active.
+    fn end_filter(&mut self) {
+        let Some(mut saved) = self.pre_filter_expanded.take() else {
+            return;
+        };
+        let selected = self.tree_rows.get(self.selected_index).map(|row| {
+            let mut depth = row.depth;
+            for r in self.tree_rows.iter().take(self.selected_index).rev() {
+                if r.depth < depth {
+                    saved.insert(r.node_id.clone());
+                    depth = r.depth;
+                }
             }
+            row.node_id.clone()
+        });
+        self.expanded = saved;
+        self.rebuild_tree();
+        if let Some(pos) =
+            selected.and_then(|id| self.tree_rows.iter().position(|r| r.node_id == id))
+        {
+            self.selected_index = pos;
         }
     }
 
@@ -296,6 +320,9 @@ impl App {
     /// Rebuilds after a query edit, expanding every group so matches are
     /// never hidden in a collapsed fold, and selects the first match.
     fn apply_filter_change(&mut self) {
+        if self.pre_filter_expanded.is_none() {
+            self.pre_filter_expanded = Some(self.expanded.clone());
+        }
         self.rebuild_tree();
         self.expanded.extend(all_node_ids(&self.tree));
         self.reflatten();
@@ -745,6 +772,51 @@ mod tests {
             Some("aaa"),
             "cursor stays on the session picked while filtered"
         );
+    }
+
+    #[test]
+    fn test_clear_filter_restores_folds_but_keeps_selection_visible() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a, b]);
+        app.collapse_all();
+        assert!(agent_ids(&app).is_empty());
+
+        type_query(&mut app, "aaa");
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+        app.clear_filter();
+
+        // alpha holds the selection so it stays open; beta is collapsed again.
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+        assert!(!app
+            .expanded
+            .contains(&TreeNodeId::Project("/p/beta".to_string())));
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("aaa"));
+    }
+
+    #[test]
+    fn test_backspace_to_empty_restores_folds() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a, b]);
+        let beta = TreeNodeId::Project("/p/beta".to_string());
+        app.set_node_expanded(&beta, false);
+
+        type_query(&mut app, "bbb");
+        assert!(app.expanded.contains(&beta), "filter opens beta");
+        app.pop_search_char();
+        app.pop_search_char(); // "b": each edit re-selects the first match
+        app.select_go_to(0); // cursor on beta's own row, not inside it
+        app.pop_search_char();
+
+        assert!(app.filter_matches.is_none());
+        assert!(!app.expanded.contains(&beta), "beta collapsed again");
     }
 
     #[test]

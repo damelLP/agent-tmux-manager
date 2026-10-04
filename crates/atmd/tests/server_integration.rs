@@ -826,6 +826,53 @@ async fn test_e2e_notification_permission_prompt_becomes_needs_input() {
     server.shutdown().await;
 }
 
+/// A tmux-mode teammate fires `TeammateIdle` from its *own* session
+/// (captured with Claude Code 2.1.288). It must idle that session, not
+/// spawn a `waiter@<teammate>` child under it.
+#[tokio::test]
+async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let teammate = SessionId::new("34d56705-0907-49a6-8785-e72091a93178");
+    registry
+        .register(create_test_session(teammate.as_str()))
+        .await
+        .expect("register teammate session");
+
+    let payload = serde_json::json!({
+        "session_id": "34d56705-0907-49a6-8785-e72091a93178",
+        "transcript_path": "/home/damel/.claude/projects/-tmp-claude-1000--home-damel-git-agent-tmux-manager-17338be7-f08a-4b0b-a88e-ae6ee9ad56c5-scratchpad-teamcap-work/34d56705-0907-49a6-8785-e72091a93178.jsonl",
+        "cwd": "/tmp/claude-1000/-home-damel-git-agent-tmux-manager/17338be7-f08a-4b0b-a88e-ae6ee9ad56c5/scratchpad/teamcap/work",
+        "scratchpad_dir": "/tmp/claude-1000/-tmp-claude-1000--home-damel-git-agent-tmux-manager-17338be7-f08a-4b0b-a88e-ae6ee9ad56c5-scratchpad-teamcap-work/34d56705-0907-49a6-8785-e72091a93178/scratchpad",
+        "permission_mode": "auto",
+        "agent_type": "general-purpose",
+        "hook_event_name": "TeammateIdle",
+        "teammate_name": "waiter",
+        "team_name": "session-ae223ce3"
+    });
+    client.send(ClientMessage::hook_event(payload)).await;
+    sleep(Duration::from_millis(50)).await;
+
+    let ids: Vec<String> = registry
+        .get_all_sessions()
+        .await
+        .into_iter()
+        .map(|view| view.id.as_str().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![teammate.as_str().to_string()],
+        "no placeholder child"
+    );
+    let view = registry.get_session(teammate).await.expect("teammate");
+    assert_eq!(view.status_label, "idle");
+    assert!(view.child_session_ids.is_empty());
+
+    server.shutdown().await;
+}
+
 // ============================================================================
 // Pi Event → LifecycleEvent translation (end-to-end, wire-level)
 //

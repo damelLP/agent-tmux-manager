@@ -97,6 +97,25 @@ pub struct App {
 
     /// Compact mode: vertical layout optimized for narrow sidebar panes.
     pub compact: bool,
+
+    /// Free-text filter query (empty = no filter). Applied live while typing.
+    pub filter_query: String,
+
+    /// Whether the `/` search prompt is open and capturing keystrokes.
+    pub search_active: bool,
+
+    /// Sessions matching `filter_query`, or `None` when no filter is active.
+    /// Visible sessions outside this set are shown only as context.
+    pub filter_matches: Option<HashSet<SessionId>>,
+
+    /// Fold state saved when a filter starts, restored when it ends.
+    /// `Some` exactly while a filter is active; `Some(None)` when the filter
+    /// started before any tree was built, so there is no fold state to keep.
+    pre_filter_expanded: Option<Option<HashSet<TreeNodeId>>>,
+
+    /// Row selected before the last rebuild that had one, so ending a filter
+    /// keeps the cursor even when the filtered tree was left with no rows.
+    last_selected_node: Option<TreeNodeId>,
 }
 
 impl Default for App {
@@ -126,6 +145,11 @@ impl App {
             tmux_session_filter: None,
             filter_pane_ids: HashSet::new(),
             compact: false,
+            filter_query: String::new(),
+            search_active: false,
+            filter_matches: None,
+            pre_filter_expanded: None,
+            last_selected_node: None,
         }
     }
 
@@ -194,7 +218,10 @@ impl App {
     /// On first build (no expanded nodes yet), expands all nodes so the
     /// tree starts fully open.
     fn rebuild_tree(&mut self) {
-        let sessions: Vec<SessionView> = if self.tmux_session_filter.is_some() {
+        if let Some(row) = self.tree_rows.get(self.selected_index) {
+            self.last_selected_node = Some(row.node_id.clone());
+        }
+        let mut sessions: Vec<SessionView> = if self.tmux_session_filter.is_some() {
             if self.filter_pane_ids.is_empty() {
                 // Filter is set but pane IDs not loaded yet — show empty
                 Vec::new()
@@ -212,14 +239,135 @@ impl App {
         } else {
             self.sessions.values().cloned().collect()
         };
-        self.tree = build_tree(&sessions);
+        let previous_matches = self.filter_matches.take();
+        self.filter_matches = if self.filter_query.is_empty() {
+            None
+        } else {
+            let refs: Vec<&SessionView> = sessions.iter().collect();
+            let selection = crate::filter::select(&refs, &self.filter_query);
+            sessions.retain(|s| selection.visible.contains(&s.id));
+            Some(selection.matched)
+        };
+        let previous_tree = std::mem::replace(&mut self.tree, build_tree(&sessions));
 
         // On first build, expand everything so the tree starts open
         if self.expanded.is_empty() && !self.tree.is_empty() {
             self.expanded = all_node_ids(&self.tree);
         }
 
+        // Open the groups around sessions that just started matching or whose
+        // groups changed (moved project, worktree level appeared), so a live
+        // update never leaves a match hidden in a collapsed fold. Folds around
+        // unchanged matches are left as the user set them.
+        if let Some(matched) = &self.filter_matches {
+            for id in matched {
+                let node = TreeNodeId::Agent(id.clone());
+                let Some(path) = ancestor_ids(&self.tree, &node) else {
+                    continue;
+                };
+                let was_matched = previous_matches.as_ref().is_some_and(|p| p.contains(id));
+                if !was_matched || ancestor_ids(&previous_tree, &node).as_ref() != Some(&path) {
+                    self.expanded.extend(path);
+                }
+            }
+        }
+
         self.reflatten();
+        self.clamp_selection();
+    }
+
+    /// Opens the `/` search prompt, keeping any existing query for editing.
+    pub fn start_search(&mut self) {
+        self.search_active = true;
+    }
+
+    /// Closes the search prompt and keeps the current filter applied.
+    pub fn confirm_search(&mut self) {
+        self.search_active = false;
+    }
+
+    /// Appends a character to the filter query.
+    pub fn push_search_char(&mut self, c: char) {
+        self.filter_query.push(c);
+        self.apply_filter_change();
+    }
+
+    /// Removes the last character from the filter query.
+    pub fn pop_search_char(&mut self) {
+        if self.filter_query.pop().is_none() {
+            return;
+        }
+        if self.filter_query.is_empty() {
+            self.end_filter();
+        } else {
+            self.apply_filter_change();
+        }
+    }
+
+    /// Closes the search prompt and removes the filter.
+    pub fn clear_filter(&mut self) {
+        self.search_active = false;
+        self.filter_query.clear();
+        self.end_filter();
+    }
+
+    /// Restores the fold state saved when the filter started, keeping the
+    /// selected row and the groups around it open (like vim after a search).
+    /// No-op when no filter is active.
+    fn end_filter(&mut self) {
+        let Some(saved) = self.pre_filter_expanded.take() else {
+            return;
+        };
+        let selected = self
+            .tree_rows
+            .get(self.selected_index)
+            .map(|r| r.node_id.clone())
+            .or_else(|| self.last_selected_node.clone());
+        self.rebuild_tree();
+        // Open the selection's ancestors in the unfiltered tree; it can have
+        // group levels (e.g. worktrees) that the filtered tree skipped.
+        // Assigned after the rebuild, which expands everything when the set
+        // is empty. With no saved state, open everything like a first build.
+        let mut expanded = saved.unwrap_or_else(|| all_node_ids(&self.tree));
+        if let Some(path) = selected
+            .as_ref()
+            .and_then(|id| ancestor_ids(&self.tree, id))
+        {
+            expanded.extend(path);
+        }
+        self.expanded = expanded;
+        self.reflatten();
+        if let Some(pos) =
+            selected.and_then(|id| self.tree_rows.iter().position(|r| r.node_id == id))
+        {
+            self.selected_index = pos;
+        }
+        self.clamp_selection();
+    }
+
+    /// Returns true if the session is shown only as an ancestor of a match.
+    pub fn is_filter_context(&self, id: &SessionId) -> bool {
+        self.filter_matches
+            .as_ref()
+            .is_some_and(|matched| !matched.contains(id))
+    }
+
+    /// Rebuilds after a query edit, expanding every group so matches are
+    /// never hidden in a collapsed fold, and selects the first match.
+    fn apply_filter_change(&mut self) {
+        if self.pre_filter_expanded.is_none() {
+            self.pre_filter_expanded = Some((!self.tree.is_empty()).then(|| self.expanded.clone()));
+        }
+        self.rebuild_tree();
+        self.expanded.extend(all_node_ids(&self.tree));
+        self.reflatten();
+        if let Some(matched) = &self.filter_matches {
+            if let Some(pos) = self.tree_rows.iter().position(|r| {
+                matches!(&r.kind, TreeRowKind::Agent { session } if matched.contains(&session.id))
+            }) {
+                self.selected_index = pos;
+            }
+        }
         self.clamp_selection();
     }
 
@@ -542,6 +690,25 @@ impl App {
     }
 }
 
+/// Returns the IDs of the groups enclosing `target`, outermost first, or
+/// `None` if `target` is not in the tree.
+fn ancestor_ids(tree: &[TreeNode], target: &TreeNodeId) -> Option<Vec<TreeNodeId>> {
+    tree.iter().find_map(|node| {
+        if &node.node_id() == target {
+            return Some(Vec::new());
+        }
+        let children = match node {
+            TreeNode::Project { children, .. }
+            | TreeNode::Worktree { children, .. }
+            | TreeNode::Team { children, .. } => children,
+            TreeNode::Agent { subagents, .. } => subagents,
+        };
+        let mut path = ancestor_ids(children, target)?;
+        path.insert(0, node.node_id());
+        Some(path)
+    })
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -580,6 +747,281 @@ mod tests {
             tmux_pane: None,
             ..Default::default()
         }
+    }
+
+    fn type_query(app: &mut App, query: &str) {
+        app.start_search();
+        for c in query.chars() {
+            app.push_search_char(c);
+        }
+    }
+
+    fn agent_ids(app: &App) -> Vec<&str> {
+        app.tree_rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                TreeRowKind::Agent { session } => Some(session.id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_filter_keeps_lead_as_context_for_matching_child() {
+        let lead = create_test_session("lead", "2024-01-15T10:00:00Z");
+        let mut mate = create_test_session("mate", "2024-01-15T10:01:00Z");
+        mate.parent_session_id = Some(lead.id.clone());
+        mate.harness = "codex".to_string();
+        let other = create_test_session("other", "2024-01-15T10:02:00Z");
+        let mut app = App::new();
+        app.update_sessions(vec![lead, mate, other]);
+
+        type_query(&mut app, "codex");
+
+        assert_eq!(agent_ids(&app), vec!["lead", "mate"]);
+        let mate_row = app.tree_rows.iter().find(
+            |r| matches!(&r.kind, TreeRowKind::Agent { session } if session.id.as_str() == "mate"),
+        );
+        assert_eq!(mate_row.map(|r| r.depth), Some(2), "mate stays nested");
+        assert!(app.is_filter_context(&SessionId::new("lead")));
+        assert!(!app.is_filter_context(&SessionId::new("mate")));
+        assert_eq!(
+            app.selected_session().map(|s| s.id.as_str()),
+            Some("mate"),
+            "first match is selected"
+        );
+    }
+
+    #[test]
+    fn test_filter_expands_collapsed_groups_holding_matches() {
+        let mut app = App::new();
+        app.update_sessions(vec![create_test_session("s1", "2024-01-15T10:00:00Z")]);
+        app.collapse_all();
+        assert!(agent_ids(&app).is_empty());
+
+        type_query(&mut app, "s1");
+
+        assert_eq!(agent_ids(&app), vec!["s1"]);
+    }
+
+    #[test]
+    fn test_clear_filter_restores_all_sessions() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            create_test_session("aaa", "2024-01-15T10:00:00Z"),
+            create_test_session("bbb", "2024-01-15T10:01:00Z"),
+        ]);
+        type_query(&mut app, "aaa");
+        app.confirm_search();
+        assert!(!app.search_active);
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+
+        app.clear_filter();
+
+        assert!(app.filter_matches.is_none());
+        assert!(!app.is_filter_context(&SessionId::new("aaa")));
+        assert_eq!(agent_ids(&app).len(), 2);
+        assert_eq!(
+            app.selected_session().map(|s| s.id.as_str()),
+            Some("aaa"),
+            "cursor stays on the session picked while filtered"
+        );
+    }
+
+    #[test]
+    fn test_clear_filter_restores_folds_but_keeps_selection_visible() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a, b]);
+        app.collapse_all();
+        assert!(agent_ids(&app).is_empty());
+
+        type_query(&mut app, "aaa");
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+        app.clear_filter();
+
+        // alpha holds the selection so it stays open; beta is collapsed again.
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+        assert!(!app
+            .expanded
+            .contains(&TreeNodeId::Project("/p/beta".to_string())));
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("aaa"));
+    }
+
+    #[test]
+    fn test_clear_filter_reopens_worktree_hidden_while_filtered() {
+        // Two worktrees: filtering to one drops the worktree level (single
+        // worktree), so the collapsed worktree never appears while filtered.
+        let wt = |id: &str, path: &str, t: &str| {
+            let mut s = create_test_session(id, t);
+            s.project_root = Some("/p".to_string());
+            s.worktree_path = Some(path.to_string());
+            s
+        };
+        let mut app = App::new();
+        app.update_sessions(vec![
+            wt("aaa", "/p", "2024-01-15T10:00:00Z"),
+            wt("bbb", "/p/.worktrees/feat", "2024-01-15T10:01:00Z"),
+        ]);
+        let feat = TreeNodeId::Worktree("/p/.worktrees/feat".to_string());
+        app.set_node_expanded(&feat, false);
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+
+        type_query(&mut app, "bbb");
+        app.clear_filter();
+
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("bbb"));
+        assert!(app.expanded.contains(&feat));
+    }
+
+    #[test]
+    fn test_backspace_to_empty_restores_folds() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a, b]);
+        let beta = TreeNodeId::Project("/p/beta".to_string());
+        app.set_node_expanded(&beta, false);
+
+        type_query(&mut app, "bbb");
+        assert!(app.expanded.contains(&beta), "filter opens beta");
+        app.pop_search_char();
+        app.pop_search_char(); // "b": each edit re-selects the first match
+        app.select_go_to(0); // cursor on beta's own row, not inside it
+        app.pop_search_char();
+
+        assert!(app.filter_matches.is_none());
+        assert!(!app.expanded.contains(&beta), "beta collapsed again");
+    }
+
+    #[test]
+    fn test_backspace_to_empty_removes_filter() {
+        let mut app = App::new();
+        app.update_sessions(vec![create_test_session("aaa", "2024-01-15T10:00:00Z")]);
+        type_query(&mut app, "zz");
+        assert!(agent_ids(&app).is_empty());
+
+        app.pop_search_char();
+        app.pop_search_char();
+        app.pop_search_char(); // extra pop on empty query is a no-op
+
+        assert!(app.search_active, "prompt stays open");
+        assert!(app.filter_matches.is_none());
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+    }
+
+    #[test]
+    fn test_filter_applies_to_sessions_arriving_later() {
+        let mut app = App::new();
+        type_query(&mut app, "codex");
+        let mut late = create_test_session("late", "2024-01-15T10:00:00Z");
+        late.harness = "codex".to_string();
+
+        app.update_sessions(vec![
+            late,
+            create_test_session("plain", "2024-01-15T10:01:00Z"),
+        ]);
+
+        assert_eq!(agent_ids(&app), vec!["late"]);
+    }
+
+    #[test]
+    fn test_filter_opens_collapsed_group_when_session_starts_matching() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        a.harness = "qq".to_string();
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a, b.clone()]);
+        app.set_node_expanded(&TreeNodeId::Project("/p/beta".to_string()), false);
+        // No prefix of "qq" matches bbb, so typing never opens beta.
+        type_query(&mut app, "qq");
+        app.confirm_search();
+
+        b.harness = "qq".to_string();
+        app.update_sessions(vec![b]);
+
+        assert_eq!(agent_ids(&app), vec!["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn test_filter_opens_worktree_level_that_appears_around_existing_match() {
+        // One matching worktree hides the worktree level; a second match in
+        // another worktree brings it back around the existing match too.
+        let wt = |id: &str, path: &str, t: &str| {
+            let mut s = create_test_session(id, t);
+            s.project_root = Some("/p".to_string());
+            s.worktree_path = Some(path.to_string());
+            s
+        };
+        let mut a = wt("aaa", "/p", "2024-01-15T10:00:00Z");
+        a.harness = "qq".to_string();
+        let mut b = wt("bbb", "/p/.worktrees/feat", "2024-01-15T10:01:00Z");
+        let mut app = App::new();
+        app.update_sessions(vec![a, b.clone()]);
+        app.collapse_all();
+        type_query(&mut app, "qq");
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+
+        b.harness = "qq".to_string();
+        app.update_sessions(vec![b]);
+
+        assert_eq!(agent_ids(&app), vec!["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn test_filter_opens_new_group_of_match_that_moved_project() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        a.harness = "qq".to_string();
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a.clone(), b]);
+        app.set_node_expanded(&TreeNodeId::Project("/p/beta".to_string()), false);
+        type_query(&mut app, "qq");
+
+        a.project_root = Some("/p/beta".to_string());
+        app.update_sessions(vec![a]);
+
+        assert_eq!(agent_ids(&app), vec!["aaa"]);
+    }
+
+    #[test]
+    fn test_clear_filter_after_zero_results_keeps_selection() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            create_test_session("aaa", "2024-01-15T10:00:00Z"),
+            create_test_session("bbb", "2024-01-15T10:01:00Z"),
+        ]);
+        type_query(&mut app, "bbb");
+        app.push_search_char('z');
+        assert!(agent_ids(&app).is_empty());
+
+        app.clear_filter();
+
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("bbb"));
+    }
+
+    #[test]
+    fn test_clear_filter_started_before_sessions_loaded_opens_all() {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        type_query(&mut app, "aaa");
+        app.update_sessions(vec![a, b]);
+
+        app.clear_filter();
+
+        assert_eq!(agent_ids(&app), vec!["aaa", "bbb"]);
     }
 
     #[test]

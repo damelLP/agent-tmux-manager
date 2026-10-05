@@ -404,6 +404,31 @@ async fn run_event_loop(
                             }
                             _ => {} // Swallow all other keys
                         }
+                    } else if app.search_active {
+                        // The search prompt captures text, so `j`, `q` etc.
+                        // edit the query instead of reaching the DFA.
+                        match key.code {
+                            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                                app.quit();
+                                cancel_token.cancel();
+                                break;
+                            }
+                            KeyCode::Esc => app.clear_filter(),
+                            KeyCode::Enter => app.confirm_search(),
+                            KeyCode::Backspace => app.pop_search_char(),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                app.push_search_char(c);
+                            }
+                            _ => {}
+                        }
+                    } else if key.code == KeyCode::Esc && app.filter_matches.is_some() {
+                        // Esc clears an active filter before it quits.
+                        app.clear_filter();
+                        handler.reset();
                     } else if let Some(action) = handler.handle(key) {
                         match action {
                             UiAction::Quit => {
@@ -467,6 +492,7 @@ async fn run_event_loop(
                             UiAction::ToggleHelp => {
                                 app.toggle_help();
                             }
+                            UiAction::StartSearch => app.start_search(),
                             UiAction::ExpandNode => app.open_fold(),
                             UiAction::CloseFold => app.close_fold(),
                             UiAction::ToggleFold => app.toggle_fold(),
@@ -566,14 +592,15 @@ async fn run_event_loop(
                                 }
                             }
                         }
+                    }
 
-                        // After any action, check if selected pane changed
-                        let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
-                        if app.capture_pane_id != new_pane {
-                            app.capture_pane_id.clone_from(&new_pane);
-                            app.captured_output.clear();
-                            let _ = capture_pane_tx.send(new_pane);
-                        }
+                    // After any key (actions, search edits, filter clear),
+                    // check if selected pane changed
+                    let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
+                    if app.capture_pane_id != new_pane {
+                        app.capture_pane_id.clone_from(&new_pane);
+                        app.captured_output.clear();
+                        let _ = capture_pane_tx.send(new_pane);
                     }
                 }
                 Event::CaptureUpdate { pane_id, lines } => {

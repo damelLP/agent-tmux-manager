@@ -43,6 +43,8 @@ pub enum UiAction {
     Quit,
     /// Toggle the help popup.
     ToggleHelp,
+    /// Open the `/` search prompt to filter sessions.
+    StartSearch,
     /// Expand the current tree node if collapsed (bound to `h`, `l`, `zo`).
     /// Never closes a fold — closing is reserved for z-chords.
     ExpandNode,
@@ -201,6 +203,14 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
         tmux_only: false,
     },
     KeybindingHint {
+        help_key: "/",
+        help_desc: "Filter (vendor, status, project, branch...)",
+        footer_key: "/",
+        footer_desc: "filter",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
+    KeybindingHint {
         help_key: "?",
         help_desc: "Toggle this help",
         footer_key: "?",
@@ -210,7 +220,7 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
     },
     KeybindingHint {
         help_key: "Esc",
-        help_desc: "Close help / quit",
+        help_desc: "Close help / clear filter / quit",
         footer_key: "",
         footer_desc: "",
         category: HintCategory::Actions,
@@ -409,6 +419,7 @@ impl VimKeyResolver {
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
             'r' | 'R' => KeyMeaning::SimpleAction(UiAction::Refresh),
             '?' => KeyMeaning::SimpleAction(UiAction::ToggleHelp),
+            '/' => KeyMeaning::SimpleAction(UiAction::StartSearch),
             _ => KeyMeaning::Unbound,
         }
     }
@@ -1138,6 +1149,15 @@ mod tests {
     // -----------------------------------------------------------------------
     // ToggleHelp (?) tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_slash_starts_search() {
+        let mut h = InputHandler::new();
+        assert_eq!(
+            h.handle(key(KeyCode::Char('/'))),
+            Some(UiAction::StartSearch)
+        );
+    }
 
     #[test]
     fn test_question_mark_toggles_help() {

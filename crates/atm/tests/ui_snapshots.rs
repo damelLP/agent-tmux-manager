@@ -483,3 +483,94 @@ fn compact_footer_default() {
     });
     insta::assert_debug_snapshot!(buf);
 }
+
+// ---- Filter (`/` search) ---------------------------------------------------
+
+/// Lead (Opus) with a Sonnet teammate, plus an unrelated Opus session,
+/// filtered by "sonnet": the lead stays as dimmed context, the other hides.
+fn make_filtered_app() -> App {
+    let lead = make_session(
+        "lead0000-aaaa-bbbb-cccc-000000000001",
+        "/home/dev/project-alpha",
+        "main",
+        "Opus 4.5",
+        SessionStatus::Idle,
+        "idle",
+        40.0,
+        0.30,
+        "2026-01-15T10:05:00Z",
+    );
+    let mut mate = make_session(
+        "mate0000-aaaa-bbbb-cccc-000000000002",
+        "/home/dev/project-alpha",
+        "main",
+        "Sonnet 4.5",
+        SessionStatus::Working,
+        "working",
+        15.0,
+        0.05,
+        "2026-01-15T10:06:00Z",
+    );
+    mate.parent_session_id = Some(lead.id.clone());
+    let other = make_session(
+        "other000-aaaa-bbbb-cccc-000000000003",
+        "/home/dev/project-alpha",
+        "main",
+        "Opus 4.5",
+        SessionStatus::Idle,
+        "idle",
+        10.0,
+        0.10,
+        "2026-01-15T10:07:00Z",
+    );
+    let mut app = App::new();
+    app.state = AppState::Connected;
+    app.update_sessions(vec![lead, mate, other]);
+    app.start_search();
+    for c in "sonnet".chars() {
+        app.push_search_char(c);
+    }
+    app
+}
+
+#[test]
+fn session_list_filter_dims_context_lead() {
+    let app = make_filtered_app();
+    let buf = render_buffer(45, 6, |frame, area| {
+        render_session_list(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn footer_with_active_filter_80_cols() {
+    // After Enter closes the prompt, the filter must stay visible at a
+    // normal width; it leads the footer so hints clip instead.
+    let buf = with_tmux(|| {
+        let mut app = make_filtered_app();
+        app.confirm_search();
+        render_buffer(80, 3, |frame, area| {
+            render_footer(frame, area, &app);
+        })
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn footer_search_prompt() {
+    let app = make_filtered_app();
+    let buf = render_buffer(50, 3, |frame, area| {
+        render_footer(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn compact_footer_with_active_filter() {
+    let mut app = make_filtered_app();
+    app.confirm_search();
+    let buf = render_buffer(30, 1, |frame, area| {
+        render_compact_footer(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}

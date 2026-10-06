@@ -633,6 +633,40 @@ impl App {
         self.select_up(distance);
     }
 
+    /// Moves the cursor to the next (`forward`) or previous agent that needs
+    /// attention, in tree order, wrapping around. Agents hidden in collapsed
+    /// folds count: their enclosing groups are opened. No-op if none match.
+    pub fn select_attention(&mut self, forward: bool) {
+        let all_rows = flatten_tree(&self.tree, &all_node_ids(&self.tree));
+        let current = self
+            .tree_rows
+            .get(self.selected_index)
+            .and_then(|row| all_rows.iter().position(|r| r.node_id == row.node_id))
+            .unwrap_or(0);
+        let len = all_rows.len();
+        let target = (1..=len)
+            .map(|step| {
+                if forward {
+                    (current + step) % len
+                } else {
+                    (current + len - step) % len
+                }
+            })
+            .filter_map(|i| all_rows.get(i))
+            .find(|r| matches!(&r.kind, TreeRowKind::Agent { session } if session.needs_attention))
+            .map(|r| r.node_id.clone());
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(path) = ancestor_ids(&self.tree, &target) {
+            self.expanded.extend(path);
+        }
+        self.reflatten();
+        if let Some(pos) = self.tree_rows.iter().position(|r| r.node_id == target) {
+            self.selected_index = pos;
+        }
+    }
+
     /// Advances the blink animation by one tick.
     ///
     /// Should be called every 100ms (on each event loop tick).
@@ -1512,6 +1546,83 @@ mod tests {
             session_in("sess-b2", "2024-01-15T10:03:00Z", "/repos/proj-b"),
         ]);
         app
+    }
+
+    /// `app_two_projects` with `ids` flagged as needing attention.
+    fn app_with_attention(ids: &[&str]) -> App {
+        let mut app = app_two_projects();
+        let flagged: Vec<SessionView> = app
+            .sessions
+            .values()
+            .filter(|s| ids.contains(&s.id.as_str()))
+            .map(|s| SessionView {
+                needs_attention: true,
+                ..s.clone()
+            })
+            .collect();
+        app.update_sessions(flagged);
+        app
+    }
+
+    fn selected_id(app: &App) -> Option<&str> {
+        app.selected_session().map(|s| s.id.as_str())
+    }
+
+    #[test]
+    fn test_select_attention_forward_wraps() {
+        let mut app = app_with_attention(&["sess-a1", "sess-b2"]);
+        app.select_go_to(0);
+        app.select_attention(true);
+        let first = selected_id(&app).map(str::to_string);
+        app.select_attention(true);
+        let second = selected_id(&app).map(str::to_string);
+        app.select_attention(true);
+        assert_eq!(selected_id(&app).map(str::to_string), first);
+        let mut seen = vec![first, second];
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![Some("sess-a1".to_string()), Some("sess-b2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_select_attention_backward_reverses_forward() {
+        let mut app = app_with_attention(&["sess-a1", "sess-a2", "sess-b1"]);
+        app.select_go_to(0);
+        app.select_attention(true);
+        let start = selected_id(&app).map(str::to_string);
+        app.select_attention(true);
+        app.select_attention(false);
+        assert_eq!(selected_id(&app).map(str::to_string), start);
+    }
+
+    #[test]
+    fn test_select_attention_opens_collapsed_fold() {
+        let mut app = app_with_attention(&["sess-b1"]);
+        app.collapse_all();
+        app.select_go_to(0);
+        app.select_attention(true);
+        assert_eq!(selected_id(&app), Some("sess-b1"));
+    }
+
+    #[test]
+    fn test_select_attention_noop_when_none_flagged() {
+        let mut app = app_with_attention(&[]);
+        app.select_go_to(2);
+        let rows = app.tree_rows.len();
+        app.select_attention(true);
+        app.select_attention(false);
+        assert_eq!(app.selected_index, 2);
+        assert_eq!(app.tree_rows.len(), rows);
+    }
+
+    #[test]
+    fn test_select_attention_on_empty_app_is_noop() {
+        let mut app = App::new();
+        app.select_attention(true);
+        app.select_attention(false);
+        assert_eq!(app.selected_index, 0);
     }
 
     #[test]

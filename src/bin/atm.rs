@@ -493,6 +493,8 @@ async fn run_event_loop(
                                 app.toggle_help();
                             }
                             UiAction::StartSearch => app.start_search(),
+                            UiAction::NextAttention => app.select_attention(true),
+                            UiAction::PrevAttention => app.select_attention(false),
                             UiAction::ExpandNode => app.open_fold(),
                             UiAction::CloseFold => app.close_fold(),
                             UiAction::ToggleFold => app.toggle_fold(),

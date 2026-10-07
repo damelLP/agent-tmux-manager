@@ -386,6 +386,8 @@ async fn run_event_loop(
                 ui::render(frame, app);
             }
         })?;
+        // Keep the stored offset within range after a resize, so `k` is never dead.
+        app.help_scroll = app.help_scroll.min(help_max_scroll);
 
         let event = tokio::time::timeout(tick_rate, event_rx.recv()).await;
 

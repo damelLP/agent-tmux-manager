@@ -367,11 +367,15 @@ async fn run_event_loop(
     // Viewport height for half-page navigation (updated each frame)
     let mut viewport_height: u16 = 0;
 
+    // How far the help popup can scroll at the current size (updated each frame)
+    let mut help_max_scroll: u16 = 0;
+
     loop {
         app.tick();
 
         // Render the UI and capture viewport height for half-page navigation
         terminal.draw(|frame| {
+            help_max_scroll = ui::help_popup::max_scroll(frame.area());
             if app.compact {
                 let layout = ui::layout::CompactLayout::new(frame.area());
                 viewport_height = layout.list_area.height.saturating_sub(2);
@@ -401,6 +405,13 @@ async fn run_event_loop(
                                 app.quit();
                                 cancel_token.cancel();
                                 break;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                app.help_scroll =
+                                    app.help_scroll.saturating_add(1).min(help_max_scroll);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                app.help_scroll = app.help_scroll.saturating_sub(1);
                             }
                             _ => {} // Swallow all other keys
                         }

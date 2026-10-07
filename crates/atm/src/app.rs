@@ -74,6 +74,9 @@ pub struct App {
     /// Whether the help popup is currently visible.
     pub show_help: bool,
 
+    /// Lines the help popup is scrolled down by. Reset when help toggles.
+    pub help_scroll: u16,
+
     /// Set of expanded tree node IDs.
     pub expanded: HashSet<TreeNodeId>,
 
@@ -137,6 +140,7 @@ impl App {
             tick_count: 0,
             pick_mode: false,
             show_help: false,
+            help_scroll: 0,
             expanded: HashSet::new(),
             tree: Vec::new(),
             tree_rows: Vec::new(),
@@ -687,6 +691,7 @@ impl App {
     /// Toggles the help popup visibility.
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+        self.help_scroll = 0;
     }
 
     /// Returns the number of sessions currently tracked.

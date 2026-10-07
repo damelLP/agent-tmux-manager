@@ -398,6 +398,15 @@ async fn run_event_loop(
                     // This is necessary because Esc maps to Quit in the DFA,
                     // but we want it to dismiss help instead.
                     if app.show_help {
+                        // Same rule as `VimKeyResolver`: navigation only
+                        // fires for plain keys (Shift allowed).
+                        let plain = !key.modifiers.intersects(
+                            KeyModifiers::CONTROL
+                                | KeyModifiers::ALT
+                                | KeyModifiers::SUPER
+                                | KeyModifiers::HYPER
+                                | KeyModifiers::META,
+                        );
                         match key.code {
                             KeyCode::Char('?') | KeyCode::Esc => {
                                 app.show_help = false;
@@ -408,11 +417,11 @@ async fn run_event_loop(
                                 cancel_token.cancel();
                                 break;
                             }
-                            KeyCode::Char('j') | KeyCode::Down => {
+                            KeyCode::Char('j') | KeyCode::Down if plain => {
                                 app.help_scroll =
                                     app.help_scroll.saturating_add(1).min(help_max_scroll);
                             }
-                            KeyCode::Char('k') | KeyCode::Up => {
+                            KeyCode::Char('k') | KeyCode::Up if plain => {
                                 app.help_scroll = app.help_scroll.saturating_sub(1);
                             }
                             _ => {} // Swallow all other keys

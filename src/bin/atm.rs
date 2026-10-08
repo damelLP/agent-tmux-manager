@@ -367,11 +367,15 @@ async fn run_event_loop(
     // Viewport height for half-page navigation (updated each frame)
     let mut viewport_height: u16 = 0;
 
+    // How far the help popup can scroll at the current size (updated each frame)
+    let mut help_max_scroll: u16 = 0;
+
     loop {
         app.tick();
 
         // Render the UI and capture viewport height for half-page navigation
         terminal.draw(|frame| {
+            help_max_scroll = ui::help_popup::max_scroll(frame.area());
             if app.compact {
                 let layout = ui::layout::CompactLayout::new(frame.area());
                 viewport_height = layout.list_area.height.saturating_sub(2);
@@ -382,6 +386,8 @@ async fn run_event_loop(
                 ui::render(frame, app);
             }
         })?;
+        // Keep the stored offset within range after a resize, so `k` is never dead.
+        app.help_scroll = app.help_scroll.min(help_max_scroll);
 
         let event = tokio::time::timeout(tick_rate, event_rx.recv()).await;
 
@@ -392,6 +398,15 @@ async fn run_event_loop(
                     // This is necessary because Esc maps to Quit in the DFA,
                     // but we want it to dismiss help instead.
                     if app.show_help {
+                        // Same rule as `VimKeyResolver`: navigation only
+                        // fires for plain keys (Shift allowed).
+                        let plain = !key.modifiers.intersects(
+                            KeyModifiers::CONTROL
+                                | KeyModifiers::ALT
+                                | KeyModifiers::SUPER
+                                | KeyModifiers::HYPER
+                                | KeyModifiers::META,
+                        );
                         match key.code {
                             KeyCode::Char('?') | KeyCode::Esc => {
                                 app.show_help = false;
@@ -401,6 +416,13 @@ async fn run_event_loop(
                                 app.quit();
                                 cancel_token.cancel();
                                 break;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down if plain => {
+                                app.help_scroll =
+                                    app.help_scroll.saturating_add(1).min(help_max_scroll);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up if plain => {
+                                app.help_scroll = app.help_scroll.saturating_sub(1);
                             }
                             _ => {} // Swallow all other keys
                         }

@@ -433,7 +433,19 @@ fn help_popup_in_tmux() {
     // render in full without clipping.
     let buf = with_tmux(|| {
         render_buffer(120, 40, |frame, area| {
-            render_help_popup(frame, area);
+            render_help_popup(frame, area, 0);
+        })
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn help_popup_scrolled_to_bottom() {
+    // Same size as above; a scroll past the end clamps so the last entry
+    // sits just above the bottom border.
+    let buf = with_tmux(|| {
+        render_buffer(120, 40, |frame, area| {
+            render_help_popup(frame, area, u16::MAX);
         })
     });
     insta::assert_debug_snapshot!(buf);

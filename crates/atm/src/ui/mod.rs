@@ -77,7 +77,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Render help popup overlay (on top of everything)
     if app.show_help {
-        help_popup::render_help_popup(frame, frame.area());
+        help_popup::render_help_popup(frame, frame.area(), app.help_scroll);
     }
 }
 
@@ -100,7 +100,7 @@ pub fn render_compact(frame: &mut Frame, app: &App) {
     );
 
     if app.show_help {
-        help_popup::render_help_popup(frame, frame.area());
+        help_popup::render_help_popup(frame, frame.area(), app.help_scroll);
     }
 }
 

@@ -19,13 +19,15 @@ use super::layout::centered_popup;
 /// Renders the help popup overlay.
 ///
 /// Clears the background behind the popup and renders a bordered
-/// paragraph listing all keybindings grouped by category.
+/// paragraph listing all keybindings grouped by category, scrolled down
+/// by `scroll` lines (clamped to [`max_scroll`]).
 /// Filters out tmux-only entries when not running inside tmux.
 ///
 /// # Arguments
 /// * `frame` - The frame to render into
 /// * `area` - The full terminal area (popup will be centered within it)
-pub fn render_help_popup(frame: &mut Frame, area: Rect) {
+/// * `scroll` - Number of content lines scrolled past the top
+pub fn render_help_popup(frame: &mut Frame, area: Rect, scroll: u16) {
     let popup_area = centered_popup(60, 70, area);
 
     // Clear the area behind the popup
@@ -33,15 +35,39 @@ pub fn render_help_popup(frame: &mut Frame, area: Rect) {
 
     let in_tmux = crate::tmux::is_in_tmux();
     let lines = build_help_lines(in_tmux);
+    let max = max_scroll_for(lines.len(), popup_area);
+    let title = if max > 0 {
+        " Help (j/k to scroll) "
+    } else {
+        " Help "
+    };
 
-    let popup = Paragraph::new(lines).block(
-        Block::default()
-            .title(" Help ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let popup = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .scroll((scroll.min(max), 0));
 
     frame.render_widget(popup, popup_area);
+}
+
+/// Returns the furthest the help popup can scroll in `area` before its
+/// last line reaches the bottom border. Zero when everything fits.
+#[must_use]
+pub fn max_scroll(area: Rect) -> u16 {
+    let lines = build_help_lines(crate::tmux::is_in_tmux());
+    max_scroll_for(lines.len(), centered_popup(60, 70, area))
+}
+
+/// Lines that overflow the popup's inner height (inside the border).
+fn max_scroll_for(line_count: usize, popup_area: Rect) -> u16 {
+    let inner_height = popup_area.height.saturating_sub(2);
+    u16::try_from(line_count)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(inner_height)
 }
 
 /// Builds the styled content lines for the help popup.
@@ -57,32 +83,28 @@ fn build_help_lines(in_tmux: bool) -> Vec<Line<'static>> {
         .add_modifier(Modifier::BOLD);
 
     let mut lines = vec![Line::from("")];
-    let mut current_category = None;
+    let categories = [
+        (HintCategory::Navigation, "  Navigation"),
+        (HintCategory::Actions, "  Actions"),
+    ];
 
-    for entry in KEYBINDING_HINTS {
-        // Skip tmux-only entries when not in tmux
-        if entry.tmux_only && !in_tmux {
-            continue;
-        }
-
-        // Insert category heading when category changes
-        if current_category != Some(entry.category) {
-            if current_category.is_some() {
-                lines.push(Line::from(""));
-            }
-            let heading = match entry.category {
-                HintCategory::Navigation => "  Navigation",
-                HintCategory::Actions => "  Actions",
-            };
-            lines.push(Line::from(Span::styled(heading, heading_style)));
+    for (i, (category, heading)) in categories.into_iter().enumerate() {
+        if i > 0 {
             lines.push(Line::from(""));
-            current_category = Some(entry.category);
         }
+        lines.push(Line::from(Span::styled(heading, heading_style)));
+        lines.push(Line::from(""));
 
-        lines.push(Line::from(vec![
-            Span::styled(format!("    {:<11} ", entry.help_key), key_style),
-            Span::raw(entry.help_desc),
-        ]));
+        // Skip tmux-only entries when not in tmux
+        for entry in KEYBINDING_HINTS
+            .iter()
+            .filter(|e| e.category == category && (in_tmux || !e.tmux_only))
+        {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {:<11} ", entry.help_key), key_style),
+                Span::raw(entry.help_desc),
+            ]));
+        }
     }
 
     lines
@@ -120,6 +142,49 @@ mod tests {
             .position(|t| t.contains("Actions"))
             .expect("Actions heading should exist");
         assert_eq!(texts[actions_idx - 1], "", "blank line before Actions");
+    }
+
+    #[test]
+    fn test_each_category_heading_appears_once() {
+        let texts = help_texts(true);
+        for heading in ["  Navigation", "  Actions"] {
+            let count = texts.iter().filter(|t| *t == heading).count();
+            assert_eq!(count, 1, "{heading:?} should appear exactly once");
+        }
+    }
+
+    #[test]
+    fn test_navigation_entries_all_precede_actions_heading() {
+        let texts = help_texts(true);
+        let actions_idx = texts
+            .iter()
+            .position(|t| t == "  Actions")
+            .expect("Actions heading should exist");
+        for entry in KEYBINDING_HINTS
+            .iter()
+            .filter(|e| e.category == HintCategory::Navigation)
+        {
+            let idx = texts
+                .iter()
+                .position(|t| t.contains(entry.help_desc))
+                .expect("navigation entry should be present");
+            assert!(idx < actions_idx, "{:?} is under Actions", entry.help_desc);
+        }
+    }
+
+    #[test]
+    fn test_max_scroll_for_overflow_and_fit() {
+        // 10-row popup has 8 inner rows.
+        let popup = Rect::new(0, 0, 40, 10);
+        assert_eq!(max_scroll_for(20, popup), 12);
+        assert_eq!(max_scroll_for(8, popup), 0);
+        assert_eq!(max_scroll_for(3, popup), 0);
+        assert_eq!(max_scroll_for(5, Rect::new(0, 0, 40, 1)), 5);
+    }
+
+    #[test]
+    fn test_max_scroll_zero_on_tall_terminal() {
+        assert_eq!(max_scroll(Rect::new(0, 0, 200, 200)), 0);
     }
 
     #[test]
@@ -177,7 +242,10 @@ mod tests {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
-                .draw(|frame| render_help_popup(frame, frame.area()))
+                .draw(|frame| render_help_popup(frame, frame.area(), 0))
+                .unwrap();
+            terminal
+                .draw(|frame| render_help_popup(frame, frame.area(), u16::MAX))
                 .unwrap();
         }
     }

@@ -62,6 +62,10 @@ pub enum UiAction {
     KillAgent,
     /// Interrupt the selected agent (SIGINT).
     InterruptAgent,
+    /// Move the cursor to the next agent that needs attention (`n`).
+    NextAttention,
+    /// Move the cursor to the previous agent that needs attention (`N`).
+    PrevAttention,
     /// Spawn a new agent using smart placement (largest non-ATM pane, below).
     SpawnAgent,
     /// Spawn a new agent to the left of the target pane.
@@ -172,6 +176,14 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
     KeybindingHint {
         help_key: "Nj / Nk",
         help_desc: "Move N rows",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "n / N",
+        help_desc: "Next / previous agent needing attention (!)",
         footer_key: "",
         footer_desc: "",
         category: HintCategory::Navigation,
@@ -414,6 +426,8 @@ impl VimKeyResolver {
             'h' | 'l' => KeyMeaning::SimpleAction(UiAction::ExpandNode),
             'o' => KeyMeaning::OPrefix,
             'z' => KeyMeaning::ZPrefix,
+            'n' => KeyMeaning::SimpleAction(UiAction::NextAttention),
+            'N' => KeyMeaning::SimpleAction(UiAction::PrevAttention),
             'x' => KeyMeaning::SimpleAction(UiAction::KillAgent),
             'I' => KeyMeaning::SimpleAction(UiAction::InterruptAgent),
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
@@ -1156,6 +1170,19 @@ mod tests {
         assert_eq!(
             h.handle(key(KeyCode::Char('/'))),
             Some(UiAction::StartSearch)
+        );
+    }
+
+    #[test]
+    fn test_n_and_shift_n_cycle_attention() {
+        let mut h = InputHandler::new();
+        assert_eq!(
+            h.handle(key(KeyCode::Char('n'))),
+            Some(UiAction::NextAttention)
+        );
+        assert_eq!(
+            h.handle(key(KeyCode::Char('N'))),
+            Some(UiAction::PrevAttention)
         );
     }
 

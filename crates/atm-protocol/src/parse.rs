@@ -72,7 +72,8 @@ pub struct RawContextWindow {
     pub total_input_tokens: u64,
     #[serde(default)]
     pub total_output_tokens: u64,
-    #[serde(default = "default_context_window_size")]
+    /// 0 when omitted, meaning "not reported"
+    #[serde(default)]
     pub context_window_size: u32,
     /// Pre-calculated percentage of context window used (0-100), provided by Claude Code
     #[serde(default)]
@@ -82,10 +83,6 @@ pub struct RawContextWindow {
     pub remaining_percentage: Option<f64>,
     #[serde(default)]
     pub current_usage: Option<RawCurrentUsage>,
-}
-
-fn default_context_window_size() -> u32 {
-    200_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,7 +118,10 @@ impl RawStatusLine {
             lines_removed: cost.map(|c| c.total_lines_removed).unwrap_or(0),
             total_input_tokens: context.map(|c| c.total_input_tokens).unwrap_or(0),
             total_output_tokens: context.map(|c| c.total_output_tokens).unwrap_or(0),
-            context_window_size: context.map(|c| c.context_window_size).unwrap_or(200_000),
+            context_window_size: context
+                .map(|c| c.context_window_size)
+                .filter(|size| *size > 0)
+                .unwrap_or(200_000),
             current_input_tokens: current.map(|c| c.input_tokens).unwrap_or(0),
             current_output_tokens: current.map(|c| c.output_tokens).unwrap_or(0),
             cache_creation_tokens: current.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
@@ -178,7 +178,10 @@ impl RawStatusLine {
             lines_removed: cost.map(|c| c.total_lines_removed).unwrap_or(0),
             total_input_tokens: context.map(|c| c.total_input_tokens).unwrap_or(0),
             total_output_tokens: context.map(|c| c.total_output_tokens).unwrap_or(0),
-            context_window_size: context.map(|c| c.context_window_size).unwrap_or(200_000),
+            context_window_size: context
+                .map(|c| c.context_window_size)
+                .filter(|size| *size > 0)
+                .unwrap_or(session.context.context_window_size),
             current_input_tokens: current.map(|c| c.input_tokens).unwrap_or(0),
             current_output_tokens: current.map(|c| c.output_tokens).unwrap_or(0),
             cache_creation_tokens: current.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
@@ -378,6 +381,102 @@ mod tests {
             session.model_display_override.as_deref(),
             Some("gemini-1.5-pro")
         );
+    }
+
+    #[test]
+    fn test_update_session_applies_context_window_size() {
+        use atm_core::{AgentType, SessionDomain};
+
+        // Hook-first session seeded with the Unknown model's 200K default
+        let mut session = SessionDomain::new(
+            atm_core::SessionId::new("5aaeafa7-b633-42c6-83fb-dcbe2f713074"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+
+        // Captured from Claude Code 2.1.302 (trimmed to relevant fields)
+        let json = r#"{
+            "session_id": "5aaeafa7-b633-42c6-83fb-dcbe2f713074",
+            "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
+            "version": "2.1.302",
+            "context_window": {
+                "total_input_tokens": 45772,
+                "total_output_tokens": 4,
+                "context_window_size": 1000000,
+                "current_usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 4,
+                    "cache_creation_input_tokens": 21643,
+                    "cache_read_input_tokens": 24127
+                },
+                "used_percentage": 5,
+                "remaining_percentage": 95
+            }
+        }"#;
+
+        let raw: RawStatusLine = serde_json::from_str(json).unwrap();
+        raw.update_session(&mut session);
+
+        assert_eq!(session.context.context_window_size, 1_000_000);
+        // 45772 / 1_000_000; Claude Code rounds this to used_percentage 5
+        assert!((session.context.usage_percentage() - 4.5772).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_update_session_keeps_context_window_size_when_unreported() {
+        use atm_core::{AgentType, SessionDomain};
+
+        let mut session = SessionDomain::new(
+            atm_core::SessionId::new("test-window"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+        session.context.context_window_size = 1_000_000;
+
+        // Partial update without context_window
+        let partial = r#"{
+            "session_id": "test-window",
+            "model": {"id": "claude-opus-5-5"},
+            "cost": {"total_cost_usd": 0.50, "total_duration_ms": 10000}
+        }"#;
+        let raw: RawStatusLine = serde_json::from_str(partial).unwrap();
+        raw.update_session(&mut session);
+        assert_eq!(session.context.context_window_size, 1_000_000);
+
+        // A zero window would disable every context metric
+        let zero = r#"{
+            "session_id": "test-window",
+            "model": {"id": "claude-opus-5-5"},
+            "context_window": {"context_window_size": 0}
+        }"#;
+        let raw: RawStatusLine = serde_json::from_str(zero).unwrap();
+        raw.update_session(&mut session);
+        assert_eq!(session.context.context_window_size, 1_000_000);
+
+        // context_window present but its size omitted
+        let omitted = r#"{
+            "session_id": "test-window",
+            "model": {"id": "claude-opus-5-5"},
+            "context_window": {"current_usage": {"cache_read_input_tokens": 300000}}
+        }"#;
+        let raw: RawStatusLine = serde_json::from_str(omitted).unwrap();
+        raw.update_session(&mut session);
+        assert_eq!(session.context.context_window_size, 1_000_000);
+        assert!((session.context.usage_percentage() - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_new_session_context_window_size_omitted_defaults_to_200k() {
+        let json = r#"{
+            "session_id": "test-omitted",
+            "model": {"id": "claude-opus-5-5"},
+            "context_window": {"current_usage": {"cache_read_input_tokens": 1000}}
+        }"#;
+
+        let raw: RawStatusLine = serde_json::from_str(json).unwrap();
+        let session = raw.to_session_domain().expect("model is present");
+
+        assert_eq!(session.context.context_window_size, 200_000);
     }
 
     #[test]

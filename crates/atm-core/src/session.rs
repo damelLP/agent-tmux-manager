@@ -696,6 +696,7 @@ impl SessionDomain {
         self.lines_changed = LinesChanged::new(data.lines_added, data.lines_removed);
         self.context.total_input_tokens = TokenCount::new(data.total_input_tokens);
         self.context.total_output_tokens = TokenCount::new(data.total_output_tokens);
+        self.context.context_window_size = data.context_window_size;
         self.context.current_input_tokens = TokenCount::new(data.current_input_tokens);
         self.context.current_output_tokens = TokenCount::new(data.current_output_tokens);
         self.context.cache_creation_tokens = TokenCount::new(data.cache_creation_tokens);
@@ -1887,5 +1888,25 @@ mod tests {
             Some("/home/user/repo"),
             "should preserve existing cwd when incoming is None"
         );
+    }
+
+    #[test]
+    fn test_update_from_status_line_applies_context_window_size() {
+        // Hook-first sessions start with the Unknown model's 200K default.
+        // Claude Code 2.1.302 reports 1_000_000 for claude-opus-5-5.
+        let mut session = SessionDomain::new(
+            SessionId::new("test"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+        let mut data = make_status_data(None);
+        data.context_window_size = 1_000_000;
+        data.current_input_tokens = 0;
+        data.cache_read_tokens = 300_000;
+
+        session.update_from_status_line(&data);
+
+        assert_eq!(session.context.context_window_size, 1_000_000);
+        assert!((session.context.usage_percentage() - 30.0).abs() < 0.001);
     }
 }

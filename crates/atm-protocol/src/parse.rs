@@ -72,7 +72,8 @@ pub struct RawContextWindow {
     pub total_input_tokens: u64,
     #[serde(default)]
     pub total_output_tokens: u64,
-    #[serde(default = "default_context_window_size")]
+    /// 0 when omitted, meaning "not reported"
+    #[serde(default)]
     pub context_window_size: u32,
     /// Pre-calculated percentage of context window used (0-100), provided by Claude Code
     #[serde(default)]
@@ -82,10 +83,6 @@ pub struct RawContextWindow {
     pub remaining_percentage: Option<f64>,
     #[serde(default)]
     pub current_usage: Option<RawCurrentUsage>,
-}
-
-fn default_context_window_size() -> u32 {
-    200_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,7 +118,10 @@ impl RawStatusLine {
             lines_removed: cost.map(|c| c.total_lines_removed).unwrap_or(0),
             total_input_tokens: context.map(|c| c.total_input_tokens).unwrap_or(0),
             total_output_tokens: context.map(|c| c.total_output_tokens).unwrap_or(0),
-            context_window_size: context.map(|c| c.context_window_size).unwrap_or(200_000),
+            context_window_size: context
+                .map(|c| c.context_window_size)
+                .filter(|size| *size > 0)
+                .unwrap_or(200_000),
             current_input_tokens: current.map(|c| c.input_tokens).unwrap_or(0),
             current_output_tokens: current.map(|c| c.output_tokens).unwrap_or(0),
             cache_creation_tokens: current.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
@@ -452,6 +452,31 @@ mod tests {
         let raw: RawStatusLine = serde_json::from_str(zero).unwrap();
         raw.update_session(&mut session);
         assert_eq!(session.context.context_window_size, 1_000_000);
+
+        // context_window present but its size omitted
+        let omitted = r#"{
+            "session_id": "test-window",
+            "model": {"id": "claude-opus-5-5"},
+            "context_window": {"current_usage": {"cache_read_input_tokens": 300000}}
+        }"#;
+        let raw: RawStatusLine = serde_json::from_str(omitted).unwrap();
+        raw.update_session(&mut session);
+        assert_eq!(session.context.context_window_size, 1_000_000);
+        assert!((session.context.usage_percentage() - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_new_session_context_window_size_omitted_defaults_to_200k() {
+        let json = r#"{
+            "session_id": "test-omitted",
+            "model": {"id": "claude-opus-5-5"},
+            "context_window": {"current_usage": {"cache_read_input_tokens": 1000}}
+        }"#;
+
+        let raw: RawStatusLine = serde_json::from_str(json).unwrap();
+        let session = raw.to_session_domain().expect("model is present");
+
+        assert_eq!(session.context.context_window_size, 200_000);
     }
 
     #[test]

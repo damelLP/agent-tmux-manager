@@ -1270,8 +1270,10 @@ impl SessionView {
             working_directory: session.working_directory.clone().map(|p| {
                 // Shorten path for display
                 if p.len() > 30 {
-                    let tail = p.get(p.ceil_char_boundary(p.len().saturating_sub(27))..);
-                    format!("...{}", tail.unwrap_or_default())
+                    // Round the cut up to a char boundary for non-ASCII paths.
+                    let cut = p.len().saturating_sub(27);
+                    let tail = (cut..=p.len()).find_map(|i| p.get(i..));
+                    format!("...{}", tail.unwrap_or(&p))
                 } else {
                     p
                 }
@@ -1382,6 +1384,24 @@ mod tests {
             view.working_directory.as_deref(),
             Some(".../src/agent-tmux-manager-xy")
         );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_session_view_working_directory_never_panics(
+            p in proptest::prelude::any::<String>(),
+        ) {
+            let mut session = create_test_session("test-cwd");
+            session.working_directory = Some(p.clone());
+            let shown = SessionView::from_domain(&session).working_directory;
+            let shown = shown.as_deref().unwrap_or_default();
+            if p.len() > 30 {
+                let tail = shown.strip_prefix("...").unwrap_or_default();
+                proptest::prop_assert!(p.ends_with(tail) && tail.len() <= 27);
+            } else {
+                proptest::prop_assert_eq!(shown, p.as_str());
+            }
+        }
     }
 
     #[test]

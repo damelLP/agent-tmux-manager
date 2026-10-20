@@ -299,7 +299,13 @@ mod tests {
         ) {
             let id = format!("{prefix}{suffix}");
             let name = derive_display_name(&id);
-            proptest::prop_assert!(id.starts_with(&name));
+            // Either unchanged, or exactly "-" + 8 ASCII digits stripped from a non-empty base.
+            let stripped = id.strip_prefix(name.as_str()).and_then(|s| s.strip_prefix('-'));
+            let is_date = stripped.is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()));
+            proptest::prop_assert!(name == id || (!name.is_empty() && is_date));
+            if suffix.len() == 9 && suffix.starts_with('-') && !prefix.is_empty() {
+                proptest::prop_assert_eq!(name, prefix);
+            }
         }
     }
 }

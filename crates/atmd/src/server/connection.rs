@@ -258,6 +258,7 @@ impl ConnectionHandler {
             // read_line isn't cancel-safe, but cancelling closes the
             // connection, so a lost partial line doesn't matter.
             let read = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     debug!(client_id = ?self.client_id, "Connection cancelled");
                     return Ok(());
@@ -284,6 +285,11 @@ impl ConnectionHandler {
                     error = %e,
                     "Error handling message"
                 );
+
+                // A failed reply may have left half a line on the socket
+                if matches!(e, ConnectionError::WriteTimeout | ConnectionError::Io(_)) {
+                    return Err(e);
+                }
 
                 // Send error response but continue processing
                 let _ = self
@@ -341,6 +347,8 @@ impl ConnectionHandler {
 
                     // Check max clients limit
                     if subs.len() >= MAX_TUI_CLIENTS && !subs.contains_key(&client_id) {
+                        // Don't hold the lock while writing to this client
+                        drop(subs);
                         self.send_message(DaemonMessage::error(&format!(
                             "Too many subscribers (max: {MAX_TUI_CLIENTS})"
                         )))
@@ -815,6 +823,7 @@ pub enum ConnectionError {
 }
 
 /// The event forwarder of a connection's current subscription.
+#[must_use = "dropping a Forwarder aborts its task"]
 struct Forwarder {
     /// Stops the forwarder without closing the connection
     stop: CancellationToken,
@@ -872,6 +881,7 @@ async fn forward_events(
 ) {
     loop {
         let event = tokio::select! {
+            biased;
             _ = stop.cancelled() => return,
             event = events.recv() => event,
         };
@@ -898,13 +908,20 @@ async fn forward_events(
             continue;
         }
 
-        if let Err(e) = send_event(&writer, &event).await {
-            debug!(
-                client_id = %client_id,
-                error = %e,
-                "Failed to send event to subscriber, disconnecting"
-            );
-            break;
+        match send_event(&writer, &event).await {
+            Ok(()) => {}
+            // Nothing was written, so skip just this event
+            Err(ConnectionError::ParseError(e)) => {
+                error!(error = %e, "Failed to serialize event");
+            }
+            Err(e) => {
+                warn!(
+                    client_id = %client_id,
+                    error = %e,
+                    "Failed to send event to subscriber, disconnecting"
+                );
+                break;
+            }
         }
     }
     connection.cancel();
@@ -1072,6 +1089,28 @@ mod tests {
                 assert_eq!(session.id, SessionId::new("wanted"));
             }
             other => panic!("Expected SessionUpdated for 'wanted', got {other:?}"),
+        }
+    }
+
+    /// `stop` takes priority over queued events, so a forwarder stopped
+    /// before it runs writes nothing. Repeated because an unbiased
+    /// `select!` would pick the stop branch half the time.
+    #[tokio::test]
+    async fn test_forwarder_stop_takes_priority_over_queued_events() {
+        for _ in 0..20 {
+            let (writer, peer) = subscriber_pair();
+            let (tx, rx) = broadcast::channel(16);
+            for _ in 0..8 {
+                tx.send(updated("queued")).unwrap();
+            }
+            let connection = CancellationToken::new();
+            let forwarder = Forwarder::spawn("stopping".to_string(), rx, writer, None, &connection);
+
+            forwarder.stop().await;
+
+            let mut line = String::new();
+            let read = BufReader::new(peer).read_line(&mut line).await.unwrap();
+            assert_eq!(read, 0, "forwarder wrote {line:?} after stop");
         }
     }
 

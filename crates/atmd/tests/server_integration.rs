@@ -608,6 +608,54 @@ async fn test_shutdown_completes_while_a_subscriber_is_stuck() {
     );
 }
 
+/// A reply that hits WRITE_TIMEOUT may have left half a line on the
+/// socket, so the server closes the connection rather than replying again
+/// and carrying on. Time is paused, so the timeout elapses as soon as the
+/// pong writes block.
+#[tokio::test(start_paused = true)]
+async fn test_connection_closes_after_a_write_timeout() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    // Far more pongs than the socket buffer holds, sent without reading.
+    // Writes fail once the server closes, so errors end the loop. The
+    // write half stays open afterwards: closing it would send EOF and let
+    // the server close for that reason instead.
+    let mut writer = client.writer;
+    tokio::spawn(async move {
+        for seq in 0..20_000 {
+            let json = serde_json::to_string(&ClientMessage::ping(seq)).unwrap();
+            if writer
+                .write_all(format!("{json}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+    sleep(Duration::from_secs(30)).await;
+
+    let drained = timeout(Duration::from_secs(60), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if client.reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "connection stayed open after a write timeout"
+    );
+
+    server.shutdown().await;
+}
+
 /// A client that connects but never sends `Connect` is dropped once the
 /// handshake deadline passes. Time is paused, so the deadline elapses
 /// instantly once the runtime is otherwise idle.

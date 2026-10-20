@@ -1270,7 +1270,8 @@ impl SessionView {
             working_directory: session.working_directory.clone().map(|p| {
                 // Shorten path for display
                 if p.len() > 30 {
-                    format!("...{}", &p[p.len().saturating_sub(27)..])
+                    let tail = p.get(p.ceil_char_boundary(p.len().saturating_sub(27))..);
+                    format!("...{}", tail.unwrap_or_default())
                 } else {
                     p
                 }
@@ -1369,6 +1370,18 @@ mod tests {
         assert_eq!(view.id_short, "8e11bfb5");
         assert_eq!(view.agent_type, "explore");
         assert_eq!(view.model, "Sonnet 4");
+    }
+
+    #[test]
+    fn test_session_view_shortens_non_ascii_working_directory() {
+        // Byte offset len-27 falls inside 'é'; the cut rounds up to the next char.
+        let mut session = create_test_session("test-cwd");
+        session.working_directory = Some("/home/josé/src/agent-tmux-manager-xy".to_string());
+        let view = SessionView::from_domain(&session);
+        assert_eq!(
+            view.working_directory.as_deref(),
+            Some(".../src/agent-tmux-manager-xy")
+        );
     }
 
     #[test]

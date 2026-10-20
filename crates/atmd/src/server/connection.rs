@@ -19,8 +19,10 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use atm_claude_adapter::RawHookEvent;
@@ -59,6 +61,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// Write timeout (10 seconds)
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Deadline for a new client's `Connect` message
+const HANDSHAKE_TIMEOUT: Duration = WRITE_TIMEOUT;
+
 /// Token usage is optional metadata and must never delay hook handling.
 const CODEX_TRANSCRIPT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -96,6 +101,13 @@ pub struct ConnectionHandler {
 
     /// Counter for generating client IDs
     connection_number: u64,
+
+    /// Cancelled on server shutdown, or by the forwarder when this client
+    /// can't keep up with events
+    cancel: CancellationToken,
+
+    /// Forwards registry events while subscribed
+    forwarder: Option<Forwarder>,
 }
 
 impl ConnectionHandler {
@@ -108,12 +120,14 @@ impl ConnectionHandler {
     /// * `registry` - Handle to the session registry
     /// * `subscribers` - Shared map of event subscribers
     /// * `connection_number` - Unique number for this connection
+    /// * `cancel` - Closes the connection when cancelled
     pub fn new(
         reader: OwnedReadHalf,
         writer: OwnedWriteHalf,
         registry: RegistryHandle,
         subscribers: SubscribersMap,
         connection_number: u64,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             reader: BufReader::new(reader),
@@ -124,6 +138,8 @@ impl ConnectionHandler {
             subscribed: false,
             subscription_filter: None,
             connection_number,
+            cancel,
+            forwarder: None,
         }
     }
 
@@ -178,7 +194,9 @@ impl ConnectionHandler {
     /// version, and responds with `Connected` or `Rejected`.
     async fn handle_handshake(&mut self) -> Result<(), ConnectionError> {
         // Read first message with timeout
-        let msg = self.read_message().await?;
+        let msg = timeout(HANDSHAKE_TIMEOUT, self.read_message())
+            .await
+            .map_err(|_| ConnectionError::Timeout)??;
 
         // Check version compatibility using the top-level protocol_version
         let client_version = msg.protocol_version;
@@ -234,9 +252,19 @@ impl ConnectionHandler {
     /// Reads and processes messages until the connection closes or an
     /// unrecoverable error occurs.
     async fn process_messages(&mut self) -> Result<(), ConnectionError> {
+        let cancel = self.cancel.clone();
         loop {
-            // Read with timeout for idle connections
-            let msg = match timeout(READ_TIMEOUT, self.read_message()).await {
+            // Read with timeout for idle connections, until cancelled.
+            // read_line isn't cancel-safe, but cancelling closes the
+            // connection, so a lost partial line doesn't matter.
+            let read = tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!(client_id = ?self.client_id, "Connection cancelled");
+                    return Ok(());
+                }
+                read = timeout(READ_TIMEOUT, self.read_message()) => read,
+            };
+            let msg = match read {
                 Ok(Ok(msg)) => msg,
                 Ok(Err(ConnectionError::Eof)) => {
                     debug!(client_id = ?self.client_id, "Client sent EOF");
@@ -339,13 +367,28 @@ impl ConnectionHandler {
                     "Client subscribed to updates"
                 );
 
+                // Replace any previous forwarder. Subscribe to events before
+                // taking the snapshot so none fall between the two.
+                self.stop_forwarder().await;
+                let events = self.registry.subscribe();
+
                 // Send current session list as initial state
                 let sessions = self.registry.get_all_sessions().await;
                 self.send_message(DaemonMessage::session_list(sessions))
                     .await?;
+
+                self.forwarder = Some(Forwarder::spawn(
+                    client_id,
+                    events,
+                    Arc::clone(&self.writer),
+                    self.subscription_filter.clone(),
+                    &self.cancel,
+                ));
             }
 
             MessageType::Unsubscribe => {
+                self.stop_forwarder().await;
+
                 // Remove from subscribers map
                 if let Some(ref client_id) = self.client_id {
                     let mut subs = self.subscribers.write().await;
@@ -645,6 +688,13 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// Stops the current subscription's forwarder, if any.
+    async fn stop_forwarder(&mut self) {
+        if let Some(forwarder) = self.forwarder.take() {
+            forwarder.stop().await;
+        }
+    }
+
     /// Handles a discovery request from a TUI client.
     async fn handle_discover(&mut self) -> DiscoveryResult {
         info!(client_id = ?self.client_id, "Processing discovery request");
@@ -764,10 +814,105 @@ pub enum ConnectionError {
     RegistryError(String),
 }
 
+/// The event forwarder of a connection's current subscription.
+struct Forwarder {
+    /// Stops the forwarder without closing the connection
+    stop: CancellationToken,
+
+    /// Owns the forwarder task. Dropping it aborts the task, so an aborted
+    /// connection handler never leaves its forwarder running.
+    task: JoinSet<()>,
+}
+
+impl Forwarder {
+    /// Spawns [`forward_events`] for one subscription on `connection`.
+    fn spawn(
+        client_id: ClientId,
+        events: broadcast::Receiver<SessionEvent>,
+        writer: SubscriberWriter,
+        filter: Option<SessionId>,
+        connection: &CancellationToken,
+    ) -> Self {
+        let stop = connection.child_token();
+        let mut task = JoinSet::new();
+        task.spawn(forward_events(
+            client_id,
+            events,
+            writer,
+            filter,
+            connection.clone(),
+            stop.clone(),
+        ));
+        Self { stop, task }
+    }
+
+    /// Stops forwarding and waits for the task. The task only checks
+    /// `stop` between events, so it never leaves half a line behind.
+    async fn stop(mut self) {
+        self.stop.cancel();
+        while self.task.join_next().await.is_some() {}
+    }
+}
+
+/// Forwards registry events to one subscriber until `stop` is cancelled.
+///
+/// Each subscription has its own broadcast receiver, so a slow subscriber
+/// only delays itself. One that can't keep up has its whole `connection`
+/// cancelled: a write that exceeded [`WRITE_TIMEOUT`] may have left half a
+/// line on the socket, and a receiver that lagged past the channel's
+/// capacity has missed events. The client recovers by reconnecting, which
+/// re-subscribes and fetches a full session list.
+async fn forward_events(
+    client_id: ClientId,
+    mut events: broadcast::Receiver<SessionEvent>,
+    writer: SubscriberWriter,
+    filter: Option<SessionId>,
+    connection: CancellationToken,
+    stop: CancellationToken,
+) {
+    loop {
+        let event = tokio::select! {
+            _ = stop.cancelled() => return,
+            event = events.recv() => event,
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    client_id = %client_id,
+                    skipped,
+                    "Subscriber lagged behind events, disconnecting"
+                );
+                break;
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+
+        // Check filter
+        let session_id = match &event {
+            SessionEvent::Registered { session_id, .. }
+            | SessionEvent::Removed { session_id, .. } => session_id,
+            SessionEvent::Updated { session } => &session.id,
+        };
+        if filter.as_ref().is_some_and(|filter| filter != session_id) {
+            continue;
+        }
+
+        if let Err(e) = send_event(&writer, &event).await {
+            debug!(
+                client_id = %client_id,
+                error = %e,
+                "Failed to send event to subscriber, disconnecting"
+            );
+            break;
+        }
+    }
+    connection.cancel();
+}
+
 /// Sends an event to a subscribed client.
 ///
-/// This is used by the server to broadcast events to all subscribers.
-#[allow(dead_code)]
+/// This is used by each subscription's forwarder.
 pub async fn send_event(
     writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
     event: &SessionEvent,
@@ -807,6 +952,11 @@ pub async fn send_event(
 mod tests {
     use super::*;
 
+    use atm_core::{AgentType, Model, SessionDomain, SessionView};
+    use tokio::net::UnixStream;
+
+    use crate::registry::RemovalReason;
+
     #[test]
     fn test_connection_error_display() {
         let err = ConnectionError::VersionMismatch {
@@ -824,5 +974,121 @@ mod tests {
             max: MAX_MESSAGE_SIZE,
         };
         assert!(err.to_string().contains("2000000"));
+    }
+
+    /// A subscriber writer on one end of a socket pair, plus the peer end.
+    fn subscriber_pair() -> (SubscriberWriter, UnixStream) {
+        let (ours, peer) = UnixStream::pair().expect("socket pair");
+        let (_, write_half) = ours.into_split();
+        (Arc::new(Mutex::new(BufWriter::new(write_half))), peer)
+    }
+
+    fn updated(id: &str) -> SessionEvent {
+        let domain = SessionDomain::new(
+            SessionId::new(id),
+            AgentType::GeneralPurpose,
+            Model::Sonnet4,
+        );
+        SessionEvent::Updated {
+            session: Box::new(SessionView::from_domain(&domain)),
+        }
+    }
+
+    /// A subscriber that never reads fills its socket; the next write hits
+    /// WRITE_TIMEOUT and the forwarder cancels the whole connection.
+    /// Time is paused, so the timeout elapses as soon as the write blocks.
+    #[tokio::test(start_paused = true)]
+    async fn test_forwarder_disconnects_subscriber_that_never_reads() {
+        let (writer, _peer) = subscriber_pair();
+        let (tx, rx) = broadcast::channel(4096);
+        for _ in 0..4000 {
+            tx.send(updated("flood")).unwrap();
+        }
+        let connection = CancellationToken::new();
+
+        let _forwarder = Forwarder::spawn("stuck".to_string(), rx, writer, None, &connection);
+
+        timeout(Duration::from_secs(60), connection.cancelled())
+            .await
+            .expect("forwarder should cancel the connection after a write timeout");
+    }
+
+    /// A subscriber that falls more than the channel capacity behind has
+    /// missed events, so the forwarder cancels the connection.
+    #[tokio::test]
+    async fn test_forwarder_disconnects_subscriber_that_lags() {
+        let (writer, _peer) = subscriber_pair();
+        let (tx, rx) = broadcast::channel(4);
+        for _ in 0..10 {
+            tx.send(updated("burst")).unwrap();
+        }
+        let connection = CancellationToken::new();
+
+        let _forwarder = Forwarder::spawn("lagging".to_string(), rx, writer, None, &connection);
+
+        timeout(Duration::from_secs(5), connection.cancelled())
+            .await
+            .expect("forwarder should cancel the connection on lag");
+    }
+
+    /// Only events for the filtered session are written, and `Registered`
+    /// is never written (subscribers wait for the first update).
+    #[tokio::test]
+    async fn test_forwarder_applies_session_filter() {
+        let (writer, peer) = subscriber_pair();
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(SessionEvent::Registered {
+            session_id: SessionId::new("wanted"),
+            agent_type: AgentType::GeneralPurpose,
+        })
+        .unwrap();
+        tx.send(updated("other")).unwrap();
+        tx.send(SessionEvent::Removed {
+            session_id: SessionId::new("other"),
+            reason: RemovalReason::SessionEnded,
+        })
+        .unwrap();
+        tx.send(updated("wanted")).unwrap();
+        let connection = CancellationToken::new();
+
+        let _forwarder = Forwarder::spawn(
+            "filtered".to_string(),
+            rx,
+            writer,
+            Some(SessionId::new("wanted")),
+            &connection,
+        );
+
+        let mut line = String::new();
+        timeout(
+            Duration::from_secs(5),
+            BufReader::new(peer).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match serde_json::from_str::<DaemonMessage>(&line).unwrap() {
+            DaemonMessage::SessionUpdated { session } => {
+                assert_eq!(session.id, SessionId::new("wanted"));
+            }
+            other => panic!("Expected SessionUpdated for 'wanted', got {other:?}"),
+        }
+    }
+
+    /// Stopping a forwarder (unsubscribe) ends it without closing the
+    /// connection.
+    #[tokio::test]
+    async fn test_forwarder_stop_keeps_connection_open() {
+        let (writer, _peer) = subscriber_pair();
+        let (_tx, rx) = broadcast::channel(16);
+        let connection = CancellationToken::new();
+        let forwarder =
+            Forwarder::spawn("unsubscribing".to_string(), rx, writer, None, &connection);
+
+        timeout(Duration::from_secs(5), forwarder.stop())
+            .await
+            .expect("forwarder should stop");
+
+        assert!(!connection.is_cancelled());
     }
 }

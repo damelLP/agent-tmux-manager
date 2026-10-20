@@ -530,6 +530,47 @@ async fn flood_past_stuck_subscriber(
     stuck
 }
 
+/// A subscriber that is briefly busy (reads nothing while a burst is
+/// published) still receives every update afterwards instead of being
+/// disconnected for lagging. 1500 matches the burst in the real-atmd probe.
+#[tokio::test]
+async fn test_subscriber_busy_during_burst_is_not_disconnected() {
+    const BURST_UPDATES: usize = 1500;
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut busy = subscribe_client(&server, "busy").await;
+
+    let session_id = SessionId::new("burst");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+    for _ in 0..BURST_UPDATES {
+        registry
+            .apply_lifecycle_event(
+                session_id.clone(),
+                LifecycleEvent::PromptSubmit {
+                    prompt: Some("x".repeat(1024)),
+                },
+                Harness::ClaudeCode,
+                None,
+                None,
+            )
+            .await
+            .expect("apply lifecycle event");
+    }
+
+    for i in 0..BURST_UPDATES {
+        let mut line = String::new();
+        let read = timeout(NOT_STALLED, busy.reader.read_line(&mut line)).await;
+        assert!(
+            matches!(read, Ok(Ok(n)) if n > 0),
+            "disconnected after {i} of {BURST_UPDATES} updates: {read:?}"
+        );
+    }
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_stuck_subscriber_does_not_stall_other_subscribers() {
     let (server, registry) = TestServer::spawn_with_registry().await;

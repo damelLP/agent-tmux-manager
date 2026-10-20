@@ -39,7 +39,10 @@ pub use handle::RegistryHandle;
 
 /// Channel buffer sizes
 const COMMAND_BUFFER: usize = 100;
-const EVENT_BUFFER: usize = 100;
+/// Also how far a subscriber may fall behind before it is disconnected
+/// (see `server::connection`). Sized so a briefly busy client survives a
+/// burst of 1500 updates.
+const EVENT_BUFFER: usize = 2048;
 
 /// Cleanup interval in seconds
 const CLEANUP_INTERVAL_SECS: u64 = 2;

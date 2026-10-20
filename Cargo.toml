@@ -86,6 +86,7 @@ clap = { version = "4.4", features = ["derive"] }
 # Testing
 tempfile = "3.14"
 insta = "1"
+proptest = "1"
 
 # Internal crates (version required for crates.io, path for local dev)
 atm-core = { version = "0.2.7", path = "crates/atm-core" }

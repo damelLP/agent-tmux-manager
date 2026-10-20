@@ -149,12 +149,9 @@ impl Model {
 /// - `"gemini-1.5-pro"` → `"gemini-1.5-pro"`
 pub fn derive_display_name(id: &str) -> String {
     // Strip date suffix if present (pattern: -YYYYMMDD at end)
-    if id.len() > 9 {
-        let potential_date = &id[id.len() - 8..];
-        if potential_date.chars().all(|c| c.is_ascii_digit()) {
-            if let Some(base) = id[..id.len() - 8].strip_suffix('-') {
-                return base.to_string();
-            }
+    if let Some((base, date)) = id.rsplit_once('-') {
+        if !base.is_empty() && date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) {
+            return base.to_string();
         }
     }
     id.to_string()
@@ -285,5 +282,30 @@ mod tests {
     fn test_derive_display_name_short_ids() {
         assert_eq!(derive_display_name("gpt-4"), "gpt-4");
         assert_eq!(derive_display_name("o1"), "o1");
+    }
+
+    #[test]
+    fn test_derive_display_name_multibyte_no_panic() {
+        // Byte offset len-8 falls inside 'é' (regression: #53).
+        assert_eq!(derive_display_name("abé1234567"), "abé1234567");
+        assert_eq!(derive_display_name("modèle-20260501"), "modèle");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_derive_display_name_never_panics(
+            prefix in proptest::prelude::any::<String>(),
+            suffix in "-?[0-9]{0,9}",
+        ) {
+            let id = format!("{prefix}{suffix}");
+            let name = derive_display_name(&id);
+            // Either unchanged, or exactly "-" + 8 ASCII digits stripped from a non-empty base.
+            let stripped = id.strip_prefix(name.as_str()).and_then(|s| s.strip_prefix('-'));
+            let is_date = stripped.is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()));
+            proptest::prop_assert!(name == id || (!name.is_empty() && is_date));
+            if suffix.len() == 9 && suffix.starts_with('-') && !prefix.is_empty() {
+                proptest::prop_assert_eq!(name, prefix);
+            }
+        }
     }
 }

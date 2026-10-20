@@ -1270,7 +1270,10 @@ impl SessionView {
             working_directory: session.working_directory.clone().map(|p| {
                 // Shorten path for display
                 if p.len() > 30 {
-                    format!("...{}", &p[p.len().saturating_sub(27)..])
+                    // Round the cut up to a char boundary for non-ASCII paths.
+                    let cut = p.len().saturating_sub(27);
+                    let tail = (cut..=p.len()).find_map(|i| p.get(i..));
+                    format!("...{}", tail.unwrap_or(&p))
                 } else {
                     p
                 }
@@ -1369,6 +1372,36 @@ mod tests {
         assert_eq!(view.id_short, "8e11bfb5");
         assert_eq!(view.agent_type, "explore");
         assert_eq!(view.model, "Sonnet 4");
+    }
+
+    #[test]
+    fn test_session_view_shortens_non_ascii_working_directory() {
+        // Byte offset len-27 falls inside 'é'; the cut rounds up to the next char.
+        let mut session = create_test_session("test-cwd");
+        session.working_directory = Some("/home/josé/src/agent-tmux-manager-xy".to_string());
+        let view = SessionView::from_domain(&session);
+        assert_eq!(
+            view.working_directory.as_deref(),
+            Some(".../src/agent-tmux-manager-xy")
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_session_view_working_directory_never_panics(
+            p in proptest::prelude::any::<String>(),
+        ) {
+            let mut session = create_test_session("test-cwd");
+            session.working_directory = Some(p.clone());
+            let shown = SessionView::from_domain(&session).working_directory;
+            let shown = shown.as_deref().unwrap_or_default();
+            if p.len() > 30 {
+                let tail = shown.strip_prefix("...").unwrap_or_default();
+                proptest::prop_assert!(p.ends_with(tail) && tail.len() <= 27);
+            } else {
+                proptest::prop_assert_eq!(shown, p.as_str());
+            }
+        }
     }
 
     #[test]

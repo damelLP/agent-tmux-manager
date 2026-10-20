@@ -154,6 +154,7 @@ version = "0.2.7"
 dependencies = [
  "chrono",
  "procfs",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",

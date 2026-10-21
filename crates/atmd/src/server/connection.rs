@@ -266,22 +266,22 @@ impl ConnectionHandler {
             // Read with timeout for idle connections, until cancelled.
             // read_line isn't cancel-safe, but cancelling closes the
             // connection, so a lost partial line doesn't matter.
+            // A subscribed client may stay silent, so it gets no idle
+            // timeout (Duration::MAX never fires): a dead peer still gives
+            // EOF, and the forwarder's WRITE_TIMEOUT cancels a stopped one
+            // once writes to it back up.
+            let idle = if self.subscribed {
+                Duration::MAX
+            } else {
+                READ_TIMEOUT
+            };
             let read = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     debug!(client_id = ?self.client_id, "Connection cancelled");
                     return Ok(());
                 }
-                // A subscribed client may stay silent: a dead peer still
-                // gives EOF, and the forwarder's WRITE_TIMEOUT cancels a
-                // stopped one.
-                read = async {
-                    if self.subscribed {
-                        Ok(self.read_message().await)
-                    } else {
-                        timeout(READ_TIMEOUT, self.read_message()).await
-                    }
-                } => read,
+                read = timeout(idle, self.read_message()) => read,
             };
             let msg = match read {
                 Ok(Ok(msg)) => msg,

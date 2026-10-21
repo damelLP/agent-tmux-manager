@@ -11,7 +11,7 @@
 //! - All fallible operations use `?`, pattern matching, or `unwrap_or`
 //! - Tmux command failures are returned as errors
 
-use std::process::Command;
+use atm_tmux::TmuxClient;
 use thiserror::Error;
 
 // ============================================================================
@@ -25,13 +25,13 @@ pub enum TmuxError {
     #[error("not running inside tmux")]
     NotInTmux,
 
-    /// Failed to execute tmux command
-    #[error("tmux command failed: {0}")]
-    CommandFailed(String),
-
     /// Invalid pane ID
     #[error("invalid pane ID: {0}")]
     InvalidPaneId(String),
+
+    /// The tmux client failed (non-zero exit, timeout, tmux missing, ...)
+    #[error(transparent)]
+    Tmux(#[from] atm_tmux::TmuxError),
 }
 
 // ============================================================================
@@ -49,31 +49,36 @@ pub fn is_in_tmux() -> bool {
 
 /// Jumps to the specified tmux pane.
 ///
-/// This handles panes in different windows and sessions by:
-/// 1. Looking up the pane's session and window
-/// 2. Switching to that session with `switch-client`
-/// 3. Selecting the window with `select-window`
-/// 4. Selecting the pane with `select-pane`
+/// `switch-client -t <pane_id>` moves the current client to the pane's
+/// session and window and makes the pane active, in one command. tmux
+/// resolves the target, so grouped sessions keep the client in its own
+/// session (checked on tmux 3.8, including from a `display-popup`).
+/// A pane as the `switch-client` target requires tmux 1.9+.
 ///
 /// # Arguments
 ///
+/// * `client` - The tmux client to run the command through
 /// * `pane_id` - The tmux pane ID (e.g., "%5", "%12")
 ///
 /// # Errors
 ///
 /// * `TmuxError::NotInTmux` - If not running inside tmux
 /// * `TmuxError::InvalidPaneId` - If the pane ID is empty
-/// * `TmuxError::CommandFailed` - If the tmux command fails
+/// * `TmuxError::Tmux` - If tmux fails (e.g. the pane is gone) or times out
 ///
 /// # Example
 ///
 /// ```ignore
+/// use atm_tmux::RealTmuxClient;
 /// use atm_tui::tmux::jump_to_pane;
 ///
 /// // Jump to pane %5
-/// jump_to_pane("%5")?;
+/// jump_to_pane(&RealTmuxClient::new(), "%5").await?;
 /// ```
-pub fn jump_to_pane(pane_id: &str) -> Result<(), TmuxError> {
+pub async fn jump_to_pane<C>(client: &C, pane_id: &str) -> Result<(), TmuxError>
+where
+    C: TmuxClient + ?Sized,
+{
     // Validate pane ID before checking environment — an empty pane ID is
     // invalid regardless of whether tmux is running.
     if pane_id.is_empty() {
@@ -85,68 +90,9 @@ pub fn jump_to_pane(pane_id: &str) -> Result<(), TmuxError> {
         return Err(TmuxError::NotInTmux);
     }
 
-    // Step 1: Get the pane's session and window information
-    // Format: "pane_id session_name window_id"
-    let list_output = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_id} #{session_name} #{window_id}",
-        ])
-        .output()
-        .map_err(|e| TmuxError::CommandFailed(e.to_string()))?;
-
-    if !list_output.status.success() {
-        let stderr = String::from_utf8_lossy(&list_output.stderr);
-        return Err(TmuxError::CommandFailed(format!(
-            "list-panes failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Find the line matching our pane_id
-    let output_str = String::from_utf8_lossy(&list_output.stdout);
-    let pane_info = output_str
-        .lines()
-        .find(|line| line.starts_with(pane_id))
-        .ok_or_else(|| {
-            TmuxError::CommandFailed(format!("pane {pane_id} not found in any session"))
-        })?;
-
-    // Parse: "%5 session_name @3"
-    let parts: Vec<&str> = pane_info.split_whitespace().collect();
-    if parts.len() < 3 {
-        return Err(TmuxError::CommandFailed(format!(
-            "unexpected pane info format: {pane_info}"
-        )));
-    }
-    let session_name = parts[1];
-    let window_id = parts[2];
-
-    // Step 2: Switch to the session
-    let _ = Command::new("tmux")
-        .args(["switch-client", "-t", session_name])
-        .output();
-
-    // Step 3: Select the window
-    let _ = Command::new("tmux")
-        .args(["select-window", "-t", window_id])
-        .output();
-
-    // Step 4: Select the pane
-    let output = Command::new("tmux")
-        .args(["select-pane", "-t", pane_id])
-        .output()
-        .map_err(|e| TmuxError::CommandFailed(e.to_string()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TmuxError::CommandFailed(format!(
-            "select-pane failed: {}",
-            stderr.trim()
-        )));
-    }
+    client
+        .raw_command("switch-client", &["-t", pane_id])
+        .await?;
 
     Ok(())
 }
@@ -158,6 +104,8 @@ pub fn jump_to_pane(pane_id: &str) -> Result<(), TmuxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atm_tmux::mock::MockCall;
+    use atm_tmux::MockTmuxClient;
 
     #[test]
     fn test_is_in_tmux_returns_bool() {
@@ -165,10 +113,79 @@ mod tests {
         let _ = is_in_tmux();
     }
 
-    #[test]
-    fn test_jump_to_pane_empty_pane_id() {
-        let result = jump_to_pane("");
+    #[tokio::test]
+    async fn test_jump_to_pane_empty_pane_id() {
+        let mock = MockTmuxClient::new();
+        let result = jump_to_pane(&mock, "").await;
         assert!(matches!(result, Err(TmuxError::InvalidPaneId(_))));
+        assert_eq!(mock.call_count(), 0);
+    }
+
+    /// Restores `TMUX` to its prior value on drop, even during unwinding,
+    /// so a failing case can't leak env state into other tests.
+    struct TmuxEnvGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TmuxEnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("TMUX", v),
+                None => std::env::remove_var("TMUX"),
+            }
+        }
+    }
+
+    fn raw(subcommand: &str, args: &[&str]) -> MockCall {
+        MockCall::RawCommand {
+            subcommand: subcommand.to_string(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+        }
+    }
+
+    /// All `TMUX`-dependent cases live in one test so they don't race each
+    /// other under parallel test execution.
+    #[tokio::test]
+    async fn test_jump_to_pane_via_client() {
+        let _env = TmuxEnvGuard {
+            prev: std::env::var_os("TMUX"),
+        };
+
+        // Outside tmux: refuse before touching tmux at all.
+        std::env::remove_var("TMUX");
+        let mock = MockTmuxClient::new();
+        let result = jump_to_pane(&mock, "%5").await;
+        assert!(matches!(result, Err(TmuxError::NotInTmux)), "{result:?}");
+        assert_eq!(mock.call_count(), 0);
+
+        std::env::set_var("TMUX", "/tmp/tmux-test/default,1,0");
+
+        // One command, targeting the exact pane id: tmux resolves the
+        // session and window itself. No `list-panes` output to misparse
+        // ("%1" vs "%10", spaces in session names, grouped sessions).
+        let mock = MockTmuxClient::new();
+        jump_to_pane(&mock, "%1")
+            .await
+            .expect("jump should succeed");
+        assert_eq!(mock.calls(), vec![raw("switch-client", &["-t", "%1"])]);
+
+        // tmux errors (e.g. the pane is gone) and timeouts are returned as-is.
+        for err in [
+            atm_tmux::TmuxError::CommandFailed {
+                command: "switch-client".to_string(),
+                stderr: "can't find pane: %5".to_string(),
+            },
+            atm_tmux::TmuxError::Timeout {
+                command: "switch-client".to_string(),
+                timeout: std::time::Duration::from_secs(5),
+            },
+        ] {
+            let mock = MockTmuxClient::new();
+            mock.set_next_error(err);
+            let result = jump_to_pane(&mock, "%5").await;
+            assert!(matches!(result, Err(TmuxError::Tmux(_))), "{result:?}");
+            assert_eq!(mock.call_count(), 1);
+        }
     }
 
     #[test]
@@ -176,8 +193,14 @@ mod tests {
         let err = TmuxError::NotInTmux;
         assert_eq!(err.to_string(), "not running inside tmux");
 
-        let err = TmuxError::CommandFailed("test error".to_string());
-        assert_eq!(err.to_string(), "tmux command failed: test error");
+        let err = TmuxError::Tmux(atm_tmux::TmuxError::CommandFailed {
+            command: "switch-client".to_string(),
+            stderr: "can't find pane: %5".to_string(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "tmux command failed: switch-client — can't find pane: %5"
+        );
 
         let err = TmuxError::InvalidPaneId("".to_string());
         assert_eq!(err.to_string(), "invalid pane ID: ");

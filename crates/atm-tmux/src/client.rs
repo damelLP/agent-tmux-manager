@@ -2,11 +2,31 @@
 //!
 //! Shells out to the `tmux` binary via `tokio::process::Command`.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tokio::process::Command;
 use tracing::{debug, trace};
 
 use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
+
+/// Deadline for one tmux command. tmux normally answers in milliseconds, but
+/// a stopped or wedged server never answers and the client waits forever.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline for `new-session`, the one command that can start the server.
+/// tmux holds the starting client until the user's tmux.conf has loaded,
+/// including synchronous `run-shell` lines (e.g. a first-run plugin install).
+const NEW_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The deadline for one run of `subcommand`.
+fn command_timeout(subcommand: &str) -> Duration {
+    if subcommand == "new-session" {
+        NEW_SESSION_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    }
+}
 
 /// Real tmux client that invokes the `tmux` CLI.
 ///
@@ -60,15 +80,25 @@ impl RealTmuxClient {
     }
 
     /// Runs a tmux command, returning stdout on success or `TmuxError` on failure.
+    ///
+    /// Gives up after [`command_timeout`] with [`TmuxError::Timeout`]; the
+    /// `tmux` process is killed rather than left blocked on the server.
     async fn run(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError> {
         trace!(subcommand, ?args, "running tmux command");
 
+        let timeout = command_timeout(subcommand);
         let output = self
             .tmux_cmd()
             .arg(subcommand)
             .args(args)
-            .output()
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(timeout, output)
             .await
+            .map_err(|_| TmuxError::Timeout {
+                command: subcommand.to_string(),
+                timeout,
+            })?
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     TmuxError::NotFound

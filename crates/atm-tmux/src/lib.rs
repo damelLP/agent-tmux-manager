@@ -111,6 +111,11 @@ pub trait TmuxClient: Send + Sync {
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError>;
 
     /// Displays a popup overlay.
+    ///
+    /// The popup uses `-E`, so `tmux display-popup` does not return until the
+    /// popup closes. [`RealTmuxClient`] puts a deadline on every command: a
+    /// popup still open when it passes yields [`TmuxError::Timeout`] (which
+    /// reports the deadline) while the popup itself stays on screen (tmux 3.8).
     async fn display_popup(
         &self,
         width: &str,

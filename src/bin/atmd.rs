@@ -137,14 +137,21 @@ fn lock_daemon(socket_path: &Path) -> Result<Option<File>> {
     }
     // Read-only is enough for flock, and works on a lock file that
     // someone else created. The default socket dir is world-writable
-    // /tmp: 0600 stops other users opening the lock to hold it, and
-    // O_NOFOLLOW stops a planted symlink redirecting the O_CREAT.
+    // /tmp: 0600 stops other users opening the lock to hold it,
+    // O_NOFOLLOW stops a planted symlink redirecting the O_CREAT, and
+    // O_NONBLOCK stops a planted FIFO blocking the open.
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CREAT | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("Failed to open lock file {}", lock_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Failed to stat lock file {}", lock_path.display()))?;
+    if !metadata.is_file() {
+        bail!("Lock file {} is not a regular file", lock_path.display());
+    }
     // SAFETY: flock takes an fd that `file` keeps open for the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(Some(file));
@@ -446,6 +453,29 @@ mod tests {
 
         assert!(lock_daemon(&socket).is_err(), "followed a symlinked lock");
         assert!(!target.exists(), "created the symlink's target");
+    }
+
+    /// A blocking read-only open of a FIFO waits for a writer, which would
+    /// hang `atmd start` before it ever reaches LOCK_NB.
+    #[test]
+    fn test_daemon_lock_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_in(dir.path());
+        fs::create_dir_all(dir.path().join("run")).expect("mkdir");
+        let fifo = std::ffi::CString::new(lock_file(&socket)).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = socket.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(lock_daemon(&path).map(|lock| lock.is_some()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("lock_daemon blocked on the FIFO");
+
+        let err = result.expect_err("locked a FIFO");
+        assert!(format!("{err:#}").contains(&lock_file(&socket)));
     }
 
     #[test]

@@ -46,8 +46,17 @@ pub struct Subscriber {
     pub filter: Option<SessionId>,
 }
 
-/// Type alias for the subscribers map
+/// Type alias for the subscribers map, keyed by [`subscriber_key`]
 pub type SubscribersMap = Arc<RwLock<HashMap<String, Subscriber>>>;
+
+/// Key of a connection's entry in the [`SubscribersMap`].
+///
+/// Per connection rather than per client id: clients choose their ids, so
+/// ids can repeat, and every subscribed connection runs its own forwarder
+/// and must count against the subscriber cap.
+pub(super) fn subscriber_key(connection_number: u64) -> String {
+    connection_number.to_string()
+}
 
 /// Maximum number of concurrent TUI clients
 const MAX_TUI_CLIENTS: usize = 10;
@@ -343,10 +352,11 @@ impl ConnectionHandler {
 
                 // Add to subscribers map
                 {
+                    let key = subscriber_key(self.connection_number);
                     let mut subs = self.subscribers.write().await;
 
                     // Check max clients limit
-                    if subs.len() >= MAX_TUI_CLIENTS && !subs.contains_key(&client_id) {
+                    if subs.len() >= MAX_TUI_CLIENTS && !subs.contains_key(&key) {
                         // Don't hold the lock while writing to this client
                         drop(subs);
                         self.send_message(DaemonMessage::error(&format!(
@@ -358,7 +368,7 @@ impl ConnectionHandler {
 
                     // Add or update subscription
                     subs.insert(
-                        client_id.clone(),
+                        key,
                         Subscriber {
                             writer: Arc::clone(&self.writer),
                             filter: session_id.clone(),
@@ -398,10 +408,10 @@ impl ConnectionHandler {
                 self.stop_forwarder().await;
 
                 // Remove from subscribers map
-                if let Some(ref client_id) = self.client_id {
-                    let mut subs = self.subscribers.write().await;
-                    subs.remove(client_id);
-                }
+                self.subscribers
+                    .write()
+                    .await
+                    .remove(&subscriber_key(self.connection_number));
 
                 self.subscribed = false;
                 self.subscription_filter = None;

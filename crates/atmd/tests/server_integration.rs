@@ -435,6 +435,30 @@ async fn test_max_clients_rejection() {
     server.shutdown().await;
 }
 
+/// The cap counts subscribed connections, not client ids: clients choose
+/// their ids, and every subscribed connection runs its own forwarder.
+#[tokio::test]
+async fn test_max_clients_rejects_connection_reusing_a_client_id() {
+    let server = TestServer::spawn().await;
+    let mut clients = Vec::new();
+    for i in 0..MAX_TUI_CLIENTS {
+        clients.push(subscribe_client(&server, &format!("client-{i}")).await);
+    }
+
+    let mut reused = server.connect().await;
+    reused.handshake(Some("client-0".to_string())).await;
+    reused.send(ClientMessage::subscribe(None)).await;
+
+    match reused.recv().await {
+        DaemonMessage::Error { message, .. } => {
+            assert!(message.contains("Too many subscribers"), "got {message:?}");
+        }
+        other => panic!("Expected a Too many subscribers error, got {other:?}"),
+    }
+
+    server.shutdown().await;
+}
+
 // ============================================================================
 // Graceful Shutdown Tests
 // ============================================================================

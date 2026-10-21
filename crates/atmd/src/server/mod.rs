@@ -42,6 +42,8 @@ pub use connection::{
     ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter, SubscribersMap,
 };
 
+use connection::subscriber_key;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -218,11 +220,9 @@ impl DaemonServer {
             let client_id = handler.run().await;
 
             // Remove from subscribers if was subscribed
-            if let Some(id) = client_id {
-                let mut subs = subscribers.write().await;
-                if subs.remove(&id).is_some() {
-                    debug!(client_id = %id, "Removed disconnected subscriber");
-                }
+            let mut subs = subscribers.write().await;
+            if subs.remove(&subscriber_key(connection_number)).is_some() {
+                debug!(client_id = ?client_id, "Removed disconnected subscriber");
             }
         });
     }

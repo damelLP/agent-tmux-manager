@@ -8,8 +8,8 @@
 
 use atm_core::{AgentType, LifecycleEvent, Model, SessionDomain, SessionId, Tool};
 use atmd::registry::{
-    spawn_registry, spawn_registry_with_cancel, supervise_actor, RegistryError, RemovalReason,
-    SessionEvent, MAX_SESSIONS,
+    spawn_registry, spawn_registry_with_cancel, supervise_actor, ActorStopped, RegistryError,
+    RemovalReason, SessionEvent, MAX_SESSIONS,
 };
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -1272,7 +1272,7 @@ async fn test_cancel_stops_and_joins_registry_tasks() {
 
     cancel.cancel();
 
-    // The maintenance tasks hold senders, so they must stop for the actor to.
+    // Every task stops, including the maintenance tasks that hold senders.
     timeout(Duration::from_secs(1), tasks.actor)
         .await
         .expect("actor should stop on cancel")
@@ -1306,13 +1306,54 @@ async fn test_supervise_actor_cancels_when_actor_panics() {
     .expect("supervisor should return once the actor dies");
 
     assert!(
-        matches!(&result, Err(RegistryError::ActorStopped(reason)) if reason.contains("injected actor panic")),
+        matches!(&result, Err(ActorStopped(reason)) if reason.contains("injected actor panic")),
         "unexpected result: {result:?}"
     );
     assert!(
         cancel.is_cancelled(),
         "actor death should cancel the daemon"
     );
+}
+
+#[tokio::test]
+async fn test_supervise_actor_reports_panic_during_shutdown() {
+    let cancel = CancellationToken::new();
+    let actor_cancel = cancel.clone();
+    // Stand-in for an actor that panics while draining after cancel
+    let actor = tokio::spawn(async move {
+        actor_cancel.cancelled().await;
+        panic!("panic during shutdown");
+    });
+    cancel.cancel();
+
+    let result = timeout(Duration::from_secs(1), supervise_actor(actor, cancel))
+        .await
+        .expect("supervisor should return once the actor dies");
+
+    assert!(
+        matches!(&result, Err(ActorStopped(reason)) if reason.contains("panic during shutdown")),
+        "a panic is a failure even after cancel: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_supervise_actor_reports_exit_before_cancel() {
+    let cancel = CancellationToken::new();
+    // Stand-in for an actor whose channel closed while the daemon still runs
+    let actor = tokio::spawn(async {});
+
+    let result = timeout(
+        Duration::from_secs(1),
+        supervise_actor(actor, cancel.clone()),
+    )
+    .await
+    .expect("supervisor should return once the actor ends");
+
+    assert!(
+        matches!(&result, Err(ActorStopped(reason)) if reason.contains("exited before shutdown")),
+        "unexpected result: {result:?}"
+    );
+    assert!(cancel.is_cancelled(), "actor exit should cancel the daemon");
 }
 
 #[tokio::test]

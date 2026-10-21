@@ -192,10 +192,6 @@ pub enum RegistryError {
     /// Failed to parse status line or event data.
     #[error("parse error: {0}")]
     ParseError(String),
-
-    /// The registry actor stopped before shutdown (for example, it panicked).
-    #[error("registry actor stopped: {0}")]
-    ActorStopped(String),
 }
 
 impl RegistryError {

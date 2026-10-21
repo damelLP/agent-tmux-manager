@@ -61,6 +61,11 @@ pub struct RegistryTasks {
     pub maintenance: Vec<JoinHandle<()>>,
 }
 
+/// The registry actor stopped before shutdown (for example, it panicked).
+#[derive(Debug, thiserror::Error)]
+#[error("registry actor stopped: {0}")]
+pub struct ActorStopped(pub String);
+
 /// Spawn the registry actor and return a handle for interaction.
 ///
 /// The tasks are never cancelled; they run until the runtime shuts down.
@@ -98,6 +103,7 @@ pub fn spawn_registry() -> RegistryHandle {
 /// The maintenance tasks hold command senders, so the actor never sees its
 /// channel close on its own; `cancel` is what stops them. Join the returned
 /// [`RegistryTasks`] to wait until they have.
+#[must_use = "dropping RegistryTasks leaves the actor unsupervised"]
 pub fn spawn_registry_with_cancel(cancel: CancellationToken) -> (RegistryHandle, RegistryTasks) {
     // Create channels
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
@@ -107,7 +113,11 @@ pub fn spawn_registry_with_cancel(cancel: CancellationToken) -> (RegistryHandle,
     let actor = RegistryActor::new(cmd_rx, event_tx.clone());
     let actor_cancel = cancel.clone();
     let actor = tokio::spawn(async move {
-        actor_cancel.run_until_cancelled(actor.run()).await;
+        tokio::select! {
+            biased;
+            () = actor_cancel.cancelled() => {}
+            () = actor.run() => {}
+        }
     });
 
     // Create handle
@@ -126,29 +136,24 @@ pub fn spawn_registry_with_cancel(cancel: CancellationToken) -> (RegistryHandle,
     (handle, tasks)
 }
 
-/// Waits until `cancel` fires or the registry actor ends, whichever is first.
+/// Waits for the registry actor to end, given the `cancel` token it was
+/// spawned with.
 ///
-/// The actor ending first means it failed (it panicked, or every sender was
-/// dropped). This cancels `cancel` so the rest of the daemon shuts down, and
-/// returns [`RegistryError::ActorStopped`].
+/// Ending is a failure if the actor panicked, or if it exited before `cancel`
+/// fired (every sender was dropped). A failure cancels `cancel`, so anything
+/// derived from it shuts down, and returns [`ActorStopped`].
 pub async fn supervise_actor(
     actor: JoinHandle<()>,
     cancel: CancellationToken,
-) -> Result<(), RegistryError> {
-    tokio::select! {
-        // Checked first: shutdown stops the actor too, and that is not a failure.
-        biased;
-        () = cancel.cancelled() => Ok(()),
-        result = actor => {
-            let reason = match result {
-                Ok(()) => "exited before shutdown".to_string(),
-                Err(e) => e.to_string(),
-            };
-            error!(reason = %reason, "Registry actor stopped; shutting down");
-            cancel.cancel();
-            Err(RegistryError::ActorStopped(reason))
-        }
-    }
+) -> Result<(), ActorStopped> {
+    let reason = match actor.await {
+        Ok(()) if cancel.is_cancelled() => return Ok(()),
+        Ok(()) => "exited before shutdown".to_string(),
+        Err(e) => e.to_string(),
+    };
+    error!(reason = %reason, "Registry actor stopped; shutting down");
+    cancel.cancel();
+    Err(ActorStopped(reason))
 }
 
 /// Spawn a background task that triggers periodic stale session cleanup.
@@ -161,6 +166,7 @@ fn spawn_cleanup_task(
 
         loop {
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => {
                     debug!("Cleanup task stopping: cancelled");
                     break;
@@ -194,6 +200,7 @@ fn spawn_git_refresh_task(
 
         loop {
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => {
                     debug!("Git refresh task stopping: cancelled");
                     break;

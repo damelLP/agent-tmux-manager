@@ -233,7 +233,10 @@ async fn run_daemon() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
-    let cancel_token = CancellationToken::new();
+    // The registry outlives the server so in-flight requests drain against a
+    // live actor. Cancelling the registry (actor death) also stops the server.
+    let registry_cancel = CancellationToken::new();
+    let cancel_token = registry_cancel.child_token();
 
     let shutdown_token = cancel_token.clone();
     tokio::spawn(async move {
@@ -244,7 +247,7 @@ async fn run_daemon() -> Result<()> {
         shutdown_token.cancel();
     });
 
-    let (registry, registry_tasks) = spawn_registry_with_cancel(cancel_token.clone());
+    let (registry, registry_tasks) = spawn_registry_with_cancel(registry_cancel.clone());
     info!("Session registry started");
 
     let discovery = DiscoveryService::new(registry.clone());
@@ -260,21 +263,26 @@ async fn run_daemon() -> Result<()> {
     let _monitor_handle = spawn_monitor_task(cancel_token.clone());
     info!("Process monitor started");
 
-    let server = DaemonServer::new(&socket_path, registry, cancel_token.clone());
+    let server = DaemonServer::new(&socket_path, registry, cancel_token);
 
     info!(socket = %socket_path, "Starting server");
 
-    // If the registry actor dies, the supervisor cancels the token and the
-    // server shuts down cooperatively (drains connections, removes the socket).
+    // If the registry actor dies, the supervisor cancels the registry token and
+    // the server shuts down cooperatively (drains connections, removes the socket).
     let (server_result, registry_result) = tokio::join!(
         async {
             let result = server.run().await;
-            // Also releases the supervisor if the server failed to start
-            cancel_token.cancel();
+            // Connections have drained (or the server failed to start)
+            registry_cancel.cancel();
             result
         },
-        supervise_actor(registry_tasks.actor, cancel_token.clone()),
+        supervise_actor(registry_tasks.actor, registry_cancel.clone()),
     );
+    for task in registry_tasks.maintenance {
+        if let Err(e) = task.await {
+            error!(error = %e, "Registry maintenance task failed");
+        }
+    }
 
     if let Err(e) = server_result {
         error!(error = %e, "Server error");

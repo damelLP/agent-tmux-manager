@@ -185,17 +185,18 @@ fn main() -> Result<()> {
 
     match command {
         Command::Start { daemon } => {
-            if let Some(pid) = is_daemon_running() {
-                exit_already_running(Some(pid));
-            }
-
             // Only the lock holder touches the socket and the PID file. It is
             // taken before daemonize() so a losing `atmd start -d` exits 1 in
             // the foreground; the daemonized child inherits the locked file.
             let socket_path = socket_path();
             let Some(_lock) = lock_daemon(&socket_path)? else {
-                exit_already_running(read_pid());
+                exit_already_running(read_pid().filter(|&pid| is_process_running(pid)));
             };
+
+            // Under the lock, so only the holder ever clears a stale PID file.
+            if let Some(pid) = is_daemon_running() {
+                exit_already_running(Some(pid));
+            }
 
             if daemon {
                 daemonize()?;

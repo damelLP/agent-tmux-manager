@@ -61,15 +61,38 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// A PID that can't be running: PIDs are always below pid_max.
+fn dead_pid() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .expect("pid_max")
+        .trim()
+        .to_string()
+}
+
+fn wait_exit(child: &mut Child) -> Option<ExitStatus> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => return Some(status),
+            None if Instant::now() >= deadline => return None,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 /// Concurrent `atmd start -d`s, as the TUI's auto-start runs them, leave
-/// one daemon. The lock is taken before daemonizing, so the losers'
-/// exit status reaches the caller instead of being lost in a fork.
-#[test]
-fn test_concurrent_daemonized_starts_leave_one_daemon() {
+/// one daemon, and the PID file names it. The lock is taken before
+/// daemonizing, so the losers' exit status reaches the caller instead of
+/// being lost in a fork.
+fn assert_concurrent_daemonized_starts_leave_one_daemon(stale_pid_file: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("atmd.sock");
     let state = dir.path().join("state");
     let pid_file = state.join("atm").join("atmd.pid");
+    if stale_pid_file {
+        std::fs::create_dir_all(state.join("atm")).expect("mkdir state");
+        std::fs::write(&pid_file, dead_pid()).expect("write stale PID");
+    }
 
     let starters: Vec<Child> = (0..STARTERS)
         .map(|_| atmd(&socket, &state, &["-d"]).spawn().expect("spawn atmd"))
@@ -78,7 +101,8 @@ fn test_concurrent_daemonized_starts_leave_one_daemon() {
         .into_iter()
         .map(|mut c| c.wait().expect("wait for starter"))
         .collect();
-    wait_for("the PID file", || pid_file.exists());
+    // The winner writes its PID before it binds.
+    wait_for("the socket", || socket.exists());
     // Give a duplicate time to show up as a second survivor.
     std::thread::sleep(Duration::from_secs(1));
     let daemons = daemons_for(&socket);
@@ -89,6 +113,50 @@ fn test_concurrent_daemonized_starts_leave_one_daemon() {
     assert_eq!(recorded.trim(), daemons[0].to_string());
     let failed = statuses.iter().filter(|s| s.code() == Some(1)).count();
     assert_eq!(failed, STARTERS - 1, "starter statuses: {statuses:?}");
+}
+
+#[test]
+fn test_concurrent_daemonized_starts_leave_one_daemon() {
+    assert_concurrent_daemonized_starts_leave_one_daemon(false);
+}
+
+/// After a crash the PID file names a dead process, and every starter's
+/// stale-PID check wants to remove it.
+#[test]
+fn test_concurrent_starts_after_a_crash_keep_the_winners_pid_file() {
+    assert_concurrent_daemonized_starts_leave_one_daemon(true);
+}
+
+/// Only the lock holder may clear a stale PID file. A losing starter that
+/// cleared it could delete a winner's fresh PID file and hide the live
+/// daemon from `atmd stop`/`status` and from the client's auto-start check.
+#[test]
+fn test_losing_start_leaves_the_pid_file_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("atmd.sock");
+    let state = dir.path().join("state");
+    let pid_file = state.join("atm").join("atmd.pid");
+
+    let mut daemon = atmd(&socket, &state, &[]).spawn().expect("spawn atmd");
+    wait_for("the socket", || socket.exists());
+    // The window a winner is in after locking and before writing its PID:
+    // the file still names a dead process.
+    std::fs::write(&pid_file, dead_pid()).expect("write stale PID");
+
+    let mut loser = atmd(&socket, &state, &[]).spawn().expect("spawn loser");
+    let status = wait_exit(&mut loser);
+    let left = std::fs::read_to_string(&pid_file).ok();
+    for child in [&mut daemon, &mut loser] {
+        stop(child.id());
+        let _ = child.wait();
+    }
+
+    assert_eq!(status.and_then(|s| s.code()), Some(1), "loser: {status:?}");
+    assert_eq!(
+        left,
+        Some(dead_pid()),
+        "the losing starter touched the PID file"
+    );
 }
 
 /// A second atmd with its own state dir but the same socket must not
@@ -107,14 +175,7 @@ fn test_start_with_other_state_dir_keeps_the_running_daemons_socket() {
     let mut second = atmd(&socket, &dir.path().join("state2"), &[])
         .spawn()
         .expect("spawn second atmd");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        match second.try_wait().expect("try_wait") {
-            Some(status) => break Some(status),
-            None if Instant::now() >= deadline => break None,
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    };
+    let status = wait_exit(&mut second);
     let still_bound = std::fs::metadata(&socket).map(|m| m.ino()).ok();
     for child in [&mut first, &mut second] {
         stop(child.id());

@@ -2,11 +2,17 @@
 //!
 //! Shells out to the `tmux` binary via `tokio::process::Command`.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tokio::process::Command;
 use tracing::{debug, trace};
 
 use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
+
+/// Deadline for one tmux command. tmux normally answers in milliseconds, but
+/// a stopped or wedged server never answers and the client waits forever.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Real tmux client that invokes the `tmux` CLI.
 ///
@@ -60,6 +66,9 @@ impl RealTmuxClient {
     }
 
     /// Runs a tmux command, returning stdout on success or `TmuxError` on failure.
+    ///
+    /// Gives up after [`COMMAND_TIMEOUT`] with [`TmuxError::Timeout`]; the
+    /// `tmux` process is killed rather than left blocked on the server.
     async fn run(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError> {
         trace!(subcommand, ?args, "running tmux command");
 
@@ -67,8 +76,13 @@ impl RealTmuxClient {
             .tmux_cmd()
             .arg(subcommand)
             .args(args)
-            .output()
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(COMMAND_TIMEOUT, output)
             .await
+            .map_err(|_| TmuxError::Timeout {
+                command: subcommand.to_string(),
+            })?
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     TmuxError::NotFound

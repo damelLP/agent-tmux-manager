@@ -14,6 +14,14 @@ pub enum TmuxError {
         stderr: String,
     },
 
+    /// A tmux command did not finish before its deadline (e.g. the tmux
+    /// server is stopped or wedged). The `tmux` process has been killed.
+    #[error("tmux command timed out: {command}")]
+    Timeout {
+        /// The tmux subcommand that timed out (e.g., "list-panes").
+        command: String,
+    },
+
     /// tmux binary not found in PATH.
     #[error("tmux not found in PATH")]
     NotFound,

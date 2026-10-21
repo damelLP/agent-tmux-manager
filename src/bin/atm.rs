@@ -474,7 +474,9 @@ async fn run_event_loop(
                                     info!(session_id = %session_id, "Jump to session");
                                     if let Some(ref pane_id) = session.tmux_pane {
                                         let pane_id = pane_id.clone();
-                                        match tmux::jump_to_pane(&pane_id) {
+                                        match tmux::jump_to_pane(&RealTmuxClient::new(), &pane_id)
+                                            .await
+                                        {
                                             Ok(()) => {
                                                 info!(pane_id = %pane_id, "Jumped to pane");
                                                 if app.pick_mode {

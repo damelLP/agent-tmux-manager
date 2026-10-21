@@ -222,3 +222,39 @@ fn test_daemonized_start_with_a_relative_socket_locks_and_binds_one_path() {
     assert!(dir.path().join("run/atmd.sock.lock").exists());
     assert_eq!(daemons.len(), 1, "daemons: {daemons:?}");
 }
+
+/// A client whose state dir has no PID file must still see a daemon that
+/// already owns the shared socket (the devcontainer case), instead of
+/// spawning a duplicate that loses the lock and then giving up.
+#[test]
+fn test_client_with_other_state_dir_uses_the_running_daemon() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("atmd.sock");
+    let mut daemon = atmd(&socket, &dir.path().join("state1"), &[])
+        .spawn()
+        .expect("spawn atmd");
+    wait_for("the socket", || socket.exists());
+
+    let started = Instant::now();
+    let list = Command::new(env!("CARGO_BIN_EXE_atm"))
+        .args(["list", "--format", "json"])
+        .env("ATM_SOCKET", &socket)
+        .env("XDG_STATE_HOME", dir.path().join("state2"))
+        .output()
+        .expect("run atm list");
+    let elapsed = started.elapsed();
+    let daemons = daemons_for(&socket);
+    daemons.iter().for_each(|pid| stop(*pid));
+    let _ = daemon.wait();
+
+    assert!(
+        list.status.success(),
+        "atm list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "atm list took {elapsed:?}"
+    );
+    assert_eq!(daemons, vec![daemon.id()], "a second daemon survived");
+}

@@ -194,10 +194,15 @@ fn main() -> Result<()> {
 
     match command {
         Command::Start { daemon } => {
-            // One absolute path for the lock and the bind: daemonize()
-            // changes to `/`, which would move a relative ATM_SOCKET.
-            let socket_path =
-                std::path::absolute(socket_path()).context("Failed to resolve the socket path")?;
+            // daemonize() changes to `/`, so with -d a relative ATM_SOCKET is
+            // made absolute first, to keep the lock and the bind on one path.
+            // A foreground start uses it as given: lock and bind share the
+            // cwd, and an absolute form could exceed sun_path's 108 bytes.
+            let socket_path = if daemon {
+                std::path::absolute(socket_path()).context("Failed to resolve the socket path")?
+            } else {
+                PathBuf::from(socket_path())
+            };
 
             // Only the lock holder touches the socket and the PID file. It is
             // taken before daemonize() so a losing `atmd start -d` exits 1 in

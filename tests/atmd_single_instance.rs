@@ -258,3 +258,30 @@ fn test_client_with_other_state_dir_uses_the_running_daemon() {
     );
     assert_eq!(daemons, vec![daemon.id()], "a second daemon survived");
 }
+
+/// A unix socket address holds at most 108 bytes (`sun_path`). A short
+/// relative `ATM_SOCKET` in a deep working directory binds as given, so a
+/// foreground start must not expand it to an absolute path first.
+#[test]
+fn test_foreground_start_binds_a_short_relative_socket_in_a_deep_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut deep = dir.path().to_path_buf();
+    while deep.join("a.sock").as_os_str().len() <= 108 {
+        deep.push("deep-working-directory");
+    }
+    std::fs::create_dir_all(&deep).expect("mkdir deep");
+    let socket = deep.join("a.sock");
+
+    let mut daemon = atmd(Path::new("a.sock"), &dir.path().join("state"), &[])
+        .current_dir(&deep)
+        .spawn()
+        .expect("spawn atmd");
+    wait_until(|| socket.exists() || daemon.try_wait().ok().flatten().is_some());
+    let bound = socket.exists();
+    let exited = daemon.try_wait().expect("try_wait");
+    stop(daemon.id());
+    let _ = daemon.wait();
+
+    assert!(exited.is_none(), "atmd exited: {exited:?}");
+    assert!(bound, "no socket at {}", socket.display());
+}

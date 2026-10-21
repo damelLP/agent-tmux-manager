@@ -34,6 +34,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deadline for writing one message to the daemon.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The error every client deadline reports, so callers match one kind.
+fn timed_out(step: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{step} timed out"))
+}
+
 /// Resolves the daemon socket path, honoring the `ATM_SOCKET` env var.
 ///
 /// Mirrors `atmd`'s behavior so a daemon and its clients pointed at a
@@ -287,10 +292,7 @@ impl DaemonClient {
                     CONNECT_TIMEOUT,
                     UnixStream::connect(&self.config.socket_path),
                 );
-                match connect
-                    .await
-                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
-                {
+                match connect.await.unwrap_or_else(|_| Err(timed_out("connect"))) {
                     Ok(stream) => {
                         debug!(attempt, "Connection successful");
                         return Ok(stream);
@@ -345,7 +347,7 @@ impl DaemonClient {
         let mut line = String::new();
         timeout(HANDSHAKE_TIMEOUT, buf_reader.read_line(&mut line))
             .await
-            .map_err(|_| TuiError::DaemonConnection("handshake timed out".to_string()))??;
+            .map_err(|_| timed_out("handshake"))??;
 
         let response: DaemonMessage = serde_json::from_str(line.trim())?;
         match response {
@@ -420,7 +422,7 @@ impl DaemonClient {
             writer.flush().await
         })
         .await
-        .map_err(|_| TuiError::DaemonConnection("write timed out".to_string()))??;
+        .map_err(|_| timed_out("write"))??;
         debug!(message_type = ?message.message, "Sent message to daemon");
         Ok(())
     }
@@ -948,7 +950,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(60), send).await;
 
         assert!(
-            matches!(result, Ok(Err(TuiError::DaemonConnection(_)))),
+            matches!(&result, Ok(Err(TuiError::Io(e))) if e.kind() == std::io::ErrorKind::TimedOut),
             "expected a write timeout, got {result:?}"
         );
         assert!(started.elapsed() >= WRITE_TIMEOUT);

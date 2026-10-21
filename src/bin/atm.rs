@@ -809,11 +809,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     }
 
     // Send disconnect
-    let disconnect_msg = ClientMessage::disconnect();
-    if let Ok(json) = serde_json::to_string(&disconnect_msg) {
-        let _ =
-            tokio::time::timeout(deadline, writer.write_all(format!("{json}\n").as_bytes())).await;
-    }
+    let _ = send(&mut writer, &ClientMessage::disconnect(), deadline).await;
 
     Ok(sessions)
 }

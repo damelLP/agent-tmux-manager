@@ -33,7 +33,7 @@ use tracing_subscriber::EnvFilter;
 
 use atmd::discovery::DiscoveryService;
 use atmd::monitor::spawn_monitor_task;
-use atmd::registry::spawn_registry;
+use atmd::registry::{spawn_registry_with_cancel, supervise_actor};
 use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
 
 /// ATM daemon - Claude Code session manager
@@ -244,7 +244,7 @@ async fn run_daemon() -> Result<()> {
         shutdown_token.cancel();
     });
 
-    let registry = spawn_registry();
+    let (registry, registry_tasks) = spawn_registry_with_cancel(cancel_token.clone());
     info!("Session registry started");
 
     let discovery = DiscoveryService::new(registry.clone());
@@ -260,14 +260,27 @@ async fn run_daemon() -> Result<()> {
     let _monitor_handle = spawn_monitor_task(cancel_token.clone());
     info!("Process monitor started");
 
-    let server = DaemonServer::new(&socket_path, registry, cancel_token);
+    let server = DaemonServer::new(&socket_path, registry, cancel_token.clone());
 
     info!(socket = %socket_path, "Starting server");
 
-    if let Err(e) = server.run().await {
+    // If the registry actor dies, the supervisor cancels the token and the
+    // server shuts down cooperatively (drains connections, removes the socket).
+    let (server_result, registry_result) = tokio::join!(
+        async {
+            let result = server.run().await;
+            // Also releases the supervisor if the server failed to start
+            cancel_token.cancel();
+            result
+        },
+        supervise_actor(registry_tasks.actor, cancel_token.clone()),
+    );
+
+    if let Err(e) = server_result {
         error!(error = %e, "Server error");
         return Err(e.into());
     }
+    registry_result?;
 
     info!("ATM daemon stopped");
     Ok(())

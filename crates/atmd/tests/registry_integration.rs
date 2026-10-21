@@ -8,8 +8,8 @@
 
 use atm_core::{AgentType, LifecycleEvent, Model, SessionDomain, SessionId, Tool};
 use atmd::registry::{
-    spawn_registry, spawn_registry_with_cancel, RegistryError, RemovalReason, SessionEvent,
-    MAX_SESSIONS,
+    spawn_registry, spawn_registry_with_cancel, supervise_actor, RegistryError, RemovalReason,
+    SessionEvent, MAX_SESSIONS,
 };
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -1290,4 +1290,43 @@ async fn test_cancel_stops_and_joins_registry_tasks() {
         handle.remove(SessionId::new("cancel-test")).await,
         Err(RegistryError::ChannelClosed)
     ));
+}
+
+#[tokio::test]
+async fn test_supervise_actor_cancels_when_actor_panics() {
+    let cancel = CancellationToken::new();
+    // Stand-in for an actor that panics while handling a command
+    let actor = tokio::spawn(async { panic!("injected actor panic") });
+
+    let result = timeout(
+        Duration::from_secs(1),
+        supervise_actor(actor, cancel.clone()),
+    )
+    .await
+    .expect("supervisor should return once the actor dies");
+
+    assert!(
+        matches!(&result, Err(RegistryError::ActorStopped(reason)) if reason.contains("injected actor panic")),
+        "unexpected result: {result:?}"
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "actor death should cancel the daemon"
+    );
+}
+
+#[tokio::test]
+async fn test_supervise_actor_ok_on_shutdown() {
+    let cancel = CancellationToken::new();
+    let (_handle, tasks) = spawn_registry_with_cancel(cancel.clone());
+    let supervisor = tokio::spawn(supervise_actor(tasks.actor, cancel.clone()));
+
+    // Shutdown also stops the actor; that must not count as a failure.
+    cancel.cancel();
+
+    let result = timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("supervisor should return on cancel")
+        .expect("supervisor should not panic");
+    assert!(result.is_ok(), "unexpected result: {result:?}");
 }

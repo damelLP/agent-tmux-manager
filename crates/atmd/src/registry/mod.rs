@@ -29,7 +29,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, error};
 
 mod actor;
 mod commands;
@@ -124,6 +124,31 @@ pub fn spawn_registry_with_cancel(cancel: CancellationToken) -> (RegistryHandle,
         maintenance: vec![cleanup, git_refresh],
     };
     (handle, tasks)
+}
+
+/// Waits until `cancel` fires or the registry actor ends, whichever is first.
+///
+/// The actor ending first means it failed (it panicked, or every sender was
+/// dropped). This cancels `cancel` so the rest of the daemon shuts down, and
+/// returns [`RegistryError::ActorStopped`].
+pub async fn supervise_actor(
+    actor: JoinHandle<()>,
+    cancel: CancellationToken,
+) -> Result<(), RegistryError> {
+    tokio::select! {
+        // Checked first: shutdown stops the actor too, and that is not a failure.
+        biased;
+        () = cancel.cancelled() => Ok(()),
+        result = actor => {
+            let reason = match result {
+                Ok(()) => "exited before shutdown".to_string(),
+                Err(e) => e.to_string(),
+            };
+            error!(reason = %reason, "Registry actor stopped; shutting down");
+            cancel.cancel();
+            Err(RegistryError::ActorStopped(reason))
+        }
+    }
 }
 
 /// Spawn a background task that triggers periodic stale session cleanup.

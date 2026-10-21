@@ -7,9 +7,13 @@
 //! We test the panic-free behavior of production code through assertions.
 
 use atm_core::{AgentType, LifecycleEvent, Model, SessionDomain, SessionId, Tool};
-use atmd::registry::{spawn_registry, RegistryError, RemovalReason, SessionEvent, MAX_SESSIONS};
+use atmd::registry::{
+    spawn_registry, spawn_registry_with_cancel, RegistryError, RemovalReason, SessionEvent,
+    MAX_SESSIONS,
+};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Test Helpers
@@ -1251,4 +1255,39 @@ async fn test_rescan_refreshes_git_info() {
         Some("new-branch"),
         "rescan should pick up updated branch"
     );
+}
+
+// ============================================================================
+// Shutdown Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_cancel_stops_and_joins_registry_tasks() {
+    let cancel = CancellationToken::new();
+    let (handle, tasks) = spawn_registry_with_cancel(cancel.clone());
+    handle
+        .register(create_test_session("cancel-test"))
+        .await
+        .expect("registry should work before cancel");
+
+    cancel.cancel();
+
+    // The maintenance tasks hold senders, so they must stop for the actor to.
+    timeout(Duration::from_secs(1), tasks.actor)
+        .await
+        .expect("actor should stop on cancel")
+        .expect("actor should not panic");
+    assert_eq!(tasks.maintenance.len(), 2);
+    for task in tasks.maintenance {
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("maintenance task should stop on cancel")
+            .expect("maintenance task should not panic");
+    }
+
+    assert!(!handle.is_connected());
+    assert!(matches!(
+        handle.remove(SessionId::new("cancel-test")).await,
+        Err(RegistryError::ChannelClosed)
+    ));
 }

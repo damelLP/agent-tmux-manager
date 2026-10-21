@@ -26,7 +26,9 @@
 //! - Channel operations handle closure gracefully
 
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 mod actor;
@@ -50,7 +52,19 @@ const CLEANUP_INTERVAL_SECS: u64 = 2;
 /// Git info refresh interval in seconds
 const GIT_REFRESH_INTERVAL_SECS: u64 = 5;
 
+/// Background tasks spawned by [`spawn_registry_with_cancel`].
+#[derive(Debug)]
+pub struct RegistryTasks {
+    /// The registry actor.
+    pub actor: JoinHandle<()>,
+    /// Periodic stale-session cleanup and git refresh.
+    pub maintenance: Vec<JoinHandle<()>>,
+}
+
 /// Spawn the registry actor and return a handle for interaction.
+///
+/// The tasks are never cancelled; they run until the runtime shuts down.
+/// Use [`spawn_registry_with_cancel`] to stop and join them.
 ///
 /// This function:
 /// 1. Creates command and event channels
@@ -76,33 +90,58 @@ const GIT_REFRESH_INTERVAL_SECS: u64 = 5;
 /// }
 /// ```
 pub fn spawn_registry() -> RegistryHandle {
+    spawn_registry_with_cancel(CancellationToken::new()).0
+}
+
+/// Spawn the registry actor and its maintenance tasks, all stopped by `cancel`.
+///
+/// The maintenance tasks hold command senders, so the actor never sees its
+/// channel close on its own; `cancel` is what stops them. Join the returned
+/// [`RegistryTasks`] to wait until they have.
+pub fn spawn_registry_with_cancel(cancel: CancellationToken) -> (RegistryHandle, RegistryTasks) {
     // Create channels
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
 
     // Create and spawn actor
     let actor = RegistryActor::new(cmd_rx, event_tx.clone());
-    tokio::spawn(actor.run());
+    let actor_cancel = cancel.clone();
+    let actor = tokio::spawn(async move {
+        actor_cancel.run_until_cancelled(actor.run()).await;
+    });
 
     // Create handle
     let handle = RegistryHandle::new(cmd_tx.clone(), event_tx);
 
     // Spawn cleanup task
-    spawn_cleanup_task(cmd_tx.clone());
+    let cleanup = spawn_cleanup_task(cmd_tx.clone(), cancel.clone());
 
     // Spawn git info refresh task (detects branch switches)
-    spawn_git_refresh_task(cmd_tx);
+    let git_refresh = spawn_git_refresh_task(cmd_tx, cancel);
 
-    handle
+    let tasks = RegistryTasks {
+        actor,
+        maintenance: vec![cleanup, git_refresh],
+    };
+    (handle, tasks)
 }
 
 /// Spawn a background task that triggers periodic stale session cleanup.
-fn spawn_cleanup_task(sender: mpsc::Sender<RegistryCommand>) {
+fn spawn_cleanup_task(
+    sender: mpsc::Sender<RegistryCommand>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    debug!("Cleanup task stopping: cancelled");
+                    break;
+                }
+                _ = ticker.tick() => {}
+            }
 
             // Fire-and-forget cleanup command
             if sender.send(RegistryCommand::CleanupStale).await.is_err() {
@@ -113,7 +152,7 @@ fn spawn_cleanup_task(sender: mpsc::Sender<RegistryCommand>) {
 
             debug!("Triggered stale session cleanup");
         }
-    });
+    })
 }
 
 /// Spawn a background task that periodically refreshes git info for all sessions.
@@ -121,17 +160,26 @@ fn spawn_cleanup_task(sender: mpsc::Sender<RegistryCommand>) {
 /// Detects branch switches that happen without a working directory change
 /// (e.g., `git checkout other-branch`). The cost is minimal: one stat() + read()
 /// of `.git/HEAD` per tracked session every 5 seconds.
-fn spawn_git_refresh_task(sender: mpsc::Sender<RegistryCommand>) {
+fn spawn_git_refresh_task(
+    sender: mpsc::Sender<RegistryCommand>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(GIT_REFRESH_INTERVAL_SECS));
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    debug!("Git refresh task stopping: cancelled");
+                    break;
+                }
+                _ = ticker.tick() => {}
+            }
 
             if sender.send(RegistryCommand::RefreshGitInfo).await.is_err() {
                 debug!("Git refresh task stopping: registry channel closed");
                 break;
             }
         }
-    });
+    })
 }

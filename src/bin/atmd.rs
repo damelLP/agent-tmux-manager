@@ -33,7 +33,7 @@ use tracing_subscriber::EnvFilter;
 
 use atmd::discovery::DiscoveryService;
 use atmd::monitor::spawn_monitor_task;
-use atmd::registry::spawn_registry;
+use atmd::registry::{spawn_registry_with_cancel, supervise_actor};
 use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
 
 /// ATM daemon - Claude Code session manager
@@ -233,7 +233,10 @@ async fn run_daemon() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
-    let cancel_token = CancellationToken::new();
+    // The registry outlives the server so in-flight requests drain against a
+    // live actor. Cancelling the registry (actor death) also stops the server.
+    let registry_cancel = CancellationToken::new();
+    let cancel_token = registry_cancel.child_token();
 
     let shutdown_token = cancel_token.clone();
     tokio::spawn(async move {
@@ -244,7 +247,7 @@ async fn run_daemon() -> Result<()> {
         shutdown_token.cancel();
     });
 
-    let registry = spawn_registry();
+    let (registry, registry_tasks) = spawn_registry_with_cancel(registry_cancel.clone());
     info!("Session registry started");
 
     let discovery = DiscoveryService::new(registry.clone());
@@ -264,10 +267,28 @@ async fn run_daemon() -> Result<()> {
 
     info!(socket = %socket_path, "Starting server");
 
-    if let Err(e) = server.run().await {
+    // If the registry actor dies, the supervisor cancels the registry token and
+    // the server shuts down cooperatively (drains connections, removes the socket).
+    let (server_result, registry_result) = tokio::join!(
+        async {
+            let result = server.run().await;
+            // Connections have drained (or the server failed to start)
+            registry_cancel.cancel();
+            result
+        },
+        supervise_actor(registry_tasks.actor, registry_cancel.clone()),
+    );
+    for task in registry_tasks.maintenance {
+        if let Err(e) = task.await {
+            error!(error = %e, "Registry maintenance task failed");
+        }
+    }
+
+    if let Err(e) = server_result {
         error!(error = %e, "Server error");
         return Err(e.into());
     }
+    registry_result?;
 
     info!("ATM daemon stopped");
     Ok(())

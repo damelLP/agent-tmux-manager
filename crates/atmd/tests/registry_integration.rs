@@ -7,9 +7,13 @@
 //! We test the panic-free behavior of production code through assertions.
 
 use atm_core::{AgentType, LifecycleEvent, Model, SessionDomain, SessionId, Tool};
-use atmd::registry::{spawn_registry, RegistryError, RemovalReason, SessionEvent, MAX_SESSIONS};
+use atmd::registry::{
+    spawn_registry, spawn_registry_with_cancel, supervise_actor, ActorStopped, RegistryError,
+    RemovalReason, SessionEvent, MAX_SESSIONS,
+};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Test Helpers
@@ -1251,4 +1255,119 @@ async fn test_rescan_refreshes_git_info() {
         Some("new-branch"),
         "rescan should pick up updated branch"
     );
+}
+
+// ============================================================================
+// Shutdown Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_cancel_stops_and_joins_registry_tasks() {
+    let cancel = CancellationToken::new();
+    let (handle, tasks) = spawn_registry_with_cancel(cancel.clone());
+    handle
+        .register(create_test_session("cancel-test"))
+        .await
+        .expect("registry should work before cancel");
+
+    cancel.cancel();
+
+    // Every task stops, including the maintenance tasks that hold senders.
+    timeout(Duration::from_secs(1), tasks.actor)
+        .await
+        .expect("actor should stop on cancel")
+        .expect("actor should not panic");
+    assert_eq!(tasks.maintenance.len(), 2);
+    for task in tasks.maintenance {
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("maintenance task should stop on cancel")
+            .expect("maintenance task should not panic");
+    }
+
+    assert!(!handle.is_connected());
+    assert!(matches!(
+        handle.remove(SessionId::new("cancel-test")).await,
+        Err(RegistryError::ChannelClosed)
+    ));
+}
+
+#[tokio::test]
+async fn test_supervise_actor_cancels_when_actor_panics() {
+    let cancel = CancellationToken::new();
+    // Stand-in for an actor that panics while handling a command
+    let actor = tokio::spawn(async { panic!("injected actor panic") });
+
+    let result = timeout(
+        Duration::from_secs(1),
+        supervise_actor(actor, cancel.clone()),
+    )
+    .await
+    .expect("supervisor should return once the actor dies");
+
+    assert!(
+        matches!(&result, Err(ActorStopped(reason)) if reason.contains("injected actor panic")),
+        "unexpected result: {result:?}"
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "actor death should cancel the daemon"
+    );
+}
+
+#[tokio::test]
+async fn test_supervise_actor_reports_panic_during_shutdown() {
+    let cancel = CancellationToken::new();
+    let actor_cancel = cancel.clone();
+    // Stand-in for an actor that panics while draining after cancel
+    let actor = tokio::spawn(async move {
+        actor_cancel.cancelled().await;
+        panic!("panic during shutdown");
+    });
+    cancel.cancel();
+
+    let result = timeout(Duration::from_secs(1), supervise_actor(actor, cancel))
+        .await
+        .expect("supervisor should return once the actor dies");
+
+    assert!(
+        matches!(&result, Err(ActorStopped(reason)) if reason.contains("panic during shutdown")),
+        "a panic is a failure even after cancel: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_supervise_actor_reports_exit_before_cancel() {
+    let cancel = CancellationToken::new();
+    // Stand-in for an actor whose channel closed while the daemon still runs
+    let actor = tokio::spawn(async {});
+
+    let result = timeout(
+        Duration::from_secs(1),
+        supervise_actor(actor, cancel.clone()),
+    )
+    .await
+    .expect("supervisor should return once the actor ends");
+
+    assert!(
+        matches!(&result, Err(ActorStopped(reason)) if reason.contains("exited before shutdown")),
+        "unexpected result: {result:?}"
+    );
+    assert!(cancel.is_cancelled(), "actor exit should cancel the daemon");
+}
+
+#[tokio::test]
+async fn test_supervise_actor_ok_on_shutdown() {
+    let cancel = CancellationToken::new();
+    let (_handle, tasks) = spawn_registry_with_cancel(cancel.clone());
+    let supervisor = tokio::spawn(supervise_actor(tasks.actor, cancel.clone()));
+
+    // Shutdown also stops the actor; that must not count as a failure.
+    cancel.cancel();
+
+    let result = timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("supervisor should return on cancel")
+        .expect("supervisor should not panic");
+    assert!(result.is_ok(), "unexpected result: {result:?}");
 }

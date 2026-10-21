@@ -107,7 +107,7 @@ where
     // Find the line matching our pane_id
     let pane_info = output_str
         .lines()
-        .find(|line| line.starts_with(pane_id))
+        .find(|line| line.split_whitespace().next() == Some(pane_id))
         .ok_or_else(|| {
             TmuxError::CommandFailed(format!("pane {pane_id} not found in any session"))
         })?;
@@ -221,6 +221,23 @@ mod tests {
                     pane: "%5".to_string()
                 },
             ]
+        );
+
+        // "%1" must not match the "%10" line listed before it (tmux 3.8
+        // lists sessions by name, so this order is real).
+        let mock = MockTmuxClient::new();
+        mock.set_next_raw_output("%10 alpha @9\n%1 zeta @0\n");
+        jump_to_pane(&mock, "%1")
+            .await
+            .expect("jump should succeed");
+        assert_eq!(
+            mock.calls().get(1..3),
+            Some(
+                &[
+                    raw("switch-client", &["-t", "zeta"]),
+                    raw("select-window", &["-t", "@0"]),
+                ][..]
+            )
         );
 
         // Not listed: error, and no switching.

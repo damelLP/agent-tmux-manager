@@ -447,7 +447,9 @@ impl DaemonClient {
         R: AsyncBufReadExt + Unpin,
         W: AsyncWriteExt + Unpin,
     {
-        let mut line = String::new();
+        // Unlike `read_line`, `next_line` keeps a partly read line when a
+        // command wins the select below.
+        let mut lines = reader.lines();
 
         loop {
             // Check for cancellation
@@ -460,18 +462,17 @@ impl DaemonClient {
             let mut command_rx = self.command_rx.lock().await;
 
             // Wait for either a daemon message or a TUI command
-            line.clear();
             tokio::select! {
                 // Read from daemon
-                read_result = reader.read_line(&mut line) => {
+                read_result = lines.next_line() => {
                     drop(command_rx); // Release lock before processing
                     match read_result {
-                        Ok(0) => {
+                        Ok(None) => {
                             // EOF - connection closed
                             info!("Daemon closed connection");
                             return Ok(());
                         }
-                        Ok(_) => {
+                        Ok(Some(line)) => {
                             // Parse and handle message
                             if let Err(e) = self.handle_message(line.trim()).await {
                                 warn!(error = %e, line = %line.trim(), "Failed to handle message");
@@ -935,6 +936,58 @@ mod tests {
 
         cancel_token.cancel();
         run.await.expect("client task");
+    }
+
+    /// A TUI command that arrives while a daemon line is half-read must not
+    /// lose that line. Subscribed TUIs no longer reconnect every few
+    /// minutes, so a lost update would stay lost.
+    #[tokio::test(start_paused = true)]
+    async fn test_message_loop_keeps_a_partial_line_across_a_command() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let client = DaemonClient::new(
+            DaemonConfig::default(),
+            event_tx,
+            cmd_rx,
+            CancellationToken::new(),
+        );
+        let (ours, daemon) = tokio::io::duplex(64 * 1024);
+        let (reader, mut writer) = tokio::io::split(ours);
+        let (daemon_reader, mut daemon_writer) = tokio::io::split(daemon);
+        tokio::spawn(async move {
+            client
+                .message_loop(&mut BufReader::new(reader), &mut writer)
+                .await
+        });
+
+        let json = serde_json::to_string(&DaemonMessage::session_removed(SessionId::new("s1")))
+            .expect("serialize");
+        let (head, tail) = json.split_at(json.len() / 2);
+        daemon_writer
+            .write_all(head.as_bytes())
+            .await
+            .expect("write head");
+        // Let the client read the head and block waiting for the rest.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The command wins the select while the line is incomplete.
+        cmd_tx.send(ClientCommand::Discover).expect("send command");
+        let mut sent = String::new();
+        BufReader::new(daemon_reader)
+            .read_line(&mut sent)
+            .await
+            .expect("read discover");
+        assert!(sent.contains("discover"), "unexpected client line: {sent}");
+
+        daemon_writer
+            .write_all(format!("{tail}\n").as_bytes())
+            .await
+            .expect("write tail");
+        let event = tokio::time::timeout(Duration::from_secs(60), event_rx.recv()).await;
+        assert!(
+            matches!(&event, Ok(Some(Event::SessionRemoved(id))) if id == "s1"),
+            "half-read line was lost: {event:?}"
+        );
     }
 
     /// A daemon that stops reading must not block the client's writes

@@ -11,14 +11,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use atm_core::{AgentType, Model, SessionDomain, SessionId};
+use atm_core::{AgentType, Harness, LifecycleEvent, Model, SessionDomain, SessionId};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use atmd::registry::spawn_registry;
 use atmd::server::DaemonServer;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 // ============================================================================
@@ -42,6 +42,7 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(100);
 struct TestServer {
     socket_path: PathBuf,
     cancel_token: CancellationToken,
+    run_task: tokio::task::JoinHandle<()>,
     _temp_dir: TempDir, // Keep alive for RAII cleanup
 }
 
@@ -58,7 +59,7 @@ impl TestServer {
         let server = DaemonServer::new(socket_path.clone(), registry, cancel_token.clone());
 
         // Spawn server in background
-        tokio::spawn(async move {
+        let run_task = tokio::spawn(async move {
             let _ = server.run().await;
         });
 
@@ -80,6 +81,7 @@ impl TestServer {
         let test_server = TestServer {
             socket_path,
             cancel_token,
+            run_task,
             _temp_dir: temp_dir,
         };
 
@@ -433,6 +435,30 @@ async fn test_max_clients_rejection() {
     server.shutdown().await;
 }
 
+/// The cap counts subscribed connections, not client ids: clients choose
+/// their ids, and every subscribed connection runs its own forwarder.
+#[tokio::test]
+async fn test_max_clients_rejects_connection_reusing_a_client_id() {
+    let server = TestServer::spawn().await;
+    let mut clients = Vec::new();
+    for i in 0..MAX_TUI_CLIENTS {
+        clients.push(subscribe_client(&server, &format!("client-{i}")).await);
+    }
+
+    let mut reused = server.connect().await;
+    reused.handshake(Some("client-0".to_string())).await;
+    reused.send(ClientMessage::subscribe(None)).await;
+
+    match reused.recv().await {
+        DaemonMessage::Error { message, .. } => {
+            assert!(message.contains("Too many subscribers"), "got {message:?}");
+        }
+        other => panic!("Expected a Too many subscribers error, got {other:?}"),
+    }
+
+    server.shutdown().await;
+}
+
 // ============================================================================
 // Graceful Shutdown Tests
 // ============================================================================
@@ -457,6 +483,219 @@ async fn test_graceful_shutdown() {
         !socket_path.exists(),
         "Socket file should be removed after shutdown"
     );
+}
+
+// ============================================================================
+// Slow Subscriber Tests
+// ============================================================================
+
+/// Updates published while one subscriber never reads. At well over 1 KiB
+/// each, they overflow its Unix socket buffer (~200 KiB on Linux) many
+/// times over, so its writes are certainly blocked.
+const FLOOD_UPDATES: usize = 2000;
+
+/// Bound for work that must not wait on a stuck subscriber. A stalled
+/// server never finishes, so any finite bound tells the two apart.
+const NOT_STALLED: Duration = Duration::from_secs(30);
+
+/// Connects, handshakes and subscribes to all sessions, consuming the
+/// initial session list.
+async fn subscribe_client(server: &TestServer, client_id: &str) -> TestClient {
+    let mut client = server.connect().await;
+    client.handshake(Some(client_id.to_string())).await;
+    client.send(ClientMessage::subscribe(None)).await;
+    match client.recv().await {
+        DaemonMessage::SessionList { .. } => client,
+        other => panic!("Expected SessionList, got {other:?}"),
+    }
+}
+
+/// Subscribes a client that never reads again, then floods updates past
+/// its socket buffer while a healthy subscriber reads each one in
+/// lockstep. Fails if the stuck subscriber stalls the healthy one.
+/// Returns the stuck client so its socket stays open.
+async fn flood_past_stuck_subscriber(
+    server: &TestServer,
+    registry: &atmd::registry::RegistryHandle,
+) -> TestClient {
+    let stuck = subscribe_client(server, "stuck").await;
+    let mut healthy = subscribe_client(server, "healthy").await;
+
+    let session_id = SessionId::new("flood");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+
+    let flood = async {
+        for _ in 0..FLOOD_UPDATES {
+            registry
+                .apply_lifecycle_event(
+                    session_id.clone(),
+                    LifecycleEvent::PromptSubmit {
+                        prompt: Some("x".repeat(1024)),
+                    },
+                    Harness::ClaudeCode,
+                    None,
+                    None,
+                )
+                .await
+                .expect("apply lifecycle event");
+            match healthy.recv().await {
+                DaemonMessage::SessionUpdated { .. } => {}
+                other => panic!("Expected SessionUpdated, got {other:?}"),
+            }
+        }
+    };
+    assert!(
+        timeout(NOT_STALLED, flood).await.is_ok(),
+        "healthy subscriber stalled behind a subscriber that never reads"
+    );
+    stuck
+}
+
+/// A subscriber that is briefly busy (reads nothing while a burst is
+/// published) still receives every update afterwards instead of being
+/// disconnected for lagging. 1500 matches the burst in the real-atmd probe.
+#[tokio::test]
+async fn test_subscriber_busy_during_burst_is_not_disconnected() {
+    const BURST_UPDATES: usize = 1500;
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut busy = subscribe_client(&server, "busy").await;
+
+    let session_id = SessionId::new("burst");
+    registry
+        .register(create_test_session(session_id.as_str()))
+        .await
+        .expect("register session");
+    for _ in 0..BURST_UPDATES {
+        registry
+            .apply_lifecycle_event(
+                session_id.clone(),
+                LifecycleEvent::PromptSubmit {
+                    prompt: Some("x".repeat(1024)),
+                },
+                Harness::ClaudeCode,
+                None,
+                None,
+            )
+            .await
+            .expect("apply lifecycle event");
+    }
+
+    for i in 0..BURST_UPDATES {
+        let mut line = String::new();
+        let read = timeout(NOT_STALLED, busy.reader.read_line(&mut line)).await;
+        assert!(
+            matches!(read, Ok(Ok(n)) if n > 0),
+            "disconnected after {i} of {BURST_UPDATES} updates: {read:?}"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stuck_subscriber_does_not_stall_other_subscribers() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let _stuck = flood_past_stuck_subscriber(&server, &registry).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_subscribe_succeeds_while_a_subscriber_is_stuck() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let _stuck = flood_past_stuck_subscriber(&server, &registry).await;
+
+    let late = timeout(NOT_STALLED, subscribe_client(&server, "late")).await;
+    assert!(late.is_ok(), "subscribe stalled behind a stuck subscriber");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_shutdown_completes_while_a_subscriber_is_stuck() {
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let _stuck = flood_past_stuck_subscriber(&server, &registry).await;
+    let socket_path = server.socket_path.clone();
+
+    server.cancel_token.cancel();
+    let stopped = timeout(NOT_STALLED, server.run_task).await;
+
+    assert!(
+        stopped.is_ok(),
+        "server.run() stalled behind a stuck subscriber"
+    );
+    assert!(
+        !socket_path.exists(),
+        "socket should be removed on shutdown"
+    );
+}
+
+/// A reply that hits WRITE_TIMEOUT may have left half a line on the
+/// socket, so the server closes the connection rather than replying again
+/// and carrying on. Time is paused, so the timeout elapses as soon as the
+/// pong writes block.
+#[tokio::test(start_paused = true)]
+async fn test_connection_closes_after_a_write_timeout() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    // Far more pongs than the socket buffer holds, sent without reading.
+    // Writes fail once the server closes, so errors end the loop. The
+    // write half stays open afterwards: closing it would send EOF and let
+    // the server close for that reason instead.
+    let mut writer = client.writer;
+    tokio::spawn(async move {
+        for seq in 0..20_000 {
+            let json = serde_json::to_string(&ClientMessage::ping(seq)).unwrap();
+            if writer
+                .write_all(format!("{json}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+    sleep(Duration::from_secs(30)).await;
+
+    let drained = timeout(Duration::from_secs(60), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if client.reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "connection stayed open after a write timeout"
+    );
+
+    server.shutdown().await;
+}
+
+/// A client that connects but never sends `Connect` is dropped once the
+/// handshake deadline passes. Time is paused, so the deadline elapses
+/// instantly once the runtime is otherwise idle.
+#[tokio::test(start_paused = true)]
+async fn test_handshake_deadline_closes_silent_client() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+
+    let mut line = String::new();
+    let read = timeout(Duration::from_secs(60), client.reader.read_line(&mut line)).await;
+
+    assert!(
+        matches!(read, Ok(Ok(0))),
+        "expected EOF after the handshake deadline, got {read:?}"
+    );
+    server.shutdown().await;
 }
 
 #[tokio::test]

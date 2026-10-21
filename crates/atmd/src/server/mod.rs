@@ -42,26 +42,33 @@ pub use connection::{
     ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter, SubscribersMap,
 };
 
+use connection::subscriber_key;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use atm_core::SessionId;
-use atm_protocol::DaemonMessage;
 
-use crate::registry::{RegistryHandle, SessionEvent};
+use crate::registry::RegistryHandle;
 
 /// Default socket path
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/atm.sock";
 
 /// Maximum number of concurrent TUI clients
 const MAX_TUI_CLIENTS: usize = 10;
+
+/// How long shutdown waits for connection handlers before aborting them
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Unix socket server for the ATM daemon.
 ///
@@ -150,8 +157,8 @@ impl DaemonServer {
             "Daemon server listening"
         );
 
-        // Spawn event broadcaster
-        self.spawn_event_broadcaster();
+        // Connection handlers, each cancelled with the server
+        let mut connections = JoinSet::new();
 
         // Accept connections until cancelled
         loop {
@@ -167,7 +174,7 @@ impl DaemonServer {
                     match result {
                         Ok((stream, _addr)) => {
                             let conn_num = self.connection_counter.fetch_add(1, Ordering::Relaxed);
-                            self.handle_connection(stream, conn_num);
+                            self.handle_connection(&mut connections, stream, conn_num);
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to accept connection");
@@ -175,74 +182,47 @@ impl DaemonServer {
                         }
                     }
                 }
+
+                // Reap finished handlers so the set doesn't grow
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
             }
         }
 
         // Cleanup
         self.cleanup().await;
+        drain_connections(connections).await;
         Ok(())
     }
 
     /// Handles a new client connection by spawning a handler task.
-    fn handle_connection(&self, stream: tokio::net::UnixStream, connection_number: u64) {
+    fn handle_connection(
+        &self,
+        connections: &mut JoinSet<()>,
+        stream: tokio::net::UnixStream,
+        connection_number: u64,
+    ) {
         let (reader, writer) = stream.into_split();
         let registry = self.registry.clone();
         let subscribers = Arc::clone(&self.subscribers);
+        let cancel = self.cancel_token.child_token();
 
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let handler = ConnectionHandler::new(
                 reader,
                 writer,
                 registry,
                 Arc::clone(&subscribers),
                 connection_number,
+                cancel,
             );
 
             // Run the handler and get the client_id when done
             let client_id = handler.run().await;
 
             // Remove from subscribers if was subscribed
-            if let Some(id) = client_id {
-                let mut subs = subscribers.write().await;
-                if subs.remove(&id).is_some() {
-                    debug!(client_id = %id, "Removed disconnected subscriber");
-                }
-            }
-        });
-    }
-
-    /// Spawns the event broadcaster task.
-    ///
-    /// This task receives events from the registry and broadcasts them
-    /// to all subscribed TUI clients.
-    fn spawn_event_broadcaster(&self) {
-        let mut event_rx = self.registry.subscribe();
-        let subscribers = Arc::clone(&self.subscribers);
-        let cancel_token = self.cancel_token.clone();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        debug!("Event broadcaster shutting down");
-                        break;
-                    }
-
-                    result = event_rx.recv() => {
-                        match result {
-                            Ok(event) => {
-                                broadcast_event(&subscribers, &event).await;
-                            }
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                warn!(skipped = n, "Event broadcaster lagged, skipped events");
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {
-                                debug!("Event channel closed");
-                                break;
-                            }
-                        }
-                    }
-                }
+            let mut subs = subscribers.write().await;
+            if subs.remove(&subscriber_key(connection_number)).is_some() {
+                debug!(client_id = ?client_id, "Removed disconnected subscriber");
             }
         });
     }
@@ -304,77 +284,20 @@ impl DaemonServer {
     }
 }
 
-/// Broadcasts an event to all subscribed clients.
-async fn broadcast_event(subscribers: &SubscribersMap, event: &SessionEvent) {
-    // Get session_id from event for filtering
-    let session_id = match event {
-        SessionEvent::Registered { session_id, .. } => session_id,
-        SessionEvent::Updated { session } => &session.id,
-        SessionEvent::Removed { session_id, .. } => session_id,
-    };
+/// Waits up to [`CONNECTION_DRAIN_TIMEOUT`] for cancelled connection
+/// handlers to finish, then aborts the rest.
+async fn drain_connections(mut connections: JoinSet<()>) {
+    let drained = timeout(CONNECTION_DRAIN_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
 
-    // Build the message once
-    let msg = match event {
-        SessionEvent::Registered { .. } => {
-            // Don't broadcast registration - wait for first update with data
-            return;
-        }
-        SessionEvent::Updated { session } => DaemonMessage::session_updated((**session).clone()),
-        SessionEvent::Removed { session_id, .. } => {
-            DaemonMessage::session_removed(session_id.clone())
-        }
-    };
-
-    let json = match serde_json::to_string(&msg) {
-        Ok(j) => j,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize event");
-            return;
-        }
-    };
-
-    // Send to all matching subscribers
-    let subs = subscribers.read().await;
-    let mut failed_clients = Vec::new();
-
-    for (client_id, sub) in subs.iter() {
-        // Check filter
-        if let Some(ref filter) = sub.filter {
-            if filter != session_id {
-                continue;
-            }
-        }
-
-        // Try to send
-        let mut writer = sub.writer.lock().await;
-        let send_result = async {
-            use tokio::io::AsyncWriteExt;
-            writer.write_all(json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            Ok::<(), std::io::Error>(())
-        }
-        .await;
-
-        if let Err(e) = send_result {
-            debug!(
-                client_id = %client_id,
-                error = %e,
-                "Failed to send event to subscriber"
-            );
-            failed_clients.push(client_id.clone());
-        }
-    }
-
-    // Remove failed clients (need to drop read lock first)
-    drop(subs);
-
-    if !failed_clients.is_empty() {
-        let mut subs = subscribers.write().await;
-        for client_id in failed_clients {
-            subs.remove(&client_id);
-            debug!(client_id = %client_id, "Removed failed subscriber");
-        }
+    if drained.is_err() {
+        warn!(
+            remaining = connections.len(),
+            "Aborting connection handlers that did not stop in time"
+        );
+        connections.shutdown().await;
     }
 }
 

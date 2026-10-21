@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +24,15 @@ use atm_protocol::{ClientMessage, DaemonMessage, ProtocolVersion};
 
 /// Default Unix socket path the daemon listens on.
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/atm.sock";
+
+/// Deadline for connecting to the daemon socket.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline for the daemon's reply to `Connect`.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for writing one message to the daemon.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolves the daemon socket path, honoring the `ATM_SOCKET` env var.
 ///
@@ -274,7 +283,14 @@ impl DaemonClient {
                 }
             } else {
                 // Attempt connection
-                match UnixStream::connect(&self.config.socket_path).await {
+                let connect = timeout(
+                    CONNECT_TIMEOUT,
+                    UnixStream::connect(&self.config.socket_path),
+                );
+                match connect
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+                {
                     Ok(stream) => {
                         debug!(attempt, "Connection successful");
                         return Ok(stream);
@@ -327,7 +343,9 @@ impl DaemonClient {
 
         // Wait for connected response
         let mut line = String::new();
-        buf_reader.read_line(&mut line).await?;
+        timeout(HANDSHAKE_TIMEOUT, buf_reader.read_line(&mut line))
+            .await
+            .map_err(|_| TuiError::DaemonConnection("handshake timed out".to_string()))??;
 
         let response: DaemonMessage = serde_json::from_str(line.trim())?;
         match response {
@@ -396,9 +414,13 @@ impl DaemonClient {
         message: &ClientMessage,
     ) -> Result<()> {
         let json = serde_json::to_string(message)?;
-        writer.write_all(json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        timeout(WRITE_TIMEOUT, async {
+            writer.write_all(json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await
+        })
+        .await
+        .map_err(|_| TuiError::DaemonConnection("write timed out".to_string()))??;
         debug!(message_type = ?message.message, "Sent message to daemon");
         Ok(())
     }
@@ -467,9 +489,9 @@ impl DaemonClient {
                         Some(ClientCommand::Discover) => {
                             debug!("Received discover command from TUI");
                             let discover_msg = ClientMessage::discover();
-                            if let Err(e) = self.send_message(writer, &discover_msg).await {
-                                warn!(error = %e, "Failed to send discover message");
-                            }
+                            // A timed-out write may leave half a line on the
+                            // socket, so end the connection and reconnect.
+                            self.send_message(writer, &discover_msg).await?;
                         }
                         None => {
                             // Command channel closed - TUI shutting down
@@ -870,5 +892,65 @@ mod tests {
 
         // Should complete almost immediately (well under 1 second)
         assert!(elapsed < Duration::from_millis(500));
+    }
+
+    // ------------------------------------------------------------------------
+    // Deadline Tests
+    // ------------------------------------------------------------------------
+
+    /// A stalled daemon still completes connects through the kernel
+    /// backlog. The client must give up on the handshake and reconnect
+    /// rather than wait on the first stream forever. Time is paused, so
+    /// the deadline elapses as soon as the client blocks on the read.
+    #[tokio::test(start_paused = true)]
+    async fn test_handshake_deadline_reconnects_to_a_daemon_that_never_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("stalled.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let cancel_token = CancellationToken::new();
+        let config = DaemonConfig {
+            socket_path,
+            ..Default::default()
+        };
+        let client = DaemonClient::new(config, event_tx, cmd_rx, cancel_token.clone());
+        let started = tokio::time::Instant::now();
+        let run = tokio::spawn(async move { client.run().await });
+
+        // Accept and hold the connection, never answering `Connect`.
+        let (_held, _) = listener.accept().await.expect("accept");
+        let event = tokio::time::timeout(Duration::from_secs(60), event_rx.recv()).await;
+        assert!(
+            matches!(event, Ok(Some(Event::DaemonDisconnected))),
+            "client still waiting on a silent daemon"
+        );
+        assert!(started.elapsed() >= HANDSHAKE_TIMEOUT);
+
+        let reconnect = tokio::time::timeout(Duration::from_secs(60), listener.accept()).await;
+        assert!(matches!(reconnect, Ok(Ok(_))), "client did not reconnect");
+
+        cancel_token.cancel();
+        run.await.expect("client task");
+    }
+
+    /// A daemon that stops reading must not block the client's writes
+    /// forever. A 1-byte duplex stands in for a full socket buffer.
+    #[tokio::test(start_paused = true)]
+    async fn test_send_message_times_out_when_daemon_stops_reading() {
+        let (client, _event_rx) = create_test_client();
+        let (mut writer, _daemon) = tokio::io::duplex(1);
+
+        let started = tokio::time::Instant::now();
+        let msg = ClientMessage::discover();
+        let send = client.send_message(&mut writer, &msg);
+        let result = tokio::time::timeout(Duration::from_secs(60), send).await;
+
+        assert!(
+            matches!(result, Ok(Err(TuiError::DaemonConnection(_)))),
+            "expected a write timeout, got {result:?}"
+        );
+        assert!(started.elapsed() >= WRITE_TIMEOUT);
     }
 }

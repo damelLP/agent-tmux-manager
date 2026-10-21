@@ -53,12 +53,19 @@ fn stop(pid: u32) {
     }
 }
 
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+    true
+}
+
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    assert!(wait_until(ready), "timed out waiting for {what}");
 }
 
 /// A PID that can't be running: PIDs are always below pid_max.
@@ -192,4 +199,26 @@ fn test_start_with_other_state_dir_keeps_the_running_daemons_socket() {
         Some(inode),
         "the second atmd rebound the socket"
     );
+}
+
+/// `daemonize()` changes to `/`. A relative `ATM_SOCKET` must still lock
+/// and bind one path, resolved against the directory `atmd` started in.
+#[test]
+fn test_daemonized_start_with_a_relative_socket_locks_and_binds_one_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let relative = Path::new("run/atmd.sock");
+    let socket = dir.path().join(relative);
+
+    let status = atmd(relative, &dir.path().join("state"), &["-d"])
+        .current_dir(dir.path())
+        .status()
+        .expect("run atmd");
+    let bound = wait_until(|| socket.exists());
+    let daemons = daemons_for(relative);
+    daemons.iter().for_each(|pid| stop(*pid));
+
+    assert!(status.success(), "atmd start -d: {status}");
+    assert!(bound, "no socket at {}", socket.display());
+    assert!(dir.path().join("run/atmd.sock.lock").exists());
+    assert_eq!(daemons.len(), 1, "daemons: {daemons:?}");
 }

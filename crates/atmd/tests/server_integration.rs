@@ -698,6 +698,80 @@ async fn test_handshake_deadline_closes_silent_client() {
     server.shutdown().await;
 }
 
+/// A subscribed TUI sends nothing after `Subscribe`, so the idle read
+/// timeout must not drop it. Time is paused, so READ_TIMEOUT (300s)
+/// passes instantly while the server waits on the socket.
+#[tokio::test(start_paused = true)]
+async fn test_subscribed_client_stays_connected_past_read_timeout() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    client.send(ClientMessage::subscribe(None)).await;
+    assert!(matches!(
+        client.recv().await,
+        DaemonMessage::SessionList { .. }
+    ));
+
+    let mut line = String::new();
+    let read = timeout(Duration::from_secs(600), client.reader.read_line(&mut line)).await;
+    assert!(
+        read.is_err(),
+        "subscribed connection closed while idle: {read:?}"
+    );
+
+    // Still served after the idle period.
+    client.send(ClientMessage::ping(1)).await;
+    assert!(matches!(
+        client.recv().await,
+        DaemonMessage::Pong { seq: 1 }
+    ));
+
+    server.shutdown().await;
+}
+
+/// A connection that never subscribed is still closed once idle past
+/// READ_TIMEOUT.
+#[tokio::test(start_paused = true)]
+async fn test_unsubscribed_client_times_out_when_idle() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let mut line = String::new();
+    let read = timeout(Duration::from_secs(600), client.reader.read_line(&mut line)).await;
+    assert!(
+        matches!(read, Ok(Ok(0))),
+        "expected EOF after the idle timeout, got {read:?}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Unsubscribing puts the idle read timeout back.
+#[tokio::test(start_paused = true)]
+async fn test_unsubscribed_after_subscribe_times_out_when_idle() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    client.send(ClientMessage::subscribe(None)).await;
+    assert!(matches!(
+        client.recv().await,
+        DaemonMessage::SessionList { .. }
+    ));
+    client
+        .send(ClientMessage::new(MessageType::Unsubscribe))
+        .await;
+
+    let mut line = String::new();
+    let read = timeout(Duration::from_secs(600), client.reader.read_line(&mut line)).await;
+    assert!(
+        matches!(read, Ok(Ok(0))),
+        "expected EOF after the idle timeout, got {read:?}"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_client_disconnect_message() {
     let server = TestServer::spawn().await;

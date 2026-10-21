@@ -64,7 +64,7 @@ const MAX_TUI_CLIENTS: usize = 10;
 /// Maximum message size (1 MB)
 const MAX_MESSAGE_SIZE: usize = 1_048_576;
 
-/// Read timeout for idle connections (5 minutes)
+/// Read timeout for idle, unsubscribed connections (5 minutes)
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Write timeout (10 seconds)
@@ -272,7 +272,16 @@ impl ConnectionHandler {
                     debug!(client_id = ?self.client_id, "Connection cancelled");
                     return Ok(());
                 }
-                read = timeout(READ_TIMEOUT, self.read_message()) => read,
+                // A subscribed client may stay silent: a dead peer still
+                // gives EOF, and the forwarder's WRITE_TIMEOUT cancels a
+                // stopped one.
+                read = async {
+                    if self.subscribed {
+                        Ok(self.read_message().await)
+                    } else {
+                        timeout(READ_TIMEOUT, self.read_message()).await
+                    }
+                } => read,
             };
             let msg = match read {
                 Ok(Ok(msg)) => msg,

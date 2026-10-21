@@ -134,10 +134,13 @@ fn lock_daemon(socket_path: &str) -> Result<Option<File>> {
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
     // Read-only is enough for flock, and works on a lock file that
-    // someone else created.
+    // someone else created. The default socket dir is world-writable
+    // /tmp: 0600 stops other users opening the lock to hold it, and
+    // O_NOFOLLOW stops a planted symlink redirecting the O_CREAT.
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CREAT)
+        .custom_flags(libc::O_CREAT | libc::O_NOFOLLOW)
+        .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("Failed to open lock file {}", lock_path.display()))?;
     // SAFETY: flock takes an fd that `file` keeps open for the call.
@@ -404,6 +407,35 @@ mod tests {
         fs::set_permissions(&lock_file, fs::Permissions::from_mode(0o444)).expect("chmod");
 
         assert!(lock_daemon(&socket).expect("lock").is_some());
+    }
+
+    /// Other users must not be able to open the lock file and hold the
+    /// lock while this user's daemon is down.
+    #[test]
+    fn test_daemon_lock_file_is_private() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_in(dir.path());
+        drop(lock_daemon(&socket).expect("lock"));
+
+        let mode = fs::metadata(format!("{socket}.lock"))
+            .expect("lock file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// The default socket dir is world-writable /tmp, so a planted
+    /// symlink must not redirect the lock's O_CREAT.
+    #[test]
+    fn test_daemon_lock_refuses_a_symlinked_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_in(dir.path());
+        fs::create_dir_all(dir.path().join("run")).expect("mkdir");
+        let target = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, format!("{socket}.lock")).expect("symlink");
+
+        assert!(lock_daemon(&socket).is_err(), "followed a symlinked lock");
+        assert!(!target.exists(), "created the symlink's target");
     }
 
     #[test]

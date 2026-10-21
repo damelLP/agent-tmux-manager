@@ -177,6 +177,7 @@ mod tests {
             },
             atm_tmux::TmuxError::Timeout {
                 command: "switch-client".to_string(),
+                timeout: std::time::Duration::from_secs(5),
             },
         ] {
             let mock = MockTmuxClient::new();

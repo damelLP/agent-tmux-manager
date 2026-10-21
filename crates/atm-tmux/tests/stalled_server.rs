@@ -28,8 +28,10 @@ impl IsolatedServer {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let label = format!("atm-stall-{}-{nanos}", std::process::id());
+        // `-f /dev/null`: don't load the developer's tmux.conf.
         let started = Command::new("tmux")
-            .args(["-L", &label, "new-session", "-d", "-s", "stall"])
+            .args(["-L", &label, "-f", "/dev/null"])
+            .args(["new-session", "-d", "-s", "stall"])
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
@@ -94,9 +96,24 @@ async fn stalled_server_call_times_out_without_leaking_client() {
         .await
         .expect("list_panes must give up on a stalled server, not hang");
     assert!(
-        matches!(&result, Err(TmuxError::Timeout { command }) if command == "list-panes"),
-        "expected Timeout for list-panes, got {result:?}"
+        matches!(&result, Err(TmuxError::Timeout { command, timeout })
+            if command == "list-panes" && *timeout == Duration::from_secs(5)),
+        "expected a 5s Timeout for list-panes, got {result:?}"
     );
+
+    // new-session may cold-start a server, which runs the user's tmux.conf
+    // first, so it gets a longer deadline. Workspace setup sends it through
+    // raw_command.
+    let started = tokio::time::Instant::now();
+    let result = client
+        .raw_command("new-session", &["-d", "-s", "late"])
+        .await;
+    assert!(
+        matches!(&result, Err(TmuxError::Timeout { command, timeout })
+            if command == "new-session" && *timeout == Duration::from_secs(30)),
+        "expected a 30s Timeout for new-session, got {result:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_secs(30));
 
     // kill_on_drop: the blocked client is killed, not left waiting on the
     // server. Real time, since the kill is delivered outside tokio.

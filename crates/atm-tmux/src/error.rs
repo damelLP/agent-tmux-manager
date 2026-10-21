@@ -16,10 +16,12 @@ pub enum TmuxError {
 
     /// A tmux command did not finish before its deadline (e.g. the tmux
     /// server is stopped or wedged). The `tmux` process has been killed.
-    #[error("tmux command timed out: {command}")]
+    #[error("tmux command timed out after {timeout:?}: {command}")]
     Timeout {
         /// The tmux subcommand that timed out (e.g., "list-panes").
         command: String,
+        /// The deadline that elapsed.
+        timeout: std::time::Duration,
     },
 
     /// tmux binary not found in PATH.

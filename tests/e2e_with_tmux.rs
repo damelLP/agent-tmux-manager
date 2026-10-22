@@ -202,7 +202,7 @@ except Exception as e:
 /// We pass this label to `RealTmuxClient::with_socket(...)` so the project's
 /// own tmux library code talks to *this* server, not the developer's default.
 ///
-/// Env vars passed to `start_with_env(...)` propagate into the tmux server's
+/// Env vars passed to `start_with_label_session_env(...)` propagate into the tmux server's
 /// process — and from there into the shells running in panes the server
 /// creates. Scenario 4 uses this channel to hand the `claude` shim the
 /// `ATM_SOCKET` it needs to phone home to atmd. (The shim path itself is
@@ -213,18 +213,13 @@ struct PrivateTmux {
 }
 
 impl PrivateTmux {
-    fn start_with_env<I, K, V>(env: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<std::ffi::OsStr>,
-        V: AsRef<std::ffi::OsStr>,
-    {
+    /// A socket label unique to this test run.
+    fn fresh_label() -> String {
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let socket_label = format!("atm-e2e-{}-{}", std::process::id(), now_nanos);
-        Self::start_with_label_session_env(&socket_label, "probe", env)
+        format!("atm-e2e-{}-{}", std::process::id(), now_nanos)
     }
 
     fn start_with_label_session_env<I, K, V>(socket_label: &str, session_name: &str, env: I) -> Self
@@ -274,7 +269,10 @@ struct Daemon {
 }
 
 impl Daemon {
-    async fn spawn(binary: &Path) -> Self {
+    /// `tmux_label` is the private tmux server's `-L` label. Without it,
+    /// atmd's discovery would list the panes of whatever server `$TMUX`
+    /// names, which is the developer's own when tests run inside tmux.
+    async fn spawn(binary: &Path, tmux_label: &str) -> Self {
         let socket_dir_guard = tempfile::tempdir().expect("create socket tempdir");
         let state_dir_guard = tempfile::tempdir().expect("create state tempdir");
         let socket_path = socket_dir_guard.path().join("atmd.sock");
@@ -288,6 +286,7 @@ impl Daemon {
             .arg("start")
             .env("ATM_SOCKET", &socket_path)
             .env("XDG_STATE_HOME", &state_dir)
+            .env("ATM_TMUX_SOCKET", tmux_label)
             .env("RUST_LOG", "warn")
             .stdout(log_file)
             .stderr(log_clone)
@@ -425,8 +424,11 @@ impl E2eEnv {
 
         // Daemon comes up first so the tmux server's env can carry
         // ATM_SOCKET straight into any panes it births. Scenario 4's
-        // shim reads it from there to find the daemon socket.
-        let daemon = Daemon::spawn(&atmd_path).await;
+        // shim reads it from there to find the daemon socket. The label
+        // is picked first so the daemon's discovery can target the
+        // private server too.
+        let tmux_label = PrivateTmux::fresh_label();
+        let daemon = Daemon::spawn(&atmd_path, &tmux_label).await;
 
         // Stage the `claude` shim once; scenario 4 will inject it via
         // ATM_SPAWN_BIN. Earlier iterations tried prepending the shim
@@ -436,8 +438,11 @@ impl E2eEnv {
         let shim_dir_guard = tempfile::tempdir().expect("create shim tempdir");
         let shim_path = write_claude_shim(shim_dir_guard.path());
 
-        let tmux_server =
-            PrivateTmux::start_with_env([("ATM_SOCKET", daemon.socket_path.as_os_str())]);
+        let tmux_server = PrivateTmux::start_with_label_session_env(
+            &tmux_label,
+            "probe",
+            [("ATM_SOCKET", daemon.socket_path.as_os_str())],
+        );
         let tmux = RealTmuxClient::with_socket(tmux_server.label().to_string());
 
         Some(Self {

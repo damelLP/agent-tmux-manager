@@ -736,8 +736,12 @@ fn create_log_file() -> Option<std::fs::File> {
 async fn fetch_sessions() -> Result<Vec<SessionView>> {
     let socket_path = atm_tui::client::resolve_socket_path();
 
-    let stream = UnixStream::connect(&socket_path)
+    // One deadline bounds every step of this one-shot exchange.
+    let deadline = Duration::from_secs(5);
+
+    let stream = tokio::time::timeout(deadline, UnixStream::connect(&socket_path))
         .await
+        .context("Timeout connecting to daemon")?
         .context("Failed to connect to daemon. Is atmd running?")?;
 
     let (reader, mut writer) = stream.into_split();
@@ -747,11 +751,12 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     async fn send(
         writer: &mut tokio::net::unix::OwnedWriteHalf,
         msg: &ClientMessage,
+        deadline: Duration,
     ) -> Result<()> {
         let json = serde_json::to_string(msg).context("Failed to serialize message")?;
-        writer
-            .write_all(format!("{json}\n").as_bytes())
+        tokio::time::timeout(deadline, writer.write_all(format!("{json}\n").as_bytes()))
             .await
+            .context("Timeout writing to daemon")?
             .context("Failed to write to daemon")?;
         Ok(())
     }
@@ -760,13 +765,13 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     send(
         &mut writer,
         &ClientMessage::connect(Some("atm-cli".to_string())),
+        deadline,
     )
     .await?;
 
     // Step 2: Read Connected response, then send ListSessions
     let mut sessions = Vec::new();
     let mut line = String::new();
-    let deadline = Duration::from_secs(5);
 
     loop {
         line.clear();
@@ -783,7 +788,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
             match msg {
                 DaemonMessage::Connected { .. } => {
                     // Now request the session list
-                    send(&mut writer, &ClientMessage::list_sessions()).await?;
+                    send(&mut writer, &ClientMessage::list_sessions(), deadline).await?;
                     continue;
                 }
                 DaemonMessage::SessionList {
@@ -804,10 +809,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     }
 
     // Send disconnect
-    let disconnect_msg = ClientMessage::disconnect();
-    if let Ok(json) = serde_json::to_string(&disconnect_msg) {
-        let _ = writer.write_all(format!("{json}\n").as_bytes()).await;
-    }
+    let _ = send(&mut writer, &ClientMessage::disconnect(), deadline).await;
 
     Ok(sessions)
 }

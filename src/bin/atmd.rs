@@ -20,9 +20,11 @@
 //! ```
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{bail, Context, Result};
@@ -109,6 +111,67 @@ fn is_daemon_running() -> Option<u32> {
     None
 }
 
+fn socket_path() -> String {
+    env::var("ATM_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string())
+}
+
+/// Takes the single-daemon lock for `socket_path`. It is held until the
+/// returned file is dropped, which is process exit. `Ok(None)` means
+/// another atmd holds it.
+///
+/// The lock is `<socket>.lock`, not the PID file. The socket is what two
+/// daemons contend for, and they may use different state dirs, so
+/// different PID files. The PID file is also unlinked by stale-PID cleanup,
+/// which would let a second starter lock a fresh inode. For the same reason
+/// the lock file is never removed.
+fn lock_daemon(socket_path: &Path) -> Result<Option<File>> {
+    let mut lock_path = socket_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    // Read-only is enough for flock, and works on a lock file that
+    // someone else created. The default socket dir is world-writable
+    // /tmp: 0600 stops other users opening the lock to hold it,
+    // O_NOFOLLOW stops a planted symlink redirecting the O_CREAT, and
+    // O_NONBLOCK stops a planted FIFO blocking the open.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file {}", lock_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Failed to stat lock file {}", lock_path.display()))?;
+    if !metadata.is_file() {
+        bail!("Lock file {} is not a regular file", lock_path.display());
+    }
+    // SAFETY: flock takes an fd that `file` keeps open for the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(err).with_context(|| format!("Failed to lock {}", lock_path.display()))
+}
+
+fn exit_already_running(pid: Option<u32>) -> ! {
+    match pid {
+        Some(pid) => eprintln!("Daemon is already running (PID {pid})"),
+        None => eprintln!("Daemon is already running"),
+    }
+    eprintln!("Use 'atmd stop' to stop it first.");
+    process::exit(1);
+}
+
 fn stop_daemon(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
@@ -131,10 +194,26 @@ fn main() -> Result<()> {
 
     match command {
         Command::Start { daemon } => {
+            // daemonize() changes to `/`, so with -d a relative ATM_SOCKET is
+            // made absolute first, to keep the lock and the bind on one path.
+            // A foreground start uses it as given: lock and bind share the
+            // cwd, and an absolute form could exceed sun_path's 108 bytes.
+            let socket_path = if daemon {
+                std::path::absolute(socket_path()).context("Failed to resolve the socket path")?
+            } else {
+                PathBuf::from(socket_path())
+            };
+
+            // Only the lock holder touches the socket and the PID file. It is
+            // taken before daemonize() so a losing `atmd start -d` exits 1 in
+            // the foreground; the daemonized child inherits the locked file.
+            let Some(_lock) = lock_daemon(&socket_path)? else {
+                exit_already_running(read_pid().filter(|&pid| is_process_running(pid)));
+            };
+
+            // Under the lock, so only the holder ever clears a stale PID file.
             if let Some(pid) = is_daemon_running() {
-                eprintln!("Daemon is already running (PID {pid})");
-                eprintln!("Use 'atmd stop' to stop it first.");
-                process::exit(1);
+                exit_already_running(Some(pid));
             }
 
             if daemon {
@@ -143,7 +222,7 @@ fn main() -> Result<()> {
 
             write_pid()?;
 
-            let result = run_daemon();
+            let result = run_daemon(socket_path);
 
             remove_pid_file();
 
@@ -213,7 +292,7 @@ fn daemonize() -> Result<()> {
 }
 
 #[tokio::main]
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
@@ -229,10 +308,6 @@ async fn run_daemon() -> Result<()> {
         "ATM daemon starting"
     );
 
-    let socket_path = env::var("ATM_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
     // The registry outlives the server so in-flight requests drain against a
     // live actor. Cancelling the registry (actor death) also stops the server.
     let registry_cancel = CancellationToken::new();
@@ -265,7 +340,7 @@ async fn run_daemon() -> Result<()> {
 
     let server = DaemonServer::new(&socket_path, registry, cancel_token);
 
-    info!(socket = %socket_path, "Starting server");
+    info!(socket = %socket_path.display(), "Starting server");
 
     // If the registry actor dies, the supervisor cancels the registry token and
     // the server shuts down cooperatively (drains connections, removes the socket).
@@ -319,4 +394,103 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn socket_in(dir: &Path) -> PathBuf {
+        dir.join("run").join("atmd.sock")
+    }
+
+    fn lock_file(socket: &Path) -> String {
+        format!("{}.lock", socket.display())
+    }
+
+    #[test]
+    fn test_daemon_lock_is_exclusive_until_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The socket's parent doesn't exist yet, as on a fresh runtime dir.
+        let socket = socket_in(dir.path());
+
+        let first = lock_daemon(&socket).expect("lock").expect("first holder");
+        assert!(lock_daemon(&socket).expect("lock").is_none(), "lock shared");
+        drop(first);
+        assert!(lock_daemon(&socket).expect("lock").is_some(), "lock kept");
+    }
+
+    #[test]
+    fn test_daemon_lock_takes_a_read_only_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_in(dir.path());
+        drop(lock_daemon(&socket).expect("lock"));
+        fs::set_permissions(lock_file(&socket), fs::Permissions::from_mode(0o444)).expect("chmod");
+
+        assert!(lock_daemon(&socket).expect("lock").is_some());
+    }
+
+    /// Other users must not be able to open the lock file and hold the
+    /// lock while this user's daemon is down.
+    #[test]
+    fn test_daemon_lock_file_is_private() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_in(dir.path());
+        drop(lock_daemon(&socket).expect("lock"));
+
+        let mode = fs::metadata(lock_file(&socket))
+            .expect("lock file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// The default socket dir is world-writable /tmp, so a planted
+    /// symlink must not redirect the lock's O_CREAT.
+    #[test]
+    fn test_daemon_lock_refuses_a_symlinked_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_in(dir.path());
+        fs::create_dir_all(dir.path().join("run")).expect("mkdir");
+        let target = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, lock_file(&socket)).expect("symlink");
+
+        assert!(lock_daemon(&socket).is_err(), "followed a symlinked lock");
+        assert!(!target.exists(), "created the symlink's target");
+    }
+
+    /// A blocking read-only open of a FIFO waits for a writer, which would
+    /// hang `atmd start` before it ever reaches LOCK_NB.
+    #[test]
+    fn test_daemon_lock_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_in(dir.path());
+        fs::create_dir_all(dir.path().join("run")).expect("mkdir");
+        let fifo = std::ffi::CString::new(lock_file(&socket)).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = socket.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(lock_daemon(&path).map(|lock| lock.is_some()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("lock_daemon blocked on the FIFO");
+
+        let err = result.expect_err("locked a FIFO");
+        assert!(format!("{err:#}").contains(&lock_file(&socket)));
+    }
+
+    #[test]
+    fn test_daemon_lock_fails_hard_when_the_lock_file_cannot_be_opened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("file");
+        fs::write(&not_a_dir, "").expect("write file");
+        let socket = not_a_dir.join("atmd.sock");
+
+        let err = lock_daemon(&socket).expect_err("lock under a file");
+        assert!(format!("{err:#}").contains(&not_a_dir.display().to_string()));
+    }
 }

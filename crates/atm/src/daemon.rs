@@ -5,12 +5,15 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use socket2::{Domain, SockAddr, Socket, Type};
 use tracing::{debug, info};
+
+use crate::client::resolve_socket_path;
 
 /// Returns the path to the daemon PID file.
 fn pid_file_path() -> PathBuf {
@@ -34,12 +37,29 @@ fn is_process_running(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
-/// Checks if the daemon is currently running.
+/// Checks if the daemon is currently running: our PID file names a live
+/// process, or a daemon is listening on the configured socket. That
+/// daemon may use another state dir, and so another PID file.
 pub fn is_daemon_running() -> bool {
-    if let Some(pid) = read_pid() {
-        is_process_running(pid)
-    } else {
-        false
+    read_pid().is_some_and(is_process_running) || is_socket_listening(&resolve_socket_path())
+}
+
+/// Whether something accepts connections on `socket`. The connect is
+/// non-blocking: a blocking unix connect waits while a stalled daemon's
+/// backlog is full, and a full backlog (`EAGAIN`) still means a listener.
+fn is_socket_listening(socket: &Path) -> bool {
+    let Ok(addr) = SockAddr::unix(socket) else {
+        return false;
+    };
+    let Ok(probe) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+        return false;
+    };
+    if probe.set_nonblocking(true).is_err() {
+        return false;
+    }
+    match probe.connect(&addr) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
     }
 }
 
@@ -134,5 +154,49 @@ mod tests {
     fn test_is_process_running_nonexistent() {
         // Very high PID should not exist
         assert!(!is_process_running(999_999_999));
+    }
+
+    #[test]
+    fn test_is_socket_listening() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("atmd.sock");
+        assert!(!is_socket_listening(&socket), "no socket file");
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        assert!(is_socket_listening(&socket), "live listener");
+
+        // A crashed daemon leaves the socket file behind.
+        drop(listener);
+        assert!(!is_socket_listening(&socket), "stale socket file");
+    }
+
+    /// A stalled daemon whose backlog is full still counts, and the probe
+    /// must not wait for room in the backlog.
+    #[test]
+    fn test_is_socket_listening_with_a_full_backlog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("atmd.sock");
+        let addr = SockAddr::unix(&socket).expect("addr");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+        listener.bind(&addr).expect("bind");
+        listener.listen(0).expect("listen");
+        // Never accepted, so these fill the backlog. A blocking connect
+        // here would itself wait forever.
+        let connect = || {
+            let client = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+            client.set_nonblocking(true).expect("nonblocking");
+            (client.connect(&addr), client)
+        };
+        let _queued: Vec<_> = (0..4).map(|_| connect()).collect();
+        let (full, _client) = connect();
+        assert_eq!(
+            full.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "backlog not full"
+        );
+
+        let started = std::time::Instant::now();
+        assert!(is_socket_listening(&socket));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

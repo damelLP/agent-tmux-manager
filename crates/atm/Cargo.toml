@@ -22,6 +22,7 @@ atm-claude-adapter = { workspace = true }
 atm-codex-adapter = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+socket2 = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 serde = { workspace = true }

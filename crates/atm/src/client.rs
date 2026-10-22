@@ -121,6 +121,8 @@ impl Default for DaemonConfig {
 /// 3. Sends a `Subscribe` message to receive session updates
 /// 4. Reads messages in a loop, forwarding session updates to the TUI
 /// 5. On disconnect, notifies TUI and retries with exponential backoff
+/// 6. On the default socket, each failed attempt also starts the daemon
+///    if it is not running
 ///
 /// # Example
 ///
@@ -151,10 +153,14 @@ pub struct DaemonClient {
     /// Cancellation token for graceful shutdown.
     cancel_token: CancellationToken,
 
-    /// Starts the daemon when nothing listens on the socket. Defaults to
-    /// `ensure_daemon_running`, which starts it at `resolve_socket_path()`.
-    respawn: Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>,
+    /// Starts the daemon after a failed connect, if it is not running.
+    /// `ensure_daemon_running` on the default socket, which is the only
+    /// socket it starts a daemon for; `None` on any other socket.
+    respawn: Option<Respawn>,
 }
+
+/// A blocking step that starts the daemon unless it is already running.
+type Respawn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
 impl DaemonClient {
     /// Creates a new daemon client.
@@ -168,7 +174,10 @@ impl DaemonClient {
     ///
     /// # Returns
     ///
-    /// A new `DaemonClient` instance ready to connect.
+    /// A new `DaemonClient` instance ready to connect. If
+    /// `config.socket_path` is the default socket (`resolve_socket_path()`),
+    /// the client starts the daemon (`atmd start -d`) whenever connecting
+    /// fails while no daemon is running.
     #[must_use]
     pub fn new(
         config: DaemonConfig,
@@ -176,12 +185,14 @@ impl DaemonClient {
         command_rx: mpsc::UnboundedReceiver<ClientCommand>,
         cancel_token: CancellationToken,
     ) -> Self {
+        let respawn = (config.socket_path == resolve_socket_path())
+            .then(|| Arc::new(crate::daemon::ensure_daemon_running) as Respawn);
         Self {
             config,
             event_tx,
             command_rx: tokio::sync::Mutex::new(command_rx),
             cancel_token,
-            respawn: Arc::new(crate::daemon::ensure_daemon_running),
+            respawn,
         }
     }
 
@@ -285,14 +296,13 @@ impl DaemonClient {
             );
 
             // Check if socket exists first (provides better error message)
-            let nothing_listening = if !self.config.socket_path.exists() {
+            if !self.config.socket_path.exists() {
                 if attempt == 1 {
                     warn!(
                         socket_path = %self.config.socket_path.display(),
                         "Daemon socket not found, will retry"
                     );
                 }
-                true
             } else {
                 // Attempt connection
                 let connect = timeout(
@@ -310,22 +320,14 @@ impl DaemonClient {
                             error = %e,
                             "Connection attempt failed"
                         );
-                        // A stale socket file (the daemon crashed) refuses;
-                        // a timeout or WouldBlock means a slow daemon.
-                        matches!(
-                            e.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                        )
                     }
                 }
-            };
+            }
 
-            // Start the daemon if nothing listens, then wait before retry,
+            // Start the daemon if it is not running, then wait before retry,
             // checking for cancellation
             let respawn_and_wait = async {
-                if nothing_listening {
-                    self.respawn_daemon().await;
-                }
+                self.respawn_daemon().await;
                 sleep(delay).await;
             };
             tokio::select! {
@@ -343,11 +345,14 @@ impl DaemonClient {
     }
 
     /// Starts the daemon after `atmd stop` or a crash, so a running TUI
-    /// recovers without a restart. The respawn step sleeps while the daemon
-    /// starts, so it runs off the runtime. A failure is only logged: the
-    /// caller's backoff retries it.
+    /// recovers without a restart. The respawn step checks the PID file and
+    /// the socket itself, so a daemon that is only slow is left alone. It
+    /// sleeps while the daemon starts, so it runs off the runtime. A failure
+    /// is only logged: the caller's backoff retries it.
     async fn respawn_daemon(&self) {
-        let respawn = Arc::clone(&self.respawn);
+        let Some(respawn) = self.respawn.clone() else {
+            return;
+        };
         match tokio::task::spawn_blocking(move || respawn()).await {
             Ok(Ok(())) => debug!("Daemon running"),
             Ok(Err(e)) => warn!(error = %e, "Failed to start daemon, will retry"),
@@ -990,7 +995,7 @@ mod tests {
             ..Default::default()
         };
         let mut client = DaemonClient::new(config, event_tx, cmd_rx, cancel_token.clone());
-        client.respawn = Arc::new(respawn);
+        client.respawn = Some(Arc::new(respawn));
         let run = tokio::spawn(async move { client.run().await });
         (cancel_token, run)
     }
@@ -1006,6 +1011,24 @@ mod tests {
             std::os::unix::net::UnixListener::bind(socket_path).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         started.send(listener).map_err(|e| e.to_string())
+    }
+
+    /// `ensure_daemon_running` only manages the default socket, so a client
+    /// on another socket must never run it, nor start an unrelated daemon.
+    #[test]
+    fn test_only_a_client_on_the_default_socket_respawns_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = |socket_path| {
+            let (event_tx, _event_rx) = mpsc::unbounded_channel();
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let config = DaemonConfig {
+                socket_path,
+                ..Default::default()
+            };
+            DaemonClient::new(config, event_tx, cmd_rx, CancellationToken::new())
+        };
+        assert!(client(resolve_socket_path()).respawn.is_some());
+        assert!(client(dir.path().join("other.sock")).respawn.is_none());
     }
 
     /// `atmd stop` removes the socket. The client starts the daemon, and
@@ -1040,8 +1063,8 @@ mod tests {
         run.await.expect("client task");
     }
 
-    /// `kill -9` leaves the socket file behind, so connecting is refused.
-    /// That also means no daemon, unlike a slow one.
+    /// `kill -9` leaves the socket file behind, so the connect is refused
+    /// instead of finding no socket.
     #[tokio::test]
     async fn test_reconnect_respawns_a_daemon_behind_a_stale_socket() {
         let dir = tempfile::tempdir().expect("tempdir");

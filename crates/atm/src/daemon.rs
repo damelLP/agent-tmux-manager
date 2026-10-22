@@ -98,7 +98,12 @@ fn spawn_daemon() -> std::io::Result<()> {
     if let Some(socket) = std::env::var_os("ATM_SOCKET").filter(|v| !v.is_empty()) {
         cmd.env("ATM_SOCKET", socket);
     }
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
+    // `atmd start -d` exits once it has forked the daemon. Reap it without
+    // waiting here, so a TUI that respawns the daemon collects no zombies.
+    if let Err(e) = thread::Builder::new().spawn(move || child.wait()) {
+        debug!(error = %e, "Failed to start a thread to reap atmd start");
+    }
 
     Ok(())
 }

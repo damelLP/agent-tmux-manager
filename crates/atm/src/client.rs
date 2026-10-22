@@ -9,6 +9,7 @@
 //! No `.unwrap()`, `.expect()`, `panic!()`, `unreachable!()`, or `todo!()`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -149,6 +150,10 @@ pub struct DaemonClient {
 
     /// Cancellation token for graceful shutdown.
     cancel_token: CancellationToken,
+
+    /// Starts the daemon when nothing listens on the socket. Defaults to
+    /// `ensure_daemon_running`, which starts it at `resolve_socket_path()`.
+    respawn: Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>,
 }
 
 impl DaemonClient {
@@ -176,6 +181,7 @@ impl DaemonClient {
             event_tx,
             command_rx: tokio::sync::Mutex::new(command_rx),
             cancel_token,
+            respawn: Arc::new(crate::daemon::ensure_daemon_running),
         }
     }
 
@@ -279,13 +285,14 @@ impl DaemonClient {
             );
 
             // Check if socket exists first (provides better error message)
-            if !self.config.socket_path.exists() {
+            let nothing_listening = if !self.config.socket_path.exists() {
                 if attempt == 1 {
                     warn!(
                         socket_path = %self.config.socket_path.display(),
                         "Daemon socket not found, will retry"
                     );
                 }
+                true
             } else {
                 // Attempt connection
                 let connect = timeout(
@@ -303,13 +310,26 @@ impl DaemonClient {
                             error = %e,
                             "Connection attempt failed"
                         );
+                        // A stale socket file (the daemon crashed) refuses;
+                        // a timeout or WouldBlock means a slow daemon.
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        )
                     }
                 }
-            }
+            };
 
-            // Wait before retry, checking for cancellation
+            // Start the daemon if nothing listens, then wait before retry,
+            // checking for cancellation
+            let respawn_and_wait = async {
+                if nothing_listening {
+                    self.respawn_daemon().await;
+                }
+                sleep(delay).await;
+            };
             tokio::select! {
-                _ = sleep(delay) => {
+                _ = respawn_and_wait => {
                     // Increase delay for next attempt (exponential backoff)
                     let next_delay_ms = (delay.as_millis() as f64 * self.config.retry_multiplier) as u64;
                     delay = Duration::from_millis(next_delay_ms).min(self.config.retry_max_delay);
@@ -319,6 +339,19 @@ impl DaemonClient {
                     return Err(TuiError::DaemonConnection("cancelled".to_string()));
                 }
             }
+        }
+    }
+
+    /// Starts the daemon after `atmd stop` or a crash, so a running TUI
+    /// recovers without a restart. The respawn step sleeps while the daemon
+    /// starts, so it runs off the runtime. A failure is only logged: the
+    /// caller's backoff retries it.
+    async fn respawn_daemon(&self) {
+        let respawn = Arc::clone(&self.respawn);
+        match tokio::task::spawn_blocking(move || respawn()).await {
+            Ok(Ok(())) => debug!("Daemon running"),
+            Ok(Err(e)) => warn!(error = %e, "Failed to start daemon, will retry"),
+            Err(e) => warn!(error = %e, "Daemon start task failed, will retry"),
         }
     }
 
@@ -935,6 +968,107 @@ mod tests {
         assert!(matches!(reconnect, Ok(Ok(_))), "client did not reconnect");
 
         cancel_token.cancel();
+        run.await.expect("client task");
+    }
+
+    // ------------------------------------------------------------------------
+    // Respawn Tests
+    // ------------------------------------------------------------------------
+
+    /// Runs a client on `socket_path` whose respawn step is `respawn`, so
+    /// no test starts a real daemon.
+    fn spawn_client_with_respawn(
+        socket_path: PathBuf,
+        respawn: impl Fn() -> std::result::Result<(), String> + Send + Sync + 'static,
+    ) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let cancel_token = CancellationToken::new();
+        let config = DaemonConfig {
+            socket_path,
+            retry_initial_delay: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let mut client = DaemonClient::new(config, event_tx, cmd_rx, cancel_token.clone());
+        client.respawn = Arc::new(respawn);
+        let run = tokio::spawn(async move { client.run().await });
+        (cancel_token, run)
+    }
+
+    /// Stands in for a daemon start: binds `socket_path`, replacing a
+    /// stale socket file as atmd does, and hands the listener to the test.
+    fn bind_daemon(
+        socket_path: &std::path::Path,
+        started: &mpsc::UnboundedSender<std::os::unix::net::UnixListener>,
+    ) -> std::result::Result<(), String> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket_path).map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        started.send(listener).map_err(|e| e.to_string())
+    }
+
+    /// `atmd stop` removes the socket. The client starts the daemon, and
+    /// a failed start is retried rather than ending the client.
+    #[tokio::test]
+    async fn test_reconnect_respawns_a_missing_daemon_and_retries_a_failed_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("atmd.sock");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+
+        let (path, count) = (socket_path.clone(), Arc::clone(&calls));
+        let (cancel_token, run) = spawn_client_with_respawn(socket_path, move || {
+            if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err("first start fails".to_string());
+            }
+            bind_daemon(&path, &started_tx)
+        });
+
+        let listener = tokio::time::timeout(Duration::from_secs(10), started_rx.recv())
+            .await
+            .expect("client never respawned the daemon")
+            .expect("respawn channel closed");
+        let listener = tokio::net::UnixListener::from_std(listener).expect("listener");
+        let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+        assert!(matches!(accepted, Ok(Ok(_))), "client did not reconnect");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Cancel, then close the stream so the handshake read ends now.
+        cancel_token.cancel();
+        drop(accepted);
+        run.await.expect("client task");
+    }
+
+    /// `kill -9` leaves the socket file behind, so connecting is refused.
+    /// That also means no daemon, unlike a slow one.
+    #[tokio::test]
+    async fn test_reconnect_respawns_a_daemon_behind_a_stale_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("atmd.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket_path).expect("bind"));
+        assert!(socket_path.exists(), "no stale socket file");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+
+        let (path, count) = (socket_path.clone(), Arc::clone(&calls));
+        let (cancel_token, run) = spawn_client_with_respawn(socket_path, move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bind_daemon(&path, &started_tx)
+        });
+
+        let listener = tokio::time::timeout(Duration::from_secs(10), started_rx.recv())
+            .await
+            .expect("client never respawned the daemon")
+            .expect("respawn channel closed");
+        let listener = tokio::net::UnixListener::from_std(listener).expect("listener");
+        let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+        assert!(matches!(accepted, Ok(Ok(_))), "client did not reconnect");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Cancel, then close the stream so the handshake read ends now.
+        cancel_token.cancel();
+        drop(accepted);
         run.await.expect("client task");
     }
 

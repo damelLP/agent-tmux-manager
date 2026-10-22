@@ -278,6 +278,10 @@ fn daemonize() -> Result<()> {
         fs::create_dir_all(parent).context("Failed to create log directory")?;
     }
 
+    // An open TUI restarts a crashed daemon within seconds. Keep the last
+    // run's log, which explains the crash, instead of truncating it.
+    let _ = fs::rename(&log_path, log_path.with_extension("log.1"));
+
     let stdout = File::create(&log_path).context("Failed to create log file for stdout")?;
     let stderr = File::create(&log_path).context("Failed to create log file for stderr")?;
 

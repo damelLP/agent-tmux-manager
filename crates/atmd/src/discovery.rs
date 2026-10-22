@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use atm_core::{builtin_harnesses, Harness, HarnessDefinition, SessionId};
-use atm_tmux::{RealTmuxClient, TmuxClient};
+use atm_tmux::{RealTmuxClient, TmuxClient, TmuxError};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
@@ -128,9 +128,8 @@ impl DiscoveryService {
     #[must_use]
     pub fn with_max_age(registry: RegistryHandle, transcript_max_age_secs: u64) -> Self {
         Self {
-            registry,
             transcript_max_age_secs,
-            tmux: Box::new(RealTmuxClient::new()),
+            ..Self::new(registry)
         }
     }
 
@@ -156,7 +155,19 @@ impl DiscoveryService {
         let mut result = DiscoveryResult::default();
 
         // One tmux call per scan; the scan below only looks pids up in it.
-        let pane_pids = list_pane_pids(self.tmux.as_ref()).await;
+        // A tmux failure means no pane info, not a failed discovery.
+        let pane_pids = list_pane_pids(self.tmux.as_ref())
+            .await
+            .unwrap_or_else(|e| {
+                match e {
+                    // A stopped or wedged server, not just "tmux isn't running".
+                    TmuxError::Timeout { .. } | TmuxError::Io(_) => {
+                        warn!(error = %e, "Listing tmux panes failed; discovering without panes");
+                    }
+                    _ => debug!(error = %e, "No tmux panes listed"),
+                }
+                HashMap::new()
+            });
 
         // Scan for agent processes (blocking I/O in spawn_blocking)
         let scan = move || scan_agent_processes(&pane_pids);
@@ -1279,8 +1290,9 @@ mod tests {
     // Pane lookup through TmuxClient
     // ========================================================================
 
+    use crate::tmux::test_pane;
     use atm_tmux::mock::MockCall;
-    use atm_tmux::{MockTmuxClient, PaneInfo, TmuxError};
+    use atm_tmux::MockTmuxClient;
 
     /// A stand-in Claude Code process: `/bin/sh` run through a symlink
     /// named `claude`, so its comm is `claude` and its argv0 ends in
@@ -1294,13 +1306,36 @@ mod tests {
 
     impl StandIn {
         fn spawn() -> Self {
+            Self::spawn_as("claude")
+        }
+
+        /// A long-running `/bin/sh` whose comm is `name`.
+        fn spawn_as(name: &str) -> Self {
             let dir = TempDir::new().unwrap();
-            let claude = dir.path().join("claude");
-            std::os::unix::fs::symlink("/bin/sh", &claude).unwrap();
-            let child = std::process::Command::new(&claude)
+            let path = dir.path().join(name);
+            std::os::unix::fs::symlink("/bin/sh", &path).unwrap();
+            let child = std::process::Command::new(&path)
                 .args(["-c", "while :; do sleep 1; done"])
                 .spawn()
                 .unwrap();
+            // spawn() returns once exec closes its CLOEXEC pipe, which is
+            // before the kernel sets the new comm and cmdline: under load a
+            // scan can still see the forked test thread. Wait for both.
+            let pid = child.id();
+            let argv0 = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+            let execed = || {
+                process_comm(pid).as_deref() == Some(name)
+                    && fs::read(format!("/proc/{pid}/cmdline"))
+                        .is_ok_and(|c| c.split(|&b| b == 0).next() == Some(argv0))
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !execed() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stand-in {name:?} never finished exec"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             Self { child, _dir: dir }
         }
 
@@ -1313,18 +1348,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
-        }
-    }
-
-    fn shell_pane(pane_id: &str, pane_pid: u32) -> PaneInfo {
-        PaneInfo {
-            pane_id: pane_id.to_string(),
-            session_name: "s".to_string(),
-            window_index: 0,
-            pane_pid,
-            width: 80,
-            height: 24,
-            is_active: false,
         }
     }
 
@@ -1345,8 +1368,8 @@ mod tests {
         mock.set_panes(vec![
             // The test process is `under_shell`'s parent, as a pane's
             // shell is an agent's.
-            shell_pane("%7", std::process::id()),
-            shell_pane("%8", pane_itself.pid()),
+            test_pane("%7", std::process::id()),
+            test_pane("%8", pane_itself.pid()),
         ]);
         let registry = crate::registry::spawn_registry();
 
@@ -1373,22 +1396,58 @@ mod tests {
     #[tokio::test]
     async fn discover_registers_sessions_without_panes_when_tmux_fails() {
         let agent = StandIn::spawn();
-        let mock = MockTmuxClient::new();
-        mock.set_panes(vec![shell_pane("%7", std::process::id())]);
-        // tmux 3.8's reply when no server is listening.
-        mock.set_next_error(TmuxError::CommandFailed {
-            command: "list-panes".to_string(),
-            stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)"
-                .to_string(),
-        });
-        let registry = crate::registry::spawn_registry();
+        for error in [
+            // tmux 3.8's reply when no server is listening.
+            TmuxError::CommandFailed {
+                command: "list-panes".to_string(),
+                stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)"
+                    .to_string(),
+            },
+            // A stopped server, as seen live against a SIGSTOPped tmux 3.8.
+            TmuxError::Timeout {
+                command: "list-panes".to_string(),
+                timeout: Duration::from_secs(5),
+            },
+        ] {
+            let mock = MockTmuxClient::new();
+            mock.set_panes(vec![test_pane("%7", std::process::id())]);
+            mock.set_next_error(error);
+            let registry = crate::registry::spawn_registry();
 
-        DiscoveryService::new(registry.clone())
-            .with_tmux(mock.clone())
-            .discover()
-            .await;
+            DiscoveryService::new(registry.clone())
+                .with_tmux(mock.clone())
+                .discover()
+                .await;
 
-        assert_eq!(mock.calls(), vec![MockCall::ListPanes]);
-        assert_eq!(discovered_pane(&registry, agent.pid()).await, None);
+            assert_eq!(mock.calls(), vec![MockCall::ListPanes]);
+            assert_eq!(discovered_pane(&registry, agent.pid()).await, None);
+        }
+    }
+
+    // Pane lookup walks the ancestors `read_parent_pid` reports.
+
+    #[test]
+    fn read_parent_pid_of_self_is_the_real_parent() {
+        assert_eq!(
+            read_parent_pid(std::process::id()),
+            Some(std::os::unix::process::parent_id())
+        );
+    }
+
+    #[test]
+    fn read_parent_pid_of_a_missing_process_is_none() {
+        assert_eq!(read_parent_pid(999_999_999), None);
+    }
+
+    #[test]
+    fn read_parent_pid_survives_parens_and_spaces_in_comm() {
+        let odd = StandIn::spawn_as("a) (b c");
+        let comm = fs::read_to_string(format!("/proc/{}/comm", odd.pid())).unwrap();
+        assert_eq!(comm.trim(), "a) (b c");
+        assert_eq!(read_parent_pid(odd.pid()), Some(std::process::id()));
+        assert_eq!(
+            collect_ancestor_pids(odd.pid()).first(),
+            Some(&std::process::id())
+        );
     }
 }

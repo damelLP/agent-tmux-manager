@@ -7,24 +7,19 @@
 
 use std::collections::HashMap;
 
-use atm_tmux::TmuxClient;
-use tracing::debug;
+use atm_tmux::{TmuxClient, TmuxError};
 
 /// Lists all tmux panes as a map of shell PID to pane ID (e.g. "%5").
 ///
-/// A tmux failure (no server, tmux not installed, timeout) yields an empty
-/// map: discovery still registers sessions, just without a pane.
-pub async fn list_pane_pids(tmux: &dyn TmuxClient) -> HashMap<u32, String> {
-    match tmux.list_panes().await {
-        Ok(panes) => panes
-            .into_iter()
-            .map(|pane| (pane.pane_pid, pane.pane_id))
-            .collect(),
-        Err(e) => {
-            debug!(error = %e, "No tmux panes listed");
-            HashMap::new()
-        }
-    }
+/// # Errors
+/// Returns the client's [`TmuxError`] (no server, tmux not installed,
+/// timeout). Discovery treats any error as "no pane info".
+pub async fn list_pane_pids(tmux: &dyn TmuxClient) -> Result<HashMap<u32, String>, TmuxError> {
+    let panes = tmux.list_panes().await?;
+    Ok(panes
+        .into_iter()
+        .map(|pane| (pane.pane_pid, pane.pane_id))
+        .collect())
 }
 
 /// Finds the tmux pane ID for a process.
@@ -35,6 +30,7 @@ pub async fn list_pane_pids(tmux: &dyn TmuxClient) -> HashMap<u32, String> {
 /// # Returns
 /// * `Some(pane_id)` - The tmux pane ID (e.g., "%5") if found
 /// * `None` - If not running in tmux or pane not found
+#[must_use]
 pub fn find_pane_for_pid(
     pid: u32,
     ancestor_pids: &[u32],
@@ -46,22 +42,25 @@ pub fn find_pane_for_pid(
         .cloned()
 }
 
+/// A pane fixture for tests: only `pane_id` and `pane_pid` matter to
+/// discovery.
+#[cfg(test)]
+pub(crate) fn test_pane(pane_id: &str, pane_pid: u32) -> atm_tmux::PaneInfo {
+    atm_tmux::PaneInfo {
+        pane_id: pane_id.to_string(),
+        session_name: "s".to_string(),
+        window_index: 0,
+        pane_pid,
+        width: 80,
+        height: 24,
+        is_active: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atm_tmux::{MockTmuxClient, PaneInfo, TmuxError};
-
-    fn pane(pane_id: &str, pane_pid: u32) -> PaneInfo {
-        PaneInfo {
-            pane_id: pane_id.to_string(),
-            session_name: "s".to_string(),
-            window_index: 0,
-            pane_pid,
-            width: 80,
-            height: 24,
-            is_active: false,
-        }
-    }
+    use atm_tmux::MockTmuxClient;
 
     fn pane_pids(pairs: &[(u32, &str)]) -> HashMap<u32, String> {
         pairs
@@ -73,22 +72,25 @@ mod tests {
     #[tokio::test]
     async fn list_pane_pids_maps_shell_pid_to_pane_id() {
         let mock = MockTmuxClient::new();
-        mock.set_panes(vec![pane("%1", 100), pane("%2", 200)]);
+        mock.set_panes(vec![test_pane("%1", 100), test_pane("%2", 200)]);
         assert_eq!(
-            list_pane_pids(&mock).await,
-            pane_pids(&[(100, "%1"), (200, "%2")])
+            list_pane_pids(&mock).await.ok(),
+            Some(pane_pids(&[(100, "%1"), (200, "%2")]))
         );
     }
 
     #[tokio::test]
-    async fn list_pane_pids_is_empty_when_tmux_fails() {
+    async fn list_pane_pids_returns_the_tmux_error() {
         let mock = MockTmuxClient::new();
-        mock.set_panes(vec![pane("%1", 100)]);
+        mock.set_panes(vec![test_pane("%1", 100)]);
         mock.set_next_error(TmuxError::Timeout {
             command: "list-panes".to_string(),
             timeout: std::time::Duration::from_secs(5),
         });
-        assert!(list_pane_pids(&mock).await.is_empty());
+        assert!(matches!(
+            list_pane_pids(&mock).await,
+            Err(TmuxError::Timeout { .. })
+        ));
     }
 
     #[test]

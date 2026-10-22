@@ -35,6 +35,8 @@ atm                    # launch TUI (starts daemon automatically)
 
 Sessions appear as you use supported coding-agent harnesses. Press `Enter` to jump to any session, `q` to quit.
 
+An open TUI restarts the daemon if it goes away, within a few seconds. That includes `atmd stop`, so quit every TUI before you stop the daemon for good.
+
 ## CLI at a glance
 
 ```bash

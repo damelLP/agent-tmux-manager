@@ -564,8 +564,8 @@ async fn scenario_atm_list_client(env: &E2eEnv, expected_session_id: &str) {
 }
 
 /// Scenario 3 — drive the isolated tmux server through `atm-tmux`'s own
-/// library. Unlike atmd's discovery code, `RealTmuxClient` supports `-L`,
-/// so this stays fully isolated from the developer's default tmux.
+/// library. `RealTmuxClient` supports `-L`, so this stays fully isolated
+/// from the developer's default tmux.
 async fn scenario_real_tmux_lib(env: &E2eEnv) {
     let panes_before = env.tmux.list_panes().await.expect("list panes (initial)");
     assert!(

@@ -235,6 +235,7 @@ dependencies = [
  "atm-core",
  "atm-pi-adapter",
  "atm-protocol",
+ "atm-tmux",
  "chrono",
  "clap",
  "daemonize",

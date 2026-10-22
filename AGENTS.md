@@ -94,7 +94,7 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 | `atm-protocol` | Vendor-neutral wire messages + parsing | `atm-core` |
 | `atm-<vendor>-adapter` | **All** knowledge of one harness: event vocabulary, payload shapes, mapping to core types | `atm-core` only |
 | `atm-tmux` | Thin async wrapper over the tmux CLI (`TmuxClient` trait + `MockTmuxClient`) | no internal crates |
-| `atmd` | Session registry, broadcast server | core, protocol, adapters |
+| `atmd` | Session registry, broadcast server | core, protocol, tmux, adapters |
 | `atm` (crate `atm-tui`) | TUI and CLI | core, protocol, tmux, adapters |
 | root `atm` package | `atm` / `atmd` binaries | everything |
 

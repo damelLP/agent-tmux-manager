@@ -1,163 +1,117 @@
 //! Tmux integration for session discovery.
 //!
-//! Provides utilities for finding tmux pane IDs for Claude processes.
-//! All functions in this module perform blocking I/O and should be
-//! called via `spawn_blocking`.
+//! Maps agent processes to the tmux panes they run in. Panes are listed
+//! once per discovery scan through [`TmuxClient`], so the call shares that
+//! client's deadline and `ATM_TMUX_SOCKET` handling; the per-process
+//! lookup is pure.
 
 use std::collections::HashMap;
-use std::fs;
-use std::process::Command;
 
-use tracing::{debug, trace};
+use atm_tmux::{TmuxClient, TmuxError};
 
-/// Finds the tmux pane ID for a given process ID.
+/// Lists all tmux panes as a map of shell PID to pane ID (e.g. "%5").
 ///
-/// This function:
-/// 1. Lists all tmux panes with their shell PIDs
-/// 2. Walks the process tree from the target PID upward
-/// 3. Returns the pane ID if any ancestor matches a pane's shell PID
+/// # Errors
+/// Returns the client's [`TmuxError`] (no server, tmux not installed,
+/// timeout). Discovery treats any error as "no pane info".
+pub async fn list_pane_pids(tmux: &dyn TmuxClient) -> Result<HashMap<u32, String>, TmuxError> {
+    let panes = tmux.list_panes().await?;
+    Ok(panes
+        .into_iter()
+        .map(|pane| (pane.pane_pid, pane.pane_id))
+        .collect())
+}
+
+/// Finds the tmux pane ID for a process.
 ///
-/// # Arguments
-/// * `pid` - The process ID to find the pane for (e.g., Claude's PID)
+/// Checks `pid`, then each of its `ancestor_pids` (nearest first), against
+/// the pane shell PIDs in `pane_pids`; the first match wins.
 ///
 /// # Returns
 /// * `Some(pane_id)` - The tmux pane ID (e.g., "%5") if found
 /// * `None` - If not running in tmux or pane not found
-///
-/// # Note
-/// This function performs blocking I/O and should be called via `spawn_blocking`.
-pub fn find_pane_for_pid(pid: u32) -> Option<String> {
-    // Get all tmux panes and their shell PIDs
-    let pane_pids = list_tmux_panes()?;
-
-    if pane_pids.is_empty() {
-        debug!("No tmux panes found");
-        return None;
-    }
-
-    trace!(pane_count = pane_pids.len(), "Found tmux panes");
-
-    // Walk up the process tree from the target PID
-    let mut current_pid = pid;
-    let mut depth = 0;
-    const MAX_DEPTH: u32 = 20; // Prevent infinite loops
-
-    while depth < MAX_DEPTH {
-        // Check if current PID matches any pane's shell PID
-        if let Some(pane_id) = pane_pids.get(&current_pid) {
-            debug!(pid, pane_id, depth, "Found tmux pane for process");
-            return Some(pane_id.clone());
-        }
-
-        // Get parent PID
-        match get_parent_pid(current_pid) {
-            Some(ppid) if ppid > 1 => {
-                current_pid = ppid;
-                depth += 1;
-            }
-            _ => {
-                // Reached init (PID 1) or couldn't read parent
-                break;
-            }
-        }
-    }
-
-    debug!(pid, "No tmux pane found for process");
-    None
+#[must_use]
+pub fn find_pane_for_pid(
+    pid: u32,
+    ancestor_pids: &[u32],
+    pane_pids: &HashMap<u32, String>,
+) -> Option<String> {
+    std::iter::once(&pid)
+        .chain(ancestor_pids)
+        .find_map(|p| pane_pids.get(p))
+        .cloned()
 }
 
-/// Lists all tmux panes and their shell PIDs.
-///
-/// Runs `tmux list-panes -a -F "#{pane_id} #{pane_pid}"` and parses the output.
-///
-/// # Returns
-/// * `Some(HashMap<u32, String>)` - Map of shell PID to pane ID
-/// * `None` - If tmux is not running or command fails
-fn list_tmux_panes() -> Option<HashMap<u32, String>> {
-    let output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        // tmux not running or no server
-        return None;
+/// A pane fixture for tests: only `pane_id` and `pane_pid` matter to
+/// discovery.
+#[cfg(test)]
+pub(crate) fn test_pane(pane_id: &str, pane_pid: u32) -> atm_tmux::PaneInfo {
+    atm_tmux::PaneInfo {
+        pane_id: pane_id.to_string(),
+        session_name: "s".to_string(),
+        window_index: 0,
+        pane_pid,
+        width: 80,
+        height: 24,
+        is_active: false,
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut pane_pids = HashMap::new();
-
-    for line in stdout.lines() {
-        let mut parts = line.split_whitespace();
-        if let (Some(pane_id), Some(pane_pid_str)) = (parts.next(), parts.next()) {
-            if let Ok(pane_pid) = pane_pid_str.parse::<u32>() {
-                pane_pids.insert(pane_pid, pane_id.to_string());
-            }
-        }
-    }
-
-    Some(pane_pids)
-}
-
-/// Gets the parent PID of a process.
-///
-/// Reads `/proc/{pid}/stat` and extracts the parent PID (field 4).
-///
-/// # Arguments
-/// * `pid` - The process ID to get the parent of
-///
-/// # Returns
-/// * `Some(ppid)` - The parent process ID
-/// * `None` - If the process doesn't exist or can't be read
-pub(crate) fn get_parent_pid(pid: u32) -> Option<u32> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat_content = fs::read_to_string(&stat_path).ok()?;
-
-    // Format: pid (comm) state ppid ...
-    // The comm field can contain spaces and parentheses, so find the last ')'
-    let close_paren = stat_content.rfind(')')?;
-    let after_comm = stat_content.get(close_paren + 1..)?;
-
-    // Fields after (comm): state ppid ...
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    // fields[0] = state, fields[1] = ppid
-    fields.get(1)?.parse().ok()
-}
-
-/// Checks if tmux is available on the system.
-///
-/// Simply checks if the `tmux` command exists and is executable.
-pub fn is_tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atm_tmux::MockTmuxClient;
 
-    #[test]
-    fn test_get_parent_pid_self() {
-        // Current process should have a valid parent
-        let pid = std::process::id();
-        let ppid = get_parent_pid(pid);
-        assert!(ppid.is_some());
-        assert!(ppid.unwrap() > 0);
+    fn pane_pids(pairs: &[(u32, &str)]) -> HashMap<u32, String> {
+        pairs
+            .iter()
+            .map(|(pid, pane_id)| (*pid, pane_id.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_pane_pids_maps_shell_pid_to_pane_id() {
+        let mock = MockTmuxClient::new();
+        mock.set_panes(vec![test_pane("%1", 100), test_pane("%2", 200)]);
+        assert_eq!(
+            list_pane_pids(&mock).await.ok(),
+            Some(pane_pids(&[(100, "%1"), (200, "%2")]))
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pane_pids_returns_the_tmux_error() {
+        let mock = MockTmuxClient::new();
+        mock.set_panes(vec![test_pane("%1", 100)]);
+        mock.set_next_error(TmuxError::Timeout {
+            command: "list-panes".to_string(),
+            timeout: std::time::Duration::from_secs(5),
+        });
+        assert!(matches!(
+            list_pane_pids(&mock).await,
+            Err(TmuxError::Timeout { .. })
+        ));
     }
 
     #[test]
-    fn test_get_parent_pid_nonexistent() {
-        // PID that almost certainly doesn't exist
-        let ppid = get_parent_pid(999_999_999);
-        assert!(ppid.is_none());
+    fn find_pane_matches_the_process_itself() {
+        let panes = pane_pids(&[(100, "%1")]);
+        assert_eq!(find_pane_for_pid(100, &[50], &panes).as_deref(), Some("%1"));
     }
 
     #[test]
-    fn test_is_tmux_available() {
-        // Just verify it doesn't panic - result depends on system
-        let _ = is_tmux_available();
+    fn find_pane_prefers_the_nearest_ancestor() {
+        let panes = pane_pids(&[(50, "%outer"), (70, "%inner")]);
+        assert_eq!(
+            find_pane_for_pid(100, &[70, 50], &panes).as_deref(),
+            Some("%inner")
+        );
+    }
+
+    #[test]
+    fn find_pane_is_none_outside_tmux() {
+        let panes = pane_pids(&[(999, "%1")]);
+        assert_eq!(find_pane_for_pid(100, &[70, 50], &panes), None);
+        assert_eq!(find_pane_for_pid(100, &[70, 50], &HashMap::new()), None);
     }
 }

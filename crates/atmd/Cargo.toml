@@ -37,9 +37,7 @@ tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-daemonize = "0.5"
 dirs = "5.0"
-libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

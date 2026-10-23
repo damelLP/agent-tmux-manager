@@ -409,15 +409,6 @@ async fn test_max_clients_rejection() {
         clients.push(client);
     }
 
-    // The 11th client can connect and handshake, but subscribing depends on
-    // whether the add_subscriber logic is called. In the current implementation,
-    // subscribe is handled by ConnectionHandler, and we need to verify the
-    // subscriber count limit is enforced.
-    //
-    // Note: The current implementation doesn't immediately reject at subscribe time
-    // via the protocol - the add_subscriber happens in the server's subscriber list.
-    // For this test, we verify that MAX_TUI_CLIENTS clients can successfully subscribe.
-
     // Verify all MAX_TUI_CLIENTS clients are working by sending ping
     for (i, client) in clients.iter_mut().enumerate() {
         client.send(ClientMessage::ping(i as u64)).await;
@@ -427,6 +418,19 @@ async fn test_max_clients_rejection() {
             }
             other => panic!("Expected Pong for client {i}, got {other:?}"),
         }
+    }
+
+    // One more client can connect and handshake, but the daemon answers
+    // its Subscribe with an Error naming the cap.
+    let mut extra = server.connect().await;
+    extra.handshake(Some("client-extra".to_string())).await;
+    extra.send(ClientMessage::subscribe(None)).await;
+    match extra.recv().await {
+        DaemonMessage::Error { message, .. } => {
+            let expected = format!("Too many subscribers (max: {MAX_TUI_CLIENTS})");
+            assert_eq!(message, expected);
+        }
+        other => panic!("Expected a Too many subscribers error, got {other:?}"),
     }
 
     server.shutdown().await;

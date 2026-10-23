@@ -299,6 +299,10 @@ impl ConnectionHandler {
 
             // Process the message
             if let Err(e) = self.handle_message(msg).await {
+                // Disconnect: the client is done, which is no error
+                if matches!(e, ConnectionError::Eof) {
+                    return Ok(());
+                }
                 error!(
                     client_id = ?self.client_id,
                     error = %e,

@@ -54,7 +54,7 @@ pub enum RegistryCommand {
     /// cost, duration, context usage, and lines changed.
     ///
     /// # Errors
-    /// - `RegistryError::SessionNotFound` if the session doesn't exist
+    /// - `RegistryError::RegistryFull` if it would create a session in a full registry
     /// - `RegistryError::ParseError` if the JSON is malformed
     UpdateFromStatusLine {
         /// ID of the session to update
@@ -73,7 +73,7 @@ pub enum RegistryCommand {
     /// `LifecycleEvent` before constructing this command.
     ///
     /// # Errors
-    /// - `RegistryError::SessionNotFound` if the session doesn't exist
+    /// - `RegistryError::RegistryFull` if it would create a session in a full registry
     ApplyLifecycleEvent {
         /// ID of the session to update
         session_id: SessionId,

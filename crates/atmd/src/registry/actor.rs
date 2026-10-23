@@ -260,8 +260,9 @@ impl RegistryActor {
     /// Stores `session` under a `pid` the registry does not hold yet.
     ///
     /// Every new session enters the registry here, so each creation path
-    /// enforces the capacity limit, records the pid, keeps both indexes in
-    /// step and publishes `Registered`.
+    /// enforces the capacity limit, records the pid, inserts into both
+    /// indexes and publishes `Registered`. It does not check whether another
+    /// pid already holds `session.id`.
     fn insert_new_session(
         &mut self,
         pid: u32,

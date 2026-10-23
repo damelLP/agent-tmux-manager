@@ -97,7 +97,7 @@ impl RegistryHandle {
     ///
     /// # Errors
     ///
-    /// - `RegistryError::SessionNotFound` if the session doesn't exist
+    /// - `RegistryError::RegistryFull` if it would create a session in a full registry
     /// - `RegistryError::ParseError` if the JSON is malformed
     /// - `RegistryError::ChannelClosed` if the actor has shut down
     pub async fn update_from_status_line(
@@ -127,7 +127,7 @@ impl RegistryHandle {
     ///
     /// # Errors
     ///
-    /// - `RegistryError::SessionNotFound` if the session doesn't exist
+    /// - `RegistryError::RegistryFull` if it would create a session in a full registry
     /// - `RegistryError::ChannelClosed` if the actor has shut down
     pub async fn apply_lifecycle_event(
         &self,

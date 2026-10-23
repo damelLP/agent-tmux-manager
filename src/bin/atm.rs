@@ -1587,16 +1587,17 @@ where
     Ok(output.trim().to_string())
 }
 
-/// Whether tmux has `session`. A timeout stays an error: tmux didn't
-/// answer, so the session may well exist.
+/// Whether tmux has `session`. Only tmux's own "no" (a failed command)
+/// means absent. A timeout, or tmux failing to run, stays an error: tmux
+/// didn't answer, so the session may well exist.
 async fn has_session<C>(client: &C, session: &str) -> Result<bool>
 where
     C: TmuxClient + ?Sized,
 {
     match tmux_run(client, &["has-session", "-t", session]).await {
         Ok(_) => Ok(true),
-        Err(e) if matches!(e.downcast_ref(), Some(TmuxError::Timeout { .. })) => Err(e),
-        Err(_) => Ok(false),
+        Err(e) if matches!(e.downcast_ref(), Some(TmuxError::CommandFailed { .. })) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -2527,8 +2528,9 @@ mod has_session_tests {
     use std::time::Duration;
 
     /// tmux's own "no" (`can't find session`, or no server yet) means the
-    /// session is absent. A timeout means tmux didn't answer, so the
-    /// workspace commands must not report "not found" or create a duplicate.
+    /// session is absent. A timeout or a missing tmux means tmux didn't
+    /// answer, so the workspace commands must not report "not found" or
+    /// create a duplicate.
     #[tokio::test]
     async fn test_has_session_keeps_a_timeout_an_error() {
         let client = MockTmuxClient::new();
@@ -2549,6 +2551,11 @@ mod has_session_tests {
             matches!(&result, Err(e) if format!("{e:#}").contains("timed out")),
             "a timeout read as {result:?}"
         );
+
+        // Nor is failing to run tmux at all.
+        client.set_next_error(TmuxError::NotFound);
+        let result = has_session(&client, "ws").await;
+        assert!(result.is_err(), "a missing tmux read as {result:?}");
     }
 }
 

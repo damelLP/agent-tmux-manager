@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -264,8 +264,9 @@ impl ConnectionHandler {
         let cancel = self.cancel.clone();
         loop {
             // Read with timeout for idle connections, until cancelled.
-            // read_line isn't cancel-safe, but cancelling closes the
-            // connection, so a lost partial line doesn't matter.
+            // read_message isn't cancel-safe (its partial line is a local),
+            // but cancelling closes the connection, so a lost partial line
+            // doesn't matter.
             // A subscribed client may stay silent, so it gets no idle
             // timeout (Duration::MAX never fires): a dead peer still gives
             // EOF, and the forwarder's WRITE_TIMEOUT cancels a stopped one
@@ -309,10 +310,10 @@ impl ConnectionHandler {
                     return Err(e);
                 }
 
-                // Send error response but continue processing
-                let _ = self
-                    .send_message(DaemonMessage::error(&e.to_string()))
-                    .await;
+                // Send error response but continue processing, unless the
+                // reply itself failed
+                self.send_message(DaemonMessage::error(&e.to_string()))
+                    .await?;
             }
         }
     }
@@ -732,11 +733,13 @@ impl ConnectionHandler {
 
     /// Reads a single message from the client.
     async fn read_message(&mut self) -> Result<ClientMessage, ConnectionError> {
-        let mut line = String::new();
+        let mut line = Vec::new();
 
-        let bytes_read = self
-            .reader
-            .read_line(&mut line)
+        // One byte past the limit is enough to tell a line is too large,
+        // so a client that never sends a newline can't grow `line` forever.
+        let bytes_read = (&mut self.reader)
+            .take(MAX_MESSAGE_SIZE as u64 + 1)
+            .read_until(b'\n', &mut line)
             .await
             .map_err(|e| ConnectionError::Io(e.to_string()))?;
 
@@ -751,8 +754,8 @@ impl ConnectionHandler {
             });
         }
 
-        let msg: ClientMessage =
-            serde_json::from_str(&line).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+        let msg: ClientMessage = serde_json::from_slice(&line)
+            .map_err(|e| ConnectionError::ParseError(e.to_string()))?;
 
         debug!(
             client_id = ?self.client_id,

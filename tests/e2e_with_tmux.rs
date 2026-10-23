@@ -232,7 +232,18 @@ impl PrivateTmux {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.args(["-L", socket_label, "new-session", "-d", "-s", session_name]);
+        // `-f /dev/null`: the developer's ~/.tmux.conf (key bindings,
+        // plugins, a sourced ATM bindings file) must not leak into tests.
+        cmd.args([
+            "-L",
+            socket_label,
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+        ]);
         run_tmux_or_panic(&mut cmd, "new-session");
 
         Self {

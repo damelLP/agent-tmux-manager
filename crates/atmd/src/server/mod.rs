@@ -70,6 +70,9 @@ const MAX_TUI_CLIENTS: usize = 10;
 /// How long shutdown waits for connection handlers before aborting them
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the accept loop pauses after a failed accept
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Unix socket server for the ATM daemon.
 ///
 /// Manages client connections and event broadcasting.
@@ -178,7 +181,13 @@ impl DaemonServer {
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to accept connection");
-                            // Continue accepting other connections
+                            // An error such as EMFILE leaves the connection
+                            // queued, so the next accept would fail at once.
+                            // Pause instead of spinning; shutdown still wins.
+                            tokio::select! {
+                                _ = self.cancel_token.cancelled() => {}
+                                _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                            }
                         }
                     }
                 }

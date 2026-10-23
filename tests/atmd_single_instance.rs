@@ -166,6 +166,36 @@ fn test_losing_start_leaves_the_pid_file_alone() {
     );
 }
 
+/// `atmd status` and `atmd stop` don't take the lock, so they must not
+/// clear a stale PID file either. One that read the stale PID just before
+/// a starter wrote its own would delete the starter's fresh PID file.
+#[test]
+fn test_status_and_stop_leave_a_stale_pid_file_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("atmd.sock");
+    let state = dir.path().join("state");
+    let pid_file = state.join("atm").join("atmd.pid");
+    std::fs::create_dir_all(state.join("atm")).expect("mkdir state");
+    std::fs::write(&pid_file, dead_pid()).expect("write stale PID");
+
+    for command in ["status", "stop"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_atmd"))
+            .arg(command)
+            .env("ATM_SOCKET", &socket)
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .expect("run atmd");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("not running"), "atmd {command}: {stdout}");
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).ok(),
+            Some(dead_pid()),
+            "atmd {command} touched the PID file"
+        );
+    }
+}
+
 /// A second atmd with its own state dir but the same socket must not
 /// steal the socket from the first.
 #[test]

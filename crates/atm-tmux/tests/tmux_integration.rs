@@ -20,12 +20,15 @@ fn test_socket() -> String {
     )
 }
 
-/// Starts an isolated tmux server and returns the socket name.
+/// Starts an isolated tmux server and returns the socket name. `-f
+/// /dev/null` keeps the developer's ~/.tmux.conf out of it.
 fn start_tmux_server(socket: &str) -> bool {
     Command::new("tmux")
         .args([
             "-L",
             socket,
+            "-f",
+            "/dev/null",
             "new-session",
             "-d",
             "-s",

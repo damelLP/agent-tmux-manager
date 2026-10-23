@@ -680,6 +680,52 @@ async fn test_connection_closes_after_a_write_timeout() {
     server.shutdown().await;
 }
 
+/// The error reply to a bad message can hit WRITE_TIMEOUT too, and may also
+/// leave half a line, so it closes the connection like any failed reply.
+/// The bad messages lack a session_id, so each one fails in the handler
+/// and gets an error reply. Time is paused, as above.
+#[tokio::test(start_paused = true)]
+async fn test_connection_closes_when_an_error_reply_times_out() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let bad = ClientMessage {
+        protocol_version: ProtocolVersion::CURRENT,
+        message: MessageType::StatusUpdate {
+            data: serde_json::json!({ "not_session_id": "x" }),
+        },
+    };
+    let line = format!("{}\n", serde_json::to_string(&bad).unwrap());
+    let mut writer = client.writer;
+    tokio::spawn(async move {
+        for _ in 0..20_000 {
+            if writer.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+    sleep(Duration::from_secs(30)).await;
+
+    let drained = timeout(Duration::from_secs(60), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if client.reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "connection stayed open after an error reply timed out"
+    );
+
+    server.shutdown().await;
+}
+
 /// A client that connects but never sends `Connect` is dropped once the
 /// handshake deadline passes. Time is paused, so the deadline elapses
 /// instantly once the runtime is otherwise idle.

@@ -202,17 +202,6 @@ impl RegistryActor {
         session: SessionDomain,
         pid: Option<u32>,
     ) -> Result<(), RegistryError> {
-        // Check capacity
-        if self.sessions_by_pid.len() >= MAX_SESSIONS {
-            warn!(
-                session_id = %session.id,
-                current = self.sessions_by_pid.len(),
-                max = MAX_SESSIONS,
-                "Registry is full, rejecting registration"
-            );
-            return Err(RegistryError::RegistryFull { max: MAX_SESSIONS });
-        }
-
         // Get or generate PID - we need a PID for the primary key
         let pid = match pid {
             Some(p) if p != 0 => p,
@@ -255,14 +244,7 @@ impl RegistryActor {
 
         let session_id = session.id.clone();
         let agent_type = session.agent_type.clone();
-
-        // Create infrastructure and set PID
-        let mut infra = SessionInfrastructure::new();
-        infra.set_pid(pid);
-
-        // Insert into primary storage and index
-        self.sessions_by_pid.insert(pid, (session, infra));
-        self.session_id_to_pid.insert(session_id.clone(), pid);
+        self.insert_new_session(pid, session)?;
 
         info!(
             session_id = %session_id,
@@ -271,12 +253,6 @@ impl RegistryActor {
             total_sessions = self.sessions_by_pid.len(),
             "Session registered"
         );
-
-        // Publish event (ignore if no subscribers)
-        let _ = self.event_publisher.send(SessionEvent::Registered {
-            session_id,
-            agent_type,
-        });
 
         Ok(())
     }
@@ -738,14 +714,7 @@ impl RegistryActor {
                 proc_cwd,
                 read_parent_session_id(p, harness),
             );
-            let mut infra = SessionInfrastructure::new();
-            infra.set_pid(p);
-            self.sessions_by_pid.insert(p, (session, infra));
-            self.session_id_to_pid.insert(session_id.clone(), p);
-            let _ = self.event_publisher.send(SessionEvent::Registered {
-                session_id: session_id.clone(),
-                agent_type: AgentType::GeneralPurpose,
-            });
+            self.insert_new_session(p, session)?;
         }
 
         if !self.prepare_child_event(p, &event, harness, &context) {
@@ -1550,6 +1519,57 @@ mod tests {
         assert!(matches!(
             result,
             Err(RegistryError::RegistryFull { max: MAX_SESSIONS })
+        ));
+        assert_eq!(actor.session_count(), MAX_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_event_for_new_pid_respects_max_sessions() {
+        let (_, mut actor, _) = create_actor();
+        for i in 0..MAX_SESSIONS {
+            register_test_session(&mut actor, &format!("test-{i}"));
+        }
+
+        // Above Linux's PID_MAX_LIMIT (2^22), so never a live process.
+        let unused_pid = 4_194_305;
+        let (tx, rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new("one-too-many"),
+            event: LifecycleEvent::SessionStart { source: None },
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(unused_pid),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to: tx,
+        });
+
+        let result = rx.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(RegistryError::RegistryFull { max: MAX_SESSIONS })
+        ));
+        assert_eq!(actor.session_count(), MAX_SESSIONS);
+        assert!(session_view(&actor, "one-too-many").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_register_duplicate_when_full_reports_already_exists() {
+        let (_, mut actor, _) = create_actor();
+        for i in 0..MAX_SESSIONS {
+            register_test_session(&mut actor, &format!("test-{i}"));
+        }
+
+        // A duplicate is rejected as a duplicate before capacity is checked.
+        let (tx, rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Register {
+            session: Box::new(create_test_session("test-0")),
+            respond_to: tx,
+        });
+
+        let result = rx.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(RegistryError::SessionAlreadyExists(id)) if id == SessionId::new("test-0")
         ));
         assert_eq!(actor.session_count(), MAX_SESSIONS);
     }

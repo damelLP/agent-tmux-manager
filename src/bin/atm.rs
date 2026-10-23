@@ -1590,11 +1590,15 @@ where
 /// Whether tmux has `session`. Only tmux's own "no" (a failed command)
 /// means absent. A timeout, or tmux failing to run, stays an error: tmux
 /// didn't answer, so the session may well exist.
+///
+/// `=` makes tmux match the name exactly; a bare `ws` also finds `ws2`.
+/// `set-hook` rejects `=` (tmux 3.8), so hooks target the bare name, which
+/// tmux resolves exactly once this has found the session.
 async fn has_session<C>(client: &C, session: &str) -> Result<bool>
 where
     C: TmuxClient + ?Sized,
 {
-    match tmux_run(client, &["has-session", "-t", session]).await {
+    match tmux_run(client, &["has-session", "-t", &format!("={session}")]).await {
         Ok(_) => Ok(true),
         Err(e) if matches!(e.downcast_ref(), Some(TmuxError::CommandFailed { .. })) => Ok(false),
         Err(e) => Err(e),
@@ -1831,7 +1835,9 @@ fn exec_attach(socket: &Option<String>, session_name: &str) -> Result<()> {
     if let Some(s) = effective_tmux_socket(socket) {
         cmd.arg("-L").arg(s);
     }
-    cmd.arg("attach-session").arg("-t").arg(session_name);
+    cmd.arg("attach-session")
+        .arg("-t")
+        .arg(format!("={session_name}"));
 
     #[cfg(unix)]
     {
@@ -2033,7 +2039,7 @@ async fn cmd_workspace_attach(session: Option<String>, isolate: bool) -> Result<
         &[
             "list-windows",
             "-t",
-            &session_name,
+            &format!("={session_name}"),
             "-F",
             "#{window_id} #{window_width}",
         ],
@@ -2524,8 +2530,24 @@ mod shell_quote_tests {
 #[cfg(test)]
 mod has_session_tests {
     use super::has_session;
+    use atm_tmux::mock::MockCall;
     use atm_tmux::{MockTmuxClient, TmuxError};
     use std::time::Duration;
+
+    /// A bare `-t ws` prefix-matches `ws2` (tmux 3.8), so `workspace
+    /// create ws` would refuse and `workspace attach ws` would pick `ws2`.
+    #[tokio::test]
+    async fn test_has_session_matches_the_name_exactly() {
+        let client = MockTmuxClient::new();
+        has_session(&client, "ws").await.expect("has-session");
+        assert_eq!(
+            client.calls(),
+            vec![MockCall::RawCommand {
+                subcommand: "has-session".to_string(),
+                args: vec!["-t".to_string(), "=ws".to_string()],
+            }]
+        );
+    }
 
     /// tmux's own "no" (`can't find session`, or no server yet) means the
     /// session is absent. A timeout or a missing tmux means tmux didn't

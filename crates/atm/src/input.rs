@@ -33,8 +33,9 @@ pub enum Event {
     /// Full session list received from daemon (replace all sessions).
     SessionListReplace(Vec<SessionView>),
 
-    /// Connection to the daemon was lost.
-    DaemonDisconnected,
+    /// Connection to the daemon was lost, with the reason when the daemon
+    /// rejected it.
+    DaemonDisconnected(Option<String>),
 
     /// A session was removed from the daemon.
     SessionRemoved(String),

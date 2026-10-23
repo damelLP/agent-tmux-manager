@@ -48,7 +48,7 @@ use atm_core::{
     SessionView,
 };
 use atm_protocol::{ClientMessage, DaemonMessage};
-use atm_tmux::{RealTmuxClient, TmuxClient};
+use atm_tmux::{RealTmuxClient, TmuxClient, TmuxError};
 use atm_tui::app::App;
 use atm_tui::client::DaemonClient;
 use atm_tui::daemon;
@@ -667,9 +667,9 @@ async fn run_event_loop(
                 Event::DiscoveryComplete { discovered, failed } => {
                     info!(discovered, failed, "Discovery complete");
                 }
-                Event::DaemonDisconnected => {
+                Event::DaemonDisconnected(reason) => {
                     warn!("Daemon disconnected");
-                    app.mark_disconnected();
+                    app.mark_disconnected(reason);
                 }
             },
             Ok(None) => {
@@ -770,7 +770,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     .await?;
 
     // Step 2: Read Connected response, then send ListSessions
-    let mut sessions = Vec::new();
+    let sessions;
     let mut line = String::new();
 
     loop {
@@ -781,7 +781,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
             .context("Failed to read from daemon")?;
 
         if n == 0 {
-            break;
+            bail!("Daemon closed the connection before sending the session list");
         }
 
         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(line.trim()) {
@@ -1587,6 +1587,20 @@ where
     Ok(output.trim().to_string())
 }
 
+/// Whether tmux has `session`. Only tmux's own "no" (a failed command)
+/// means absent. A timeout, or tmux failing to run, stays an error: tmux
+/// didn't answer, so the session may well exist.
+async fn has_session<C>(client: &C, session: &str) -> Result<bool>
+where
+    C: TmuxClient + ?Sized,
+{
+    match tmux_run(client, &["has-session", "-t", session]).await {
+        Ok(_) => Ok(true),
+        Err(e) if matches!(e.downcast_ref(), Some(TmuxError::CommandFailed { .. })) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Calculate sidebar width from terminal columns, clamped to [SIDEBAR_MIN, SIDEBAR_MAX].
 fn sidebar_width(cols: u16) -> u32 {
     (cols as u32 * SIDEBAR_PCT / 100).clamp(SIDEBAR_MIN, SIDEBAR_MAX)
@@ -1854,8 +1868,7 @@ async fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Res
     let client = workspace_tmux_client(&socket_name);
 
     // 3. Check if session already exists
-    let has_session = tmux_run(&client, &["has-session", "-t", &session_name]).await;
-    if has_session.is_ok() {
+    if has_session(&client, &session_name).await? {
         if isolate {
             bail!(
                 "Workspace '{}' already exists on socket 'atm-{}'. \
@@ -2006,10 +2019,7 @@ async fn cmd_workspace_attach(session: Option<String>, isolate: bool) -> Result<
     let client = workspace_tmux_client(&socket_name);
 
     // 2. Verify session exists
-    if tmux_run(&client, &["has-session", "-t", &session_name])
-        .await
-        .is_err()
-    {
+    if !has_session(&client, &session_name).await? {
         if let Some(ref s) = socket_name {
             bail!("Session '{}' not found on socket '{}'", session_name, s);
         } else {
@@ -2508,6 +2518,44 @@ mod shell_quote_tests {
             tmux_shell_prefix(Some("sock'; touch /tmp/pwned #".to_string())),
             "tmux -L 'sock'\\''; touch /tmp/pwned #'"
         );
+    }
+}
+
+#[cfg(test)]
+mod has_session_tests {
+    use super::has_session;
+    use atm_tmux::{MockTmuxClient, TmuxError};
+    use std::time::Duration;
+
+    /// tmux's own "no" (`can't find session`, or no server yet) means the
+    /// session is absent. A timeout or a missing tmux means tmux didn't
+    /// answer, so the workspace commands must not report "not found" or
+    /// create a duplicate.
+    #[tokio::test]
+    async fn test_has_session_keeps_a_timeout_an_error() {
+        let client = MockTmuxClient::new();
+        assert!(has_session(&client, "ws").await.expect("exists"));
+
+        client.set_next_error(TmuxError::CommandFailed {
+            command: "has-session".to_string(),
+            stderr: "can't find session: ws".to_string(),
+        });
+        assert!(!has_session(&client, "ws").await.expect("absent"));
+
+        client.set_next_error(TmuxError::Timeout {
+            command: "has-session".to_string(),
+            timeout: Duration::from_secs(5),
+        });
+        let result = has_session(&client, "ws").await;
+        assert!(
+            matches!(&result, Err(e) if format!("{e:#}").contains("timed out")),
+            "a timeout read as {result:?}"
+        );
+
+        // Nor is failing to run tmux at all.
+        client.set_next_error(TmuxError::NotFound);
+        let result = has_session(&client, "ws").await;
+        assert!(result.is_err(), "a missing tmux read as {result:?}");
     }
 }
 

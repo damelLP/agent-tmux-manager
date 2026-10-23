@@ -828,9 +828,14 @@ async fn test_client_disconnect_message() {
     // Send disconnect
     client.send(ClientMessage::disconnect()).await;
 
-    // Connection will close (server won't send response to disconnect)
-    // Give server time to process
-    sleep(SHUTDOWN_GRACE_PERIOD).await;
+    // Connection will close (server won't send response to disconnect),
+    // rather than answer with an Error "Connection closed"
+    let mut line = String::new();
+    let read = timeout(Duration::from_secs(5), client.reader.read_line(&mut line)).await;
+    assert!(
+        matches!(read, Ok(Ok(0))),
+        "expected EOF after Disconnect, got {read:?}: {line}"
+    );
 
     server.shutdown().await;
 }

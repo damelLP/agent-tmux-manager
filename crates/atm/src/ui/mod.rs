@@ -234,7 +234,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = App::new();
-        app.mark_disconnected();
+        app.mark_disconnected(None);
 
         terminal
             .draw(|frame| {

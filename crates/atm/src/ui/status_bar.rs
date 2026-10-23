@@ -272,6 +272,7 @@ mod tests {
         let state = AppState::Disconnected {
             since: chrono::Utc::now(),
             retry_count: 1,
+            reason: None,
         };
         let (text, style) = get_status_display(&state);
         assert_eq!(text, "Disconnected");
@@ -283,6 +284,7 @@ mod tests {
         let state = AppState::Disconnected {
             since: chrono::Utc::now(),
             retry_count: 5,
+            reason: None,
         };
         let (text, _) = get_status_display(&state);
         assert_eq!(text, "Disconnected (retrying...)");

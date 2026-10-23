@@ -438,9 +438,19 @@ impl DaemonClient {
             }
         }
 
-        // Subscribe to session updates
+        // Subscribe to session updates. The daemon answers with the session
+        // list, or with an Error when it refuses (e.g. at its subscriber
+        // cap). A refused client would never get updates, so it's rejected.
         let subscribe_msg = ClientMessage::subscribe(None);
         self.send_message(&mut writer, &subscribe_msg).await?;
+        line.clear();
+        timeout(HANDSHAKE_TIMEOUT, buf_reader.read_line(&mut line))
+            .await
+            .map_err(|_| timed_out("subscribe"))??;
+        if let DaemonMessage::Error { message, .. } = serde_json::from_str(line.trim())? {
+            return Err(TuiError::Rejected(message));
+        }
+        self.handle_message(line.trim()).await?;
 
         // Request initial session list
         let list_msg = ClientMessage::list_sessions();
@@ -1072,6 +1082,63 @@ mod tests {
         assert!(
             waited < Duration::from_millis(400),
             "backoff not reset: {waited:?}"
+        );
+
+        cancel_token.cancel();
+        run.await.expect("client task");
+    }
+
+    /// A daemon at its subscriber cap accepts the handshake but answers
+    /// `Subscribe` with an Error. The client would get no updates, so it
+    /// must disconnect with that reason for the TUI to show, rather than
+    /// sit on a stale list.
+    #[tokio::test]
+    async fn test_subscribe_refusal_reaches_the_disconnected_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("full.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let cancel_token = CancellationToken::new();
+        let config = DaemonConfig {
+            socket_path,
+            ..Default::default()
+        };
+        let client = DaemonClient::new(config, event_tx, cmd_rx, cancel_token.clone());
+        let run = tokio::spawn(async move { client.run().await });
+
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read connect");
+        let connected = DaemonMessage::connected("client-1".to_string());
+        let connected = format!("{}\n", serde_json::to_string(&connected).expect("json"));
+        writer.write_all(connected.as_bytes()).await.expect("write");
+        line.clear();
+        reader.read_line(&mut line).await.expect("read subscribe");
+        assert!(
+            line.contains("subscribe"),
+            "expected Subscribe, got {line:?}"
+        );
+        // The daemon's own refusal (atmd server/connection.rs)
+        let refused = DaemonMessage::error("Too many subscribers (max: 64)");
+        let refused = format!("{}\n", serde_json::to_string(&refused).expect("json"));
+        writer.write_all(refused.as_bytes()).await.expect("write");
+
+        let event = timeout(Duration::from_secs(5), event_rx.recv()).await;
+        let Ok(Some(Event::DaemonDisconnected(reason))) = event else {
+            panic!("subscribe refusal didn't disconnect: {event:?}");
+        };
+        // As the TUI event loop does
+        let mut app = crate::app::App::new();
+        app.mark_disconnected(reason);
+        assert!(
+            matches!(&app.state, crate::app::AppState::Disconnected { reason: Some(r), .. }
+                if r.contains("Too many subscribers (max: 64)")),
+            "reason lost: {:?}",
+            app.state
         );
 
         cancel_token.cancel();

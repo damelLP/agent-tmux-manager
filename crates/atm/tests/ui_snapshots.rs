@@ -355,6 +355,17 @@ fn session_list_disconnected_rejected() {
     insta::assert_debug_snapshot!(buf);
 }
 
+#[test]
+fn session_list_connected_empty() {
+    // Connected to the daemon, but no agent has reported yet.
+    let mut app = App::new();
+    app.state = AppState::Connected;
+    let buf = render_buffer(64, 16, |frame, area| {
+        render_session_list(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
 // ---- Split layout: detail_panel -------------------------------------------
 
 #[test]

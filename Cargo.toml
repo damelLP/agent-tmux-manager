@@ -2,6 +2,7 @@
 name = "atm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -48,6 +49,9 @@ expect_used = "warn"
 [workspace.package]
 version = "0.2.7"
 edition = "2021"
+# MSRV. The floor comes from dependencies (ratatui -> instability, darling).
+# Clippy reads it, so a std API newer than this fails `clippy -D warnings`.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/damelLP/agent-tmux-manager"
 authors = ["damelLP"]

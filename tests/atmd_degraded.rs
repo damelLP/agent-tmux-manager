@@ -7,7 +7,8 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -51,6 +52,38 @@ fn stop(mut daemon: Child) -> bool {
         let _ = daemon.wait();
     }
     stopped
+}
+
+/// Startup discovery lists tmux panes, and a wedged tmux server holds that
+/// call until its 5s deadline. The daemon must bind meanwhile, or hooks
+/// that fire during startup find no socket and their events are lost.
+#[test]
+fn test_wedged_tmux_does_not_delay_the_bind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("atmd.sock");
+    // tmux refuses a socket dir that others can read.
+    let tmux_dir = dir
+        .path()
+        .join(format!("tmux-{}", unsafe { libc::getuid() }));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&tmux_dir)
+        .expect("tmux socket dir");
+    // Accepts connections but never answers, so a tmux client waits on it
+    // forever (checked with tmux 3.8).
+    let _wedged = UnixListener::bind(tmux_dir.join("wedged")).expect("bind wedged tmux");
+
+    let started = Instant::now();
+    let daemon = atmd(dir.path()).spawn().expect("spawn atmd");
+    let bound = wait_until(|| socket.exists());
+    let elapsed = started.elapsed();
+    stop(daemon);
+
+    assert!(bound, "atmd never bound");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "atmd bound {elapsed:?} after starting"
+    );
 }
 
 /// An accept() that fails with EMFILE leaves the connection in the

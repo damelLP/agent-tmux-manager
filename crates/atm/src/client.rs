@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -83,7 +83,9 @@ pub struct DaemonConfig {
     /// Initial delay before first retry after connection failure.
     pub retry_initial_delay: Duration,
 
-    /// Maximum delay between retry attempts.
+    /// Maximum delay between retry attempts. A connection that lasts this
+    /// long resets the backoff; a shorter one (a daemon in a crash loop,
+    /// or one that rejects the client) keeps backing off.
     pub retry_max_delay: Duration,
 
     /// Multiplier for exponential backoff (e.g., 2.0 doubles delay each retry).
@@ -236,6 +238,7 @@ impl DaemonClient {
             "Daemon client starting"
         );
 
+        let mut delay = self.config.retry_initial_delay;
         loop {
             // Check for cancellation before attempting connection
             if self.cancel_token.is_cancelled() {
@@ -244,9 +247,10 @@ impl DaemonClient {
             }
 
             // Attempt to connect with retry logic
-            match self.connect_with_retry().await {
+            match self.connect_with_retry(&mut delay).await {
                 Ok(stream) => {
                     info!("Connected to daemon");
+                    let connected_at = Instant::now();
 
                     // Read messages until disconnect or error
                     if let Err(e) = self.handle_connection(stream).await {
@@ -255,6 +259,13 @@ impl DaemonClient {
 
                     // Notify TUI of disconnect (ignore send errors - TUI may be shutting down)
                     let _ = self.event_tx.send(Event::DaemonDisconnected);
+
+                    if connected_at.elapsed() >= self.config.retry_max_delay {
+                        delay = self.config.retry_initial_delay;
+                    } else {
+                        // Err means cancelled, which the check below handles
+                        let _ = self.wait_before_retry(&mut delay).await;
+                    }
                 }
                 Err(e) => {
                     // Only log if not cancelled - connect_with_retry returns early on cancel
@@ -275,15 +286,14 @@ impl DaemonClient {
     /// Attempts to connect to the daemon with exponential backoff.
     ///
     /// Retries connection indefinitely until successful or cancelled.
-    /// Uses exponential backoff between attempts, starting at `retry_initial_delay`
-    /// and capping at `retry_max_delay`.
+    /// Uses exponential backoff between attempts, from `delay` (which `run`
+    /// carries across short-lived connections) capping at `retry_max_delay`.
     ///
     /// # Returns
     ///
     /// * `Ok(UnixStream)` - Connected stream ready for communication
     /// * `Err(TuiError)` - If cancelled during retry (not typically an error path)
-    async fn connect_with_retry(&self) -> Result<UnixStream> {
-        let mut delay = self.config.retry_initial_delay;
+    async fn connect_with_retry(&self, delay: &mut Duration) -> Result<UnixStream> {
         let mut attempt = 0u32;
 
         loop {
@@ -324,22 +334,30 @@ impl DaemonClient {
                 }
             }
 
-            // Start the daemon if it is not running, then wait before retry,
-            // checking for cancellation
-            let respawn_and_wait = async {
-                self.respawn_daemon().await;
-                sleep(delay).await;
-            };
-            tokio::select! {
-                _ = respawn_and_wait => {
-                    // Increase delay for next attempt (exponential backoff)
-                    let next_delay_ms = (delay.as_millis() as f64 * self.config.retry_multiplier) as u64;
-                    delay = Duration::from_millis(next_delay_ms).min(self.config.retry_max_delay);
-                }
-                _ = self.cancel_token.cancelled() => {
-                    info!("Connection retry cancelled");
-                    return Err(TuiError::DaemonConnection("cancelled".to_string()));
-                }
+            self.wait_before_retry(delay).await?;
+        }
+    }
+
+    /// Starts the daemon if it is not running, then waits `delay` and
+    /// grows it for the next attempt (exponential backoff).
+    ///
+    /// # Returns
+    ///
+    /// * `Err(TuiError)` - If cancelled while waiting
+    async fn wait_before_retry(&self, delay: &mut Duration) -> Result<()> {
+        let respawn_and_wait = async {
+            self.respawn_daemon().await;
+            sleep(*delay).await;
+        };
+        tokio::select! {
+            _ = respawn_and_wait => {
+                let next_delay_ms = (delay.as_millis() as f64 * self.config.retry_multiplier) as u64;
+                *delay = Duration::from_millis(next_delay_ms).min(self.config.retry_max_delay);
+                Ok(())
+            }
+            _ = self.cancel_token.cancelled() => {
+                info!("Connection retry cancelled");
+                Err(TuiError::DaemonConnection("cancelled".to_string()))
             }
         }
     }
@@ -971,6 +989,76 @@ mod tests {
 
         let reconnect = tokio::time::timeout(Duration::from_secs(60), listener.accept()).await;
         assert!(matches!(reconnect, Ok(Ok(_))), "client did not reconnect");
+
+        cancel_token.cancel();
+        run.await.expect("client task");
+    }
+
+    /// A daemon that rejects every handshake (an old atmd after an
+    /// upgrade), or that crashes right after accepting, connects at once.
+    /// The client must keep backing off across those short connections,
+    /// and start over only after a connection that stays up. Real time:
+    /// the paused clock jumps to the next timer while socket reads are in
+    /// flight, which would blur the gaps measured here.
+    #[tokio::test]
+    async fn test_reconnect_backoff_carries_across_short_connections() {
+        async fn accept(listener: &tokio::net::UnixListener) -> UnixStream {
+            let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+            accepted
+                .expect("client did not reconnect")
+                .expect("accept")
+                .0
+        }
+        let reply = |msg: DaemonMessage| {
+            format!("{}\n", serde_json::to_string(&msg).expect("serialize")).into_bytes()
+        };
+        let rejected = reply(DaemonMessage::rejected("incompatible protocol"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("rejecting.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let cancel_token = CancellationToken::new();
+        let config = DaemonConfig {
+            socket_path,
+            retry_initial_delay: Duration::from_millis(50),
+            retry_max_delay: Duration::from_millis(800),
+            ..Default::default()
+        };
+        let client = DaemonClient::new(config, event_tx, cmd_rx, cancel_token.clone());
+        let run = tokio::spawn(async move { client.run().await });
+
+        let mut accepted_at = Vec::new();
+        for _ in 0..4 {
+            let mut stream = accept(&listener).await;
+            accepted_at.push(Instant::now());
+            stream.write_all(&rejected).await.expect("reject");
+        }
+        // 50ms, 100ms, then 200ms apart, rather than redialled at once.
+        let waited = accepted_at[3] - accepted_at[0];
+        assert!(
+            waited >= Duration::from_millis(350),
+            "redialled after {waited:?}"
+        );
+
+        // A connection that outlives retry_max_delay resets the backoff...
+        let mut stream = accept(&listener).await;
+        let connected = reply(DaemonMessage::connected("client-1".to_string()));
+        stream.write_all(&connected).await.expect("connect");
+        sleep(Duration::from_millis(900)).await;
+        drop(stream);
+
+        // ...so the next rejection waits 50ms again, not 800ms.
+        let mut stream = accept(&listener).await;
+        let rejected_at = Instant::now();
+        stream.write_all(&rejected).await.expect("reject");
+        accept(&listener).await;
+        let waited = rejected_at.elapsed();
+        assert!(
+            waited < Duration::from_millis(400),
+            "backoff not reset: {waited:?}"
+        );
 
         cancel_token.cancel();
         run.await.expect("client task");

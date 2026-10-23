@@ -20,7 +20,7 @@ fn atmd(dir: &Path) -> Command {
         .env("ATM_SOCKET", dir.join("atmd.sock"))
         .env("XDG_STATE_HOME", dir.join("state"))
         .env("TMUX_TMPDIR", dir)
-        .env("ATM_TMUX_SOCKET", "wedged")
+        .env("ATM_TMUX_SOCKET", "atm-test")
         .env_remove("TMUX")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
@@ -39,18 +39,28 @@ fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
     true
 }
 
-/// SIGTERM, then SIGKILL if the daemon doesn't exit. Returns whether
-/// SIGTERM was enough.
-fn stop(mut daemon: Child) -> bool {
-    unsafe {
-        libc::kill(daemon.id() as i32, libc::SIGTERM);
+/// A running atmd, killed on drop so a failed assertion doesn't leave it
+/// behind.
+struct Daemon(Child);
+
+impl Daemon {
+    /// SIGTERM, then SIGKILL if the daemon doesn't exit. Returns whether
+    /// SIGTERM was enough.
+    fn stop(&mut self) -> bool {
+        unsafe {
+            libc::kill(self.0.id() as i32, libc::SIGTERM);
+        }
+        wait_until(|| self.0.try_wait().ok().flatten().is_some())
     }
-    let stopped = wait_until(|| daemon.try_wait().ok().flatten().is_some());
-    if !stopped {
-        let _ = daemon.kill();
-        let _ = daemon.wait();
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    stopped
 }
 
 /// An accept() that fails with EMFILE leaves the connection in the
@@ -78,7 +88,7 @@ fn test_accept_errors_back_off() {
             Ok(())
         });
     }
-    let daemon = cmd.spawn().expect("spawn atmd");
+    let mut daemon = Daemon(cmd.spawn().expect("spawn atmd"));
     assert!(wait_until(|| socket.exists()), "atmd never bound");
 
     // Silent clients hold their descriptors until the 10s handshake
@@ -96,7 +106,7 @@ fn test_accept_errors_back_off() {
     let before = failures();
     std::thread::sleep(Duration::from_secs(1));
     let in_one_second = failures() - before;
-    let stopped = stop(daemon);
+    let stopped = daemon.stop();
 
     assert!(failing, "accept never failed; is the fd limit too high?");
     assert!(

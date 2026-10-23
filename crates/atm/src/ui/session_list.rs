@@ -474,7 +474,7 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(Color::White),
                 )),
                 Line::from(Span::styled(
-                    "  3. Restart daemon: atmd stop (atm starts a new one)",
+                    "  3. Restart: atmd stop, rerun atm",
                     Style::default().fg(Color::Cyan),
                 )),
                 Line::from(""),

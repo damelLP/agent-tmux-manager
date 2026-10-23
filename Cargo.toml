@@ -65,6 +65,7 @@ thiserror = "1.0"
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+async-trait = "0.1"
 # Non-blocking unix connect for the TUI's daemon probe (already in the tree via tokio)
 socket2 = "0.6"
 
@@ -78,6 +79,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # System monitoring
 sysinfo = "0.32"
+procfs = "0.17"
+
+# Daemon and OS integration
+daemonize = "0.5"
+dirs = "5.0"
+libc = "0.2"
 
 # Error handling
 anyhow = "1.0"
@@ -120,9 +127,9 @@ tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-daemonize = "0.5"
-dirs = "5.0"
-libc = "0.2"
+daemonize = { workspace = true }
+dirs = { workspace = true }
+libc = { workspace = true }
 atmd = { workspace = true }
 
 [dev-dependencies]

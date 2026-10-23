@@ -247,7 +247,7 @@ impl DaemonClient {
             }
 
             // Attempt to connect with retry logic
-            match self.connect_with_retry(&mut delay).await {
+            match self.connect_with_retry(delay).await {
                 Ok(stream) => {
                     info!("Connected to daemon");
                     let connected_at = Instant::now();
@@ -289,14 +289,15 @@ impl DaemonClient {
     /// Attempts to connect to the daemon with exponential backoff.
     ///
     /// Retries connection indefinitely until successful or cancelled.
-    /// Uses exponential backoff between attempts, from `delay` (which `run`
-    /// carries across short-lived connections) capping at `retry_max_delay`.
+    /// Uses exponential backoff between attempts, starting at `delay` (which
+    /// `run` carries across short-lived connections) and capping at
+    /// `retry_max_delay`. Growth here isn't carried into later connections.
     ///
     /// # Returns
     ///
     /// * `Ok(UnixStream)` - Connected stream ready for communication
     /// * `Err(TuiError)` - If cancelled during retry (not typically an error path)
-    async fn connect_with_retry(&self, delay: &mut Duration) -> Result<UnixStream> {
+    async fn connect_with_retry(&self, mut delay: Duration) -> Result<UnixStream> {
         let mut attempt = 0u32;
 
         loop {
@@ -337,7 +338,7 @@ impl DaemonClient {
                 }
             }
 
-            self.wait_before_retry(delay).await?;
+            self.wait_before_retry(&mut delay).await?;
         }
     }
 
@@ -994,9 +995,10 @@ mod tests {
     /// A daemon that rejects every handshake (an old atmd after an
     /// upgrade), or that crashes right after accepting, connects at once.
     /// The client must keep backing off across those short connections,
-    /// and start over only after a connection that stays up. Real time:
-    /// the paused clock jumps to the next timer while socket reads are in
-    /// flight, which would blur the gaps measured here.
+    /// and start over only after a connection that stays up. The backoff
+    /// of failed connects before the daemon appeared doesn't carry over.
+    /// Real time: the paused clock jumps to the next timer while socket
+    /// reads are in flight, which would blur the gaps measured here.
     #[tokio::test]
     async fn test_reconnect_backoff_carries_across_short_connections() {
         async fn accept(listener: &tokio::net::UnixListener) -> UnixStream {
@@ -1013,12 +1015,11 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("rejecting.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
         let config = DaemonConfig {
-            socket_path,
+            socket_path: socket_path.clone(),
             retry_initial_delay: Duration::from_millis(50),
             retry_max_delay: Duration::from_millis(800),
             ..Default::default()
@@ -1026,13 +1027,23 @@ mod tests {
         let client = DaemonClient::new(config, event_tx, cmd_rx, cancel_token.clone());
         let run = tokio::spawn(async move { client.run().await });
 
+        // No daemon yet: failed connects grow their backoff to 800ms.
+        sleep(Duration::from_millis(1000)).await;
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+
         let mut accepted_at = Vec::new();
         for _ in 0..4 {
             let mut stream = accept(&listener).await;
             accepted_at.push(Instant::now());
             stream.write_all(&rejected).await.expect("reject");
         }
-        // 50ms, 100ms, then 200ms apart, rather than redialled at once.
+        // 50ms, 100ms, then 200ms apart, rather than redialled at once,
+        // and not 800ms apart either.
+        let first = accepted_at[1] - accepted_at[0];
+        assert!(
+            first < Duration::from_millis(400),
+            "first redial after {first:?}"
+        );
         let waited = accepted_at[3] - accepted_at[0];
         assert!(
             waited >= Duration::from_millis(350),

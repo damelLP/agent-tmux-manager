@@ -281,6 +281,44 @@ impl RegistryActor {
         Ok(())
     }
 
+    /// Stores `session` under a `pid` the registry does not hold yet.
+    ///
+    /// Every new session enters the registry here, so each creation path
+    /// enforces the capacity limit, records the pid, keeps both indexes in
+    /// step and publishes `Registered`.
+    fn insert_new_session(
+        &mut self,
+        pid: u32,
+        session: SessionDomain,
+    ) -> Result<(), RegistryError> {
+        if self.sessions_by_pid.len() >= MAX_SESSIONS {
+            warn!(
+                session_id = %session.id,
+                current = self.sessions_by_pid.len(),
+                max = MAX_SESSIONS,
+                "Registry is full, rejecting new session"
+            );
+            return Err(RegistryError::RegistryFull { max: MAX_SESSIONS });
+        }
+
+        let session_id = session.id.clone();
+        let agent_type = session.agent_type.clone();
+
+        let mut infra = SessionInfrastructure::new();
+        infra.set_pid(pid);
+
+        self.sessions_by_pid.insert(pid, (session, infra));
+        self.session_id_to_pid.insert(session_id.clone(), pid);
+
+        // Publish event (ignore if no subscribers)
+        let _ = self.event_publisher.send(SessionEvent::Registered {
+            session_id,
+            agent_type,
+        });
+
+        Ok(())
+    }
+
     /// Generates a synthetic PID for sessions without a real PID (testing only).
     fn generate_synthetic_pid(&self) -> u32 {
         // Use high PID range unlikely to conflict with real processes
@@ -374,17 +412,6 @@ impl RegistryActor {
             return Ok(());
         }
 
-        // Check capacity
-        if self.sessions_by_pid.len() >= MAX_SESSIONS {
-            warn!(
-                session_id = %session_id,
-                current = self.sessions_by_pid.len(),
-                max = MAX_SESSIONS,
-                "Registry is full, cannot register discovered session"
-            );
-            return Err(RegistryError::RegistryFull { max: MAX_SESSIONS });
-        }
-
         // Create minimal session with defaults (genuinely new process).
         // Agent type and model will be updated when the status line arrives.
         // Harness tag comes from whichever discoverer matched (Claude, pi,
@@ -399,15 +426,7 @@ impl RegistryActor {
             Some(cwd),
             read_parent_session_id(pid, harness),
         );
-        let agent_type = session.agent_type.clone();
-
-        // Create new infrastructure with PID
-        let mut infra = SessionInfrastructure::new();
-        infra.set_pid(pid);
-
-        // Insert into primary storage and index
-        self.sessions_by_pid.insert(pid, (session, infra));
-        self.session_id_to_pid.insert(session_id.clone(), pid);
+        self.insert_new_session(pid, session)?;
 
         info!(
             session_id = %session_id,
@@ -415,12 +434,6 @@ impl RegistryActor {
             total_sessions = self.sessions_by_pid.len(),
             "Discovered session registered"
         );
-
-        // Publish event (ignore if no subscribers)
-        let _ = self.event_publisher.send(SessionEvent::Registered {
-            session_id: session_id.clone(),
-            agent_type,
-        });
 
         // Also publish an initial Updated event so TUI shows it
         if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
@@ -620,36 +633,13 @@ impl RegistryActor {
                 session.worktree_branch = wt_branch;
             }
 
-            // Check capacity
-            if self.sessions_by_pid.len() >= MAX_SESSIONS {
-                warn!(
-                    session_id = %session_id,
-                    "Registry full, cannot auto-register session"
-                );
-                return Err(RegistryError::RegistryFull { max: MAX_SESSIONS });
-            }
-
-            let agent_type = session.agent_type.clone();
-
-            // Create infrastructure with PID
-            let mut infra = SessionInfrastructure::new();
-            infra.set_pid(pid);
-
-            // Insert into storage and index
-            self.sessions_by_pid.insert(pid, (session, infra));
-            self.session_id_to_pid.insert(session_id.clone(), pid);
+            self.insert_new_session(pid, session)?;
 
             info!(
                 session_id = %session_id,
                 pid = pid,
                 "Session auto-registered from status line"
             );
-
-            // Publish events
-            let _ = self.event_publisher.send(SessionEvent::Registered {
-                session_id: session_id.clone(),
-                agent_type,
-            });
 
             if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
                 let view = SessionView::from_domain(session);

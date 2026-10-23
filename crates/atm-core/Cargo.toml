@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Core domain types for ATM - Claude Code agent management"
+description = "Core domain types for ATM - coding-agent management"
 readme = "../../README.md"
 
 [dependencies]

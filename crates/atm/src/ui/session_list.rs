@@ -402,7 +402,7 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "No active Claude Code sessions detected",
+                    "No active agent sessions detected",
                     Style::default().fg(Color::Yellow),
                 )),
                 Line::from(""),
@@ -413,7 +413,7 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(Color::White),
                 )),
                 Line::from(Span::styled(
-                    "  2. Run: claude",
+                    "  2. Run an agent: claude, pi or codex",
                     Style::default().fg(Color::Cyan),
                 )),
                 Line::from(Span::styled(
@@ -422,7 +422,7 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Tip: Make sure Claude Code is configured with atm integration",
+                    "Tip: Run atm setup to add atm integration to your agents",
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),

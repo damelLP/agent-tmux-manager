@@ -770,7 +770,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     .await?;
 
     // Step 2: Read Connected response, then send ListSessions
-    let mut sessions = Vec::new();
+    let sessions;
     let mut line = String::new();
 
     loop {
@@ -781,7 +781,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
             .context("Failed to read from daemon")?;
 
         if n == 0 {
-            break;
+            bail!("Daemon closed the connection before sending the session list");
         }
 
         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(line.trim()) {

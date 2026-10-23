@@ -278,8 +278,12 @@ fn daemonize() -> Result<()> {
         fs::create_dir_all(parent).context("Failed to create log directory")?;
     }
 
-    let stdout = File::create(&log_path).context("Failed to create log file for stdout")?;
-    let stderr = File::create(&log_path).context("Failed to create log file for stderr")?;
+    let rotate_error = rotate_log(&log_path);
+    let stdout = open_log(&log_path).context("Failed to open log file for stdout")?;
+    let mut stderr = open_log(&log_path).context("Failed to open log file for stderr")?;
+    if let Some(e) = rotate_error {
+        let _ = writeln!(stderr, "Failed to rotate {}: {e}", log_path.display());
+    }
 
     let daemonize = Daemonize::new()
         .working_directory("/")
@@ -289,6 +293,24 @@ fn daemonize() -> Result<()> {
     daemonize.start().context("Failed to daemonize")?;
 
     Ok(())
+}
+
+/// Keeps the previous run's log as `atm.log.1`. An open TUI restarts a
+/// crashed daemon within seconds, and the new log would otherwise replace
+/// the one that explains the crash. Best effort: returns the error unless
+/// there was no log yet.
+fn rotate_log(log_path: &Path) -> Option<std::io::Error> {
+    match fs::rename(log_path, log_path.with_extension("log.1")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(e),
+        _ => None,
+    }
+}
+
+/// Opens the log for appending, never truncating: after a failed rotation
+/// the old log survives, and O_APPEND stops the stdout and stderr handles
+/// overwriting each other from offset 0.
+fn open_log(log_path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(log_path)
 }
 
 #[tokio::main]
@@ -407,6 +429,47 @@ mod tests {
 
     fn lock_file(socket: &Path) -> String {
         format!("{}.lock", socket.display())
+    }
+
+    /// Opens the log twice, as daemonize() does for stdout and stderr.
+    fn write_run(log: &Path, stdout_line: &str, stderr_line: &str) {
+        let mut stdout = open_log(log).expect("open stdout log");
+        let mut stderr = open_log(log).expect("open stderr log");
+        stdout.write_all(stdout_line.as_bytes()).expect("write");
+        stderr.write_all(stderr_line.as_bytes()).expect("write");
+    }
+
+    #[test]
+    fn test_log_rotation_keeps_the_previous_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("atm.log");
+        assert!(rotate_log(&log).is_none(), "a first start has no log");
+        write_run(&log, "old out\n", "old err\n");
+
+        assert!(rotate_log(&log).is_none());
+        write_run(&log, "new out\n", "new err\n");
+
+        let old = fs::read_to_string(dir.path().join("atm.log.1")).expect("rotated log");
+        assert_eq!(old, "old out\nold err\n");
+        assert_eq!(fs::read_to_string(&log).expect("log"), "new out\nnew err\n");
+    }
+
+    /// A failed rotation must not cost the crash log: the next run
+    /// appends to it instead of truncating it.
+    #[test]
+    fn test_failed_log_rotation_keeps_the_old_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("atm.log");
+        fs::write(&log, "crash trace\n").expect("old log");
+        fs::create_dir(dir.path().join("atm.log.1")).expect("blocking dir");
+
+        assert!(rotate_log(&log).is_some(), "rename onto a directory");
+        write_run(&log, "new out\n", "new err\n");
+
+        assert_eq!(
+            fs::read_to_string(&log).expect("log"),
+            "crash trace\nnew out\nnew err\n"
+        );
     }
 
     #[test]

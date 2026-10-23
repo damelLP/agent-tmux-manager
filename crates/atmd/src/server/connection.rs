@@ -309,10 +309,10 @@ impl ConnectionHandler {
                     return Err(e);
                 }
 
-                // Send error response but continue processing
-                let _ = self
-                    .send_message(DaemonMessage::error(&e.to_string()))
-                    .await;
+                // Send error response but continue processing, unless the
+                // reply itself failed
+                self.send_message(DaemonMessage::error(&e.to_string()))
+                    .await?;
             }
         }
     }

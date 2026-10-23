@@ -64,8 +64,10 @@ use crate::registry::RegistryHandle;
 /// Default socket path
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/atm.sock";
 
-/// Maximum number of concurrent TUI clients
-const MAX_TUI_CLIENTS: usize = 10;
+/// Maximum number of concurrent TUI clients (subscribed connections).
+/// A workspace runs one `atm --compact` sidebar per window, and each
+/// sidebar is a subscriber.
+pub const MAX_TUI_CLIENTS: usize = 64;
 
 /// How long shutdown waits for connection handlers before aborting them
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);

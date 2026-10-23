@@ -14,7 +14,7 @@ use std::time::Duration;
 use atm_core::{AgentType, Harness, LifecycleEvent, Model, SessionDomain, SessionId};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use atmd::registry::spawn_registry;
-use atmd::server::DaemonServer;
+use atmd::server::{DaemonServer, MAX_TUI_CLIENTS};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -395,9 +395,6 @@ async fn test_broadcast_respects_filter() {
 // Max Clients Tests
 // ============================================================================
 
-/// MAX_TUI_CLIENTS is 10 (defined in server/mod.rs)
-const MAX_TUI_CLIENTS: usize = 10;
-
 #[tokio::test]
 async fn test_max_clients_rejection() {
     let server = TestServer::spawn().await;
@@ -419,9 +416,9 @@ async fn test_max_clients_rejection() {
     //
     // Note: The current implementation doesn't immediately reject at subscribe time
     // via the protocol - the add_subscriber happens in the server's subscriber list.
-    // For this test, we verify that 10 clients can successfully subscribe.
+    // For this test, we verify that MAX_TUI_CLIENTS clients can successfully subscribe.
 
-    // Verify all 10 clients are working by sending ping
+    // Verify all MAX_TUI_CLIENTS clients are working by sending ping
     for (i, client) in clients.iter_mut().enumerate() {
         client.send(ClientMessage::ping(i as u64)).await;
         match client.recv().await {

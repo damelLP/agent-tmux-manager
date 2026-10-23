@@ -264,8 +264,9 @@ impl ConnectionHandler {
         let cancel = self.cancel.clone();
         loop {
             // Read with timeout for idle connections, until cancelled.
-            // read_until isn't cancel-safe, but cancelling closes the
-            // connection, so a lost partial line doesn't matter.
+            // read_message isn't cancel-safe (its partial line is a local),
+            // but cancelling closes the connection, so a lost partial line
+            // doesn't matter.
             // A subscribed client may stay silent, so it gets no idle
             // timeout (Duration::MAX never fires): a dead peer still gives
             // EOF, and the forwarder's WRITE_TIMEOUT cancels a stopped one

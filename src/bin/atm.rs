@@ -1587,18 +1587,23 @@ where
     Ok(output.trim().to_string())
 }
 
+/// The `-t` target for exactly the session `name` (tmux 3.8). Without `=`
+/// tmux falls back to a prefix, so `ws` finds `ws2`. The trailing `:` makes
+/// it a session where `-t` takes a pane (`set-hook`), which would first try
+/// a bare name as a window of the caller's session, and ends the name
+/// before tmux reads a `.` in it as the window.pane separator.
+fn exact_session(name: &str) -> String {
+    format!("={name}:")
+}
+
 /// Whether tmux has `session`. Only tmux's own "no" (a failed command)
 /// means absent. A timeout, or tmux failing to run, stays an error: tmux
 /// didn't answer, so the session may well exist.
-///
-/// `=` makes tmux match the name exactly; a bare `ws` also finds `ws2`.
-/// `set-hook` rejects `=` (tmux 3.8), so hooks target the bare name, which
-/// tmux resolves exactly once this has found the session.
 async fn has_session<C>(client: &C, session: &str) -> Result<bool>
 where
     C: TmuxClient + ?Sized,
 {
-    match tmux_run(client, &["has-session", "-t", &format!("={session}")]).await {
+    match tmux_run(client, &["has-session", "-t", &exact_session(session)]).await {
         Ok(_) => Ok(true),
         Err(e) if matches!(e.downcast_ref(), Some(TmuxError::CommandFailed { .. })) => Ok(false),
         Err(e) => Err(e),
@@ -1680,7 +1685,7 @@ where
         &[
             "set-hook",
             "-t",
-            session_name,
+            &exact_session(session_name),
             "after-resize-window",
             &hook_cmd,
         ],
@@ -1696,7 +1701,7 @@ where
         &[
             "set-hook",
             "-t",
-            session_name,
+            &exact_session(session_name),
             "after-resize-pane",
             &pane_hook_cmd,
         ],
@@ -1811,7 +1816,7 @@ where
         &[
             "set-hook",
             "-t",
-            session_name,
+            &exact_session(session_name),
             "after-new-window",
             &hook_cmd,
         ],
@@ -1837,7 +1842,7 @@ fn exec_attach(socket: &Option<String>, session_name: &str) -> Result<()> {
     }
     cmd.arg("attach-session")
         .arg("-t")
-        .arg(format!("={session_name}"));
+        .arg(exact_session(session_name));
 
     #[cfg(unix)]
     {
@@ -2039,7 +2044,7 @@ async fn cmd_workspace_attach(session: Option<String>, isolate: bool) -> Result<
         &[
             "list-windows",
             "-t",
-            &format!("={session_name}"),
+            &exact_session(&session_name),
             "-F",
             "#{window_id} #{window_width}",
         ],
@@ -2544,9 +2549,50 @@ mod has_session_tests {
             client.calls(),
             vec![MockCall::RawCommand {
                 subcommand: "has-session".to_string(),
-                args: vec!["-t".to_string(), "=ws".to_string()],
+                args: vec!["-t".to_string(), "=ws:".to_string()],
             }]
         );
+    }
+
+    /// `set-hook -t` takes a pane, so a bare `api` is first looked up as a
+    /// window in the caller's own session (tmux 3.8): run from a session
+    /// with a window named `api`, the hooks would land there.
+    #[test]
+    fn test_workspace_hooks_target_the_session_exactly() {
+        let _guard = super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The installers write their scripts under XDG_DATA_HOME
+        let data_home = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", data_home.path());
+
+        let client = MockTmuxClient::new();
+        let socket = Some("atm-my.proj".to_string());
+        let installed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                super::install_resize_hooks(&client, &socket, "my.proj").await?;
+                super::install_new_window_hook(&client, &socket, "my.proj").await
+            });
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        installed.expect("install hooks");
+
+        let targets: Vec<String> = client
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                MockCall::RawCommand { subcommand, args } if subcommand == "set-hook" => {
+                    args.get(1).cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, vec!["=my.proj:"; 3]);
     }
 
     /// tmux's own "no" (`can't find session`, or no server yet) means the

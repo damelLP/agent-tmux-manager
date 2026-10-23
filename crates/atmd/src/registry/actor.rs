@@ -1523,27 +1523,18 @@ mod tests {
         assert_eq!(actor.session_count(), MAX_SESSIONS);
     }
 
-    #[tokio::test]
-    async fn test_lifecycle_event_for_new_pid_respects_max_sessions() {
+    #[test]
+    fn test_lifecycle_event_for_new_pid_respects_max_sessions() {
         let (_, mut actor, _) = create_actor();
-        for i in 0..MAX_SESSIONS {
-            register_test_session(&mut actor, &format!("test-{i}"));
-        }
+        fill_registry(&mut actor, MAX_SESSIONS);
 
-        // Above Linux's PID_MAX_LIMIT (2^22), so never a live process.
-        let unused_pid = 4_194_305;
-        let (tx, rx) = oneshot::channel();
-        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
-            session_id: SessionId::new("one-too-many"),
-            event: LifecycleEvent::SessionStart { source: None },
-            harness: atm_core::Harness::ClaudeCode,
-            pid: Some(unused_pid),
-            tmux_pane: None,
-            context: LifecycleContext::default(),
-            respond_to: tx,
-        });
+        let result = apply_event(
+            &mut actor,
+            "one-too-many",
+            Some(UNUSED_PID),
+            LifecycleEvent::SessionStart { source: None },
+        );
 
-        let result = rx.await.unwrap();
         assert!(matches!(
             result,
             Err(RegistryError::RegistryFull { max: MAX_SESSIONS })
@@ -1555,9 +1546,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_duplicate_when_full_reports_already_exists() {
         let (_, mut actor, _) = create_actor();
-        for i in 0..MAX_SESSIONS {
-            register_test_session(&mut actor, &format!("test-{i}"));
-        }
+        fill_registry(&mut actor, MAX_SESSIONS);
 
         // A duplicate is rejected as a duplicate before capacity is checked.
         let (tx, rx) = oneshot::channel();
@@ -1572,6 +1561,104 @@ mod tests {
             Err(RegistryError::SessionAlreadyExists(id)) if id == SessionId::new("test-0")
         ));
         assert_eq!(actor.session_count(), MAX_SESSIONS);
+    }
+
+    /// Above Linux's PID_MAX_LIMIT (2^22), so never a live process.
+    const UNUSED_PID: u32 = 4_194_305;
+
+    fn fill_registry(actor: &mut RegistryActor, count: usize) {
+        for i in 0..count {
+            register_test_session(actor, &format!("test-{i}"));
+        }
+    }
+
+    fn apply_event(
+        actor: &mut RegistryActor,
+        id: &str,
+        pid: Option<u32>,
+        event: LifecycleEvent,
+    ) -> Result<(), RegistryError> {
+        let (respond_to, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new(id),
+            event,
+            harness: atm_core::Harness::ClaudeCode,
+            pid,
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn test_lifecycle_events_for_held_sessions_apply_when_full() {
+        let (_, mut actor, _) = create_actor();
+        apply_event(
+            &mut actor,
+            "by-pid",
+            Some(UNUSED_PID),
+            LifecycleEvent::SessionStart { source: None },
+        )
+        .unwrap();
+        fill_registry(&mut actor, MAX_SESSIONS - 1);
+        assert_eq!(actor.session_count(), MAX_SESSIONS);
+
+        // Found by pid, then by session id: neither creates, so both apply.
+        for (id, pid) in [("by-pid", Some(UNUSED_PID)), ("test-0", None)] {
+            apply_event(&mut actor, id, pid, LifecycleEvent::WorkingStart).unwrap();
+            let status = session_view(&actor, id).unwrap().status;
+            assert_eq!(status, atm_core::SessionStatus::Working, "{id}");
+        }
+        assert_eq!(actor.session_count(), MAX_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn test_register_discovered_respects_max_sessions() {
+        let (_, mut actor, _) = create_actor();
+        fill_registry(&mut actor, MAX_SESSIONS);
+
+        let (tx, rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::RegisterDiscovered {
+            session_id: SessionId::pending_from_pid(UNUSED_PID),
+            pid: UNUSED_PID,
+            cwd: PathBuf::from("/tmp"),
+            tmux_pane: None,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+
+        assert!(matches!(
+            rx.await.unwrap(),
+            Err(RegistryError::RegistryFull { max: MAX_SESSIONS })
+        ));
+        assert_eq!(actor.session_count(), MAX_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn test_status_line_create_respects_max_sessions() {
+        let (_, mut actor, _) = create_actor();
+        fill_registry(&mut actor, MAX_SESSIONS);
+
+        let (tx, rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id: SessionId::new("one-too-many"),
+            data: serde_json::json!({
+                "session_id": "one-too-many",
+                "pid": UNUSED_PID,
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.10, "total_duration_ms": 5000},
+                "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
+            }),
+            respond_to: tx,
+        });
+
+        assert!(matches!(
+            rx.await.unwrap(),
+            Err(RegistryError::RegistryFull { max: MAX_SESSIONS })
+        ));
+        assert_eq!(actor.session_count(), MAX_SESSIONS);
+        assert!(session_view(&actor, "one-too-many").is_none());
     }
 
     #[tokio::test]

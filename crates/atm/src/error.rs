@@ -77,6 +77,11 @@ pub enum TuiError {
         daemon_version: String,
     },
 
+    /// The daemon answered `Connect` with `Rejected`, giving this reason
+    /// (e.g. an incompatible protocol version).
+    #[error("Daemon rejected the connection: {0}")]
+    Rejected(String),
+
     /// Protocol parse or format error.
     ///
     /// A message from the daemon could not be parsed or a message

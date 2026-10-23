@@ -253,12 +253,15 @@ impl DaemonClient {
                     let connected_at = Instant::now();
 
                     // Read messages until disconnect or error
+                    let mut reason = None;
                     if let Err(e) = self.handle_connection(stream).await {
                         warn!(error = %e, "Connection ended with error");
+                        // A rejection recurs on every retry, so show it
+                        reason = matches!(e, TuiError::Rejected(_)).then(|| e.to_string());
                     }
 
                     // Notify TUI of disconnect (ignore send errors - TUI may be shutting down)
-                    let _ = self.event_tx.send(Event::DaemonDisconnected);
+                    let _ = self.event_tx.send(Event::DaemonDisconnected(reason));
 
                     if connected_at.elapsed() >= self.config.retry_max_delay {
                         delay = self.config.retry_initial_delay;
@@ -424,14 +427,8 @@ impl DaemonClient {
                     "Handshake complete"
                 );
             }
-            DaemonMessage::Rejected {
-                reason: _,
-                protocol_version,
-            } => {
-                return Err(TuiError::VersionMismatch {
-                    client_version: ProtocolVersion::CURRENT.to_string(),
-                    daemon_version: protocol_version.to_string(),
-                });
+            DaemonMessage::Rejected { reason, .. } => {
+                return Err(TuiError::Rejected(reason));
             }
             _ => {
                 return Err(TuiError::ProtocolError(format!(
@@ -982,7 +979,7 @@ mod tests {
         let (_held, _) = listener.accept().await.expect("accept");
         let event = tokio::time::timeout(Duration::from_secs(60), event_rx.recv()).await;
         assert!(
-            matches!(event, Ok(Some(Event::DaemonDisconnected))),
+            matches!(event, Ok(Some(Event::DaemonDisconnected(None)))),
             "client still waiting on a silent daemon"
         );
         assert!(started.elapsed() >= HANDSHAKE_TIMEOUT);
@@ -1017,7 +1014,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("rejecting.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
         let config = DaemonConfig {
@@ -1040,6 +1037,12 @@ mod tests {
         assert!(
             waited >= Duration::from_millis(350),
             "redialled after {waited:?}"
+        );
+        // The TUI learns why, so it can show it.
+        let event = event_rx.recv().await;
+        assert!(
+            matches!(&event, Some(Event::DaemonDisconnected(Some(r))) if r.contains("incompatible protocol")),
+            "rejection reason lost: {event:?}"
         );
 
         // A connection that outlives retry_max_delay resets the backoff...

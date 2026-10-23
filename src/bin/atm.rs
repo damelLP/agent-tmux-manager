@@ -667,9 +667,9 @@ async fn run_event_loop(
                 Event::DiscoveryComplete { discovered, failed } => {
                     info!(discovered, failed, "Discovery complete");
                 }
-                Event::DaemonDisconnected => {
+                Event::DaemonDisconnected(reason) => {
                     warn!("Daemon disconnected");
-                    app.mark_disconnected();
+                    app.mark_disconnected(reason);
                 }
             },
             Ok(None) => {

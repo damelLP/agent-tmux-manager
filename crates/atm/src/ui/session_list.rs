@@ -10,7 +10,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
@@ -435,12 +435,16 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
                 )),
             ],
         ),
-        AppState::Disconnected { retry_count, .. } => (
+        AppState::Disconnected {
+            retry_count,
+            reason,
+            ..
+        } => (
             " Disconnected ",
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Lost connection to daemon",
+                    reason.as_deref().unwrap_or("Lost connection to daemon"),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
@@ -479,6 +483,11 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
                 AppState::Disconnected { .. } => Style::default().fg(Color::Red),
             }),
     );
+    // A rejection reason is wider than the list, so let it wrap
+    let paragraph = match state {
+        AppState::Disconnected { .. } => paragraph.wrap(Wrap { trim: false }),
+        _ => paragraph,
+    };
 
     frame.render_widget(paragraph, area);
 }

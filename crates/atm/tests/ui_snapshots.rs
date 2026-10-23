@@ -329,6 +329,28 @@ fn session_list_subagent_nesting() {
     insta::assert_debug_snapshot!(buf);
 }
 
+#[test]
+fn session_list_disconnected_rejected() {
+    // A daemon on another protocol version rejects every connection. The
+    // reason replaces "Lost connection" and wraps to the list's width.
+    let mut app = App::new();
+    app.state = AppState::Disconnected {
+        since: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
+            .expect("valid rfc3339")
+            .with_timezone(&chrono::Utc),
+        retry_count: 3,
+        reason: Some(
+            "Daemon rejected the connection: Protocol version 1.0 \
+             not compatible with server version 2.0"
+                .to_string(),
+        ),
+    };
+    let buf = render_buffer(36, 18, |frame, area| {
+        render_session_list(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
 // ---- Split layout: detail_panel -------------------------------------------
 
 #[test]
@@ -405,6 +427,7 @@ fn header_disconnected_with_retries() {
             .expect("valid rfc3339")
             .with_timezone(&chrono::Utc),
         retry_count: 5,
+        reason: None,
     };
     let buf = render_buffer(80, 3, |frame, area| {
         render_header(frame, area, &app);

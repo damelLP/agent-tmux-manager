@@ -29,6 +29,8 @@ pub enum AppState {
         since: DateTime<Utc>,
         /// Number of reconnection attempts.
         retry_count: u32,
+        /// Why the daemon rejected the last connection, if it did.
+        reason: Option<String>,
     },
 
     /// Initial connection in progress.
@@ -519,18 +521,24 @@ impl App {
     ///
     /// If already disconnected, increments the retry counter.
     /// If connected or connecting, transitions to disconnected with retry_count = 1.
-    pub fn mark_disconnected(&mut self) {
+    /// `reason` replaces the previous one: why the daemon rejected this
+    /// connection, or `None`.
+    pub fn mark_disconnected(&mut self, reason: Option<String>) {
         match &self.state {
-            AppState::Disconnected { since, retry_count } => {
+            AppState::Disconnected {
+                since, retry_count, ..
+            } => {
                 self.state = AppState::Disconnected {
                     since: *since,
                     retry_count: retry_count.saturating_add(1),
+                    reason,
                 };
             }
             AppState::Connected | AppState::Connecting => {
                 self.state = AppState::Disconnected {
                     since: Utc::now(),
                     retry_count: 1,
+                    reason,
                 };
             }
         }
@@ -1183,7 +1191,7 @@ mod tests {
         let mut app = App::new();
         app.state = AppState::Connected;
 
-        app.mark_disconnected();
+        app.mark_disconnected(None);
 
         match &app.state {
             AppState::Disconnected { retry_count, .. } => {
@@ -1199,9 +1207,10 @@ mod tests {
         app.state = AppState::Disconnected {
             since: Utc::now(),
             retry_count: 3,
+            reason: None,
         };
 
-        app.mark_disconnected();
+        app.mark_disconnected(None);
 
         match &app.state {
             AppState::Disconnected { retry_count, .. } => {

@@ -40,3 +40,21 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+  msrv:
+    name: MSRV check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Must match rust-version in Cargo.toml's [workspace.package].
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked

@@ -349,19 +349,25 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     info!("Session registry started");
 
     let discovery = DiscoveryService::new(registry.clone());
+    let discovery_result = discovery.discover().await;
+    if discovery_result.discovered > 0 {
+        info!(
+            discovered = discovery_result.discovered,
+            failed = discovery_result.failed,
+            "Initial session discovery complete"
+        );
+    }
 
     let _monitor_handle = spawn_monitor_task(cancel_token.clone());
     info!("Process monitor started");
 
-    let server = DaemonServer::new(&socket_path, registry, cancel_token.clone());
+    let server = DaemonServer::new(&socket_path, registry, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
 
     // If the registry actor dies, the supervisor cancels the registry token and
     // the server shuts down cooperatively (drains connections, removes the socket).
-    // Startup discovery runs alongside the server, after it in join! so the
-    // first poll binds the socket: listing panes waits out a wedged tmux.
-    let (server_result, registry_result, _) = tokio::join!(
+    let (server_result, registry_result) = tokio::join!(
         async {
             let result = server.run().await;
             // Connections have drained (or the server failed to start)
@@ -369,16 +375,6 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
             result
         },
         supervise_actor(registry_tasks.actor, registry_cancel.clone()),
-        cancel_token.run_until_cancelled(async {
-            let discovery_result = discovery.discover().await;
-            if discovery_result.discovered > 0 {
-                info!(
-                    discovered = discovery_result.discovered,
-                    failed = discovery_result.failed,
-                    "Initial session discovery complete"
-                );
-            }
-        }),
     );
     for task in registry_tasks.maintenance {
         if let Err(e) = task.await {

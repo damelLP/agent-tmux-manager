@@ -101,12 +101,13 @@ fn is_process_running(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
+/// Read-only: `stop` and `status` call this without the lock, so a stale
+/// PID file is left for the next lock holder's write_pid() to replace.
 fn is_daemon_running() -> Option<u32> {
     if let Some(pid) = read_pid() {
         if is_process_running(pid) {
             return Some(pid);
         }
-        remove_pid_file();
     }
     None
 }
@@ -124,7 +125,7 @@ fn socket_path() -> String {
 ///
 /// The lock is `<socket>.lock`, not the PID file. The socket is what two
 /// daemons contend for, and they may use different state dirs, so
-/// different PID files. The PID file is also unlinked by stale-PID cleanup,
+/// different PID files. The PID file is also unlinked when a daemon exits,
 /// which would let a second starter lock a fresh inode. For the same reason
 /// the lock file is never removed.
 fn lock_daemon(socket_path: &Path) -> Result<Option<File>> {
@@ -211,7 +212,7 @@ fn main() -> Result<()> {
                 exit_already_running(read_pid().filter(|&pid| is_process_running(pid)));
             };
 
-            // Under the lock, so only the holder ever clears a stale PID file.
+            // Under the lock, so only the holder ever replaces a stale PID file.
             if let Some(pid) = is_daemon_running() {
                 exit_already_running(Some(pid));
             }

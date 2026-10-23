@@ -329,12 +329,9 @@ fn session_list_subagent_nesting() {
     insta::assert_debug_snapshot!(buf);
 }
 
-#[test]
-fn session_list_disconnected_rejected() {
-    // A daemon on another protocol version rejects every connection. The
-    // reason replaces "Lost connection" and wraps to the list's width.
-    let mut app = App::new();
-    app.state = AppState::Disconnected {
+/// A daemon on another protocol version rejects every connection.
+fn rejected_state() -> AppState {
+    AppState::Disconnected {
         since: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
             .expect("valid rfc3339")
             .with_timezone(&chrono::Utc),
@@ -344,7 +341,14 @@ fn session_list_disconnected_rejected() {
              not compatible with server version 2.0"
                 .to_string(),
         ),
-    };
+    }
+}
+
+#[test]
+fn session_list_disconnected_rejected() {
+    // The reason replaces "Lost connection" and wraps to the list's width.
+    let mut app = App::new();
+    app.state = rejected_state();
     let buf = render_buffer(36, 18, |frame, area| {
         render_session_list(frame, area, &app);
     });
@@ -480,6 +484,18 @@ fn help_popup_scrolled_to_bottom() {
 fn compact_session_list_narrow() {
     let app = make_app_with_sessions();
     let buf = render_buffer(28, 12, |frame, area| {
+        render_compact_session_list(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn compact_session_list_disconnected_rejected() {
+    // Sessions from before the rejection are stale, so the reason shows
+    // instead of them, wrapped to the narrowest sidebar (SIDEBAR_MIN).
+    let mut app = make_app_with_sessions();
+    app.state = rejected_state();
+    let buf = render_buffer(20, 30, |frame, area| {
         render_compact_session_list(frame, area, &app);
     });
     insta::assert_debug_snapshot!(buf);

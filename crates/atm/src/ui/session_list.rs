@@ -25,7 +25,7 @@ use ratatui::{
 /// * `area` - The rectangular area for the session list
 /// * `app` - Application state containing tree data
 pub fn render_session_list(frame: &mut Frame, area: Rect, app: &App) {
-    if app.sessions.is_empty() {
+    if shows_empty_state(app) {
         render_empty_state(frame, area, &app.state);
         return;
     }
@@ -62,7 +62,7 @@ pub fn render_session_list(frame: &mut Frame, area: Rect, app: &App) {
 /// * `area` - The rectangular area for the session list
 /// * `app` - Application state containing tree data
 pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
-    if app.sessions.is_empty() {
+    if shows_empty_state(app) {
         render_empty_state(frame, area, &app.state);
         return;
     }
@@ -371,6 +371,19 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Whether the list area shows the empty state: there are no sessions,
+/// or the daemon rejects this client, so the sessions shown would be stale.
+fn shows_empty_state(app: &App) -> bool {
+    app.sessions.is_empty()
+        || matches!(
+            app.state,
+            AppState::Disconnected {
+                reason: Some(_),
+                ..
+            }
+        )
+}
+
 /// Renders the empty state when no sessions are available.
 ///
 /// Shows different messages based on connection state:
@@ -485,7 +498,9 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     // A rejection reason is wider than the list, so let it wrap
     let paragraph = match state {
-        AppState::Disconnected { .. } => paragraph.wrap(Wrap { trim: false }),
+        AppState::Disconnected {
+            reason: Some(_), ..
+        } => paragraph.wrap(Wrap { trim: false }),
         _ => paragraph,
     };
 

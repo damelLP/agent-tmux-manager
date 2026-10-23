@@ -29,7 +29,7 @@ pub const DEFAULT_SOCKET_PATH: &str = "/tmp/atm.sock";
 /// Deadline for connecting to the daemon socket.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Deadline for the daemon's reply to `Connect`.
+/// Deadline for the daemon's reply to `Connect`, and then to `Subscribe`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Deadline for writing one message to the daemon.
@@ -438,13 +438,26 @@ impl DaemonClient {
             }
         }
 
-        // Subscribe to session updates
+        // Subscribe to session updates. The daemon answers with the initial
+        // session list, taken before it forwards any event, or with an Error
+        // when it refuses (e.g. at its subscriber cap). A refused client
+        // would never get updates, so it's rejected.
         let subscribe_msg = ClientMessage::subscribe(None);
         self.send_message(&mut writer, &subscribe_msg).await?;
-
-        // Request initial session list
-        let list_msg = ClientMessage::list_sessions();
-        self.send_message(&mut writer, &list_msg).await?;
+        line.clear();
+        let read = timeout(HANDSHAKE_TIMEOUT, buf_reader.read_line(&mut line))
+            .await
+            .map_err(|_| timed_out("subscribe"))??;
+        if read == 0 {
+            info!("Daemon closed connection");
+            return Ok(());
+        }
+        // As in `message_loop`, a reply that doesn't parse is skipped
+        match serde_json::from_str(line.trim()) {
+            Ok(DaemonMessage::Error { message, .. }) => return Err(TuiError::Rejected(message)),
+            Ok(message) => self.dispatch(message),
+            Err(e) => warn!(error = %e, line = %line.trim(), "Failed to handle message"),
+        }
 
         // Read messages and handle commands in a loop
         self.message_loop(&mut buf_reader, &mut writer).await
@@ -581,8 +594,12 @@ impl DaemonClient {
     /// * `Ok(())` - Message handled successfully
     /// * `Err(TuiError)` - Failed to parse message
     async fn handle_message(&self, line: &str) -> Result<()> {
-        let message: DaemonMessage = serde_json::from_str(line)?;
+        self.dispatch(serde_json::from_str(line)?);
+        Ok(())
+    }
 
+    /// Forwards one parsed daemon message to the TUI.
+    fn dispatch(&self, message: DaemonMessage) {
         match message {
             DaemonMessage::SessionList { sessions } => {
                 debug!(count = sessions.len(), "Received session list");
@@ -623,8 +640,6 @@ impl DaemonClient {
                 warn!("Received unexpected handshake message after connection");
             }
         }
-
-        Ok(())
     }
 }
 
@@ -1076,6 +1091,124 @@ mod tests {
 
         cancel_token.cancel();
         run.await.expect("client task");
+    }
+
+    /// A client whose `Connect` a fake daemon has answered, and whose
+    /// `Subscribe` it has read.
+    struct AwaitingSubscribeReply {
+        events: mpsc::UnboundedReceiver<Event>,
+        cancel: CancellationToken,
+        run: tokio::task::JoinHandle<()>,
+        /// The daemon's end of the connection
+        writer: tokio::net::unix::OwnedWriteHalf,
+        // Dropping the command sender ends the client's message loop
+        _cmd_tx: mpsc::UnboundedSender<ClientCommand>,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn client_awaiting_subscribe_reply() -> AwaitingSubscribeReply {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("fake.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let config = DaemonConfig {
+            socket_path,
+            ..Default::default()
+        };
+        let client = DaemonClient::new(config, event_tx, cmd_rx, cancel.clone());
+        let run = tokio::spawn(async move { client.run().await });
+
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read connect");
+        let connected = DaemonMessage::connected("client-1".to_string());
+        writer
+            .write_all(&json_line(&connected))
+            .await
+            .expect("write");
+        line.clear();
+        reader.read_line(&mut line).await.expect("read subscribe");
+        assert!(
+            line.contains("subscribe"),
+            "expected Subscribe, got {line:?}"
+        );
+        AwaitingSubscribeReply {
+            events,
+            cancel,
+            run,
+            writer,
+            _cmd_tx: cmd_tx,
+            _dir: dir,
+        }
+    }
+
+    fn json_line(message: &DaemonMessage) -> Vec<u8> {
+        format!("{}\n", serde_json::to_string(message).expect("json")).into_bytes()
+    }
+
+    /// A daemon at its subscriber cap accepts the handshake but answers
+    /// `Subscribe` with an Error. The client would get no updates, so it
+    /// must disconnect with that reason for the TUI to show, rather than
+    /// sit on a stale list.
+    #[tokio::test]
+    async fn test_subscribe_refusal_reaches_the_disconnected_state() {
+        let mut client = client_awaiting_subscribe_reply().await;
+        // The daemon's own refusal (atmd server/connection.rs)
+        let refused = DaemonMessage::error("Too many subscribers (max: 64)");
+        client
+            .writer
+            .write_all(&json_line(&refused))
+            .await
+            .expect("write");
+
+        let event = timeout(Duration::from_secs(5), client.events.recv()).await;
+        let Ok(Some(Event::DaemonDisconnected(reason))) = event else {
+            panic!("subscribe refusal didn't disconnect: {event:?}");
+        };
+        // As the TUI event loop does
+        let mut app = crate::app::App::new();
+        app.mark_disconnected(reason);
+        assert!(
+            matches!(&app.state, crate::app::AppState::Disconnected { reason: Some(r), .. }
+                if r.contains("Too many subscribers (max: 64)")),
+            "reason lost: {:?}",
+            app.state
+        );
+
+        client.cancel.cancel();
+        client.run.await.expect("client task");
+    }
+
+    /// A subscribe reply the client can't parse (e.g. a session list from
+    /// a newer daemon of the same major version) is skipped, as in the
+    /// message loop, rather than ending the connection.
+    #[tokio::test]
+    async fn test_unparseable_subscribe_reply_keeps_the_connection() {
+        let mut client = client_awaiting_subscribe_reply().await;
+        client
+            .writer
+            .write_all(b"{\"type\":\"session_list\",\"sessions\":[{\"id\":1}]}\n")
+            .await
+            .expect("write");
+        client
+            .writer
+            .write_all(&json_line(&DaemonMessage::session_list(Vec::new())))
+            .await
+            .expect("write");
+
+        let event = timeout(Duration::from_secs(5), client.events.recv()).await;
+        assert!(
+            matches!(&event, Ok(Some(Event::SessionListReplace(s))) if s.is_empty()),
+            "client didn't carry on after the bad reply: {event:?}"
+        );
+
+        client.cancel.cancel();
+        client.run.await.expect("client task");
     }
 
     // ------------------------------------------------------------------------

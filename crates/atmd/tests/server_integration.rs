@@ -14,7 +14,7 @@ use std::time::Duration;
 use atm_core::{AgentType, Harness, LifecycleEvent, Model, SessionDomain, SessionId};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use atmd::registry::spawn_registry;
-use atmd::server::DaemonServer;
+use atmd::server::{DaemonServer, MAX_TUI_CLIENTS};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -395,9 +395,6 @@ async fn test_broadcast_respects_filter() {
 // Max Clients Tests
 // ============================================================================
 
-/// MAX_TUI_CLIENTS is 10 (defined in server/mod.rs)
-const MAX_TUI_CLIENTS: usize = 10;
-
 #[tokio::test]
 async fn test_max_clients_rejection() {
     let server = TestServer::spawn().await;
@@ -412,16 +409,7 @@ async fn test_max_clients_rejection() {
         clients.push(client);
     }
 
-    // The 11th client can connect and handshake, but subscribing depends on
-    // whether the add_subscriber logic is called. In the current implementation,
-    // subscribe is handled by ConnectionHandler, and we need to verify the
-    // subscriber count limit is enforced.
-    //
-    // Note: The current implementation doesn't immediately reject at subscribe time
-    // via the protocol - the add_subscriber happens in the server's subscriber list.
-    // For this test, we verify that 10 clients can successfully subscribe.
-
-    // Verify all 10 clients are working by sending ping
+    // Verify all MAX_TUI_CLIENTS clients are working by sending ping
     for (i, client) in clients.iter_mut().enumerate() {
         client.send(ClientMessage::ping(i as u64)).await;
         match client.recv().await {
@@ -430,6 +418,19 @@ async fn test_max_clients_rejection() {
             }
             other => panic!("Expected Pong for client {i}, got {other:?}"),
         }
+    }
+
+    // One more client can connect and handshake, but the daemon answers
+    // its Subscribe with an Error naming the cap.
+    let mut extra = server.connect().await;
+    extra.handshake(Some("client-extra".to_string())).await;
+    extra.send(ClientMessage::subscribe(None)).await;
+    match extra.recv().await {
+        DaemonMessage::Error { message, .. } => {
+            let expected = format!("Too many subscribers (max: {MAX_TUI_CLIENTS})");
+            assert_eq!(message, expected);
+        }
+        other => panic!("Expected a Too many subscribers error, got {other:?}"),
     }
 
     server.shutdown().await;

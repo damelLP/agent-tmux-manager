@@ -31,6 +31,7 @@ use atm_core::SessionId;
 use atm_pi_adapter::RawPiEvent;
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 
+use super::MAX_TUI_CLIENTS;
 use crate::discovery::{DiscoveryResult, DiscoveryService};
 use crate::registry::{RegistryHandle, SessionEvent};
 
@@ -57,9 +58,6 @@ pub type SubscribersMap = Arc<RwLock<HashMap<String, Subscriber>>>;
 pub(super) fn subscriber_key(connection_number: u64) -> String {
     connection_number.to_string()
 }
-
-/// Maximum number of concurrent TUI clients
-const MAX_TUI_CLIENTS: usize = 10;
 
 /// Maximum message size (1 MB)
 const MAX_MESSAGE_SIZE: usize = 1_048_576;

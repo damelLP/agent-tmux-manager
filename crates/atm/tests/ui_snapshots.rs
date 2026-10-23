@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 use atm_core::{SessionId, SessionStatus, SessionView};
 use atm_tui::app::{App, AppState};
+use atm_tui::error::TuiError;
 use atm_tui::ui::{
     detail_panel::{render_compact_preview, render_detail_panel_inline},
     help_popup::render_help_popup,
@@ -330,17 +331,16 @@ fn session_list_subagent_nesting() {
 }
 
 /// A daemon on another protocol version rejects every connection.
-fn rejected_state() -> AppState {
+const VERSION_REJECTION: &str = "Protocol version 1.0 not compatible with server version 2.0";
+
+/// A daemon rejects every connection, giving `reason`.
+fn rejected_state(reason: &str) -> AppState {
     AppState::Disconnected {
         since: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
             .expect("valid rfc3339")
             .with_timezone(&chrono::Utc),
         retry_count: 3,
-        reason: Some(
-            "Daemon rejected the connection: Protocol version 1.0 \
-             not compatible with server version 2.0"
-                .to_string(),
-        ),
+        reason: Some(TuiError::Rejected(reason.to_string()).to_string()),
     }
 }
 
@@ -348,7 +348,7 @@ fn rejected_state() -> AppState {
 fn session_list_disconnected_rejected() {
     // The reason replaces "Lost connection" and wraps to the list's width.
     let mut app = App::new();
-    app.state = rejected_state();
+    app.state = rejected_state(VERSION_REJECTION);
     let buf = render_buffer(36, 18, |frame, area| {
         render_session_list(frame, area, &app);
     });
@@ -494,7 +494,19 @@ fn compact_session_list_disconnected_rejected() {
     // Sessions from before the rejection are stale, so the reason shows
     // instead of them, wrapped to the narrowest sidebar (SIDEBAR_MIN).
     let mut app = make_app_with_sessions();
-    app.state = rejected_state();
+    app.state = rejected_state(VERSION_REJECTION);
+    let buf = render_buffer(20, 30, |frame, area| {
+        render_compact_session_list(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn compact_session_list_subscriber_cap_rejected() {
+    // A workspace with more windows than the daemon's subscriber cap: the
+    // refused sidebar says why instead of showing a list that never updates.
+    let mut app = make_app_with_sessions();
+    app.state = rejected_state("Too many subscribers (max: 64)");
     let buf = render_buffer(20, 30, |frame, area| {
         render_compact_session_list(frame, area, &app);
     });

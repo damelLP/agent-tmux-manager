@@ -77,8 +77,9 @@ pub enum TuiError {
         daemon_version: String,
     },
 
-    /// The daemon answered `Connect` with `Rejected`, giving this reason
-    /// (e.g. an incompatible protocol version).
+    /// The daemon answered `Connect` with `Rejected`, or `Subscribe` with
+    /// an Error, giving this reason (e.g. an incompatible protocol
+    /// version, or too many subscribers).
     #[error("Daemon rejected the connection: {0}")]
     Rejected(String),
 

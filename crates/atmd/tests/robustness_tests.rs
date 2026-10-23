@@ -269,8 +269,10 @@ async fn test_oversized_message_rejected() {
         r#"{{"protocol_version":{{"major":1,"minor":0}},"message":{{"type":"status_update","data":{{"padding":"{large_data}"}}}}}}"#
     );
 
-    client.send_raw(large_json.as_bytes()).await;
-    client.send_raw(b"\n").await;
+    // The daemon closes the connection after MAX_MESSAGE_SIZE bytes, so the
+    // rest of the write may fail.
+    let _ = client.writer.write_all(large_json.as_bytes()).await;
+    let _ = client.writer.write_all(b"\n").await;
 
     // Connection should be closed or error received
     // The key is daemon doesn't crash
@@ -279,6 +281,36 @@ async fn test_oversized_message_rejected() {
     // Server should still accept new connections
     let mut client2 = server.connect().await;
     client2.handshake(None).await;
+
+    server.shutdown().await;
+}
+
+/// A client that streams bytes and never sends a newline is disconnected
+/// once it passes MAX_MESSAGE_SIZE (1 MiB), rather than having the daemon
+/// buffer the line without bound. The stream is endless, so it only stops
+/// when the daemon closes the connection.
+#[tokio::test]
+async fn test_endless_line_is_cut_off_at_max_message_size() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let mut writer = client.writer;
+    let streamer = tokio::spawn(async move {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut sent = 0usize;
+        while writer.write_all(&chunk).await.is_ok() {
+            sent += chunk.len();
+        }
+        sent
+    });
+
+    let sent = timeout(Duration::from_secs(10), streamer)
+        .await
+        .expect("daemon kept reading a line past MAX_MESSAGE_SIZE")
+        .unwrap();
+    // 1 MiB read, plus whatever the socket buffers held at close
+    assert!(sent < 8 * 1024 * 1024, "daemon accepted {sent} bytes");
 
     server.shutdown().await;
 }

@@ -2096,6 +2096,25 @@ fn captured_codex_events(fixture: &str) -> Option<Vec<serde_json::Value>> {
     Some(events)
 }
 
+/// Sends one codex hook payload, then a ping, and returns the sessions
+/// once the Pong arrives. atmd handles one connection's messages in order
+/// and awaits the registry for each lifecycle event, so the Pong means
+/// the payload has been applied.
+async fn apply_codex_event(
+    client: &mut TestClient,
+    registry: &atmd::registry::RegistryHandle,
+    seq: u64,
+    event: &serde_json::Value,
+) -> Vec<SessionView> {
+    client.send(ClientMessage::codex_event(event.clone())).await;
+    client.send(ClientMessage::ping(seq)).await;
+    match client.recv().await {
+        DaemonMessage::Pong { seq: got } if got == seq => {}
+        other => panic!("expected Pong {seq}, got {other:?}"),
+    }
+    registry.get_all_sessions().await
+}
+
 #[tokio::test]
 async fn test_e2e_codex_captured_session_replay() {
     // Captured: codex-cli 0.163.0, 2026-10-24, one TUI session: a prompt,
@@ -2113,8 +2132,7 @@ async fn test_e2e_codex_captured_session_replay() {
     let (server, registry) = TestServer::spawn_with_registry().await;
     let mut client = server.connect().await;
     client.handshake(None).await;
-    // (status, activity) after each payload. Each step waits for its
-    // expected state, so a mismatch shows the state reached instead.
+    // (status, activity) after each payload.
     let steps = [
         (start, "idle", None),
         (prompt, "working", None),
@@ -2131,19 +2149,21 @@ async fn test_e2e_codex_captured_session_replay() {
     let state = |s: &SessionView| (s.status_label.clone(), s.activity_detail.clone());
     let mut seen = Vec::new();
     let mut expected = Vec::new();
-    for (event, label, detail) in steps {
-        let want = (label.to_string(), detail.map(String::from));
-        client.send(ClientMessage::codex_event(event.clone())).await;
-        let sessions = sessions_when(&registry, |s| matches!(s, [one] if state(one) == want)).await;
+    for (seq, (event, label, detail)) in (1..).zip(steps) {
+        let sessions = apply_codex_event(&mut client, &registry, seq, event).await;
         seen.push(sessions.iter().map(state).collect::<Vec<_>>());
-        expected.push(vec![want]);
+        expected.push(vec![(label.to_string(), detail.map(String::from))]);
     }
     assert_eq!(seen, expected);
-    let session = only_session(&registry).await;
-    assert_eq!(session.model, "fake-model");
+    let models: Vec<String> = registry
+        .get_all_sessions()
+        .await
+        .iter()
+        .map(|s| s.model.clone())
+        .collect();
+    assert_eq!(models, ["fake-model"]);
 
-    client.send(ClientMessage::codex_event(end.clone())).await;
-    let sessions = sessions_when(&registry, <[SessionView]>::is_empty).await;
+    let sessions = apply_codex_event(&mut client, &registry, 0, end).await;
     assert!(
         sessions.is_empty(),
         "SessionEnd removes the row: {sessions:?}"

@@ -12,7 +12,10 @@
 use atm_core::{SessionId, SessionStatus, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Round-trip helper
@@ -432,6 +435,78 @@ proptest! {
     fn session_view_roundtrip(v in arb_session_view()) {
         assert_json_roundtrip(&v);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Strategy coverage — a wire variant with no strategy arm is never
+// round-tripped, so fail when a strategy misses one.
+// ---------------------------------------------------------------------------
+
+const PROBE_TAG: &str = "__probe__";
+
+/// Wire tags of every variant of the internally tagged enum `T`.
+///
+/// Read from serde's own error for an unknown tag (``unknown variant
+/// `__probe__`, expected one of `a`, `b`, ...``), so the list comes from
+/// the production derive and can't drift from it. If serde ever rewords
+/// that error, this returns an empty set and the coverage test fails.
+/// The list includes `#[serde(alias)]` names (never serialized) and omits
+/// `#[serde(skip_deserializing)]` variants (still serialized), so either
+/// attribute also trips the coverage test.
+fn wire_variant_tags<T: serde::de::DeserializeOwned>() -> BTreeSet<String> {
+    let error = serde_json::from_str::<T>(&format!(r#"{{"type":"{PROBE_TAG}"}}"#))
+        .err()
+        .expect("the probe tag must not deserialize")
+        .to_string();
+    error
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|tag| *tag != PROBE_TAG)
+        .map(String::from)
+        .collect()
+}
+
+/// Asserts that `strategy`, sampled with a fixed seed, generates every
+/// variant of its internally tagged wire enum.
+#[track_caller]
+fn assert_covers_every_variant<S>(strategy: S)
+where
+    S: Strategy,
+    S::Value: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let expected = wire_variant_tags::<S::Value>();
+    assert!(
+        !expected.is_empty(),
+        "serde's unknown-variant wording changed; update the parser in wire_variant_tags"
+    );
+
+    let mut runner = TestRunner::deterministic();
+    let generated: BTreeSet<String> = (0..256)
+        .map(|_| {
+            let value = strategy.new_tree(&mut runner).expect("generate").current();
+            let json = serde_json::to_value(&value).expect("serialize");
+            json["type"].as_str().expect("type tag").to_string()
+        })
+        .collect();
+
+    let missing: Vec<&String> = expected.difference(&generated).collect();
+    let unlisted: Vec<&String> = generated.difference(&expected).collect();
+    assert_eq!(
+        generated, expected,
+        "strategy never generates {missing:?} (add an arm for each); \
+         serde doesn't list generated {unlisted:?}"
+    );
+}
+
+#[test]
+fn message_type_strategy_covers_every_variant() {
+    assert_covers_every_variant(arb_message_type());
+}
+
+#[test]
+fn daemon_message_strategy_covers_every_variant() {
+    assert_covers_every_variant(arb_daemon_message());
 }
 
 // ---------------------------------------------------------------------------

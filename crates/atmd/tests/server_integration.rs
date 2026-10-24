@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use atm_core::{AgentType, Harness, LifecycleEvent, Model, SessionDomain, SessionId};
+use atm_core::{AgentType, Harness, LifecycleEvent, Model, SessionDomain, SessionId, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use atmd::registry::spawn_registry;
 use atmd::server::{DaemonServer, MAX_TUI_CLIENTS};
@@ -1268,8 +1268,9 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
 // expected session state. They are the wire-level counterpart to
 // the unit tests in atm-pi-adapter::translate.
 //
-// Synthetic: payloads hand-built with `pi_event_json`. The real pi
-// 0.73.1 capture is atm-pi-adapter's tests/fixtures/pi_tool_run_0.73.1.jsonl.
+// Synthetic: payloads hand-built with `pi_event_json`, except the
+// `test_e2e_pi_captured_*` tests, which replay atm-pi-adapter's real pi
+// 0.73.1 captures (tests/fixtures/*_0.73.1.jsonl) over the socket.
 // ============================================================================
 
 fn pi_event_json(event: &str, payload: serde_json::Value) -> serde_json::Value {
@@ -1593,11 +1594,26 @@ fn captured_pi_frames(fixture: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The registry's only session, which must have a real (not pending) id.
+async fn only_session(registry: &atmd::registry::RegistryHandle) -> SessionView {
+    let mut sessions = registry.get_all_sessions().await;
+    assert_eq!(sessions.len(), 1, "expected one session, got {sessions:?}");
+    let session = sessions.remove(0);
+    assert!(
+        !session.id.is_pending(),
+        "pi-atm's session_id should replace {}",
+        session.id
+    );
+    session
+}
+
 #[tokio::test]
 async fn test_e2e_pi_captured_run_upgrades_pending_session() {
-    // Discovery registers a running pi as `pending-<pid>`. pi-atm's
-    // first frame names the session, and atmd renames that row rather
-    // than adding a second one.
+    // Discovery registers an agent it recognizes as `pending-<pid>`.
+    // pi-atm's first frame names the session, and atmd renames that row
+    // rather than adding a second one. (Discovery can't see pi 0.73.1, see
+    // atm-pi-adapter's Known gaps, so today pi's row starts at that first
+    // frame, as in the new-session test below.)
     let frames = captured_pi_frames("pi_tool_run_0.73.1.jsonl");
     let (last, rest) = frames.split_last().expect("captured frames");
     assert_eq!(last["data"]["event"], "session_shutdown");
@@ -1624,15 +1640,7 @@ async fn test_e2e_pi_captured_run_upgrades_pending_session() {
     }
     sleep(Duration::from_millis(50)).await;
 
-    let sessions = registry.get_all_sessions().await;
-    let [session] = sessions.as_slice() else {
-        panic!("expected one session, got {sessions:?}");
-    };
-    assert!(
-        !session.id.is_pending(),
-        "pi-atm's session_id should replace {}",
-        session.id
-    );
+    let session = only_session(&registry).await;
     assert_eq!(
         Some(session.id.as_str()),
         rest[0]["data"]["session_id"].as_str()
@@ -1641,6 +1649,47 @@ async fn test_e2e_pi_captured_run_upgrades_pending_session() {
     assert!(registry.get_session(pending).await.is_none());
 
     client.send_frame(last).await;
+    sleep(Duration::from_millis(50)).await;
+    assert!(registry.get_all_sessions().await.is_empty());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_pi_captured_new_session_replaces_session() {
+    // `/new` in one pi process: the old pi-atm instance ends its session,
+    // then pi's new instance starts the new one on a second connection.
+    // The pid stays; atmd shows one session at a time, under pi's id.
+    let frames = captured_pi_frames("pi_new_session_0.73.1.jsonl");
+    let [start, end_old, start_new, end] = frames.as_slice() else {
+        panic!("expected 4 frames, got {}", frames.len());
+    };
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+
+    let mut old = server.connect().await;
+    old.handshake(None).await;
+    old.send_frame(start).await;
+    sleep(Duration::from_millis(50)).await;
+    let old_id = only_session(&registry).await.id;
+    assert_eq!(Some(old_id.as_str()), start["data"]["session_id"].as_str());
+
+    old.send_frame(end_old).await;
+    sleep(Duration::from_millis(50)).await;
+    assert!(registry.get_all_sessions().await.is_empty());
+
+    let mut new = server.connect().await;
+    new.handshake(None).await;
+    new.send_frame(start_new).await;
+    sleep(Duration::from_millis(50)).await;
+    let new_id = only_session(&registry).await.id;
+    assert_eq!(
+        Some(new_id.as_str()),
+        start_new["data"]["session_id"].as_str()
+    );
+    assert_ne!(new_id, old_id);
+
+    new.send_frame(end).await;
     sleep(Duration::from_millis(50)).await;
     assert!(registry.get_all_sessions().await.is_empty());
 

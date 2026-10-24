@@ -63,7 +63,9 @@
 //! on `fake-a` (window 128000), and Ctrl+P switched it to `fake-b`
 //! (32000). It covers every event pi-atm forwards except
 //! `session_before_compact`, whose payload the adapter doesn't read. The
-//! `atm_needs_input_*` events are pi-atm's own, not pi's.
+//! `atm_needs_input_*` events are pi-atm's own, not pi's. This pi-atm
+//! (#76's first commit) forwarded `model_select`'s models whole, so the
+//! frames show what pi 0.73.1 itself puts on a Model.
 //!
 //! `tests/fixtures/pi_new_session_0.73.1.jsonl` holds `/new` in one pi
 //! process. Captured: pi 0.73.1, 2026-10-24, set up the same way, with
@@ -74,12 +76,18 @@
 //!
 //! `tests/fixtures/pi_model_select_0.62.0.jsonl` holds a model switch on
 //! an older pi. Captured: pi 0.62.0, 2026-10-24, set up the same way,
-//! with Ctrl+P and no prompt. In every capture the provider sets a probe
-//! header and `authHeader` with a fake key. pi 0.43.0 to 0.62.0 resolve
-//! both onto the Model object (`Authorization: Bearer <apiKey>`), so
-//! `model_select`'s `model` and `previousModel` carry them, and pi-atm
-//! drops `headers` before forwarding. pi 0.63.0 and later keep them off
-//! the Model and resolve them per request.
+//! with Ctrl+P and no prompt, and pi-atm picking `{id, provider,
+//! contextWindow}` from `model_select`'s `model` and `previousModel`.
+//!
+//! In every capture the provider sets a probe header and `authHeader`
+//! with a fake key. pi 0.62.0 resolves both onto the Model object
+//! (`Authorization: Bearer <apiKey>`), and so do 0.43.0, 0.50.0 and
+//! 0.60.0 (read in their `model-registry.js`, not run). pi-atm used to
+//! forward `model_select`'s models whole, headers included; on pi 0.62.0
+//! that sent the key to atmd. pi 0.63.0, the next release, and the later
+//! ones read (0.64.0, 0.65.0, 0.70.0, 0.72.1, 0.73.1) keep models.json and
+//! `registerProvider` headers off the Model and resolve them per request.
+//! Built-in github-copilot models still carry static, non-secret headers.
 //!
 //! The hand-copied JSON payloads in the `wire.rs` and `translate.rs`
 //! tests follow the spike trace. Captured: pi, version not recorded,

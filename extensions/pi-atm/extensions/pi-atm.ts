@@ -311,25 +311,30 @@ function buildEnvelope(
 	};
 }
 
-/** The fields of pi's current model (`ctx.model`) that atmd reads. */
+/** The fields of a pi Model that atmd reads. */
 type ModelSnapshot = { id: string; provider: string; contextWindow: number };
 
 /**
- * Drops `headers` from model_select's `model` and `previousModel`, the only
- * forwarded payload that carries pi's Model. pi 0.43–0.62 resolve a
- * provider's headers onto the Model, including `Authorization: Bearer
- * <apiKey>` with `authHeader`. Copies rather than mutates: pi hands the same
- * objects to every extension.
+ * Picks the fields atmd reads from a pi Model. Never forward a Model whole:
+ * it can carry `headers`, and pi 0.62 and earlier (checked back to 0.43)
+ * resolve auth into them (`Authorization: Bearer <apiKey>` for a provider
+ * with `authHeader`). A field atmd needs later is added here on purpose.
  */
-function withoutModelHeaders(eventName: string, payload: unknown): unknown {
+function pickModel(model: unknown): ModelSnapshot | undefined {
+	if (!model || typeof model !== "object") return undefined;
+	const { id, provider, contextWindow } = model as ModelSnapshot;
+	return { id, provider, contextWindow };
+}
+
+/**
+ * Picks model_select's `model` and `previousModel`; it is the only
+ * forwarded payload that carries a pi Model. Copies rather than mutates:
+ * pi hands the same payload to every extension.
+ */
+function withPickedModels(eventName: string, payload: unknown): unknown {
 	if (eventName !== "model_select" || !payload || typeof payload !== "object") return payload;
-	const strip = (model: unknown): unknown => {
-		if (!model || typeof model !== "object") return model;
-		const { headers: _headers, ...rest } = model as Record<string, unknown>;
-		return rest;
-	};
 	const p = payload as { model?: unknown; previousModel?: unknown };
-	return { ...p, model: strip(p.model), previousModel: strip(p.previousModel) };
+	return { ...p, model: pickModel(p.model), previousModel: pickModel(p.previousModel) };
 }
 
 /**
@@ -419,19 +424,13 @@ export default function (pi: ExtensionAPI): void {
 				// still goes out, with the last id read.
 				const ctxAny = ctx as {
 					sessionManager?: { getSessionId?: () => string };
-					model?: ModelSnapshot;
+					model?: unknown;
 				};
 				cachedSessionId = ctxAny.sessionManager?.getSessionId?.() || cachedSessionId;
 				// Only pi's model_select carries the model, and never at
 				// startup, so each event's frame snapshots it (atmd takes the
-				// context window from it). Pick fields by name: pi's Model can
-				// carry `headers`, which hold auth on some pi versions.
-				const current = ctxAny.model;
-				const model = current && {
-					id: current.id,
-					provider: current.provider,
-					contextWindow: current.contextWindow,
-				};
+				// context window from it).
+				const model = pickModel(ctxAny.model);
 				if (!uiPatched) {
 					// Patch `ctx.ui.select` once, the first time we have a ctx
 					// with `ui` bound. Early events can fire before the runner
@@ -444,7 +443,7 @@ export default function (pi: ExtensionAPI): void {
 				}
 				const envelope = buildEnvelope(
 					eventName,
-					withoutModelHeaders(eventName, payload),
+					withPickedModels(eventName, payload),
 					cachedSessionId,
 					model,
 				);

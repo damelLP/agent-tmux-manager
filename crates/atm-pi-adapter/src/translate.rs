@@ -675,7 +675,8 @@ mod tests {
         assert_eq!(e.to_lifecycle_event(), None);
     }
 
-    /// pi-atm's envelope `model`, as the captures below hold it.
+    /// A model as pi-atm picks it, for the envelope and for model_select,
+    /// with the captures' provider.
     fn model_snapshot(id: &str, context_window: u32) -> Value {
         serde_json::json!({"id": id, "provider": "atmfake", "contextWindow": context_window})
     }
@@ -690,13 +691,15 @@ mod tests {
     }
 
     #[test]
-    fn captured_model_select_forwards_no_headers() {
+    fn captured_model_select_carries_only_picked_model_fields() {
         // Captured: pi 0.62.0, 2026-10-24, set up as for
         // captured_tool_run_translates, with Ctrl+P from fake-a to fake-b
         // and no prompt. The provider sets a probe header and `authHeader`
-        // with a fake key. pi 0.43.0 to 0.62.0 resolve both onto the Model
-        // object, so model_select's `model` and `previousModel` carry
-        // `Authorization: Bearer <apiKey>` unless pi-atm drops `headers`.
+        // with a fake key, which pi 0.62.0 resolves onto the Model object:
+        // pi-atm used to forward model_select's `model` and `previousModel`
+        // whole, `Authorization: Bearer <apiKey>` included. It now picks
+        // the fields atmd reads. This checks the capture; no test runs
+        // pi-atm.ts itself.
         let frames: Vec<Value> = include_str!("../tests/fixtures/pi_model_select_0.62.0.jsonl")
             .lines()
             .map(|line| serde_json::from_str(line).expect("fixture line"))
@@ -709,11 +712,10 @@ mod tests {
             assert!(!has_key(frame, "headers"), "headers in {frame}");
         }
 
-        // The rest of each model still goes through.
         let payload = &select["data"]["payload"];
-        assert_eq!(payload["model"]["id"], "fake-b");
-        assert_eq!(payload["model"]["contextWindow"], 32_000);
-        assert_eq!(payload["previousModel"]["id"], "fake-a");
+        assert_eq!(payload["model"], model_snapshot("fake-b", 32_000));
+        assert_eq!(payload["previousModel"], model_snapshot("fake-a", 128_000));
+        assert_eq!(payload["source"], "cycle");
         let raw: RawPiEvent =
             serde_json::from_value(select["data"].clone()).expect("pi_event data");
         assert_eq!(

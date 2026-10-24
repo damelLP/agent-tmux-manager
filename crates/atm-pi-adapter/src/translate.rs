@@ -657,6 +657,91 @@ mod tests {
         assert_eq!(e.to_lifecycle_event(), None);
     }
 
+    #[test]
+    fn captured_tool_run_translates() {
+        // Captured: pi 0.73.1, 2026-10-24, pi's TUI in a private tmux
+        // server with pi-atm loaded, each frame tapped byte for byte by
+        // `socat -r` on its way to an isolated atmd. A local fake
+        // OpenAI-compatible provider answered (no model call); Ctrl+P
+        // cycled fake-a to fake-b. session_id absent: pi-atm bug, queued.
+        let frames: Vec<Value> = include_str!("../tests/fixtures/pi_tool_run_0.73.1.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture line"))
+            .collect();
+
+        // pi 0.73.1 nests the provider in `model`; there is no top-level
+        // `provider` for the adapter to read (see the crate docs).
+        let model_payload = &frames[1]["data"]["payload"];
+        assert_eq!(model_payload["model"]["provider"], "atmfake");
+        assert_eq!(model_payload.get("provider"), None);
+
+        let events: Vec<Option<LifecycleEvent>> = frames
+            .iter()
+            .map(|frame| {
+                serde_json::from_value::<RawPiEvent>(frame["data"].clone())
+                    .expect("pi_event data")
+                    .to_lifecycle_event()
+            })
+            .collect();
+        let [start, model, input, working, first_context, tool_start, tool_end, context, working_end, end] =
+            events.as_slice()
+        else {
+            panic!("expected 10 frames, got {}", events.len());
+        };
+
+        assert_eq!(
+            start,
+            &Some(LifecycleEvent::SessionStart {
+                source: Some("startup".into())
+            })
+        );
+        assert!(matches!(
+            model,
+            Some(LifecycleEvent::ProviderModelChange { model: Some(id), .. }) if id == "fake-b"
+        ));
+        assert_eq!(
+            input,
+            &Some(LifecycleEvent::PromptSubmit {
+                prompt: Some("Read note.txt and reply.".into())
+            })
+        );
+        assert_eq!(working, &Some(LifecycleEvent::WorkingStart));
+        // The first `context` fires before any reply, so it has no usage.
+        assert_eq!(first_context, &None);
+        assert_eq!(
+            tool_start,
+            &Some(LifecycleEvent::ToolCallStart {
+                name: Tool::from("read"),
+                tool_use_id: Some("call_f3probe".into()),
+                input: Some(serde_json::json!({"path": "note.txt"})),
+            })
+        );
+        assert_eq!(
+            tool_end,
+            &Some(LifecycleEvent::ToolCallEnd {
+                name: Tool::from("read"),
+                tool_use_id: Some("call_f3probe".into()),
+                is_error: false,
+            })
+        );
+        assert_eq!(
+            context,
+            &Some(LifecycleEvent::ContextUpdate {
+                tokens: Some(1020),
+                current_tokens: None,
+                context_window_size: None,
+                cost_usd: Some(0.0033),
+            })
+        );
+        assert_eq!(working_end, &Some(LifecycleEvent::WorkingEnd));
+        assert_eq!(
+            end,
+            &Some(LifecycleEvent::SessionEnd {
+                reason: Some("quit".into())
+            })
+        );
+    }
+
     // ========================================================================
     // FEATURE PARITY: Claude vs pi produce same session-state outcome
     //

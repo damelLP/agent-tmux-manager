@@ -6,12 +6,16 @@
 //! relevant fields. Use [`RawCodexEvent::to_lifecycle_event`] to
 //! convert into a vendor-neutral `LifecycleEvent`.
 //!
-//! Field inventory validated against live codex-cli 0.146.1 traffic
-//! (2026-08-10 spike): common fields are `session_id`,
-//! `hook_event_name`, `cwd`, `transcript_path`, `model`,
-//! `permission_mode`, plus `turn_id` on turn-scoped events. Codex does
-//! **not** send a `pid` — the `atm-codex-hook` script injects `pid`
-//! and `tmux_pane` before forwarding to the daemon.
+//! Field inventory: common fields are `session_id`, `hook_event_name`,
+//! `cwd`, `transcript_path`, `model`, `permission_mode`, plus `turn_id`
+//! on turn-scoped events. Captured: codex-cli 0.146.1, 2026-08-10, the
+//! spike (see the crate docs). Captured: codex-cli 0.163.0, 2026-10-24,
+//! `tests/fixtures/codex_tui_session_0.163.0.jsonl`: the same fields,
+//! except that `SessionEnd` carries neither `model` nor
+//! `permission_mode` and the compaction events carry no
+//! `permission_mode`. Codex does **not** send a `pid` — the
+//! `atm-codex-hook` script injects `pid` and `tmux_pane` before
+//! forwarding to the daemon.
 
 use atm_core::SessionId;
 use serde::Deserialize;
@@ -57,7 +61,8 @@ pub struct RawCodexEvent {
     #[serde(default)]
     pub tool_response: Option<serde_json::Value>,
     /// Present on PreToolUse/PostToolUse; absent on PermissionRequest
-    /// (spike-verified).
+    /// (spike-verified, and in codex-cli 0.163.0). Opaque: 0.146.1 sent
+    /// `exec-<uuid>`, 0.163.0 sends the model's function-call id.
     #[serde(default)]
     pub tool_use_id: Option<String>,
 
@@ -83,7 +88,8 @@ pub struct RawCodexEvent {
     /// SessionStart: `startup` / `resume` / `clear` / `compact`.
     #[serde(default)]
     pub source: Option<String>,
-    /// SessionEnd: observed value `other` (spike); carried verbatim.
+    /// SessionEnd: observed value `other` (spike and codex-cli 0.163.0);
+    /// carried verbatim.
     #[serde(default)]
     pub reason: Option<String>,
 
@@ -109,9 +115,10 @@ impl RawCodexEvent {
 mod tests {
     use super::*;
 
-    // The JSON literals below are trimmed copies of real payloads
-    // captured from codex-cli 0.146.1 during the 2026-08-10 spike
-    // (scratchpad codex-spike/spike-log*.jsonl).
+    // Captured: codex-cli 0.146.1, 2026-08-10, the spike's exec and
+    // interactive tmux sessions, trimmed copies (scratchpad
+    // codex-spike/spike-log*.jsonl, not kept); added in 49f2350 on
+    // 2026-08-16. Applies to the `*_from_spike_capture` tests below.
 
     #[test]
     fn parse_session_start_from_spike_capture() {
@@ -232,7 +239,8 @@ mod tests {
 
     #[test]
     fn parse_with_injected_pid_and_tmux_pane() {
-        // The atm-codex-hook script merges pid + tmux_pane into the
+        // Synthetic: a minimal payload with the fields atm-codex-hook
+        // adds. The atm-codex-hook script merges pid + tmux_pane into the
         // vendor payload before forwarding, mirroring atm-hook.
         let json = r#"{
             "session_id": "s-1",
@@ -247,6 +255,7 @@ mod tests {
 
     #[test]
     fn unknown_event_name_parses_but_has_no_type() {
+        // Synthetic: no codex version has sent this event name.
         let json = r#"{
             "session_id": "s-1",
             "hook_event_name": "SomeFutureEvent"

@@ -4,6 +4,11 @@
 //! format is not a stable hook interface. Keep all knowledge of its
 //! current JSONL shape here, scan only a bounded tail, and treat absent
 //! or changed data as unavailable rather than failing hook processing.
+//!
+//! Captured: codex-cli 0.163.0, 2026-10-24,
+//! `tests/fixtures/codex_rollout_tokens_0.163.0.jsonl` (see the crate
+//! docs). The reader was added in 49f2350 on 2026-08-16 against a codex
+//! version that was not recorded.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -109,6 +114,9 @@ pub fn read_token_usage(path: impl AsRef<Path>) -> io::Result<Option<CodexTokenU
         // Codex emits `info: null` placeholders near the beginning of
         // ordinary turns. Skip them and keep searching for the latest
         // actual measurement instead of falsely resetting usage.
+        // Captured: codex, version and method not recorded; added in
+        // 49f2350 on 2026-08-16. codex-cli 0.163.0 wrote none in 40
+        // records.
         let Some(info) = payload.info else {
             continue;
         };
@@ -170,6 +178,7 @@ mod tests {
 
     #[test]
     fn reads_latest_token_count_while_ignoring_transcript_content() {
+        // Synthetic: hand-written records in the token_count shape.
         let file = transcript(&[
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":80},"model_context_window":200000}}}"#,
             r#"{"type":"response_item","payload":{"type":"message","content":"sensitive prompt"}}"#,
@@ -192,6 +201,8 @@ mod tests {
 
     #[test]
     fn null_info_placeholder_keeps_the_last_valid_usage() {
+        // Synthetic: hand-written records; no capture with a null `info`
+        // was kept.
         let file = transcript(&[
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":80},"model_context_window":200000}}}"#,
             r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
@@ -209,6 +220,7 @@ mod tests {
 
     #[test]
     fn malformed_and_unrelated_records_are_ignored() {
+        // Synthetic: hand-written malformed and unrelated records.
         let file = transcript(&[
             "not-json",
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
@@ -222,6 +234,7 @@ mod tests {
 
     #[test]
     fn non_regular_transcript_path_is_ignored() {
+        // Synthetic: a directory in place of a rollout file.
         let directory = tempfile::tempdir().expect("create transcript directory");
         assert_eq!(
             read_token_usage(directory.path()).expect("inspect transcript path"),
@@ -231,6 +244,8 @@ mod tests {
 
     #[test]
     fn cumulative_only_schema_drift_does_not_replace_context_usage() {
+        // Synthetic: hand-written drift case; no capture has shown a
+        // token_count without last_token_usage.
         let file = transcript(&[
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":80},"model_context_window":200000}}}"#,
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":200},"model_context_window":200000}}}"#,
@@ -245,6 +260,7 @@ mod tests {
 
     #[test]
     fn scan_is_bounded_and_discards_a_partial_first_line() {
+        // Synthetic: an oversized hand-written record.
         let mut file = NamedTempFile::new().expect("create transcript");
         let oversized = "x".repeat(usize::try_from(MAX_TRAILING_BYTES).expect("bounded size"));
         writeln!(file, "{oversized}").expect("write oversized record");
@@ -259,6 +275,7 @@ mod tests {
 
     #[test]
     fn out_of_range_context_window_is_ignored() {
+        // Synthetic: a hand-written out-of-range window.
         let file = transcript(&[
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10},"last_token_usage":{"total_tokens":5},"model_context_window":4294967296}}}"#,
         ]);
@@ -268,5 +285,44 @@ mod tests {
             .expect("token usage");
         assert_eq!(usage.context_window_size, None);
         assert_eq!(usage.current_tokens, Some(5));
+    }
+
+    #[test]
+    fn captured_rollout_usage_over_one_session() {
+        // Captured: codex-cli 0.163.0, 2026-10-24, the rollout of the
+        // codex_tui_session_0.163.0.jsonl run, trimmed to its task,
+        // token_usage_record and token_count records (lines verbatim).
+        // A fake provider supplied the usage numbers.
+        let lines: Vec<&str> = include_str!("../tests/fixtures/codex_rollout_tokens_0.163.0.jsonl")
+            .lines()
+            .collect();
+        let usage_after = |count: usize| {
+            let file = transcript(lines.get(..count).expect("fixture prefix"));
+            read_token_usage(file.path()).expect("read transcript")
+        };
+
+        // While the first tool runs, the reply that asked for it has a
+        // token_usage_record on disk but no token_count yet: codex
+        // writes that after the tool output, so usage lags mid-turn.
+        assert_eq!(usage_after(2), None);
+        // By Stop, both requests of the turn are counted.
+        assert_eq!(
+            usage_after(6),
+            Some(CodexTokenUsage {
+                total_tokens: Some(4552),
+                current_tokens: Some(3277),
+                context_window_size: Some(258_400),
+            })
+        );
+        // After /compact, last_token_usage carries only total_tokens:
+        // codex's own estimate of the compacted history.
+        assert_eq!(
+            usage_after(lines.len()),
+            Some(CodexTokenUsage {
+                total_tokens: Some(8830),
+                current_tokens: Some(7305),
+                context_window_size: Some(258_400),
+            })
+        );
     }
 }

@@ -1765,10 +1765,14 @@ async fn test_e2e_pi_captured_session_cost_is_cumulative() {
 // ============================================================================
 // Codex Event → LifecycleEvent translation (end-to-end)
 //
-// Symmetric with the Claude and pi blocks above: drives real Codex raw
+// Symmetric with the Claude and pi blocks above: drives Codex raw
 // hook JSON (shapes captured from codex-cli 0.146.1 during the
 // 2026-08-10 spike) over the wire via `ClientMessage::codex_event` and
 // asserts on the resulting session state.
+//
+// Synthetic: payloads hand-built with `codex_event_json` in the spike's
+// shapes. The real codex-cli 0.163.0 capture is atm-codex-adapter's
+// tests/fixtures/codex_tui_session_0.163.0.jsonl.
 // ============================================================================
 
 /// Builds a raw Codex hook-event JSON payload for the given session.
@@ -1825,6 +1829,8 @@ async fn test_e2e_codex_event_applies_transcript_token_usage() {
     let mut client = server.connect().await;
     client.handshake(None).await;
 
+    // Synthetic: a hand-written token_count record; the origin of its
+    // numbers was not recorded (added in 49f2350 on 2026-08-16).
     let transcript_dir = tempfile::tempdir().expect("create transcript directory");
     let transcript_path = transcript_dir.path().join("rollout.jsonl");
     std::fs::write(

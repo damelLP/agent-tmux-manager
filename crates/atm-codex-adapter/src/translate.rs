@@ -5,7 +5,12 @@
 //! types. The daemon calls this at the connection boundary and
 //! everything downstream sees only `LifecycleEvent`.
 //!
-//! ## Mapping table (validated against codex-cli 0.146.1, 2026-08-10 spike)
+//! ## Mapping table
+//!
+//! Captured: codex-cli 0.146.1, 2026-08-10, the spike, for the 7 events
+//! it saw. Captured: codex-cli 0.163.0, 2026-10-24, every row but the
+//! subagent ones, in `captured_tui_session_translates`. No capture has
+//! produced `SubagentStart` or `SubagentStop`.
 //!
 //! | Codex event         | LifecycleEvent                                  |
 //! |---------------------|-------------------------------------------------|
@@ -172,7 +177,8 @@ mod tests {
     fn pre_tool_use_unknown_tool_lands_in_other() {
         // Codex tool names outside the shared canonical set (e.g. its
         // snake_case "apply_patch", observed in the spike) ride
-        // Tool::Other verbatim.
+        // Tool::Other verbatim. Captured: codex-cli 0.146.1, 2026-08-10,
+        // the spike (the tool name only).
         let mut e = raw("PreToolUse");
         e.tool_name = Some("apply_patch".into());
         match e.to_lifecycle_event() {
@@ -208,7 +214,9 @@ mod tests {
     fn post_tool_use_is_never_an_error() {
         // Codex has no PostToolUseFailure and no error marker in
         // tool_response (spike-verified) — is_error must stay false
-        // even when the response text looks like a failure.
+        // even when the response text looks like a failure. Captured:
+        // codex-cli 0.146.1, 2026-08-10, the spike's failing call (the
+        // response text).
         let mut e = raw("PostToolUse");
         e.tool_name = Some("Bash".into());
         e.tool_use_id = Some("exec-41774dae".into());
@@ -275,6 +283,7 @@ mod tests {
 
     #[test]
     fn subagent_to_child_session() {
+        // Synthetic: no capture has produced a subagent event.
         let mut start = raw("SubagentStart");
         start.agent_id = Some("a-1".into());
         start.agent_type = Some("explore".into());
@@ -347,6 +356,112 @@ mod tests {
     fn unknown_event_returns_none() {
         assert_eq!(raw("NotARealEvent").to_lifecycle_event(), None);
     }
+
+    #[test]
+    fn captured_tui_session_translates() {
+        // Captured: codex-cli 0.163.0, 2026-10-24, codex's TUI in its
+        // default shared-daemon mode, each hook's stdin logged by a hook
+        // registered for all 11 events, paths rewritten (see the crate
+        // docs). A local fake provider answered (no model call).
+        let raws: Vec<RawCodexEvent> =
+            include_str!("../tests/fixtures/codex_tui_session_0.163.0.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("fixture line"))
+                .collect();
+
+        // Codex sends neither pid nor pane: atm-codex-hook adds both.
+        for raw in &raws {
+            assert_eq!(raw.pid, None);
+            assert_eq!(raw.tmux_pane, None);
+            assert!(raw.transcript_path.is_some());
+        }
+
+        let events: Vec<Option<LifecycleEvent>> =
+            raws.iter().map(RawCodexEvent::to_lifecycle_event).collect();
+        let [start, prompt, tool_start, permission, tool_end, stop, pre_compact, post_compact, end] =
+            events.as_slice()
+        else {
+            panic!("expected 9 hook payloads, got {}", events.len());
+        };
+
+        assert_eq!(
+            start,
+            &Some(LifecycleEvent::SessionStart {
+                source: Some("startup".into())
+            })
+        );
+        assert_eq!(
+            prompt,
+            &Some(LifecycleEvent::PromptSubmit {
+                prompt: Some("Create atm-probe.txt.".into())
+            })
+        );
+        // Codex names its exec_command tool `Bash` in hook payloads, and
+        // tool_use_id is the model's function-call id.
+        assert_eq!(
+            tool_start,
+            &Some(LifecycleEvent::ToolCallStart {
+                name: Tool::Bash,
+                tool_use_id: Some("call_fake_1".into()),
+                input: Some(serde_json::json!({"command": "touch atm-probe.txt"})),
+            })
+        );
+        // PreToolUse comes before PermissionRequest, which still carries
+        // no tool_use_id.
+        assert_eq!(raws.get(3).and_then(|raw| raw.tool_use_id.clone()), None);
+        assert_eq!(
+            permission,
+            &Some(LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
+            })
+        );
+        // tool_response is a plain string (empty for `touch`).
+        assert_eq!(
+            raws.get(4).and_then(|raw| raw.tool_response.clone()),
+            Some(serde_json::Value::String(String::new()))
+        );
+        assert_eq!(
+            tool_end,
+            &Some(LifecycleEvent::ToolCallEnd {
+                name: Tool::Bash,
+                tool_use_id: Some("call_fake_1".into()),
+                is_error: false,
+            })
+        );
+        assert_eq!(stop, &Some(LifecycleEvent::WorkingEnd));
+        assert_eq!(
+            pre_compact,
+            &Some(LifecycleEvent::ContextCompactStart {
+                trigger: Some("manual".into())
+            })
+        );
+        assert_eq!(
+            post_compact,
+            &Some(LifecycleEvent::Notification {
+                message: None,
+                kind: Some(NotificationKind::Other("post_compact".into())),
+            })
+        );
+        // Fired when the shared daemon stopped, not at `/quit`.
+        assert_eq!(
+            end,
+            &Some(LifecycleEvent::SessionEnd {
+                reason: Some("other".into())
+            })
+        );
+
+        // Session-scoped events carry no turn_id, and SessionEnd no model.
+        for (index, raw) in raws.iter().enumerate() {
+            let session_scoped = matches!(
+                raw.event_type(),
+                Some(CodexEventType::SessionStart | CodexEventType::SessionEnd)
+            );
+            assert_eq!(raw.turn_id.is_none(), session_scoped, "payload {index}");
+            let model = (raw.event_type() != Some(CodexEventType::SessionEnd))
+                .then(|| "fake-model".to_string());
+            assert_eq!(raw.model, model, "payload {index}");
+        }
+    }
 }
 
 /// FEATURE PARITY with the Claude adapter.
@@ -356,6 +471,8 @@ mod tests {
 /// equivalent wire payloads through both adapters and compare the
 /// resulting `LifecycleEvent`s — including one *intentional*
 /// divergence that must not be "fixed" into false consistency.
+///
+/// Synthetic: minimal payloads hand-written for both vendors.
 #[cfg(test)]
 mod parity_tests {
     use super::*;

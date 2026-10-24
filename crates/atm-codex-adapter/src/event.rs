@@ -26,8 +26,13 @@ const HOOK_EVENT_VARIANTS: &[(CodexEventType, &str)] = &[
 
 /// Types of hook events from the Codex CLI.
 ///
-/// All 11 Codex hook events, per the official hooks documentation and
-/// validated against live codex-cli 0.146.1 traffic. Unlike Claude,
+/// All 11 Codex hook events, per the official hooks documentation.
+/// Captured: codex-cli 0.146.1, 2026-08-10, the spike: 7 of them
+/// (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+/// `PermissionRequest`, `PostToolUse`, `Stop`, `SessionEnd`). Captured:
+/// codex-cli 0.163.0, 2026-10-24: those 7 plus `PreCompact` and
+/// `PostCompact`. `SubagentStart` and `SubagentStop` have never been
+/// captured. Unlike Claude,
 /// Codex has no `PostToolUseFailure`, `Setup`, or `Notification`
 /// events; it adds `PermissionRequest` and `PostCompact` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

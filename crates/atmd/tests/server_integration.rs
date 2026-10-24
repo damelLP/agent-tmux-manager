@@ -1676,17 +1676,19 @@ async fn test_e2e_pi_captured_run_upgrades_pending_session() {
     assert!(registry.get_session(pending).await.is_none());
 
     // The context window comes from pi-atm's model snapshot (fake-b's
-    // 32000), not the unknown model's 200K default.
+    // 32000), not the unknown model's 200K default. Wait for the final
+    // display: the first `context` frame already shows `0.0% (0/32K)`.
+    let expected = "3.2% (1.0K/32K)";
     let sessions = sessions_when(
         &registry,
-        |s| matches!(s, [one] if one.context_display.ends_with("/32K)")),
+        |s| matches!(s, [one] if one.context_display == expected),
     )
     .await;
     let displays: Vec<&str> = sessions
         .iter()
         .map(|s| s.context_display.as_str())
         .collect();
-    assert_eq!(displays, ["3.2% (1.0K/32K)"]);
+    assert_eq!(displays, [expected]);
 
     client.send(ClientMessage::pi_event(last.clone())).await;
     assert_no_sessions(&registry).await;

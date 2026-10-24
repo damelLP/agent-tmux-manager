@@ -196,7 +196,7 @@ impl RawHookEvent {
             ClaudeEventType::UserPromptSubmit => LifecycleEvent::PromptSubmit {
                 prompt: self.prompt.clone(),
             },
-            ClaudeEventType::Stop => LifecycleEvent::WorkingEnd,
+            ClaudeEventType::Stop | ClaudeEventType::StopFailure => LifecycleEvent::WorkingEnd,
             ClaudeEventType::SubagentStart => LifecycleEvent::ChildSessionStart {
                 id: self.agent_id.clone(),
                 role: self.agent_type.clone(),
@@ -617,6 +617,30 @@ mod tests {
                 .count()
         };
         assert_eq!((count("SubagentStart"), count("SubagentStop")), (1, 2));
+    }
+
+    #[test]
+    fn captured_stop_failure_2_1_310_ends_the_turn() {
+        // Captured: Claude Code 2.1.310, 2026-10-25 (see the crate docs).
+        // Three turns ended by API errors: each sent StopFailure, never
+        // Stop, and the turn must end there.
+        let events = captured(include_str!(
+            "../tests/fixtures/claude_stop_failure_2.1.310.jsonl"
+        ));
+        assert!(events
+            .iter()
+            .all(|event| event.to_lifecycle_event().is_some()));
+        assert!(events.iter().all(|event| event.hook_event_name != "Stop"));
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|event| event.hook_event_name == "StopFailure")
+            .collect();
+        assert_eq!(failures.len(), 3);
+        for event in failures {
+            assert_eq!(event.to_lifecycle_event(), Some(LifecycleEvent::WorkingEnd));
+            assert_eq!(event.child_agent(), None);
+            assert_eq!(event.background_activity(), None);
+        }
     }
 
     #[test]

@@ -1421,6 +1421,63 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn test_e2e_claude_captured_stop_failure_replay() {
+    // Captured: Claude Code 2.1.310, 2026-10-25, three TUI turns ended by
+    // API errors (see atm-claude-adapter's crate docs). Claude sends
+    // StopFailure instead of Stop, then idle_prompt 60 s later, so the
+    // row must go idle at StopFailure rather than stay working until then.
+    let fixture = "claude_stop_failure_2.1.310.jsonl";
+    let Some(events) = captured_hook_payloads("atm-claude-adapter", fixture) else {
+        return;
+    };
+    let sessions: Vec<_> = events.chunks(5).collect();
+    assert_eq!(sessions.len(), 3, "{fixture}");
+    for session in sessions {
+        let names: Vec<_> = session
+            .iter()
+            .map(|event| event["hook_event_name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "SessionStart",
+                "UserPromptSubmit",
+                "StopFailure",
+                "Notification",
+                "SessionEnd"
+            ]
+        );
+
+        let (server, registry) = TestServer::spawn_with_registry().await;
+        let mut client = server.connect().await;
+        client.handshake(None).await;
+        let mut seen = Vec::new();
+        for (seq, event) in (1..).zip(session) {
+            send_applied(&mut client, seq, ClientMessage::hook_event(event.clone())).await;
+            let states: Vec<_> = registry
+                .get_all_sessions()
+                .await
+                .into_iter()
+                .map(|s| (s.status_label, s.activity_detail))
+                .collect();
+            seen.push(states);
+        }
+        // SessionStart, UserPromptSubmit, StopFailure, idle_prompt, then
+        // the SessionEnd from tearing the capture down, which removes it.
+        let state = |label: &str| vec![(label.to_string(), None)];
+        let expected = [
+            state("idle"),
+            state("working"),
+            state("idle"),
+            state("idle"),
+            vec![],
+        ];
+        assert_eq!(seen, expected, "session {}", session[0]["session_id"]);
+        server.shutdown().await;
+    }
+}
+
 // ============================================================================
 // Pi Event → LifecycleEvent translation (end-to-end, wire-level)
 //
@@ -2246,7 +2303,16 @@ async fn test_e2e_codex_malformed_tool_event_is_suppressed() {
 /// `None` outside the workspace: atmd's tests ship in its crates.io
 /// package without the adapter's fixtures, so the caller skips.
 fn captured_codex_events(fixture: &str) -> Option<Vec<serde_json::Value>> {
-    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../atm-codex-adapter");
+    captured_hook_payloads("atm-codex-adapter", fixture)
+}
+
+/// The hook payloads in `fixture`, one per line in the `adapter` crate's
+/// `tests/fixtures`, each given this test's pid as the hook script would
+/// add one. `None` outside the workspace, as for [`captured_codex_events`].
+fn captured_hook_payloads(adapter: &str, fixture: &str) -> Option<Vec<serde_json::Value>> {
+    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(adapter);
     if !adapter.join("Cargo.toml").exists() {
         eprintln!("skipped: no {} outside the workspace", adapter.display());
         return None;

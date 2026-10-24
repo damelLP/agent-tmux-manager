@@ -17,6 +17,7 @@ const HOOK_EVENT_VARIANTS: &[(ClaudeEventType, &str)] = &[
     (ClaudeEventType::PostToolUseFailure, "PostToolUseFailure"),
     (ClaudeEventType::UserPromptSubmit, "UserPromptSubmit"),
     (ClaudeEventType::Stop, "Stop"),
+    (ClaudeEventType::StopFailure, "StopFailure"),
     (ClaudeEventType::SubagentStart, "SubagentStart"),
     (ClaudeEventType::SubagentStop, "SubagentStop"),
     (ClaudeEventType::SessionStart, "SessionStart"),
@@ -49,6 +50,8 @@ pub enum ClaudeEventType {
     UserPromptSubmit,
     /// Claude stopped responding (finished turn)
     Stop,
+    /// The turn ended on an API error; sent instead of `Stop`.
+    StopFailure,
 
     // === Subagent Lifecycle ===
     /// A subagent was spawned
@@ -120,6 +123,7 @@ impl ClaudeEventType {
                 | Self::PostToolUseFailure
                 | Self::SessionEnd
                 | Self::Stop
+                | Self::StopFailure
                 | Self::SubagentStop
         )
     }
@@ -195,6 +199,10 @@ mod tests {
             ClaudeEventType::from_event_name("Stop"),
             Some(ClaudeEventType::Stop)
         );
+        assert_eq!(
+            ClaudeEventType::from_event_name("StopFailure"),
+            Some(ClaudeEventType::StopFailure)
+        );
 
         // Subagent events
         assert_eq!(
@@ -247,6 +255,7 @@ mod tests {
         assert!(ClaudeEventType::PostToolUseFailure.is_post_event());
         assert!(ClaudeEventType::SessionEnd.is_post_event());
         assert!(ClaudeEventType::Stop.is_post_event());
+        assert!(ClaudeEventType::StopFailure.is_post_event());
         assert!(ClaudeEventType::SubagentStop.is_post_event());
     }
 }

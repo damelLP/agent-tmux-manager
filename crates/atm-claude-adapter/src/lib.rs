@@ -8,7 +8,7 @@
 //!
 //! ## Layers
 //!
-//! - [`event`] — `ClaudeEventType` enum (the 16 Claude hook event names
+//! - [`event`] — `ClaudeEventType` enum (the 17 Claude hook event names
 //!   ATM registers)
 //! - [`wire`] — `RawHookEvent` struct (deserialized JSON Claude sends
 //!   on stdin to the hook script)
@@ -96,6 +96,18 @@
 //! 2026-10-03, whose message calls it a scrubbed capture of a real
 //! subagent run.
 //!
+//! `tests/fixtures/claude_stop_failure_2.1.310.jsonl` holds three TUI
+//! sessions whose one turn ended on an API error, five hooks each:
+//! `SessionStart`, `UserPromptSubmit`, `StopFailure`, `Notification`
+//! (`idle_prompt`), and a `SessionEnd` (reason `other`) from tearing the
+//! capture down. Captured: Claude Code 2.1.310, 2026-10-25, by the
+//! method above but left in auto mode (`permission_mode: "auto"`), with
+//! the fake Messages API failing each turn: a 500
+//! (`error: "server_error"`), a 429 (`rate_limit`), and a stream cut
+//! after its first text delta (`unknown`). Paths were rewritten as
+//! above. The fake API's `127.0.0.1` port in `last_assistant_message` is
+//! verbatim.
+//!
 //! The JSON payloads in the `wire.rs` tests are hand-written (see
 //! `Synthetic:` there). Tests that build `RawHookEvent` structs check
 //! mapping logic and claim no capture. Claude-shaped JSON in other
@@ -105,6 +117,47 @@
 //! `tests/registry_integration.rs`, `tests/robustness_tests.rs`,
 //! `tests/server_integration.rs`) and in the root
 //! `tests/e2e_with_tmux.rs`.
+//!
+//! ## API errors (captured 2026-10-25)
+//!
+//! A turn that ends on an API error sends `StopFailure` instead of
+//! `Stop`, and ATM ends the turn on it. A status line follows about
+//! 310 ms later and `Notification` (`idle_prompt`) 60 s later, as after
+//! `Stop`. Sealed TUI runs on Claude Code 2.1.310 against a fake
+//! Messages API, counting the turn's own requests:
+//!
+//! | Fake API reply | Requests | `StopFailure` after | `error` |
+//! |---|---|---|---|
+//! | 500 `api_error` | 11 | 178 s | `server_error` |
+//! | 529 `overloaded_error` | 3 | 1.9 s | `server_error` |
+//! | 400 `invalid_request_error` | 6, within 0.2 s | 0.35 s | `unknown` |
+//! | 429 `rate_limit_error` | 11 | 173 s | `rate_limit` |
+//! | Connection cut mid-stream | 2, then 1 without streaming | 3.7 s | `unknown` |
+//! | SSE `error` event mid-stream | 1, then 1 without streaming | 2.1 s | `unknown` |
+//!
+//! A 500 followed by a good reply ended with `Stop`. While Claude retries
+//! the row reads working, which matches the TUI's "Retrying in …" line.
+//! The payload carries `error` and `last_assistant_message` (the error
+//! text the TUI shows), and never had the schema's optional
+//! `error_details`.
+//!
+//! - Unlike `Stop`, `StopFailure` lists no `background_tasks` or
+//!   `session_crons` (neither its schema nor the captures has them). So
+//!   after a failed turn the parent shows no "N running" summary, and
+//!   children left working are not swept until a later quiet `Stop`.
+//! - In `claude -p` (9 runs, each a 400), `StopFailure`'s hook started
+//!   about 115 ms before `SessionEnd`'s, and no row was left after the
+//!   process exited. Claude doesn't await the hook, so the order is
+//!   observed, not guaranteed.
+//! - Read from the binary, not run: the hook's `error` values also
+//!   include `overloaded`, `authentication_failed`, `billing_error`,
+//!   `max_output_tokens` and others. A subagent's API error sends no
+//!   `StopFailure`. Claude also sends it for turns that end without an
+//!   API error: a prompt too long, a tool call or reply still malformed
+//!   or empty after a retry, and auto-compact thrashing.
+//! - Not checked: a `StopFailure` after which Claude goes on working,
+//!   such as a quota auto-resume after `rate_limit`. The row would read
+//!   idle until the next hook.
 //!
 //! ## Known gaps (Claude Code 2.1.310)
 //!
@@ -170,17 +223,42 @@
 //!   renames that row to the new id. After `/exit`, atmd's dead-process
 //!   cleanup removes it about 1 s later, logging "process died without
 //!   a session-end signal" although one arrived.
-//! - **ATM registers 16 of the 33 hook events that 2.1.310 declares**
-//!   (read from the event list in its binary, not run). The others are
-//!   `PostToolBatch`, `UserPromptExpansion`, `StopFailure`,
-//!   `PostCompact`, `PreModelSwitch`, `PostModelSwitch`,
-//!   `PermissionDenied`, `Elicitation`, `ElicitationResult`,
-//!   `ConfigChange`, `WorktreeCreate`, `WorktreeRemove`,
-//!   `InstructionsLoaded`, `CwdChanged`, `FileChanged`, `DirectoryAdded`
-//!   and `MessageDisplay`. Those that could change a row's state:
-//!   `StopFailure` (a turn that ends in an API error fires no `Stop`, so
-//!   the row may stay Working; unverified), `PostCompact`,
-//!   `PermissionDenied`, and the model-switch pair.
+//! - **A user's interrupt fires no hook.** In sealed TUI runs, pressing
+//!   Esc while Claude streamed a reply, and denying a permission dialog
+//!   in manual mode (Esc or "No"), sent no hook at all: no `Stop`, no
+//!   `PostToolUseFailure`, no `PermissionDenied`, and no `idle_prompt`
+//!   within 75 s. Only a status line came, within about 0.3 s, and status
+//!   lines leave a row's status alone (see above). So the row stays
+//!   working, or needs input after a denied dialog, until the next
+//!   prompt. A fix needs a signal Claude doesn't send today. An Esc
+//!   while a tool runs was not tried (`PostToolUseFailure` has an
+//!   `is_interrupt` field).
+//! - **ATM registers 17 of the 33 hook events that 2.1.310 declares**
+//!   (read from the event list in its binary). The others are
+//!   `PostToolBatch`, `UserPromptExpansion`, `PostCompact`,
+//!   `PreModelSwitch`, `PostModelSwitch`, `PermissionDenied`,
+//!   `Elicitation`, `ElicitationResult`, `ConfigChange`,
+//!   `WorktreeCreate`, `WorktreeRemove`, `InstructionsLoaded`,
+//!   `CwdChanged`, `FileChanged`, `DirectoryAdded` and `MessageDisplay`.
+//!   Per Claude's changelog (not run), `StopFailure` arrived in 2.1.78
+//!   and `TaskCreated` in 2.1.84, and before 2.1.101 an unknown hook
+//!   name made Claude ignore the whole settings.json. So ATM's hooks need
+//!   Claude Code 2.1.84 or later, as they did before `StopFailure`.
+//!   Those that looked as if they could change a row's state were
+//!   captured on 2026-10-25 and left unregistered:
+//!   - `PermissionDenied` fires only when the auto-mode classifier
+//!     denies a tool call, not when the user denies a dialog. The run
+//!     sent `PreToolUse`, `PermissionDenied`, no `PostToolUse*`, then
+//!     the model's next reply and its `Stop`. The row stays working and
+//!     shows the denied tool until the next hook.
+//!   - A session-only model switch (the `meta+p` picker, then `s`)
+//!     fires `PreModelSwitch` and `PostModelSwitch` (source `picker`).
+//!     The status line about 300 ms later carries the new model, which
+//!     updates the row.
+//!   - After `/compact`, `PostCompact` (trigger `manual`) comes 23 ms
+//!     after `SessionStart` (source `compact`) has set the row idle, so
+//!     it would add nothing. It also carries `compact_summary`, the
+//!     conversation summary, which atm-hook would send to atmd.
 //! - **`PermissionRequest` comes about 6 s before `Notification`
 //!   (`permission_prompt`) for the same dialog.** Both map to needs
 //!   input. The `Notification` carries no tool, so the row's label

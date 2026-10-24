@@ -604,7 +604,7 @@ impl ConnectionHandler {
     /// [`Self::handle_pi_event`] — parses raw codex-shaped JSON via
     /// `atm-codex-adapter`, translates into a vendor-neutral
     /// `LifecycleEvent`, and forwards to the registry. Codex always
-    /// sends a `session_id` (like Claude, unlike pi), so no
+    /// sends a `session_id` (like Claude), so no
     /// pending-from-pid fallback is needed here.
     async fn handle_codex_event(&mut self, data: serde_json::Value) -> Result<(), ConnectionError> {
         debug!(client_id = ?self.client_id, "Received codex event data");

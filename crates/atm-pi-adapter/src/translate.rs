@@ -691,12 +691,14 @@ mod tests {
             .iter()
             .map(|frame| serde_json::from_value(frame["data"].clone()).expect("pi_event data"))
             .collect();
-        // pi-atm's envelope: pid and tmux_pane on every frame, which is
-        // how atmd keys the session. session_id absent: pi-atm bug, queued.
+        // pi-atm's envelope: pid, tmux_pane and pi's session id on every
+        // frame. atmd keys the session by pid and names it by session_id.
+        let session_id = raws.first().and_then(|raw| raw.session_id.clone());
+        assert!(session_id.is_some(), "pi-atm sends pi's session id");
         for raw in &raws {
             assert_eq!(raw.pid, Some(1_187_873));
             assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
-            assert_eq!(raw.session_id, None);
+            assert_eq!(raw.session_id, session_id);
         }
 
         let events: Vec<Option<LifecycleEvent>> =

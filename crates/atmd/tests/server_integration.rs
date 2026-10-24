@@ -143,6 +143,13 @@ impl TestClient {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// Sends one raw wire frame, as a harness extension writes it.
+    async fn send_frame(&mut self, frame: &serde_json::Value) {
+        let line = format!("{frame}\n");
+        self.writer.write_all(line.as_bytes()).await.unwrap();
+        self.writer.flush().await.unwrap();
+    }
+
     /// Performs handshake with optional client ID.
     async fn handshake(&mut self, client_id: Option<String>) -> String {
         self.send(ClientMessage::connect(client_id)).await;
@@ -1561,6 +1568,81 @@ async fn test_e2e_pi_suppressed_event_does_not_panic_or_disrupt() {
         .await
         .expect("still exists");
     assert_eq!(before.status_label, after.status_label);
+
+    server.shutdown().await;
+}
+
+/// Reads one of atm-pi-adapter's captured pi 0.73.1 fixtures: whole
+/// frames as pi-atm sent them to atmd, one per line.
+///
+/// Each frame's pid becomes this test's own pid. The captured pi has
+/// exited, and the registry's cleanup sweep drops sessions whose pid is
+/// dead.
+fn captured_pi_frames(fixture: &str) -> Vec<serde_json::Value> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../atm-pi-adapter/tests/fixtures")
+        .join(fixture);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    text.lines()
+        .map(|line| {
+            let mut frame: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+            frame["data"]["pid"] = std::process::id().into();
+            frame
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_e2e_pi_captured_run_upgrades_pending_session() {
+    // Discovery registers a running pi as `pending-<pid>`. pi-atm's
+    // first frame names the session, and atmd renames that row rather
+    // than adding a second one.
+    let frames = captured_pi_frames("pi_tool_run_0.73.1.jsonl");
+    let (last, rest) = frames.split_last().expect("captured frames");
+    assert_eq!(last["data"]["event"], "session_shutdown");
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+
+    let pid = std::process::id();
+    let pending = SessionId::pending_from_pid(pid);
+    registry
+        .register_discovered(
+            pending.clone(),
+            pid,
+            std::env::temp_dir(),
+            None,
+            Harness::Pi,
+        )
+        .await
+        .expect("register discovered session");
+
+    for frame in rest {
+        client.send_frame(frame).await;
+    }
+    sleep(Duration::from_millis(50)).await;
+
+    let sessions = registry.get_all_sessions().await;
+    let [session] = sessions.as_slice() else {
+        panic!("expected one session, got {sessions:?}");
+    };
+    assert!(
+        !session.id.is_pending(),
+        "pi-atm's session_id should replace {}",
+        session.id
+    );
+    assert_eq!(
+        Some(session.id.as_str()),
+        rest[0]["data"]["session_id"].as_str()
+    );
+    assert_eq!(session.harness, "pi");
+    assert!(registry.get_session(pending).await.is_none());
+
+    client.send_frame(last).await;
+    sleep(Duration::from_millis(50)).await;
+    assert!(registry.get_all_sessions().await.is_empty());
 
     server.shutdown().await;
 }

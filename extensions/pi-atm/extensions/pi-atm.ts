@@ -295,14 +295,46 @@ function send(envelope: unknown): void {
  * payload. The shape matches `atm_pi_adapter::wire::RawPiEvent` so the
  * daemon-side `serde_json::from_value::<RawPiEvent>(data)` succeeds.
  */
-function buildEnvelope(eventName: string, payload: unknown, sessionId: string | undefined): unknown {
+function buildEnvelope(
+	eventName: string,
+	payload: unknown,
+	sessionId: string | undefined,
+	model?: ModelSnapshot,
+): unknown {
 	return {
 		event: eventName,
 		payload,
 		session_id: sessionId,
 		pid: process.pid,
 		tmux_pane: process.env.TMUX_PANE,
+		model,
 	};
+}
+
+/** The fields of a pi Model that atmd reads. */
+type ModelSnapshot = { id: string; provider: string; contextWindow: number };
+
+/**
+ * Picks the fields atmd reads from a pi Model. Never forward a Model whole:
+ * it can carry `headers`, and pi 0.62 and earlier (checked back to 0.43)
+ * resolve auth into them (`Authorization: Bearer <apiKey>` for a provider
+ * with `authHeader`). A field atmd needs later is added here on purpose.
+ */
+function pickModel(model: unknown): ModelSnapshot | undefined {
+	if (!model || typeof model !== "object") return undefined;
+	const { id, provider, contextWindow } = model as ModelSnapshot;
+	return { id, provider, contextWindow };
+}
+
+/**
+ * Picks model_select's `model` and `previousModel`; it is the only
+ * forwarded payload that carries a pi Model. Copies rather than mutates:
+ * pi hands the same payload to every extension.
+ */
+function withPickedModels(eventName: string, payload: unknown): unknown {
+	if (eventName !== "model_select" || !payload || typeof payload !== "object") return payload;
+	const p = payload as { model?: unknown; previousModel?: unknown };
+	return { ...p, model: pickModel(p.model), previousModel: pickModel(p.previousModel) };
 }
 
 /**
@@ -390,8 +422,15 @@ export default function (pi: ExtensionAPI): void {
 				logDebug(`event fired: ${eventName}`);
 				// Duck-typed guard: if ctx lacks `getSessionId`, the event
 				// still goes out, with the last id read.
-				const ctxAny = ctx as { sessionManager?: { getSessionId?: () => string } };
+				const ctxAny = ctx as {
+					sessionManager?: { getSessionId?: () => string };
+					model?: unknown;
+				};
 				cachedSessionId = ctxAny.sessionManager?.getSessionId?.() || cachedSessionId;
+				// Only pi's model_select carries the model, and never at
+				// startup, so each event's frame snapshots it (atmd takes the
+				// context window from it).
+				const model = pickModel(ctxAny.model);
 				if (!uiPatched) {
 					// Patch `ctx.ui.select` once, the first time we have a ctx
 					// with `ui` bound. Early events can fire before the runner
@@ -402,7 +441,12 @@ export default function (pi: ExtensionAPI): void {
 					// even if patching ran before the id was discovered.
 					uiPatched = patchUiSelectOnce(ctx, () => cachedSessionId);
 				}
-				const envelope = buildEnvelope(eventName, payload, cachedSessionId);
+				const envelope = buildEnvelope(
+					eventName,
+					withPickedModels(eventName, payload),
+					cachedSessionId,
+					model,
+				);
 				// Fire-and-forget: `send()` is synchronous and returns
 				// `void` — it either writes to the live socket, queues
 				// onto the bounded outbox, or drops on the floor when a

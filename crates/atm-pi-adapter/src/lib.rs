@@ -59,10 +59,13 @@
 //! the frames pi-atm sent atmd. Captured: pi 0.73.1, 2026-10-24, pi's
 //! TUI in a private tmux server with pi-atm installed by `atm setup`,
 //! frames tapped by `socat -r` on the way to an isolated atmd, answered
-//! by a local fake OpenAI-compatible provider (no model call). It covers
-//! every event pi-atm forwards except `session_before_compact`, whose
-//! payload the adapter doesn't read. The `atm_needs_input_*` events are
-//! pi-atm's own, not pi's.
+//! by a local fake OpenAI-compatible provider (no model call). pi started
+//! on `fake-a` (window 128000), and Ctrl+P switched it to `fake-b`
+//! (32000). It covers every event pi-atm forwards except
+//! `session_before_compact`, whose payload the adapter doesn't read. The
+//! `atm_needs_input_*` events are pi-atm's own, not pi's. This pi-atm
+//! (#76's first commit) forwarded `model_select`'s models whole, so the
+//! frames show what pi 0.73.1 itself puts on a Model.
 //!
 //! `tests/fixtures/pi_new_session_0.73.1.jsonl` holds `/new` in one pi
 //! process. Captured: pi 0.73.1, 2026-10-24, set up the same way, with
@@ -70,6 +73,21 @@
 //! for each session, so the old pi-atm instance sent `session_start` and
 //! `session_shutdown` (reason `new`) on one connection, and the new
 //! instance sent the new session's frames on a second one.
+//!
+//! `tests/fixtures/pi_model_select_0.62.0.jsonl` holds a model switch on
+//! an older pi. Captured: pi 0.62.0, 2026-10-24, set up the same way,
+//! with Ctrl+P and no prompt, and pi-atm picking `{id, provider,
+//! contextWindow}` from `model_select`'s `model` and `previousModel`.
+//!
+//! In every capture the provider sets a probe header and `authHeader`
+//! with a fake key. pi 0.62.0 resolves both onto the Model object
+//! (`Authorization: Bearer <apiKey>`), and so do 0.43.0, 0.50.0 and
+//! 0.60.0 (read in their `model-registry.js`, not run). pi-atm used to
+//! forward `model_select`'s models whole, headers included; on pi 0.62.0
+//! that sent the key to atmd. pi 0.63.0, the next release, and the later
+//! ones read (0.64.0, 0.65.0, 0.70.0, 0.72.1, 0.73.1) keep models.json and
+//! `registerProvider` headers off the Model and resolve them per request.
+//! Built-in github-copilot models still carry static, non-secret headers.
 //!
 //! The hand-copied JSON payloads in the `wire.rs` and `translate.rs`
 //! tests follow the spike trace. Captured: pi, version not recorded,
@@ -87,10 +105,18 @@
 //! - `model_select` fires only when the user changes model: pi's source
 //!   emits it for `set` and `cycle`, never for the declared `restore`.
 //!   A fresh or resumed session sends none, so its model shows as
-//!   unknown until the user switches.
-//! - `model_select`'s `model.contextWindow` isn't passed on.
-//!   `ContextUpdate.context_window_size` is always `None`, so context
-//!   percentages use the unknown model's 200K default.
+//!   unknown until the user switches. pi-atm's envelope snapshot of
+//!   `ctx.model` holds the startup model, but the adapter reads only its
+//!   context window.
+//! - The context window comes from that snapshot, on `context` events.
+//!   pi-atm before the snapshot sends none, so context percentages use
+//!   the unknown model's 200K default until the user re-runs `atm setup`.
+//! - After a model switch, the row pairs the new model with the old
+//!   model's window until the next `context` event, which comes with the
+//!   next prompt. `model_select` carries the new window, but
+//!   `ProviderModelChange` has no field for it, and adding one is an
+//!   atm-core change. Checked: one prompt on fake-a, then Ctrl+P, and
+//!   `atm list` showed fake-b at `0.8% (1.0K/128K)`.
 //! - Each assistant message's `usage` and `cost` cover that request
 //!   only. The adapter takes the latest from each `context` event, and
 //!   atm-core stores it as the session's cost, so a pi session shows

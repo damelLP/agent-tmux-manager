@@ -98,10 +98,15 @@ Only events that drive `LifecycleEvent` translation are forwarded
 | `agent_end`             | → `LifecycleEvent::WorkingEnd`                        |
 | `tool_call`             | → `LifecycleEvent::ToolCallStart` (or `NeedsInput` when amplike's permission gate triggers via `ctx.ui.select`) |
 | `tool_execution_end`    | → `LifecycleEvent::ToolCallEnd`                       |
-| `model_select`          | → `LifecycleEvent::ProviderModelChange`               |
+| `model_select`          | → `LifecycleEvent::ProviderModelChange` (`model` and `previousModel` cut to `{id, provider, contextWindow}`) |
 | `input` (interactive)   | → `LifecycleEvent::PromptSubmit`                      |
 | `session_before_compact`| → `LifecycleEvent::ContextCompactStart`               |
-| `context`               | → `LifecycleEvent::ContextUpdate {tokens, cost}`      |
+| `context`               | → `LifecycleEvent::ContextUpdate {tokens, cost, context window}` |
+
+Each frame also carries `model`, pi's current model (`ctx.model`) cut to
+`{id, provider, contextWindow}`. The `context` event has no window of its
+own, so atmd takes it from there. pi-atm never forwards a whole Model: it
+can carry `headers`, which hold auth on pi 0.62 and earlier.
 
 High-frequency events (`message_update`, `before_provider_request`,
 `turn_start`/`turn_end`) and duplicates of forwarded events

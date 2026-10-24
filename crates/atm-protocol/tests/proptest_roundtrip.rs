@@ -14,7 +14,7 @@ use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
-use serde::de::value::MapDeserializer;
+use serde::de::value::{MapDeserializer, StrDeserializer};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -495,25 +495,31 @@ impl serde::de::Error for VariantProbe {
     }
 }
 
-/// Wire tags of every variant of the internally tagged enum `T`.
+/// Wire tags of every variant of the enum `T`.
 ///
-/// Deserializes `{"type": "__probe__"}` and keeps the list serde's derive
-/// reports for the unknown tag, so it can't drift from the production
-/// enum. The list includes input-only names (`#[serde(alias)]`,
-/// `rename(deserialize = ..)`, `skip_serializing` variants) and omits
-/// `skip_deserializing` variants, so any of those also trips the coverage
-/// test.
+/// Deserializes an unknown tag in both shapes our wire enums use, an
+/// internally tagged object (`{"type": "__probe__"}`) and a bare unit tag
+/// (`"__probe__"`), and keeps the list serde's derive reports for it, so
+/// it can't drift from the production enum. The list includes input-only
+/// names (`#[serde(alias)]`, `rename(deserialize = ..)`, `skip_serializing`
+/// variants) and omits `skip_deserializing` variants, so any of those also
+/// trips the coverage test.
 fn wire_variant_tags<T: serde::de::DeserializeOwned>() -> BTreeSet<String> {
-    let probe = MapDeserializer::<_, VariantProbe>::new(std::iter::once(("type", "__probe__")));
-    let expected = T::deserialize(probe)
-        .err()
-        .and_then(|probe| probe.0)
+    const PROBE: &str = "__probe__";
+    let tagged = T::deserialize(MapDeserializer::<_, VariantProbe>::new(std::iter::once((
+        "type", PROBE,
+    ))));
+    let unit = T::deserialize(StrDeserializer::<VariantProbe>::new(PROBE));
+    let expected = [tagged.err(), unit.err()]
+        .into_iter()
+        .flatten()
+        .find_map(|probe| probe.0)
         .expect("serde's derive reports the variant list through de::Error::unknown_variant");
     expected.iter().map(|tag| tag.to_string()).collect()
 }
 
 /// Asserts that `strategy`, sampled with a fixed seed, generates every
-/// variant of its internally tagged wire enum.
+/// variant of its wire enum.
 #[track_caller]
 fn assert_covers_every_variant<S>(strategy: S)
 where
@@ -532,7 +538,10 @@ where
         .map(|_| {
             let value = strategy.new_tree(&mut runner).expect("generate").current();
             let json = serde_json::to_value(&value).expect("serialize");
-            json["type"].as_str().expect("type tag").to_string()
+            // Internally tagged enums carry the tag in `type`; unit-only
+            // enums serialize as the bare tag.
+            let tag = json.get("type").unwrap_or(&json);
+            tag.as_str().expect("variant tag").to_string()
         })
         .collect();
 
@@ -554,6 +563,11 @@ fn message_type_strategy_covers_every_variant() {
 #[test]
 fn daemon_message_strategy_covers_every_variant() {
     assert_covers_every_variant(arb_daemon_message());
+}
+
+#[test]
+fn session_status_strategy_covers_every_variant() {
+    assert_covers_every_variant(arb_session_status());
 }
 
 // ---------------------------------------------------------------------------

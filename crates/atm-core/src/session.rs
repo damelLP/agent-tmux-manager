@@ -1492,6 +1492,25 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_context_update_ignores_a_zero_window() {
+        // A window of 0 would turn every percentage into 0%. The pi
+        // adapter passes a 0 `contextWindow` through, so this filter is
+        // what stops it.
+        let mut session = create_test_session("test-context-zero-window");
+        let before = session.context.context_window_size;
+
+        session.apply_lifecycle_event(&LifecycleEvent::ContextUpdate {
+            tokens: None,
+            current_tokens: None,
+            context_window_size: Some(0),
+            cost_usd: None,
+        });
+
+        assert_eq!(session.context.context_window_size, before);
+        assert_ne!(before, 0);
+    }
+
+    #[test]
     fn lifecycle_context_update_tracks_current_and_cumulative_tokens() {
         let mut session = create_test_session("test-context-update");
 

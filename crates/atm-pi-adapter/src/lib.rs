@@ -111,6 +111,12 @@
 //! - The context window comes from that snapshot, on `context` events.
 //!   pi-atm before the snapshot sends none, so context percentages use
 //!   the unknown model's 200K default until the user re-runs `atm setup`.
+//! - After a model switch, the row pairs the new model with the old
+//!   model's window until the next `context` event, which comes with the
+//!   next prompt. `model_select` carries the new window, but
+//!   `ProviderModelChange` has no field for it, and adding one is an
+//!   atm-core change. Checked: one prompt on fake-a, then Ctrl+P, and
+//!   `atm list` showed fake-b at `0.8% (1.0K/128K)`.
 //! - Each assistant message's `usage` and `cost` cover that request
 //!   only. The adapter takes the latest from each `context` event, and
 //!   atm-core stores it as the session's cost, so a pi session shows

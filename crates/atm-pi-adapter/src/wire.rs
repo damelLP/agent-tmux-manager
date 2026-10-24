@@ -43,9 +43,14 @@ pub struct RawPiEvent {
     pub tmux_pane: Option<String>,
     /// pi's current model when the event fired, as pi-atm snapshots it
     /// (`{id, provider, contextWindow}` from `ctx.model`). Older pi-atm
-    /// never sent it.
-    #[serde(default, deserialize_with = "deserialize_optional_model")]
-    pub model: Option<PiModel>,
+    /// never sent it. Not `payload.model`, which is model_select's new
+    /// model.
+    #[serde(
+        rename = "model",
+        default,
+        deserialize_with = "deserialize_optional_model"
+    )]
+    pub current_model: Option<PiModel>,
 }
 
 /// Pi event payload — fields vary per event type.
@@ -138,7 +143,8 @@ where
 
 /// Accepts pi's `Model` object or a bare id, with the stringish rules
 /// for each part. No id means no model. A `contextWindow` that isn't a
-/// whole number in `u32` range is dropped.
+/// JSON integer in `u32` range is dropped (JS writes whole numbers as
+/// integers). A 0 gets through; atm-core ignores it.
 fn deserialize_optional_model<'de, D>(deserializer: D) -> Result<Option<PiModel>, D::Error>
 where
     D: Deserializer<'de>,
@@ -385,7 +391,7 @@ mod tests {
         }"#;
         let raw: RawPiEvent = serde_json::from_str(json).unwrap();
         assert_eq!(
-            raw.model,
+            raw.current_model,
             Some(PiModel {
                 id: "fake-b".into(),
                 provider: Some("atmfake".into()),
@@ -395,7 +401,7 @@ mod tests {
 
         let older = r#"{"event": "context", "payload": {"type": "context"}}"#;
         let raw: RawPiEvent = serde_json::from_str(older).unwrap();
-        assert_eq!(raw.model, None);
+        assert_eq!(raw.current_model, None);
     }
 
     #[test]
@@ -409,13 +415,13 @@ mod tests {
 
             let raw: RawPiEvent = serde_json::from_str(&json).unwrap();
 
-            let model = raw.model.expect("the id still makes a model");
+            let model = raw.current_model.expect("the id still makes a model");
             assert_eq!(model.context_window, None, "contextWindow {window}");
         }
 
         let json = r#"{"event": "context", "model": {"id": "fake-b"}}"#;
         let raw: RawPiEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(raw.model.and_then(|m| m.context_window), None);
+        assert_eq!(raw.current_model.and_then(|m| m.context_window), None);
     }
 
     #[test]

@@ -230,7 +230,8 @@ impl RawPiEvent {
                 // The context event carries no window; pi-atm's envelope
                 // snapshot of the current model does. It goes through even
                 // before the first reply has usage.
-                let context_window_size = self.model.as_ref().and_then(|m| m.context_window);
+                let context_window_size =
+                    self.current_model.as_ref().and_then(|m| m.context_window);
                 if tokens.is_none() && cost_usd.is_none() && context_window_size.is_none() {
                     return None;
                 }
@@ -278,7 +279,7 @@ mod tests {
             session_id: None,
             pid: None,
             tmux_pane: None,
-            model: None,
+            current_model: None,
         }
     }
 

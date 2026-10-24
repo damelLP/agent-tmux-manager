@@ -58,19 +58,22 @@ pub struct RawPiEvent {
 }
 
 /// pi-atm's usage snapshot, `{cost, tokens, contextTokens}`. pi-atm sums
-/// every assistant message in the session file, as pi's footer does.
+/// every assistant message in the session file, as pi's footer does. It
+/// sends `{}` when it couldn't read pi's session.
 /// Captured: pi 0.73.1, `tests/fixtures/pi_session_cost_0.73.1.jsonl`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PiUsage {
     /// The session's cost in USD: the sum of `usage.cost.total`.
     pub cost_usd: Option<f64>,
-    /// The session's tokens: the sum of input, output, cacheRead and
-    /// cacheWrite, as pi's `/session` counts them.
+    /// The session's tokens: input + output + cacheRead + cacheWrite,
+    /// summed over the same messages as the cost.
     pub tokens: Option<u64>,
     /// The active context, from pi's `getContextUsage()`. `None` when pi
     /// doesn't know it (after a compaction, until the next reply).
     pub context_tokens: Option<u64>,
 }
+
+/// Pi event payload — fields vary per event type.
 ///
 /// Modeled as one struct with all `Option` fields because pi's runtime
 /// JSON shape is essentially that: each event fills the relevant

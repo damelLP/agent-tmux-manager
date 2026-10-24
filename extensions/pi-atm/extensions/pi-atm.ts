@@ -321,10 +321,10 @@ function buildEnvelope(
 
 /** The usage pi puts on each assistant message, for that request alone. */
 type Usage = {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
 	totalTokens?: number;
 	cost?: { total?: number };
 };
@@ -339,31 +339,38 @@ type UsageContext = {
 };
 
 /**
- * pi's session totals: `cost` in USD, `tokens` as pi's `/session` counts
- * them, and `contextTokens`, the active context (`null` when pi doesn't
- * know it, after a compaction until the next reply).
+ * pi's session totals: `cost` in USD, `tokens` (input + output + cacheRead
+ * + cacheWrite), and `contextTokens`, the active context (`null` when pi
+ * doesn't know it, after a compaction until the next reply). Empty when
+ * pi's session couldn't be read.
  */
-type UsageSnapshot = { cost: number; tokens: number; contextTokens?: number | null };
+type UsageSnapshot = { cost?: number; tokens?: number; contextTokens?: number | null };
+
+/** A usage's input + output + cacheRead + cacheWrite, a missing part as 0. */
+function sumTokens(u: Usage): number {
+	return (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+}
 
 /**
  * Sums usage over every assistant message in the session file, as pi's
  * footer does, so atm shows the cost pi shows. That's O(entries), like
  * each footer render; a running total would go wrong when /reload,
  * /resume or /fork load a session. The context size is the one the
- * footer's percentage uses. Never throws: without a snapshot the frame
- * still goes out.
+ * footer's percentage uses. Never throws. When pi's session can't be
+ * read it returns `{}`, so atmd still knows this pi-atm sends totals
+ * and doesn't fall back to one request's cost.
  */
-function usageSnapshot(ctx: UsageContext): UsageSnapshot | undefined {
+function usageSnapshot(ctx: UsageContext): UsageSnapshot {
 	try {
 		const entries = ctx.sessionManager?.getEntries?.();
-		if (!entries) return undefined;
+		if (!entries) return {};
 		let cost = 0;
 		let tokens = 0;
 		for (const entry of entries) {
 			const usage = entry.type === "message" && entry.message?.role === "assistant" ? entry.message.usage : undefined;
 			if (!usage) continue;
 			cost += usage.cost?.total ?? 0;
-			tokens += usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+			tokens += sumTokens(usage);
 		}
 		const contextUsage = ctx.getContextUsage?.();
 		const contextTokens = contextUsage
@@ -372,15 +379,15 @@ function usageSnapshot(ctx: UsageContext): UsageSnapshot | undefined {
 		return { cost, tokens, contextTokens };
 	} catch (e) {
 		logDebug(`usage snapshot failed: ${(e as Error).message}`);
-		return undefined;
+		return {};
 	}
 }
 
 /**
  * The active context where `ctx.getContextUsage()` gives none (pi before
  * 0.49, or no model window): the last reply on the current branch that
- * wasn't aborted or an error, counted as pi's `calculateContextTokens`
- * counts it.
+ * wasn't aborted, as pi 0.43-0.48's footer picks it, counted as pi's
+ * `calculateContextTokens` counts it.
  */
 function lastContextTokens(branch: SessionEntry[]): number | undefined {
 	const last = branch.findLast(
@@ -388,11 +395,10 @@ function lastContextTokens(branch: SessionEntry[]): number | undefined {
 			e.type === "message" &&
 			e.message?.role === "assistant" &&
 			e.message.usage !== undefined &&
-			e.message.stopReason !== "aborted" &&
-			e.message.stopReason !== "error",
+			e.message.stopReason !== "aborted",
 	);
 	const u = last?.message?.usage;
-	return u && (u.totalTokens || u.input + u.output + u.cacheRead + u.cacheWrite);
+	return u && (u.totalTokens || sumTokens(u));
 }
 
 /** The fields of a pi Model that atmd reads. */

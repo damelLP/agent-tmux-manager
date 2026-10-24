@@ -469,6 +469,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_usage_snapshot_keeps_the_latest_reply_out() {
+        // Synthetic: pi-atm sends `usage: {}` when it can't read pi's
+        // session. The latest reply's cost (one request's) must not
+        // replace the session's total.
+        let e = frame(serde_json::json!({
+            "event": "context",
+            "payload": {"messages": [
+                {"role": "assistant", "usage": {"totalTokens": 1205, "cost": {"total": 0.003675}}}
+            ]},
+            "model": model_snapshot("fake-b", 32_000),
+            "usage": {},
+        }));
+        assert_eq!(
+            e.to_lifecycle_event(),
+            Some(LifecycleEvent::ContextUpdate {
+                tokens: None,
+                current_tokens: None,
+                context_window_size: Some(32_000),
+                cost_usd: None,
+            })
+        );
+    }
+
+    #[test]
     fn turn_end_without_a_usage_snapshot_returns_none() {
         // Synthetic. pi-atm forwards turn_end only with a snapshot; the
         // snapshot can still be missing if reading pi's session failed.

@@ -117,9 +117,9 @@
 //! snapshot's tokens are input + output + cacheRead + cacheWrite, and its
 //! active context is `ctx.getContextUsage().tokens`, which the footer's
 //! percentage uses. pi before 0.49 has no `getContextUsage()`, so pi-atm
-//! counts the last reply on the current branch as pi's
-//! `calculateContextTokens` does, which is what those versions' footers
-//! show. Checked: pi 0.73.1, 0.50.0 and 0.48.0, two prompts and three
+//! takes the last reply on the current branch that wasn't aborted, as
+//! those versions' footers do, counted as pi's `calculateContextTokens`
+//! counts it. Checked: pi 0.73.1, 0.50.0 and 0.48.0, two prompts and three
 //! priced requests. atm and the footer agreed after each prompt:
 //! $0.006975 and $0.01065 against `$0.007` and `$0.011`, at `3.8%`.
 //!
@@ -146,12 +146,12 @@
 //!   `ProviderModelChange` has no field for it, and adding one is an
 //!   atm-core change. Checked: one prompt on fake-a, then Ctrl+P, and
 //!   `atm list` showed fake-b at `0.8% (1.0K/128K)`.
-//! - pi-atm before the usage snapshot sends no totals, until the user
-//!   re-runs `atm setup`. The adapter then takes the latest reply in each
-//!   `context` event, so the row shows one request's cost rather than
-//!   the total, a reply behind. Checked: main's
-//!   pi-atm against this atmd showed $0.0033, then $0.003675, where the
-//!   footer showed `$0.007` and `$0.011`.
+//! - pi-atm before the usage snapshot (097f4f4 and earlier) sends no
+//!   totals, until the user re-runs `atm setup`. The adapter then takes
+//!   the latest reply in each `context` event, so the row shows one
+//!   request's cost rather than the total, a reply behind. Checked: that
+//!   pi-atm, with the snapshot-aware atmd, showed $0.0033, then
+//!   $0.003675, where the footer showed `$0.007` and `$0.011`.
 //! - After `/resume`, `/fork` or `/reload`, the new row shows $0 until the
 //!   next prompt's first `context` frame, while pi's footer shows the
 //!   session file's total at once. It shares a cause with the

@@ -101,15 +101,22 @@ Only events that drive `LifecycleEvent` translation are forwarded
 | `model_select`          | → `LifecycleEvent::ProviderModelChange` (`model` and `previousModel` cut to `{id, provider, contextWindow}`) |
 | `input` (interactive)   | → `LifecycleEvent::PromptSubmit`                      |
 | `session_before_compact`| → `LifecycleEvent::ContextCompactStart`               |
-| `context`               | → `LifecycleEvent::ContextUpdate {tokens, cost, context window}` |
+| `context`               | → `LifecycleEvent::ContextUpdate {tokens, cost, context window}`, before each request |
+| `turn_end`              | → `LifecycleEvent::ContextUpdate`, after each reply is saved (payload cut to `{}`) |
 
 Each frame also carries `model`, pi's current model (`ctx.model`) cut to
 `{id, provider, contextWindow}`. The `context` event has no window of its
 own, so atmd takes it from there. pi-atm never forwards a whole Model: it
 can carry `headers`, which hold auth on pi 0.62 and earlier.
 
+`context` and `turn_end` frames also carry `usage`, the session's totals
+as pi's footer sums them: `{cost, tokens, contextTokens}` over every
+assistant message in the session file, with `contextTokens` the size
+behind the footer's context percentage. pi prices each reply on its own,
+so atm takes the session's cost from this snapshot, not from a message.
+
 High-frequency events (`message_update`, `before_provider_request`,
-`turn_start`/`turn_end`) and duplicates of forwarded events
+`turn_start`) and duplicates of forwarded events
 (`tool_execution_start`, `tool_result`) are **not** subscribed — the
 daemon-side adapter would suppress them anyway.
 

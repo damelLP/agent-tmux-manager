@@ -230,10 +230,12 @@ impl RawPiEvent {
                 if tokens.is_none() && cost_usd.is_none() {
                     return None;
                 }
+                // The context event carries no window; pi-atm's envelope
+                // snapshot of the current model does.
                 LifecycleEvent::ContextUpdate {
                     tokens,
                     current_tokens: None,
-                    context_window_size: None,
+                    context_window_size: self.model.as_ref().and_then(|m| m.context_window),
                     cost_usd,
                 }
             }
@@ -274,6 +276,7 @@ mod tests {
             session_id: None,
             pid: None,
             tmux_pane: None,
+            model: None,
         }
     }
 
@@ -639,6 +642,7 @@ mod tests {
                 model: Some(PiModel {
                     id: "gpt-5.5".into(),
                     provider: Some("openai-codex".into()),
+                    context_window: None,
                 }),
                 ..Default::default()
             },
@@ -669,6 +673,11 @@ mod tests {
         assert_eq!(e.to_lifecycle_event(), None);
     }
 
+    /// pi-atm's envelope `model`, as the captures below hold it.
+    fn model_snapshot(id: &str, context_window: u32) -> Value {
+        serde_json::json!({"id": id, "provider": "atmfake", "contextWindow": context_window})
+    }
+
     #[test]
     fn captured_tool_run_translates() {
         // Captured: pi 0.73.1, 2026-10-24, pi's TUI in a private tmux
@@ -687,6 +696,17 @@ mod tests {
         assert_eq!(model_payload["model"]["provider"], "atmfake");
         assert_eq!(model_payload.get("provider"), None);
 
+        // pi-atm's envelope carries a snapshot of pi's current model with
+        // only the fields it picks. Ctrl+P switched fake-a to fake-b, so
+        // the frames from model_select on carry fake-b.
+        assert_eq!(
+            frames[0]["data"]["model"],
+            model_snapshot("fake-a", 128_000)
+        );
+        for frame in &frames[1..] {
+            assert_eq!(frame["data"]["model"], model_snapshot("fake-b", 32_000));
+        }
+
         let raws: Vec<RawPiEvent> = frames
             .iter()
             .map(|frame| serde_json::from_value(frame["data"].clone()).expect("pi_event data"))
@@ -694,11 +714,11 @@ mod tests {
         // pi-atm's envelope: pid, tmux_pane and pi's session id on every
         // frame. atmd keys the session by pid and names it by session_id.
         for raw in &raws {
-            assert_eq!(raw.pid, Some(1_351_724));
+            assert_eq!(raw.pid, Some(1_454_791));
             assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
             assert_eq!(
                 raw.session_id.as_deref(),
-                Some("01a16f0a-7086-7557-b3da-497e783667b6")
+                Some("01a16f2a-1686-763b-9a72-a25b2d29742c")
             );
         }
 
@@ -748,12 +768,14 @@ mod tests {
                 is_error: false,
             })
         );
+        // The window comes from the envelope's snapshot: fake-b's 32000,
+        // not the unknown model's 200K default.
         assert_eq!(
             context,
             &Some(LifecycleEvent::ContextUpdate {
                 tokens: Some(1020),
                 current_tokens: None,
-                context_window_size: None,
+                context_window_size: Some(32_000),
                 cost_usd: Some(0.0033),
             })
         );
@@ -777,6 +799,8 @@ mod tests {
             .lines()
             .map(|line| {
                 let frame: Value = serde_json::from_str(line).expect("fixture line");
+                // Both instances snapshot pi's startup model.
+                assert_eq!(frame["data"]["model"], model_snapshot("fake-a", 128_000));
                 serde_json::from_value(frame["data"].clone()).expect("pi_event data")
             })
             .collect();
@@ -785,15 +809,15 @@ mod tests {
         };
 
         // One pid throughout; `/new` gives the session a new id.
-        let old_id = Some("01a16f0a-b4e7-7178-a8b1-76b9132daf2f");
-        let new_id = Some("01a16f0a-c72d-735d-a7fd-4d31020b0f07");
+        let old_id = Some("01a16f2a-5bf2-71ba-9723-99e2063243a8");
+        let new_id = Some("01a16f2a-6e61-7670-87cc-d39f08b46aa4");
         for (raw, id) in [
             (start, old_id),
             (end_old, old_id),
             (start_new, new_id),
             (end, new_id),
         ] {
-            assert_eq!(raw.pid, Some(1_352_051));
+            assert_eq!(raw.pid, Some(1_455_146));
             assert_eq!(raw.session_id.as_deref(), id);
         }
 

@@ -41,6 +41,11 @@ pub struct RawPiEvent {
     /// Tmux pane id when running inside tmux.
     #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub tmux_pane: Option<String>,
+    /// pi's current model when the event fired, as pi-atm snapshots it
+    /// (`{id, provider, contextWindow}` from `ctx.model`). Older pi-atm
+    /// never sent it.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub model: Option<PiModel>,
 }
 
 /// Pi event payload — fields vary per event type.
@@ -112,12 +117,15 @@ pub struct PiPayload {
 }
 
 /// pi's `Model` object, cut to what ATM reads: `model_select` sends
-/// `{id, provider, contextWindow, …}`. Captured: pi 0.73.1,
+/// `{id, provider, contextWindow, …}`, and pi-atm's envelope snapshot
+/// `{id, provider, contextWindow}`. Captured: pi 0.73.1,
 /// `tests/fixtures/pi_tool_run_0.73.1.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiModel {
     pub id: String,
     pub provider: Option<String>,
+    /// `contextWindow`, in tokens.
+    pub context_window: Option<u32>,
 }
 
 fn deserialize_optional_stringish<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -129,7 +137,8 @@ where
 }
 
 /// Accepts pi's `Model` object or a bare id, with the stringish rules
-/// for each part. No id means no model.
+/// for each part. No id means no model. A `contextWindow` that isn't a
+/// whole number in `u32` range is dropped.
 fn deserialize_optional_model<'de, D>(deserializer: D) -> Result<Option<PiModel>, D::Error>
 where
     D: Deserializer<'de>,
@@ -140,7 +149,15 @@ where
             .get_mut("provider")
             .map(Value::take)
             .and_then(string_from_value);
-        string_from_value(value).map(|id| PiModel { id, provider })
+        let context_window = value
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        string_from_value(value).map(|id| PiModel {
+            id,
+            provider,
+            context_window,
+        })
     }))
 }
 
@@ -315,6 +332,7 @@ mod tests {
             Some(PiModel {
                 id: "claude-sonnet-4-6".into(),
                 provider: None,
+                context_window: None,
             })
         );
     }
@@ -350,8 +368,54 @@ mod tests {
             Some(PiModel {
                 id: "gpt-5.5".into(),
                 provider: None,
+                context_window: None,
             })
         );
+    }
+
+    #[test]
+    fn envelope_model_snapshot_parses() {
+        // Captured: pi 0.73.1, 2026-10-24, the envelope `model` of the
+        // `context` frames in `tests/fixtures/pi_tool_run_0.73.1.jsonl`
+        // (payload cut). Older pi-atm sends no snapshot.
+        let json = r#"{
+            "event": "context",
+            "payload": {"type": "context", "messages": []},
+            "model": {"id": "fake-b", "provider": "atmfake", "contextWindow": 32000}
+        }"#;
+        let raw: RawPiEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            raw.model,
+            Some(PiModel {
+                id: "fake-b".into(),
+                provider: Some("atmfake".into()),
+                context_window: Some(32_000),
+            })
+        );
+
+        let older = r#"{"event": "context", "payload": {"type": "context"}}"#;
+        let raw: RawPiEvent = serde_json::from_str(older).unwrap();
+        assert_eq!(raw.model, None);
+    }
+
+    #[test]
+    fn odd_context_window_is_dropped_instead_of_failing_parse() {
+        // Synthetic: drift cases for #25. pi's `Model.contextWindow` is a
+        // required number in 0.73.1, so no release sends these.
+        for window in ["null", r#""32000""#, "-1", "1.5", "4294967296", "{}"] {
+            let json = format!(
+                r#"{{"event": "context", "model": {{"id": "fake-b", "contextWindow": {window}}}}}"#
+            );
+
+            let raw: RawPiEvent = serde_json::from_str(&json).unwrap();
+
+            let model = raw.model.expect("the id still makes a model");
+            assert_eq!(model.context_window, None, "contextWindow {window}");
+        }
+
+        let json = r#"{"event": "context", "model": {"id": "fake-b"}}"#;
+        let raw: RawPiEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(raw.model.and_then(|m| m.context_window), None);
     }
 
     #[test]

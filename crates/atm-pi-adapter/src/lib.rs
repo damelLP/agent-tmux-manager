@@ -59,10 +59,11 @@
 //! the frames pi-atm sent atmd. Captured: pi 0.73.1, 2026-10-24, pi's
 //! TUI in a private tmux server with pi-atm installed by `atm setup`,
 //! frames tapped by `socat -r` on the way to an isolated atmd, answered
-//! by a local fake OpenAI-compatible provider (no model call). It covers
-//! every event pi-atm forwards except `session_before_compact`, whose
-//! payload the adapter doesn't read. The `atm_needs_input_*` events are
-//! pi-atm's own, not pi's.
+//! by a local fake OpenAI-compatible provider (no model call). pi started
+//! on `fake-a` (window 128000), and Ctrl+P switched it to `fake-b`
+//! (32000). It covers every event pi-atm forwards except
+//! `session_before_compact`, whose payload the adapter doesn't read. The
+//! `atm_needs_input_*` events are pi-atm's own, not pi's.
 //!
 //! `tests/fixtures/pi_new_session_0.73.1.jsonl` holds `/new` in one pi
 //! process. Captured: pi 0.73.1, 2026-10-24, set up the same way, with
@@ -87,10 +88,12 @@
 //! - `model_select` fires only when the user changes model: pi's source
 //!   emits it for `set` and `cycle`, never for the declared `restore`.
 //!   A fresh or resumed session sends none, so its model shows as
-//!   unknown until the user switches.
-//! - `model_select`'s `model.contextWindow` isn't passed on.
-//!   `ContextUpdate.context_window_size` is always `None`, so context
-//!   percentages use the unknown model's 200K default.
+//!   unknown until the user switches. pi-atm's envelope snapshot of
+//!   `ctx.model` holds the startup model, but the adapter reads only its
+//!   context window.
+//! - The context window comes from that snapshot, on `context` events.
+//!   pi-atm before the snapshot sends none, so context percentages use
+//!   the unknown model's 200K default until the user re-runs `atm setup`.
 //! - Each assistant message's `usage` and `cost` cover that request
 //!   only. The adapter takes the latest from each `context` event, and
 //!   atm-core stores it as the session's cost, so a pi session shows

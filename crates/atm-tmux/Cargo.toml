@@ -2,14 +2,15 @@
 name = "atm-tmux"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Tmux CLI wrapper for the Agent Tmux Manager"
 
 [dependencies]
-async-trait = "0.1"
-dirs = "5.0"
+async-trait = { workspace = true }
+dirs = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

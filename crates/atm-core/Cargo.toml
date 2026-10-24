@@ -2,12 +2,13 @@
 name = "atm-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Core domain types for ATM - Claude Code agent management"
+description = "Core domain types for ATM - coding-agent management"
 readme = "../../README.md"
 
 [dependencies]
@@ -16,7 +17,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-procfs = "0.17"
+procfs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -5,7 +5,9 @@
 //!
 //! - **Claude Code**: writes the `atm-hook` bash script to
 //!   `~/.local/bin/`, then registers it in `~/.claude/settings.json`'s
-//!   `hooks` and `statusLine` blocks.
+//!   `hooks` and `statusLine` blocks. A statusLine of the user's own is
+//!   saved first to `claude-statusline-backup.json` in ATM's config dir
+//!   (`~/.config/atm/` on Linux), and `atm uninstall` restores it.
 //! - **pi** (<https://pi.dev/>): writes the `pi-atm` TypeScript
 //!   extension to `~/.pi/agent/packages/pi-atm/`, then adds
 //!   `"packages/pi-atm"` to `~/.pi/agent/settings.json`'s `packages`
@@ -196,13 +198,114 @@ fn create_status_line_entry() -> Value {
     })
 }
 
+/// Where setup saves the user's own Claude Code statusLine when it
+/// replaces it, for uninstall to restore.
+fn status_line_backup_path() -> Option<PathBuf> {
+    atm_config_path().map(|config| config.with_file_name("claude-statusline-backup.json"))
+}
+
+/// Setup's statusLine step: puts ATM's statusLine in `settings`. A
+/// statusLine of the user's own is first saved to `backup_path` as
+/// `{"statusLine": <theirs>}`; if that fails, `settings` is untouched.
+/// With no statusLine, an existing backup is kept: settings.json may
+/// have been lost or reset since, leaving the backup as the only copy.
+/// Returns whether `settings` changed.
+fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) -> Result<bool> {
+    match settings.get("statusLine") {
+        Some(existing) if has_atm_status_line(existing) => {
+            println!("    statusLine - already configured");
+            return Ok(false);
+        }
+        Some(existing) => {
+            let backup = Map::from_iter([("statusLine".to_string(), existing.clone())]);
+            write_json_file_pretty(backup_path, &backup)?;
+            println!(
+                "    statusLine - replaced yours; saved to {}; `atm uninstall` restores it",
+                backup_path.display()
+            );
+        }
+        None if backup_path.exists() => println!(
+            "    statusLine - added; your earlier one is still saved in {}, and `atm uninstall` restores it",
+            backup_path.display()
+        ),
+        None => println!("    statusLine - added"),
+    }
+    settings.insert("statusLine".to_string(), create_status_line_entry());
+    Ok(true)
+}
+
+/// Uninstall's statusLine step: replaces ATM's statusLine in `settings`
+/// with `backup` (the user's own, saved by setup), or removes it when
+/// there is none. Any other statusLine replaced ATM's after setup, so it
+/// stays. Returns whether `settings` changed.
+#[must_use]
+fn uninstall_status_line(settings: &mut Map<String, Value>, backup: Option<Value>) -> bool {
+    if !settings.get("statusLine").is_some_and(has_atm_status_line) {
+        return false;
+    }
+    match backup {
+        Some(original) => settings.insert("statusLine".to_string(), original),
+        None => settings.remove("statusLine"),
+    };
+    true
+}
+
 /// Checks if atm-hook is configured for statusLine
 fn has_atm_status_line(status_line: &Value) -> bool {
-    status_line
-        .get("command")
+    is_marker_command(status_line, "atm-hook")
+}
+
+/// Splits `cmd` into words roughly as a POSIX shell would, expanding
+/// nothing: quotes group and are dropped, a backslash escapes the next
+/// character (inside double quotes only `$`, `` ` ``, `"` and `\`; none
+/// inside single quotes), backslash-newline joins lines, and an unquoted
+/// space, tab, newline (POSIX's default IFS) or one of `;&|()<>` ends a
+/// word. Other Unicode whitespace, such as NBSP, stays inside a word.
+fn shell_words(cmd: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '\\') => match chars.next() {
+                Some('\n') => {}
+                next => word.get_or_insert_default().extend(next),
+            },
+            (Some('"'), '\\') => {
+                let word = word.get_or_insert_default();
+                match chars.next() {
+                    Some('\n') => {}
+                    Some(c @ ('$' | '`' | '"' | '\\')) => word.push(c),
+                    next => word.extend(std::iter::once('\\').chain(next)),
+                }
+            }
+            (Some(_), c) => word.get_or_insert_default().push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            (None, c) if " \t\n;&|()<>".contains(c) => words.extend(word.take()),
+            (None, c) => word.get_or_insert_default().push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
+/// True if `hook`'s command runs the script named `marker`: one of its
+/// [`shell_words`] has `marker` as its file name. `/x/atm-hook`,
+/// `"/x y/atm-hook"`, `ATM_DEBUG=1 /x/atm-hook` and `/x/atm-hook; :`
+/// match; `/x/atm-hook-wrapper.sh` and `'/x/atm-hook wrapper.sh'` don't.
+fn is_marker_command(hook: &Value, marker: &str) -> bool {
+    hook.get("command")
         .and_then(|c| c.as_str())
-        .map(|cmd| cmd.contains("atm-hook"))
-        .unwrap_or(false)
+        .is_some_and(|cmd| {
+            shell_words(cmd)
+                .iter()
+                .any(|word| Path::new(word).file_name().and_then(|n| n.to_str()) == Some(marker))
+        })
 }
 
 /// Creates a hook entry for the given hook type.
@@ -237,43 +340,36 @@ fn create_hook_entry(hook_type: &str) -> Value {
     }
 }
 
-/// Checks if a hook entry whose command contains `marker` is present
+/// Checks if a hook entry with a command that runs `marker` is present
 /// in a hooks array. `marker` is the vendor script's basename
-/// (`atm-hook`, `atm-codex-hook`); the two never substring-match each
-/// other, and each lives in a different vendor settings file anyway.
+/// (`atm-hook`, `atm-codex-hook`); see [`is_marker_command`].
 fn has_hook_command_marker(hooks_array: &[Value], marker: &str) -> bool {
     hooks_array.iter().any(|entry| {
         entry
             .get("hooks")
             .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains(marker))
-                        .unwrap_or(false)
-                })
-            })
+            .map(|hooks| hooks.iter().any(|hook| is_marker_command(hook, marker)))
             .unwrap_or(false)
     })
 }
 
-/// Removes entries whose command contains `marker` from a hooks array.
-fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) {
-    hooks_array.retain(|entry| {
-        !entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains(marker))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+/// Removes the commands that run `marker` from each entry's inner
+/// `hooks` array, keeping the entry's other commands and fields (e.g.
+/// `matcher`). Drops an entry only when that leaves its `hooks` empty.
+/// Returns how many commands were removed.
+#[must_use]
+fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) -> usize {
+    let mut removed = 0;
+    hooks_array.retain_mut(|entry| {
+        let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|hook| !is_marker_command(hook, marker));
+        removed += before - hooks.len();
+        hooks.len() == before || !hooks.is_empty()
     });
+    removed
 }
 
 /// Writes `content` to `path` (creating parent directories as needed)
@@ -666,20 +762,8 @@ fn setup_claude_code() -> Result<()> {
     }
 
     // statusLine
-    let status_line_configured = if let Some(existing) = settings.get("statusLine") {
-        if has_atm_status_line(existing) {
-            println!("    statusLine - already configured");
-            false
-        } else {
-            settings.insert("statusLine".to_string(), create_status_line_entry());
-            println!("    statusLine - updated to use atm-hook");
-            true
-        }
-    } else {
-        settings.insert("statusLine".to_string(), create_status_line_entry());
-        println!("    statusLine - added");
-        true
-    };
+    let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
+    let status_line_configured = install_status_line(&mut settings, &backup_path)?;
 
     if added > 0 || status_line_configured {
         write_settings(&settings)?;
@@ -767,12 +851,10 @@ pub fn uninstall() -> Result<()> {
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for hook_type in ClaudeEventType::hook_names() {
             if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
-                let before = hooks_array.len();
-                remove_hook_command_marker(hooks_array, "atm-hook");
-                let after = hooks_array.len();
+                let count = remove_hook_command_marker(hooks_array, "atm-hook");
 
-                if before != after {
-                    removed += before - after;
+                if count > 0 {
+                    removed += count;
                     println!("  {hook_type} - removed");
                 }
 
@@ -792,18 +874,41 @@ pub fn uninstall() -> Result<()> {
         println!("  No hooks found");
     }
 
-    // Step 2: Remove statusLine if it uses atm-hook
-    let mut status_line_removed = false;
-    if let Some(status_line) = settings.get("statusLine") {
-        if has_atm_status_line(status_line) {
-            settings.remove("statusLine");
-            write_settings(&settings)?;
-            println!("\nstatusLine configuration removed");
-            status_line_removed = true;
+    // Step 2: Remove statusLine if it uses atm-hook, restoring the user's
+    // own from setup's backup. ATM's backup never stops uninstall: one it
+    // can't read or delete is left for the user, with a warning.
+    let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
+    let (backup, readable) = match read_json_file_or_empty(&backup_path) {
+        Ok(mut backup) => (backup.remove("statusLine"), true),
+        Err(e) => {
+            println!(
+                "\nWarning: {e}; skipping the statusLine restore and leaving the backup in place"
+            );
+            (None, false)
         }
+    };
+    let has_backup = backup.is_some();
+    let changed = uninstall_status_line(&mut settings, backup);
+    if changed {
+        write_settings(&settings)?;
     }
-    if !status_line_removed {
-        println!("\nstatusLine - not configured by atm");
+    match (changed, has_backup) {
+        (true, true) => println!("\nstatusLine restored from {}", backup_path.display()),
+        (true, false) => println!("\nstatusLine configuration removed"),
+        (false, _) => println!("\nstatusLine - not configured by atm"),
+    }
+    // The backup is done with once restored, or once a statusLine of the
+    // user's own replaced ATM's. With no statusLine left (settings.json
+    // lost or reset) it may be the only copy, so it stays.
+    if readable && (changed || settings.contains_key("statusLine")) {
+        if let Err(e) = remove_script_file(&backup_path) {
+            println!("\nWarning: {e}");
+        }
+    } else if has_backup {
+        println!(
+            "  Your earlier statusLine is still saved in {}",
+            backup_path.display()
+        );
     }
 
     // Step 3: Remove the hook script
@@ -836,12 +941,10 @@ pub fn uninstall() -> Result<()> {
         {
             for hook_type in CodexEventType::hook_names() {
                 if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
-                    let before = hooks_array.len();
-                    remove_hook_command_marker(hooks_array, "atm-codex-hook");
-                    let after = hooks_array.len();
+                    let count = remove_hook_command_marker(hooks_array, "atm-codex-hook");
 
-                    if before != after {
-                        codex_removed += before - after;
+                    if count > 0 {
+                        codex_removed += count;
                         println!("  {hook_type} - removed");
                     }
 
@@ -910,7 +1013,7 @@ mod codex_hook_tests {
         let mut hooks_array = vec![user_entry.clone(), create_codex_hook_entry()];
 
         assert!(has_hook_command_marker(&hooks_array, MARKER));
-        remove_hook_command_marker(&mut hooks_array, MARKER);
+        assert_eq!(remove_hook_command_marker(&mut hooks_array, MARKER), 1);
         assert!(!has_hook_command_marker(&hooks_array, MARKER));
         assert_eq!(
             hooks_array,
@@ -928,6 +1031,286 @@ mod codex_hook_tests {
             hooks_array.push(create_codex_hook_entry());
         }
         assert_eq!(hooks_array.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod shared_entry_tests {
+    use super::{
+        create_codex_hook_entry, create_hook_entry, create_status_line_entry, has_atm_status_line,
+        has_hook_command_marker, is_marker_command, remove_hook_command_marker, shell_words,
+    };
+    use serde_json::{json, Value};
+
+    const USER_HOOK: &str = "/usr/bin/my-own-hook";
+
+    /// ATM's `entry` with the user's own command added to its inner
+    /// `hooks` array, as a user editing settings.json might do.
+    fn shared_with_user_hook(mut entry: Value) -> Value {
+        entry["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "command", "command": USER_HOOK}));
+        entry
+    }
+
+    /// Removing `marker` from a shared entry must leave the entry, its
+    /// other fields and the user's command, minus only ATM's command.
+    fn assert_keeps_user_command(entry: Value, marker: &str) {
+        let mut hooks_array = vec![shared_with_user_hook(entry.clone())];
+        let mut expected = entry;
+        expected["hooks"] = json!([{"type": "command", "command": USER_HOOK}]);
+
+        let removed = remove_hook_command_marker(&mut hooks_array, marker);
+
+        assert_eq!(removed, 1);
+        assert_eq!(hooks_array, vec![expected]);
+    }
+
+    #[test]
+    fn claude_uninstall_keeps_a_user_command_sharing_atms_entry() {
+        assert_keeps_user_command(create_hook_entry("PreToolUse"), "atm-hook");
+        assert_keeps_user_command(create_hook_entry("SessionStart"), "atm-hook");
+    }
+
+    #[test]
+    fn codex_uninstall_keeps_a_user_command_sharing_atms_entry() {
+        assert_keeps_user_command(create_codex_hook_entry(), "atm-codex-hook");
+    }
+
+    #[test]
+    fn an_entry_left_empty_is_dropped_but_an_already_empty_one_is_kept() {
+        let already_empty = json!({"matcher": "Bash", "hooks": []});
+        let mut hooks_array = vec![create_hook_entry("PreToolUse"), already_empty.clone()];
+
+        let removed = remove_hook_command_marker(&mut hooks_array, "atm-hook");
+
+        assert_eq!(removed, 1);
+        assert_eq!(hooks_array, vec![already_empty]);
+    }
+
+    #[test]
+    fn a_script_whose_name_only_contains_the_marker_is_not_atms() {
+        let wrapper = json!({
+            "hooks": [{"type": "command", "command": "/home/u/bin/atm-hook-wrapper.sh"}]
+        });
+        let mut hooks_array = vec![wrapper.clone()];
+
+        assert!(!has_hook_command_marker(&hooks_array, "atm-hook"));
+        assert_eq!(remove_hook_command_marker(&mut hooks_array, "atm-hook"), 0);
+        assert_eq!(hooks_array, vec![wrapper]);
+    }
+
+    #[test]
+    fn a_command_running_the_script_with_env_args_or_quotes_is_atms() {
+        for command in [
+            "/home/u/.local/bin/atm-hook",
+            "ATM_DEBUG=1 /home/u/.local/bin/atm-hook",
+            "/home/u/.local/bin/atm-hook --verbose",
+            "\"$HOME/.local/bin/atm-hook\"",
+            "'/Users/John Doe/.local/bin/atm-hook'",
+            "/Users/John\\ Doe/.local/bin/atm-hook",
+            "/home/u/.local/bin/atm-hook; :",
+            "/home/u/.local/bin/atm-hook&&true",
+            "(/home/u/.local/bin/atm-hook)",
+        ] {
+            let command = json!({"type": "command", "command": command});
+            assert!(is_marker_command(&command, "atm-hook"), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_script_name_with_a_space_after_the_marker_is_not_atms() {
+        for command in [
+            "'/home/u/bin/atm-hook wrapper.sh'",
+            "\"/home/u/bin/atm-hook wrapper.sh\" --flag",
+            "/home/u/bin/atm-hook\\ wrapper.sh",
+            "\"/home/u/bin/atm\\-hook\"",
+            "/home/u/bin/atm-hook\u{a0}wrapper.sh",
+        ] {
+            let command = json!({"type": "command", "command": command});
+            assert!(!is_marker_command(&command, "atm-hook"), "{command}");
+        }
+    }
+
+    #[test]
+    fn shell_words_groups_quotes_and_splits_on_operators() {
+        assert_eq!(
+            shell_words(r#"a 'b c' "d\"e" f\ g;h&&i|j (k) <l >m"#),
+            ["a", "b c", "d\"e", "f g", "h", "i", "j", "k", "l", "m"]
+        );
+        assert_eq!(shell_words("x '' y"), ["x", "", "y"]);
+        assert_eq!(shell_words("a\tb\nc\u{a0}d"), ["a", "b", "c\u{a0}d"]);
+        assert_eq!(shell_words(r"'a\b'"), [r"a\b"]);
+    }
+
+    /// POSIX: inside double quotes a backslash escapes only `$`, `` ` ``,
+    /// `"`, `\` and newline, and is kept before anything else. A
+    /// backslash-newline is a line continuation, quoted or not.
+    #[test]
+    fn shell_words_keeps_double_quoted_backslashes_posix_keeps() {
+        assert_eq!(
+            shell_words(r#""a\-b" "c\$d" "e\\f" "g\`h""#),
+            [r"a\-b", "c$d", r"e\f", "g`h"]
+        );
+        assert_eq!(shell_words("a\\\nb \"c\\\nd\""), ["ab", "cd"]);
+    }
+
+    #[test]
+    fn a_status_line_script_whose_name_only_contains_the_marker_is_not_atms() {
+        let wrapper = json!({"type": "command", "command": "/home/u/bin/atm-hook-wrapper.sh"});
+
+        assert!(!has_atm_status_line(&wrapper));
+        assert!(has_atm_status_line(&create_status_line_entry()));
+    }
+}
+
+#[cfg(test)]
+mod status_line_backup_tests {
+    use super::{create_status_line_entry, install_status_line, uninstall_status_line, SetupError};
+    use serde_json::{json, Map, Value};
+    use std::fs;
+    use std::path::Path;
+
+    /// A statusLine of the user's own, with a field ATM never writes.
+    fn user_status_line() -> Value {
+        json!({"type": "command", "command": "~/bin/my-status.sh", "padding": 2})
+    }
+
+    fn settings_with(status_line: Value) -> Map<String, Value> {
+        Map::from_iter([("statusLine".to_string(), status_line)])
+    }
+
+    fn write_backup(path: &Path, status_line: Value) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, json!({ "statusLine": status_line }).to_string()).unwrap();
+    }
+
+    fn read_backup(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn install_saves_the_users_status_line_then_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("atm/backup.json");
+        let mut settings = settings_with(user_status_line());
+
+        assert!(install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert_eq!(
+            read_backup(&backup),
+            json!({"statusLine": user_status_line()})
+        );
+    }
+
+    #[test]
+    fn install_without_a_status_line_adds_atms_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        let mut settings = Map::new();
+
+        assert!(install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn install_over_atms_own_status_line_keeps_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        write_backup(&backup, user_status_line());
+        let mut settings = settings_with(create_status_line_entry());
+
+        assert!(!install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert_eq!(
+            read_backup(&backup),
+            json!({"statusLine": user_status_line()})
+        );
+    }
+
+    #[test]
+    fn install_leaves_the_users_status_line_if_the_backup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("atm");
+        fs::write(&blocker, "not a directory").unwrap();
+        let mut settings = settings_with(user_status_line());
+
+        let err = install_status_line(&mut settings, &blocker.join("backup.json")).unwrap_err();
+
+        assert!(
+            matches!(err, SetupError::Io { op: "create", ref path, .. } if path == &blocker),
+            "{err:?}"
+        );
+        assert_eq!(settings, settings_with(user_status_line()));
+    }
+
+    /// A backup may outlive the statusLine it came from: settings.json
+    /// may have been lost or reset since. It is then the only copy.
+    #[test]
+    fn install_without_a_status_line_keeps_an_earlier_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        write_backup(&backup, user_status_line());
+        let mut settings = Map::new();
+
+        assert!(install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert_eq!(
+            read_backup(&backup),
+            json!({"statusLine": user_status_line()})
+        );
+    }
+
+    #[test]
+    fn uninstall_restores_the_backup_over_atms_status_line() {
+        let mut settings = settings_with(create_status_line_entry());
+
+        assert!(uninstall_status_line(
+            &mut settings,
+            Some(user_status_line())
+        ));
+
+        assert_eq!(settings, settings_with(user_status_line()));
+    }
+
+    #[test]
+    fn uninstall_without_a_backup_removes_atms_status_line() {
+        let mut settings = settings_with(create_status_line_entry());
+
+        assert!(uninstall_status_line(&mut settings, None));
+
+        assert!(settings.is_empty(), "{settings:?}");
+    }
+
+    #[test]
+    fn uninstall_keeps_a_status_line_that_replaced_atms() {
+        let newer = json!({"type": "command", "command": "~/bin/newer-status.sh"});
+        let mut settings = settings_with(newer.clone());
+
+        assert!(!uninstall_status_line(
+            &mut settings,
+            Some(user_status_line())
+        ));
+
+        assert_eq!(settings, settings_with(newer));
+    }
+
+    #[test]
+    fn uninstall_without_a_status_line_restores_nothing() {
+        let mut settings = Map::new();
+
+        assert!(!uninstall_status_line(
+            &mut settings,
+            Some(user_status_line())
+        ));
+
+        assert!(settings.is_empty(), "{settings:?}");
     }
 }
 

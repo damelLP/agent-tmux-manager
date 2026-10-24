@@ -13,12 +13,23 @@
 //! stdin. Captured: Claude Code 2.1.310, 2026-10-24, the TUI run
 //! described under "Captured payloads" in `atm-claude-adapter`'s crate
 //! docs (a local fake Messages API, no model call; paths rewritten to
-//! `/home/user`). Every field `RawStatusLine` reads is on every line.
+//! `/home/user`). Every field `RawStatusLine` reads that Claude supplies
+//! is on every line; `pid` and `tmux_pane` are not, because Claude sends
+//! neither and `atm-hook` adds them before atmd sees the line.
 //! `current_usage` and `used_percentage` are `null` until a session's
 //! first request, including the session `/clear` starts. The lines also
 //! carry fields the parser ignores: `effort`, `thinking`, `fast_mode`,
 //! `output_style`, `prompt_cache`, `prompt_id` and
 //! `workspace.added_dirs`.
+//!
+//! `context_window.total_input_tokens` is not a session total. On every
+//! line it equals the sum of the latest request's `input_tokens`,
+//! `cache_creation_input_tokens` and `cache_read_input_tokens`, and
+//! `total_output_tokens` stays at one request's 42 across requests. Both
+//! drop to 0 after `/compact`, while `cost.total_cost_usd` keeps growing.
+//! The 2.1.302 capture below shows the same: its 45772 is the sum of its
+//! `current_usage` input fields. atm-core's `ContextUsage` still
+//! documents both fields as cumulative.
 //!
 //! `test_update_session_applies_context_window_size` uses one status
 //! line trimmed to the fields read. Captured: Claude Code 2.1.302, a
@@ -541,25 +552,29 @@ mod tests {
     #[test]
     fn captured_status_lines_2_1_310_parse() {
         // Captured: Claude Code 2.1.310, 2026-10-24 (see the module docs).
-        let sessions: Vec<SessionDomain> =
+        let lines: Vec<RawStatusLine> =
             include_str!("../tests/fixtures/claude_status_line_2.1.310.jsonl")
                 .lines()
-                .map(|line| {
-                    let raw: RawStatusLine = serde_json::from_str(line).expect("fixture line");
-                    raw.to_session_domain().expect("model is present")
-                })
+                .map(|line| serde_json::from_str(line).expect("fixture line"))
                 .collect();
-        assert_eq!(sessions.len(), 14);
-        for session in &sessions {
-            assert_eq!(session.model_display_override.as_deref(), Some("Opus 5.5"));
+        assert_eq!(lines.len(), 14);
+        let mut sessions = Vec::new();
+        for raw in &lines {
+            let model = raw.model.as_ref().expect("model is present");
+            assert_eq!(model.id, "claude-opus-5-5");
+            assert_eq!(model.display_name.as_deref(), Some("Opus 5.5"));
+            let session = raw.to_session_domain().expect("model is present");
             assert_eq!(session.context.context_window_size, 1_000_000);
             assert_eq!(session.claude_code_version.as_deref(), Some("2.1.310"));
+            sessions.push(session);
         }
 
         // Before the first request, `current_usage` is null.
         assert_eq!(sessions[0].context.context_tokens().as_u64(), 0);
-        // After the first request: the fake provider's usage,
-        // 1002 input + 300 cache creation + 4000 cache read.
+        // After the first prompt's tool request, the fake provider's
+        // second POST (`input_tokens` = 1000 + 2): 1002 input + 300 cache
+        // creation + 4000 cache read. Its cost also covers the first POST,
+        // a side request with no tools.
         assert_eq!(sessions[2].context.context_tokens().as_u64(), 5302);
         assert!((sessions[2].cost.as_usd() - 0.014292).abs() < 1e-9);
     }

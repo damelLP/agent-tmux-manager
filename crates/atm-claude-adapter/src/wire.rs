@@ -106,10 +106,12 @@ mod tests {
 
     // Synthetic: every payload in this module is a hand-written minimal
     // shape with placeholder values (`test-123`), Claude Code version not
-    // recorded. `parse_pre_tool_use` was added in c2a89f0 on 2026-01-25,
-    // the others in 8682450 on 2026-01-27, all in atm-protocol, and moved
-    // here in 7a20d86 on 2026-05-10. The captured payloads are in
-    // `tests/fixtures` (see the crate docs).
+    // recorded. They were written in atm-protocol as
+    // `test_raw_hook_event_*`: the PreToolUse one
+    // (`test_raw_hook_event_parsing`) in c2a89f0 on 2026-01-25, the others
+    // in 8682450 on 2026-01-27. 7a20d86 renamed them and moved them here
+    // on 2026-05-10. The captured payloads are in `tests/fixtures` (see
+    // the crate docs).
 
     #[test]
     fn parse_pre_tool_use() {

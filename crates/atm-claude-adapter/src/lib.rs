@@ -70,13 +70,21 @@
 //! The session ran a Bash call approved in the dialog, a failing Bash
 //! call (approved), and an Agent call whose subagent ran one Bash call,
 //! then `/compact`, `/clear` and `/exit`. A second process resumed the
-//! first session with `--resume` and exited. `SessionStart` carries
-//! `model` for sources `startup` and `compact` only. Claude sends no `pid`
-//! or `tmux_pane`; `atm-hook` adds them. Every field the adapter reads
-//! is unchanged from the 2.1.267 capture; 2.1.310 adds fields only
-//! (`effort`, and on `SessionStart` `model`, `prompt_id` and, for
+//! first session with `--resume` and exited. Both processes were launched
+//! with `--model claude-opus-5-5`, and `SessionStart` carried `model` for
+//! sources `startup` and `compact` only (unverified without `--model`).
+//! Claude sends no `pid` or `tmux_pane`; `atm-hook` adds them.
+//!
+//! For the events both captures have, every field the adapter reads is
+//! unchanged from 2.1.267, and this capture has only extra fields:
+//! `effort`, and on `SessionStart` `model`, `prompt_id` and, for
 //! `resume`, `seconds_since_last_response`, `context_tokens`,
-//! `prompt_cache_likely_expired` and `estimated_cache_write_usd`).
+//! `prompt_cache_likely_expired` and `estimated_cache_write_usd`. The
+//! 2.1.267 capture's method is not recorded, so some of these may come
+//! from the method rather than the version. `PostToolUseFailure`,
+//! `PermissionRequest`, `Notification` and `PreCompact` are captured
+//! here for the first time, so their fields have no earlier capture to
+//! compare with.
 //!
 //! The same run's 14 status lines are in `atm-protocol`, at
 //! `tests/fixtures/claude_status_line_2.1.310.jsonl` next to
@@ -90,7 +98,13 @@
 //!
 //! The JSON payloads in the `wire.rs` tests are hand-written (see
 //! `Synthetic:` there). Tests that build `RawHookEvent` structs check
-//! mapping logic and claim no capture.
+//! mapping logic and claim no capture. Claude-shaped JSON in other
+//! crates' tests is hand-written too unless marked `Captured:`: in
+//! atm-protocol (`message.rs`, `parse.rs`, `tests/proptest_roundtrip.rs`),
+//! in atmd (the registry actor's and handle's unit tests,
+//! `tests/registry_integration.rs`, `tests/robustness_tests.rs`,
+//! `tests/server_integration.rs`) and in the root
+//! `tests/e2e_with_tmux.rs`.
 //!
 //! ## Known gaps (Claude Code 2.1.310)
 //!
@@ -114,8 +128,10 @@
 //!   runs, listing it in `background_tasks` with `"status": "running"`,
 //!   so the parent's busy `Stop` keeps the child. After `SubagentStop`,
 //!   Claude submits a `UserPromptSubmit` whose `prompt` is a
-//!   `<task-notification>` block, then a quiet `Stop`. That prompt is
-//!   never the session's first, so `first_prompt` is unaffected.
+//!   `<task-notification>` block, then a quiet `Stop`. A row that already
+//!   has a first prompt keeps it. A row with none, such as one found by
+//!   discovery after atmd restarts during a background run, would take
+//!   that block as its first prompt (read from the code, unverified).
 //!   `SubagentStop` lists its own subagent as still running; only `Stop`
 //!   is read for background work.
 //! - **`/compact` fires `PreCompact` (trigger `manual`), a

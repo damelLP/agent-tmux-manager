@@ -534,15 +534,20 @@ mod tests {
         assert_eq!(e.to_lifecycle_event(), None);
     }
 
+    fn captured(fixture: &str) -> Vec<RawHookEvent> {
+        fixture
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture line"))
+            .collect()
+    }
+
     #[test]
     fn captured_subagent_run_preserves_routing_contract() {
         // Captured: Claude Code 2.1.267, date not recorded (see the crate
         // docs).
-        let events: Vec<RawHookEvent> =
-            include_str!("../tests/fixtures/claude_subagent_run_2.1.267.jsonl")
-                .lines()
-                .map(|line| serde_json::from_str(line).expect("fixture line"))
-                .collect();
+        let events = captured(include_str!(
+            "../tests/fixtures/claude_subagent_run_2.1.267.jsonl"
+        ));
         assert!(events
             .iter()
             .all(|event| event.to_lifecycle_event().is_some()));
@@ -560,11 +565,9 @@ mod tests {
     #[test]
     fn captured_tui_session_2_1_310_preserves_contract() {
         // Captured: Claude Code 2.1.310, 2026-10-24 (see the crate docs).
-        let events: Vec<RawHookEvent> =
-            include_str!("../tests/fixtures/claude_tui_session_2.1.310.jsonl")
-                .lines()
-                .map(|line| serde_json::from_str(line).expect("fixture line"))
-                .collect();
+        let events = captured(include_str!(
+            "../tests/fixtures/claude_tui_session_2.1.310.jsonl"
+        ));
         let lifecycle: Vec<LifecycleEvent> = events
             .iter()
             .map(|event| event.to_lifecycle_event().expect("known event"))
@@ -618,9 +621,11 @@ mod tests {
 
     #[test]
     fn teammate_metadata_and_alias_are_extracted() {
-        // Captured: Claude Code 2.1.288, 2026-10-04, a tmux teammate's
-        // own session (see "Agent teams" in the crate docs): the name is
-        // the sender's, so the event idles that session itself.
+        // Synthetic: hand-built structs. The TeammateIdle values copy a
+        // Claude Code 2.1.288 tmux teammate's own session (2026-10-04,
+        // see "Agent teams" in the crate docs): the name is the sender's,
+        // so the event idles that session itself. TaskCompleted was never
+        // captured.
         let mut idle = raw("TeammateIdle");
         idle.teammate_name = Some("waiter".into());
         idle.agent_type = Some("general-purpose".into());

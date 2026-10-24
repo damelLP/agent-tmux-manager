@@ -413,7 +413,7 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(Color::White),
                 )),
                 Line::from(Span::styled(
-                    "  2. Run an agent: claude, pi or codex",
+                    "  2. Run an agent",
                     Style::default().fg(Color::Cyan),
                 )),
                 Line::from(Span::styled(

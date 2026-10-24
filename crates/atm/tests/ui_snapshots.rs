@@ -366,6 +366,18 @@ fn session_list_connected_empty() {
     insta::assert_debug_snapshot!(buf);
 }
 
+#[test]
+fn compact_session_list_connected_empty() {
+    // The sidebar reuses the empty state at as little as 20 columns
+    // (SIDEBAR_MIN), where it clips: the steps must still read.
+    let mut app = App::new();
+    app.state = AppState::Connected;
+    let buf = render_buffer(20, 16, |frame, area| {
+        render_compact_session_list(frame, area, &app);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
 // ---- Split layout: detail_panel -------------------------------------------
 
 #[test]

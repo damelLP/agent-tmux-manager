@@ -689,9 +689,8 @@ impl SessionDomain {
     /// When `current_usage` is null in Claude's status line, all current_* values
     /// will be 0, which correctly resets context percentage to 0%.
     ///
-    /// Leaves `status` alone: lifecycle events own it. Claude Code 2.1.310
-    /// sends a status line after every turn, so a status line doesn't mean
-    /// Claude is working.
+    /// Leaves `status` alone: lifecycle events own it, and a status line
+    /// carries no turn state (see atm-claude-adapter's Known gaps).
     ///
     /// Returns `true` if the working directory changed (caller should re-resolve git info).
     pub fn update_from_status_line(&mut self, data: &StatusLineData) -> bool {
@@ -1963,8 +1962,7 @@ mod tests {
 
     #[test]
     fn test_update_from_status_line_keeps_status() {
-        // Claude Code 2.1.310 sends a status line after every Stop, so a
-        // status line says nothing about whether a turn is running.
+        // A status line says nothing about whether a turn is running.
         for status in [
             SessionStatus::Idle,
             SessionStatus::Working,

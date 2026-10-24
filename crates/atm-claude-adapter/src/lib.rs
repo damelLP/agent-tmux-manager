@@ -121,6 +121,30 @@
 //!   `allowManagedHooksOnly: true` and `--safe-mode` each stopped both
 //!   the hooks and the statusLine, so ATM hears nothing from those
 //!   sessions.
+//! - **The row reads idle for one model response after an auto-compact
+//!   or a blocked `Stop`.** Both were checked in sealed TUI runs with
+//!   replies streamed over 8 s:
+//!   - A user's own `Stop` hook that returns `decision: block` makes
+//!     Claude continue. ATM's `Stop` has already set Idle, and neither a
+//!     hook nor a status line marks the continuation. The next hook is
+//!     its first `PreToolUse`, or a second `Stop` with
+//!     `stop_hook_active: true`.
+//!   - An auto-compact at the start of a turn fires `UserPromptSubmit`,
+//!     `PreCompact` (trigger `auto`), a `SubagentStop`, then
+//!     `SessionStart` (source `compact`), which sets Idle while Claude
+//!     goes on to answer. `SessionStart` has the same fields after a
+//!     manual `/compact`, where Idle is right; only `PreCompact` carries
+//!     the trigger.
+//!
+//!   In both cases the row stays idle until the response's first
+//!   `PreToolUse`, or its `Stop`. `atm list` in those runs:
+//!
+//!   | Build | 3 s into the response | After the turn |
+//!   |---|---|---|
+//!   | Status lines set Working (before #81) | `working` | `working` (~60 s) |
+//!   | Status lines leave status alone | `idle` | `idle` |
+//!
+//!   The fix needs core lifecycle state; see the #79 follow-up.
 //! - **The Agent tool runs subagents in the background by default.**
 //!   `PostToolUse` for `Agent` follows `SubagentStart` at once, with
 //!   `tool_response` `{"isAsync": true, "status": "async_launched",

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use atm_claude_adapter::ClaudeEventType;
 use atm_codex_adapter::CodexEventType;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 /// Errors from installing or removing ATM's harness integrations.
@@ -125,21 +125,28 @@ fn hook_script_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/local/bin/atm-hook"))
 }
 
-/// Reads a JSON file at `path`, returning an empty object if the file
-/// does not exist. Errors carry the path for diagnostics.
-fn read_json_file_or_empty(path: &Path) -> Result<Value> {
+/// Reads the JSON object in the file at `path`, returning an empty object
+/// if the file does not exist. Errors carry the path for diagnostics.
+///
+/// Valid JSON that isn't an object (`[]`, `null`, `1`) is a
+/// [`SetupError::Shape`] carrying `not_object`, so callers never panic
+/// indexing it or replace the user's file with `{}`.
+fn read_json_file_or_empty(path: &Path, not_object: &'static str) -> Result<Map<String, Value>> {
     if !path.exists() {
-        return Ok(json!({}));
+        return Ok(Map::new());
     }
 
     let content = fs::read_to_string(path).map_err(io_err("read", path))?;
 
-    serde_json::from_str(&content).map_err(json_err("parse", path))
+    match serde_json::from_str(&content).map_err(json_err("parse", path))? {
+        Value::Object(settings) => Ok(settings),
+        _ => Err(SetupError::Shape(not_object)),
+    }
 }
 
 /// Writes `value` to `path` as pretty-printed JSON, creating parent
 /// directories as needed. Errors carry the path for diagnostics.
-fn write_json_file_pretty(path: &Path, value: &Value) -> Result<()> {
+fn write_json_file_pretty(path: &Path, value: &Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_err("create", parent))?;
     }
@@ -149,13 +156,13 @@ fn write_json_file_pretty(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// Reads Claude Code settings, returns empty object if file doesn't exist
-fn read_settings() -> Result<Value> {
+fn read_settings() -> Result<Map<String, Value>> {
     let path = claude_settings_path().ok_or(SetupError::HomeDirUnknown)?;
-    read_json_file_or_empty(&path)
+    read_json_file_or_empty(&path, "~/.claude/settings.json is not a JSON object")
 }
 
 /// Writes Claude Code settings
-fn write_settings(settings: &Value) -> Result<()> {
+fn write_settings(settings: &Map<String, Value>) -> Result<()> {
     let path = claude_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, settings)
 }
@@ -362,13 +369,13 @@ fn detect_codex() -> bool {
 // ============================================================================
 
 /// Reads Codex's hooks.json. Returns an empty object if not present.
-fn read_codex_hooks() -> Result<Value> {
+fn read_codex_hooks() -> Result<Map<String, Value>> {
     let path = codex_hooks_path().ok_or(SetupError::HomeDirUnknown)?;
-    read_json_file_or_empty(&path)
+    read_json_file_or_empty(&path, "~/.codex/hooks.json is not a JSON object")
 }
 
 /// Writes Codex's hooks.json
-fn write_codex_hooks(hooks: &Value) -> Result<()> {
+fn write_codex_hooks(hooks: &Map<String, Value>) -> Result<()> {
     let path = codex_hooks_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, hooks)
 }
@@ -414,12 +421,12 @@ fn pi_settings_path() -> Option<PathBuf> {
 }
 
 /// Reads pi's settings.json. Returns an empty object if not present.
-fn read_pi_settings() -> Result<Value> {
+fn read_pi_settings() -> Result<Map<String, Value>> {
     let path = pi_settings_path().ok_or(SetupError::HomeDirUnknown)?;
-    read_json_file_or_empty(&path)
+    read_json_file_or_empty(&path, "~/.pi/agent/settings.json is not a JSON object")
 }
 
-fn write_pi_settings(settings: &Value) -> Result<()> {
+fn write_pi_settings(settings: &Map<String, Value>) -> Result<()> {
     let path = pi_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, settings)
 }
@@ -445,20 +452,10 @@ fn install_pi_extension() -> Result<(bool, bool)> {
     fs::write(&pkg_path, PI_ATM_PACKAGE_JSON).map_err(io_err("write", &pkg_path))?;
 
     // Update pi's settings.json packages array.
-    //
-    // `Value` indexing panics when the inner value isn't an object —
-    // a corrupted or hand-edited settings.json that's e.g. `null` or
-    // `["array"]` would crash atm setup. Replace any non-object root
-    // with `{}` so the indexing below is always valid; we still error
-    // out below if `packages` exists but is the wrong shape.
     let mut settings = read_pi_settings()?;
-    if !settings.is_object() {
-        settings = json!({});
-    }
-    if settings.get("packages").is_none() {
-        settings["packages"] = json!([]);
-    }
-    let packages = settings["packages"]
+    let packages = settings
+        .entry("packages")
+        .or_insert_with(|| json!([]))
         .as_array_mut()
         .ok_or(SetupError::Shape(
             "packages is not an array in pi settings.json",
@@ -628,11 +625,9 @@ fn setup_claude_code() -> Result<()> {
     let mut settings = read_settings()?;
 
     // Ensure hooks object exists
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = json!({});
-    }
-
-    let hooks = settings["hooks"]
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or(SetupError::Shape("hooks is not an object"))?;
 
@@ -660,12 +655,12 @@ fn setup_claude_code() -> Result<()> {
             println!("    statusLine - already configured");
             false
         } else {
-            settings["statusLine"] = create_status_line_entry();
+            settings.insert("statusLine".to_string(), create_status_line_entry());
             println!("    statusLine - updated to use atm-hook");
             true
         }
     } else {
-        settings["statusLine"] = create_status_line_entry();
+        settings.insert("statusLine".to_string(), create_status_line_entry());
         println!("    statusLine - added");
         true
     };
@@ -705,21 +700,14 @@ fn setup_codex() -> Result<()> {
     install_executable_script(&hook_path, ATM_CODEX_HOOK_SCRIPT)?;
     println!("done");
 
-    // A corrupted or hand-edited hooks.json that isn't an object would
-    // make the indexing below panic; replace any non-object root with
-    // `{}` (mirrors the guard in install_pi_extension).
     let mut settings = read_codex_hooks()?;
-    if !settings.is_object() {
-        settings = json!({});
-    }
-
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = json!({});
-    }
-
-    let hooks = settings["hooks"].as_object_mut().ok_or(SetupError::Shape(
-        "hooks is not an object in codex hooks.json",
-    ))?;
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(SetupError::Shape(
+            "hooks is not an object in codex hooks.json",
+        ))?;
 
     let mut added = 0;
 
@@ -792,9 +780,7 @@ pub fn uninstall() -> Result<()> {
     let mut status_line_removed = false;
     if let Some(status_line) = settings.get("statusLine") {
         if has_atm_status_line(status_line) {
-            if let Some(obj) = settings.as_object_mut() {
-                obj.remove("statusLine");
-            }
+            settings.remove("statusLine");
             write_settings(&settings)?;
             println!("\nstatusLine configuration removed");
             status_line_removed = true;

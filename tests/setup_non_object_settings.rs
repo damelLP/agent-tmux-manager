@@ -14,6 +14,20 @@ const CLAUDE: &str = ".claude/settings.json";
 const CODEX: &str = ".codex/hooks.json";
 const PI: &str = ".pi/agent/settings.json";
 
+/// Each harness's settings file and the marker of ATM's entry in it.
+const HARNESS_FILES: [(&str, &str); 3] = [
+    (CLAUDE, "atm-hook"),
+    (CODEX, "atm-codex-hook"),
+    (PI, "pi-atm"),
+];
+
+/// What `atm setup` installs outside the settings files.
+const INSTALLED_ARTIFACTS: [&str; 3] = [
+    ".local/bin/atm-hook",
+    ".local/bin/atm-codex-hook",
+    ".pi/agent/packages/pi-atm",
+];
+
 /// Valid JSON roots that are not objects. The trailing newline is never
 /// written by serde_json, so a rewrite of the file can't match these bytes.
 const NON_OBJECT_ROOTS: [&str; 4] = ["[]\n", "null\n", "1\n", "\"x\"\n"];
@@ -39,84 +53,103 @@ fn write_home_file(home: &Path, file: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
-/// Runs `atm <cmd>` once per non-object root in `file` and returns, for
-/// each root, the output and the file's bytes afterwards.
-fn run_with_each_root(cmd: &str, file: &str) -> Vec<(&'static str, Output, Vec<u8>)> {
-    NON_OBJECT_ROOTS
-        .iter()
-        .map(|root| {
-            let home = tempfile::tempdir().expect("tempdir");
-            write_home_file(home.path(), file, root);
-            let output = run_atm(home.path(), cmd);
-            let after = fs::read(home.path().join(file)).unwrap();
-            (*root, output, after)
-        })
-        .collect()
+/// Asserts `atm setup` fails with exit 1 (not a panic's 101) and an error
+/// naming the resolved path of `file`, and leaves `file` byte-identical,
+/// for every non-object root.
+fn assert_setup_rejects(file: &str) {
+    for root in NON_OBJECT_ROOTS {
+        let home = tempfile::tempdir().expect("tempdir");
+        let path = home.path().join(file);
+        write_home_file(home.path(), file, root);
+
+        let output = run_atm(home.path(), "setup");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("atm setup with {file} = {root:?}: {stderr}");
+        assert_eq!(output.status.code(), Some(1), "{context}");
+        let message = format!("{} is not a JSON object", path.display());
+        assert!(stderr.contains(&message), "{context}");
+        assert_eq!(fs::read(&path).unwrap(), root.as_bytes(), "{context}");
+    }
 }
 
-/// Asserts `atm <cmd>` fails with exit 1 (not a panic's 101) and an error
-/// naming `file`, and leaves `file` byte-identical, for every non-object
-/// root.
-fn assert_rejected(cmd: &str, file: &str) {
-    let message = format!("~/{file} is not a JSON object");
-    for (root, output, after) in run_with_each_root(cmd, file) {
+/// Sets up every harness, then replaces `file` with each non-object root
+/// and runs `atm uninstall`. Such a file holds no ATM entries, so the run
+/// must complete, remove ATM everywhere else, and leave `file`
+/// byte-identical.
+fn assert_uninstall_skips(file: &str) {
+    for root in NON_OBJECT_ROOTS {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = home.path();
+        for (harness_file, _) in HARNESS_FILES {
+            write_home_file(home, harness_file, "{}");
+        }
+        let setup = run_atm(home, "setup");
+        assert!(setup.status.success(), "setup: {setup:?}");
+        write_home_file(home, file, root);
+
+        let output = run_atm(home, "uninstall");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "atm {cmd} with {file} = {root:?}: {stderr}"
-        );
+        let context = format!("atm uninstall with {file} = {root:?}: {stdout}{stderr}");
+        assert!(output.status.success(), "{context}");
         assert!(
-            stderr.contains(&message),
-            "atm {cmd} with {file} = {root:?}: {stderr}"
+            stdout.contains("ATM uninstalled successfully!"),
+            "{context}"
         );
+        assert!(!stdout.contains("failed"), "{context}");
         assert_eq!(
-            after,
+            fs::read(home.join(file)).unwrap(),
             root.as_bytes(),
-            "atm {cmd} rewrote {file} = {root:?}"
+            "{context}"
         );
+        for (harness_file, marker) in HARNESS_FILES {
+            if harness_file != file {
+                let content = fs::read_to_string(home.join(harness_file)).unwrap();
+                assert!(!content.contains(marker), "{harness_file}: {content}");
+            }
+        }
+        for artifact in INSTALLED_ARTIFACTS {
+            assert!(!home.join(artifact).exists(), "{artifact} left: {context}");
+        }
     }
 }
 
 #[test]
 fn setup_rejects_a_non_object_claude_settings_file() {
-    assert_rejected("setup", CLAUDE);
+    assert_setup_rejects(CLAUDE);
 }
 
 #[test]
 fn setup_rejects_a_non_object_codex_hooks_file() {
-    assert_rejected("setup", CODEX);
+    assert_setup_rejects(CODEX);
 }
 
 #[test]
 fn setup_rejects_a_non_object_pi_settings_file() {
-    assert_rejected("setup", PI);
+    assert_setup_rejects(PI);
 }
 
 #[test]
-fn uninstall_rejects_a_non_object_claude_settings_file() {
-    assert_rejected("uninstall", CLAUDE);
+fn uninstall_skips_a_non_object_claude_settings_file() {
+    assert_uninstall_skips(CLAUDE);
 }
 
 #[test]
-fn uninstall_rejects_a_non_object_codex_hooks_file() {
-    assert_rejected("uninstall", CODEX);
+fn uninstall_skips_a_non_object_codex_hooks_file() {
+    assert_uninstall_skips(CODEX);
 }
 
-/// Uninstall prints pi failures and carries on, so it exits 0 (a known
-/// limit tracked separately). The error must still name the file, and
-/// the file must be left alone.
 #[test]
-fn uninstall_reports_a_non_object_pi_settings_file() {
-    let message = format!("failed: ~/{PI} is not a JSON object");
-    for (root, output, after) in run_with_each_root("uninstall", PI) {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(&message),
-            "atm uninstall with {PI} = {root:?}: {stdout}"
-        );
-        assert_eq!(after, root.as_bytes(), "atm uninstall rewrote {PI}");
-    }
+fn uninstall_skips_a_non_object_pi_settings_file() {
+    assert_uninstall_skips(PI);
+}
+
+/// The `userKey` value in a settings file's content.
+fn user_key(content: &str) -> serde_json::Value {
+    let settings: serde_json::Value = serde_json::from_str(content).unwrap();
+    settings["userKey"].clone()
 }
 
 /// Guards the happy path: setup adds ATM's entries next to the user's own
@@ -124,12 +157,7 @@ fn uninstall_reports_a_non_object_pi_settings_file() {
 #[test]
 fn setup_then_uninstall_keeps_the_users_own_keys() {
     let home = tempfile::tempdir().expect("tempdir");
-    let files = [
-        (CLAUDE, "atm-hook"),
-        (CODEX, "atm-codex-hook"),
-        (PI, "pi-atm"),
-    ];
-    for (file, _) in files {
+    for (file, _) in HARNESS_FILES {
         write_home_file(home.path(), file, r#"{"userKey": "kept"}"#);
     }
 
@@ -139,13 +167,10 @@ fn setup_then_uninstall_keeps_the_users_own_keys() {
         "setup: {}",
         String::from_utf8_lossy(&setup.stderr)
     );
-    for (file, marker) in files {
+    for (file, marker) in HARNESS_FILES {
         let content = fs::read_to_string(home.path().join(file)).unwrap();
         assert!(content.contains(marker), "setup left {file}: {content}");
-        assert!(
-            content.contains("\"userKey\""),
-            "setup lost {file}: {content}"
-        );
+        assert_eq!(user_key(&content), "kept", "setup lost {file}: {content}");
     }
 
     let uninstall = run_atm(home.path(), "uninstall");
@@ -154,14 +179,15 @@ fn setup_then_uninstall_keeps_the_users_own_keys() {
         "uninstall: {}",
         String::from_utf8_lossy(&uninstall.stderr)
     );
-    for (file, marker) in files {
+    for (file, marker) in HARNESS_FILES {
         let content = fs::read_to_string(home.path().join(file)).unwrap();
         assert!(
             !content.contains(marker),
             "uninstall left {file}: {content}"
         );
-        assert!(
-            content.contains("\"userKey\""),
+        assert_eq!(
+            user_key(&content),
+            "kept",
             "uninstall lost {file}: {content}"
         );
     }

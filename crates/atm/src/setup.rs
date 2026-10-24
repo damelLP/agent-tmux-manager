@@ -61,6 +61,10 @@ pub enum SetupError {
     /// A settings file is valid JSON but not the shape ATM edits.
     #[error("{0}")]
     Shape(&'static str),
+
+    /// The settings file at `path` is valid JSON but not an object.
+    #[error("{} is not a JSON object", .path.display())]
+    NotAnObject { path: PathBuf },
 }
 
 type Result<T> = std::result::Result<T, SetupError>;
@@ -129,9 +133,9 @@ fn hook_script_path() -> PathBuf {
 /// if the file does not exist. Errors carry the path for diagnostics.
 ///
 /// Valid JSON that isn't an object (`[]`, `null`, `1`) is a
-/// [`SetupError::Shape`] carrying `not_object`, so callers never panic
-/// indexing it or replace the user's file with `{}`.
-fn read_json_file_or_empty(path: &Path, not_object: &'static str) -> Result<Map<String, Value>> {
+/// [`SetupError::NotAnObject`], so callers never panic indexing it or
+/// replace the user's file with `{}`.
+fn read_json_file_or_empty(path: &Path) -> Result<Map<String, Value>> {
     if !path.exists() {
         return Ok(Map::new());
     }
@@ -140,7 +144,19 @@ fn read_json_file_or_empty(path: &Path, not_object: &'static str) -> Result<Map<
 
     match serde_json::from_str(&content).map_err(json_err("parse", path))? {
         Value::Object(settings) => Ok(settings),
-        _ => Err(SetupError::Shape(not_object)),
+        _ => Err(SetupError::NotAnObject {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+/// Uninstall's read of a harness settings file. One that isn't a JSON
+/// object holds no ATM entries, so it reads as empty (and, with nothing
+/// removed, is never written back) rather than stopping the uninstall.
+fn or_empty_if_not_object(read: Result<Map<String, Value>>) -> Result<Map<String, Value>> {
+    match read {
+        Err(SetupError::NotAnObject { .. }) => Ok(Map::new()),
+        read => read,
     }
 }
 
@@ -158,7 +174,7 @@ fn write_json_file_pretty(path: &Path, value: &Map<String, Value>) -> Result<()>
 /// Reads Claude Code settings, returns empty object if file doesn't exist
 fn read_settings() -> Result<Map<String, Value>> {
     let path = claude_settings_path().ok_or(SetupError::HomeDirUnknown)?;
-    read_json_file_or_empty(&path, "~/.claude/settings.json is not a JSON object")
+    read_json_file_or_empty(&path)
 }
 
 /// Writes Claude Code settings
@@ -371,7 +387,7 @@ fn detect_codex() -> bool {
 /// Reads Codex's hooks.json. Returns an empty object if not present.
 fn read_codex_hooks() -> Result<Map<String, Value>> {
     let path = codex_hooks_path().ok_or(SetupError::HomeDirUnknown)?;
-    read_json_file_or_empty(&path, "~/.codex/hooks.json is not a JSON object")
+    read_json_file_or_empty(&path)
 }
 
 /// Writes Codex's hooks.json
@@ -423,7 +439,7 @@ fn pi_settings_path() -> Option<PathBuf> {
 /// Reads pi's settings.json. Returns an empty object if not present.
 fn read_pi_settings() -> Result<Map<String, Value>> {
     let path = pi_settings_path().ok_or(SetupError::HomeDirUnknown)?;
-    read_json_file_or_empty(&path, "~/.pi/agent/settings.json is not a JSON object")
+    read_json_file_or_empty(&path)
 }
 
 fn write_pi_settings(settings: &Map<String, Value>) -> Result<()> {
@@ -484,7 +500,7 @@ fn uninstall_pi_extension() -> Result<bool> {
             changed = true;
         }
     }
-    let mut settings = read_pi_settings()?;
+    let mut settings = or_empty_if_not_object(read_pi_settings())?;
     if let Some(packages) = settings.get_mut("packages").and_then(|p| p.as_array_mut()) {
         let before = packages.len();
         packages.retain(|v| v.as_str() != Some("packages/pi-atm"));
@@ -745,7 +761,7 @@ pub fn uninstall() -> Result<()> {
 
     // Step 1: Remove from Claude Code settings
     println!("Removing Claude Code hooks...");
-    let mut settings = read_settings()?;
+    let mut settings = or_empty_if_not_object(read_settings())?;
 
     let mut removed = 0;
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
@@ -812,7 +828,7 @@ pub fn uninstall() -> Result<()> {
     // Step 5: Remove Codex hooks if configured
     if detect_codex() {
         println!("\nRemoving Codex hooks...");
-        let mut codex_settings = read_codex_hooks()?;
+        let mut codex_settings = or_empty_if_not_object(read_codex_hooks())?;
         let mut codex_removed = 0;
         if let Some(hooks) = codex_settings
             .get_mut("hooks")

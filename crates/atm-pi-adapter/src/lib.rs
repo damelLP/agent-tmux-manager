@@ -74,6 +74,12 @@
 //! `session_shutdown` (reason `new`) on one connection, and the new
 //! instance sent the new session's frames on a second one.
 //!
+//! `tests/fixtures/pi_session_cost_0.73.1.jsonl` holds two prompts on
+//! fake-b ($3/$15 per M): a read tool call and its reply, then one more
+//! reply. Captured: pi 0.73.1, 2026-10-24, set up the same way, starting
+//! on fake-b, with pi-atm's usage snapshot. pi's footer showed `$0.007`
+//! after the first prompt and `$0.011` after the second.
+//!
 //! `tests/fixtures/pi_model_select_0.62.0.jsonl` holds a model switch on
 //! an older pi. Captured: pi 0.62.0, 2026-10-24, set up the same way,
 //! with Ctrl+P and no prompt, and pi-atm picking `{id, provider,
@@ -100,6 +106,29 @@
 //! no capture. `Synthetic:` marks the tests and examples whose shapes
 //! or values no capture produced.
 //!
+//! ## Cost and tokens
+//!
+//! pi prices each reply on its own: an assistant message's `usage`
+//! covers that request only. pi-atm puts a `usage` snapshot on `context`
+//! and `turn_end` frames, summed over every assistant message in the
+//! session file as pi's footer sums them, so atm shows the cost pi shows.
+//! `context` fires before each request and `turn_end` after each reply is
+//! saved, so a prompt's last reply counts before `agent_end`. The
+//! snapshot's tokens are input + output + cacheRead + cacheWrite, and its
+//! active context is `ctx.getContextUsage().tokens`, which the footer's
+//! percentage uses. pi before 0.49 has no `getContextUsage()`, so pi-atm
+//! counts the last reply on the current branch as pi's
+//! `calculateContextTokens` does, which is what those versions' footers
+//! show. Checked: pi 0.73.1, 0.50.0 and 0.48.0, two prompts and three
+//! priced requests. atm and the footer agreed after each prompt:
+//! $0.006975 and $0.01065 against `$0.007` and `$0.011`, at `3.8%`.
+//!
+//! pi's `/session` (`get_session_stats`) sums `state.messages` instead:
+//! the current branch since the last compaction. After a compaction or a
+//! /tree branch switch it shows less than the footer, whose sum covers
+//! every branch in the file. atm follows the footer, which is always on
+//! screen. Read in pi 0.73.1's source, not run.
+//!
 //! ## Known gaps (pi 0.73.1)
 //!
 //! - `model_select` fires only when the user changes model: pi's source
@@ -117,12 +146,24 @@
 //!   `ProviderModelChange` has no field for it, and adding one is an
 //!   atm-core change. Checked: one prompt on fake-a, then Ctrl+P, and
 //!   `atm list` showed fake-b at `0.8% (1.0K/128K)`.
-//! - Each assistant message's `usage` and `cost` cover that request
-//!   only. The adapter takes the latest from each `context` event, and
-//!   atm-core stores it as the session's cost, so a pi session shows
-//!   one request's cost rather than its total. A turn's last reply
-//!   arrives only in `agent_end.messages`, which the adapter doesn't
-//!   read, so the figure also lags one request behind.
+//! - pi-atm before the usage snapshot sends no totals, until the user
+//!   re-runs `atm setup`. The adapter then takes the latest reply in each
+//!   `context` event, so the row shows one request's cost rather than
+//!   the total, a reply behind. Checked: main's
+//!   pi-atm against this atmd showed $0.0033, then $0.003675, where the
+//!   footer showed `$0.007` and `$0.011`.
+//! - After `/resume`, `/fork` or `/reload`, the new row shows $0 until the
+//!   next prompt's first `context` frame, while pi's footer shows the
+//!   session file's total at once. It shares a cause with the
+//!   `model_select` gap above: one pi event maps to one `LifecycleEvent`,
+//!   so `session_start` can't also carry the usage or the model.
+//!   Unverified: read, not run.
+//! - Compaction and branch-summary calls aren't counted. pi's footer
+//!   doesn't count them either, since they aren't assistant messages.
+//!   Read, not run.
+//! - After a compaction, pi shows the context size as `?` until the next
+//!   reply. pi-atm then sends the cost only, and the row keeps its last
+//!   context size. Unverified.
 //! - `input` becomes `PromptSubmit` only for source `interactive`.
 //!   Prompts with source `rpc` or `extension` are dropped.
 //! - Two pi processes can hold one session, because pi takes no lock on

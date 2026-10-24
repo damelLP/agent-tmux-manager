@@ -20,6 +20,7 @@
 //! | `tool_result`           | (suppressed — `tool_execution_end` is canonical) |
 //! | `session_before_compact`| `ContextCompactStart`                         |
 //! | `model_select`          | `ProviderModelChange { provider, model }`     |
+//! | `context`, `turn_end`   | `ContextUpdate` from pi-atm's usage snapshot  |
 //!
 //! ### Why some events suppress
 //!
@@ -66,7 +67,8 @@ use crate::wire::RawPiEvent;
 /// reply on its own. Captured: pi 0.73.1, 2026-10-24, the fixture above,
 /// whose two replies cost 0.0033 and 0.003675. We pick the **last**
 /// message that has a usage object, so the result covers the latest
-/// request only (see the crate docs' known gaps). Either field returns
+/// request only. Used only for frames from pi-atm before its usage
+/// snapshot (see the crate docs' known gaps). Either field returns
 /// `None` if not present.
 fn extract_context_usage(messages: Option<&Value>) -> (Option<u64>, Option<f64>) {
     let Some(arr) = messages.and_then(Value::as_array) else {
@@ -219,25 +221,35 @@ impl RawPiEvent {
             // tool_call will drive further state.
             PiEventType::AtmNeedsInputResolved => LifecycleEvent::WorkingStart,
 
-            PiEventType::Context => {
-                // Pi's `context` event carries the full conversation
-                // snapshot in `messages[]`. Each assistant message has
-                // `usage.{cost.total, totalTokens}` beside `provider`
-                // and `model`. We extract just cost+tokens from the
-                // *latest* message that carries usage info; pi reports
-                // them per request, not per session.
-                let (tokens, cost_usd) = extract_context_usage(p.messages.as_ref());
-                // The context event carries no window; pi-atm's envelope
-                // snapshot of the current model does. It goes through even
-                // before the first reply has usage.
+            PiEventType::Context | PiEventType::TurnEnd => {
+                // pi-atm's usage snapshot carries the session's totals.
+                // pi-atm before the snapshot forwards only `context`, whose
+                // latest reply gives one request's figures.
+                let (tokens, current_tokens, cost_usd) = match (&self.usage, &self.event) {
+                    // Session tokens go only with the context size: alone,
+                    // atm-core would show them as the active context.
+                    (Some(u), _) => (u.context_tokens.and(u.tokens), u.context_tokens, u.cost_usd),
+                    (None, PiEventType::Context) => {
+                        let (tokens, cost_usd) = extract_context_usage(p.messages.as_ref());
+                        (tokens, None, cost_usd)
+                    }
+                    (None, _) => return None,
+                };
+                // pi's events carry no window; pi-atm's envelope snapshot
+                // of the current model does. It goes through even before
+                // the first reply has usage.
                 let context_window_size =
                     self.current_model.as_ref().and_then(|m| m.context_window);
-                if tokens.is_none() && cost_usd.is_none() && context_window_size.is_none() {
+                if tokens.is_none()
+                    && current_tokens.is_none()
+                    && cost_usd.is_none()
+                    && context_window_size.is_none()
+                {
                     return None;
                 }
                 LifecycleEvent::ContextUpdate {
                     tokens,
-                    current_tokens: None,
+                    current_tokens,
                     context_window_size,
                     cost_usd,
                 }
@@ -250,7 +262,6 @@ impl RawPiEvent {
             | PiEventType::AfterProviderResponse
             | PiEventType::BeforeAgentStart
             | PiEventType::TurnStart
-            | PiEventType::TurnEnd
             | PiEventType::MessageStart
             | PiEventType::MessageUpdate
             | PiEventType::MessageEnd
@@ -280,6 +291,7 @@ mod tests {
             pid: None,
             tmux_pane: None,
             current_model: None,
+            usage: None,
         }
     }
 
@@ -382,6 +394,93 @@ mod tests {
             },
         );
         assert_eq!(e.to_lifecycle_event(), None);
+    }
+
+    /// A pi-atm frame's `data`, parsed as atmd parses it.
+    fn frame(data: Value) -> RawPiEvent {
+        serde_json::from_value(data).expect("pi_event data")
+    }
+
+    #[test]
+    fn turn_end_usage_snapshot_becomes_context_update() {
+        // Synthetic: pi-atm's snapshot, with the totals pi 0.73.1 reported
+        // after a tool call and its reply (0.0033 + 0.003675). The real
+        // frames are in captured_session_cost_translates.
+        let e = frame(serde_json::json!({
+            "event": "turn_end",
+            "payload": {},
+            "model": model_snapshot("fake-b", 32_000),
+            "usage": {"cost": 0.006975, "tokens": 2225, "contextTokens": 1205},
+        }));
+        assert_eq!(
+            e.to_lifecycle_event(),
+            Some(LifecycleEvent::ContextUpdate {
+                tokens: Some(2225),
+                current_tokens: Some(1205),
+                context_window_size: Some(32_000),
+                cost_usd: Some(0.006975),
+            })
+        );
+    }
+
+    #[test]
+    fn context_takes_the_usage_snapshot_over_the_latest_reply() {
+        // Synthetic. The latest reply cost 0.0033 on its own; the snapshot
+        // carries the session's total.
+        let e = frame(serde_json::json!({
+            "event": "context",
+            "payload": {"messages": [
+                {"role": "assistant", "usage": {"totalTokens": 1020, "cost": {"total": 0.0033}}}
+            ]},
+            "usage": {"cost": 0.006975, "tokens": 2225, "contextTokens": 1023},
+        }));
+        assert_eq!(
+            e.to_lifecycle_event(),
+            Some(LifecycleEvent::ContextUpdate {
+                tokens: Some(2225),
+                current_tokens: Some(1023),
+                context_window_size: None,
+                cost_usd: Some(0.006975),
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_context_size_sends_the_cost_only() {
+        // Synthetic: after a compaction, pi doesn't know the context size
+        // until the next reply (`getContextUsage().tokens` is null). Sent
+        // alone, the session's tokens would show as the active context
+        // (atm-core's `current_tokens.or(tokens)`).
+        let e = frame(serde_json::json!({
+            "event": "turn_end",
+            "payload": {},
+            "model": model_snapshot("fake-b", 32_000),
+            "usage": {"cost": 0.01065, "tokens": 3430, "contextTokens": null},
+        }));
+        assert_eq!(
+            e.to_lifecycle_event(),
+            Some(LifecycleEvent::ContextUpdate {
+                tokens: None,
+                current_tokens: None,
+                context_window_size: Some(32_000),
+                cost_usd: Some(0.01065),
+            })
+        );
+    }
+
+    #[test]
+    fn turn_end_without_a_usage_snapshot_returns_none() {
+        // Synthetic. pi-atm forwards turn_end only with a snapshot; the
+        // snapshot can still be missing if reading pi's session failed.
+        for usage in [Value::Null, serde_json::json!("junk")] {
+            let e = frame(serde_json::json!({
+                "event": "turn_end",
+                "payload": {},
+                "model": model_snapshot("fake-b", 32_000),
+                "usage": usage,
+            }));
+            assert_eq!(e.to_lifecycle_event(), None, "usage {usage}");
+        }
     }
 
     #[test]
@@ -910,6 +1009,96 @@ mod tests {
                 reason: Some("quit".into())
             })
         );
+    }
+
+    #[test]
+    fn captured_session_cost_translates() {
+        // Captured: pi 0.73.1, 2026-10-24, set up as for
+        // captured_tool_run_translates, starting on fake-b ($3/$15 per M).
+        // Prompt 1 made two priced requests (a read tool call at 0.0033,
+        // then a reply at 0.003675) and prompt 2 one (0.003675). pi's
+        // footer showed `$0.007`, then `$0.011` and `3.8%/32k`.
+        let raws: Vec<RawPiEvent> = include_str!("../tests/fixtures/pi_session_cost_0.73.1.jsonl")
+            .lines()
+            .map(|line| {
+                let frame: Value = serde_json::from_str(line).expect("fixture line");
+                assert_eq!(frame["data"]["model"], model_snapshot("fake-b", 32_000));
+                serde_json::from_value(frame["data"].clone()).expect("pi_event data")
+            })
+            .collect();
+        let events: Vec<Option<LifecycleEvent>> =
+            raws.iter().map(RawPiEvent::to_lifecycle_event).collect();
+        let [start, input, working, first_context, tool_start, tool_end, turn_end, context, last_turn_end, working_end, input_2, working_2, context_2, turn_end_2, working_end_2, end] =
+            events.as_slice()
+        else {
+            panic!("expected 16 frames, got {}", events.len());
+        };
+
+        let update = |tokens, current_tokens, cost_usd| {
+            Some(LifecycleEvent::ContextUpdate {
+                tokens,
+                current_tokens,
+                context_window_size: Some(32_000),
+                cost_usd,
+            })
+        };
+        assert_eq!(
+            start,
+            &Some(LifecycleEvent::SessionStart {
+                source: Some("startup".into())
+            })
+        );
+        for input in [input, input_2] {
+            assert!(matches!(input, Some(LifecycleEvent::PromptSubmit { .. })));
+        }
+        for working in [working, working_2] {
+            assert_eq!(working, &Some(LifecycleEvent::WorkingStart));
+        }
+        // Before any reply pi counts the prompt alone: 6 tokens, $0.
+        assert_eq!(first_context, &update(Some(0), Some(6), Some(0.0)));
+        assert!(matches!(
+            tool_start,
+            Some(LifecycleEvent::ToolCallStart { .. })
+        ));
+        assert!(matches!(tool_end, Some(LifecycleEvent::ToolCallEnd { .. })));
+        // Each turn_end carries the session's total so far. The active
+        // context after the tool call includes pi's estimate for its result.
+        assert_eq!(turn_end, &update(Some(1020), Some(1025), Some(0.0033)));
+        assert_eq!(context, &update(Some(1020), Some(1025), Some(0.0033)));
+        assert_eq!(
+            last_turn_end,
+            &update(Some(2225), Some(1205), Some(0.006975))
+        );
+        assert_eq!(context_2, &update(Some(2225), Some(1207), Some(0.006975)));
+        assert_eq!(turn_end_2, &update(Some(3430), Some(1205), Some(0.01065)));
+        // agent_end still ends each prompt, after its last reply counted.
+        for working_end in [working_end, working_end_2] {
+            assert_eq!(working_end, &Some(LifecycleEvent::WorkingEnd));
+        }
+        assert_eq!(
+            end,
+            &Some(LifecycleEvent::SessionEnd {
+                reason: Some("quit".into())
+            })
+        );
+
+        // Folded into a session, as atmd does: the cost after each prompt
+        // is the run's total so far, matching pi's footer.
+        let mut session = atm_core::SessionDomain::new(
+            atm_core::SessionId::new("captured"),
+            atm_core::AgentType::GeneralPurpose,
+            atm_core::Model::Unknown,
+        );
+        let apply = |session: &mut atm_core::SessionDomain, events: &[Option<LifecycleEvent>]| {
+            for event in events.iter().flatten() {
+                session.apply_lifecycle_event(event);
+            }
+        };
+        apply(&mut session, events.get(..10).expect("prompt 1 frames"));
+        assert_eq!(session.cost.as_microdollars(), 6_975);
+        apply(&mut session, events.get(10..15).expect("prompt 2 frames"));
+        assert_eq!(session.cost.as_microdollars(), 10_650);
+        assert_eq!(session.context.format(), "3.8% (1.2K/32K)");
     }
 
     // ========================================================================

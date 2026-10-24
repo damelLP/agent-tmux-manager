@@ -51,9 +51,26 @@ pub struct RawPiEvent {
         deserialize_with = "deserialize_optional_model"
     )]
     pub current_model: Option<PiModel>,
+    /// pi's session totals when the event fired, as pi-atm sums them for
+    /// `context` and `turn_end` frames. Older pi-atm never sent them.
+    #[serde(default, deserialize_with = "deserialize_optional_usage")]
+    pub usage: Option<PiUsage>,
 }
 
-/// Pi event payload — fields vary per event type.
+/// pi-atm's usage snapshot, `{cost, tokens, contextTokens}`. pi-atm sums
+/// every assistant message in the session file, as pi's footer does.
+/// Captured: pi 0.73.1, `tests/fixtures/pi_session_cost_0.73.1.jsonl`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PiUsage {
+    /// The session's cost in USD: the sum of `usage.cost.total`.
+    pub cost_usd: Option<f64>,
+    /// The session's tokens: the sum of input, output, cacheRead and
+    /// cacheWrite, as pi's `/session` counts them.
+    pub tokens: Option<u64>,
+    /// The active context, from pi's `getContextUsage()`. `None` when pi
+    /// doesn't know it (after a compaction, until the next reply).
+    pub context_tokens: Option<u64>,
+}
 ///
 /// Modeled as one struct with all `Option` fields because pi's runtime
 /// JSON shape is essentially that: each event fills the relevant
@@ -164,6 +181,21 @@ where
             provider,
             context_window,
         })
+    }))
+}
+
+/// Accepts pi-atm's usage snapshot. Anything but an object means no
+/// snapshot, and a field that isn't a JSON number of the right kind is
+/// dropped, so a bad snapshot never fails the frame.
+fn deserialize_optional_usage<'de, D>(deserializer: D) -> Result<Option<PiUsage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.filter(Value::is_object).map(|value| PiUsage {
+        cost_usd: value.get("cost").and_then(Value::as_f64),
+        tokens: value.get("tokens").and_then(Value::as_u64),
+        context_tokens: value.get("contextTokens").and_then(Value::as_u64),
     }))
 }
 
@@ -422,6 +454,34 @@ mod tests {
         let json = r#"{"event": "context", "model": {"id": "fake-b"}}"#;
         let raw: RawPiEvent = serde_json::from_str(json).unwrap();
         assert_eq!(raw.current_model.and_then(|m| m.context_window), None);
+    }
+
+    #[test]
+    fn odd_usage_fields_are_dropped_instead_of_failing_parse() {
+        // Synthetic: drift cases. pi-atm sends JS numbers, and
+        // `contextTokens: null` when pi doesn't know the context size.
+        let json = r#"{"event": "turn_end",
+            "usage": {"cost": "0.01", "tokens": -1, "contextTokens": null}}"#;
+        let raw: RawPiEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(raw.usage, Some(PiUsage::default()));
+
+        let json = r#"{"event": "turn_end",
+            "usage": {"cost": 0.01065, "tokens": 3430, "contextTokens": 1205}}"#;
+        let raw: RawPiEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            raw.usage,
+            Some(PiUsage {
+                cost_usd: Some(0.01065),
+                tokens: Some(3430),
+                context_tokens: Some(1205),
+            })
+        );
+
+        for usage in ["null", r#""junk""#, "[]", "1"] {
+            let json = format!(r#"{{"event": "turn_end", "usage": {usage}}}"#);
+            let raw: RawPiEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(raw.usage, None, "usage {usage}");
+        }
     }
 
     #[test]

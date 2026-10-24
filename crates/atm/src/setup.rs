@@ -5,7 +5,9 @@
 //!
 //! - **Claude Code**: writes the `atm-hook` bash script to
 //!   `~/.local/bin/`, then registers it in `~/.claude/settings.json`'s
-//!   `hooks` and `statusLine` blocks.
+//!   `hooks` and `statusLine` blocks. A statusLine of the user's own is
+//!   saved first to `claude-statusline-backup.json` in ATM's config dir
+//!   (`~/.config/atm/` on Linux), and `atm uninstall` restores it.
 //! - **pi** (<https://pi.dev/>): writes the `pi-atm` TypeScript
 //!   extension to `~/.pi/agent/packages/pi-atm/`, then adds
 //!   `"packages/pi-atm"` to `~/.pi/agent/settings.json`'s `packages`
@@ -194,6 +196,58 @@ fn create_status_line_entry() -> Value {
         "type": "command",
         "command": command
     })
+}
+
+/// Where setup saves the user's own Claude Code statusLine when it
+/// replaces it, for uninstall to restore.
+fn status_line_backup_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("atm/claude-statusline-backup.json"))
+}
+
+/// Setup's statusLine step: puts ATM's statusLine in `settings`. A
+/// statusLine of the user's own is first saved to `backup_path` as
+/// `{"statusLine": <theirs>}`; if that fails, `settings` is untouched.
+/// Returns whether `settings` changed.
+fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) -> Result<bool> {
+    match settings.get("statusLine") {
+        Some(existing) if has_atm_status_line(existing) => {
+            println!("    statusLine - already configured");
+            return Ok(false);
+        }
+        Some(existing) => {
+            let backup = Map::from_iter([("statusLine".to_string(), existing.clone())]);
+            write_json_file_pretty(backup_path, &backup)?;
+            println!(
+                "    statusLine - replaced yours; saved to {}; `atm uninstall` restores it",
+                backup_path.display()
+            );
+        }
+        None => println!("    statusLine - added"),
+    }
+    settings.insert("statusLine".to_string(), create_status_line_entry());
+    Ok(true)
+}
+
+/// Uninstall's statusLine step: replaces ATM's statusLine in `settings`
+/// with the user's own saved at `backup_path`, or removes it when there
+/// is no backup. Any other statusLine replaced ATM's after setup, so it
+/// stays and the backup is stale. Returns whether `settings` changed.
+fn uninstall_status_line(settings: &mut Map<String, Value>, backup_path: &Path) -> Result<bool> {
+    if !settings.get("statusLine").is_some_and(has_atm_status_line) {
+        println!("\nstatusLine - not configured by atm");
+        return Ok(false);
+    }
+    match read_json_file_or_empty(backup_path)?.remove("statusLine") {
+        Some(original) => {
+            settings.insert("statusLine".to_string(), original);
+            println!("\nstatusLine restored from {}", backup_path.display());
+        }
+        None => {
+            settings.remove("statusLine");
+            println!("\nstatusLine configuration removed");
+        }
+    }
+    Ok(true)
 }
 
 /// Checks if atm-hook is configured for statusLine
@@ -666,20 +720,8 @@ fn setup_claude_code() -> Result<()> {
     }
 
     // statusLine
-    let status_line_configured = if let Some(existing) = settings.get("statusLine") {
-        if has_atm_status_line(existing) {
-            println!("    statusLine - already configured");
-            false
-        } else {
-            settings.insert("statusLine".to_string(), create_status_line_entry());
-            println!("    statusLine - updated to use atm-hook");
-            true
-        }
-    } else {
-        settings.insert("statusLine".to_string(), create_status_line_entry());
-        println!("    statusLine - added");
-        true
-    };
+    let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
+    let status_line_configured = install_status_line(&mut settings, &backup_path)?;
 
     if added > 0 || status_line_configured {
         write_settings(&settings)?;
@@ -790,19 +832,14 @@ pub fn uninstall() -> Result<()> {
         println!("  No hooks found");
     }
 
-    // Step 2: Remove statusLine if it uses atm-hook
-    let mut status_line_removed = false;
-    if let Some(status_line) = settings.get("statusLine") {
-        if has_atm_status_line(status_line) {
-            settings.remove("statusLine");
-            write_settings(&settings)?;
-            println!("\nstatusLine configuration removed");
-            status_line_removed = true;
-        }
+    // Step 2: Remove statusLine if it uses atm-hook, restoring the user's
+    // own from setup's backup. The backup goes only once settings are
+    // written, so a failed write keeps it.
+    let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
+    if uninstall_status_line(&mut settings, &backup_path)? {
+        write_settings(&settings)?;
     }
-    if !status_line_removed {
-        println!("\nstatusLine - not configured by atm");
-    }
+    remove_script_file(&backup_path)?;
 
     // Step 3: Remove the hook script
     let hook_path = hook_script_path();
@@ -1012,6 +1049,142 @@ mod shared_entry_tests {
 
         assert!(!has_atm_status_line(&wrapper));
         assert!(has_atm_status_line(&create_status_line_entry()));
+    }
+}
+
+#[cfg(test)]
+mod status_line_backup_tests {
+    use super::{create_status_line_entry, install_status_line, uninstall_status_line, SetupError};
+    use serde_json::{json, Map, Value};
+    use std::fs;
+    use std::path::Path;
+
+    /// A statusLine of the user's own, with a field ATM never writes.
+    fn user_status_line() -> Value {
+        json!({"type": "command", "command": "~/bin/my-status.sh", "padding": 2})
+    }
+
+    fn settings_with(status_line: Value) -> Map<String, Value> {
+        Map::from_iter([("statusLine".to_string(), status_line)])
+    }
+
+    fn write_backup(path: &Path, status_line: Value) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, json!({ "statusLine": status_line }).to_string()).unwrap();
+    }
+
+    fn read_backup(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn install_saves_the_users_status_line_then_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("atm/backup.json");
+        let mut settings = settings_with(user_status_line());
+
+        assert!(install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert_eq!(
+            read_backup(&backup),
+            json!({"statusLine": user_status_line()})
+        );
+    }
+
+    #[test]
+    fn install_without_a_status_line_adds_atms_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        let mut settings = Map::new();
+
+        assert!(install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn install_over_atms_own_status_line_keeps_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        write_backup(&backup, user_status_line());
+        let mut settings = settings_with(create_status_line_entry());
+
+        assert!(!install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert_eq!(
+            read_backup(&backup),
+            json!({"statusLine": user_status_line()})
+        );
+    }
+
+    #[test]
+    fn install_leaves_the_users_status_line_if_the_backup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("atm");
+        fs::write(&blocker, "not a directory").unwrap();
+        let mut settings = settings_with(user_status_line());
+
+        let err = install_status_line(&mut settings, &blocker.join("backup.json")).unwrap_err();
+
+        assert!(
+            matches!(err, SetupError::Io { op: "create", ref path, .. } if path == &blocker),
+            "{err:?}"
+        );
+        assert_eq!(settings, settings_with(user_status_line()));
+    }
+
+    #[test]
+    fn uninstall_restores_the_backup_over_atms_status_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        write_backup(&backup, user_status_line());
+        let mut settings = settings_with(create_status_line_entry());
+
+        assert!(uninstall_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(user_status_line()));
+    }
+
+    #[test]
+    fn uninstall_without_a_backup_removes_atms_status_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = settings_with(create_status_line_entry());
+
+        assert!(uninstall_status_line(&mut settings, &dir.path().join("absent.json")).unwrap());
+
+        assert!(settings.is_empty(), "{settings:?}");
+    }
+
+    #[test]
+    fn uninstall_keeps_a_status_line_that_replaced_atms() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        write_backup(&backup, user_status_line());
+        let newer = json!({"type": "command", "command": "~/bin/newer-status.sh"});
+        let mut settings = settings_with(newer.clone());
+
+        assert!(!uninstall_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(newer));
+    }
+
+    #[test]
+    fn uninstall_stops_on_an_unreadable_backup_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.json");
+        fs::write(&backup, "{").unwrap();
+        let mut settings = settings_with(create_status_line_entry());
+
+        let err = uninstall_status_line(&mut settings, &backup).unwrap_err();
+
+        assert!(
+            matches!(err, SetupError::Json { op: "parse", ref path, .. } if path == &backup),
+            "{err:?}"
+        );
+        assert_eq!(settings, settings_with(create_status_line_entry()));
     }
 }
 

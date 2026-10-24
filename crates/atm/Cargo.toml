@@ -32,7 +32,6 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 

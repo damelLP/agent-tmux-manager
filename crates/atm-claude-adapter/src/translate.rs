@@ -620,6 +620,30 @@ mod tests {
     }
 
     #[test]
+    fn captured_stop_failure_2_1_310_ends_the_turn() {
+        // Captured: Claude Code 2.1.310, 2026-10-25 (see the crate docs).
+        // Three turns ended by API errors: each sent StopFailure, never
+        // Stop, and the turn must end there.
+        let events = captured(include_str!(
+            "../tests/fixtures/claude_stop_failure_2.1.310.jsonl"
+        ));
+        assert!(events
+            .iter()
+            .all(|event| event.to_lifecycle_event().is_some()));
+        assert!(events.iter().all(|event| event.hook_event_name != "Stop"));
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|event| event.hook_event_name == "StopFailure")
+            .collect();
+        assert_eq!(failures.len(), 3);
+        for event in failures {
+            assert_eq!(event.to_lifecycle_event(), Some(LifecycleEvent::WorkingEnd));
+            assert_eq!(event.child_agent(), None);
+            assert_eq!(event.background_activity(), None);
+        }
+    }
+
+    #[test]
     fn teammate_metadata_and_alias_are_extracted() {
         // Synthetic: hand-built structs. The TeammateIdle values copy a
         // Claude Code 2.1.288 tmux teammate's own session (2026-10-04,

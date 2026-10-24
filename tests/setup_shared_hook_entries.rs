@@ -71,6 +71,12 @@ fn claude_uninstall_keeps_a_user_command_in_atms_entry() {
 }
 
 #[test]
+fn claude_uninstall_keeps_a_user_command_in_atms_stop_failure_entry() {
+    // StopFailure, unlike PreToolUse, is written without a matcher.
+    assert_uninstall_keeps_user_command(".claude/settings.json", "atm-hook", "StopFailure");
+}
+
+#[test]
 fn codex_uninstall_keeps_a_user_command_in_atms_entry() {
     assert_uninstall_keeps_user_command(".codex/hooks.json", "atm-codex-hook", "PreToolUse");
 }

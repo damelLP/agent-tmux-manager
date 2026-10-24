@@ -19,15 +19,72 @@
 //!   instruction for this.
 
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use atm_claude_adapter::ClaudeEventType;
 use atm_codex_adapter::CodexEventType;
 use serde_json::{json, Value};
+use thiserror::Error;
+
+/// Errors from installing or removing ATM's harness integrations.
+#[derive(Debug, Error)]
+pub enum SetupError {
+    /// The home directory could not be determined.
+    #[error("Could not determine home directory")]
+    HomeDirUnknown,
+
+    /// The user config directory could not be determined.
+    #[error("could not determine config directory")]
+    ConfigDirUnknown,
+
+    /// A filesystem operation (`op`, e.g. "read") on `path` failed.
+    #[error("Failed to {op} {}", .path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Parsing or serializing the JSON file at `path` failed.
+    #[error("Failed to {op} {}", .path.display())]
+    Json {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A settings file is valid JSON but not the shape ATM edits.
+    #[error("{0}")]
+    Shape(&'static str),
+}
+
+type Result<T> = std::result::Result<T, SetupError>;
+
+/// Maps an io error from `op` on `path` into [`SetupError::Io`].
+fn io_err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> SetupError + 'a {
+    move |source| SetupError::Io {
+        op,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// Maps a serde_json error from `op` on `path` into [`SetupError::Json`].
+fn json_err<'a>(
+    op: &'static str,
+    path: &'a Path,
+) -> impl FnOnce(serde_json::Error) -> SetupError + 'a {
+    move |source| SetupError::Json {
+        op,
+        path: path.to_path_buf(),
+        source,
+    }
+}
 
 /// The atm-hook bash script content (Claude Code), embedded at compile time.
 const ATM_HOOK_SCRIPT: &str = include_str!("../scripts/atm-hook");
@@ -75,33 +132,31 @@ fn read_json_file_or_empty(path: &Path) -> Result<Value> {
         return Ok(json!({}));
     }
 
-    let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = fs::read_to_string(path).map_err(io_err("read", path))?;
 
-    serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
+    serde_json::from_str(&content).map_err(json_err("parse", path))
 }
 
 /// Writes `value` to `path` as pretty-printed JSON, creating parent
 /// directories as needed. Errors carry the path for diagnostics.
 fn write_json_file_pretty(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(io_err("create", parent))?;
     }
 
-    let content = serde_json::to_string_pretty(value)?;
-    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
+    let content = serde_json::to_string_pretty(value).map_err(json_err("serialize", path))?;
+    fs::write(path, content).map_err(io_err("write", path))
 }
 
 /// Reads Claude Code settings, returns empty object if file doesn't exist
 fn read_settings() -> Result<Value> {
-    let path = claude_settings_path().context("Could not determine home directory")?;
+    let path = claude_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     read_json_file_or_empty(&path)
 }
 
 /// Writes Claude Code settings
 fn write_settings(settings: &Value) -> Result<()> {
-    let path = claude_settings_path().context("Could not determine home directory")?;
+    let path = claude_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, settings)
 }
 
@@ -202,18 +257,18 @@ fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) {
 /// and marks it executable.
 fn install_executable_script(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(io_err("create", parent))?;
     }
 
-    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    fs::write(path, content).map_err(io_err("write", path))?;
 
     #[cfg(unix)]
     {
-        let mut perms = fs::metadata(path)?.permissions();
+        let mut perms = fs::metadata(path)
+            .map_err(io_err("set permissions on", path))?
+            .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(path, perms)
-            .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+        fs::set_permissions(path, perms).map_err(io_err("set permissions on", path))?;
     }
 
     Ok(())
@@ -222,7 +277,7 @@ fn install_executable_script(path: &Path, content: &str) -> Result<()> {
 /// Removes the script at `path`, reporting whether it existed.
 fn remove_script_file(path: &Path) -> Result<bool> {
     if path.exists() {
-        fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()))?;
+        fs::remove_file(path).map_err(io_err("remove", path))?;
         Ok(true)
     } else {
         Ok(false)
@@ -232,10 +287,10 @@ fn remove_script_file(path: &Path) -> Result<bool> {
 /// Installs the ATM tmux keybindings file to ~/.config/atm/tmux-bindings.conf.
 fn install_tmux_bindings() -> Result<()> {
     let config_dir = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?
+        .ok_or(SetupError::ConfigDirUnknown)?
         .join("atm");
 
-    std::fs::create_dir_all(&config_dir)?;
+    std::fs::create_dir_all(&config_dir).map_err(io_err("create", &config_dir))?;
 
     let bindings_path = config_dir.join("tmux-bindings.conf");
     let content = r#"# ATM — Agent Tmux Manager bindings
@@ -260,7 +315,7 @@ bind C-s display-popup -E -w 35% -h 100% -x 0 "atm"
 # set -g status-right '#(atm status) | %H:%M'
 "#;
 
-    std::fs::write(&bindings_path, content)?;
+    std::fs::write(&bindings_path, content).map_err(io_err("write", &bindings_path))?;
     println!("Installed tmux bindings: {}", bindings_path.display());
     println!(
         "Add to your .tmux.conf: source-file {}",
@@ -311,13 +366,13 @@ fn detect_codex() -> bool {
 
 /// Reads Codex's hooks.json. Returns an empty object if not present.
 fn read_codex_hooks() -> Result<Value> {
-    let path = codex_hooks_path().context("Could not determine home directory")?;
+    let path = codex_hooks_path().ok_or(SetupError::HomeDirUnknown)?;
     read_json_file_or_empty(&path)
 }
 
 /// Writes Codex's hooks.json
 fn write_codex_hooks(hooks: &Value) -> Result<()> {
-    let path = codex_hooks_path().context("Could not determine home directory")?;
+    let path = codex_hooks_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, hooks)
 }
 
@@ -363,12 +418,12 @@ fn pi_settings_path() -> Option<PathBuf> {
 
 /// Reads pi's settings.json. Returns an empty object if not present.
 fn read_pi_settings() -> Result<Value> {
-    let path = pi_settings_path().context("Could not determine home directory")?;
+    let path = pi_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     read_json_file_or_empty(&path)
 }
 
 fn write_pi_settings(settings: &Value) -> Result<()> {
-    let path = pi_settings_path().context("Could not determine home directory")?;
+    let path = pi_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, settings)
 }
 
@@ -379,10 +434,9 @@ fn write_pi_settings(settings: &Value) -> Result<()> {
 /// Returns `(files_written, settings_changed)` for caller's success
 /// message.
 fn install_pi_extension() -> Result<(bool, bool)> {
-    let pkg_dir = pi_atm_package_dir().context("Could not determine home directory")?;
+    let pkg_dir = pi_atm_package_dir().ok_or(SetupError::HomeDirUnknown)?;
     let extensions_dir = pkg_dir.join("extensions");
-    fs::create_dir_all(&extensions_dir)
-        .with_context(|| format!("Failed to create {}", extensions_dir.display()))?;
+    fs::create_dir_all(&extensions_dir).map_err(io_err("create", &extensions_dir))?;
 
     // Layout matches pi-amplike: package.json with pi.extensions
     // pointing at ./extensions/, and the .ts file inside.
@@ -390,10 +444,8 @@ fn install_pi_extension() -> Result<(bool, bool)> {
     let pkg_path = pkg_dir.join("package.json");
 
     // Always write to refresh any in-place edits the user might have made.
-    fs::write(&ts_path, PI_ATM_EXTENSION)
-        .with_context(|| format!("Failed to write {}", ts_path.display()))?;
-    fs::write(&pkg_path, PI_ATM_PACKAGE_JSON)
-        .with_context(|| format!("Failed to write {}", pkg_path.display()))?;
+    fs::write(&ts_path, PI_ATM_EXTENSION).map_err(io_err("write", &ts_path))?;
+    fs::write(&pkg_path, PI_ATM_PACKAGE_JSON).map_err(io_err("write", &pkg_path))?;
 
     // Update pi's settings.json packages array.
     //
@@ -411,7 +463,9 @@ fn install_pi_extension() -> Result<(bool, bool)> {
     }
     let packages = settings["packages"]
         .as_array_mut()
-        .context("packages is not an array in pi settings.json")?;
+        .ok_or(SetupError::Shape(
+            "packages is not an array in pi settings.json",
+        ))?;
 
     // Pi's local-package format: "packages/<name>" (relative to
     // pi's `agentDir`, which is `~/.pi/agent/`).
@@ -432,8 +486,7 @@ fn uninstall_pi_extension() -> Result<bool> {
     let mut changed = false;
     if let Some(pkg_dir) = pi_atm_package_dir() {
         if pkg_dir.exists() {
-            fs::remove_dir_all(&pkg_dir)
-                .with_context(|| format!("Failed to remove {}", pkg_dir.display()))?;
+            fs::remove_dir_all(&pkg_dir).map_err(io_err("remove", &pkg_dir))?;
             changed = true;
         }
     }
@@ -490,16 +543,13 @@ pub fn ensure_default_atm_config(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(io_err("create config directory", parent))?;
     }
     match fs::write(path, default_atm_config_text()) {
         Ok(()) => Ok(true),
         // Lost a race with another writer — treat as already-present.
         Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => {
-            Err(e).with_context(|| format!("Failed to write default config {}", path.display()))
-        }
+        Err(e) => Err(e).map_err(io_err("write default config", path)),
     }
 }
 
@@ -587,7 +637,7 @@ fn setup_claude_code() -> Result<()> {
 
     let hooks = settings["hooks"]
         .as_object_mut()
-        .context("hooks is not an object")?;
+        .ok_or(SetupError::Shape("hooks is not an object"))?;
 
     let mut added = 0;
 
@@ -596,7 +646,7 @@ fn setup_claude_code() -> Result<()> {
             .entry(hook_type)
             .or_insert_with(|| json!([]))
             .as_array_mut()
-            .context("hook type is not an array")?;
+            .ok_or(SetupError::Shape("hook type is not an array"))?;
 
         if has_hook_command_marker(hooks_array, "atm-hook") {
             println!("    {hook_type} - already configured");
@@ -670,9 +720,9 @@ fn setup_codex() -> Result<()> {
         settings["hooks"] = json!({});
     }
 
-    let hooks = settings["hooks"]
-        .as_object_mut()
-        .context("hooks is not an object in codex hooks.json")?;
+    let hooks = settings["hooks"].as_object_mut().ok_or(SetupError::Shape(
+        "hooks is not an object in codex hooks.json",
+    ))?;
 
     let mut added = 0;
 
@@ -681,7 +731,7 @@ fn setup_codex() -> Result<()> {
             .entry(hook_type)
             .or_insert_with(|| json!([]))
             .as_array_mut()
-            .context("hook type is not an array")?;
+            .ok_or(SetupError::Shape("hook type is not an array"))?;
 
         if has_hook_command_marker(hooks_array, "atm-codex-hook") {
             println!("    {hook_type} - already configured");
@@ -923,5 +973,115 @@ mod config_tests {
 
         assert!(first);
         assert!(!second);
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::{ensure_default_atm_config, io_err, json_err, SetupError};
+    use std::error::Error as _;
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    /// Display must match the anyhow context strings setup printed before
+    /// SetupError existed, so `atm setup` output is unchanged.
+    #[test]
+    fn display_matches_previous_messages() {
+        let p = Path::new("/h/.claude/settings.json");
+        let io = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let json = || serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let cases = [
+            (
+                SetupError::HomeDirUnknown,
+                "Could not determine home directory",
+            ),
+            (
+                SetupError::ConfigDirUnknown,
+                "could not determine config directory",
+            ),
+            (
+                io_err("read", p)(io()),
+                "Failed to read /h/.claude/settings.json",
+            ),
+            (
+                io_err("create", p)(io()),
+                "Failed to create /h/.claude/settings.json",
+            ),
+            (
+                io_err("write", p)(io()),
+                "Failed to write /h/.claude/settings.json",
+            ),
+            (
+                io_err("set permissions on", p)(io()),
+                "Failed to set permissions on /h/.claude/settings.json",
+            ),
+            (
+                io_err("remove", p)(io()),
+                "Failed to remove /h/.claude/settings.json",
+            ),
+            (
+                io_err("create config directory", p)(io()),
+                "Failed to create config directory /h/.claude/settings.json",
+            ),
+            (
+                io_err("write default config", p)(io()),
+                "Failed to write default config /h/.claude/settings.json",
+            ),
+            (
+                json_err("parse", p)(json()),
+                "Failed to parse /h/.claude/settings.json",
+            ),
+            (
+                SetupError::Shape("hooks is not an object"),
+                "hooks is not an object",
+            ),
+            (
+                SetupError::Shape("hook type is not an array"),
+                "hook type is not an array",
+            ),
+            (
+                SetupError::Shape("hooks is not an object in codex hooks.json"),
+                "hooks is not an object in codex hooks.json",
+            ),
+            (
+                SetupError::Shape("packages is not an array in pi settings.json"),
+                "packages is not an array in pi settings.json",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    /// The underlying error stays reachable via `source()`, so anyhow in
+    /// `main` still prints it under "Caused by:".
+    #[test]
+    fn io_and_json_errors_keep_their_source() {
+        let p = Path::new("/x");
+        let io = io_err("read", p)(io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(
+            io.source().map(ToString::to_string),
+            Some(io::Error::from(io::ErrorKind::NotFound).to_string())
+        );
+
+        let parse = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let expected = parse.to_string();
+        let json = json_err("parse", p)(parse);
+        assert_eq!(json.source().map(ToString::to_string), Some(expected));
+    }
+
+    #[test]
+    fn ensure_default_atm_config_reports_a_typed_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("atm");
+        fs::write(&blocker, "not a directory").unwrap();
+
+        let err = ensure_default_atm_config(&blocker.join("config.toml")).unwrap_err();
+
+        assert!(
+            matches!(err, SetupError::Io { op: "create config directory", ref path, .. } if path == &blocker),
+            "unexpected error: {err:?}"
+        );
     }
 }

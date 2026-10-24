@@ -41,10 +41,12 @@ use serde_json::Value;
 use crate::event::PiEventType;
 use crate::wire::RawPiEvent;
 
-/// Extracts cumulative `(tokens, cost_usd)` from a pi `context` event's
+/// Extracts `(tokens, cost_usd)` from a pi `context` event's
 /// `messages[]` array.
 ///
-/// Pi's wire shape (verified by the spike trace):
+/// Pi's wire shape. Captured: pi, version not recorded, 2026-05-02
+/// spike trace (see the crate docs). pi 0.73.1 sends the same shape
+/// (`tests/fixtures/pi_tool_run_0.73.1.jsonl`).
 /// ```jsonc
 /// "messages": [
 ///   { "role": "user", ... },
@@ -60,16 +62,18 @@ use crate::wire::RawPiEvent;
 /// ]
 /// ```
 ///
-/// Cost values are *cumulative for the session* — pi reports the
-/// running total on each assistant message. We pick the **last**
-/// message that has a usage object so we always get the latest
-/// cumulative numbers. Either field returns `None` if not present.
+/// Usage and cost are *per request*, not session totals: pi prices each
+/// reply on its own. Captured: pi 0.73.1, 2026-10-24, the fixture above,
+/// whose two replies cost 0.0033 and 0.003675. We pick the **last**
+/// message that has a usage object, so the result covers the latest
+/// request only (see the crate docs' known gaps). Either field returns
+/// `None` if not present.
 fn extract_context_usage(messages: Option<&Value>) -> (Option<u64>, Option<f64>) {
     let Some(arr) = messages.and_then(Value::as_array) else {
         return (None, None);
     };
     // Walk in reverse — the last assistant message has the freshest
-    // cumulative usage.
+    // usage.
     for msg in arr.iter().rev() {
         let Some(usage) = msg.get("usage") else {
             continue;
@@ -218,10 +222,10 @@ impl RawPiEvent {
             PiEventType::Context => {
                 // Pi's `context` event carries the full conversation
                 // snapshot in `messages[]`. Each assistant message has
-                // `usage.{cost.total, totalTokens, provider, model}`.
-                // We extract just cost+tokens from the *latest*
-                // message that carries usage info — pi reports
-                // cumulative session-wide values there.
+                // `usage.{cost.total, totalTokens}` beside `provider`
+                // and `model`. We extract just cost+tokens from the
+                // *latest* message that carries usage info; pi reports
+                // them per request, not per session.
                 let (tokens, cost_usd) = extract_context_usage(p.messages.as_ref());
                 if tokens.is_none() && cost_usd.is_none() {
                     return None;
@@ -292,7 +296,8 @@ mod tests {
 
     #[test]
     fn atm_needs_input_open_plumbs_title_into_label() {
-        // Real shape: pi-atm forwards `title` from the
+        // Synthetic: no permission-gate run has been captured.
+        // pi-atm forwards `title` from the
         // intercepted ctx.ui.select call so the TUI can show
         // the gated command (or whatever the dialog asked).
         let payload = PiPayload {
@@ -313,8 +318,8 @@ mod tests {
 
     #[test]
     fn context_event_extracts_latest_usage_into_context_update() {
-        // Real-shape payload mirroring the spike's
-        // /tmp/atm-pi-spike-pid1226148-2026-05-02 trace line.
+        // Captured: pi, version not recorded, 2026-05-02 spike trace
+        // (see the crate docs).
         let messages = serde_json::json!([
             {"role": "user", "content": "Use ls to list /tmp"},
             {
@@ -357,6 +362,8 @@ mod tests {
 
     #[test]
     fn context_event_with_no_usage_returns_none() {
+        // Synthetic: hand-made messages. The real no-usage case is the
+        // fixture's first `context` (see captured_tool_run_translates).
         let messages = serde_json::json!([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"} // no usage
@@ -445,6 +452,8 @@ mod tests {
 
     #[test]
     fn non_interactive_input_is_suppressed() {
+        // Synthetic: `internal` isn't a pi 0.73.1 source (those are
+        // interactive, rpc and extension).
         let e = raw(
             PiEventType::Input,
             PiPayload {
@@ -497,6 +506,7 @@ mod tests {
 
     #[test]
     fn tool_call_with_known_tool_uses_canonical_variant() {
+        // Synthetic: pi 0.73.1's own tools are lowercase (`bash`).
         // If pi happens to emit a tool name we recognize (e.g. "Bash"
         // when wrapping a Claude bridge), we land in the canonical
         // variant — same Tool::Bash as the Claude side.
@@ -518,10 +528,10 @@ mod tests {
 
     #[test]
     fn tool_call_with_needs_user_input_becomes_permission_gate() {
-        // Pi has no permission event. The TS extension synthesizes
-        // this by setting needs_user_input=true when it reaches
-        // ctx.ui.select(...). This is THE load-bearing finding from
-        // the spike.
+        // Synthetic: no pi-atm version has sent needs_user_input; it
+        // signals the gate with atm_needs_input_open instead. This
+        // covers the inline-flag path `to_lifecycle_event` still
+        // supports.
         let e = raw(
             PiEventType::ToolCall,
             PiPayload {
@@ -623,6 +633,8 @@ mod tests {
 
     #[test]
     fn model_select_becomes_provider_model_change() {
+        // Synthetic: top-level `provider`. pi 0.73.1 sends it only as
+        // `model.provider` (see the crate docs).
         let e = raw(
             PiEventType::ModelSelect,
             PiPayload {
@@ -655,6 +667,97 @@ mod tests {
             PiPayload::default(),
         );
         assert_eq!(e.to_lifecycle_event(), None);
+    }
+
+    #[test]
+    fn captured_tool_run_translates() {
+        // Captured: pi 0.73.1, 2026-10-24, pi's TUI in a private tmux
+        // server with pi-atm loaded, each frame tapped byte for byte by
+        // `socat -r` on its way to an isolated atmd. A local fake
+        // OpenAI-compatible provider answered (no model call); Ctrl+P
+        // cycled fake-a to fake-b. session_id absent: pi-atm bug, queued.
+        let frames: Vec<Value> = include_str!("../tests/fixtures/pi_tool_run_0.73.1.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture line"))
+            .collect();
+
+        // pi 0.73.1 nests the provider in `model`; there is no top-level
+        // `provider` for the adapter to read (see the crate docs).
+        let model_payload = &frames[1]["data"]["payload"];
+        assert_eq!(model_payload["model"]["provider"], "atmfake");
+        assert_eq!(model_payload.get("provider"), None);
+
+        let raws: Vec<RawPiEvent> = frames
+            .iter()
+            .map(|frame| serde_json::from_value(frame["data"].clone()).expect("pi_event data"))
+            .collect();
+        // pi-atm's envelope: pid and tmux_pane on every frame, which is
+        // how atmd keys the session. session_id absent: pi-atm bug, queued.
+        for raw in &raws {
+            assert_eq!(raw.pid, Some(1_187_873));
+            assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
+            assert_eq!(raw.session_id, None);
+        }
+
+        let events: Vec<Option<LifecycleEvent>> =
+            raws.iter().map(RawPiEvent::to_lifecycle_event).collect();
+        let [start, model, input, working, first_context, tool_start, tool_end, context, working_end, end] =
+            events.as_slice()
+        else {
+            panic!("expected 10 frames, got {}", events.len());
+        };
+
+        assert_eq!(
+            start,
+            &Some(LifecycleEvent::SessionStart {
+                source: Some("startup".into())
+            })
+        );
+        assert!(matches!(
+            model,
+            Some(LifecycleEvent::ProviderModelChange { model: Some(id), .. }) if id == "fake-b"
+        ));
+        assert_eq!(
+            input,
+            &Some(LifecycleEvent::PromptSubmit {
+                prompt: Some("Read note.txt and reply.".into())
+            })
+        );
+        assert_eq!(working, &Some(LifecycleEvent::WorkingStart));
+        // The first `context` fires before any reply, so it has no usage.
+        assert_eq!(first_context, &None);
+        assert_eq!(
+            tool_start,
+            &Some(LifecycleEvent::ToolCallStart {
+                name: Tool::from("read"),
+                tool_use_id: Some("call_f3probe".into()),
+                input: Some(serde_json::json!({"path": "note.txt"})),
+            })
+        );
+        assert_eq!(
+            tool_end,
+            &Some(LifecycleEvent::ToolCallEnd {
+                name: Tool::from("read"),
+                tool_use_id: Some("call_f3probe".into()),
+                is_error: false,
+            })
+        );
+        assert_eq!(
+            context,
+            &Some(LifecycleEvent::ContextUpdate {
+                tokens: Some(1020),
+                current_tokens: None,
+                context_window_size: None,
+                cost_usd: Some(0.0033),
+            })
+        );
+        assert_eq!(working_end, &Some(LifecycleEvent::WorkingEnd));
+        assert_eq!(
+            end,
+            &Some(LifecycleEvent::SessionEnd {
+                reason: Some("quit".into())
+            })
+        );
     }
 
     // ========================================================================

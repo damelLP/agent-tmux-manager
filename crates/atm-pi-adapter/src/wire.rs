@@ -1,8 +1,9 @@
 //! pi wire payload deserialization.
 //!
-//! Matches the JSONL format the pi extension API produces (verified
-//! against real traces in `/tmp/atm-pi-spike-*.jsonl` from spike
-//! `agent-tmux-manager-9dn`).
+//! Matches the JSONL format the pi extension API produces.
+//! Captured: pi, version not recorded, 2026-05-02 spike trace (see the
+//! crate docs). Re-captured with pi 0.73.1 on 2026-10-24:
+//! `tests/fixtures/pi_tool_run_0.73.1.jsonl`.
 //!
 //! The TS extension subscribes via `pi.on(eventName, handler)` and
 //! forwards `{ event: <name>, payload: <object> }` to atmd. We
@@ -30,6 +31,8 @@ pub struct RawPiEvent {
 
     // === Fields injected by the TS extension ===
     /// Session id (resolved from pi's session manager at emission time).
+    /// Always `None` with pi 0.73.1: pi-atm reads a property pi no longer
+    /// has (see the crate docs).
     #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub session_id: Option<String>,
     /// Pi process pid (so atmd can correlate to /proc).
@@ -83,6 +86,8 @@ pub struct PiPayload {
     pub text: Option<String>,
 
     // === Model select ===
+    /// Always `None` for pi 0.73.1's `model_select`, which sends the
+    /// provider only as `model.provider` (see the crate docs).
     #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub provider: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_stringish")]
@@ -152,7 +157,14 @@ fn non_empty(s: String) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Sample line from `/tmp/atm-pi-spike-pid1226148-2026-05-02T08-55-56-043Z.jsonl`.
+    // The `parse_*` payloads below follow the spike trace.
+    // Captured: pi, version not recorded, 2026-05-02 spike trace (see
+    // the crate docs). Only the session_start payload was recorded as a
+    // line from that trace; the others name no source. pi 0.73.1 sends
+    // the same fields: `tests/fixtures/pi_tool_run_0.73.1.jsonl`, plus
+    // the tool_execution_start and tool_result lines pi-atm doesn't
+    // forward, from the same run's pi-spike tracer (quoted in PR #73).
+
     #[test]
     fn parse_session_start_real_payload() {
         let json = r#"{
@@ -199,7 +211,8 @@ mod tests {
 
     #[test]
     fn parse_tool_call_undeclared_event() {
-        // tool_call is undeclared in pi's TypeScript types but real.
+        // tool_call was undeclared in pi's TypeScript types at the spike;
+        // pi 0.73.1 declares it.
         let json = r#"{
             "event": "tool_call",
             "payload": {
@@ -252,8 +265,10 @@ mod tests {
 
     #[test]
     fn stringish_fields_accept_object_ids() {
-        // Regression shape for atmd log error:
-        // `Parse error: invalid type: map, expected a string` from pi-atm.
+        // Synthetic: shape rebuilt from the atmd log error
+        // `Parse error: invalid type: map, expected a string` from pi-atm
+        // (#25). pi 0.73.1's real model_select sends `model` as an object
+        // but has no top-level `provider` (see the crate docs).
         // Some pi extension/runtime fields are object-like even when ATM only
         // needs their stable string id. The adapter should not drop the entire
         // event on that schema drift.
@@ -281,6 +296,7 @@ mod tests {
 
     #[test]
     fn stringish_payload_fields_drop_unlabeled_objects_instead_of_failing_parse() {
+        // Synthetic: object-valued `text`, a drift case for #25.
         let json = r#"{
             "event": "input",
             "payload": {

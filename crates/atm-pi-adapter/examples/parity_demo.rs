@@ -1,9 +1,14 @@
 //! Parity demonstration: same conceptual operation, two vendors, same
 //! `LifecycleEvent` output.
 //!
-//! Reads real wire payloads as the daemon would receive them, runs each
+//! Reads wire payloads as the daemon would receive them, runs each
 //! through its respective adapter's translation, and prints the
 //! resulting `LifecycleEvent` side-by-side.
+//!
+//! Synthetic: the payloads are hand-written to mirror Claude's, and
+//! several use values pi 0.73.1 doesn't send: tool `Bash` (pi's is
+//! `bash`), shutdown reason `clear`, `needs_user_input`, and Case 4's
+//! top-level `provider`.
 //!
 //! Run with:
 //!
@@ -85,6 +90,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     // ---- CASE 4: provider/model change (pi-only event) ----
+    // Synthetic: top-level `provider`. pi 0.73.1 sends it only as
+    // `model.provider` (see the atm-pi-adapter crate docs).
     println!("──────────────────────────────────────────────────────────────────");
     println!("Case 4: Provider/model change (pi-only — Claude has no analog)");
     let pi_json = r#"{

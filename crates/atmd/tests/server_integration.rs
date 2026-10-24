@@ -1260,6 +1260,9 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
 // connection layer hands off to atm-pi-adapter and produces the
 // expected session state. They are the wire-level counterpart to
 // the unit tests in atm-pi-adapter::translate.
+//
+// Synthetic: payloads hand-built with `pi_event_json`. The real pi
+// 0.73.1 capture is atm-pi-adapter's tests/fixtures/pi_tool_run_0.73.1.jsonl.
 // ============================================================================
 
 fn pi_event_json(event: &str, payload: serde_json::Value) -> serde_json::Value {

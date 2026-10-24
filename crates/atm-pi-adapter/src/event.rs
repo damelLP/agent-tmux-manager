@@ -1,8 +1,14 @@
 //! pi event-name vocabulary.
 //!
-//! Sourced from pi's `dist/core/extensions/types.d.ts` (declared) plus
-//! two undeclared events (`tool_call`, `tool_result`) confirmed real by
-//! the `agent-tmux-manager-9dn` spike trace under `extensions/pi-spike/`.
+//! Sourced from pi's `dist/core/extensions/types.d.ts`. At the
+//! `agent-tmux-manager-9dn` spike (2026-05-02, pi version not recorded)
+//! two events, `tool_call` and `tool_result`, were undeclared there but
+//! confirmed real by the trace under `extensions/pi-spike/`.
+//!
+//! Captured: pi 0.73.1, 2026-10-24, the `on(event: ...)` names in that
+//! file. It declares 29 events, `tool_call` and `tool_result` included.
+//! All but `thinking_level_select` are variants here; that one lands
+//! in `Other`, and pi-atm doesn't forward it.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -49,11 +55,12 @@ pub enum PiEventType {
     ToolExecutionStart,
     ToolExecutionUpdate,
     ToolExecutionEnd,
-    /// Undeclared in pi's type union but real — fires alongside
-    /// `tool_execution_start`. Permission-gate hook point.
+    /// Undeclared in pi's type union at the spike, declared in pi
+    /// 0.73.1 — fires alongside `tool_execution_start`. Permission-gate
+    /// hook point.
     ToolCall,
-    /// Undeclared in pi's type union but real — fires alongside
-    /// `tool_execution_end`.
+    /// Undeclared in pi's type union at the spike, declared in pi
+    /// 0.73.1 — fires alongside `tool_execution_end`.
     ToolResult,
 
     // === Misc ===

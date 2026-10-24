@@ -193,8 +193,8 @@ impl RawPiEvent {
             }
 
             PiEventType::ModelSelect => LifecycleEvent::ProviderModelChange {
-                provider: p.provider.clone(),
-                model: p.model.clone(),
+                provider: p.model.as_ref().and_then(|m| m.provider.clone()),
+                model: p.model.as_ref().map(|m| m.id.clone()),
             },
 
             // Synthetic events emitted by `pi-atm` when it detects
@@ -265,7 +265,7 @@ impl RawPiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::PiPayload;
+    use crate::wire::{PiModel, PiPayload};
 
     fn raw(event: PiEventType, payload: PiPayload) -> RawPiEvent {
         RawPiEvent {
@@ -633,13 +633,13 @@ mod tests {
 
     #[test]
     fn model_select_becomes_provider_model_change() {
-        // Synthetic: top-level `provider`. pi 0.73.1 sends it only as
-        // `model.provider` (see the crate docs).
         let e = raw(
             PiEventType::ModelSelect,
             PiPayload {
-                provider: Some("openai-codex".into()),
-                model: Some("gpt-5.5".into()),
+                model: Some(PiModel {
+                    id: "gpt-5.5".into(),
+                    provider: Some("openai-codex".into()),
+                }),
                 ..Default::default()
             },
         );
@@ -682,7 +682,7 @@ mod tests {
             .collect();
 
         // pi 0.73.1 nests the provider in `model`; there is no top-level
-        // `provider` for the adapter to read (see the crate docs).
+        // `provider`.
         let model_payload = &frames[1]["data"]["payload"];
         assert_eq!(model_payload["model"]["provider"], "atmfake");
         assert_eq!(model_payload.get("provider"), None);
@@ -716,10 +716,13 @@ mod tests {
                 source: Some("startup".into())
             })
         );
-        assert!(matches!(
+        assert_eq!(
             model,
-            Some(LifecycleEvent::ProviderModelChange { model: Some(id), .. }) if id == "fake-b"
-        ));
+            &Some(LifecycleEvent::ProviderModelChange {
+                provider: Some("atmfake".into()),
+                model: Some("fake-b".into()),
+            })
+        );
         assert_eq!(
             input,
             &Some(LifecycleEvent::PromptSubmit {

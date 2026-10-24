@@ -86,12 +86,8 @@ pub struct PiPayload {
     pub text: Option<String>,
 
     // === Model select ===
-    /// Always `None` for pi 0.73.1's `model_select`, which sends the
-    /// provider only as `model.provider` (see the crate docs).
-    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
-    pub provider: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_stringish")]
-    pub model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub model: Option<PiModel>,
 
     // === Context event (carries cost/tokens) ===
     /// `messages[]` — full conversation snapshot.
@@ -115,12 +111,37 @@ pub struct PiPayload {
     pub title: Option<String>,
 }
 
+/// pi's `Model` object, cut to what ATM reads: `model_select` sends
+/// `{id, provider, contextWindow, …}`. Captured: pi 0.73.1,
+/// `tests/fixtures/pi_tool_run_0.73.1.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiModel {
+    pub id: String,
+    pub provider: Option<String>,
+}
+
 fn deserialize_optional_stringish<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value.and_then(string_from_value))
+}
+
+/// Accepts pi's `Model` object or a bare id, with the stringish rules
+/// for each part. No id means no model.
+fn deserialize_optional_model<'de, D>(deserializer: D) -> Result<Option<PiModel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|mut value| {
+        let provider = value
+            .get_mut("provider")
+            .map(Value::take)
+            .and_then(string_from_value);
+        string_from_value(value).map(|id| PiModel { id, provider })
+    }))
 }
 
 fn string_from_value(value: Value) -> Option<String> {
@@ -267,8 +288,8 @@ mod tests {
     fn stringish_fields_accept_object_ids() {
         // Synthetic: shape rebuilt from the atmd log error
         // `Parse error: invalid type: map, expected a string` from pi-atm
-        // (#25). pi 0.73.1's real model_select sends `model` as an object
-        // but has no top-level `provider` (see the crate docs).
+        // (#25). pi's real `model` object (0.43.0 to 0.73.1) also carries
+        // `provider`; this one has only an id.
         // Some pi extension/runtime fields are object-like even when ATM only
         // needs their stable string id. The adapter should not drop the entire
         // event on that schema drift.
@@ -278,7 +299,6 @@ mod tests {
             "tmux_pane": {"id": "%28"},
             "payload": {
                 "type":"model_select",
-                "provider": {"id":"anthropic"},
                 "model": {"id":"claude-sonnet-4-6"}
             }
         }"#;
@@ -290,8 +310,48 @@ mod tests {
             Some("019e3c43-c15a-740c-9a59-8faba2531283")
         );
         assert_eq!(raw.tmux_pane.as_deref(), Some("%28"));
-        assert_eq!(raw.payload.provider.as_deref(), Some("anthropic"));
-        assert_eq!(raw.payload.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            raw.payload.model,
+            Some(PiModel {
+                id: "claude-sonnet-4-6".into(),
+                provider: None,
+            })
+        );
+    }
+
+    #[test]
+    fn model_without_an_id_is_dropped_instead_of_failing_parse() {
+        // Synthetic: a drift case for #25. pi's `Model.id` is a required
+        // string, so no release sends these.
+        for model in [r#"{"provider": "anthropic"}"#, "[]", "null"] {
+            let json = format!(
+                r#"{{"event": "model_select", "payload": {{"type": "model_select", "model": {model}}}}}"#
+            );
+
+            let raw: RawPiEvent = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(raw.payload.model, None, "model {model}");
+        }
+    }
+
+    #[test]
+    fn model_accepts_a_bare_id() {
+        // Synthetic: no pi release sends a string `model`; the stringish
+        // field accepted one before `PiModel`, so it still does.
+        let json = r#"{
+            "event": "model_select",
+            "payload": {"type": "model_select", "model": "gpt-5.5"}
+        }"#;
+
+        let raw: RawPiEvent = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            raw.payload.model,
+            Some(PiModel {
+                id: "gpt-5.5".into(),
+                provider: None,
+            })
+        );
     }
 
     #[test]

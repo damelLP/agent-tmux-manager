@@ -7,8 +7,7 @@
 //!
 //! Synthetic: the payloads are hand-written to mirror Claude's, and
 //! several use values pi 0.73.1 doesn't send: tool `Bash` (pi's is
-//! `bash`), shutdown reason `clear`, `needs_user_input`, and Case 4's
-//! top-level `provider`.
+//! `bash`), shutdown reason `clear` and `needs_user_input`.
 //!
 //! Run with:
 //!
@@ -90,16 +89,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     // ---- CASE 4: provider/model change (pi-only event) ----
-    // Synthetic: top-level `provider`. pi 0.73.1 sends it only as
-    // `model.provider` (see the atm-pi-adapter crate docs).
+    // pi's `model` object, cut to the fields the adapter reads.
     println!("──────────────────────────────────────────────────────────────────");
     println!("Case 4: Provider/model change (pi-only — Claude has no analog)");
     let pi_json = r#"{
         "event": "model_select",
         "payload": {
             "type": "model_select",
-            "provider": "openai-codex",
-            "model": "gpt-5.5"
+            "model": {"id": "gpt-5.5", "provider": "openai-codex"}
         }
     }"#;
     let pi: RawPiEvent = serde_json::from_str(pi_json)?;

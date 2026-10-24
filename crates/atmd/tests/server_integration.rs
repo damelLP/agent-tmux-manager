@@ -2070,8 +2070,8 @@ async fn test_e2e_codex_malformed_tool_event_is_suppressed() {
     server.shutdown().await;
 }
 
-/// The hook payloads in atm-codex-adapter's captured codex-cli 0.163.0
-/// fixture, as codex wrote them to the hook's stdin, each given this
+/// The hook payloads in one of atm-codex-adapter's captured codex-cli
+/// 0.163.0 fixtures, as codex wrote them to the hook's stdin, each given this
 /// test's pid as atm-codex-hook would add one.
 ///
 /// `None` outside the workspace: atmd's tests ship in its crates.io
@@ -2141,10 +2141,8 @@ async fn test_e2e_codex_captured_session_replay() {
         (tool_end, "working", Some("Thinking")),
         (stop, "idle", None),
         (pre_compact, "working", Some("Compacting")),
-        // Known gap (crate docs): no Stop follows a manual /compact and
-        // PostCompact changes no status, so the row stays Working until
-        // the next prompt. Flip this with the fix.
-        (post_compact, "working", Some("Compacting")),
+        // No Stop follows a manual /compact, so PostCompact ends it.
+        (post_compact, "idle", None),
     ];
     let state = |s: &SessionView| (s.status_label.clone(), s.activity_detail.clone());
     let mut seen = Vec::new();
@@ -2170,6 +2168,84 @@ async fn test_e2e_codex_captured_session_replay() {
     );
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_codex_captured_auto_compact_replay() {
+    // Captured: codex-cli 0.163.0, 2026-10-24, auto compactions in the
+    // TUI (mid-turn, then before the next turn) and in `codex exec`
+    // (after the turn's Stop); see atm-codex-adapter's crate docs.
+    // (status, activity) after a payload.
+    type Step = (&'static str, Option<&'static str>);
+    const IDLE: Step = ("idle", None);
+    const WORKING: Step = ("working", None);
+    const BASH: Step = ("working", Some("Bash"));
+    const THINKING: Step = ("working", Some("Thinking"));
+    const COMPACTING: Step = ("working", Some("Compacting"));
+    // One step per payload but the final SessionEnd.
+    let tui = [
+        IDLE,       // SessionStart startup
+        WORKING,    // UserPromptSubmit
+        BASH,       // PreToolUse
+        THINKING,   // PostToolUse
+        COMPACTING, // PreCompact auto, mid-turn
+        IDLE,       // PostCompact auto
+        // Known gap (crate docs): the turn is still running, but
+        // SessionStart{compact} shows the row idle until its next event.
+        IDLE,       // SessionStart compact
+        IDLE,       // Stop
+        COMPACTING, // PreCompact auto: the next prompt compacts first
+        IDLE,       // PostCompact auto
+        IDLE,       // SessionStart compact
+        WORKING,    // UserPromptSubmit
+        BASH,       // PreToolUse
+        THINKING,   // PostToolUse
+        COMPACTING, // PreCompact auto, mid-turn
+        IDLE,       // PostCompact auto
+        IDLE,       // SessionStart compact: the same known gap
+        IDLE,       // Stop
+    ];
+    let exec = [
+        IDLE,       // SessionStart startup
+        WORKING,    // UserPromptSubmit
+        BASH,       // PreToolUse
+        THINKING,   // PostToolUse
+        IDLE,       // Stop
+        COMPACTING, // PreCompact auto, after Stop
+        IDLE,       // PostCompact auto: nothing follows it
+    ];
+    let cases: [(&str, &[Step]); 2] = [
+        ("codex_tui_auto_compact_0.163.0.jsonl", &tui),
+        ("codex_exec_post_turn_compact_0.163.0.jsonl", &exec),
+    ];
+    for (fixture, steps) in cases {
+        let Some(events) = captured_codex_events(fixture) else {
+            return;
+        };
+        let Some((end, events)) = events.split_last() else {
+            panic!("{fixture} is empty");
+        };
+        assert_eq!(events.len(), steps.len(), "{fixture}");
+
+        let (server, registry) = TestServer::spawn_with_registry().await;
+        let mut client = server.connect().await;
+        client.handshake(None).await;
+        let state = |s: &SessionView| (s.status_label.clone(), s.activity_detail.clone());
+        let mut seen = Vec::new();
+        let mut expected = Vec::new();
+        for (seq, (event, (label, detail))) in (1..).zip(events.iter().zip(steps)) {
+            let sessions = apply_codex_event(&mut client, &registry, seq, event).await;
+            let name = event["hook_event_name"].as_str().unwrap_or_default();
+            seen.push((name, sessions.iter().map(state).collect::<Vec<_>>()));
+            let want = vec![(label.to_string(), detail.map(String::from))];
+            expected.push((name, want));
+        }
+        assert_eq!(seen, expected, "{fixture}");
+
+        let sessions = apply_codex_event(&mut client, &registry, 0, end).await;
+        assert!(sessions.is_empty(), "{fixture}: {sessions:?}");
+        server.shutdown().await;
+    }
 }
 
 #[tokio::test]

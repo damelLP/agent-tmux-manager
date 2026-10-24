@@ -9,11 +9,12 @@
 //!
 //! Captured: codex-cli 0.146.1, 2026-08-10, the spike, for the 7 events
 //! it saw. Captured: codex-cli 0.163.0, 2026-10-24, those 7 plus
-//! `PreCompact` (trigger `manual` only) and `PostCompact`, in
-//! `captured_tui_session_translates`. No capture has produced
-//! `SubagentStart`, `SubagentStop`, an unknown event, or a
-//! `PermissionRequest` without a tool; those rows are tested
-//! synthetically.
+//! `PreCompact` and `PostCompact` with trigger `manual`, in
+//! `captured_tui_session_translates`, and with trigger `auto` (mid-turn,
+//! before a turn, after `Stop`), in `captured_auto_compaction_translates`.
+//! No capture has produced `SubagentStart`, `SubagentStop`, an unknown
+//! event, a `PermissionRequest` without a tool, or a `PostCompact`
+//! without a trigger; those rows are tested synthetically.
 //!
 //! | Codex event         | LifecycleEvent                                  |
 //! |---------------------|-------------------------------------------------|
@@ -24,7 +25,7 @@
 //! | `PostToolUse`       | `ToolCallEnd { name, tool_use_id, is_error: false }` |
 //! | `PermissionRequest` | `NeedsInput { PermissionGate { tool } }` (or generic `NeedsInput` without a tool) |
 //! | `PreCompact`        | `ContextCompactStart { trigger }`               |
-//! | `PostCompact`       | `Notification { kind: Other("post_compact") }`  |
+//! | `PostCompact`       | `WorkingEnd` (any trigger)                      |
 //! | `Stop`              | `WorkingEnd`                                    |
 //! | `SubagentStart`     | `ChildSessionStart { id, role }`                |
 //! | `SubagentStop`      | `ChildSessionEnd { id }`                        |
@@ -47,6 +48,14 @@
 //!   dropping it would leave a genuinely-blocked session showing
 //!   "working" forever — a worse failure mode than an unlabelled
 //!   needs-input state.
+//! - **`PostCompact` ends work.** Codex fires `SessionStart{compact}`
+//!   only when the next model request starts, so nothing follows a
+//!   manual `/compact` or a compaction after `Stop` until the user
+//!   prompts. Mid-turn and pre-turn compactions reach the same idle
+//!   state one event later, through that `SessionStart{compact}`. Claude
+//!   Code 2.1.310 fires `SessionStart{compact}` as soon as compaction
+//!   ends (static read of its bundle, not run), so the Claude adapter
+//!   needs no such mapping.
 
 use atm_core::{LifecycleEvent, NeedsInputReason, NotificationKind, Tool};
 
@@ -117,14 +126,10 @@ impl RawCodexEvent {
             CodexEventType::PreCompact => LifecycleEvent::ContextCompactStart {
                 trigger: self.trigger.clone(),
             },
-            // Codex-only concept with no first-class LifecycleEvent
-            // variant; ride the open NotificationKind tail (mirrors
-            // Claude's Setup → Notification(Setup) precedent) rather
-            // than growing atm-core for a single-vendor signal.
-            CodexEventType::PostCompact => LifecycleEvent::Notification {
-                message: None,
-                kind: Some(NotificationKind::from("post_compact")),
-            },
+            // No Stop follows a manual /compact or a compaction after
+            // Stop. Mid-turn and pre-turn compactions are followed by
+            // SessionStart{compact}, which already ends work.
+            CodexEventType::PostCompact => LifecycleEvent::WorkingEnd,
         })
     }
 }
@@ -345,14 +350,76 @@ mod tests {
     }
 
     #[test]
-    fn post_compact_to_notification() {
+    fn post_compact_without_trigger_to_working_end() {
+        // Synthetic: every captured PostCompact carries a trigger. The
+        // manual and auto triggers are covered by the captured tests.
         assert_eq!(
             raw("PostCompact").to_lifecycle_event(),
-            Some(LifecycleEvent::Notification {
-                message: None,
-                kind: Some(NotificationKind::Other("post_compact".into())),
-            })
+            Some(LifecycleEvent::WorkingEnd)
         );
+    }
+
+    fn captured(fixture: &str) -> Vec<RawCodexEvent> {
+        fixture
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture line"))
+            .collect()
+    }
+
+    #[test]
+    fn captured_auto_compaction_translates() {
+        // Captured: codex-cli 0.163.0, 2026-10-24, auto compactions in
+        // the TUI (mid-turn, then before the next turn's
+        // UserPromptSubmit) and in `codex exec` (after the turn's Stop),
+        // paths rewritten (see the crate docs). A local fake provider
+        // answered (no model call).
+        let tui = captured(include_str!(
+            "../tests/fixtures/codex_tui_auto_compact_0.163.0.jsonl"
+        ));
+        let exec = captured(include_str!(
+            "../tests/fixtures/codex_exec_post_turn_compact_0.163.0.jsonl"
+        ));
+        let names = |raws: &[RawCodexEvent]| -> Vec<String> {
+            raws.iter().map(|r| r.hook_event_name.clone()).collect()
+        };
+        let turn = ["UserPromptSubmit", "PreToolUse", "PostToolUse"];
+        let compaction = ["PreCompact", "PostCompact", "SessionStart"];
+        let mut tui_names = vec!["SessionStart"];
+        tui_names.extend(turn);
+        tui_names.extend(compaction);
+        tui_names.push("Stop");
+        tui_names.extend(compaction);
+        tui_names.extend(turn);
+        tui_names.extend(compaction);
+        tui_names.extend(["Stop", "SessionEnd"]);
+        assert_eq!(names(&tui), tui_names);
+        let mut exec_names = vec!["SessionStart"];
+        exec_names.extend(turn);
+        exec_names.extend(["Stop", "PreCompact", "PostCompact", "SessionEnd"]);
+        assert_eq!(names(&exec), exec_names);
+
+        for raw in tui.iter().chain(&exec) {
+            let expected = match raw.hook_event_name.as_str() {
+                "PreCompact" => LifecycleEvent::ContextCompactStart {
+                    trigger: Some("auto".into()),
+                },
+                // Mid-turn, before a turn, and after Stop alike.
+                "PostCompact" => LifecycleEvent::WorkingEnd,
+                // Codex starts the post-compaction context with a
+                // SessionStart; atm-core treats it as idle (Known gaps).
+                "SessionStart" if raw.source.as_deref() == Some("compact") => {
+                    LifecycleEvent::SessionStart {
+                        source: Some("compact".into()),
+                    }
+                }
+                _ => continue,
+            };
+            assert_eq!(
+                raw.trigger.is_some(),
+                raw.hook_event_name.ends_with("Compact")
+            );
+            assert_eq!(raw.to_lifecycle_event(), Some(expected), "{raw:?}");
+        }
     }
 
     #[test]
@@ -449,12 +516,11 @@ mod tests {
                 trigger: Some("manual".into())
             })
         );
+        // No Stop follows a manual /compact: PostCompact ends it.
+        assert_eq!(post_compact.trigger.as_deref(), Some("manual"));
         assert_eq!(
             post_compact.to_lifecycle_event(),
-            Some(LifecycleEvent::Notification {
-                message: None,
-                kind: Some(NotificationKind::Other("post_compact".into())),
-            })
+            Some(LifecycleEvent::WorkingEnd)
         );
         // Fired when the shared daemon stopped, not at `/quit`.
         assert_eq!(

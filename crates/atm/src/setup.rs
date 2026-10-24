@@ -258,8 +258,9 @@ fn has_atm_status_line(status_line: &Value) -> bool {
 /// Splits `cmd` into words roughly as a POSIX shell would, expanding
 /// nothing: quotes group and are dropped, a backslash escapes the next
 /// character (inside double quotes only `$`, `` ` ``, `"` and `\`; none
-/// inside single quotes), backslash-newline joins lines, and unquoted
-/// whitespace or one of `;&|()<>` ends a word.
+/// inside single quotes), backslash-newline joins lines, and an unquoted
+/// space, tab, newline (POSIX's default IFS) or one of `;&|()<>` ends a
+/// word. Other Unicode whitespace, such as NBSP, stays inside a word.
 fn shell_words(cmd: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word: Option<String> = None;
@@ -285,7 +286,7 @@ fn shell_words(cmd: &str) -> Vec<String> {
                 quote = Some(c);
                 word.get_or_insert_default();
             }
-            (None, c) if c.is_whitespace() || ";&|()<>".contains(c) => words.extend(word.take()),
+            (None, c) if " \t\n;&|()<>".contains(c) => words.extend(word.take()),
             (None, c) => word.get_or_insert_default().push(c),
         }
     }
@@ -1125,6 +1126,7 @@ mod shared_entry_tests {
             "\"/home/u/bin/atm-hook wrapper.sh\" --flag",
             "/home/u/bin/atm-hook\\ wrapper.sh",
             "\"/home/u/bin/atm\\-hook\"",
+            "/home/u/bin/atm-hook\u{a0}wrapper.sh",
         ] {
             let command = json!({"type": "command", "command": command});
             assert!(!is_marker_command(&command, "atm-hook"), "{command}");
@@ -1138,6 +1140,7 @@ mod shared_entry_tests {
             ["a", "b c", "d\"e", "f g", "h", "i", "j", "k", "l", "m"]
         );
         assert_eq!(shell_words("x '' y"), ["x", "", "y"]);
+        assert_eq!(shell_words("a\tb\nc\u{a0}d"), ["a", "b", "c\u{a0}d"]);
         assert_eq!(shell_words(r"'a\b'"), [r"a\b"]);
     }
 

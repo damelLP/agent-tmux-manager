@@ -318,7 +318,8 @@ fn arb_session_view() -> impl Strategy<Value = SessionView> {
 }
 
 // ---------------------------------------------------------------------------
-// Client MessageType strategy (covers every variant)
+// Client MessageType strategy (covers every variant; enforced by
+// `message_type_strategy_covers_every_variant`)
 // ---------------------------------------------------------------------------
 
 fn arb_message_type() -> impl Strategy<Value = MessageType> {
@@ -330,6 +331,10 @@ fn arb_message_type() -> impl Strategy<Value = MessageType> {
         arb_finite_json_value().prop_map(|data| MessageType::StatusUpdate { data }),
         // HookEvent { data: Value }
         arb_finite_json_value().prop_map(|data| MessageType::HookEvent { data }),
+        // PiEvent { data: Value }
+        arb_finite_json_value().prop_map(|data| MessageType::PiEvent { data }),
+        // CodexEvent { data: Value }
+        arb_finite_json_value().prop_map(|data| MessageType::CodexEvent { data }),
         // ListSessions
         Just(MessageType::ListSessions),
         // Subscribe { session_id: Option<SessionId> }
@@ -357,7 +362,8 @@ fn arb_client_message() -> impl Strategy<Value = ClientMessage> {
 }
 
 // ---------------------------------------------------------------------------
-// DaemonMessage strategy (covers every variant)
+// DaemonMessage strategy (covers every variant; enforced by
+// `daemon_message_strategy_covers_every_variant`)
 // ---------------------------------------------------------------------------
 
 fn arb_daemon_message() -> impl Strategy<Value = DaemonMessage> {

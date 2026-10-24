@@ -346,8 +346,7 @@ function patchUiSelectOnce(
 
 	// Note: `getSessionId` is a getter, not a value. It is read on every
 	// `select` call so synthetic events still carry the correct session
-	// id even when patching happens before `currentSessionId` is set
-	// (e.g. before the first `session_start` event fires).
+	// id even when patching happens before the id is cached.
 	ui.select = async function patchedSelect(
 		title: string,
 		options: string[],
@@ -369,8 +368,12 @@ function patchUiSelectOnce(
 export default function (pi: ExtensionAPI): void {
 	logDebug(`pi-atm starting, socket=${SOCKET}`);
 
-	// `sessionManager.currentSessionId` only becomes available after
-	// `session_start` fires. Cache it from the first event we see.
+	// pi loads extensions afresh whenever it replaces the session (/new,
+	// /resume, /fork, /reload), so this instance serves one session.
+	// Cache its id from the first event. Reading it live would mislabel
+	// one event: an in-memory fork (`--no-session`) moves the shared
+	// session manager to the new id before this instance's
+	// `session_shutdown` fires.
 	let cachedSessionId: string | undefined;
 	let uiPatched = false;
 
@@ -385,9 +388,10 @@ export default function (pi: ExtensionAPI): void {
 			try {
 				logDebug(`event fired: ${eventName}`);
 				if (!cachedSessionId) {
-					// Best-effort session id discovery via duck-typed access.
-					const ctxAny = ctx as { sessionManager?: { currentSessionId?: string } };
-					cachedSessionId = ctxAny.sessionManager?.currentSessionId;
+					// Duck-typed guard: if ctx lacks `getSessionId`, the event
+					// still goes out, without a session id.
+					const ctxAny = ctx as { sessionManager?: { getSessionId?: () => string } };
+					cachedSessionId = ctxAny.sessionManager?.getSessionId?.();
 				}
 				if (!uiPatched) {
 					// Patch `ctx.ui.select` once, the first time we have a ctx

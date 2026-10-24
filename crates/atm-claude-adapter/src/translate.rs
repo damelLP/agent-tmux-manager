@@ -536,6 +536,8 @@ mod tests {
 
     #[test]
     fn captured_subagent_run_preserves_routing_contract() {
+        // Captured: Claude Code 2.1.267, date not recorded (see the crate
+        // docs).
         let events: Vec<RawHookEvent> =
             include_str!("../tests/fixtures/claude_subagent_run_2.1.267.jsonl")
                 .lines()
@@ -557,6 +559,7 @@ mod tests {
 
     #[test]
     fn captured_tui_session_2_1_310_preserves_contract() {
+        // Captured: Claude Code 2.1.310, 2026-10-24 (see the crate docs).
         let events: Vec<RawHookEvent> =
             include_str!("../tests/fixtures/claude_tui_session_2.1.310.jsonl")
                 .lines()

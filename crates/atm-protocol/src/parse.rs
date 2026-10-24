@@ -3,14 +3,37 @@
 //! Currently houses Claude's status-line JSON parser. The
 //! Claude raw hook event vocabulary lives in the `atm-claude-adapter`
 //! crate; pi-shaped wire data lives in `atm-pi-adapter`. Future:
-//! `RawStatusLine` likely also moves to `atm-claude-adapter`.
+//! `RawStatusLine` likely also moves to `atm-claude-adapter`, with its
+//! fixture.
+//!
+//! ## Captured payloads
+//!
+//! `tests/fixtures/claude_status_line_2.1.310.jsonl` holds 14 status
+//! lines, one per line, as Claude wrote them to the statusLine command's
+//! stdin. Captured: Claude Code 2.1.310, 2026-10-24, the TUI run
+//! described under "Captured payloads" in `atm-claude-adapter`'s crate
+//! docs (a local fake Messages API, no model call; paths rewritten to
+//! `/home/user`). Every field `RawStatusLine` reads is on every line.
+//! `current_usage` and `used_percentage` are `null` until a session's
+//! first request, including the session `/clear` starts. The lines also
+//! carry fields the parser ignores: `effort`, `thinking`, `fast_mode`,
+//! `output_style`, `prompt_cache`, `prompt_id` and
+//! `workspace.added_dirs`.
+//!
+//! `test_update_session_applies_context_window_size` uses one status
+//! line trimmed to the fields read. Captured: Claude Code 2.1.302, a
+//! `--settings` statusLine override over startup, a turn, `/clear` and
+//! another turn; added in ada96c5 on 2026-10-18. The other test payloads
+//! are hand-written (see `Synthetic:` there).
 
 use atm_core::{SessionDomain, StatusLineData};
 use serde::Deserialize;
 
 /// Raw status line JSON structure from Claude Code.
 ///
-/// Based on validated integration testing (Week 1).
+/// Written in c2a89f0 on 2026-01-25 from "validated integration testing
+/// (Week 1)", Claude Code version not recorded. Re-checked against
+/// Claude Code 2.1.310 (see the module docs).
 /// All fields except session_id are optional to handle partial updates.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawStatusLine {
@@ -203,6 +226,12 @@ mod tests {
     use super::*;
     use atm_core::Model;
 
+    // Synthetic: unless marked Captured, the payloads in this module are
+    // hand-written, with placeholder ids (`test-123`) and models chosen
+    // for the case (`gpt-4o`, `gemini-1.5-pro`), Claude Code version not
+    // recorded. They were added in c2a89f0 (2026-01-25), d0147d7
+    // (2026-02-11) and ada96c5 (2026-10-18).
+
     #[test]
     fn test_raw_status_line_parsing() {
         let json = r#"{
@@ -394,7 +423,9 @@ mod tests {
             Model::Unknown,
         );
 
-        // Captured from Claude Code 2.1.302 (trimmed to relevant fields)
+        // Captured: Claude Code 2.1.302, a `--settings` statusLine
+        // override, trimmed to the fields read; added in ada96c5 on
+        // 2026-10-18.
         let json = r#"{
             "session_id": "5aaeafa7-b633-42c6-83fb-dcbe2f713074",
             "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
@@ -509,6 +540,7 @@ mod tests {
 
     #[test]
     fn captured_status_lines_2_1_310_parse() {
+        // Captured: Claude Code 2.1.310, 2026-10-24 (see the module docs).
         let sessions: Vec<SessionDomain> =
             include_str!("../tests/fixtures/claude_status_line_2.1.310.jsonl")
                 .lines()

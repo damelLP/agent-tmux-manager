@@ -88,6 +88,33 @@
 //! under Known gaps come from a logging hook that read the live rollout
 //! at each hook.
 //!
+//! `tests/fixtures/codex_tui_auto_compact_0.163.0.jsonl` holds a second
+//! TUI session's hook payloads. Captured: codex-cli 0.163.0, 2026-10-24,
+//! the same setup and rewrites as above, plus
+//! `model_auto_compact_token_limit = 1000` in `config.toml`, which every
+//! request's fake usage exceeds. Two prompts each ran one shell command
+//! without approval. The first compacted mid-turn, after its tool call.
+//! The second compacted before its `UserPromptSubmit` and again
+//! mid-turn. Each compaction fires `PreCompact` and `PostCompact`
+//! (trigger `auto`), then `SessionStart` with source `compact` as the
+//! next model request starts. `SessionEnd` fired when the daemon was
+//! stopped. In a third TUI run (not kept), a manual `/compact` followed
+//! by a prompt fired `SessionStart{compact}` only with that prompt,
+//! before its `UserPromptSubmit`.
+//!
+//! `tests/fixtures/codex_exec_post_turn_compact_0.163.0.jsonl` holds one
+//! `codex exec` run's hook payloads. Captured: codex-cli 0.163.0,
+//! 2026-10-24, `codex exec --dangerously-bypass-hook-trust
+//! --skip-git-repo-check <prompt> < /dev/null` (embedded mode, with no
+//! approval or sandbox flag) in the same sealed setup, with
+//! `model_post_turn_compact_threshold_percent = 1` and
+//! `model_context_window = 100000`, paths rewritten as above. Its
+//! payloads report `permission_mode: "bypassPermissions"`. One prompt
+//! ran one shell command. Codex compacted after the turn's `Stop`, and
+//! nothing followed `PostCompact` until `SessionEnd`. Whether the real
+//! backend turns post-turn compaction on by default is unverified; with
+//! only the token limit set, no run compacted after `Stop`.
+//!
 //! The JSON payloads in the `wire.rs` tests are trimmed copies of the
 //! spike's logs. Captured: codex-cli 0.146.1, 2026-08-10, the spike
 //! described above (`spike-log*.jsonl`, not kept); added in 49f2350 on
@@ -111,7 +138,12 @@
 //!   - `TMUX_PANE` in the hook's environment is the daemon's, inherited
 //!     from whichever TUI started it, so other sessions show that pane;
 //!   - `/quit` detaches ("Any running work continues") and fires no
-//!     `SessionEnd`; it arrives when the daemon stops.
+//!     `SessionEnd`; it arrives when the daemon stops;
+//!   - one session's events overwrite another's state on the shared
+//!     row. While session A waits on approval, session B's `PreCompact`
+//!     turns the row from needs-input to Working/"Compacting" and B's
+//!     `Stop` sets it idle, hiding A's approval either way. While A runs
+//!     a tool, B's `PostCompact` sets the row idle until A's next event.
 //!
 //!   From code reading, not run: atm's kill, interrupt (`C-c`) and
 //!   `atm send` act on the row's pane, so they reach the daemon's
@@ -127,12 +159,32 @@
 //!   `--no-daemon` flag is absent from codex-cli 0.155.0 and present in
 //!   0.158.0 (static check of the npm binaries, not run); that the
 //!   daemon is the default is checked on 0.163.0 only.
-//! - **A manual `/compact` leaves the row "Compacting".** Codex fires
-//!   `PreCompact` then `PostCompact` and no `Stop` (two TUI captures).
-//!   `PreCompact` sets Working/"Compacting", `PostCompact` maps to a
-//!   `Notification` that changes no status, and nothing demotes a quiet
-//!   Working row, so it stays Working until the next prompt. atmd's
-//!   `test_e2e_codex_captured_session_replay` pins this. Fix pending.
+//! - **A failed compaction leaves the row "Compacting".** When the fake
+//!   provider answered the summary request with a 400 (codex retried it
+//!   6 times), a manual `/compact` fired `PreCompact` and nothing else
+//!   (one TUI run, not kept). No hook ends it, so the row stays
+//!   Working/"Compacting" until the next prompt.
+//! - **A mid-turn auto compaction shows the row idle.** The turn goes on
+//!   to its `Stop`, but `PostCompact` (mapped to `WorkingEnd`) and the
+//!   `SessionStart{compact}` after it (atm-core's `SessionStart`) both
+//!   set Idle. The row shows idle while codex works, until its next tool
+//!   call or `Stop`. atmd's `test_e2e_codex_captured_auto_compact_replay`
+//!   pins this. In a timed TUI run against the fake provider,
+//!   `SessionStart{compact}` started about 25 ms after `PostCompact` and
+//!   before the next model request, so mapping `PostCompact` to
+//!   `WorkingEnd` brings the idle forward by about one hook's runtime.
+//!
+//!   Unverified, from code reasoning: the adapter maps each payload on
+//!   its own, and a mid-turn `PostCompact{auto}` and one after `Stop`
+//!   both carry their own turn's `turn_id`, so telling them apart needs
+//!   state from outside the payload. Candidates: the row's status before
+//!   `PreCompact`, restored when compaction ends (an atm-core change),
+//!   or the rollout's `task_started`/`task_complete` records, which
+//!   atmd already reads at each codex hook (their timing relative to
+//!   `PostCompact` not checked). Claude likely has the same gap: Claude
+//!   Code 2.1.310's compaction routine, which takes the trigger as a
+//!   parameter, fires `SessionStart{compact}` right after `PostCompact`
+//!   (static read of its bundle, not run).
 //! - **Usage lags one request mid-turn.** A logging hook that read the
 //!   live rollout at each hook saw no `token_count` at `PreToolUse`,
 //!   `PermissionRequest` or `PostToolUse` of a turn's first request, and

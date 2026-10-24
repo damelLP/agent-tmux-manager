@@ -556,6 +556,64 @@ mod tests {
     }
 
     #[test]
+    fn captured_tui_session_2_1_310_preserves_contract() {
+        let events: Vec<RawHookEvent> =
+            include_str!("../tests/fixtures/claude_tui_session_2.1.310.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("fixture line"))
+                .collect();
+        let lifecycle: Vec<LifecycleEvent> = events
+            .iter()
+            .map(|event| event.to_lifecycle_event().expect("known event"))
+            .collect();
+
+        let sources: Vec<_> = lifecycle
+            .iter()
+            .filter_map(|event| match event {
+                LifecycleEvent::SessionStart { source } => source.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, ["startup", "compact", "clear", "resume"]);
+        assert!(lifecycle.iter().any(|event| matches!(
+            event,
+            LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::Notification {
+                    label: Some(label), ..
+                }
+            } if label == "Bash: touch atm-probe.txt && echo atm-probe"
+        )));
+        assert!(lifecycle
+            .iter()
+            .any(|event| matches!(event, LifecycleEvent::ToolCallEnd { is_error: true, .. })));
+        assert!(lifecycle.contains(&LifecycleEvent::Idle));
+
+        // The Agent call runs in the background: the lead's third Stop
+        // arrives while the subagent still runs, the fourth after it ends.
+        let running: Vec<u32> = events
+            .iter()
+            .filter_map(RawHookEvent::background_activity)
+            .map(|activity| activity.running)
+            .collect();
+        assert_eq!(running, [0, 0, 1, 0]);
+        let routed: Vec<_> = events
+            .iter()
+            .filter(|event| event.child_agent().is_some())
+            .map(|event| event.hook_event_name.as_str())
+            .collect();
+        assert_eq!(routed, ["PreToolUse", "PostToolUse"]);
+
+        // `/compact` adds a SubagentStop with no SubagentStart.
+        let count = |name: &str| {
+            events
+                .iter()
+                .filter(|event| event.hook_event_name == name)
+                .count()
+        };
+        assert_eq!((count("SubagentStart"), count("SubagentStop")), (1, 2));
+    }
+
+    #[test]
     fn teammate_metadata_and_alias_are_extracted() {
         // Captured from a tmux teammate's own session (2.1.288): the
         // name is the sender's, so the event idles that session itself.

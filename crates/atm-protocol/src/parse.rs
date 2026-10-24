@@ -508,6 +508,31 @@ mod tests {
     }
 
     #[test]
+    fn captured_status_lines_2_1_310_parse() {
+        let sessions: Vec<SessionDomain> =
+            include_str!("../tests/fixtures/claude_status_line_2.1.310.jsonl")
+                .lines()
+                .map(|line| {
+                    let raw: RawStatusLine = serde_json::from_str(line).expect("fixture line");
+                    raw.to_session_domain().expect("model is present")
+                })
+                .collect();
+        assert_eq!(sessions.len(), 14);
+        for session in &sessions {
+            assert_eq!(session.model_display_override.as_deref(), Some("Opus 5.5"));
+            assert_eq!(session.context.context_window_size, 1_000_000);
+            assert_eq!(session.claude_code_version.as_deref(), Some("2.1.310"));
+        }
+
+        // Before the first request, `current_usage` is null.
+        assert_eq!(sessions[0].context.context_tokens().as_u64(), 0);
+        // After the first request: the fake provider's usage,
+        // 1002 input + 300 cache creation + 4000 cache read.
+        assert_eq!(sessions[2].context.context_tokens().as_u64(), 5302);
+        assert!((sessions[2].cost.as_usd() - 0.014292).abs() < 1e-9);
+    }
+
+    #[test]
     fn test_raw_status_line_partial_data() {
         // Status line with model but no cost/context should create session with defaults
         let json = r#"{

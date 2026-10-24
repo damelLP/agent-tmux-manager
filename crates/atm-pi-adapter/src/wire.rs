@@ -1,10 +1,9 @@
 //! pi wire payload deserialization.
 //!
 //! Matches the JSONL format the pi extension API produces.
-//! Captured: pi, version not recorded, 2026-05-02, spike
-//! `agent-tmux-manager-9dn` traces in `/tmp/atm-pi-spike-*.jsonl` (not
-//! kept); added in 7a20d86 on 2026-05-10. Re-captured with pi 0.73.1 on
-//! 2026-10-24: `tests/fixtures/pi_tool_run_0.73.1.jsonl`.
+//! Captured: pi, version not recorded, 2026-05-02 spike trace (see the
+//! crate docs). Re-captured with pi 0.73.1 on 2026-10-24:
+//! `tests/fixtures/pi_tool_run_0.73.1.jsonl`.
 //!
 //! The TS extension subscribes via `pi.on(eventName, handler)` and
 //! forwards `{ event: <name>, payload: <object> }` to atmd. We
@@ -32,6 +31,8 @@ pub struct RawPiEvent {
 
     // === Fields injected by the TS extension ===
     /// Session id (resolved from pi's session manager at emission time).
+    /// Always `None` with pi 0.73.1: pi-atm reads a property pi no longer
+    /// has (see the crate docs).
     #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub session_id: Option<String>,
     /// Pi process pid (so atmd can correlate to /proc).
@@ -157,14 +158,12 @@ mod tests {
     use super::*;
 
     // The `parse_*` payloads below follow the spike trace.
-    // Captured: pi, version not recorded, 2026-05-02 (trace
-    // /tmp/atm-pi-spike-pid1226148-2026-05-02T08-55-56-043Z.jsonl, not
-    // kept), pi-spike tracer in an interactive session; added in 7a20d86
-    // on 2026-05-10. Only the session_start payload was recorded as a
+    // Captured: pi, version not recorded, 2026-05-02 spike trace (see
+    // the crate docs). Only the session_start payload was recorded as a
     // line from that trace; the others name no source. pi 0.73.1 sends
-    // the same fields (`tests/fixtures/pi_tool_run_0.73.1.jsonl`; the
-    // same run's pi-spike tracer log for tool_execution_start and
-    // tool_result, which pi-atm doesn't forward).
+    // the same fields: `tests/fixtures/pi_tool_run_0.73.1.jsonl`, plus
+    // the tool_execution_start and tool_result lines pi-atm doesn't
+    // forward, from the same run's pi-spike tracer (quoted in PR #73).
 
     #[test]
     fn parse_session_start_real_payload() {

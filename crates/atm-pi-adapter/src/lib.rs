@@ -42,11 +42,15 @@
 //!
 //! Pi has *no* dedicated permission-prompt event. Permission gating
 //! happens *inside* an extension's `tool_call` handler via
-//! `ctx.ui.select(...)`. ATM's pi adapter therefore registers a
-//! `tool_call` handler and synthesizes
-//! [`atm_core::NeedsInputReason::PermissionGate`] when the gate is
-//! reached. A passive observer cannot detect this state; only an active
-//! extension can.
+//! `ctx.ui.select(...)`. pi-atm therefore wraps `ctx.ui.select` and
+//! emits the synthetic `atm_needs_input_open` / `atm_needs_input_resolved`
+//! events around the dialog. They translate to
+//! [`atm_core::NeedsInputReason::Notification`] (kind `PermissionPrompt`)
+//! and back to `WorkingStart`. The adapter still maps a `tool_call`
+//! with `needs_user_input: true` to
+//! [`atm_core::NeedsInputReason::PermissionGate`], but no pi-atm version
+//! sends that flag. A passive observer cannot detect this state; only
+//! an active extension can.
 //!
 //! ## Captured payloads
 //!
@@ -59,9 +63,16 @@
 //! `session_before_compact`, whose payload the adapter doesn't read.
 //! The `atm_needs_input_*` events are pi-atm's own, not pi's.
 //!
-//! The hand-copied payloads in the `wire.rs` and `translate.rs` tests
-//! come from the 2026-05-02 spike trace (pi version not recorded).
-//! Tests marked `Synthetic:` use shapes no capture produced.
+//! The hand-copied JSON payloads in the `wire.rs` and `translate.rs`
+//! tests follow the spike trace. Captured: pi, version not recorded,
+//! 2026-05-02 (trace
+//! `/tmp/atm-pi-spike-pid1226148-2026-05-02T08-55-56-043Z.jsonl`, not
+//! kept), pi-spike tracer in an interactive session, spike
+//! `agent-tmux-manager-9dn`; added in 7a20d86 on 2026-05-10.
+//!
+//! Tests that build `PiPayload` structs check mapping logic and claim
+//! no capture. `Synthetic:` marks the tests and examples whose shapes
+//! or values no capture produced.
 //!
 //! ## Known gaps (pi 0.73.1)
 //!
@@ -70,9 +81,21 @@
 //!   adapter reads a top-level `provider`, so
 //!   `ProviderModelChange.provider` is always `None`. Nothing reads it
 //!   yet: `SessionDomain` keeps only the model.
-//! - `model_select` fires only when the model changes (source `set`,
-//!   `cycle` or `restore`). A fresh session sends none, so its model
-//!   shows as unknown until the user switches.
+//! - `model_select` fires only when the user changes model: pi's source
+//!   emits it for `set` and `cycle`, never for the declared `restore`.
+//!   A fresh or resumed session sends none, so its model shows as
+//!   unknown until the user switches.
+//! - `model_select`'s `model.contextWindow` isn't passed on.
+//!   `ContextUpdate.context_window_size` is always `None`, so context
+//!   percentages use the unknown model's 200K default.
+//! - Each assistant message's `usage` and `cost` cover that request
+//!   only. The adapter takes the latest from each `context` event, and
+//!   atm-core stores it as the session's cost, so a pi session shows
+//!   one request's cost rather than its total. A turn's last reply
+//!   arrives only in `agent_end.messages`, which the adapter doesn't
+//!   read, so the figure also lags one request behind.
+//! - `input` becomes `PromptSubmit` only for source `interactive`.
+//!   Prompts with source `rpc` or `extension` are dropped.
 //! - pi-atm sends no `session_id`. It reads
 //!   `ctx.sessionManager.currentSessionId`, which pi 0.73.1 doesn't have
 //!   (its session manager has `getSessionId()`), so atmd keys pi

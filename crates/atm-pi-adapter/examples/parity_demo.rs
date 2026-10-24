@@ -5,8 +5,10 @@
 //! through its respective adapter's translation, and prints the
 //! resulting `LifecycleEvent` side-by-side.
 //!
-//! Synthetic: the payloads are hand-written in the captured shapes,
-//! except Case 4 (see there).
+//! Synthetic: the payloads are hand-written to mirror Claude's, and
+//! several use values pi 0.73.1 doesn't send: tool `Bash` (pi's is
+//! `bash`), shutdown reason `clear`, `needs_user_input`, and Case 4's
+//! top-level `provider`.
 //!
 //! Run with:
 //!

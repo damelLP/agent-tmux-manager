@@ -789,9 +789,10 @@ impl SessionDomain {
                     self.context.total_input_tokens = TokenCount::new(*t);
                     self.context.total_output_tokens = TokenCount::default();
                 }
-                // Pi only exposes the cumulative figure, so retain the
-                // historical fallback. Codex supplies a distinct active
-                // context count and does not need that approximation.
+                // Without `current_tokens`, `tokens` stands in for the
+                // active context. That fits pi-atm before its usage
+                // snapshot, which sends one request's total. Current
+                // pi-atm and Codex send both whenever they send `tokens`.
                 if let Some(t) = current_tokens.or(*tokens) {
                     self.context.current_input_tokens = TokenCount::new(t);
                     self.context.current_output_tokens = TokenCount::default();

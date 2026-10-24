@@ -1733,6 +1733,35 @@ async fn test_e2e_pi_captured_new_session_replaces_session() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn test_e2e_pi_captured_session_cost_is_cumulative() {
+    // Two prompts and three priced requests in one pi 0.73.1 session. Its
+    // cost is the sum, $0.01065, as pi's footer showed (`$0.011`), not the
+    // last request's $0.003675.
+    let Some(events) = captured_pi_events("pi_session_cost_0.73.1.jsonl") else {
+        return;
+    };
+    let (last, rest) = events.split_last().expect("captured frames");
+    assert_eq!(last["event"], "session_shutdown");
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    for event in rest {
+        client.send(ClientMessage::pi_event(event.clone())).await;
+    }
+
+    let done = |s: &[SessionView]| matches!(s, [one] if one.cost_usd == 0.01065);
+    let sessions = sessions_when(&registry, done).await;
+    let shown: Vec<(f64, &str)> = sessions
+        .iter()
+        .map(|s| (s.cost_usd, s.context_display.as_str()))
+        .collect();
+    assert_eq!(shown, [(0.01065, "3.8% (1.2K/32K)")]);
+
+    server.shutdown().await;
+}
+
 // ============================================================================
 // Codex Event → LifecycleEvent translation (end-to-end)
 //

@@ -264,11 +264,8 @@ fn install_executable_script(path: &Path, content: &str) -> Result<()> {
 
     #[cfg(unix)]
     {
-        let mut perms = fs::metadata(path)
-            .map_err(io_err("set permissions on", path))?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).map_err(io_err("set permissions on", path))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .map_err(io_err("set permissions on", path))?;
     }
 
     Ok(())
@@ -984,8 +981,9 @@ mod error_tests {
     use std::io;
     use std::path::Path;
 
-    /// Display must match the anyhow context strings setup printed before
-    /// SetupError existed, so `atm setup` output is unchanged.
+    /// For each `op` string used in this file, Display must match the anyhow
+    /// context string setup printed before SetupError existed (`serialize`
+    /// is new: that site had no context).
     #[test]
     fn display_matches_previous_messages() {
         let p = Path::new("/h/.claude/settings.json");
@@ -1031,6 +1029,10 @@ mod error_tests {
             (
                 json_err("parse", p)(json()),
                 "Failed to parse /h/.claude/settings.json",
+            ),
+            (
+                json_err("serialize", p)(json()),
+                "Failed to serialize /h/.claude/settings.json",
             ),
             (
                 SetupError::Shape("hooks is not an object"),

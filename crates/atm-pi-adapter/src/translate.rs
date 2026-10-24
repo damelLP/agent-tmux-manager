@@ -682,7 +682,7 @@ mod tests {
             .collect();
 
         // pi 0.73.1 nests the provider in `model`; there is no top-level
-        // `provider` for the adapter to read (see the crate docs).
+        // `provider`.
         let model_payload = &frames[1]["data"]["payload"];
         assert_eq!(model_payload["model"]["provider"], "atmfake");
         assert_eq!(model_payload.get("provider"), None);
@@ -716,10 +716,13 @@ mod tests {
                 source: Some("startup".into())
             })
         );
-        assert!(matches!(
+        assert_eq!(
             model,
-            Some(LifecycleEvent::ProviderModelChange { model: Some(id), .. }) if id == "fake-b"
-        ));
+            &Some(LifecycleEvent::ProviderModelChange {
+                provider: Some("atmfake".into()),
+                model: Some("fake-b".into()),
+            })
+        );
         assert_eq!(
             input,
             &Some(LifecycleEvent::PromptSubmit {

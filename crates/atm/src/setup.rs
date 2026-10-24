@@ -255,18 +255,43 @@ fn has_atm_status_line(status_line: &Value) -> bool {
     is_marker_command(status_line, "atm-hook")
 }
 
+/// Splits `cmd` into words roughly as a POSIX shell would, expanding
+/// nothing: quotes group and are dropped, a backslash escapes the next
+/// character (not inside single quotes), and unquoted whitespace or one
+/// of `;&|()<>` ends a word.
+fn shell_words(cmd: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"') | None, '\\') => word.get_or_insert_default().extend(chars.next()),
+            (Some(_), c) => word.get_or_insert_default().push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            (None, c) if c.is_whitespace() || ";&|()<>".contains(c) => words.extend(word.take()),
+            (None, c) => word.get_or_insert_default().push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
 /// True if `hook`'s command runs the script named `marker`: one of its
-/// words, quotes trimmed, has `marker` as its file name. `/x/atm-hook`,
-/// `"/x y/atm-hook"` and `ATM_DEBUG=1 /x/atm-hook` match;
-/// `/x/atm-hook-wrapper.sh` does not.
+/// [`shell_words`] has `marker` as its file name. `/x/atm-hook`,
+/// `"/x y/atm-hook"`, `ATM_DEBUG=1 /x/atm-hook` and `/x/atm-hook; :`
+/// match; `/x/atm-hook-wrapper.sh` and `'/x/atm-hook wrapper.sh'` don't.
 fn is_marker_command(hook: &Value, marker: &str) -> bool {
     hook.get("command")
         .and_then(|c| c.as_str())
         .is_some_and(|cmd| {
-            cmd.split_whitespace().any(|word| {
-                let path = Path::new(word.trim_matches(['"', '\'']));
-                path.file_name().and_then(|n| n.to_str()) == Some(marker)
-            })
+            shell_words(cmd)
+                .iter()
+                .any(|word| Path::new(word).file_name().and_then(|n| n.to_str()) == Some(marker))
         })
 }
 
@@ -1000,7 +1025,7 @@ mod codex_hook_tests {
 mod shared_entry_tests {
     use super::{
         create_codex_hook_entry, create_hook_entry, create_status_line_entry, has_atm_status_line,
-        has_hook_command_marker, is_marker_command, remove_hook_command_marker,
+        has_hook_command_marker, is_marker_command, remove_hook_command_marker, shell_words,
     };
     use serde_json::{json, Value};
 
@@ -1071,10 +1096,36 @@ mod shared_entry_tests {
             "/home/u/.local/bin/atm-hook --verbose",
             "\"$HOME/.local/bin/atm-hook\"",
             "'/Users/John Doe/.local/bin/atm-hook'",
+            "/Users/John\\ Doe/.local/bin/atm-hook",
+            "/home/u/.local/bin/atm-hook; :",
+            "/home/u/.local/bin/atm-hook&&true",
+            "(/home/u/.local/bin/atm-hook)",
         ] {
             let command = json!({"type": "command", "command": command});
             assert!(is_marker_command(&command, "atm-hook"), "{command}");
         }
+    }
+
+    #[test]
+    fn a_quoted_script_name_with_a_space_after_the_marker_is_not_atms() {
+        for command in [
+            "'/home/u/bin/atm-hook wrapper.sh'",
+            "\"/home/u/bin/atm-hook wrapper.sh\" --flag",
+            "/home/u/bin/atm-hook\\ wrapper.sh",
+        ] {
+            let command = json!({"type": "command", "command": command});
+            assert!(!is_marker_command(&command, "atm-hook"), "{command}");
+        }
+    }
+
+    #[test]
+    fn shell_words_groups_quotes_and_splits_on_operators() {
+        assert_eq!(
+            shell_words(r#"a 'b c' "d\"e" f\ g;h&&i|j (k) <l >m"#),
+            ["a", "b c", "d\"e", "f g", "h", "i", "j", "k", "l", "m"]
+        );
+        assert_eq!(shell_words("x '' y"), ["x", "", "y"]);
+        assert_eq!(shell_words(r"'a\b'"), [r"a\b"]);
     }
 
     #[test]

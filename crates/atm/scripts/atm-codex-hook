@@ -5,7 +5,7 @@
 # CRITICAL: This script MUST:
 # - Always exit 0 with no stdout (never break Codex; a silent exit-0
 #   hook is neutral for PermissionRequest — verified against codex-cli
-#   0.146.1: the approval dialog still renders normally)
+#   0.146.1 and 0.163.0: the approval dialog still renders normally)
 # - Be non-blocking (100ms timeout)
 # - Handle daemon unavailability gracefully
 
@@ -22,10 +22,17 @@ log_debug() {
 }
 
 # Find the actual Codex process by walking up the process tree.
-# Codex is a node wrapper spawning a native binary; the hook's direct
-# parent has comm "codex" in practice, but walking the tree (like
-# atm-hook does for Claude) stays robust if intermediate shells appear.
+# Codex is a node wrapper spawning a native binary (comm "codex"). In
+# codex-cli 0.146.1 the hook's direct parent was the session's codex;
+# walking the tree (like atm-hook does for Claude) stays robust if
+# intermediate shells appear.
 # Returns the PID of the first (nearest) "codex" process found.
+# Known gap, codex-cli 0.163.0: by default the TUI runs sessions on a
+# shared `codex app-server` daemon, and hooks are that daemon's
+# children. The nearest "codex" is then the daemon, the same pid for
+# every session, and $TMUX_PANE below is the daemon's, not the
+# session's. `codex --no-daemon` keeps the old parent. Fix pending; see
+# atm-codex-adapter's crate docs.
 find_codex_pid() {
     local pid=$PPID
     local codex_pid=""

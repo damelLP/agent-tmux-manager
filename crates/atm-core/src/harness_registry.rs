@@ -216,6 +216,9 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         process_matchers: CODEX_MATCHERS,
         // Enabled since atm-codex-adapter landed: hook events flow via
         // atm-codex-hook, so discovered codex sessions get live status.
+        // Not in codex-cli 0.163.0's default shared-daemon mode: hooks
+        // report the daemon's pid, so a discovered row never gets them
+        // (see atm-codex-adapter's Known gaps).
         discovery_enabled: true,
         allow_bare_cmdline_match: true,
         process_excludes: CODEX_EXCLUDES,

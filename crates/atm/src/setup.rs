@@ -18,7 +18,8 @@
 //!   `~/.codex/hooks.json`'s `hooks` object (5s timeout per hook; no
 //!   statusLine equivalent exists). Codex requires a one-time trust
 //!   approval of non-managed hooks — `setup_codex` prints the `/hooks`
-//!   instruction for this.
+//!   instruction for this. codex-cli 0.163.0 also asks at startup
+//!   ("Hooks need review"), and `/hooks` still exists.
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -495,11 +496,12 @@ fn write_codex_hooks(hooks: &Map<String, Value>) -> Result<()> {
 
 /// Creates a Codex hook entry for the given hook type.
 ///
-/// Shape validated against codex-cli 0.146.1: entries live under a
+/// Shape validated against codex-cli 0.146.1 and, on 2026-10-24, 0.163.0
+/// (all 11 events registered): entries live under a
 /// top-level `hooks` object keyed by event name; omitting `matcher`
 /// fires for all tools. Codex clamps the SessionEnd hook timeout to
-/// 3s; 5s is a comfortable ceiling for the fire-and-forget script
-/// everywhere else.
+/// 3s (0.163.0 warns that it does); 5s is a comfortable ceiling for the
+/// fire-and-forget script everywhere else.
 fn create_codex_hook_entry() -> Value {
     let hook_path = codex_hook_script_path();
     let command = hook_path.to_string_lossy().to_string();
@@ -1002,7 +1004,8 @@ mod codex_hook_tests {
             .and_then(|c| c.as_str())
             .is_some_and(|c| c.contains("atm-codex-hook")));
         assert_eq!(hooks[0].get("timeout").and_then(|t| t.as_u64()), Some(5));
-        // No matcher key: omitting it fires for all tools (spike-verified).
+        // No matcher key: omitting it fires for all tools (spike-verified;
+        // codex-cli 0.163.0 fired it for its one tool used, exec_command).
         assert!(entry.get("matcher").is_none());
     }
 

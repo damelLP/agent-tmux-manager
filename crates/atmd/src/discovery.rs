@@ -1237,7 +1237,9 @@ mod tests {
         // The live-observed shape: node wrapper (comm "node"/"MainThread")
         // matched via cmdline, native child (comm "codex") matched via exe.
         // The hook script reports the native child's PID, so discovery
-        // must keep exactly that one.
+        // must keep exactly that one. Not in codex-cli 0.163.0's default
+        // shared-daemon mode, where it reports the daemon's PID (see
+        // atm-codex-adapter's Known gaps); `codex --no-daemon` still does.
         let wrapper = fake_match(100, Harness::Codex, vec![50, 1], false);
         let native = fake_match(200, Harness::Codex, vec![100, 50, 1], true);
         assert_eq!(kept_pids(vec![wrapper, native]), vec![200]);

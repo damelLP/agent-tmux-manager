@@ -1765,10 +1765,14 @@ async fn test_e2e_pi_captured_session_cost_is_cumulative() {
 // ============================================================================
 // Codex Event → LifecycleEvent translation (end-to-end)
 //
-// Symmetric with the Claude and pi blocks above: drives real Codex raw
+// Symmetric with the Claude and pi blocks above: drives Codex raw
 // hook JSON (shapes captured from codex-cli 0.146.1 during the
 // 2026-08-10 spike) over the wire via `ClientMessage::codex_event` and
 // asserts on the resulting session state.
+//
+// Synthetic: payloads hand-built with `codex_event_json` in the spike's
+// shapes. The real codex-cli 0.163.0 capture is atm-codex-adapter's
+// tests/fixtures/codex_tui_session_0.163.0.jsonl.
 // ============================================================================
 
 /// Builds a raw Codex hook-event JSON payload for the given session.
@@ -1825,6 +1829,8 @@ async fn test_e2e_codex_event_applies_transcript_token_usage() {
     let mut client = server.connect().await;
     client.handshake(None).await;
 
+    // Synthetic: a hand-written token_count record; the origin of its
+    // numbers was not recorded (added in 49f2350 on 2026-08-16).
     let transcript_dir = tempfile::tempdir().expect("create transcript directory");
     let transcript_path = transcript_dir.path().join("rollout.jsonl");
     std::fs::write(
@@ -2060,6 +2066,108 @@ async fn test_e2e_codex_malformed_tool_event_is_suppressed() {
         .await
         .expect("still exists");
     assert_eq!(before.status_label, after.status_label);
+
+    server.shutdown().await;
+}
+
+/// The hook payloads in atm-codex-adapter's captured codex-cli 0.163.0
+/// fixture, as codex wrote them to the hook's stdin, each given this
+/// test's pid as atm-codex-hook would add one.
+///
+/// `None` outside the workspace: atmd's tests ship in its crates.io
+/// package without the adapter's fixtures, so the caller skips.
+fn captured_codex_events(fixture: &str) -> Option<Vec<serde_json::Value>> {
+    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../atm-codex-adapter");
+    if !adapter.join("Cargo.toml").exists() {
+        eprintln!("skipped: no {} outside the workspace", adapter.display());
+        return None;
+    }
+    let path = adapter.join("tests/fixtures").join(fixture);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let events = text
+        .lines()
+        .map(|line| {
+            let mut payload: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+            payload["pid"] = std::process::id().into();
+            payload
+        })
+        .collect();
+    Some(events)
+}
+
+/// Sends one codex hook payload, then a ping, and returns the sessions
+/// once the Pong arrives. atmd handles one connection's messages in order
+/// and awaits the registry for each lifecycle event, so the Pong means
+/// the payload has been applied.
+async fn apply_codex_event(
+    client: &mut TestClient,
+    registry: &atmd::registry::RegistryHandle,
+    seq: u64,
+    event: &serde_json::Value,
+) -> Vec<SessionView> {
+    client.send(ClientMessage::codex_event(event.clone())).await;
+    client.send(ClientMessage::ping(seq)).await;
+    match client.recv().await {
+        DaemonMessage::Pong { seq: got } if got == seq => {}
+        other => panic!("expected Pong {seq}, got {other:?}"),
+    }
+    registry.get_all_sessions().await
+}
+
+#[tokio::test]
+async fn test_e2e_codex_captured_session_replay() {
+    // Captured: codex-cli 0.163.0, 2026-10-24, one TUI session: a prompt,
+    // an approved tool call, `/compact`, then SessionEnd when codex's
+    // shared daemon stopped (see atm-codex-adapter's crate docs).
+    let Some(events) = captured_codex_events("codex_tui_session_0.163.0.jsonl") else {
+        return;
+    };
+    let [start, prompt, tool_start, permission, tool_end, stop, pre_compact, post_compact, end] =
+        events.as_slice()
+    else {
+        panic!("expected 9 hook payloads, got {}", events.len());
+    };
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    // (status, activity) after each payload.
+    let steps = [
+        (start, "idle", None),
+        (prompt, "working", None),
+        (tool_start, "working", Some("Bash")),
+        (permission, "needs input", Some("Bash")),
+        (tool_end, "working", Some("Thinking")),
+        (stop, "idle", None),
+        (pre_compact, "working", Some("Compacting")),
+        // Known gap (crate docs): no Stop follows a manual /compact and
+        // PostCompact changes no status, so the row stays Working until
+        // the next prompt. Flip this with the fix.
+        (post_compact, "working", Some("Compacting")),
+    ];
+    let state = |s: &SessionView| (s.status_label.clone(), s.activity_detail.clone());
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (seq, (event, label, detail)) in (1..).zip(steps) {
+        let sessions = apply_codex_event(&mut client, &registry, seq, event).await;
+        seen.push(sessions.iter().map(state).collect::<Vec<_>>());
+        expected.push(vec![(label.to_string(), detail.map(String::from))]);
+    }
+    assert_eq!(seen, expected);
+    let models: Vec<String> = registry
+        .get_all_sessions()
+        .await
+        .iter()
+        .map(|s| s.model.clone())
+        .collect();
+    assert_eq!(models, ["fake-model"]);
+
+    let sessions = apply_codex_event(&mut client, &registry, 0, end).await;
+    assert!(
+        sessions.is_empty(),
+        "SessionEnd removes the row: {sessions:?}"
+    );
 
     server.shutdown().await;
 }

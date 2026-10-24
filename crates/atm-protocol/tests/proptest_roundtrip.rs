@@ -9,10 +9,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
-use atm_core::{SessionId, SessionStatus, SessionView};
+use atm_core::{builtin_harnesses, Harness, SessionId, SessionStatus, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+use serde::de::value::{MapDeserializer, StrDeserializer};
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Round-trip helper
@@ -158,6 +162,21 @@ fn arb_session_status() -> impl Strategy<Value = SessionStatus> {
     ]
 }
 
+/// Strategy for `SessionView::harness`, a free-form short tag on the wire.
+///
+/// Mixes the tag of every built-in harness plus `Harness::Unknown`, mapped
+/// through `Harness::short_tag` as `SessionView::from_domain` does, with
+/// the general tricky-string strategy, so pi and Codex sessions round-trip
+/// as well as Claude ones.
+fn arb_harness_tag() -> impl Strategy<Value = String> {
+    let tags: Vec<String> = builtin_harnesses()
+        .map(|definition| definition.harness)
+        .chain([Harness::Unknown])
+        .map(|harness| harness.short_tag().to_string())
+        .collect();
+    prop_oneof![proptest::sample::select(tags), arb_tricky_string()]
+}
+
 /// Strategy for RFC3339-ish timestamp strings.
 ///
 /// These fields are plain `String` on the wire (formatted upstream and
@@ -197,10 +216,11 @@ fn arb_session_view() -> impl Strategy<Value = SessionView> {
     // NOTE: every bundle below ends in `.boxed()` on purpose — see the
     // doc comment above before removing or adding one.
 
-    // Identity + status (4)
+    // Identity + status (5)
     let identity = (
         arb_session_id(),
         arb_tricky_string(), // agent_type
+        arb_harness_tag(),
         arb_tricky_string(), // model
         arb_session_status(),
     )
@@ -262,7 +282,7 @@ fn arb_session_view() -> impl Strategy<Value = SessionView> {
     )
         .prop_map(
             |(
-                (id, agent_type, model, status),
+                (id, agent_type, harness, model, status),
                 (ctx_pct, cost_usd, duration_seconds),
                 (
                     context_display,
@@ -281,7 +301,7 @@ fn arb_session_view() -> impl Strategy<Value = SessionView> {
                 id_short: id.short().to_string(),
                 id,
                 agent_type,
-                harness: "claude".into(),
+                harness,
                 model,
                 status,
                 status_label: status.label().to_string(),
@@ -315,7 +335,8 @@ fn arb_session_view() -> impl Strategy<Value = SessionView> {
 }
 
 // ---------------------------------------------------------------------------
-// Client MessageType strategy (covers every variant)
+// Client MessageType strategy (covers every variant; enforced by
+// `message_type_strategy_covers_every_variant`)
 // ---------------------------------------------------------------------------
 
 fn arb_message_type() -> impl Strategy<Value = MessageType> {
@@ -327,6 +348,10 @@ fn arb_message_type() -> impl Strategy<Value = MessageType> {
         arb_finite_json_value().prop_map(|data| MessageType::StatusUpdate { data }),
         // HookEvent { data: Value }
         arb_finite_json_value().prop_map(|data| MessageType::HookEvent { data }),
+        // PiEvent { data: Value }
+        arb_finite_json_value().prop_map(|data| MessageType::PiEvent { data }),
+        // CodexEvent { data: Value }
+        arb_finite_json_value().prop_map(|data| MessageType::CodexEvent { data }),
         // ListSessions
         Just(MessageType::ListSessions),
         // Subscribe { session_id: Option<SessionId> }
@@ -354,7 +379,8 @@ fn arb_client_message() -> impl Strategy<Value = ClientMessage> {
 }
 
 // ---------------------------------------------------------------------------
-// DaemonMessage strategy (covers every variant)
+// DaemonMessage strategy (covers every variant; enforced by
+// `daemon_message_strategy_covers_every_variant`)
 // ---------------------------------------------------------------------------
 
 fn arb_daemon_message() -> impl Strategy<Value = DaemonMessage> {
@@ -432,6 +458,110 @@ proptest! {
     fn session_view_roundtrip(v in arb_session_view()) {
         assert_json_roundtrip(&v);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Strategy coverage — a wire variant with no strategy arm is never
+// round-tripped, so fail when a strategy misses one.
+// ---------------------------------------------------------------------------
+
+/// Deserializer error that keeps the variant list serde's derive passes to
+/// `de::Error::unknown_variant`, so the list is read as data rather than
+/// parsed from message text.
+#[derive(Debug)]
+struct VariantProbe(Option<&'static [&'static str]>);
+
+impl std::fmt::Display for VariantProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for VariantProbe {}
+
+impl serde::de::Error for VariantProbe {
+    fn custom<T: std::fmt::Display>(_msg: T) -> Self {
+        Self(None)
+    }
+
+    fn unknown_variant(_variant: &str, expected: &'static [&'static str]) -> Self {
+        Self(Some(expected))
+    }
+}
+
+/// Wire tags of every variant of the enum `T`.
+///
+/// Deserializes an unknown tag in both shapes our wire enums use, an
+/// internally tagged object (`{"type": "__probe__"}`) and a bare unit tag
+/// (`"__probe__"`), and keeps the list serde's derive reports for it, so
+/// it can't drift from the production enum. The list includes input-only
+/// names (`#[serde(alias)]`, `rename(deserialize = ..)`, `skip_serializing`
+/// variants) and omits `skip_deserializing` variants, so any of those also
+/// trips the coverage test.
+fn wire_variant_tags<T: serde::de::DeserializeOwned>() -> BTreeSet<String> {
+    const PROBE: &str = "__probe__";
+    let tagged = T::deserialize(MapDeserializer::<_, VariantProbe>::new(std::iter::once((
+        "type", PROBE,
+    ))));
+    let unit = T::deserialize(StrDeserializer::<VariantProbe>::new(PROBE));
+    let expected = [tagged.err(), unit.err()]
+        .into_iter()
+        .flatten()
+        .find_map(|probe| probe.0)
+        .expect("serde's derive reports the variant list through de::Error::unknown_variant");
+    expected.iter().map(|tag| tag.to_string()).collect()
+}
+
+/// Asserts that `strategy`, sampled with a fixed seed, generates every
+/// variant of its wire enum.
+#[track_caller]
+fn assert_covers_every_variant<S>(strategy: S)
+where
+    S: Strategy,
+    S::Value: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let expected = wire_variant_tags::<S::Value>();
+
+    // Pin the algorithm: `TestRunner::deterministic()` takes it from
+    // `PROPTEST_RNG_ALGORITHM`.
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig::default(),
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
+    let generated: BTreeSet<String> = (0..256)
+        .map(|_| {
+            let value = strategy.new_tree(&mut runner).expect("generate").current();
+            let json = serde_json::to_value(&value).expect("serialize");
+            // Internally tagged enums carry the tag in `type`; unit-only
+            // enums serialize as the bare tag.
+            let tag = json.get("type").unwrap_or(&json);
+            tag.as_str().expect("variant tag").to_string()
+        })
+        .collect();
+
+    let missing: Vec<&String> = expected.difference(&generated).collect();
+    let unlisted: Vec<&String> = generated.difference(&expected).collect();
+    assert_eq!(
+        generated, expected,
+        "strategy never generates {missing:?}: add an arm for each variant, or \
+         exclude a tag here if it is input-only (alias, rename(deserialize)); \
+         serde doesn't list generated {unlisted:?}"
+    );
+}
+
+#[test]
+fn message_type_strategy_covers_every_variant() {
+    assert_covers_every_variant(arb_message_type());
+}
+
+#[test]
+fn daemon_message_strategy_covers_every_variant() {
+    assert_covers_every_variant(arb_daemon_message());
+}
+
+#[test]
+fn session_status_strategy_covers_every_variant() {
+    assert_covers_every_variant(arb_session_status());
 }
 
 // ---------------------------------------------------------------------------

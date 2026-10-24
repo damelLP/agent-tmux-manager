@@ -13,7 +13,7 @@
 //! atm send <session-id> <text> # Send text to agent pane
 //! atm list                   # List agents (tab-separated)
 //! atm status                 # One-line summary for tmux status bar
-//! atm setup                  # Configure Claude Code hooks
+//! atm setup                  # Configure agent integrations
 //! atm uninstall              # Remove hooks
 //! ```
 

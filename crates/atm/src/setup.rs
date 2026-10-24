@@ -241,7 +241,7 @@ fn install_tmux_bindings() -> Result<()> {
     let content = r#"# ATM — Agent Tmux Manager bindings
 # Source this in your .tmux.conf: source-file ~/.config/atm/tmux-bindings.conf
 
-# Spawn a new Claude agent (default: below current pane)
+# Spawn a new agent (default: below current pane)
 bind C-n run-shell "atm spawn --target-pane #{pane_id}"
 
 # Directional agent spawn (vim-style: h=left, j=below, k=above, l=right)

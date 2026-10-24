@@ -45,7 +45,7 @@ atm spawn --harness pi             # spawn a specific harness (pi, codex, ...)
 ATM_SPAWN_PI_BIN=mise ATM_SPAWN_PI_ARGS='x pi' atm spawn --harness pi
 ```
 
-`atm setup` creates `~/.config/atm/config.toml` with defaults and leaves an existing file untouched. `atm spawn` only reads it, and uses built-in defaults when it is missing. Default spawn harness and per-harness spawn defaults can be configured there:
+`atm setup` writes a default `config.toml` once it detects a supported agent, and prints its path (usually `~/.config/atm/config.toml`). It never overwrites an existing file. `atm spawn` only reads it, and uses built-in defaults when it is missing. Default spawn harness and per-harness spawn defaults can be configured there:
 
 ```toml
 [harness]

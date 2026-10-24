@@ -30,9 +30,9 @@ pub struct RawPiEvent {
     pub payload: PiPayload,
 
     // === Fields injected by the TS extension ===
-    /// Session id (resolved from pi's session manager at emission time).
-    /// Always `None` with pi 0.73.1: pi-atm reads a property pi no longer
-    /// has (see the crate docs).
+    /// pi's session id, which pi-atm reads with
+    /// `ctx.sessionManager.getSessionId()`. Older pi-atm never sent it
+    /// (see the crate docs).
     #[serde(default, deserialize_with = "deserialize_optional_stringish")]
     pub session_id: Option<String>,
     /// Pi process pid (so atmd can correlate to /proc).

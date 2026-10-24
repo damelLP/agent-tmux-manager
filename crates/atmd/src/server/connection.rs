@@ -567,9 +567,9 @@ impl ConnectionHandler {
         };
 
         // Pi events identify their session via the extension-injected
-        // `session_id` field. If absent (early events, before pi's
-        // `session_start` fires), derive a pending id from the pid so
-        // two pi processes don't collide on a shared sentinel id —
+        // `session_id` field. If absent (older pi-atm read a property pi
+        // doesn't have, so it never sent one), derive a pending id from
+        // the pid so two pi processes don't collide on a shared sentinel id —
         // matches Claude's `pending_from_pid` discovery pattern.
         // Reject events that have neither: nothing to attribute them to.
         let session_id = match raw_event.session_id.as_deref() {

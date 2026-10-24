@@ -615,8 +615,9 @@ mod tests {
 
     #[test]
     fn teammate_metadata_and_alias_are_extracted() {
-        // Captured from a tmux teammate's own session (2.1.288): the
-        // name is the sender's, so the event idles that session itself.
+        // Captured: Claude Code 2.1.288, 2026-10-04, a tmux teammate's
+        // own session (see "Agent teams" in the crate docs): the name is
+        // the sender's, so the event idles that session itself.
         let mut idle = raw("TeammateIdle");
         idle.teammate_name = Some("waiter".into());
         idle.agent_type = Some("general-purpose".into());

@@ -55,10 +55,14 @@ relative to its `agentDir` directly:
 atm setup
 ```
 
+This directory is the source. `atm setup` embeds a mirror of it from
+`crates/atm/assets/pi-atm/`, and `tests/setup_pi_package.rs` fails if
+the installed files drift from the ones here.
+
 Or manually for local development:
 
 ```sh
-pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/pi-atm.ts
+pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/extensions/pi-atm.ts
 ```
 
 pi loads `.ts` files directly via `@mariozechner/jiti`, so no compile
@@ -119,7 +123,7 @@ about atm; atm doesn't need to know about amplike.
 2. In one terminal launch atm: `atm`.
 3. In another terminal start pi with this extension:
    ```sh
-   pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/pi-atm.ts
+   pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/extensions/pi-atm.ts
    ```
 4. Ask pi to do something. Watch the new session appear in the atm TUI
    with `[pi]` badge and status flipping between `working` and `idle`.

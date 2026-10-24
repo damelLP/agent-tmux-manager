@@ -100,6 +100,7 @@ const ATM_CODEX_HOOK_SCRIPT: &str = include_str!("../scripts/atm-codex-hook");
 
 /// The pi-atm TypeScript extension content, embedded at compile time.
 /// pi loads `.ts` files directly via `@mariozechner/jiti`.
+/// `assets/pi-atm/` mirrors `extensions/pi-atm/`; `tests/setup_pi_package.rs` enforces it.
 const PI_ATM_EXTENSION: &str = include_str!("../assets/pi-atm/extensions/pi-atm.ts");
 
 /// Package manifest written next to the embedded extension. Pi looks

@@ -257,8 +257,9 @@ fn has_atm_status_line(status_line: &Value) -> bool {
 
 /// Splits `cmd` into words roughly as a POSIX shell would, expanding
 /// nothing: quotes group and are dropped, a backslash escapes the next
-/// character (not inside single quotes), and unquoted whitespace or one
-/// of `;&|()<>` ends a word.
+/// character (inside double quotes only `$`, `` ` ``, `"` and `\`; none
+/// inside single quotes), backslash-newline joins lines, and unquoted
+/// whitespace or one of `;&|()<>` ends a word.
 fn shell_words(cmd: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word: Option<String> = None;
@@ -267,7 +268,18 @@ fn shell_words(cmd: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
-            (Some('"') | None, '\\') => word.get_or_insert_default().extend(chars.next()),
+            (None, '\\') => match chars.next() {
+                Some('\n') => {}
+                next => word.get_or_insert_default().extend(next),
+            },
+            (Some('"'), '\\') => {
+                let word = word.get_or_insert_default();
+                match chars.next() {
+                    Some('\n') => {}
+                    Some(c @ ('$' | '`' | '"' | '\\')) => word.push(c),
+                    next => word.extend(std::iter::once('\\').chain(next)),
+                }
+            }
             (Some(_), c) => word.get_or_insert_default().push(c),
             (None, '\'' | '"') => {
                 quote = Some(c);
@@ -1112,6 +1124,7 @@ mod shared_entry_tests {
             "'/home/u/bin/atm-hook wrapper.sh'",
             "\"/home/u/bin/atm-hook wrapper.sh\" --flag",
             "/home/u/bin/atm-hook\\ wrapper.sh",
+            "\"/home/u/bin/atm\\-hook\"",
         ] {
             let command = json!({"type": "command", "command": command});
             assert!(!is_marker_command(&command, "atm-hook"), "{command}");
@@ -1126,6 +1139,18 @@ mod shared_entry_tests {
         );
         assert_eq!(shell_words("x '' y"), ["x", "", "y"]);
         assert_eq!(shell_words(r"'a\b'"), [r"a\b"]);
+    }
+
+    /// POSIX: inside double quotes a backslash escapes only `$`, `` ` ``,
+    /// `"`, `\` and newline, and is kept before anything else. A
+    /// backslash-newline is a line continuation, quoted or not.
+    #[test]
+    fn shell_words_keeps_double_quoted_backslashes_posix_keeps() {
+        assert_eq!(
+            shell_words(r#""a\-b" "c\$d" "e\\f" "g\`h""#),
+            [r"a\-b", "c$d", r"e\f", "g`h"]
+        );
+        assert_eq!(shell_words("a\\\nb \"c\\\nd\""), ["ab", "cd"]);
     }
 
     #[test]

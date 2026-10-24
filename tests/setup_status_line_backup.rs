@@ -136,3 +136,93 @@ fn rerunning_setup_keeps_the_backup() {
         json!({"statusLine": user_status_line()})
     );
 }
+
+/// ATM's backup never stops uninstall: a corrupt one is reported, left in
+/// place for the user, and ATM's statusLine is removed as with no backup.
+/// Codex and pi are set up too, to check the later steps still run.
+#[test]
+fn a_corrupt_backup_lets_uninstall_finish_and_stays_in_place() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home = home.path();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".pi/agent")).unwrap();
+    setup_over_user_status_line(home);
+    let backup = home.join(BACKUP);
+    fs::write(&backup, "{\n").unwrap();
+
+    let stdout = run_atm_ok(home, "uninstall");
+
+    let warning = format!("Warning: Failed to parse {};", backup.display());
+    assert!(stdout.contains(&warning), "{stdout}");
+    assert!(
+        stdout.contains("statusLine configuration removed"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("ATM uninstalled successfully!"), "{stdout}");
+    assert_eq!(fs::read(&backup).unwrap(), b"{\n");
+    assert!(read_json(&home.join(CLAUDE)).get("statusLine").is_none());
+    let codex = fs::read_to_string(home.join(".codex/hooks.json")).unwrap();
+    assert!(!codex.contains("atm-codex-hook"), "{codex}");
+    for artifact in [
+        ".local/bin/atm-hook",
+        ".local/bin/atm-codex-hook",
+        ".pi/agent/packages/pi-atm",
+    ] {
+        assert!(!home.join(artifact).exists(), "{artifact} left: {stdout}");
+    }
+}
+
+/// With no statusLine left to restore over (settings.json lost or reset
+/// since setup), the backup may be the only copy, so uninstall keeps it.
+#[test]
+fn uninstall_keeps_the_backup_when_settings_were_lost() {
+    let home = tempfile::tempdir().expect("tempdir");
+    setup_over_user_status_line(home.path());
+    fs::remove_file(home.path().join(CLAUDE)).unwrap();
+
+    let stdout = run_atm_ok(home.path(), "uninstall");
+
+    let backup = home.path().join(BACKUP);
+    assert!(
+        stdout.contains(&format!(
+            "Your earlier statusLine is still saved in {}",
+            backup.display()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        read_json(&backup),
+        json!({"statusLine": user_status_line()})
+    );
+}
+
+/// A stale backup uninstall can't delete is reported, not fatal.
+#[test]
+fn an_undeletable_backup_lets_uninstall_finish() {
+    let home = tempfile::tempdir().expect("tempdir");
+    setup_over_user_status_line(home.path());
+    let settings_path = home.path().join(CLAUDE);
+    let mut settings = read_json(&settings_path);
+    settings["statusLine"] = json!({"type": "command", "command": "~/bin/newer-status.sh"});
+    write_json(&settings_path, &settings);
+    let config_dir = home.path().join(".config/atm");
+    let mode =
+        |m| fs::set_permissions(&config_dir, std::os::unix::fs::PermissionsExt::from_mode(m));
+    mode(0o555).unwrap();
+    if fs::write(config_dir.join("probe"), "").is_ok() {
+        mode(0o755).unwrap();
+        eprintln!("skipped: a read-only dir is writable here (root?)");
+        return;
+    }
+
+    let output = run_atm(home.path(), "uninstall");
+    mode(0o755).unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    let backup = home.path().join(BACKUP);
+    let warning = format!("Warning: Failed to remove {}", backup.display());
+    assert!(stdout.contains(&warning), "{stdout}");
+    assert!(stdout.contains("ATM uninstalled successfully!"), "{stdout}");
+    assert!(!home.path().join(".local/bin/atm-hook").exists());
+}

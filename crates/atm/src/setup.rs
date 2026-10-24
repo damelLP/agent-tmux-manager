@@ -201,12 +201,14 @@ fn create_status_line_entry() -> Value {
 /// Where setup saves the user's own Claude Code statusLine when it
 /// replaces it, for uninstall to restore.
 fn status_line_backup_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("atm/claude-statusline-backup.json"))
+    atm_config_path().map(|config| config.with_file_name("claude-statusline-backup.json"))
 }
 
 /// Setup's statusLine step: puts ATM's statusLine in `settings`. A
 /// statusLine of the user's own is first saved to `backup_path` as
 /// `{"statusLine": <theirs>}`; if that fails, `settings` is untouched.
+/// With no statusLine, an existing backup is kept: settings.json may
+/// have been lost or reset since, leaving the backup as the only copy.
 /// Returns whether `settings` changed.
 fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) -> Result<bool> {
     match settings.get("statusLine") {
@@ -222,6 +224,10 @@ fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) ->
                 backup_path.display()
             );
         }
+        None if backup_path.exists() => println!(
+            "    statusLine - added; your earlier one is still saved in {}, and `atm uninstall` restores it",
+            backup_path.display()
+        ),
         None => println!("    statusLine - added"),
     }
     settings.insert("statusLine".to_string(), create_status_line_entry());
@@ -229,25 +235,19 @@ fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) ->
 }
 
 /// Uninstall's statusLine step: replaces ATM's statusLine in `settings`
-/// with the user's own saved at `backup_path`, or removes it when there
-/// is no backup. Any other statusLine replaced ATM's after setup, so it
-/// stays and the backup is stale. Returns whether `settings` changed.
-fn uninstall_status_line(settings: &mut Map<String, Value>, backup_path: &Path) -> Result<bool> {
+/// with `backup` (the user's own, saved by setup), or removes it when
+/// there is none. Any other statusLine replaced ATM's after setup, so it
+/// stays. Returns whether `settings` changed.
+#[must_use]
+fn uninstall_status_line(settings: &mut Map<String, Value>, backup: Option<Value>) -> bool {
     if !settings.get("statusLine").is_some_and(has_atm_status_line) {
-        println!("\nstatusLine - not configured by atm");
-        return Ok(false);
+        return false;
     }
-    match read_json_file_or_empty(backup_path)?.remove("statusLine") {
-        Some(original) => {
-            settings.insert("statusLine".to_string(), original);
-            println!("\nstatusLine restored from {}", backup_path.display());
-        }
-        None => {
-            settings.remove("statusLine");
-            println!("\nstatusLine configuration removed");
-        }
-    }
-    Ok(true)
+    match backup {
+        Some(original) => settings.insert("statusLine".to_string(), original),
+        None => settings.remove("statusLine"),
+    };
+    true
 }
 
 /// Checks if atm-hook is configured for statusLine
@@ -256,14 +256,17 @@ fn has_atm_status_line(status_line: &Value) -> bool {
 }
 
 /// True if `hook`'s command runs the script named `marker`: one of its
-/// words has `marker` as its file name. `/x/atm-hook` and
-/// `ATM_DEBUG=1 /x/atm-hook` match; `/x/atm-hook-wrapper.sh` does not.
+/// words, quotes trimmed, has `marker` as its file name. `/x/atm-hook`,
+/// `"/x y/atm-hook"` and `ATM_DEBUG=1 /x/atm-hook` match;
+/// `/x/atm-hook-wrapper.sh` does not.
 fn is_marker_command(hook: &Value, marker: &str) -> bool {
     hook.get("command")
         .and_then(|c| c.as_str())
         .is_some_and(|cmd| {
-            cmd.split_whitespace()
-                .any(|word| Path::new(word).file_name().and_then(|n| n.to_str()) == Some(marker))
+            cmd.split_whitespace().any(|word| {
+                let path = Path::new(word.trim_matches(['"', '\'']));
+                path.file_name().and_then(|n| n.to_str()) == Some(marker)
+            })
         })
 }
 
@@ -316,6 +319,7 @@ fn has_hook_command_marker(hooks_array: &[Value], marker: &str) -> bool {
 /// `hooks` array, keeping the entry's other commands and fields (e.g.
 /// `matcher`). Drops an entry only when that leaves its `hooks` empty.
 /// Returns how many commands were removed.
+#[must_use]
 fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) -> usize {
     let mut removed = 0;
     hooks_array.retain_mut(|entry| {
@@ -833,13 +837,41 @@ pub fn uninstall() -> Result<()> {
     }
 
     // Step 2: Remove statusLine if it uses atm-hook, restoring the user's
-    // own from setup's backup. The backup goes only once settings are
-    // written, so a failed write keeps it.
+    // own from setup's backup. ATM's backup never stops uninstall: one it
+    // can't read or delete is left for the user, with a warning.
     let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
-    if uninstall_status_line(&mut settings, &backup_path)? {
+    let (backup, readable) = match read_json_file_or_empty(&backup_path) {
+        Ok(mut backup) => (backup.remove("statusLine"), true),
+        Err(e) => {
+            println!(
+                "\nWarning: {e}; skipping the statusLine restore and leaving the backup in place"
+            );
+            (None, false)
+        }
+    };
+    let has_backup = backup.is_some();
+    let changed = uninstall_status_line(&mut settings, backup);
+    if changed {
         write_settings(&settings)?;
     }
-    remove_script_file(&backup_path)?;
+    match (changed, has_backup) {
+        (true, true) => println!("\nstatusLine restored from {}", backup_path.display()),
+        (true, false) => println!("\nstatusLine configuration removed"),
+        (false, _) => println!("\nstatusLine - not configured by atm"),
+    }
+    // The backup is done with once restored, or once a statusLine of the
+    // user's own replaced ATM's. With no statusLine left (settings.json
+    // lost or reset) it may be the only copy, so it stays.
+    if readable && (changed || settings.contains_key("statusLine")) {
+        if let Err(e) = remove_script_file(&backup_path) {
+            println!("\nWarning: {e}");
+        }
+    } else if has_backup {
+        println!(
+            "  Your earlier statusLine is still saved in {}",
+            backup_path.display()
+        );
+    }
 
     // Step 3: Remove the hook script
     let hook_path = hook_script_path();
@@ -943,7 +975,7 @@ mod codex_hook_tests {
         let mut hooks_array = vec![user_entry.clone(), create_codex_hook_entry()];
 
         assert!(has_hook_command_marker(&hooks_array, MARKER));
-        remove_hook_command_marker(&mut hooks_array, MARKER);
+        assert_eq!(remove_hook_command_marker(&mut hooks_array, MARKER), 1);
         assert!(!has_hook_command_marker(&hooks_array, MARKER));
         assert_eq!(
             hooks_array,
@@ -1032,11 +1064,13 @@ mod shared_entry_tests {
     }
 
     #[test]
-    fn a_command_running_the_script_with_env_or_args_is_atms() {
+    fn a_command_running_the_script_with_env_args_or_quotes_is_atms() {
         for command in [
             "/home/u/.local/bin/atm-hook",
             "ATM_DEBUG=1 /home/u/.local/bin/atm-hook",
             "/home/u/.local/bin/atm-hook --verbose",
+            "\"$HOME/.local/bin/atm-hook\"",
+            "'/Users/John Doe/.local/bin/atm-hook'",
         ] {
             let command = json!({"type": "command", "command": command});
             assert!(is_marker_command(&command, "atm-hook"), "{command}");
@@ -1136,55 +1170,68 @@ mod status_line_backup_tests {
         assert_eq!(settings, settings_with(user_status_line()));
     }
 
+    /// A backup may outlive the statusLine it came from: settings.json
+    /// may have been lost or reset since. It is then the only copy.
     #[test]
-    fn uninstall_restores_the_backup_over_atms_status_line() {
+    fn install_without_a_status_line_keeps_an_earlier_backup() {
         let dir = tempfile::tempdir().unwrap();
         let backup = dir.path().join("backup.json");
         write_backup(&backup, user_status_line());
+        let mut settings = Map::new();
+
+        assert!(install_status_line(&mut settings, &backup).unwrap());
+
+        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert_eq!(
+            read_backup(&backup),
+            json!({"statusLine": user_status_line()})
+        );
+    }
+
+    #[test]
+    fn uninstall_restores_the_backup_over_atms_status_line() {
         let mut settings = settings_with(create_status_line_entry());
 
-        assert!(uninstall_status_line(&mut settings, &backup).unwrap());
+        assert!(uninstall_status_line(
+            &mut settings,
+            Some(user_status_line())
+        ));
 
         assert_eq!(settings, settings_with(user_status_line()));
     }
 
     #[test]
     fn uninstall_without_a_backup_removes_atms_status_line() {
-        let dir = tempfile::tempdir().unwrap();
         let mut settings = settings_with(create_status_line_entry());
 
-        assert!(uninstall_status_line(&mut settings, &dir.path().join("absent.json")).unwrap());
+        assert!(uninstall_status_line(&mut settings, None));
 
         assert!(settings.is_empty(), "{settings:?}");
     }
 
     #[test]
     fn uninstall_keeps_a_status_line_that_replaced_atms() {
-        let dir = tempfile::tempdir().unwrap();
-        let backup = dir.path().join("backup.json");
-        write_backup(&backup, user_status_line());
         let newer = json!({"type": "command", "command": "~/bin/newer-status.sh"});
         let mut settings = settings_with(newer.clone());
 
-        assert!(!uninstall_status_line(&mut settings, &backup).unwrap());
+        assert!(!uninstall_status_line(
+            &mut settings,
+            Some(user_status_line())
+        ));
 
         assert_eq!(settings, settings_with(newer));
     }
 
     #[test]
-    fn uninstall_stops_on_an_unreadable_backup_naming_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let backup = dir.path().join("backup.json");
-        fs::write(&backup, "{").unwrap();
-        let mut settings = settings_with(create_status_line_entry());
+    fn uninstall_without_a_status_line_restores_nothing() {
+        let mut settings = Map::new();
 
-        let err = uninstall_status_line(&mut settings, &backup).unwrap_err();
+        assert!(!uninstall_status_line(
+            &mut settings,
+            Some(user_status_line())
+        ));
 
-        assert!(
-            matches!(err, SetupError::Json { op: "parse", ref path, .. } if path == &backup),
-            "{err:?}"
-        );
-        assert_eq!(settings, settings_with(create_status_line_entry()));
+        assert!(settings.is_empty(), "{settings:?}");
     }
 }
 

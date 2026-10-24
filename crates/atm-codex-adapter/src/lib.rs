@@ -138,15 +138,18 @@
 //!   - `TMUX_PANE` in the hook's environment is the daemon's, inherited
 //!     from whichever TUI started it, so other sessions show that pane;
 //!   - `/quit` detaches ("Any running work continues") and fires no
-//!     `SessionEnd`; it arrives when the daemon stops.
+//!     `SessionEnd`; it arrives when the daemon stops;
+//!   - one session's events overwrite another's state on the shared
+//!     row. While session A waits on approval, session B's `PreCompact`
+//!     turns the row from needs-input to Working/"Compacting" and B's
+//!     `Stop` sets it idle, hiding A's approval either way. While A runs
+//!     a tool, B's `PostCompact` sets the row idle until A's next event.
 //!
 //!   From code reading, not run: atm's kill, interrupt (`C-c`) and
 //!   `atm send` act on the row's pane, so they reach the daemon's
 //!   pane, which may be another session or, once its TUI has quit, a
-//!   shell; a row created from a hook event takes its project from
-//!   `/proc/<daemon pid>/cwd`; and a `Stop` or a `PostCompact` from any
-//!   session sets the shared row idle, even while another session works
-//!   or waits for approval.
+//!   shell; and a row created from a hook event takes its project from
+//!   `/proc/<daemon pid>/cwd`.
 //!
 //!   `codex --no-daemon` restores one process per session: each hook
 //!   sees its own TUI's pid and pane, and `/quit` fires `SessionEnd`

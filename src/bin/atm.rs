@@ -2155,10 +2155,10 @@ async fn main() -> Result<()> {
     // Handle subcommands first (before TUI initialization)
     match args.command {
         Some(Command::Setup) => {
-            return setup::setup();
+            return Ok(setup::setup()?);
         }
         Some(Command::Uninstall) => {
-            return setup::uninstall();
+            return Ok(setup::uninstall()?);
         }
         Some(Command::Spawn {
             harness,

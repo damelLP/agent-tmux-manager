@@ -202,7 +202,6 @@ dependencies = [
 name = "atm-tui"
 version = "0.2.7"
 dependencies = [
- "anyhow",
  "atm-claude-adapter",
  "atm-codex-adapter",
  "atm-core",
@@ -229,7 +228,6 @@ dependencies = [
 name = "atmd"
 version = "0.2.7"
 dependencies = [
- "anyhow",
  "atm-claude-adapter",
  "atm-codex-adapter",
  "atm-core",

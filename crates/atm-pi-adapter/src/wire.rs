@@ -135,8 +135,11 @@ where
     D: Deserializer<'de>,
 {
     let value = Option::<Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|value| {
-        let provider = value.get("provider").cloned().and_then(string_from_value);
+    Ok(value.and_then(|mut value| {
+        let provider = value
+            .get_mut("provider")
+            .map(Value::take)
+            .and_then(string_from_value);
         string_from_value(value).map(|id| PiModel { id, provider })
     }))
 }
@@ -314,6 +317,21 @@ mod tests {
                 provider: None,
             })
         );
+    }
+
+    #[test]
+    fn model_without_an_id_is_dropped_instead_of_failing_parse() {
+        // Synthetic: a drift case for #25. pi's `Model.id` is a required
+        // string, so no release sends these.
+        for model in [r#"{"provider": "anthropic"}"#, "[]", "null"] {
+            let json = format!(
+                r#"{{"event": "model_select", "payload": {{"type": "model_select", "model": {model}}}}}"#
+            );
+
+            let raw: RawPiEvent = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(raw.payload.model, None, "model {model}");
+        }
     }
 
     #[test]

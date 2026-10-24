@@ -37,6 +37,7 @@
 //! - **model** = `claude-sonnet-4-6` / `gpt-5.5` / etc.
 //!
 //! Provider+model changes ride [`atm_core::LifecycleEvent::ProviderModelChange`].
+//! atm-core keeps only the model: `SessionDomain` has no provider.
 //!
 //! ## NeedsInput is extension-mediated
 //!

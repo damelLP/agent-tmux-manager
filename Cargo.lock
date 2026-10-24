@@ -238,7 +238,6 @@ dependencies = [
  "atm-tmux",
  "chrono",
  "clap",
- "dirs",
  "serde",
  "serde_json",
  "sysinfo",

@@ -55,10 +55,6 @@ relative to its `agentDir` directly:
 atm setup
 ```
 
-This directory is the source. `atm setup` embeds a mirror of it from
-`crates/atm/assets/pi-atm/`, and `tests/setup_pi_package.rs` fails if
-the installed files drift from the ones here.
-
 Or manually for local development:
 
 ```sh
@@ -73,6 +69,11 @@ Once published to npm:
 ```sh
 pi install npm:pi-atm
 ```
+
+For maintainers: this directory is the source. `atm setup` installs
+its `package.json` and `extensions/` from a copy embedded in
+`crates/atm/assets/pi-atm/`. Edit the files here, then copy them
+there; `tests/setup_pi_package.rs` fails if the two drift apart.
 
 ## Configuration
 

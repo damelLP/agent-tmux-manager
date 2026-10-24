@@ -83,11 +83,6 @@
 //!
 //! ## Known gaps (pi 0.73.1)
 //!
-//! - `model_select` sends `{model, previousModel, source}`. `model` is
-//!   pi's `Model` object, and the provider is `model.provider`. The
-//!   adapter reads a top-level `provider`, so
-//!   `ProviderModelChange.provider` is always `None`. Nothing reads it
-//!   yet: `SessionDomain` keeps only the model.
 //! - `model_select` fires only when the user changes model: pi's source
 //!   emits it for `set` and `cycle`, never for the declared `restore`.
 //!   A fresh or resumed session sends none, so its model shows as

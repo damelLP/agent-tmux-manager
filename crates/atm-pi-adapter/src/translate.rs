@@ -193,8 +193,8 @@ impl RawPiEvent {
             }
 
             PiEventType::ModelSelect => LifecycleEvent::ProviderModelChange {
-                provider: p.provider.clone(),
-                model: p.model.clone(),
+                provider: p.model.as_ref().and_then(|m| m.provider.clone()),
+                model: p.model.as_ref().map(|m| m.id.clone()),
             },
 
             // Synthetic events emitted by `pi-atm` when it detects
@@ -265,7 +265,7 @@ impl RawPiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::PiPayload;
+    use crate::wire::{PiModel, PiPayload};
 
     fn raw(event: PiEventType, payload: PiPayload) -> RawPiEvent {
         RawPiEvent {
@@ -633,13 +633,13 @@ mod tests {
 
     #[test]
     fn model_select_becomes_provider_model_change() {
-        // Synthetic: top-level `provider`. pi 0.73.1 sends it only as
-        // `model.provider` (see the crate docs).
         let e = raw(
             PiEventType::ModelSelect,
             PiPayload {
-                provider: Some("openai-codex".into()),
-                model: Some("gpt-5.5".into()),
+                model: Some(PiModel {
+                    id: "gpt-5.5".into(),
+                    provider: Some("openai-codex".into()),
+                }),
                 ..Default::default()
             },
         );

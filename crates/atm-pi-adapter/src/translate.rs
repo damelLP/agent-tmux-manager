@@ -678,6 +678,51 @@ mod tests {
         serde_json::json!({"id": id, "provider": "atmfake", "contextWindow": context_window})
     }
 
+    /// True if `key` names a field anywhere in `value`.
+    fn has_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(map) => map.contains_key(key) || map.values().any(|v| has_key(v, key)),
+            Value::Array(items) => items.iter().any(|v| has_key(v, key)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn captured_model_select_forwards_no_headers() {
+        // Captured: pi 0.62.0, 2026-10-24, set up as for
+        // captured_tool_run_translates, with Ctrl+P from fake-a to fake-b
+        // and no prompt. The provider sets a probe header and `authHeader`
+        // with a fake key. pi 0.43.0 to 0.62.0 resolve both onto the Model
+        // object, so model_select's `model` and `previousModel` carry
+        // `Authorization: Bearer <apiKey>` unless pi-atm drops `headers`.
+        let frames: Vec<Value> = include_str!("../tests/fixtures/pi_model_select_0.62.0.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture line"))
+            .collect();
+        let [_, select, _] = frames.as_slice() else {
+            panic!("expected 3 frames, got {}", frames.len());
+        };
+
+        for frame in &frames {
+            assert!(!has_key(frame, "headers"), "headers in {frame}");
+        }
+
+        // The rest of each model still goes through.
+        let payload = &select["data"]["payload"];
+        assert_eq!(payload["model"]["id"], "fake-b");
+        assert_eq!(payload["model"]["contextWindow"], 32_000);
+        assert_eq!(payload["previousModel"]["id"], "fake-a");
+        let raw: RawPiEvent =
+            serde_json::from_value(select["data"].clone()).expect("pi_event data");
+        assert_eq!(
+            raw.to_lifecycle_event(),
+            Some(LifecycleEvent::ProviderModelChange {
+                provider: Some("atmfake".into()),
+                model: Some("fake-b".into()),
+            })
+        );
+    }
+
     #[test]
     fn captured_tool_run_translates() {
         // Captured: pi 0.73.1, 2026-10-24, pi's TUI in a private tmux
@@ -695,6 +740,12 @@ mod tests {
         let model_payload = &frames[1]["data"]["payload"];
         assert_eq!(model_payload["model"]["provider"], "atmfake");
         assert_eq!(model_payload.get("provider"), None);
+
+        // The provider sets a header and `authHeader`, but pi 0.73.1 keeps
+        // them off the Model object (it resolves them per request).
+        for frame in &frames {
+            assert!(!has_key(frame, "headers"), "headers in {frame}");
+        }
 
         // pi-atm's envelope carries a snapshot of pi's current model with
         // only the fields it picks. Ctrl+P switched fake-a to fake-b, so

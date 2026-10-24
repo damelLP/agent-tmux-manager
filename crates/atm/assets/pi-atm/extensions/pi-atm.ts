@@ -315,6 +315,24 @@ function buildEnvelope(
 type ModelSnapshot = { id: string; provider: string; contextWindow: number };
 
 /**
+ * Drops `headers` from model_select's `model` and `previousModel`, the only
+ * forwarded payload that carries pi's Model. pi 0.43–0.62 resolve a
+ * provider's headers onto the Model, including `Authorization: Bearer
+ * <apiKey>` with `authHeader`. Copies rather than mutates: pi hands the same
+ * objects to every extension.
+ */
+function withoutModelHeaders(eventName: string, payload: unknown): unknown {
+	if (eventName !== "model_select" || !payload || typeof payload !== "object") return payload;
+	const strip = (model: unknown): unknown => {
+		if (!model || typeof model !== "object") return model;
+		const { headers: _headers, ...rest } = model as Record<string, unknown>;
+		return rest;
+	};
+	const p = payload as { model?: unknown; previousModel?: unknown };
+	return { ...p, model: strip(p.model), previousModel: strip(p.previousModel) };
+}
+
+/**
  * Wraps `ctx.ui.select` so any extension that opens a permission /
  * elicitation dialog (most often pi-amplike's bash permission gate)
  * gets atm visibility for free.
@@ -424,7 +442,12 @@ export default function (pi: ExtensionAPI): void {
 					// even if patching ran before the id was discovered.
 					uiPatched = patchUiSelectOnce(ctx, () => cachedSessionId);
 				}
-				const envelope = buildEnvelope(eventName, payload, cachedSessionId, model);
+				const envelope = buildEnvelope(
+					eventName,
+					withoutModelHeaders(eventName, payload),
+					cachedSessionId,
+					model,
+				);
 				// Fire-and-forget: `send()` is synchronous and returns
 				// `void` — it either writes to the live socket, queues
 				// onto the bounded outbox, or drops on the floor when a

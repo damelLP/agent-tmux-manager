@@ -72,6 +72,15 @@
 //! `session_shutdown` (reason `new`) on one connection, and the new
 //! instance sent the new session's frames on a second one.
 //!
+//! `tests/fixtures/pi_model_select_0.62.0.jsonl` holds a model switch on
+//! an older pi. Captured: pi 0.62.0, 2026-10-24, set up the same way,
+//! with Ctrl+P and no prompt. In every capture the provider sets a probe
+//! header and `authHeader` with a fake key. pi 0.43.0 to 0.62.0 resolve
+//! both onto the Model object (`Authorization: Bearer <apiKey>`), so
+//! `model_select`'s `model` and `previousModel` carry them, and pi-atm
+//! drops `headers` before forwarding. pi 0.63.0 and later keep them off
+//! the Model and resolve them per request.
+//!
 //! The hand-copied JSON payloads in the `wire.rs` and `translate.rs`
 //! tests follow the spike trace. Captured: pi, version not recorded,
 //! 2026-05-02 (trace

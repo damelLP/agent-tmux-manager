@@ -13,6 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use serde_json::Value;
+
 /// The authoritative pi-atm package, relative to the repo root.
 const SOURCE: &str = "extensions/pi-atm";
 /// The copy `atm setup` embeds, relative to the repo root.
@@ -33,36 +35,41 @@ fn run_atm(home: &Path, cmd: &str) -> Output {
         .expect("run atm")
 }
 
-/// Adds every file under `dir` to `files`, keyed by its path relative to
-/// `root`.
-fn read_tree(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
-    for entry in fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            read_tree(root, &path, files);
-        } else {
-            let file = path.strip_prefix(root).unwrap().to_path_buf();
-            files.insert(file, fs::read(&path).unwrap());
+/// Adds the file at `path`, or every file under it, to `files`, keyed by
+/// its path relative to `root`. Like pi loading an extension dir, it skips
+/// names starting with `.` (vim swap files, Emacs lock links); it also
+/// skips `~` backups. Symlinks are read, never walked into.
+fn add_files(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+    let is_dir = fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
+    if !is_dir {
+        let content = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        files.insert(path.strip_prefix(root).unwrap().to_path_buf(), content);
+        return;
+    }
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') && !name.ends_with('~') {
+            add_files(root, &entry.path(), files);
         }
     }
 }
 
-/// The source files pi loads: `package.json` and everything under
-/// `extensions/`. README.md and LICENSE are for readers, not pi.
+/// The source files pi loads: `package.json` and every path its
+/// `pi.extensions` lists. README.md and LICENSE are for readers, not pi.
 fn source_package() -> BTreeMap<PathBuf, Vec<u8>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(SOURCE);
+    let manifest = root.join("package.json");
     let mut files = BTreeMap::new();
-    let manifest = PathBuf::from("package.json");
-    files.insert(manifest.clone(), fs::read(root.join(&manifest)).unwrap());
-    read_tree(&root, &root.join("extensions"), &mut files);
-    files
-}
-
-/// Every file `atm setup` installed into pi's packages dir under `home`.
-fn installed_package(home: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    let root = home.join(INSTALLED);
-    let mut files = BTreeMap::new();
-    read_tree(&root, &root, &mut files);
+    add_files(&root, &manifest, &mut files);
+    let parsed: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let entries = parsed["pi"]["extensions"]
+        .as_array()
+        .expect("package.json lists pi.extensions");
+    for entry in entries {
+        let entry = entry.as_str().expect("pi.extensions entries are paths");
+        add_files(&root, &root.join(entry), &mut files);
+    }
     files
 }
 
@@ -73,18 +80,27 @@ fn setup_installs_the_pi_package_exactly_as_its_source() {
     fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
 
     let output = run_atm(home.path(), "setup");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "atm setup: {output:?}");
+    let installed_root = home.path().join(INSTALLED);
+    assert!(
+        installed_root.is_dir(),
+        "atm setup did not install {INSTALLED}:\n{stdout}"
+    );
 
     let source = source_package();
-    let installed = installed_package(home.path());
+    let mut installed = BTreeMap::new();
+    add_files(&installed_root, &installed_root, &mut installed);
     let mut drift = Vec::new();
     for (file, content) in &source {
         let name = file.display();
         match installed.get(file) {
             Some(copy) if copy == content => {}
             Some(_) => drift.push(format!(
-                "{INSTALLED}/{name} differs from {SOURCE}/{name}; sync it with \
-                 `cp {SOURCE}/{name} {MIRROR}/{name}`"
+                "{INSTALLED}/{name} differs from {SOURCE}/{name}, which wins. \
+                 Compare with `diff {SOURCE}/{name} {MIRROR}/{name}`, then sync \
+                 with `cp {SOURCE}/{name} {MIRROR}/{name}`; if they already \
+                 match, crates/atm/src/setup.rs installs the wrong bytes"
             )),
             None => drift.push(format!(
                 "{SOURCE}/{name} is not installed; copy it with \

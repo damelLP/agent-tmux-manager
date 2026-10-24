@@ -13,7 +13,8 @@ use atm_core::{Harness, SessionId, SessionStatus, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
-use proptest::test_runner::TestRunner;
+use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+use serde::de::value::MapDeserializer;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -470,29 +471,45 @@ proptest! {
 // round-tripped, so fail when a strategy misses one.
 // ---------------------------------------------------------------------------
 
-const PROBE_TAG: &str = "__probe__";
+/// Deserializer error that keeps the variant list serde's derive passes to
+/// `de::Error::unknown_variant`, so the list is read as data rather than
+/// parsed from message text.
+#[derive(Debug)]
+struct VariantProbe(Option<&'static [&'static str]>);
+
+impl std::fmt::Display for VariantProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for VariantProbe {}
+
+impl serde::de::Error for VariantProbe {
+    fn custom<T: std::fmt::Display>(_msg: T) -> Self {
+        Self(None)
+    }
+
+    fn unknown_variant(_variant: &str, expected: &'static [&'static str]) -> Self {
+        Self(Some(expected))
+    }
+}
 
 /// Wire tags of every variant of the internally tagged enum `T`.
 ///
-/// Read from serde's own error for an unknown tag (``unknown variant
-/// `__probe__`, expected one of `a`, `b`, ...``), so the list comes from
-/// the production derive and can't drift from it. If serde ever rewords
-/// that error, this returns an empty set and the coverage test fails.
-/// The list includes `#[serde(alias)]` names (never serialized) and omits
-/// `#[serde(skip_deserializing)]` variants (still serialized), so either
-/// attribute also trips the coverage test.
+/// Deserializes `{"type": "__probe__"}` and keeps the list serde's derive
+/// reports for the unknown tag, so it can't drift from the production
+/// enum. The list includes input-only names (`#[serde(alias)]`,
+/// `rename(deserialize = ..)`, `skip_serializing` variants) and omits
+/// `skip_deserializing` variants, so any of those also trips the coverage
+/// test.
 fn wire_variant_tags<T: serde::de::DeserializeOwned>() -> BTreeSet<String> {
-    let error = serde_json::from_str::<T>(&format!(r#"{{"type":"{PROBE_TAG}"}}"#))
+    let probe = MapDeserializer::<_, VariantProbe>::new(std::iter::once(("type", "__probe__")));
+    let expected = T::deserialize(probe)
         .err()
-        .expect("the probe tag must not deserialize")
-        .to_string();
-    error
-        .split('`')
-        .skip(1)
-        .step_by(2)
-        .filter(|tag| *tag != PROBE_TAG)
-        .map(String::from)
-        .collect()
+        .and_then(|probe| probe.0)
+        .expect("serde's derive reports the variant list through de::Error::unknown_variant");
+    expected.iter().map(|tag| tag.to_string()).collect()
 }
 
 /// Asserts that `strategy`, sampled with a fixed seed, generates every
@@ -504,12 +521,13 @@ where
     S::Value: serde::Serialize + serde::de::DeserializeOwned,
 {
     let expected = wire_variant_tags::<S::Value>();
-    assert!(
-        !expected.is_empty(),
-        "serde's unknown-variant wording changed; update the parser in wire_variant_tags"
-    );
 
-    let mut runner = TestRunner::deterministic();
+    // Pin the algorithm: `TestRunner::deterministic()` takes it from
+    // `PROPTEST_RNG_ALGORITHM`.
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig::default(),
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
     let generated: BTreeSet<String> = (0..256)
         .map(|_| {
             let value = strategy.new_tree(&mut runner).expect("generate").current();
@@ -522,7 +540,8 @@ where
     let unlisted: Vec<&String> = generated.difference(&expected).collect();
     assert_eq!(
         generated, expected,
-        "strategy never generates {missing:?} (add an arm for each); \
+        "strategy never generates {missing:?}: add an arm for each variant, or \
+         exclude a tag here if it is input-only (alias, rename(deserialize)); \
          serde doesn't list generated {unlisted:?}"
     );
 }

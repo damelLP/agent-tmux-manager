@@ -81,8 +81,12 @@
 //! `token_usage_record` and `token_count` records, lines kept verbatim.
 //! The usage numbers are the fake provider's, except in the last
 //! `token_count`: after `/compact` codex writes a `last_token_usage`
-//! with only `total_tokens` set, its own estimate of the compacted
-//! history.
+//! with every field 0 except `total_tokens`, its own estimate of the
+//! compacted history. Codex's thread-title request runs in a separate
+//! thread (`thread_source: thread_title`), so its usage is in no
+//! session rollout. The fixture carries no hook timing; the timings
+//! under Known gaps come from a logging hook that read the live rollout
+//! at each hook.
 //!
 //! The JSON payloads in the `wire.rs` tests are trimmed copies of the
 //! spike's logs. Captured: codex-cli 0.146.1, 2026-08-10, the spike
@@ -102,11 +106,18 @@
 //!   isolated atmd:
 //!   - every session's hooks report the daemon's pid, so atmd, which
 //!     keys sessions by pid, folds all codex sessions into one row, and
-//!     discovery's `pending-<pid>` row for each TUI never reconciles;
+//!     discovery's `pending-<pid>` row for each TUI never reconciles.
+//!     The first `SessionEnd` from any session removes that shared row;
 //!   - `TMUX_PANE` in the hook's environment is the daemon's, inherited
 //!     from whichever TUI started it, so other sessions show that pane;
 //!   - `/quit` detaches ("Any running work continues") and fires no
 //!     `SessionEnd`; it arrives when the daemon stops.
+//!
+//!   From code reading, not run: atm's kill, interrupt (`C-c`) and
+//!   `atm send` act on the row's pane, so they reach the daemon's
+//!   pane, which may be another session or, once its TUI has quit, a
+//!   shell; and a row created from a hook event takes its project from
+//!   `/proc/<daemon pid>/cwd`.
 //!
 //!   `codex --no-daemon` restores one process per session: each hook
 //!   sees its own TUI's pid and pane, and `/quit` fires `SessionEnd`
@@ -116,13 +127,24 @@
 //!   `--no-daemon` flag is absent from codex-cli 0.155.0 and present in
 //!   0.158.0 (static check of the npm binaries, not run); that the
 //!   daemon is the default is checked on 0.163.0 only.
-//! - **Usage lags one request mid-turn.** Codex writes a request's
-//!   `token_count` after the tool output it led to, so hooks during a
-//!   turn see the previous request's usage. By `Stop` the turn's last
-//!   request is on disk. The `token_usage_record` codex writes as each
-//!   reply completes is not read. Not checked on 0.146.1.
+//! - **A manual `/compact` leaves the row "Compacting".** Codex fires
+//!   `PreCompact` then `PostCompact` and no `Stop` (two TUI captures).
+//!   `PreCompact` sets Working/"Compacting", `PostCompact` maps to a
+//!   `Notification` that changes no status, and nothing demotes a quiet
+//!   Working row, so it stays Working until the next prompt. atmd's
+//!   `test_e2e_codex_captured_session_replay` pins this. Fix pending.
+//! - **Usage lags one request mid-turn.** A logging hook that read the
+//!   live rollout at each hook saw no `token_count` at `PreToolUse`,
+//!   `PermissionRequest` or `PostToolUse` of a turn's first request, and
+//!   both of the turn's at `Stop` (every TUI and exec run). Codex writes
+//!   a request's `token_count` after the tool output it led to, but the
+//!   `token_usage_record` as the reply completes. Reading that record
+//!   might remove the lag (it has no context window); not tried. Not
+//!   checked on 0.146.1.
 //! - No `info: null` `token_count` placeholders appeared: 0 of 40 across
-//!   `codex exec` and TUI runs. [`read_token_usage`] still skips them.
+//!   `codex exec` and TUI runs, against a fake provider that sends no
+//!   rate-limit headers, so the real backend is unverified.
+//!   [`read_token_usage`] still skips them.
 //! - `SubagentStart` and `SubagentStop` have never been captured.
 //!
 //! ## Layers

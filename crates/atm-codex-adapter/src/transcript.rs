@@ -114,9 +114,10 @@ pub fn read_token_usage(path: impl AsRef<Path>) -> io::Result<Option<CodexTokenU
         // Codex emits `info: null` placeholders near the beginning of
         // ordinary turns. Skip them and keep searching for the latest
         // actual measurement instead of falsely resetting usage.
-        // Captured: codex, version and method not recorded; added in
+        // Captured: codex-cli, version and method not recorded; added in
         // 49f2350 on 2026-08-16. codex-cli 0.163.0 wrote none in 40
-        // records.
+        // records against a fake provider that sends no rate-limit
+        // headers; the real backend is unverified.
         let Some(info) = payload.info else {
             continue;
         };
@@ -301,21 +302,27 @@ mod tests {
             read_token_usage(file.path()).expect("read transcript")
         };
 
+        // The hook-time snapshots below match what a logging hook read
+        // from the live rollout at each hook in the capture runs; the
+        // fixture itself carries no hook timing.
+        //
         // While the first tool runs, the reply that asked for it has a
         // token_usage_record on disk but no token_count yet: codex
         // writes that after the tool output, so usage lags mid-turn.
         assert_eq!(usage_after(2), None);
-        // By Stop, both requests of the turn are counted.
+        // At Stop both of the turn's requests in this thread are counted
+        // (task_complete, line 6, comes later). Codex's thread-title
+        // request runs in a separate thread and is in no rollout here.
         assert_eq!(
-            usage_after(6),
+            usage_after(5),
             Some(CodexTokenUsage {
                 total_tokens: Some(4552),
                 current_tokens: Some(3277),
                 context_window_size: Some(258_400),
             })
         );
-        // After /compact, last_token_usage carries only total_tokens:
-        // codex's own estimate of the compacted history.
+        // After /compact, last_token_usage has every field 0 except
+        // total_tokens: codex's own estimate of the compacted history.
         assert_eq!(
             usage_after(lines.len()),
             Some(CodexTokenUsage {

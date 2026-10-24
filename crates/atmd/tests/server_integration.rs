@@ -2070,6 +2070,88 @@ async fn test_e2e_codex_malformed_tool_event_is_suppressed() {
     server.shutdown().await;
 }
 
+/// The hook payloads in atm-codex-adapter's captured codex-cli 0.163.0
+/// fixture, as codex wrote them to the hook's stdin, each given this
+/// test's pid as atm-codex-hook would add one.
+///
+/// `None` outside the workspace: atmd's tests ship in its crates.io
+/// package without the adapter's fixtures, so the caller skips.
+fn captured_codex_events(fixture: &str) -> Option<Vec<serde_json::Value>> {
+    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../atm-codex-adapter");
+    if !adapter.join("Cargo.toml").exists() {
+        eprintln!("skipped: no {} outside the workspace", adapter.display());
+        return None;
+    }
+    let path = adapter.join("tests/fixtures").join(fixture);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let events = text
+        .lines()
+        .map(|line| {
+            let mut payload: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+            payload["pid"] = std::process::id().into();
+            payload
+        })
+        .collect();
+    Some(events)
+}
+
+#[tokio::test]
+async fn test_e2e_codex_captured_session_replay() {
+    // Captured: codex-cli 0.163.0, 2026-10-24, one TUI session: a prompt,
+    // an approved tool call, `/compact`, then SessionEnd when codex's
+    // shared daemon stopped (see atm-codex-adapter's crate docs).
+    let Some(events) = captured_codex_events("codex_tui_session_0.163.0.jsonl") else {
+        return;
+    };
+    let [start, prompt, tool_start, permission, tool_end, stop, pre_compact, post_compact, end] =
+        events.as_slice()
+    else {
+        panic!("expected 9 hook payloads, got {}", events.len());
+    };
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    // (status, activity) after each payload. Each step waits for its
+    // expected state, so a mismatch shows the state reached instead.
+    let steps = [
+        (start, "idle", None),
+        (prompt, "working", None),
+        (tool_start, "working", Some("Bash")),
+        (permission, "needs input", Some("Bash")),
+        (tool_end, "working", Some("Thinking")),
+        (stop, "idle", None),
+        (pre_compact, "working", Some("Compacting")),
+        // Known gap (crate docs): no Stop follows a manual /compact and
+        // PostCompact changes no status, so the row stays Working until
+        // the next prompt. Flip this with the fix.
+        (post_compact, "working", Some("Compacting")),
+    ];
+    let state = |s: &SessionView| (s.status_label.clone(), s.activity_detail.clone());
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (event, label, detail) in steps {
+        let want = (label.to_string(), detail.map(String::from));
+        client.send(ClientMessage::codex_event(event.clone())).await;
+        let sessions = sessions_when(&registry, |s| matches!(s, [one] if state(one) == want)).await;
+        seen.push(sessions.iter().map(state).collect::<Vec<_>>());
+        expected.push(vec![want]);
+    }
+    assert_eq!(seen, expected);
+    let session = only_session(&registry).await;
+    assert_eq!(session.model, "fake-model");
+
+    client.send(ClientMessage::codex_event(end.clone())).await;
+    let sessions = sessions_when(&registry, <[SessionView]>::is_empty).await;
+    assert!(
+        sessions.is_empty(),
+        "SessionEnd removes the row: {sessions:?}"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_concurrent_ping_pong() {
     let server = TestServer::spawn().await;

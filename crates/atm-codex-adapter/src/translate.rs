@@ -8,9 +8,12 @@
 //! ## Mapping table
 //!
 //! Captured: codex-cli 0.146.1, 2026-08-10, the spike, for the 7 events
-//! it saw. Captured: codex-cli 0.163.0, 2026-10-24, every row but the
-//! subagent ones, in `captured_tui_session_translates`. No capture has
-//! produced `SubagentStart` or `SubagentStop`.
+//! it saw. Captured: codex-cli 0.163.0, 2026-10-24, those 7 plus
+//! `PreCompact` (trigger `manual` only) and `PostCompact`, in
+//! `captured_tui_session_translates`. No capture has produced
+//! `SubagentStart`, `SubagentStop`, an unknown event, or a
+//! `PermissionRequest` without a tool; those rows are tested
+//! synthetically.
 //!
 //! | Codex event         | LifecycleEvent                                  |
 //! |---------------------|-------------------------------------------------|
@@ -368,39 +371,50 @@ mod tests {
                 .lines()
                 .map(|line| serde_json::from_str(line).expect("fixture line"))
                 .collect();
+        let [start, prompt, tool_start, permission, tool_end, stop, pre_compact, post_compact, end] =
+            raws.as_slice()
+        else {
+            panic!("expected 9 hook payloads, got {}", raws.len());
+        };
 
-        // Codex sends neither pid nor pane: atm-codex-hook adds both.
         for raw in &raws {
+            use CodexEventType::{PostCompact, PreCompact, SessionEnd, SessionStart};
+            let event = raw.event_type();
+            let name = &raw.hook_event_name;
+            // Codex sends neither pid nor pane: atm-codex-hook adds both.
             assert_eq!(raw.pid, None);
             assert_eq!(raw.tmux_pane, None);
             assert!(raw.transcript_path.is_some());
+            // Session-scoped events carry no turn_id; the compaction
+            // events do.
+            let session_scoped = matches!(event, Some(SessionStart | SessionEnd));
+            assert_eq!(raw.turn_id.is_none(), session_scoped, "{name}");
+            // SessionEnd carries no model; it and the compaction events
+            // carry no permission_mode.
+            let model = (event != Some(SessionEnd)).then(|| "fake-model".to_string());
+            assert_eq!(raw.model, model, "{name}");
+            let mode = (!matches!(event, Some(PreCompact | PostCompact | SessionEnd)))
+                .then(|| "default".to_string());
+            assert_eq!(raw.permission_mode, mode, "{name}");
         }
 
-        let events: Vec<Option<LifecycleEvent>> =
-            raws.iter().map(RawCodexEvent::to_lifecycle_event).collect();
-        let [start, prompt, tool_start, permission, tool_end, stop, pre_compact, post_compact, end] =
-            events.as_slice()
-        else {
-            panic!("expected 9 hook payloads, got {}", events.len());
-        };
-
         assert_eq!(
-            start,
-            &Some(LifecycleEvent::SessionStart {
+            start.to_lifecycle_event(),
+            Some(LifecycleEvent::SessionStart {
                 source: Some("startup".into())
             })
         );
         assert_eq!(
-            prompt,
-            &Some(LifecycleEvent::PromptSubmit {
+            prompt.to_lifecycle_event(),
+            Some(LifecycleEvent::PromptSubmit {
                 prompt: Some("Create atm-probe.txt.".into())
             })
         );
         // Codex names its exec_command tool `Bash` in hook payloads, and
         // tool_use_id is the model's function-call id.
         assert_eq!(
-            tool_start,
-            &Some(LifecycleEvent::ToolCallStart {
+            tool_start.to_lifecycle_event(),
+            Some(LifecycleEvent::ToolCallStart {
                 name: Tool::Bash,
                 tool_use_id: Some("call_fake_1".into()),
                 input: Some(serde_json::json!({"command": "touch atm-probe.txt"})),
@@ -408,59 +422,47 @@ mod tests {
         );
         // PreToolUse comes before PermissionRequest, which still carries
         // no tool_use_id.
-        assert_eq!(raws.get(3).and_then(|raw| raw.tool_use_id.clone()), None);
+        assert_eq!(permission.tool_use_id, None);
         assert_eq!(
-            permission,
-            &Some(LifecycleEvent::NeedsInput {
+            permission.to_lifecycle_event(),
+            Some(LifecycleEvent::NeedsInput {
                 reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
             })
         );
         // tool_response is a plain string (empty for `touch`).
         assert_eq!(
-            raws.get(4).and_then(|raw| raw.tool_response.clone()),
+            tool_end.tool_response,
             Some(serde_json::Value::String(String::new()))
         );
         assert_eq!(
-            tool_end,
-            &Some(LifecycleEvent::ToolCallEnd {
+            tool_end.to_lifecycle_event(),
+            Some(LifecycleEvent::ToolCallEnd {
                 name: Tool::Bash,
                 tool_use_id: Some("call_fake_1".into()),
                 is_error: false,
             })
         );
-        assert_eq!(stop, &Some(LifecycleEvent::WorkingEnd));
+        assert_eq!(stop.to_lifecycle_event(), Some(LifecycleEvent::WorkingEnd));
         assert_eq!(
-            pre_compact,
-            &Some(LifecycleEvent::ContextCompactStart {
+            pre_compact.to_lifecycle_event(),
+            Some(LifecycleEvent::ContextCompactStart {
                 trigger: Some("manual".into())
             })
         );
         assert_eq!(
-            post_compact,
-            &Some(LifecycleEvent::Notification {
+            post_compact.to_lifecycle_event(),
+            Some(LifecycleEvent::Notification {
                 message: None,
                 kind: Some(NotificationKind::Other("post_compact".into())),
             })
         );
         // Fired when the shared daemon stopped, not at `/quit`.
         assert_eq!(
-            end,
-            &Some(LifecycleEvent::SessionEnd {
+            end.to_lifecycle_event(),
+            Some(LifecycleEvent::SessionEnd {
                 reason: Some("other".into())
             })
         );
-
-        // Session-scoped events carry no turn_id, and SessionEnd no model.
-        for (index, raw) in raws.iter().enumerate() {
-            let session_scoped = matches!(
-                raw.event_type(),
-                Some(CodexEventType::SessionStart | CodexEventType::SessionEnd)
-            );
-            assert_eq!(raw.turn_id.is_none(), session_scoped, "payload {index}");
-            let model = (raw.event_type() != Some(CodexEventType::SessionEnd))
-                .then(|| "fake-model".to_string());
-            assert_eq!(raw.model, model, "payload {index}");
-        }
     }
 }
 

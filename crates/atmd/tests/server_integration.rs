@@ -975,7 +975,7 @@ async fn test_multiple_clients_concurrent() {
 // ============================================================================
 // Hook Event → LifecycleEvent translation (end-to-end)
 //
-// These tests drive a real Claude raw `HookEvent` JSON over the wire and
+// These tests drive Claude-shaped raw hook-event JSON over the wire and
 // confirm that the connection layer translates it into a vendor-neutral
 // `LifecycleEvent`, the registry applies it correctly, and the resulting
 // session state matches expectations. Together they exercise:
@@ -985,6 +985,10 @@ async fn test_multiple_clients_concurrent() {
 // Each test pre-registers a session (to skip the PID-based create-on-event
 // path that needs `/proc` lookups), then sends a hook event and reads the
 // session view back through the registry handle.
+//
+// Synthetic: `hook_event_json` builds minimal hand-written payloads. The
+// `TeammateIdle` test below sends a captured one; the adapter's fixture
+// tests cover full captured payloads.
 // ============================================================================
 
 /// Builds a raw Claude hook-event JSON payload for the given session.
@@ -1017,7 +1021,7 @@ async fn test_e2e_pre_tool_use_translates_to_tool_call_start() {
         .await
         .expect("register session");
 
-    // Send a real Claude PreToolUse(Bash) hook event over the wire.
+    // Send a Claude PreToolUse(Bash) hook event over the wire.
     client
         .send(ClientMessage::hook_event(hook_event_json(
             session_id.as_str(),
@@ -1191,9 +1195,11 @@ async fn test_e2e_notification_permission_prompt_becomes_needs_input() {
     server.shutdown().await;
 }
 
-/// A tmux-mode teammate fires `TeammateIdle` from its *own* session
-/// (captured with Claude Code 2.1.288). It must idle that session, not
-/// spawn a `waiter@<teammate>` child under it.
+/// A tmux-mode teammate fires `TeammateIdle` from its *own* session. It
+/// must idle that session, not spawn a `waiter@<teammate>` child under
+/// it. Captured: Claude Code 2.1.288, 2026-10-04, a tmux-mode team run
+/// (see atm-claude-adapter's crate docs); paths rewritten to
+/// `/home/user` and `/tmp/claude-user`.
 #[tokio::test]
 async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
     let (server, registry) = TestServer::spawn_with_registry().await;
@@ -1222,9 +1228,9 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
 
     let payload = serde_json::json!({
         "session_id": "34d56705-0907-49a6-8785-e72091a93178",
-        "transcript_path": "/home/damel/.claude/projects/-tmp-claude-1000--home-damel-git-agent-tmux-manager-17338be7-f08a-4b0b-a88e-ae6ee9ad56c5-scratchpad-teamcap-work/34d56705-0907-49a6-8785-e72091a93178.jsonl",
-        "cwd": "/tmp/claude-1000/-home-damel-git-agent-tmux-manager/17338be7-f08a-4b0b-a88e-ae6ee9ad56c5/scratchpad/teamcap/work",
-        "scratchpad_dir": "/tmp/claude-1000/-tmp-claude-1000--home-damel-git-agent-tmux-manager-17338be7-f08a-4b0b-a88e-ae6ee9ad56c5-scratchpad-teamcap-work/34d56705-0907-49a6-8785-e72091a93178/scratchpad",
+        "transcript_path": "/home/user/.claude/projects/-home-user-project/34d56705-0907-49a6-8785-e72091a93178.jsonl",
+        "cwd": "/home/user/project",
+        "scratchpad_dir": "/tmp/claude-user/-home-user-project/34d56705-0907-49a6-8785-e72091a93178/scratchpad",
         "permission_mode": "auto",
         "agent_type": "general-purpose",
         "hook_event_name": "TeammateIdle",

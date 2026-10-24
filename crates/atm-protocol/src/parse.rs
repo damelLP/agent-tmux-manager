@@ -3,14 +3,50 @@
 //! Currently houses Claude's status-line JSON parser. The
 //! Claude raw hook event vocabulary lives in the `atm-claude-adapter`
 //! crate; pi-shaped wire data lives in `atm-pi-adapter`. Future:
-//! `RawStatusLine` likely also moves to `atm-claude-adapter`.
+//! `RawStatusLine` likely also moves to `atm-claude-adapter`, with its
+//! fixture.
+//!
+//! ## Captured payloads
+//!
+//! `tests/fixtures/claude_status_line_2.1.310.jsonl` holds 14 status
+//! lines, one per line, as Claude wrote them to the statusLine command's
+//! stdin. Captured: Claude Code 2.1.310, 2026-10-24, the TUI run
+//! described under "Captured payloads" in `atm-claude-adapter`'s crate
+//! docs (a local fake Messages API, no model call; paths rewritten to
+//! `/home/user`). Every field `RawStatusLine` reads that Claude supplies
+//! is on every line; `pid` and `tmux_pane` are not, because Claude sends
+//! neither and `atm-hook` adds them before atmd sees the line.
+//! `current_usage` and `used_percentage` are `null` until a session's
+//! first request, including the session `/clear` starts. The lines also
+//! carry fields the parser ignores: `effort`, `thinking`, `fast_mode`,
+//! `output_style`, `prompt_cache`, `prompt_id` and
+//! `workspace.added_dirs`.
+//!
+//! Claude's mapping violates atm-core's cumulative contract for
+//! `ContextUsage::total_input_tokens` and `total_output_tokens`, which
+//! pi and Codex fill with session totals; no consumer reads them today.
+//! Claude's `context_window.total_input_tokens` is not a session total.
+//! On every line it equals the sum of the latest request's
+//! `input_tokens`, `cache_creation_input_tokens` and
+//! `cache_read_input_tokens`, and `total_output_tokens` stays at one
+//! request's 42 across requests. Both drop to 0 after `/compact`, while
+//! `cost.total_cost_usd` keeps growing. The 2.1.302 capture below shows
+//! the same: its 45772 is the sum of its `current_usage` input fields.
+//!
+//! `test_update_session_applies_context_window_size` uses one status
+//! line trimmed to the fields read. Captured: Claude Code 2.1.302, a
+//! `--settings` statusLine override over startup, a turn, `/clear` and
+//! another turn; added in ada96c5 on 2026-10-18. The other test payloads
+//! are hand-written (see `Synthetic:` there).
 
 use atm_core::{SessionDomain, StatusLineData};
 use serde::Deserialize;
 
 /// Raw status line JSON structure from Claude Code.
 ///
-/// Based on validated integration testing (Week 1).
+/// Written in c2a89f0 on 2026-01-25 from "validated integration testing
+/// (Week 1)", Claude Code version not recorded. Re-checked against
+/// Claude Code 2.1.310 (see the module docs).
 /// All fields except session_id are optional to handle partial updates.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawStatusLine {
@@ -203,6 +239,12 @@ mod tests {
     use super::*;
     use atm_core::Model;
 
+    // Synthetic: unless marked Captured, the payloads in this module are
+    // hand-written, with placeholder ids (`test-123`) and models chosen
+    // for the case (`gpt-4o`, `gemini-1.5-pro`), Claude Code version not
+    // recorded. They were added in c2a89f0 (2026-01-25), d0147d7
+    // (2026-02-11) and ada96c5 (2026-10-18).
+
     #[test]
     fn test_raw_status_line_parsing() {
         let json = r#"{
@@ -394,7 +436,9 @@ mod tests {
             Model::Unknown,
         );
 
-        // Captured from Claude Code 2.1.302 (trimmed to relevant fields)
+        // Captured: Claude Code 2.1.302, a `--settings` statusLine
+        // override, trimmed to the fields read; added in ada96c5 on
+        // 2026-10-18.
         let json = r#"{
             "session_id": "5aaeafa7-b633-42c6-83fb-dcbe2f713074",
             "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
@@ -505,6 +549,36 @@ mod tests {
 
         assert_eq!(session.model, Model::Unknown);
         assert_eq!(session.model_display_override.as_deref(), Some("GPT-4o"));
+    }
+
+    #[test]
+    fn captured_status_lines_2_1_310_parse() {
+        // Captured: Claude Code 2.1.310, 2026-10-24 (see the module docs).
+        let lines: Vec<RawStatusLine> =
+            include_str!("../tests/fixtures/claude_status_line_2.1.310.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("fixture line"))
+                .collect();
+        assert_eq!(lines.len(), 14);
+        let mut sessions = Vec::new();
+        for raw in &lines {
+            let model = raw.model.as_ref().expect("model is present");
+            assert_eq!(model.id, "claude-opus-5-5");
+            assert_eq!(model.display_name.as_deref(), Some("Opus 5.5"));
+            let session = raw.to_session_domain().expect("model is present");
+            assert_eq!(session.context.context_window_size, 1_000_000);
+            assert_eq!(session.claude_code_version.as_deref(), Some("2.1.310"));
+            sessions.push(session);
+        }
+
+        // Before the first request, `current_usage` is null.
+        assert_eq!(sessions[0].context.context_tokens().as_u64(), 0);
+        // After the first prompt's tool request, the fake provider's
+        // second POST (`input_tokens` = 1000 + 2): 1002 input + 300 cache
+        // creation + 4000 cache read. Its cost also covers the first POST,
+        // a side request with no tools.
+        assert_eq!(sessions[2].context.context_tokens().as_u64(), 5302);
+        assert!((sessions[2].cost.as_usd() - 0.014292).abs() < 1e-9);
     }
 
     #[test]

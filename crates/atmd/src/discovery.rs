@@ -982,11 +982,13 @@ mod tests {
         assert!(!cmdline_is_excluded(b"\xff\0claude\0daemon\0", &definition));
     }
 
-    // Real cmdlines observed live with codex-cli 0.160.0 (2026-10-03).
-    const CODEX_DAEMON_BIN: &str = "/home/damel/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex";
-    const CODEX_CODE_MODE_HOST: &str = "/home/damel/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex-code-mode-host";
-    const CODEX_NODE_WRAPPER: &str = "/home/damel/.nvm/versions/node/v25.2.1/bin/codex";
-    const CODEX_NATIVE_BIN: &str = "/home/damel/.nvm/versions/node/v25.2.1/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
+    // Real cmdlines observed live with codex-cli 0.160.0 (2026-10-03),
+    // home and project paths rewritten to /home/user. The matchers
+    // compare exact names and suffixes, never the prefix.
+    const CODEX_DAEMON_BIN: &str = "/home/user/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex";
+    const CODEX_CODE_MODE_HOST: &str = "/home/user/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex-code-mode-host";
+    const CODEX_NODE_WRAPPER: &str = "/home/user/.nvm/versions/node/v25.2.1/bin/codex";
+    const CODEX_NATIVE_BIN: &str = "/home/user/.nvm/versions/node/v25.2.1/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
 
     fn codex_definition() -> &'static HarnessDefinition {
         atm_core::find_harness_definition("codex")
@@ -1089,14 +1091,14 @@ mod tests {
             ],
             // Tool-call sandbox stages; exe is CODEX_DAEMON_BIN for both.
             vec![
-                "/home/damel/.codex/tmp/arg0/codex-arg0TbkqL8/codex-linux-sandbox",
+                "/home/user/.codex/tmp/arg0/codex-arg0TbkqL8/codex-linux-sandbox",
                 "--sandbox-policy-cwd",
-                "/home/damel/code/baliyo",
+                "/home/user/project",
             ],
             vec![
                 "codex-linux-sandbox",
                 "--sandbox-policy-cwd",
-                "/home/damel/code/baliyo",
+                "/home/user/project",
                 "--apply-seccomp-then-exec",
             ],
         ] {

@@ -22,14 +22,16 @@
 //! `output_style`, `prompt_cache`, `prompt_id` and
 //! `workspace.added_dirs`.
 //!
-//! `context_window.total_input_tokens` is not a session total. On every
-//! line it equals the sum of the latest request's `input_tokens`,
-//! `cache_creation_input_tokens` and `cache_read_input_tokens`, and
-//! `total_output_tokens` stays at one request's 42 across requests. Both
-//! drop to 0 after `/compact`, while `cost.total_cost_usd` keeps growing.
-//! The 2.1.302 capture below shows the same: its 45772 is the sum of its
-//! `current_usage` input fields. atm-core's `ContextUsage` still
-//! documents both fields as cumulative.
+//! Claude's mapping violates atm-core's cumulative contract for
+//! `ContextUsage::total_input_tokens` and `total_output_tokens`, which
+//! pi and Codex fill with session totals; no consumer reads them today.
+//! Claude's `context_window.total_input_tokens` is not a session total.
+//! On every line it equals the sum of the latest request's
+//! `input_tokens`, `cache_creation_input_tokens` and
+//! `cache_read_input_tokens`, and `total_output_tokens` stays at one
+//! request's 42 across requests. Both drop to 0 after `/compact`, while
+//! `cost.total_cost_usd` keeps growing. The 2.1.302 capture below shows
+//! the same: its 45772 is the sum of its `current_usage` input fields.
 //!
 //! `test_update_session_applies_context_window_size` uses one status
 //! line trimmed to the fields read. Captured: Claude Code 2.1.302, a

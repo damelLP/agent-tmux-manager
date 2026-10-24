@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use atm_claude_adapter::ClaudeEventType;
 use atm_codex_adapter::CodexEventType;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 /// Errors from installing or removing ATM's harness integrations.
@@ -61,6 +61,10 @@ pub enum SetupError {
     /// A settings file is valid JSON but not the shape ATM edits.
     #[error("{0}")]
     Shape(&'static str),
+
+    /// The settings file at `path` is valid JSON but not an object.
+    #[error("{} is not a JSON object", .path.display())]
+    NotAnObject { path: PathBuf },
 }
 
 type Result<T> = std::result::Result<T, SetupError>;
@@ -125,21 +129,40 @@ fn hook_script_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/local/bin/atm-hook"))
 }
 
-/// Reads a JSON file at `path`, returning an empty object if the file
-/// does not exist. Errors carry the path for diagnostics.
-fn read_json_file_or_empty(path: &Path) -> Result<Value> {
+/// Reads the JSON object in the file at `path`, returning an empty object
+/// if the file does not exist. Errors carry the path for diagnostics.
+///
+/// Valid JSON that isn't an object (`[]`, `null`, `1`) is a
+/// [`SetupError::NotAnObject`], so callers never panic indexing it or
+/// replace the user's file with `{}`.
+fn read_json_file_or_empty(path: &Path) -> Result<Map<String, Value>> {
     if !path.exists() {
-        return Ok(json!({}));
+        return Ok(Map::new());
     }
 
     let content = fs::read_to_string(path).map_err(io_err("read", path))?;
 
-    serde_json::from_str(&content).map_err(json_err("parse", path))
+    match serde_json::from_str(&content).map_err(json_err("parse", path))? {
+        Value::Object(settings) => Ok(settings),
+        _ => Err(SetupError::NotAnObject {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+/// Uninstall's read of a harness settings file. One that isn't a JSON
+/// object holds no ATM entries, so it reads as empty (and, with nothing
+/// removed, is never written back) rather than stopping the uninstall.
+fn or_empty_if_not_object(read: Result<Map<String, Value>>) -> Result<Map<String, Value>> {
+    match read {
+        Err(SetupError::NotAnObject { .. }) => Ok(Map::new()),
+        read => read,
+    }
 }
 
 /// Writes `value` to `path` as pretty-printed JSON, creating parent
 /// directories as needed. Errors carry the path for diagnostics.
-fn write_json_file_pretty(path: &Path, value: &Value) -> Result<()> {
+fn write_json_file_pretty(path: &Path, value: &Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_err("create", parent))?;
     }
@@ -149,13 +172,13 @@ fn write_json_file_pretty(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// Reads Claude Code settings, returns empty object if file doesn't exist
-fn read_settings() -> Result<Value> {
+fn read_settings() -> Result<Map<String, Value>> {
     let path = claude_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     read_json_file_or_empty(&path)
 }
 
 /// Writes Claude Code settings
-fn write_settings(settings: &Value) -> Result<()> {
+fn write_settings(settings: &Map<String, Value>) -> Result<()> {
     let path = claude_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, settings)
 }
@@ -362,13 +385,13 @@ fn detect_codex() -> bool {
 // ============================================================================
 
 /// Reads Codex's hooks.json. Returns an empty object if not present.
-fn read_codex_hooks() -> Result<Value> {
+fn read_codex_hooks() -> Result<Map<String, Value>> {
     let path = codex_hooks_path().ok_or(SetupError::HomeDirUnknown)?;
     read_json_file_or_empty(&path)
 }
 
 /// Writes Codex's hooks.json
-fn write_codex_hooks(hooks: &Value) -> Result<()> {
+fn write_codex_hooks(hooks: &Map<String, Value>) -> Result<()> {
     let path = codex_hooks_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, hooks)
 }
@@ -414,12 +437,12 @@ fn pi_settings_path() -> Option<PathBuf> {
 }
 
 /// Reads pi's settings.json. Returns an empty object if not present.
-fn read_pi_settings() -> Result<Value> {
+fn read_pi_settings() -> Result<Map<String, Value>> {
     let path = pi_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     read_json_file_or_empty(&path)
 }
 
-fn write_pi_settings(settings: &Value) -> Result<()> {
+fn write_pi_settings(settings: &Map<String, Value>) -> Result<()> {
     let path = pi_settings_path().ok_or(SetupError::HomeDirUnknown)?;
     write_json_file_pretty(&path, settings)
 }
@@ -445,20 +468,10 @@ fn install_pi_extension() -> Result<(bool, bool)> {
     fs::write(&pkg_path, PI_ATM_PACKAGE_JSON).map_err(io_err("write", &pkg_path))?;
 
     // Update pi's settings.json packages array.
-    //
-    // `Value` indexing panics when the inner value isn't an object —
-    // a corrupted or hand-edited settings.json that's e.g. `null` or
-    // `["array"]` would crash atm setup. Replace any non-object root
-    // with `{}` so the indexing below is always valid; we still error
-    // out below if `packages` exists but is the wrong shape.
     let mut settings = read_pi_settings()?;
-    if !settings.is_object() {
-        settings = json!({});
-    }
-    if settings.get("packages").is_none() {
-        settings["packages"] = json!([]);
-    }
-    let packages = settings["packages"]
+    let packages = settings
+        .entry("packages")
+        .or_insert_with(|| json!([]))
         .as_array_mut()
         .ok_or(SetupError::Shape(
             "packages is not an array in pi settings.json",
@@ -487,7 +500,7 @@ fn uninstall_pi_extension() -> Result<bool> {
             changed = true;
         }
     }
-    let mut settings = read_pi_settings()?;
+    let mut settings = or_empty_if_not_object(read_pi_settings())?;
     if let Some(packages) = settings.get_mut("packages").and_then(|p| p.as_array_mut()) {
         let before = packages.len();
         packages.retain(|v| v.as_str() != Some("packages/pi-atm"));
@@ -628,11 +641,9 @@ fn setup_claude_code() -> Result<()> {
     let mut settings = read_settings()?;
 
     // Ensure hooks object exists
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = json!({});
-    }
-
-    let hooks = settings["hooks"]
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or(SetupError::Shape("hooks is not an object"))?;
 
@@ -660,12 +671,12 @@ fn setup_claude_code() -> Result<()> {
             println!("    statusLine - already configured");
             false
         } else {
-            settings["statusLine"] = create_status_line_entry();
+            settings.insert("statusLine".to_string(), create_status_line_entry());
             println!("    statusLine - updated to use atm-hook");
             true
         }
     } else {
-        settings["statusLine"] = create_status_line_entry();
+        settings.insert("statusLine".to_string(), create_status_line_entry());
         println!("    statusLine - added");
         true
     };
@@ -705,21 +716,14 @@ fn setup_codex() -> Result<()> {
     install_executable_script(&hook_path, ATM_CODEX_HOOK_SCRIPT)?;
     println!("done");
 
-    // A corrupted or hand-edited hooks.json that isn't an object would
-    // make the indexing below panic; replace any non-object root with
-    // `{}` (mirrors the guard in install_pi_extension).
     let mut settings = read_codex_hooks()?;
-    if !settings.is_object() {
-        settings = json!({});
-    }
-
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = json!({});
-    }
-
-    let hooks = settings["hooks"].as_object_mut().ok_or(SetupError::Shape(
-        "hooks is not an object in codex hooks.json",
-    ))?;
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(SetupError::Shape(
+            "hooks is not an object in codex hooks.json",
+        ))?;
 
     let mut added = 0;
 
@@ -757,7 +761,7 @@ pub fn uninstall() -> Result<()> {
 
     // Step 1: Remove from Claude Code settings
     println!("Removing Claude Code hooks...");
-    let mut settings = read_settings()?;
+    let mut settings = or_empty_if_not_object(read_settings())?;
 
     let mut removed = 0;
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
@@ -792,9 +796,7 @@ pub fn uninstall() -> Result<()> {
     let mut status_line_removed = false;
     if let Some(status_line) = settings.get("statusLine") {
         if has_atm_status_line(status_line) {
-            if let Some(obj) = settings.as_object_mut() {
-                obj.remove("statusLine");
-            }
+            settings.remove("statusLine");
             write_settings(&settings)?;
             println!("\nstatusLine configuration removed");
             status_line_removed = true;
@@ -826,7 +828,7 @@ pub fn uninstall() -> Result<()> {
     // Step 5: Remove Codex hooks if configured
     if detect_codex() {
         println!("\nRemoving Codex hooks...");
-        let mut codex_settings = read_codex_hooks()?;
+        let mut codex_settings = or_empty_if_not_object(read_codex_hooks())?;
         let mut codex_removed = 0;
         if let Some(hooks) = codex_settings
             .get_mut("hooks")
@@ -1084,6 +1086,86 @@ mod error_tests {
         assert!(
             matches!(err, SetupError::Io { op: "create config directory", ref path, .. } if path == &blocker),
             "unexpected error: {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod settings_read_tests {
+    use super::{json_err, or_empty_if_not_object, read_json_file_or_empty, SetupError};
+    use serde_json::{json, Map, Value};
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn non_object_roots_are_rejected_naming_their_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for root in ["[]", "null", "1", "\"x\""] {
+            fs::write(&path, root).unwrap();
+
+            let err = read_json_file_or_empty(&path).unwrap_err();
+
+            assert!(
+                matches!(err, SetupError::NotAnObject { path: ref p } if p == &path),
+                "{root}: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("{} is not a JSON object", path.display())
+            );
+        }
+    }
+
+    #[test]
+    fn an_object_root_is_read_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"userKey": "kept"}"#).unwrap();
+
+        let settings = read_json_file_or_empty(&path).unwrap();
+
+        assert_eq!(Value::Object(settings), json!({"userKey": "kept"}));
+    }
+
+    #[test]
+    fn a_missing_file_reads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let settings = read_json_file_or_empty(&dir.path().join("absent.json")).unwrap();
+
+        assert!(settings.is_empty());
+    }
+
+    #[test]
+    fn uninstall_reads_a_non_object_file_as_empty() {
+        let not_object = SetupError::NotAnObject {
+            path: "/h/.claude/settings.json".into(),
+        };
+
+        assert_eq!(or_empty_if_not_object(Err(not_object)).unwrap(), Map::new());
+    }
+
+    #[test]
+    fn uninstall_still_fails_on_other_read_errors() {
+        let p = Path::new("/h/.claude/settings.json");
+        let parse = serde_json::from_str::<Value>("{").unwrap_err();
+
+        let read = or_empty_if_not_object(Err(json_err("parse", p)(parse)));
+
+        assert!(
+            matches!(read, Err(SetupError::Json { op: "parse", .. })),
+            "{read:?}"
+        );
+    }
+
+    #[test]
+    fn uninstall_reads_an_object_file_unchanged() {
+        let settings = json!({"userKey": "kept"}).as_object().cloned().unwrap();
+
+        assert_eq!(
+            or_empty_if_not_object(Ok(settings.clone())).unwrap(),
+            settings
         );
     }
 }

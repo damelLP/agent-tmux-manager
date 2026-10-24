@@ -16,12 +16,15 @@
 //!
 //! ## Event vocabulary
 //!
-//! 28 pi events: 26 declared in pi's
-//! `dist/core/extensions/types.d.ts` plus 2 undeclared but real
-//! (`tool_call`, `tool_result`). See `event::PiEventType` for the
-//! enumeration and `translate.rs` for per-variant lifecycle mapping.
-//! Originally captured by the `agent-tmux-manager-9dn` spike under
-//! `extensions/pi-spike/`.
+//! 28 pi events. Captured: pi 0.73.1, 2026-10-24, pi's
+//! `dist/core/extensions/types.d.ts`, which declares 29. The 29th,
+//! `thinking_level_select`, is not modelled: it lands in
+//! `PiEventType::Other`, and pi-atm doesn't forward it. At the
+//! `agent-tmux-manager-9dn` spike (2026-05-02, pi version not recorded)
+//! `tool_call` and `tool_result` were undeclared but real. See
+//! `event::PiEventType` for the enumeration and `translate.rs` for
+//! per-variant lifecycle mapping. Originally captured by the spike
+//! under `extensions/pi-spike/`.
 //!
 //! ## Three-axis vendor model
 //!
@@ -44,6 +47,36 @@
 //! [`atm_core::NeedsInputReason::PermissionGate`] when the gate is
 //! reached. A passive observer cannot detect this state; only an active
 //! extension can.
+//!
+//! ## Captured payloads
+//!
+//! `tests/fixtures/pi_tool_run_0.73.1.jsonl` holds one real tool run, as
+//! the frames pi-atm sent atmd. Captured: pi 0.73.1, 2026-10-24, pi's
+//! TUI in a private tmux server with pi-atm loaded, frames tapped by
+//! `socat -r` on the way to an isolated atmd, answered by a local fake
+//! OpenAI-compatible provider (no model call). session_id absent:
+//! pi-atm bug, queued. It covers every event pi-atm forwards except
+//! `session_before_compact`, whose payload the adapter doesn't read.
+//! The `atm_needs_input_*` events are pi-atm's own, not pi's.
+//!
+//! The hand-copied payloads in the `wire.rs` and `translate.rs` tests
+//! come from the 2026-05-02 spike trace (pi version not recorded).
+//! Tests marked `Synthetic:` use shapes no capture produced.
+//!
+//! ## Known gaps (pi 0.73.1)
+//!
+//! - `model_select` sends `{model, previousModel, source}`. `model` is
+//!   pi's `Model` object, and the provider is `model.provider`. The
+//!   adapter reads a top-level `provider`, so
+//!   `ProviderModelChange.provider` is always `None`. Nothing reads it
+//!   yet: `SessionDomain` keeps only the model.
+//! - `model_select` fires only when the model changes (source `set`,
+//!   `cycle` or `restore`). A fresh session sends none, so its model
+//!   shows as unknown until the user switches.
+//! - pi-atm sends no `session_id`. It reads
+//!   `ctx.sessionManager.currentSessionId`, which pi 0.73.1 doesn't have
+//!   (its session manager has `getSessionId()`), so atmd keys pi
+//!   sessions by pid.
 
 pub mod event;
 pub mod translate;

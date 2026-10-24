@@ -44,7 +44,10 @@ use crate::wire::RawPiEvent;
 /// Extracts cumulative `(tokens, cost_usd)` from a pi `context` event's
 /// `messages[]` array.
 ///
-/// Pi's wire shape (verified by the spike trace):
+/// Pi's wire shape. Captured: pi, version not recorded, 2026-05-02
+/// (spike trace filename), pi-spike tracer; added in 7a20d86 on
+/// 2026-05-10. pi 0.73.1 sends the same shape
+/// (`tests/fixtures/pi_tool_run_0.73.1.jsonl`).
 /// ```jsonc
 /// "messages": [
 ///   { "role": "user", ... },
@@ -313,8 +316,10 @@ mod tests {
 
     #[test]
     fn context_event_extracts_latest_usage_into_context_update() {
-        // Real-shape payload mirroring the spike's
-        // /tmp/atm-pi-spike-pid1226148-2026-05-02 trace line.
+        // Captured: pi, version not recorded, 2026-05-02 (trace
+        // /tmp/atm-pi-spike-pid1226148-2026-05-02T08-55-56-043Z.jsonl, not
+        // kept), pi-spike tracer in an interactive session; added in
+        // 7a20d86 on 2026-05-10.
         let messages = serde_json::json!([
             {"role": "user", "content": "Use ls to list /tmp"},
             {
@@ -623,6 +628,8 @@ mod tests {
 
     #[test]
     fn model_select_becomes_provider_model_change() {
+        // Synthetic: top-level `provider`. pi 0.73.1 sends it only as
+        // `model.provider` (see the crate docs).
         let e = raw(
             PiEventType::ModelSelect,
             PiPayload {

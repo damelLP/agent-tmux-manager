@@ -689,6 +689,9 @@ impl SessionDomain {
     /// When `current_usage` is null in Claude's status line, all current_* values
     /// will be 0, which correctly resets context percentage to 0%.
     ///
+    /// Leaves `status` alone: lifecycle events own it, and a status line
+    /// carries no turn state (see atm-claude-adapter's Known gaps).
+    ///
     /// Returns `true` if the working directory changed (caller should re-resolve git info).
     pub fn update_from_status_line(&mut self, data: &StatusLineData) -> bool {
         self.cost = Money::from_usd(data.cost_usd);
@@ -702,12 +705,6 @@ impl SessionDomain {
         self.context.cache_creation_tokens = TokenCount::new(data.cache_creation_tokens);
         self.context.cache_read_tokens = TokenCount::new(data.cache_read_tokens);
         self.last_activity = Utc::now();
-
-        // Status line update means Claude is working
-        // Don't override AttentionNeeded (permission wait)
-        if self.status != SessionStatus::AttentionNeeded {
-            self.status = SessionStatus::Working;
-        }
 
         // Detect working directory change
         let cwd_changed = match (&data.cwd, &self.working_directory) {
@@ -1961,5 +1958,26 @@ mod tests {
 
         assert_eq!(session.context.context_window_size, 1_000_000);
         assert!((session.context.usage_percentage() - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_update_from_status_line_keeps_status() {
+        // A status line says nothing about whether a turn is running.
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::AttentionNeeded,
+        ] {
+            let mut session = SessionDomain::new(
+                SessionId::new("test"),
+                AgentType::GeneralPurpose,
+                Model::Sonnet4,
+            );
+            session.status = status;
+
+            session.update_from_status_line(&make_status_data(None));
+
+            assert_eq!(session.status, status);
+        }
     }
 }

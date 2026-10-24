@@ -108,19 +108,43 @@
 //!
 //! ## Known gaps (Claude Code 2.1.310)
 //!
-//! - **A status line after every turn turns the row back to Working.**
-//!   Claude sends a status line about 300 ms after each `Stop`, and
-//!   atm-core's `SessionDomain::update_from_status_line` sets Working on
-//!   every status line unless the session needs input. In the capture,
-//!   status lines followed three `Stop`s by 317, 307 and 307 ms.
-//!   `atm list` still showed `working` 54 s after the last status line,
-//!   and the row went idle only with `Notification` (`idle_prompt`)
-//!   60 s after the last `Stop`. After `/clear`, `atm list` showed the
-//!   new session `working` too. `/compact` (whose `SessionStart` sets
-//!   Idle) and a permission-mode change at an idle prompt are also
-//!   followed by a status line, so the same applies (read from the
-//!   code, not checked in `atm list`). Unverified for versions before
-//!   2.1.310.
+//! - **`claude --bare` runs the statusLine but no hooks, so ATM can't
+//!   see its turns.** A sealed TUI run with `--bare` sent status lines at
+//!   startup, after a permission-mode change and after a turn, and no
+//!   hook events. Status lines leave a row's status alone, because Claude
+//!   also sends one about 300 ms after every `Stop` (317, 307 and 307 ms
+//!   in the capture), and after `/compact`, `/clear` and a
+//!   permission-mode change at the idle prompt. So a `--bare` row stays
+//!   idle while Claude works. It was wrong when every status line set
+//!   Working too: the row then stayed working at the idle prompt. In the
+//!   same kind of run, `disableAllHooks: true`, a managed
+//!   `allowManagedHooksOnly: true` and `--safe-mode` each stopped both
+//!   the hooks and the statusLine, so ATM hears nothing from those
+//!   sessions.
+//! - **The row reads idle for one model response after an auto-compact
+//!   or a blocked `Stop`.** Both were checked in sealed TUI runs with
+//!   replies streamed over 8 s:
+//!   - A user's own `Stop` hook that returns `decision: block` makes
+//!     Claude continue. ATM's `Stop` has already set Idle, and neither a
+//!     hook nor a status line marks the continuation. The next hook is
+//!     its first `PreToolUse`, or a second `Stop` with
+//!     `stop_hook_active: true`.
+//!   - An auto-compact at the start of a turn fires `UserPromptSubmit`,
+//!     `PreCompact` (trigger `auto`), a `SubagentStop`, then
+//!     `SessionStart` (source `compact`), which sets Idle while Claude
+//!     goes on to answer. `SessionStart` has the same fields after a
+//!     manual `/compact`, where Idle is right; only `PreCompact` carries
+//!     the trigger.
+//!
+//!   In both cases the row stays idle until the response's first
+//!   `PreToolUse`, or its `Stop`. `atm list` in those runs:
+//!
+//!   | Build | 3 s into the response | After the turn |
+//!   |---|---|---|
+//!   | Status lines set Working (before #81) | `working` | `working` (~60 s) |
+//!   | Status lines leave status alone | `idle` | `idle` |
+//!
+//!   The fix needs core lifecycle state; see the #79 follow-up.
 //! - **The Agent tool runs subagents in the background by default.**
 //!   `PostToolUse` for `Agent` follows `SubagentStart` at once, with
 //!   `tool_response` `{"isAsync": true, "status": "async_launched",

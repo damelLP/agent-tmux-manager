@@ -1258,6 +1258,169 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
     server.shutdown().await;
 }
 
+/// atmd's fixture holding every hook payload and status line of one Claude
+/// Code TUI session, in the order atm-hook received them. Each line is
+/// `{"offset_ms":..,"kind":"hook"|"status_line","payload":..}`, with
+/// `offset_ms` from the first call. Captured: Claude Code 2.1.310,
+/// 2026-10-24, the run described under "Captured payloads" in
+/// atm-claude-adapter's crate docs; paths rewritten to `/home/user` and
+/// `/tmp/claude-user`. The payloads are those of atm-claude-adapter's
+/// `claude_tui_session_2.1.310.jsonl` and atm-protocol's
+/// `claude_status_line_2.1.310.jsonl`; this file adds their order.
+const CLAUDE_INTERLEAVED: &str = "tests/fixtures/claude_tui_interleaved_2.1.310.jsonl";
+
+/// Index in [`CLAUDE_INTERLEAVED`] of the first call from the second
+/// process, which resumed the session with `--resume` after the first
+/// process exited.
+const CLAUDE_RESUMED_AT: usize = 42;
+
+/// The `(kind, payload)` of each call in [`CLAUDE_INTERLEAVED`], each
+/// payload given a live pid as atm-hook would add one: this test's own for
+/// the first process, and its parent's from [`CLAUDE_RESUMED_AT`] on, so
+/// atmd sees two processes as it did in the capture.
+fn captured_claude_calls() -> Vec<(String, serde_json::Value)> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CLAUDE_INTERLEAVED);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut call: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+            let kind = call["kind"].as_str().expect("kind").to_string();
+            let mut payload = call["payload"].take();
+            payload["pid"] = if i < CLAUDE_RESUMED_AT {
+                std::process::id()
+            } else {
+                std::os::unix::process::parent_id()
+            }
+            .into();
+            (kind, payload)
+        })
+        .collect()
+}
+
+/// Sends one message, then a ping, and returns once the Pong arrives.
+/// atmd handles one connection's messages in order and awaits the
+/// registry for each, so the Pong means the message has been applied.
+async fn send_applied(client: &mut TestClient, seq: u64, message: ClientMessage) {
+    client.send(message).await;
+    client.send(ClientMessage::ping(seq)).await;
+    match client.recv().await {
+        DaemonMessage::Pong { seq: got } if got == seq => {}
+        other => panic!("expected Pong {seq}, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_claude_interleaved_fixture_matches_its_sources() {
+    // Every payload is byte-identical to its line in the two source
+    // fixtures, so the interleaved fixture adds only the capture order.
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let hooks_path =
+        crates.join("atm-claude-adapter/tests/fixtures/claude_tui_session_2.1.310.jsonl");
+    let status_path = crates.join("atm-protocol/tests/fixtures/claude_status_line_2.1.310.jsonl");
+    if !hooks_path.exists() || !status_path.exists() {
+        // atmd's tests ship in its crates.io package without those crates.
+        eprintln!("skipped: no source fixtures outside the workspace");
+        return;
+    }
+    let read = |path: &PathBuf| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+    let text = read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CLAUDE_INTERLEAVED));
+    let mut hooks = Vec::new();
+    let mut status_lines = Vec::new();
+    for line in text.lines() {
+        let (head, payload) = line.split_once(r#","payload":"#).expect("payload field");
+        let payload = payload
+            .strip_suffix('}')
+            .expect("payload is the last field");
+        if head.ends_with(r#""kind":"hook""#) {
+            hooks.push(payload);
+        } else if head.ends_with(r#""kind":"status_line""#) {
+            status_lines.push(payload);
+        } else {
+            panic!("unexpected kind in {head}");
+        }
+    }
+    assert_eq!(hooks, read(&hooks_path).lines().collect::<Vec<_>>());
+    assert_eq!(status_lines, read(&status_path).lines().collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
+    // Claude 2.1.310 sends a status line ~300 ms after every Stop, and
+    // after `/compact`, `/clear` and a permission-mode change at the idle
+    // prompt. Status lines carry no turn state, so none of them may change
+    // a row's status or activity, and above all none may turn an idle row
+    // back to working.
+    //
+    // The calls go over one connection in capture order. atm-hook opens
+    // a connection per call, so this replay doesn't cover calls arriving
+    // out of order.
+    let calls = captured_claude_calls();
+    assert_eq!(calls.len(), 46);
+    assert_eq!(calls[CLAUDE_RESUMED_AT + 1].1["source"], "resume");
+    // Each status line that follows an idle point, by its fixture index,
+    // with the hook event before it: the permission-mode change at the
+    // idle prompt (40 s after SessionStart), the three Stops, `/compact`'s
+    // SessionStart, and `/clear`'s SessionStart under a new session id.
+    let checkpoints = [
+        (2, "SessionStart"),
+        (10, "Stop"),
+        (18, "Stop"),
+        (29, "Stop"),
+        (35, "SessionStart"),
+        (39, "SessionStart"),
+    ];
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    let state = |view: Option<SessionView>| view.map(|v| (v.status_label, v.activity_detail));
+    let mut seen = Vec::new();
+    let mut changed = Vec::new();
+    for (seq, (i, (kind, payload))) in (1..).zip(calls.iter().enumerate()) {
+        let message = match kind.as_str() {
+            "hook" => ClientMessage::hook_event(payload.clone()),
+            "status_line" => ClientMessage::status_update(payload.clone()),
+            other => panic!("unexpected kind {other}"),
+        };
+        let id = SessionId::new(payload["session_id"].as_str().expect("session_id"));
+        let before = state(registry.get_session(id.clone()).await);
+        send_applied(&mut client, seq, message).await;
+        let after = state(registry.get_session(id).await);
+        if kind == "status_line" {
+            let unchanged = match (&before, &after) {
+                (Some(before), Some(after)) => after == before,
+                // A status line for an ended session re-creates its row
+                // (see atm-claude-adapter's Known gaps), which starts idle.
+                (None, Some((label, _))) => label == "idle",
+                _ => false,
+            };
+            if !unchanged {
+                changed.push((i, before, after.clone()));
+            }
+        }
+        if let Some(&(_, previous)) = checkpoints.iter().find(|(at, _)| *at == i) {
+            let hook = calls[i - 1].1["hook_event_name"].as_str();
+            assert_eq!(hook, Some(previous), "fixture order at {i}");
+            seen.push((i, kind.as_str(), after.map(|(label, _)| label)));
+        }
+    }
+    assert!(
+        changed.is_empty(),
+        "status lines changed rows: {changed:#?}"
+    );
+    let expected: Vec<_> = checkpoints
+        .iter()
+        .map(|&(i, _)| (i, "status_line", Some("idle".to_string())))
+        .collect();
+    assert_eq!(seen, expected);
+
+    server.shutdown().await;
+}
+
 // ============================================================================
 // Pi Event → LifecycleEvent translation (end-to-end, wire-level)
 //
@@ -2102,22 +2265,15 @@ fn captured_codex_events(fixture: &str) -> Option<Vec<serde_json::Value>> {
     Some(events)
 }
 
-/// Sends one codex hook payload, then a ping, and returns the sessions
-/// once the Pong arrives. atmd handles one connection's messages in order
-/// and awaits the registry for each lifecycle event, so the Pong means
-/// the payload has been applied.
+/// Applies one codex hook payload (see [`send_applied`]) and returns the
+/// sessions.
 async fn apply_codex_event(
     client: &mut TestClient,
     registry: &atmd::registry::RegistryHandle,
     seq: u64,
     event: &serde_json::Value,
 ) -> Vec<SessionView> {
-    client.send(ClientMessage::codex_event(event.clone())).await;
-    client.send(ClientMessage::ping(seq)).await;
-    match client.recv().await {
-        DaemonMessage::Pong { seq: got } if got == seq => {}
-        other => panic!("expected Pong {seq}, got {other:?}"),
-    }
+    send_applied(client, seq, ClientMessage::codex_event(event.clone())).await;
     registry.get_all_sessions().await
 }
 

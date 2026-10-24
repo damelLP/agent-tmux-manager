@@ -101,7 +101,8 @@
 //! `SessionStart`, `UserPromptSubmit`, `StopFailure`, `Notification`
 //! (`idle_prompt`), and a `SessionEnd` (reason `other`) from tearing the
 //! capture down. Captured: Claude Code 2.1.310, 2026-10-25, by the
-//! method above, with the fake Messages API failing each turn: a 500
+//! method above but left in auto mode (`permission_mode: "auto"`), with
+//! the fake Messages API failing each turn: a 500
 //! (`error: "server_error"`), a 429 (`rate_limit`), and a stream cut
 //! after its first text delta (`unknown`). Paths were rewritten as
 //! above. The fake API's `127.0.0.1` port in `last_assistant_message` is
@@ -138,10 +139,25 @@
 //! the row reads working, which matches the TUI's "Retrying in …" line.
 //! The payload carries `error` and `last_assistant_message` (the error
 //! text the TUI shows), and never had the schema's optional
-//! `error_details`. Read from the binary, not run: the hook's `error`
-//! values also include `overloaded`, `authentication_failed`,
-//! `billing_error`, `max_output_tokens` and others, and a subagent's
-//! API error sends no `StopFailure`.
+//! `error_details`.
+//!
+//! - Unlike `Stop`, `StopFailure` lists no `background_tasks` or
+//!   `session_crons` (neither its schema nor the captures has them). So
+//!   after a failed turn the parent shows no "N running" summary, and
+//!   children left working are not swept until a later quiet `Stop`.
+//! - In `claude -p` (9 runs, each a 400), `StopFailure`'s hook started
+//!   about 115 ms before `SessionEnd`'s, and no row was left after the
+//!   process exited. Claude doesn't await the hook, so the order is
+//!   observed, not guaranteed.
+//! - Read from the binary, not run: the hook's `error` values also
+//!   include `overloaded`, `authentication_failed`, `billing_error`,
+//!   `max_output_tokens` and others. A subagent's API error sends no
+//!   `StopFailure`. Claude also sends it for turns that end without an
+//!   API error: a prompt too long, a tool call or reply still malformed
+//!   or empty after a retry, and auto-compact thrashing.
+//! - Not checked: a `StopFailure` after which Claude goes on working,
+//!   such as a quota auto-resume after `rate_limit`. The row would read
+//!   idle until the next hook.
 //!
 //! ## Known gaps (Claude Code 2.1.310)
 //!
@@ -224,6 +240,10 @@
 //!   `Elicitation`, `ElicitationResult`, `ConfigChange`,
 //!   `WorktreeCreate`, `WorktreeRemove`, `InstructionsLoaded`,
 //!   `CwdChanged`, `FileChanged`, `DirectoryAdded` and `MessageDisplay`.
+//!   Per Claude's changelog (not run), `StopFailure` arrived in 2.1.78
+//!   and `TaskCreated` in 2.1.84, and before 2.1.101 an unknown hook
+//!   name made Claude ignore the whole settings.json. So ATM's hooks need
+//!   Claude Code 2.1.84 or later, as they did before `StopFailure`.
 //!   Those that looked as if they could change a row's state were
 //!   captured on 2026-10-25 and left unregistered:
 //!   - `PermissionDenied` fires only when the auto-mode classifier

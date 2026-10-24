@@ -77,6 +77,23 @@ fn claude_uninstall_keeps_a_user_command_in_atms_stop_failure_entry() {
 }
 
 #[test]
+fn claude_setup_writes_stop_failure_without_a_matcher() {
+    // Claude Code 2.1.310 fired this entry, as setup writes it, in a real
+    // run (2026-10-25).
+    let home = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(home.path().join(".claude")).unwrap();
+    let setup = run_atm(home.path(), "setup");
+    assert!(setup.status.success(), "setup: {setup:?}");
+
+    let settings = read_json(&home.path().join(".claude/settings.json"));
+    let entries = settings["hooks"]["StopFailure"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].get("matcher"), None, "{entries:?}");
+    let command = entries[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(command.ends_with("/atm-hook"), "{command}");
+}
+
+#[test]
 fn codex_uninstall_keeps_a_user_command_in_atms_entry() {
     assert_uninstall_keeps_user_command(".codex/hooks.json", "atm-codex-hook", "PreToolUse");
 }

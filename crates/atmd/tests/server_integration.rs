@@ -1455,17 +1455,24 @@ async fn test_e2e_claude_captured_stop_failure_replay() {
         let mut seen = Vec::new();
         for (seq, event) in (1..).zip(session) {
             send_applied(&mut client, seq, ClientMessage::hook_event(event.clone())).await;
-            let labels: Vec<String> = registry
+            let states: Vec<_> = registry
                 .get_all_sessions()
                 .await
                 .into_iter()
-                .map(|s| s.status_label)
+                .map(|s| (s.status_label, s.activity_detail))
                 .collect();
-            seen.push(labels);
+            seen.push(states);
         }
         // SessionStart, UserPromptSubmit, StopFailure, idle_prompt, then
         // the SessionEnd from tearing the capture down, which removes it.
-        let expected: [&[&str]; 5] = [&["idle"], &["working"], &["idle"], &["idle"], &[]];
+        let state = |label: &str| vec![(label.to_string(), None)];
+        let expected = [
+            state("idle"),
+            state("working"),
+            state("idle"),
+            state("idle"),
+            vec![],
+        ];
         assert_eq!(seen, expected, "session {}", session[0]["session_id"]);
         server.shutdown().await;
     }

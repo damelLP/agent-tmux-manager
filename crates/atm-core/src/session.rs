@@ -689,6 +689,10 @@ impl SessionDomain {
     /// When `current_usage` is null in Claude's status line, all current_* values
     /// will be 0, which correctly resets context percentage to 0%.
     ///
+    /// Leaves `status` alone: lifecycle events own it. Claude Code 2.1.310
+    /// sends a status line after every turn, so a status line doesn't mean
+    /// Claude is working.
+    ///
     /// Returns `true` if the working directory changed (caller should re-resolve git info).
     pub fn update_from_status_line(&mut self, data: &StatusLineData) -> bool {
         self.cost = Money::from_usd(data.cost_usd);
@@ -702,12 +706,6 @@ impl SessionDomain {
         self.context.cache_creation_tokens = TokenCount::new(data.cache_creation_tokens);
         self.context.cache_read_tokens = TokenCount::new(data.cache_read_tokens);
         self.last_activity = Utc::now();
-
-        // Status line update means Claude is working
-        // Don't override AttentionNeeded (permission wait)
-        if self.status != SessionStatus::AttentionNeeded {
-            self.status = SessionStatus::Working;
-        }
 
         // Detect working directory change
         let cwd_changed = match (&data.cwd, &self.working_directory) {

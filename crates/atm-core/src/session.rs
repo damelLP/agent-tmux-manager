@@ -1962,4 +1962,26 @@ mod tests {
         assert_eq!(session.context.context_window_size, 1_000_000);
         assert!((session.context.usage_percentage() - 30.0).abs() < 0.001);
     }
+
+    #[test]
+    fn test_update_from_status_line_keeps_status() {
+        // Claude Code 2.1.310 sends a status line after every Stop, so a
+        // status line says nothing about whether a turn is running.
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::AttentionNeeded,
+        ] {
+            let mut session = SessionDomain::new(
+                SessionId::new("test"),
+                AgentType::GeneralPurpose,
+                Model::Sonnet4,
+            );
+            session.status = status;
+
+            session.update_from_status_line(&make_status_data(None));
+
+            assert_eq!(session.status, status);
+        }
+    }
 }

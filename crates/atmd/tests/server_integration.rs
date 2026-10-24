@@ -1258,6 +1258,129 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
     server.shutdown().await;
 }
 
+/// atmd's fixture holding every hook payload and status line of one Claude
+/// Code TUI session, in the order atm-hook received them. Each line is
+/// `{"offset_ms":..,"kind":"hook"|"status_line","payload":..}`, with
+/// `offset_ms` from the first call. Captured: Claude Code 2.1.310,
+/// 2026-10-24, the run described under "Captured payloads" in
+/// atm-claude-adapter's crate docs; paths rewritten to `/home/user` and
+/// `/tmp/claude-user`. The payloads are those of atm-claude-adapter's
+/// `claude_tui_session_2.1.310.jsonl` and atm-protocol's
+/// `claude_status_line_2.1.310.jsonl`; this file adds their order.
+const CLAUDE_INTERLEAVED: &str = "tests/fixtures/claude_tui_interleaved_2.1.310.jsonl";
+
+/// The `(kind, payload)` of each call in [`CLAUDE_INTERLEAVED`], each
+/// payload given this test's pid as atm-hook would add one.
+fn captured_claude_calls() -> Vec<(String, serde_json::Value)> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CLAUDE_INTERLEAVED);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    text.lines()
+        .map(|line| {
+            let mut call: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+            let kind = call["kind"].as_str().expect("kind").to_string();
+            let mut payload = call["payload"].take();
+            payload["pid"] = std::process::id().into();
+            (kind, payload)
+        })
+        .collect()
+}
+
+#[test]
+fn test_claude_interleaved_fixture_matches_its_sources() {
+    // Every payload is byte-identical to its line in the two source
+    // fixtures, so the interleaved fixture adds only the capture order.
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let hooks_path =
+        crates.join("atm-claude-adapter/tests/fixtures/claude_tui_session_2.1.310.jsonl");
+    let status_path = crates.join("atm-protocol/tests/fixtures/claude_status_line_2.1.310.jsonl");
+    if !hooks_path.exists() || !status_path.exists() {
+        // atmd's tests ship in its crates.io package without those crates.
+        eprintln!("skipped: no source fixtures outside the workspace");
+        return;
+    }
+    let read = |path: &PathBuf| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+    let text = read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CLAUDE_INTERLEAVED));
+    let mut hooks = Vec::new();
+    let mut status_lines = Vec::new();
+    for line in text.lines() {
+        let (head, payload) = line.split_once(r#","payload":"#).expect("payload field");
+        let payload = payload
+            .strip_suffix('}')
+            .expect("payload is the last field");
+        if head.ends_with(r#""kind":"hook""#) {
+            hooks.push(payload);
+        } else if head.ends_with(r#""kind":"status_line""#) {
+            status_lines.push(payload);
+        } else {
+            panic!("unexpected kind in {head}");
+        }
+    }
+    assert_eq!(hooks, read(&hooks_path).lines().collect::<Vec<_>>());
+    assert_eq!(status_lines, read(&status_path).lines().collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn test_e2e_claude_captured_status_lines_leave_idle_rows_idle() {
+    // Claude 2.1.310 sends a status line ~300 ms after every Stop, and
+    // after `/compact`, `/clear` and a permission-mode change at the idle
+    // prompt. Status lines carry no turn state, so none of them may turn
+    // an idle row back to working.
+    let calls = captured_claude_calls();
+    assert_eq!(calls.len(), 46);
+    // Each status line that follows an idle point, by its fixture index,
+    // with the hook event before it: the permission-mode change at the
+    // idle prompt (40 s after SessionStart), the three Stops, `/compact`'s
+    // SessionStart, and `/clear`'s SessionStart under a new session id.
+    let checkpoints = [
+        (2, "SessionStart"),
+        (10, "Stop"),
+        (18, "Stop"),
+        (29, "Stop"),
+        (35, "SessionStart"),
+        (39, "SessionStart"),
+    ];
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    let mut seen = Vec::new();
+    for (seq, (i, (kind, payload))) in (1..).zip(calls.iter().enumerate()) {
+        let message = match kind.as_str() {
+            "hook" => ClientMessage::hook_event(payload.clone()),
+            "status_line" => ClientMessage::status_update(payload.clone()),
+            other => panic!("unexpected kind {other}"),
+        };
+        client.send(message).await;
+        // atmd handles one connection's messages in order and awaits the
+        // registry for each, so the Pong means the call has been applied.
+        client.send(ClientMessage::ping(seq)).await;
+        match client.recv().await {
+            DaemonMessage::Pong { seq: got } if got == seq => {}
+            other => panic!("expected Pong {seq}, got {other:?}"),
+        }
+        if let Some(&(_, before)) = checkpoints.iter().find(|(at, _)| *at == i) {
+            let previous = calls[i - 1].1["hook_event_name"].as_str();
+            let id = payload["session_id"].as_str().expect("session_id");
+            let status = registry
+                .get_session(SessionId::new(id))
+                .await
+                .map(|view| view.status_label);
+            seen.push((i, kind.as_str(), previous, status));
+            assert_eq!(previous, Some(before), "fixture order at {i}");
+        }
+    }
+    let expected: Vec<_> = checkpoints
+        .iter()
+        .map(|&(i, before)| (i, "status_line", Some(before), Some("idle".to_string())))
+        .collect();
+    assert_eq!(seen, expected);
+
+    server.shutdown().await;
+}
+
 // ============================================================================
 // Pi Event → LifecycleEvent translation (end-to-end, wire-level)
 //

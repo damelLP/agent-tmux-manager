@@ -198,18 +198,19 @@ fn create_status_line_entry() -> Value {
 
 /// Checks if atm-hook is configured for statusLine
 fn has_atm_status_line(status_line: &Value) -> bool {
-    status_line
-        .get("command")
-        .and_then(|c| c.as_str())
-        .map(|cmd| cmd.contains("atm-hook"))
-        .unwrap_or(false)
+    is_marker_command(status_line, "atm-hook")
 }
 
-/// True if `hook`'s command contains `marker`.
+/// True if `hook`'s command runs the script named `marker`: one of its
+/// words has `marker` as its file name. `/x/atm-hook` and
+/// `ATM_DEBUG=1 /x/atm-hook` match; `/x/atm-hook-wrapper.sh` does not.
 fn is_marker_command(hook: &Value, marker: &str) -> bool {
     hook.get("command")
         .and_then(|c| c.as_str())
-        .is_some_and(|cmd| cmd.contains(marker))
+        .is_some_and(|cmd| {
+            cmd.split_whitespace()
+                .any(|word| Path::new(word).file_name().and_then(|n| n.to_str()) == Some(marker))
+        })
 }
 
 /// Creates a hook entry for the given hook type.
@@ -244,10 +245,9 @@ fn create_hook_entry(hook_type: &str) -> Value {
     }
 }
 
-/// Checks if a hook entry whose command contains `marker` is present
+/// Checks if a hook entry with a command that runs `marker` is present
 /// in a hooks array. `marker` is the vendor script's basename
-/// (`atm-hook`, `atm-codex-hook`); the two never substring-match each
-/// other, and each lives in a different vendor settings file anyway.
+/// (`atm-hook`, `atm-codex-hook`); see [`is_marker_command`].
 fn has_hook_command_marker(hooks_array: &[Value], marker: &str) -> bool {
     hooks_array.iter().any(|entry| {
         entry
@@ -258,7 +258,7 @@ fn has_hook_command_marker(hooks_array: &[Value], marker: &str) -> bool {
     })
 }
 
-/// Removes the commands that contain `marker` from each entry's inner
+/// Removes the commands that run `marker` from each entry's inner
 /// `hooks` array, keeping the entry's other commands and fields (e.g.
 /// `matcher`). Drops an entry only when that leaves its `hooks` empty.
 /// Returns how many commands were removed.
@@ -930,8 +930,8 @@ mod codex_hook_tests {
 #[cfg(test)]
 mod shared_entry_tests {
     use super::{
-        create_codex_hook_entry, create_hook_entry, has_hook_command_marker,
-        remove_hook_command_marker,
+        create_codex_hook_entry, create_hook_entry, create_status_line_entry, has_atm_status_line,
+        has_hook_command_marker, is_marker_command, remove_hook_command_marker,
     };
     use serde_json::{json, Value};
 
@@ -980,6 +980,38 @@ mod shared_entry_tests {
 
         assert_eq!(removed, 1);
         assert_eq!(hooks_array, vec![already_empty]);
+    }
+
+    #[test]
+    fn a_script_whose_name_only_contains_the_marker_is_not_atms() {
+        let wrapper = json!({
+            "hooks": [{"type": "command", "command": "/home/u/bin/atm-hook-wrapper.sh"}]
+        });
+        let mut hooks_array = vec![wrapper.clone()];
+
+        assert!(!has_hook_command_marker(&hooks_array, "atm-hook"));
+        assert_eq!(remove_hook_command_marker(&mut hooks_array, "atm-hook"), 0);
+        assert_eq!(hooks_array, vec![wrapper]);
+    }
+
+    #[test]
+    fn a_command_running_the_script_with_env_or_args_is_atms() {
+        for command in [
+            "/home/u/.local/bin/atm-hook",
+            "ATM_DEBUG=1 /home/u/.local/bin/atm-hook",
+            "/home/u/.local/bin/atm-hook --verbose",
+        ] {
+            let command = json!({"type": "command", "command": command});
+            assert!(is_marker_command(&command, "atm-hook"), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_status_line_script_whose_name_only_contains_the_marker_is_not_atms() {
+        let wrapper = json!({"type": "command", "command": "/home/u/bin/atm-hook-wrapper.sh"});
+
+        assert!(!has_atm_status_line(&wrapper));
+        assert!(has_atm_status_line(&create_status_line_entry()));
     }
 }
 

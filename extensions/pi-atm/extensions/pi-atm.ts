@@ -76,8 +76,9 @@ function logDebug(msg: string): void {
 }
 
 /**
- * Persistent socket connection to atmd for the lifetime of this pi
- * process. Lazily opened on the first `send()`; reconnects automatically
+ * Persistent socket connection to atmd for the lifetime of this pi-atm
+ * instance (pi 0.65+ loads a new instance, with its own connection, for
+ * each session). Lazily opened on the first `send()`; reconnects automatically
  * if dropped (e.g. atmd restarts). One handshake per connection
  * instead of one per event keeps the daemon log quiet and avoids
  * thousands of short-lived connections in long pi sessions.
@@ -346,8 +347,7 @@ function patchUiSelectOnce(
 
 	// Note: `getSessionId` is a getter, not a value. It is read on every
 	// `select` call so synthetic events still carry the correct session
-	// id even when patching happens before `currentSessionId` is set
-	// (e.g. before the first `session_start` event fires).
+	// id even when patching happens before the id is cached.
 	ui.select = async function patchedSelect(
 		title: string,
 		options: string[],
@@ -369,8 +369,12 @@ function patchUiSelectOnce(
 export default function (pi: ExtensionAPI): void {
 	logDebug(`pi-atm starting, socket=${SOCKET}`);
 
-	// `sessionManager.currentSessionId` only becomes available after
-	// `session_start` fires. Cache it from the first event we see.
+	// pi's session id, read on every event: pi 0.50–0.64 switch sessions
+	// (/new, /resume, /fork) in place under this same instance, while pi
+	// 0.65+ loads a new instance per session. One frame gets the wrong id:
+	// an in-memory fork (`--no-session`) moves the session manager to the
+	// new id before the old instance's `session_shutdown`. atmd ends
+	// sessions by pid, so it doesn't use that id.
 	let cachedSessionId: string | undefined;
 	let uiPatched = false;
 
@@ -384,11 +388,10 @@ export default function (pi: ExtensionAPI): void {
 		pi.on(eventName as any, async (payload: unknown, ctx: unknown) => {
 			try {
 				logDebug(`event fired: ${eventName}`);
-				if (!cachedSessionId) {
-					// Best-effort session id discovery via duck-typed access.
-					const ctxAny = ctx as { sessionManager?: { currentSessionId?: string } };
-					cachedSessionId = ctxAny.sessionManager?.currentSessionId;
-				}
+				// Duck-typed guard: if ctx lacks `getSessionId`, the event
+				// still goes out, with the last id read.
+				const ctxAny = ctx as { sessionManager?: { getSessionId?: () => string } };
+				cachedSessionId = ctxAny.sessionManager?.getSessionId?.() || cachedSessionId;
 				if (!uiPatched) {
 					// Patch `ctx.ui.select` once, the first time we have a ctx
 					// with `ui` bound. Early events can fire before the runner

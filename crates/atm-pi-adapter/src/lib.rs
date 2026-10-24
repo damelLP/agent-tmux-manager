@@ -56,12 +56,19 @@
 //!
 //! `tests/fixtures/pi_tool_run_0.73.1.jsonl` holds one real tool run, as
 //! the frames pi-atm sent atmd. Captured: pi 0.73.1, 2026-10-24, pi's
-//! TUI in a private tmux server with pi-atm loaded, frames tapped by
-//! `socat -r` on the way to an isolated atmd, answered by a local fake
-//! OpenAI-compatible provider (no model call). session_id absent:
-//! pi-atm bug, queued. It covers every event pi-atm forwards except
-//! `session_before_compact`, whose payload the adapter doesn't read.
-//! The `atm_needs_input_*` events are pi-atm's own, not pi's.
+//! TUI in a private tmux server with pi-atm installed by `atm setup`,
+//! frames tapped by `socat -r` on the way to an isolated atmd, answered
+//! by a local fake OpenAI-compatible provider (no model call). It covers
+//! every event pi-atm forwards except `session_before_compact`, whose
+//! payload the adapter doesn't read. The `atm_needs_input_*` events are
+//! pi-atm's own, not pi's.
+//!
+//! `tests/fixtures/pi_new_session_0.73.1.jsonl` holds `/new` in one pi
+//! process. Captured: pi 0.73.1, 2026-10-24, set up the same way, with
+//! startup, `/new` and `/quit` and no prompt. pi loads extensions afresh
+//! for each session, so the old pi-atm instance sent `session_start` and
+//! `session_shutdown` (reason `new`) on one connection, and the new
+//! instance sent the new session's frames on a second one.
 //!
 //! The hand-copied JSON payloads in the `wire.rs` and `translate.rs`
 //! tests follow the spike trace. Captured: pi, version not recorded,
@@ -96,10 +103,44 @@
 //!   read, so the figure also lags one request behind.
 //! - `input` becomes `PromptSubmit` only for source `interactive`.
 //!   Prompts with source `rpc` or `extension` are dropped.
-//! - pi-atm sends no `session_id`. It reads
-//!   `ctx.sessionManager.currentSessionId`, which pi 0.73.1 doesn't have
-//!   (its session manager has `getSessionId()`), so atmd keys pi
-//!   sessions by pid.
+//! - Two pi processes can hold one session, because pi takes no lock on
+//!   session files. Checked: `pi -c` in a second pane, and `--session`
+//!   on one file; `/resume` of an open session is unverified. Both
+//!   processes send the same `session_id`. atmd keeps a row per pid
+//!   (`atm list` showed both), but removing either pid un-indexes the id
+//!   (`handle_remove_by_pid`, atmd `registry/actor.rs:996`), and the TUI
+//!   keys rows by `SessionId` (atm-tui `app.rs:55`), so the two collapse
+//!   into one. Claude has the same case with `claude --resume`. Queued as
+//!   "one session id held by two pids". Older pi-atm sent no
+//!   `session_id` (it read `currentSessionId`, which no pi release has),
+//!   so each pid got its own `pending-<pid>` and the case never arose.
+//! - Discovery can't see pi. pi sets `process.title = "pi"` (found in
+//!   0.50.0, 0.65.0, 0.70.0, 0.72.1 and 0.73.1, not in 0.10.0), so
+//!   `/proc` shows cmdline `pi` and exe `node`. pi's matchers need a
+//!   path, and pi rejects bare cmdline matches. A pi already running
+//!   when atmd starts appears only with pi-atm's next event.
+//! - `/new`, `/resume`, `/fork` and `/reload` replace the session in the
+//!   same process. pi (0.65.0 and later) loads pi-atm afresh, so
+//!   `session_shutdown` comes from the old instance and `session_start`
+//!   from the new one on a new connection. atmd ends the old row and
+//!   starts a new one. That includes `/reload`, which keeps the id, so
+//!   the row's model and cost reset (fake-b at $0.0033 became Unknown at
+//!   $0). The old instance's connection stays open until atmd closes it
+//!   after 300 s idle. Over rpc, `new_session` and `clone` fired
+//!   `session_start` twice; the TUI's `/new` fired it once.
+//! - atmd renames a row only from `pending-<pid>` to a real id. So if the
+//!   old instance's `session_shutdown` is lost (pi-atm drops sends during
+//!   its 1 s reconnect back-off), the new session's events land on the
+//!   old row, which keeps the old id. And if it arrives after the new
+//!   `session_start` (both instances connect afresh when atmd has closed
+//!   the idle connection), it removes the new session's row until that
+//!   session's next event. Both unverified; queued as atmd registry items.
+//! - pi 0.50.0 to 0.64.0 switch sessions in place: one pi-atm instance
+//!   throughout, and only `session_switch`, which pi-atm doesn't forward.
+//!   pi-atm reads the id on every event, so its frames follow the switch,
+//!   but atmd keeps the row's first id (the rename rule above). Checked
+//!   with pi 0.64.0 over rpc: after `new_session`, frames carried the new
+//!   id and `atm list` still showed the first.
 
 pub mod event;
 pub mod translate;

@@ -672,10 +672,10 @@ mod tests {
     #[test]
     fn captured_tool_run_translates() {
         // Captured: pi 0.73.1, 2026-10-24, pi's TUI in a private tmux
-        // server with pi-atm loaded, each frame tapped byte for byte by
-        // `socat -r` on its way to an isolated atmd. A local fake
-        // OpenAI-compatible provider answered (no model call); Ctrl+P
-        // cycled fake-a to fake-b. session_id absent: pi-atm bug, queued.
+        // server with pi-atm installed by `atm setup`, each frame tapped
+        // byte for byte by `socat -r` on its way to an isolated atmd. A
+        // local fake OpenAI-compatible provider answered (no model call);
+        // Ctrl+P cycled fake-a to fake-b.
         let frames: Vec<Value> = include_str!("../tests/fixtures/pi_tool_run_0.73.1.jsonl")
             .lines()
             .map(|line| serde_json::from_str(line).expect("fixture line"))
@@ -691,12 +691,15 @@ mod tests {
             .iter()
             .map(|frame| serde_json::from_value(frame["data"].clone()).expect("pi_event data"))
             .collect();
-        // pi-atm's envelope: pid and tmux_pane on every frame, which is
-        // how atmd keys the session. session_id absent: pi-atm bug, queued.
+        // pi-atm's envelope: pid, tmux_pane and pi's session id on every
+        // frame. atmd keys the session by pid and names it by session_id.
         for raw in &raws {
-            assert_eq!(raw.pid, Some(1_187_873));
+            assert_eq!(raw.pid, Some(1_351_724));
             assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
-            assert_eq!(raw.session_id, None);
+            assert_eq!(
+                raw.session_id.as_deref(),
+                Some("01a16f0a-7086-7557-b3da-497e783667b6")
+            );
         }
 
         let events: Vec<Option<LifecycleEvent>> =
@@ -755,6 +758,63 @@ mod tests {
         assert_eq!(
             end,
             &Some(LifecycleEvent::SessionEnd {
+                reason: Some("quit".into())
+            })
+        );
+    }
+
+    #[test]
+    fn captured_new_session_translates() {
+        // Captured: pi 0.73.1, 2026-10-24, set up as for
+        // captured_tool_run_translates, then `/new` and `/quit` with no
+        // prompt. pi loads a new pi-atm instance for the new session: the
+        // old instance sent the first two frames, and the new one sent the
+        // rest on a second connection.
+        let raws: Vec<RawPiEvent> = include_str!("../tests/fixtures/pi_new_session_0.73.1.jsonl")
+            .lines()
+            .map(|line| {
+                let frame: Value = serde_json::from_str(line).expect("fixture line");
+                serde_json::from_value(frame["data"].clone()).expect("pi_event data")
+            })
+            .collect();
+        let [start, end_old, start_new, end] = raws.as_slice() else {
+            panic!("expected 4 frames, got {}", raws.len());
+        };
+
+        // One pid throughout; `/new` gives the session a new id.
+        let old_id = Some("01a16f0a-b4e7-7178-a8b1-76b9132daf2f");
+        let new_id = Some("01a16f0a-c72d-735d-a7fd-4d31020b0f07");
+        for (raw, id) in [
+            (start, old_id),
+            (end_old, old_id),
+            (start_new, new_id),
+            (end, new_id),
+        ] {
+            assert_eq!(raw.pid, Some(1_352_051));
+            assert_eq!(raw.session_id.as_deref(), id);
+        }
+
+        assert_eq!(
+            start.to_lifecycle_event(),
+            Some(LifecycleEvent::SessionStart {
+                source: Some("startup".into())
+            })
+        );
+        assert_eq!(
+            end_old.to_lifecycle_event(),
+            Some(LifecycleEvent::SessionEnd {
+                reason: Some("new".into())
+            })
+        );
+        assert_eq!(
+            start_new.to_lifecycle_event(),
+            Some(LifecycleEvent::SessionStart {
+                source: Some("new".into())
+            })
+        );
+        assert_eq!(
+            end.to_lifecycle_event(),
+            Some(LifecycleEvent::SessionEnd {
                 reason: Some("quit".into())
             })
         );

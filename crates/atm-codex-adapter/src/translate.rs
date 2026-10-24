@@ -48,14 +48,17 @@
 //!   dropping it would leave a genuinely-blocked session showing
 //!   "working" forever — a worse failure mode than an unlabelled
 //!   needs-input state.
-//! - **`PostCompact` ends work.** Codex fires `SessionStart{compact}`
-//!   only when the next model request starts, so nothing follows a
-//!   manual `/compact` or a compaction after `Stop` until the user
-//!   prompts. Mid-turn and pre-turn compactions reach the same idle
-//!   state one event later, through that `SessionStart{compact}`. Claude
-//!   Code 2.1.310 fires `SessionStart{compact}` as soon as compaction
-//!   ends (static read of its bundle, not run), so the Claude adapter
-//!   needs no such mapping.
+//! - **`PostCompact` ends work, whatever its trigger.** No `Stop`
+//!   follows a manual `/compact` or a compaction after `Stop`, and codex
+//!   fires `SessionStart{compact}` only as its next model request
+//!   starts, so the row would otherwise stay "Compacting" until the user
+//!   prompts. The cost is mid-turn: the turn goes on after `PostCompact`,
+//!   yet the row shows idle from here (see Known gaps in the crate
+//!   docs). Without this mapping, the `SessionStart{compact}` that
+//!   follows would show it idle anyway, about one hook's runtime later.
+//!   Claude Code 2.1.310 fires `SessionStart{compact}` as soon as
+//!   compaction ends (static read of its bundle, not run), so the Claude
+//!   adapter needs no such mapping.
 
 use atm_core::{LifecycleEvent, NeedsInputReason, NotificationKind, Tool};
 
@@ -127,8 +130,8 @@ impl RawCodexEvent {
                 trigger: self.trigger.clone(),
             },
             // No Stop follows a manual /compact or a compaction after
-            // Stop. Mid-turn and pre-turn compactions are followed by
-            // SessionStart{compact}, which already ends work.
+            // Stop. Mid-turn this shows the row idle too early (crate
+            // docs, Known gaps).
             CodexEventType::PostCompact => LifecycleEvent::WorkingEnd,
         })
     }
@@ -379,30 +382,38 @@ mod tests {
         let exec = captured(include_str!(
             "../tests/fixtures/codex_exec_post_turn_compact_0.163.0.jsonl"
         ));
-        let names = |raws: &[RawCodexEvent]| -> Vec<String> {
-            raws.iter().map(|r| r.hook_event_name.clone()).collect()
+        let names = |raws: &[RawCodexEvent]| -> String {
+            let names: Vec<&str> = raws.iter().map(|r| r.hook_event_name.as_str()).collect();
+            names.join(" ")
         };
-        let turn = ["UserPromptSubmit", "PreToolUse", "PostToolUse"];
-        let compaction = ["PreCompact", "PostCompact", "SessionStart"];
-        let mut tui_names = vec!["SessionStart"];
-        tui_names.extend(turn);
-        tui_names.extend(compaction);
-        tui_names.push("Stop");
-        tui_names.extend(compaction);
-        tui_names.extend(turn);
-        tui_names.extend(compaction);
-        tui_names.extend(["Stop", "SessionEnd"]);
+        let tui_names = concat!(
+            "SessionStart ",
+            "UserPromptSubmit PreToolUse PostToolUse ",
+            "PreCompact PostCompact SessionStart ", // mid-turn
+            "Stop ",
+            "PreCompact PostCompact SessionStart ", // before the turn
+            "UserPromptSubmit PreToolUse PostToolUse ",
+            "PreCompact PostCompact SessionStart ", // mid-turn
+            "Stop ",
+            "SessionEnd",
+        );
         assert_eq!(names(&tui), tui_names);
-        let mut exec_names = vec!["SessionStart"];
-        exec_names.extend(turn);
-        exec_names.extend(["Stop", "PreCompact", "PostCompact", "SessionEnd"]);
+        let exec_names = concat!(
+            "SessionStart ",
+            "UserPromptSubmit PreToolUse PostToolUse ",
+            "Stop ",
+            "PreCompact PostCompact ", // after Stop
+            "SessionEnd",
+        );
         assert_eq!(names(&exec), exec_names);
 
         for raw in tui.iter().chain(&exec) {
-            let expected = match raw.hook_event_name.as_str() {
-                "PreCompact" => LifecycleEvent::ContextCompactStart {
-                    trigger: Some("auto".into()),
-                },
+            let name = &raw.hook_event_name;
+            // Only the compaction events carry a trigger, here always auto.
+            let trigger = name.ends_with("Compact").then(|| "auto".to_string());
+            assert_eq!(raw.trigger, trigger, "{name}");
+            let expected = match name.as_str() {
+                "PreCompact" => LifecycleEvent::ContextCompactStart { trigger },
                 // Mid-turn, before a turn, and after Stop alike.
                 "PostCompact" => LifecycleEvent::WorkingEnd,
                 // Codex starts the post-compaction context with a
@@ -414,10 +425,6 @@ mod tests {
                 }
                 _ => continue,
             };
-            assert_eq!(
-                raw.trigger.is_some(),
-                raw.hook_event_name.ends_with("Compact")
-            );
             assert_eq!(raw.to_lifecycle_event(), Some(expected), "{raw:?}");
         }
     }
@@ -433,11 +440,9 @@ mod tests {
         // default shared-daemon mode, each hook's stdin logged by a hook
         // registered for all 11 events, paths rewritten (see the crate
         // docs). A local fake provider answered (no model call).
-        let raws: Vec<RawCodexEvent> =
-            include_str!("../tests/fixtures/codex_tui_session_0.163.0.jsonl")
-                .lines()
-                .map(|line| serde_json::from_str(line).expect("fixture line"))
-                .collect();
+        let raws = captured(include_str!(
+            "../tests/fixtures/codex_tui_session_0.163.0.jsonl"
+        ));
         let [start, prompt, tool_start, permission, tool_end, stop, pre_compact, post_compact, end] =
             raws.as_slice()
         else {

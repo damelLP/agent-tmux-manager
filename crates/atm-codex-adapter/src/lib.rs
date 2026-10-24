@@ -104,10 +104,12 @@
 //!
 //! `tests/fixtures/codex_exec_post_turn_compact_0.163.0.jsonl` holds one
 //! `codex exec` run's hook payloads. Captured: codex-cli 0.163.0,
-//! 2026-10-24, `codex exec --dangerously-bypass-hook-trust` (embedded
-//! mode) in the same sealed setup, with
+//! 2026-10-24, `codex exec --dangerously-bypass-hook-trust
+//! --skip-git-repo-check <prompt> < /dev/null` (embedded mode, with no
+//! approval or sandbox flag) in the same sealed setup, with
 //! `model_post_turn_compact_threshold_percent = 1` and
-//! `model_context_window = 100000`, paths rewritten as above. One prompt
+//! `model_context_window = 100000`, paths rewritten as above. Its
+//! payloads report `permission_mode: "bypassPermissions"`. One prompt
 //! ran one shell command. Codex compacted after the turn's `Stop`, and
 //! nothing followed `PostCompact` until `SessionEnd`. Whether the real
 //! backend turns post-turn compaction on by default is unverified; with
@@ -141,8 +143,10 @@
 //!   From code reading, not run: atm's kill, interrupt (`C-c`) and
 //!   `atm send` act on the row's pane, so they reach the daemon's
 //!   pane, which may be another session or, once its TUI has quit, a
-//!   shell; and a row created from a hook event takes its project from
-//!   `/proc/<daemon pid>/cwd`.
+//!   shell; a row created from a hook event takes its project from
+//!   `/proc/<daemon pid>/cwd`; and a `Stop` or a `PostCompact` from any
+//!   session sets the shared row idle, even while another session works
+//!   or waits for approval.
 //!
 //!   `codex --no-daemon` restores one process per session: each hook
 //!   sees its own TUI's pid and pane, and `/quit` fires `SessionEnd`
@@ -157,17 +161,27 @@
 //!   6 times), a manual `/compact` fired `PreCompact` and nothing else
 //!   (one TUI run, not kept). No hook ends it, so the row stays
 //!   Working/"Compacting" until the next prompt.
-//! - **A mid-turn auto compaction shows the row idle.**
-//!   `SessionStart{compact}` maps to atm-core's `SessionStart`, which
-//!   sets Idle, yet mid-turn the turn goes on to its `Stop`. The row
-//!   shows idle while codex works, until its next tool call or `Stop`.
-//!   atmd's `test_e2e_codex_captured_auto_compact_replay` pins this.
-//!   The adapter alone can't fix it: a mid-turn `PostCompact{auto}` and
-//!   one after `Stop` both carry their turn's own `turn_id`, so telling
-//!   them apart needs turn state in atmd's registry. Claude likely has
-//!   the same gap: Claude Code 2.1.310's compaction routine, which takes
-//!   the trigger as a parameter, fires `SessionStart{compact}` right
-//!   after `PostCompact` (static read of its bundle, not run).
+//! - **A mid-turn auto compaction shows the row idle.** The turn goes on
+//!   to its `Stop`, but `PostCompact` (mapped to `WorkingEnd`) and the
+//!   `SessionStart{compact}` after it (atm-core's `SessionStart`) both
+//!   set Idle. The row shows idle while codex works, until its next tool
+//!   call or `Stop`. atmd's `test_e2e_codex_captured_auto_compact_replay`
+//!   pins this. In a timed TUI run against the fake provider,
+//!   `SessionStart{compact}` started about 25 ms after `PostCompact` and
+//!   before the next model request, so mapping `PostCompact` to
+//!   `WorkingEnd` brings the idle forward by about one hook's runtime.
+//!
+//!   Unverified, from code reasoning: the adapter maps each payload on
+//!   its own, and a mid-turn `PostCompact{auto}` and one after `Stop`
+//!   both carry their own turn's `turn_id`, so telling them apart needs
+//!   state from outside the payload. Candidates: the row's status before
+//!   `PreCompact`, restored when compaction ends (an atm-core change),
+//!   or the rollout's `task_started`/`task_complete` records, which
+//!   atmd already reads at each codex hook (their timing relative to
+//!   `PostCompact` not checked). Claude likely has the same gap: Claude
+//!   Code 2.1.310's compaction routine, which takes the trigger as a
+//!   parameter, fires `SessionStart{compact}` right after `PostCompact`
+//!   (static read of its bundle, not run).
 //! - **Usage lags one request mid-turn.** A logging hook that read the
 //!   live rollout at each hook saw no `token_count` at `PreToolUse`,
 //!   `PermissionRequest` or `PostToolUse` of a turn's first request, and

@@ -9,7 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
-use atm_core::{Harness, SessionId, SessionStatus, SessionView};
+use atm_core::{builtin_harnesses, Harness, SessionId, SessionStatus, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -164,23 +164,17 @@ fn arb_session_status() -> impl Strategy<Value = SessionStatus> {
 
 /// Strategy for `SessionView::harness`, a free-form short tag on the wire.
 ///
-/// Mixes every real tag, mapped through `Harness::short_tag` as
-/// `SessionView::from_domain` does, with the general tricky-string
-/// strategy, so pi and Codex sessions round-trip as well as Claude ones.
+/// Mixes the tag of every built-in harness plus `Harness::Unknown`, mapped
+/// through `Harness::short_tag` as `SessionView::from_domain` does, with
+/// the general tricky-string strategy, so pi and Codex sessions round-trip
+/// as well as Claude ones.
 fn arb_harness_tag() -> impl Strategy<Value = String> {
-    prop_oneof![
-        prop_oneof![
-            Just(Harness::ClaudeCode),
-            Just(Harness::Pi),
-            Just(Harness::Codex),
-            Just(Harness::Amp),
-            Just(Harness::Qwen),
-            Just(Harness::Gemini),
-            Just(Harness::Unknown),
-        ]
-        .prop_map(|harness| harness.short_tag().to_string()),
-        arb_tricky_string(),
-    ]
+    let tags: Vec<String> = builtin_harnesses()
+        .map(|definition| definition.harness)
+        .chain([Harness::Unknown])
+        .map(|harness| harness.short_tag().to_string())
+        .collect();
+    prop_oneof![proptest::sample::select(tags), arb_tricky_string()]
 }
 
 /// Strategy for RFC3339-ish timestamp strings.

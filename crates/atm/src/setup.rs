@@ -205,6 +205,13 @@ fn has_atm_status_line(status_line: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// True if `hook`'s command contains `marker`.
+fn is_marker_command(hook: &Value, marker: &str) -> bool {
+    hook.get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|cmd| cmd.contains(marker))
+}
+
 /// Creates a hook entry for the given hook type.
 ///
 /// Hook types that filter by tool name use a matcher, others don't.
@@ -246,34 +253,27 @@ fn has_hook_command_marker(hooks_array: &[Value], marker: &str) -> bool {
         entry
             .get("hooks")
             .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains(marker))
-                        .unwrap_or(false)
-                })
-            })
+            .map(|hooks| hooks.iter().any(|hook| is_marker_command(hook, marker)))
             .unwrap_or(false)
     })
 }
 
-/// Removes entries whose command contains `marker` from a hooks array.
-fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) {
-    hooks_array.retain(|entry| {
-        !entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains(marker))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+/// Removes the commands that contain `marker` from each entry's inner
+/// `hooks` array, keeping the entry's other commands and fields (e.g.
+/// `matcher`). Drops an entry only when that leaves its `hooks` empty.
+/// Returns how many commands were removed.
+fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) -> usize {
+    let mut removed = 0;
+    hooks_array.retain_mut(|entry| {
+        let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|hook| !is_marker_command(hook, marker));
+        removed += before - hooks.len();
+        hooks.len() == before || !hooks.is_empty()
     });
+    removed
 }
 
 /// Writes `content` to `path` (creating parent directories as needed)
@@ -767,12 +767,10 @@ pub fn uninstall() -> Result<()> {
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for hook_type in ClaudeEventType::hook_names() {
             if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
-                let before = hooks_array.len();
-                remove_hook_command_marker(hooks_array, "atm-hook");
-                let after = hooks_array.len();
+                let count = remove_hook_command_marker(hooks_array, "atm-hook");
 
-                if before != after {
-                    removed += before - after;
+                if count > 0 {
+                    removed += count;
                     println!("  {hook_type} - removed");
                 }
 
@@ -836,12 +834,10 @@ pub fn uninstall() -> Result<()> {
         {
             for hook_type in CodexEventType::hook_names() {
                 if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
-                    let before = hooks_array.len();
-                    remove_hook_command_marker(hooks_array, "atm-codex-hook");
-                    let after = hooks_array.len();
+                    let count = remove_hook_command_marker(hooks_array, "atm-codex-hook");
 
-                    if before != after {
-                        codex_removed += before - after;
+                    if count > 0 {
+                        codex_removed += count;
                         println!("  {hook_type} - removed");
                     }
 
@@ -928,6 +924,62 @@ mod codex_hook_tests {
             hooks_array.push(create_codex_hook_entry());
         }
         assert_eq!(hooks_array.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod shared_entry_tests {
+    use super::{
+        create_codex_hook_entry, create_hook_entry, has_hook_command_marker,
+        remove_hook_command_marker,
+    };
+    use serde_json::{json, Value};
+
+    const USER_HOOK: &str = "/usr/bin/my-own-hook";
+
+    /// ATM's `entry` with the user's own command added to its inner
+    /// `hooks` array, as a user editing settings.json might do.
+    fn shared_with_user_hook(mut entry: Value) -> Value {
+        entry["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "command", "command": USER_HOOK}));
+        entry
+    }
+
+    /// Removing `marker` from a shared entry must leave the entry, its
+    /// other fields and the user's command, minus only ATM's command.
+    fn assert_keeps_user_command(entry: Value, marker: &str) {
+        let mut hooks_array = vec![shared_with_user_hook(entry.clone())];
+        let mut expected = entry;
+        expected["hooks"] = json!([{"type": "command", "command": USER_HOOK}]);
+
+        let removed = remove_hook_command_marker(&mut hooks_array, marker);
+
+        assert_eq!(removed, 1);
+        assert_eq!(hooks_array, vec![expected]);
+    }
+
+    #[test]
+    fn claude_uninstall_keeps_a_user_command_sharing_atms_entry() {
+        assert_keeps_user_command(create_hook_entry("PreToolUse"), "atm-hook");
+        assert_keeps_user_command(create_hook_entry("SessionStart"), "atm-hook");
+    }
+
+    #[test]
+    fn codex_uninstall_keeps_a_user_command_sharing_atms_entry() {
+        assert_keeps_user_command(create_codex_hook_entry(), "atm-codex-hook");
+    }
+
+    #[test]
+    fn an_entry_left_empty_is_dropped_but_an_already_empty_one_is_kept() {
+        let already_empty = json!({"matcher": "Bash", "hooks": []});
+        let mut hooks_array = vec![create_hook_entry("PreToolUse"), already_empty.clone()];
+
+        let removed = remove_hook_command_marker(&mut hooks_array, "atm-hook");
+
+        assert_eq!(removed, 1);
+        assert_eq!(hooks_array, vec![already_empty]);
     }
 }
 

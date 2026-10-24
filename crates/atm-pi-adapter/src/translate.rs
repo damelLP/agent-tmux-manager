@@ -227,15 +227,17 @@ impl RawPiEvent {
                 // *latest* message that carries usage info; pi reports
                 // them per request, not per session.
                 let (tokens, cost_usd) = extract_context_usage(p.messages.as_ref());
-                if tokens.is_none() && cost_usd.is_none() {
+                // The context event carries no window; pi-atm's envelope
+                // snapshot of the current model does. It goes through even
+                // before the first reply has usage.
+                let context_window_size = self.model.as_ref().and_then(|m| m.context_window);
+                if tokens.is_none() && cost_usd.is_none() && context_window_size.is_none() {
                     return None;
                 }
-                // The context event carries no window; pi-atm's envelope
-                // snapshot of the current model does.
                 LifecycleEvent::ContextUpdate {
                     tokens,
                     current_tokens: None,
-                    context_window_size: self.model.as_ref().and_then(|m| m.context_window),
+                    context_window_size,
                     cost_usd,
                 }
             }
@@ -801,8 +803,17 @@ mod tests {
             })
         );
         assert_eq!(working, &Some(LifecycleEvent::WorkingStart));
-        // The first `context` fires before any reply, so it has no usage.
-        assert_eq!(first_context, &None);
+        // The first `context` fires before any reply, so it has no usage,
+        // but the window still goes through.
+        assert_eq!(
+            first_context,
+            &Some(LifecycleEvent::ContextUpdate {
+                tokens: None,
+                current_tokens: None,
+                context_window_size: Some(32_000),
+                cost_usd: None,
+            })
+        );
         assert_eq!(
             tool_start,
             &Some(LifecycleEvent::ToolCallStart {

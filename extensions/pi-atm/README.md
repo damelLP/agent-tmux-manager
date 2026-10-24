@@ -58,7 +58,7 @@ atm setup
 Or manually for local development:
 
 ```sh
-pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/pi-atm.ts
+pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/extensions/pi-atm.ts
 ```
 
 pi loads `.ts` files directly via `@mariozechner/jiti`, so no compile
@@ -69,6 +69,11 @@ Once published to npm:
 ```sh
 pi install npm:pi-atm
 ```
+
+For maintainers: this directory is the source. `atm setup` installs
+its `package.json` and `extensions/` from a copy embedded in
+`crates/atm/assets/pi-atm/`. Edit the files here, then copy them
+there; `tests/setup_pi_package.rs` fails if the two drift apart.
 
 ## Configuration
 
@@ -119,7 +124,7 @@ about atm; atm doesn't need to know about amplike.
 2. In one terminal launch atm: `atm`.
 3. In another terminal start pi with this extension:
    ```sh
-   pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/pi-atm.ts
+   pi --extension /abs/path/to/agent-tmux-manager/extensions/pi-atm/extensions/pi-atm.ts
    ```
 4. Ask pi to do something. Watch the new session appear in the atm TUI
    with `[pi]` badge and status flipping between `working` and `idle`.

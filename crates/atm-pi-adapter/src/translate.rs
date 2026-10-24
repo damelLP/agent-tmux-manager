@@ -694,11 +694,11 @@ mod tests {
         // pi-atm's envelope: pid, tmux_pane and pi's session id on every
         // frame. atmd keys the session by pid and names it by session_id.
         for raw in &raws {
-            assert_eq!(raw.pid, Some(1_292_851));
+            assert_eq!(raw.pid, Some(1_351_724));
             assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
             assert_eq!(
                 raw.session_id.as_deref(),
-                Some("01a16ef5-7d27-715d-81c8-131249e82ee5")
+                Some("01a16f0a-7086-7557-b3da-497e783667b6")
             );
         }
 
@@ -782,15 +782,15 @@ mod tests {
         };
 
         // One pid throughout; `/new` gives the session a new id.
-        let old_id = Some("01a16ef5-ee0a-7079-8fa7-faf3ac99f488");
-        let new_id = Some("01a16ef6-005d-7073-889d-bbee3e0770c6");
+        let old_id = Some("01a16f0a-b4e7-7178-a8b1-76b9132daf2f");
+        let new_id = Some("01a16f0a-c72d-735d-a7fd-4d31020b0f07");
         for (raw, id) in [
             (start, old_id),
             (end_old, old_id),
             (start_new, new_id),
             (end, new_id),
         ] {
-            assert_eq!(raw.pid, Some(1_293_490));
+            assert_eq!(raw.pid, Some(1_352_051));
             assert_eq!(raw.session_id.as_deref(), id);
         }
 

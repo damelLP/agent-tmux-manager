@@ -196,7 +196,7 @@ impl RawHookEvent {
             ClaudeEventType::UserPromptSubmit => LifecycleEvent::PromptSubmit {
                 prompt: self.prompt.clone(),
             },
-            ClaudeEventType::Stop => LifecycleEvent::WorkingEnd,
+            ClaudeEventType::Stop | ClaudeEventType::StopFailure => LifecycleEvent::WorkingEnd,
             ClaudeEventType::SubagentStart => LifecycleEvent::ChildSessionStart {
                 id: self.agent_id.clone(),
                 role: self.agent_type.clone(),

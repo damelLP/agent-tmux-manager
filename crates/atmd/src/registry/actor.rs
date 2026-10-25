@@ -3793,17 +3793,7 @@ mod tests {
     /// Sends a `WorkingStart` for `pid` reporting `id`. The lifecycle path
     /// creates the session if `pid` has none, and renames only a pending id.
     fn working_as(actor: &mut RegistryActor, pid: u32, id: &str) {
-        let (respond_to, mut rx) = oneshot::channel();
-        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
-            session_id: SessionId::new(id),
-            event: LifecycleEvent::WorkingStart,
-            harness: atm_core::Harness::ClaudeCode,
-            pid: Some(pid),
-            tmux_pane: None,
-            context: LifecycleContext::default(),
-            respond_to,
-        });
-        rx.try_recv().unwrap().unwrap();
+        apply_event(actor, id, Some(pid), LifecycleEvent::WorkingStart).unwrap();
     }
 
     /// Starts in-process children `agent-1` (alias `rev`) and `agent-2`

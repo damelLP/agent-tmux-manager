@@ -5,15 +5,17 @@
 //! mount or a FIFO would keep `atm` from exiting after quit.
 
 use atm_core::beads::BeadsTask;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::oneshot;
+use tracing::warn;
 
 /// Reads a directory's in-progress Beads tasks off the render path, with at
-/// most one read in flight.
+/// most one read in flight per directory.
 pub struct BeadsReader<F> {
     read: F,
-    /// The directory being read and where its result will arrive.
-    pending: Option<(String, oneshot::Receiver<Vec<BeadsTask>>)>,
+    /// Reads not yet returned, by directory: where each result will arrive.
+    pending: HashMap<String, oneshot::Receiver<Vec<BeadsTask>>>,
 }
 
 impl<F> BeadsReader<F>
@@ -24,41 +26,51 @@ where
     pub fn new(read: F) -> Self {
         Self {
             read,
-            pending: None,
+            pending: HashMap::new(),
         }
     }
 
     /// Starts a read of `dir` unless one is still pending, then waits up to
-    /// `timeout` for the pending read.
+    /// `timeout` for it.
     ///
-    /// Returns the directory read and its newest in-progress task once a read
-    /// completes. Returns `None` while the read is still running, so the caller
-    /// keeps its last value, and when there is no directory to read.
+    /// Returns `dir` and its newest in-progress task once the read completes.
+    /// Returns `None` while the read is still running, so the caller keeps its
+    /// last value, and when there is no directory to read.
+    #[must_use = "dropping the result loses a finished read"]
     pub async fn poll(
         &mut self,
         dir: Option<&str>,
         timeout: Duration,
     ) -> Option<(String, Option<BeadsTask>)> {
-        if self.pending.is_none() {
-            let dir = dir?.to_string();
+        let dir = dir?;
+        if !self.pending.contains_key(dir) {
             let (tx, rx) = oneshot::channel();
             let read = self.read.clone();
-            let thread_dir = dir.clone();
-            std::thread::Builder::new()
+            let thread_dir = dir.to_string();
+            let spawned = std::thread::Builder::new()
                 .name("atm-beads-read".to_string())
                 .spawn(move || {
                     let _ = tx.send(read(&thread_dir));
-                })
-                .ok()?;
-            self.pending = Some((dir, rx));
+                });
+            if let Err(e) = spawned {
+                warn!(error = %e, dir, "Failed to start a Beads read");
+                return None;
+            }
+            self.pending.insert(dir.to_string(), rx);
         }
-        let (_, rx) = self.pending.as_mut()?;
-        // Timed out: the read stays pending, so a hung read holds one thread
-        // rather than one per poll.
+        let rx = self.pending.get_mut(dir)?;
+        // Timed out: the read stays pending, so a hung directory holds one
+        // thread rather than one per poll, and other directories still read.
         let result = tokio::time::timeout(timeout, rx).await.ok()?;
-        let (dir, _) = self.pending.take()?;
-        // A read thread that panicked sent nothing; the next poll reads afresh.
-        Some((dir, result.ok()?.into_iter().next()))
+        self.pending.remove(dir);
+        match result {
+            Ok(tasks) => Some((dir.to_string(), tasks.into_iter().next())),
+            Err(_) => {
+                // The read thread panicked and sent nothing; the next poll reads afresh.
+                warn!(dir, "Beads read ended without a result");
+                None
+            }
+        }
     }
 }
 
@@ -122,7 +134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hung_read_never_starts_a_second_read() {
+    async fn test_hung_read_never_starts_a_second_read_of_its_dir() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
         // Never returns, like a read of a FIFO with no writer or a hung mount.
@@ -133,41 +145,70 @@ mod tests {
             }
         });
 
-        for dir in ["/a", "/b", "/a", "/b"] {
+        for dir in ["/a", "/b", "/a", "/b", "/a"] {
             assert!(reader.poll(Some(dir), SHORT).await.is_none(), "{dir}");
         }
 
-        // The first read's thread may start late on a loaded host; a second
-        // read, wrongly started by any of the polls, would have run by now.
+        // One read per directory. The reads' threads may start late on a
+        // loaded host; a third read, wrongly started by any of the polls,
+        // would have run by now.
         let deadline = Instant::now() + LONG;
-        while calls.load(SeqCst) == 0 && Instant::now() < deadline {
+        while calls.load(SeqCst) < 2 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         tokio::time::sleep(SHORT).await;
-        assert_eq!(calls.load(SeqCst), 1);
+        assert_eq!(calls.load(SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn test_late_result_reports_its_own_dir_then_next_read_starts() {
+    async fn test_hung_read_in_one_dir_does_not_block_another() {
+        // /a never returns, like a project on a hung mount; /b is healthy.
+        let mut reader = BeadsReader::new(|dir: &str| -> Vec<BeadsTask> {
+            if dir == "/a" {
+                loop {
+                    std::thread::park();
+                }
+            }
+            vec![task(dir)]
+        });
+
+        assert!(reader.poll(Some("/a"), SHORT).await.is_none());
+        let polled = reader.poll(Some("/b"), LONG).await;
+        assert_eq!(summary(polled), read_of("/b", Some("/b")));
+        assert!(
+            reader.poll(Some("/a"), SHORT).await.is_none(),
+            "/a still hung"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_late_result_returns_when_its_dir_is_polled_again() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
         let (release, gate) = mpsc::channel::<()>();
         let gate = Arc::new(Mutex::new(gate));
         let mut reader = BeadsReader::new(move |dir: &str| {
             counter.fetch_add(1, SeqCst);
-            let _ = gate.lock().unwrap().recv(); // returns once `release` drops
+            if dir == "/a" {
+                let _ = gate.lock().unwrap().recv(); // returns once `release` drops
+            }
             vec![task(dir)]
         });
 
         assert!(reader.poll(Some("/a"), SHORT).await.is_none(), "slow read");
         drop(release);
 
-        // The selection moved to /b meanwhile; the finished read is still /a's.
-        let polled = reader.poll(Some("/b"), LONG).await;
-        assert_eq!(summary(polled), read_of("/a", Some("/a")));
+        // The selection moved to /b meanwhile: /b reads on its own.
         let polled = reader.poll(Some("/b"), LONG).await;
         assert_eq!(summary(polled), read_of("/b", Some("/b")));
+        // Back on /a, the finished read is returned without a new one.
+        let polled = reader.poll(Some("/a"), LONG).await;
+        assert_eq!(summary(polled), read_of("/a", Some("/a")));
         assert_eq!(calls.load(SeqCst), 2);
+        // The next poll of /a reads afresh.
+        let polled = reader.poll(Some("/a"), LONG).await;
+        assert_eq!(summary(polled), read_of("/a", Some("/a")));
+        assert_eq!(calls.load(SeqCst), 3);
     }
 
     #[tokio::test]

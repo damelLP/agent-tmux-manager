@@ -439,10 +439,7 @@ impl RegistryActor {
             "Session ID upgraded"
         );
 
-        let _ = self.event_publisher.send(SessionEvent::Removed {
-            session_id: old_id,
-            reason: RemovalReason::Upgraded,
-        });
+        self.publish_removed(old_id, RemovalReason::Upgraded);
         let _ = self.event_publisher.send(SessionEvent::Registered {
             session_id: new_id,
             agent_type,
@@ -701,6 +698,13 @@ impl RegistryActor {
         }
     }
 
+    /// Publishes that `session_id` left the registry.
+    fn publish_removed(&self, session_id: SessionId, reason: RemovalReason) {
+        let _ = self
+            .event_publisher
+            .send(SessionEvent::Removed { session_id, reason });
+    }
+
     /// Applies `event` to the session stored under `pid` and publishes it.
     fn apply_to_session(&mut self, pid: u32, event: &LifecycleEvent, tmux_pane: Option<String>) {
         let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) else {
@@ -871,28 +875,11 @@ impl RegistryActor {
         session_id: SessionId,
         reason: RemovalReason,
     ) -> Result<(), RegistryError> {
-        let pid = match self.session_id_to_pid.remove(&session_id) {
-            Some(p) => p,
+        let pid = match self.session_id_to_pid.get(&session_id) {
+            Some(p) => *p,
             None => return Err(RegistryError::SessionNotFound(session_id)),
         };
-
-        if let Some((session, _)) = self.sessions_by_pid.remove(&pid) {
-            self.detach_removed_session(&session, reason);
-        }
-
-        info!(
-            session_id = %session_id,
-            pid = pid,
-            reason = %reason,
-            remaining_sessions = self.sessions_by_pid.len(),
-            "Session removed"
-        );
-
-        // Publish removed event
-        let _ = self
-            .event_publisher
-            .send(SessionEvent::Removed { session_id, reason });
-
+        self.remove_and_announce(pid, session_id, reason);
         Ok(())
     }
 
@@ -902,18 +889,22 @@ impl RegistryActor {
         pid: u32,
         reason: RemovalReason,
     ) -> Result<(), RegistryError> {
-        let (session, _) = match self.sessions_by_pid.remove(&pid) {
-            Some(entry) => entry,
+        let session_id = match self.sessions_by_pid.get(&pid) {
+            Some((session, _)) => session.id.clone(),
             None => {
                 return Err(RegistryError::SessionNotFound(SessionId::new(format!(
                     "pid-{pid}"
                 ))));
             }
         };
+        self.remove_and_announce(pid, session_id, reason);
+        Ok(())
+    }
 
-        let session_id = session.id.clone();
-        self.session_id_to_pid.remove(&session_id);
-        self.detach_removed_session(&session, reason);
+    /// Removes the session at `pid`, then logs and publishes its removal
+    /// as `session_id`.
+    fn remove_and_announce(&mut self, pid: u32, session_id: SessionId, reason: RemovalReason) {
+        self.remove_entry(pid, &session_id, reason);
 
         info!(
             session_id = %session_id,
@@ -923,12 +914,17 @@ impl RegistryActor {
             "Session removed"
         );
 
-        // Publish removed event
-        let _ = self
-            .event_publisher
-            .send(SessionEvent::Removed { session_id, reason });
+        self.publish_removed(session_id, reason);
+    }
 
-        Ok(())
+    /// Removes the row at `pid` and `session_id`'s index entry, then
+    /// detaches the removed session from its parent and children.
+    fn remove_entry(&mut self, pid: u32, session_id: &SessionId, reason: RemovalReason) {
+        let removed = self.sessions_by_pid.remove(&pid);
+        self.session_id_to_pid.remove(session_id);
+        if let Some((session, _)) = removed {
+            self.detach_removed_session(&session, reason);
+        }
     }
 
     /// Handles cleanup of dead-process sessions.
@@ -970,11 +966,7 @@ impl RegistryActor {
                 })
                 .unwrap_or_default();
 
-            let removed = self.sessions_by_pid.remove(&pid);
-            self.session_id_to_pid.remove(&session_id);
-            if let Some((session, _)) = removed {
-                self.detach_removed_session(&session, RemovalReason::ProcessDied);
-            }
+            self.remove_entry(pid, &session_id, RemovalReason::ProcessDied);
 
             // Use warn! so it shows up without RUST_LOG=debug
             warn!(
@@ -984,11 +976,7 @@ impl RegistryActor {
                 "Session removed by cleanup"
             );
 
-            // Publish removed event
-            let _ = self.event_publisher.send(SessionEvent::Removed {
-                session_id,
-                reason: RemovalReason::ProcessDied,
-            });
+            self.publish_removed(session_id, RemovalReason::ProcessDied);
         }
     }
 

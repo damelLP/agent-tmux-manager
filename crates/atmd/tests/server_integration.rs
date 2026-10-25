@@ -1394,8 +1394,9 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
         if kind == "status_line" {
             let unchanged = match (&before, &after) {
                 (Some(before), Some(after)) => after == before,
-                // The resumed process's first status line (call 42, a new
-                // pid) creates its row, which starts idle.
+                // Each process's first status line creates its row, which
+                // starts idle: call 0, before SessionStart(startup), and
+                // call 42, from the resumed process's new pid.
                 (None, Some((label, _))) => label == "idle",
                 // A late status line for a session that SessionEnd just
                 // removed in the same process is dropped.

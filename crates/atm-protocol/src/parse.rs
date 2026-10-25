@@ -26,7 +26,7 @@
 //! first status line of a TUI started with `--model " "`. Captured:
 //! Claude Code 2.1.310, 2026-10-25, a TUI with no network and no model
 //! call (paths rewritten to `/home/user`). A whitespace model setting
-//! (`--model " "` or `ANTHROPIC_MODEL=" "`, with or without `--bare`)
+//! (`--model " "`, also under `--bare`, or `ANTHROPIC_MODEL=" "`)
 //! makes Claude report `"model": {"id": "", "display_name": "unknown
 //! model"}`: the configured model is blank, a real if misconfigured
 //! session, so the line still creates one, as `Model::Unknown`. An empty
@@ -163,7 +163,8 @@ impl RawStatusLine {
     }
 
     /// Updates an existing SessionDomain with new data.
-    /// Only updates fields that are present in this status line.
+    /// An absent or empty model id and an absent window size leave the
+    /// session's own alone; other absent fields map to 0.
     /// Returns `true` if the working directory changed.
     pub fn update_session(&self, session: &mut SessionDomain) -> bool {
         session.update_from_status_line(&self.status_line_data())
@@ -450,7 +451,37 @@ mod tests {
         assert_eq!(session.model, Model::Unknown);
         assert!(session.model_display_override.is_none());
         assert_eq!(session.harness, atm_core::Harness::ClaudeCode);
-        assert_eq!(session.context.context_window_size, 200_000);
+        assert_eq!(session.claude_code_version.as_deref(), Some("2.1.310"));
+        assert_eq!(
+            session.working_directory.as_deref(),
+            Some("/home/user/project")
+        );
+    }
+
+    #[test]
+    fn captured_blank_model_status_line_keeps_existing_model() {
+        use atm_core::{AgentType, SessionDomain};
+
+        // The same captured line on a session that already has a model:
+        // the empty id and Claude's "unknown model" display name leave
+        // the model and its override alone.
+        let raw: RawStatusLine = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude_status_line_blank_model_2.1.310.json"
+        ))
+        .expect("fixture line");
+        for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
+            let mut session = SessionDomain::new(
+                atm_core::SessionId::new("test-blank-model"),
+                AgentType::GeneralPurpose,
+                model,
+            );
+            session.model_display_override = display_override.map(str::to_string);
+
+            raw.update_session(&mut session);
+
+            assert_eq!(session.model, model);
+            assert_eq!(session.model_display_override.as_deref(), display_override);
+        }
     }
 
     #[test]

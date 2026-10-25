@@ -91,7 +91,11 @@
 //!
 //! The same run's 14 status lines are in `atm-protocol`, at
 //! `tests/fixtures/claude_status_line_2.1.310.jsonl` next to
-//! `RawStatusLine`. The fixture moves here when `RawStatusLine` does.
+//! `RawStatusLine`. Beside them, `claude_status_line_blank_model_2.1.310.json`
+//! records a status-line quirk: Claude reports a whitespace model setting
+//! (`--model " "`, `ANTHROPIC_MODEL=" "`) as `"model": {"id": "",
+//! "display_name": "unknown model"}`; `atm-protocol`'s `parse.rs` docs
+//! describe it. The fixtures move here when `RawStatusLine` does.
 //!
 //! `tests/fixtures/claude_subagent_run_2.1.267.jsonl` holds one Agent
 //! run that finished inside the Agent call. Captured: Claude Code

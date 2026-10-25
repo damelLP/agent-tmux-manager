@@ -73,6 +73,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         layout.detail_area,
         app.selected_session(),
         &app.captured_output,
+        app.now,
     );
 
     // Render help popup overlay (on top of everything)

@@ -37,8 +37,9 @@ pub use lifecycle::{
 pub use model::{derive_display_name, Model};
 pub use project::{resolve_project_root, resolve_worktree_info};
 pub use session::{
-    ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId, SessionInfrastructure,
-    SessionStatus, SessionView, StatusLineData, ToolUsageRecord, ToolUseId, TranscriptPath,
+    format_age, ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId,
+    SessionInfrastructure, SessionStatus, SessionView, StatusLineData, ToolUsageRecord, ToolUseId,
+    TranscriptPath,
 };
 pub use tool::Tool;
 pub use tree::{

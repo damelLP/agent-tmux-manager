@@ -101,14 +101,53 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 - **Vendor knowledge lives only in its adapter.** `atm-core`, `atm-protocol`
   and `atmd`'s registry stay vendor-neutral. Adding a harness means a new
   adapter crate, not `if vendor == ..` branches elsewhere.
+  - **Exception: built-in harness metadata.** `Harness` (`harness.rs`) and
+    `BUILTIN_HARNESSES` (`harness_registry.rs`) in `atm-core` hold static
+    facts about each CLI as data: its name, command, process matchers and
+    prompt mode. Spawning and discovery read them instead of branching per
+    vendor (c23888d, #44). They never hold payload schemas, event names or
+    parsing; those stay in the adapter.
 - Adapters never depend on each other.
 - One definition per concept, in `atm-core`. Never create a field-for-field
   copy of an existing type; an adapter's raw payload type exists only because
   the vendor's shape differs.
 
+### Adding a harness
+
+A new harness touches these places (Codex, #30, touched 23 files):
+
+1. A new `crates/atm-<vendor>-adapter`: raw payload types, event vocabulary
+   and the mapping to `atm-core` lifecycle events. Its crate docs (`//!`)
+   record the verified payloads, quirks and harness version.
+2. `atm-core`: a `Harness` variant and a `BUILTIN_HARNESSES` entry, static
+   facts only (see the exception above).
+3. `atm-protocol`: a `MessageType::<Vendor>Event { data }` variant and its
+   constructor (`message.rs`), carrying the payload as opaque JSON, plus an
+   arm in `tests/proptest_roundtrip.rs`, whose coverage guard fails without
+   one.
+4. `atmd`: the adapter dependency, and dispatch of the new message to the
+   adapter in `server/connection.rs`. Discovery reads the registry entry;
+   add the harness's process shapes to `discovery.rs`'s tests.
+5. The forwarder the harness runs: a hook script under `crates/atm/scripts/`,
+   or an extension (`extensions/pi-atm` is authoritative and
+   `crates/atm/assets/pi-atm` is its install mirror).
+6. `atm` (crate `atm-tui`): install and uninstall in `setup.rs`. A badge
+   colour in `ui/session_list.rs` is optional (unknown harnesses get grey).
+7. The root `Cargo.toml` (`[workspace.dependencies]` and members) and
+   `.github/workflows/release.yml` (§2).
+8. Tests: adapter tests on real captures (§3), an end-to-end replay in
+   `crates/atmd/tests/server_integration.rs`, and setup tests in
+   `tests/setup_*.rs`.
+9. `README.md`: the supported harnesses and their setup.
+
 ### Async rules
 
 - Never block the runtime; use `spawn_blocking` for sync work.
+  - **Exception: a read that can hang forever** (a FIFO, a stuck
+    filesystem) runs on a detached `std::thread` and reports back through a
+    `oneshot` with a timeout. tokio's runtime waits for every
+    `spawn_blocking` task when it drops, so a hung one stops the process
+    from ever exiting (#84).
 - Every external operation (tmux, socket, subprocess) has a timeout.
 - Handle channel closure (`None`/`Err`) as a normal shutdown path.
 - Use `CancellationToken` for cooperative shutdown.
@@ -133,6 +172,11 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
   the commit message. Never accept just to make a test pass.
 - Adapters: test against **real captured payloads** from the harness, not
   hand-imagined ones (principle 3).
+- Record every payload's provenance next to it, in the adapter's crate docs
+  or a comment beside the test: `Captured: <harness> <version>, <YYYY-MM-DD>,
+  <method>.` for a real capture, or `Synthetic: <why>` for a hand-built one.
+  Put the harness version in captured fixture filenames
+  (`claude_tui_session_2.1.310.jsonl`).
 
 ## 4. Workflow and guardrails
 
@@ -192,8 +236,8 @@ them with `/hooks`.
 - Parallel agents: one task per agent, each in its own git worktree under
   `.worktrees/`.
 - Keep new files small and single-purpose. Some existing files (e.g.
-  `registry/actor.rs`, `src/bin/atm.rs`) are large; don't split them as part
-  of a feature — that's a separate refactor (principle 2).
+  `registry/actor.rs`, `src/bin/atm/main.rs`) are large; don't split them as
+  part of a feature — that's a separate refactor (principle 2).
 
 ## 5. Pointers
 

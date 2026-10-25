@@ -370,10 +370,7 @@ impl RegistryActor {
                 "Re-discovered existing session, refreshed git info (metadata preserved)"
             );
 
-            let view = SessionView::from_domain(existing_session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
+            self.publish_updated(pid);
 
             // Update the session_id index
             self.session_id_to_pid.remove(&old_id);
@@ -406,12 +403,7 @@ impl RegistryActor {
         );
 
         // Also publish an initial Updated event so TUI shows it
-        if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
-            let view = SessionView::from_domain(session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
-        }
+        self.publish_updated(pid);
 
         Ok(())
     }
@@ -479,23 +471,7 @@ impl RegistryActor {
         // Fallback: lookup by session_id (when no PID available)
         if let Some(&pid) = self.session_id_to_pid.get(&session_id) {
             if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-                let cwd_changed = session.update_from_status_line(&data);
-                infra.record_update();
-
-                // Resolve project/worktree if not yet set, or if cwd changed
-                if session.project_root.is_none() || cwd_changed {
-                    if let Some(ref cwd) = session.working_directory {
-                        if cwd_changed {
-                            info!(
-                                session_id = %session_id,
-                                pid = pid,
-                                new_cwd = %cwd,
-                                "Working directory changed, re-resolving git info"
-                            );
-                        }
-                        apply_git_context(session);
-                    }
-                }
+                apply_status_line(session, infra, &data, &session_id, pid);
 
                 debug!(
                     session_id = %session_id,
@@ -504,10 +480,7 @@ impl RegistryActor {
                     "Session updated from status line (by session_id)"
                 );
 
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
+                self.publish_updated(pid);
             }
             return Ok(());
         }
@@ -542,23 +515,8 @@ impl RegistryActor {
         }
 
         if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-            let cwd_changed = session.update_from_status_line(&data);
-            infra.record_update();
-
-            // Resolve project/worktree if not yet set, or if cwd changed
-            if session.project_root.is_none() || cwd_changed {
-                if let Some(ref cwd) = session.working_directory {
-                    if cwd_changed {
-                        info!(
-                            session_id = %session.id,
-                            pid = pid,
-                            new_cwd = %cwd,
-                            "Working directory changed, re-resolving git info"
-                        );
-                    }
-                    apply_git_context(session);
-                }
-            }
+            let log_id = session.id.clone();
+            apply_status_line(session, infra, &data, &log_id, pid);
 
             debug!(
                 session_id = %session_id,
@@ -567,10 +525,7 @@ impl RegistryActor {
                 "Session updated from status line"
             );
 
-            let view = SessionView::from_domain(session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
+            self.publish_updated(pid);
         } else {
             // Session doesn't exist - create it
             let mut session = SessionDomain::from_status_line(&data);
@@ -587,12 +542,7 @@ impl RegistryActor {
                 "Session auto-registered from status line"
             );
 
-            if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
-            }
+            self.publish_updated(pid);
         }
 
         Ok(())
@@ -1047,7 +997,7 @@ impl RegistryActor {
     /// Detects branch switches that happen without a working directory change
     /// (e.g., `git checkout other-branch` in the same directory).
     fn handle_refresh_git_info(&mut self) {
-        let mut updated_count = 0;
+        let mut updated_pids = Vec::new();
 
         for (pid, (session, _)) in self.sessions_by_pid.iter_mut() {
             let cwd = match &session.working_directory {
@@ -1072,15 +1022,16 @@ impl RegistryActor {
                 session.project_root = new_project_root;
                 session.worktree_path = new_wt_path;
                 session.worktree_branch = new_wt_branch;
-                updated_count += 1;
-
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
+                updated_pids.push(*pid);
             }
         }
 
+        // Publish in loop order once the loop's borrow has ended
+        for pid in &updated_pids {
+            self.publish_updated(*pid);
+        }
+
+        let updated_count = updated_pids.len();
         if updated_count > 0 {
             info!(updated_count, "Git info refresh completed with changes");
         }
@@ -1154,6 +1105,35 @@ fn apply_git_context(session: &mut SessionDomain) {
             session.worktree_path,
             session.worktree_branch,
         ) = resolve_git_context(cwd);
+    }
+}
+
+/// Applies a status line to a stored session and counts the update. Then
+/// re-resolves the git context if the project root is unset or the working
+/// directory changed, logging `log_id` on a change.
+fn apply_status_line(
+    session: &mut SessionDomain,
+    infra: &mut SessionInfrastructure,
+    data: &StatusLineData,
+    log_id: &SessionId,
+    pid: u32,
+) {
+    let cwd_changed = session.update_from_status_line(data);
+    infra.record_update();
+
+    // Resolve project/worktree if not yet set, or if cwd changed
+    if session.project_root.is_none() || cwd_changed {
+        if let Some(ref cwd) = session.working_directory {
+            if cwd_changed {
+                info!(
+                    session_id = %log_id,
+                    pid = pid,
+                    new_cwd = %cwd,
+                    "Working directory changed, re-resolving git info"
+                );
+            }
+            apply_git_context(session);
+        }
     }
 }
 
@@ -2756,5 +2736,482 @@ mod tests {
 
         apply_with_context(&mut actor, &parent, LifecycleEvent::WorkingEnd, stop(0, 0));
         assert!(session_view(&actor, "agent-1").is_none());
+    }
+
+    // ========================================================================
+    // Status-line and Updated-event pins
+    // ========================================================================
+
+    /// Drains the queued events. Returns a `"<kind> <id>"` summary of each,
+    /// in order, and the views the `Updated` events carried.
+    fn drain_events(rx: &mut broadcast::Receiver<SessionEvent>) -> (Vec<String>, Vec<SessionView>) {
+        let mut summaries = Vec::new();
+        let mut views = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            summaries.push(match event {
+                SessionEvent::Registered { session_id, .. } => format!("Registered {session_id}"),
+                SessionEvent::Updated { session } => {
+                    let summary = format!("Updated {}", session.id);
+                    views.push(*session);
+                    summary
+                }
+                SessionEvent::Removed { session_id, reason } => {
+                    format!("Removed {session_id} {reason:?}")
+                }
+            });
+        }
+        (summaries, views)
+    }
+
+    /// `view` as JSON without its clock-derived age fields.
+    fn view_json(view: &SessionView) -> serde_json::Value {
+        let mut json = serde_json::to_value(view).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("last_activity_display").unwrap();
+        fields.remove("age_display").unwrap();
+        json
+    }
+
+    /// Asserts that a published view matches a fresh view of the same session.
+    fn assert_view_is_current(actor: &RegistryActor, view: &SessionView) {
+        let current = session_view(actor, view.id.as_str()).unwrap();
+        assert_eq!(view_json(view), view_json(&current));
+    }
+
+    fn send_status_line(actor: &mut RegistryActor, json: serde_json::Value) {
+        let session_id = SessionId::new(json["session_id"].as_str().unwrap());
+        let (pid, data) = parse_status_line(json).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    fn discover(
+        actor: &mut RegistryActor,
+        id: SessionId,
+        pid: u32,
+        cwd: &std::path::Path,
+        tmux_pane: Option<&str>,
+    ) {
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::RegisterDiscovered {
+            session_id: id,
+            pid,
+            cwd: cwd.to_path_buf(),
+            tmux_pane: tmux_pane.map(String::from),
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    fn pid_of(actor: &RegistryActor, id: &str) -> u32 {
+        actor.session_id_to_pid[&SessionId::new(id)]
+    }
+
+    fn update_count(actor: &RegistryActor, id: &str) -> u64 {
+        actor.sessions_by_pid[&pid_of(actor, id)].1.update_count
+    }
+
+    fn path_str(path: &std::path::Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    /// Runs `f` and returns what it logged, up to DEBUG, one line per event.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        // tracing caches each callsite's interest. While only one
+        // dispatcher is registered it asks just the thread that hits the
+        // callsite first, so a parallel test could switch a line off for
+        // this one. An idle second dispatcher makes it ask every live one.
+        static IDLE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        IDLE.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn rediscovery_of_an_upgraded_session_publishes_one_updated_view() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, &repo_a, None);
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "real-a",
+                "pid": pid,
+                "cwd": path_str(&repo_a),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.30, "total_duration_ms": 5000}
+            }),
+        );
+        drain_events(&mut event_rx);
+
+        // Discovery only knows the pending id; the session keeps its real one.
+        discover(&mut actor, pending, pid, &repo_b, Some("%7"));
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated real-a"]);
+        let view = &views[0];
+        assert_view_is_current(&actor, view);
+        // The view shortens long paths, so check the stored session's cwd.
+        let stored = &actor.sessions_by_pid[&pid].0;
+        assert_eq!(stored.working_directory.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(view.project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(view.worktree_branch.as_deref(), Some("feature"));
+        assert_eq!(view.tmux_pane.as_deref(), Some("%7"));
+        assert_eq!(
+            view.cost_usd, 0.30,
+            "rediscovery keeps the session's metadata"
+        );
+    }
+
+    #[test]
+    fn new_discovery_publishes_registered_then_updated() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo, "main");
+        let pid = std::process::id();
+        let id = SessionId::pending_from_pid(pid);
+
+        discover(&mut actor, id.clone(), pid, &repo, None);
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [format!("Registered {id}"), format!("Updated {id}")]
+        );
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn status_line_by_session_id_updates_counts_and_publishes() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let mut session = create_test_session("by-id");
+        session.working_directory = Some(path_str(&repo_a).to_string());
+        register_session_in(&mut actor, session);
+        drain_events(&mut event_rx);
+
+        // No "pid" field: the registry finds the session by its id.
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "by-id",
+                "cwd": path_str(&repo_b),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.50, "total_duration_ms": 5000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated by-id"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.50);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
+        assert_eq!(update_count(&actor, "by-id"), 1);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "by-id",
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.75, "total_duration_ms": 6000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated by-id"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.75);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(update_count(&actor, "by-id"), 2);
+    }
+
+    #[test]
+    fn status_line_by_pid_upgrade_publishes_removed_registered_updated() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, &repo_a, None);
+        drain_events(&mut event_rx);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "real-d",
+                "pid": pid,
+                "cwd": path_str(&repo_b),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.40, "total_duration_ms": 5000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                format!("Removed {pending} Upgraded"),
+                "Registered real-d".to_string(),
+                "Updated real-d".to_string(),
+            ]
+        );
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.40);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
+        assert_eq!(update_count(&actor, "real-d"), 1);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "real-d",
+                "pid": pid,
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.60, "total_duration_ms": 6000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated real-d"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.60);
+        assert_eq!(update_count(&actor, "real-d"), 2);
+    }
+
+    #[test]
+    fn status_line_auto_register_publishes_registered_then_updated() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo, "main");
+        let status_line = |cost: f64| {
+            serde_json::json!({
+                "session_id": "auto-e",
+                "pid": std::process::id(),
+                "cwd": path_str(&repo),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": cost, "total_duration_ms": 5000}
+            })
+        };
+
+        send_status_line(&mut actor, status_line(0.10));
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Registered auto-e", "Updated auto-e"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.10);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("main"));
+        assert_eq!(
+            update_count(&actor, "auto-e"),
+            0,
+            "creating a session is not counted as an update"
+        );
+
+        send_status_line(&mut actor, status_line(0.20));
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated auto-e"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.20);
+        assert_eq!(update_count(&actor, "auto-e"), 1);
+    }
+
+    #[test]
+    fn status_line_resolves_git_when_project_root_is_unset() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "main");
+        let mut by_id = create_test_session("unset-by-id");
+        by_id.working_directory = Some(path_str(&repo_a).to_string());
+        register_session_in(&mut actor, by_id);
+        let pid = std::process::id();
+        discover(
+            &mut actor,
+            SessionId::new("unset-by-pid"),
+            pid,
+            &repo_b,
+            None,
+        );
+        // As if the directories were not repos when the sessions were
+        // resolved. Clearing the fields directly keeps the test independent
+        // of whether TMPDIR sits inside some other checkout.
+        for id in ["unset-by-id", "unset-by-pid"] {
+            let session = &mut actor
+                .sessions_by_pid
+                .get_mut(&pid_of(&actor, id))
+                .unwrap()
+                .0;
+            session.project_root = None;
+            session.worktree_path = None;
+            session.worktree_branch = None;
+        }
+
+        // The status lines report no cwd change.
+        let model = serde_json::json!({"id": "claude-sonnet-4-20250514"});
+        send_status_line(
+            &mut actor,
+            serde_json::json!({"session_id": "unset-by-id", "model": model}),
+        );
+        send_status_line(
+            &mut actor,
+            serde_json::json!({"session_id": "unset-by-pid", "pid": pid, "model": model}),
+        );
+
+        let by_id = session_view(&actor, "unset-by-id").unwrap();
+        assert_eq!(by_id.project_root.as_deref(), Some(path_str(&repo_a)));
+        assert_eq!(by_id.worktree_branch.as_deref(), Some("main"));
+        let by_pid = session_view(&actor, "unset-by-pid").unwrap();
+        assert_eq!(by_pid.project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(by_pid.worktree_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn status_line_logs_keep_each_paths_session_id() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+
+        // A stale index entry: "stale-alias" still points at the session
+        // now called "renamed". The by-session_id path logs the id it
+        // looked up, not the session's own.
+        let mut renamed = create_test_session("renamed");
+        renamed.working_directory = Some(path_str(&repo_a).to_string());
+        register_session_in(&mut actor, renamed);
+        let renamed_pid = pid_of(&actor, "renamed");
+        actor
+            .session_id_to_pid
+            .insert(SessionId::new("stale-alias"), renamed_pid);
+        let logs = capture_logs(|| {
+            send_status_line(
+                &mut actor,
+                serde_json::json!({
+                    "session_id": "stale-alias",
+                    "cwd": path_str(&repo_b),
+                    "model": {"id": "claude-sonnet-4-20250514"},
+                    "cost": {"total_cost_usd": 0.50, "total_duration_ms": 5000}
+                }),
+            );
+        });
+        assert_eq!(
+            logs,
+            format!(
+                " INFO Working directory changed, re-resolving git info \
+                 session_id=stale-alias pid={renamed_pid} new_cwd={}\n\
+                 DEBUG Session updated from status line (by session_id) \
+                 session_id=stale-alias pid={renamed_pid} cost=$0.50\n",
+                path_str(&repo_b)
+            )
+        );
+
+        // By pid: the session is renamed first, so it logs the new id.
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, &repo_a, None);
+        let logs = capture_logs(|| {
+            send_status_line(
+                &mut actor,
+                serde_json::json!({
+                    "session_id": "real-p",
+                    "pid": pid,
+                    "cwd": path_str(&repo_b),
+                    "model": {"id": "claude-sonnet-4-20250514"},
+                    "cost": {"total_cost_usd": 0.25, "total_duration_ms": 5000}
+                }),
+            );
+        });
+        assert_eq!(
+            logs,
+            format!(
+                " INFO Session ID upgraded old_id={pending} new_id=real-p pid={pid}\n \
+                 INFO Working directory changed, re-resolving git info \
+                 session_id=real-p pid={pid} new_cwd={}\n\
+                 DEBUG Session updated from status line session_id=real-p pid={pid} \
+                 cost=$0.25\n",
+                path_str(&repo_b)
+            )
+        );
+    }
+
+    #[test]
+    fn refresh_git_info_publishes_each_changed_session_in_map_order() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["git-0", "git-1", "git-2", "git-3"];
+        for id in ids {
+            let repo = dir.path().join(id);
+            init_repo(&repo, "main");
+            let mut session = create_test_session(id);
+            session.working_directory = Some(path_str(&repo).to_string());
+            register_session_in(&mut actor, session);
+        }
+        drain_events(&mut event_rx);
+        let changed = ["git-0", "git-1", "git-3"];
+        for id in changed {
+            init_repo(&dir.path().join(id), "develop");
+        }
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+
+        let expected: Vec<String> = actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| session.id.as_str())
+            .filter(|id| changed.contains(id))
+            .map(|id| format!("Updated {id}"))
+            .collect();
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+            assert_eq!(view.worktree_branch.as_deref(), Some("develop"));
+        }
     }
 }

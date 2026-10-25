@@ -274,10 +274,11 @@
 //!   id. atmd drops status lines with that id from the same pid for 10 s
 //!   after the `SessionEnd`. Before that, the late line re-created the
 //!   ended session's row. `claude --resume <id>` runs in a new process,
-//!   so its status lines count at once. Left open: an in-process `/resume`
-//!   back to a session that ended in that process under 10 s earlier
-//!   would lose its status lines until the 10 s pass (read from the code,
-//!   unverified).
+//!   so its status lines count at once. An in-process `/resume` back to
+//!   the cleared session sends `SessionEnd` (reason `resume`), then
+//!   `SessionStart` (source `resume`) for the old id in the same pid, and
+//!   a redraw status line ~50 ms later; that `SessionStart` lifts the
+//!   drop, so the redraw line counts (sealed TUI run, 2.1.310).
 //! - **A user's interrupt fires no hook.** In sealed TUI runs, pressing
 //!   Esc while Claude streamed a reply, and denying a permission dialog
 //!   in manual mode (Esc or "No"), sent no hook at all: no `Stop`, no

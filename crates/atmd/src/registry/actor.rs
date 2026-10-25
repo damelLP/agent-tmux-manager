@@ -373,7 +373,7 @@ impl RegistryActor {
             self.publish_updated(pid);
 
             // Update the session_id index
-            self.session_id_to_pid.remove(&old_id);
+            self.unindex(&old_id, pid);
             self.session_id_to_pid.insert(session_id, pid);
 
             return Ok(());
@@ -429,7 +429,7 @@ impl RegistryActor {
         session.id = new_id.clone();
         let agent_type = session.agent_type.clone();
 
-        self.session_id_to_pid.remove(&old_id);
+        self.unindex(&old_id, pid);
         self.session_id_to_pid.insert(new_id.clone(), pid);
 
         info!(
@@ -917,14 +917,22 @@ impl RegistryActor {
         self.publish_removed(session_id, reason);
     }
 
-    /// Removes the row at `pid` and `session_id`'s index entry, wherever
-    /// that entry points, then detaches the removed session from its parent
-    /// and children.
+    /// Removes the row at `pid` and `session_id`'s index entry if it points
+    /// at `pid`, then detaches the removed session from its parent and
+    /// children.
     fn remove_entry(&mut self, pid: u32, session_id: &SessionId, reason: RemovalReason) {
         let removed = self.sessions_by_pid.remove(&pid);
-        self.session_id_to_pid.remove(session_id);
+        self.unindex(session_id, pid);
         if let Some((session, _)) = removed {
             self.detach_removed_session(&session, reason);
+        }
+    }
+
+    /// Drops `session_id`'s index entry only if it points at `pid`. Another
+    /// process can report the same id, and its row keeps the entry.
+    fn unindex(&mut self, session_id: &SessionId, pid: u32) {
+        if self.session_id_to_pid.get(session_id) == Some(&pid) {
+            self.session_id_to_pid.remove(session_id);
         }
     }
 

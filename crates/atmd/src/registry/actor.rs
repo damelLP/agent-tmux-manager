@@ -4246,18 +4246,27 @@ mod tests {
     }
 
     /// `/exit`: a status line after `SessionEnd` must not leave a ghost
-    /// row that lasts until cleanup finds the process dead.
+    /// row that lasts until cleanup finds the process dead. The drop logs
+    /// at DEBUG.
     #[test]
     fn exit_drops_a_late_status_line() {
         let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
         old_session_at(&mut actor, &mut event_rx);
-        session_end(&mut actor, OLD, std::process::id(), "prompt_input_exit");
+        session_end(&mut actor, OLD, pid, "prompt_input_exit");
         drain_setup(&mut event_rx);
 
-        status_line_costing(&mut actor, std::process::id(), OLD, OLD_COST);
+        let logs = capture_logs(|| status_line_costing(&mut actor, pid, OLD, OLD_COST));
 
         assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
         assert_eq!(actor.session_count(), 0);
+        assert_eq!(
+            logs,
+            format!(
+                "DEBUG Status line for a session that ended in this process, ignoring \
+                 session_id={OLD} pid={pid}\n"
+            )
+        );
     }
 
     /// `claude --resume <id>` brings an ended id back in a new process.

@@ -1482,20 +1482,31 @@ async fn test_e2e_claude_captured_stop_failure_replay() {
 async fn test_e2e_claude_captured_background_agent_dialog_replay() {
     // Captured: Claude Code 2.1.310, 2026-10-25, two TUI turns whose
     // permission dialog stayed open while background subagents started
-    // and stopped (see atm-claude-adapter's crate docs). Claude sends no
-    // other hook while a dialog waits, so a child event that turned the
-    // lead working hid the dialog until the user answered it.
+    // and stopped (see atm-claude-adapter's crate docs). The lead sends no
+    // hook of its own while its dialog waits, so a child event that turned
+    // it working hid the dialog until the user answered it.
     let fixture = "claude_background_agent_dialog_2.1.310.jsonl";
     let Some(events) = captured_hook_payloads("atm-claude-adapter", fixture) else {
         return;
     };
     assert_eq!(events.len(), 34, "{fixture}");
     let (race, deep) = events.split_at(14);
-    // The lead's row after each hook: status, needs_attention, and how
-    // many child rows it has.
-    let idle = |children: usize| Some(("idle".to_string(), false, children));
-    let working = |children: usize| Some(("working".to_string(), false, children));
-    let asking = |children: usize| Some(("needs input".to_string(), true, children));
+    // The lead's row after each hook: status, activity, needs_attention,
+    // and how many child rows it has.
+    let row = |status: &str, activity: Option<&str>, children: usize| {
+        let needs_attention = status == "needs input";
+        Some((
+            status.to_string(),
+            activity.map(String::from),
+            needs_attention,
+            children,
+        ))
+    };
+    let idle = |children| row("idle", None, children);
+    let working = |activity, children| row("working", activity, children);
+    let asking = |activity, children| row("needs input", Some(activity), children);
+    let (agent, thinking) = (Some("Agent"), Some("Thinking"));
+    let (bash, permission) = ("Bash: touch atm-probe.txt && echo atm-probe", "Permission");
     let sessions = [
         // A background agent, then a gated Bash call; the agent stops
         // while the dialog is open.
@@ -1503,16 +1514,16 @@ async fn test_e2e_claude_captured_background_agent_dialog_replay() {
             race,
             vec![
                 ("SessionStart", idle(0)),
-                ("UserPromptSubmit", working(0)),
-                ("PreToolUse", working(0)),
-                ("SubagentStart", working(1)),
-                ("PostToolUse", working(1)),
-                ("PreToolUse", working(1)),
-                ("PermissionRequest", asking(1)),
-                ("Notification", asking(1)),
-                ("SubagentStop", asking(0)),
-                ("PostToolUse", working(0)),
-                ("UserPromptSubmit", working(0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("PreToolUse", working(agent, 0)),
+                ("SubagentStart", working(agent, 1)),
+                ("PostToolUse", working(thinking, 1)),
+                ("PreToolUse", working(Some("Bash"), 1)),
+                ("PermissionRequest", asking(bash, 1)),
+                ("Notification", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("PostToolUse", working(thinking, 0)),
+                ("UserPromptSubmit", working(None, 0)),
                 ("Stop", idle(0)),
                 ("Notification", idle(0)),
                 ("SessionEnd", None),
@@ -1525,22 +1536,22 @@ async fn test_e2e_claude_captured_background_agent_dialog_replay() {
             deep,
             vec![
                 ("SessionStart", idle(0)),
-                ("UserPromptSubmit", working(0)),
-                ("PreToolUse", working(0)),
-                ("SubagentStart", working(1)),
-                ("PostToolUse", working(1)),
-                ("PreToolUse", working(1)),
-                ("PermissionRequest", asking(1)),
-                ("Notification", asking(1)),
-                ("PreToolUse", asking(1)),
-                ("SubagentStart", asking(2)),
-                ("PostToolUse", asking(2)),
-                ("SubagentStop", asking(1)),
-                ("SubagentStop", asking(0)),
-                ("SubagentStart", asking(1)),
-                ("SubagentStop", asking(0)),
-                ("PostToolUse", working(0)),
-                ("UserPromptSubmit", working(0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("PreToolUse", working(agent, 0)),
+                ("SubagentStart", working(agent, 1)),
+                ("PostToolUse", working(thinking, 1)),
+                ("PreToolUse", working(Some("Bash"), 1)),
+                ("PermissionRequest", asking(bash, 1)),
+                ("Notification", asking(permission, 1)),
+                ("PreToolUse", asking(permission, 1)),
+                ("SubagentStart", asking(permission, 2)),
+                ("PostToolUse", asking(permission, 2)),
+                ("SubagentStop", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("SubagentStart", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("PostToolUse", working(thinking, 0)),
+                ("UserPromptSubmit", working(None, 0)),
                 ("Stop", idle(0)),
                 ("Notification", idle(0)),
                 ("SessionEnd", None),
@@ -1558,6 +1569,7 @@ async fn test_e2e_claude_captured_background_agent_dialog_replay() {
             let row = registry.get_session(lead.clone()).await.map(|view| {
                 (
                     view.status_label,
+                    view.activity_detail,
                     view.needs_attention,
                     view.child_session_ids.len(),
                 )

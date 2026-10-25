@@ -175,11 +175,12 @@
 //!
 //! Background subagents start and stop on their own schedule, so their
 //! `SubagentStart` and `SubagentStop` can reach the lead while it waits on
-//! a permission dialog. Claude sends no other hook while a dialog waits,
-//! so child events leave the lead's status alone: until 2026-10-25 they
-//! set it working, and the row lost its needs input until the user
-//! answered. Sealed TUI runs on Claude Code 2.1.310 in manual mode, with
-//! `atm list` polled every 200 ms:
+//! a permission dialog. The lead sends no hook of its own while its
+//! dialog waits; a background agent's own hooks carry its `agent_id` and
+//! go to its row. So child events leave the lead's status alone: until
+//! 2026-10-25 they set it working, and the row lost its needs input until
+//! the user answered. Sealed TUI runs on Claude Code 2.1.310 in manual
+//! mode, with `atm list` polled every 200 ms:
 //!
 //! - A background agent that finished 15 s into the dialog sent its
 //!   `SubagentStop` then. The task notification's `UserPromptSubmit`
@@ -192,7 +193,10 @@
 //!   message, Claude started the agent 71 ms after the dialog's answer.
 //! - Stopping a background agent from the task list (`x`) sent no
 //!   `SubagentStop`, only the task notification's `UserPromptSubmit` and
-//!   a quiet `Stop`, which sweeps the child. A natural `SubagentStop` at
+//!   a quiet `Stop`. That `Stop` swept the child because it still read
+//!   working; the sweep skips a child waiting on input, so a child stopped
+//!   while it waits keeps its row (read from the code, not run; it
+//!   predates 2026-10-25). A natural `SubagentStop` at
 //!   an idle lead was followed by that `UserPromptSubmit` 53 ms later, so
 //!   no captured case needed a child event to mark the lead working.
 //!
@@ -201,7 +205,10 @@
 //! - **A nested subagent's row sits directly under the lead.** Its
 //!   `SubagentStart` carries only `agent_id` and `agent_type`, nothing
 //!   naming the subagent that spawned it, so atmd nests it under the
-//!   lead, beside its spawner.
+//!   lead, beside its spawner. A fix can't just nest it under the
+//!   spawner: the spawner's `SubagentStop` came before the nested
+//!   agent's, and removing a session removes its children, so the running
+//!   nested agent's row would go with it.
 //! - **`claude --bare` runs the statusLine but no hooks, so ATM can't
 //!   see its turns.** A sealed TUI run with `--bare` sent status lines at
 //!   startup, after a permission-mode change and after a turn, and no

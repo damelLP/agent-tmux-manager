@@ -21,11 +21,15 @@ pub struct BeadsTask {
 /// Returns tasks sorted by most recently updated first.
 pub fn find_in_progress_tasks(working_dir: &str) -> Vec<BeadsTask> {
     let jsonl_path = Path::new(working_dir).join(".beads/issues.jsonl");
-    let content = match std::fs::read_to_string(&jsonl_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    match std::fs::read_to_string(&jsonl_path) {
+        Ok(content) => parse_in_progress_tasks(&content),
+        Err(_) => Vec::new(),
+    }
+}
 
+/// Parses `issues.jsonl` content into its in-progress tasks, most recently
+/// updated first. Malformed lines and entries without an ID or title are skipped.
+pub fn parse_in_progress_tasks(content: &str) -> Vec<BeadsTask> {
     let mut tasks: Vec<(String, BeadsTask)> = Vec::new(); // (updated_at, task) for sorting
 
     for line in content.lines() {
@@ -112,5 +116,59 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].title, "Another active"); // most recent first
         assert_eq!(result[1].title, "Active task");
+    }
+
+    fn ids(tasks: &[BeadsTask]) -> Vec<&str> {
+        tasks.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    #[test]
+    fn test_parse_keeps_only_in_progress_newest_first() {
+        let content = r#"{"id":"a","title":"Old active","status":"in_progress","updated_at":"2026-01-01T00:00:00Z","description":"First line\nSecond line"}
+{"id":"b","title":"Open","status":"open","updated_at":"2026-01-05T00:00:00Z"}
+{"id":"c","title":"Closed but says in_progress","status":"closed","notes":"was in_progress","updated_at":"2026-01-06T00:00:00Z"}
+{"id":"d","title":"New active","status":"in_progress","updated_at":"2026-01-03T00:00:00Z","description":""}
+"#;
+
+        let tasks = parse_in_progress_tasks(content);
+
+        assert_eq!(ids(&tasks), ["d", "a"]);
+        assert_eq!(tasks[0].title, "New active");
+        assert_eq!(tasks[0].description, None); // empty description dropped
+        assert_eq!(
+            tasks[1].description.as_deref(),
+            Some("First line\nSecond line")
+        );
+    }
+
+    #[test]
+    fn test_parse_skips_malformed_and_incomplete_lines() {
+        let content = r#"{"id":"a","title":"Truncated","status":"in_progress"
+not json "in_progress"
+{"id":"","title":"No id","status":"in_progress"}
+{"id":"b","title":"","status":"in_progress"}
+{"title":"Missing id","status":"in_progress"}
+{"id":"c","title":"Status not a string","status":["in_progress"]}
+{"id":"d","title":"Good","status":"in_progress","updated_at":"2026-01-01T00:00:00Z"}
+"#;
+
+        assert_eq!(ids(&parse_in_progress_tasks(content)), ["d"]);
+    }
+
+    #[test]
+    fn test_parse_empty_content() {
+        assert!(parse_in_progress_tasks("").is_empty());
+        assert!(parse_in_progress_tasks("\n\n").is_empty());
+    }
+
+    #[test]
+    fn test_parse_crlf_line_endings() {
+        let content = "{\"id\":\"a\",\"title\":\"Windows\",\"status\":\"in_progress\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\r\n\
+                       {\"id\":\"b\",\"title\":\"Newer\",\"status\":\"in_progress\",\"updated_at\":\"2026-01-02T00:00:00Z\"}\r\n";
+
+        let tasks = parse_in_progress_tasks(content);
+
+        assert_eq!(ids(&tasks), ["b", "a"]);
+        assert_eq!(tasks[1].title, "Windows");
     }
 }

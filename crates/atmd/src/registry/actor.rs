@@ -2885,7 +2885,9 @@ mod tests {
         assert_eq!(events, ["Updated real-a"]);
         let view = &views[0];
         assert_view_is_current(&actor, view);
-        assert_eq!(view.working_directory.as_deref(), Some(path_str(&repo_b)));
+        // The view shortens long paths, so check the stored session's cwd.
+        let stored = &actor.sessions_by_pid[&pid].0;
+        assert_eq!(stored.working_directory.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(view.project_root.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(view.worktree_branch.as_deref(), Some("feature"));
         assert_eq!(view.tmux_pane.as_deref(), Some("%7"));

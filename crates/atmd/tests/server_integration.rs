@@ -1380,6 +1380,7 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
     let state = |view: Option<SessionView>| view.map(|v| (v.status_label, v.activity_detail));
     let mut seen = Vec::new();
     let mut changed = Vec::new();
+    let mut dropped = Vec::new();
     for (seq, (i, (kind, payload))) in (1..).zip(calls.iter().enumerate()) {
         let message = match kind.as_str() {
             "hook" => ClientMessage::hook_event(payload.clone()),
@@ -1393,9 +1394,16 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
         if kind == "status_line" {
             let unchanged = match (&before, &after) {
                 (Some(before), Some(after)) => after == before,
-                // A status line for an ended session re-creates its row
-                // (see atm-claude-adapter's Known gaps), which starts idle.
+                // Each process's first status line creates its row, which
+                // starts idle: call 0, before SessionStart(startup), and
+                // call 42, from the resumed process's new pid.
                 (None, Some((label, _))) => label == "idle",
+                // A late status line for a session that SessionEnd just
+                // removed in the same process is dropped.
+                (None, None) => {
+                    dropped.push(i);
+                    true
+                }
                 _ => false,
             };
             if !unchanged {
@@ -1412,6 +1420,9 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
         changed.is_empty(),
         "status lines changed rows: {changed:#?}"
     );
+    // The lines that followed SessionEnd: /clear, /exit, and the resumed
+    // session's /exit.
+    assert_eq!(dropped, [37, 41, 45]);
     let expected: Vec<_> = checkpoints
         .iter()
         .map(|&(i, _)| (i, "status_line", Some("idle".to_string())))

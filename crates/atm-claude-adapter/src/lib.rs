@@ -270,11 +270,15 @@
 //!   of the unmatched `SubagentStop`s in the agent-teams notes above
 //!   (unverified for teams).
 //! - **A status line also follows `SessionEnd`** (`/clear` and `/exit`),
-//!   still carrying the ended session's id, and atmd re-creates the row
-//!   from it. After `/clear`, the new session's first status line
-//!   renames that row to the new id. After `/exit`, atmd's dead-process
-//!   cleanup removes it about 1 s later, logging "process died without
-//!   a session-end signal" although one arrived.
+//!   8 to 30 ms later in the captures, still carrying the ended session's
+//!   id. atmd drops status lines with that id from the same pid for 10 s
+//!   after the `SessionEnd`. Before that, the late line re-created the
+//!   ended session's row. `claude --resume <id>` runs in a new process,
+//!   so its status lines count at once. An in-process `/resume` back to
+//!   the cleared session sends `SessionEnd` (reason `resume`), then
+//!   `SessionStart` (source `resume`) for the old id in the same pid, and
+//!   a redraw status line ~50 ms later; that `SessionStart` lifts the
+//!   drop, so the redraw line counts (sealed TUI run, 2.1.310).
 //! - **A user's interrupt fires no hook.** In sealed TUI runs, pressing
 //!   Esc while Claude streamed a reply, and denying a permission dialog
 //!   in manual mode (Esc or "No"), sent no hook at all: no `Stop`, no

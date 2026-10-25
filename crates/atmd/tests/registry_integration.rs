@@ -927,13 +927,13 @@ async fn test_hook_event_forwards_agent_fields() {
         .await
         .expect("SubagentStart hook should succeed");
 
-    // The parent session should still be accessible and working
+    // The parent session should still be accessible
     let view = handle
         .get_session(SessionId::new("parent-for-subagent"))
         .await
         .expect("parent session should exist");
-    // SubagentStart is a pre-event, so session stays working
-    assert_eq!(view.status_label, "working");
+    // A child's start leaves the parent's status alone, so it stays idle
+    assert_eq!(view.status_label, "idle");
 }
 
 #[tokio::test]

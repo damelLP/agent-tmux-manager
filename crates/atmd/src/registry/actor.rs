@@ -2405,14 +2405,16 @@ mod tests {
             }),
             ..LifecycleContext::default()
         };
+        let lead_status = session_view(&actor, "lead").map(|view| view.status);
         needs_input_from(&mut actor, &parent, child_context.clone());
         assert_eq!(
             session_view(&actor, "agent-1").map(|view| view.status),
             Some(atm_core::SessionStatus::AttentionNeeded)
         );
+        // The child's needs-input stays on the child's row.
         assert_eq!(
             session_view(&actor, "lead").map(|view| view.status),
-            Some(atm_core::SessionStatus::Working)
+            lead_status
         );
 
         apply_with_context(

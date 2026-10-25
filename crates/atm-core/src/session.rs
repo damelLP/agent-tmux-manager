@@ -857,9 +857,10 @@ impl SessionDomain {
                 // `Notification`, after translation.
             }
             LifecycleEvent::ChildSessionStart { .. } | LifecycleEvent::ChildSessionEnd { .. } => {
-                // Children are tracked by the registry as in-process sessions;
-                // status remains Working.
-                self.status = SessionStatus::Working;
+                // Status unchanged: the registry tracks children as their
+                // own sessions, and a child's start or stop says nothing
+                // about this session's turn. A background child can start
+                // or stop while this session waits on a permission dialog.
             }
         }
     }

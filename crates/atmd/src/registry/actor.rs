@@ -2857,32 +2857,42 @@ mod tests {
     }
 
     #[test]
-    fn rediscovery_under_a_new_id_publishes_one_updated_view() {
+    fn rediscovery_of_an_upgraded_session_publishes_one_updated_view() {
         let (_, mut actor, mut event_rx) = create_actor();
         let dir = tempfile::tempdir().unwrap();
         let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
         init_repo(&repo_a, "main");
         init_repo(&repo_b, "feature");
         let pid = std::process::id();
-        discover(&mut actor, SessionId::new("first-id"), pid, &repo_a, None);
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, &repo_a, None);
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "real-a",
+                "pid": pid,
+                "cwd": path_str(&repo_a),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.30, "total_duration_ms": 5000}
+            }),
+        );
         drain_events(&mut event_rx);
 
-        discover(
-            &mut actor,
-            SessionId::new("second-id"),
-            pid,
-            &repo_b,
-            Some("%7"),
-        );
+        // Discovery only knows the pending id; the session keeps its real one.
+        discover(&mut actor, pending, pid, &repo_b, Some("%7"));
 
         let (events, views) = drain_events(&mut event_rx);
-        assert_eq!(events, ["Updated second-id"]);
+        assert_eq!(events, ["Updated real-a"]);
         let view = &views[0];
         assert_view_is_current(&actor, view);
         assert_eq!(view.working_directory.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(view.project_root.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(view.worktree_branch.as_deref(), Some("feature"));
         assert_eq!(view.tmux_pane.as_deref(), Some("%7"));
+        assert_eq!(
+            view.cost_usd, 0.30,
+            "rediscovery keeps the session's metadata"
+        );
     }
 
     #[test]
@@ -3052,27 +3062,35 @@ mod tests {
     fn status_line_resolves_git_when_project_root_is_unset() {
         let (_, mut actor, _) = create_actor();
         let dir = tempfile::tempdir().unwrap();
-        let (plain_a, plain_b) = (dir.path().join("plain-a"), dir.path().join("plain-b"));
-        std::fs::create_dir_all(&plain_a).unwrap();
-        std::fs::create_dir_all(&plain_b).unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "main");
         let mut by_id = create_test_session("unset-by-id");
-        by_id.working_directory = Some(path_str(&plain_a).to_string());
+        by_id.working_directory = Some(path_str(&repo_a).to_string());
         register_session_in(&mut actor, by_id);
         let pid = std::process::id();
         discover(
             &mut actor,
             SessionId::new("unset-by-pid"),
             pid,
-            &plain_b,
+            &repo_b,
             None,
         );
+        // As if the directories were not repos when the sessions were
+        // resolved. Clearing the fields directly keeps the test independent
+        // of whether TMPDIR sits inside some other checkout.
         for id in ["unset-by-id", "unset-by-pid"] {
-            assert_eq!(session_view(&actor, id).unwrap().project_root, None);
+            let session = &mut actor
+                .sessions_by_pid
+                .get_mut(&pid_of(&actor, id))
+                .unwrap()
+                .0;
+            session.project_root = None;
+            session.worktree_path = None;
+            session.worktree_branch = None;
         }
 
-        // The directories become repos; the status lines report no cwd change.
-        init_repo(&plain_a, "main");
-        init_repo(&plain_b, "main");
+        // The status lines report no cwd change.
         let model = serde_json::json!({"id": "claude-sonnet-4-20250514"});
         send_status_line(
             &mut actor,
@@ -3084,10 +3102,10 @@ mod tests {
         );
 
         let by_id = session_view(&actor, "unset-by-id").unwrap();
-        assert_eq!(by_id.project_root.as_deref(), Some(path_str(&plain_a)));
+        assert_eq!(by_id.project_root.as_deref(), Some(path_str(&repo_a)));
         assert_eq!(by_id.worktree_branch.as_deref(), Some("main"));
         let by_pid = session_view(&actor, "unset-by-pid").unwrap();
-        assert_eq!(by_pid.project_root.as_deref(), Some(path_str(&plain_b)));
+        assert_eq!(by_pid.project_root.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(by_pid.worktree_branch.as_deref(), Some("main"));
     }
 

@@ -1188,10 +1188,13 @@ pub struct SessionView {
     /// Whether session needs attention (permission wait, high context)
     pub needs_attention: bool,
 
-    /// Time since last activity (formatted)
+    /// Time since last activity (formatted) when this view was built.
+    /// It goes stale in a view kept by a subscriber; format
+    /// `last_activity` with [`format_age`] at display time instead.
     pub last_activity_display: String,
 
-    /// Session age (formatted)
+    /// Session age (formatted) when this view was built. Goes stale like
+    /// `last_activity_display`; format `started_at` with [`format_age`].
     pub age_display: String,
 
     /// Session start time (ISO 8601)
@@ -1232,8 +1235,6 @@ impl SessionView {
     /// Creates a SessionView from a SessionDomain.
     pub fn from_domain(session: &SessionDomain) -> Self {
         let now = Utc::now();
-        let since_activity = now.signed_duration_since(session.last_activity);
-        let age = now.signed_duration_since(session.started_at);
 
         Self {
             id: session.id.clone(),
@@ -1277,8 +1278,8 @@ impl SessionView {
                 }
             }),
             needs_attention: session.status.needs_attention() || session.needs_context_attention(),
-            last_activity_display: format_duration(since_activity),
-            age_display: format_duration(age),
+            last_activity_display: format_age(session.last_activity, now),
+            age_display: format_age(session.started_at, now),
             started_at: session.started_at.to_rfc3339(),
             last_activity: session.last_activity.to_rfc3339(),
             tmux_pane: session.tmux_pane.clone(),
@@ -1298,9 +1299,13 @@ impl From<&SessionDomain> for SessionView {
     }
 }
 
-/// Formats a duration for human-readable display.
-fn format_duration(duration: chrono::Duration) -> String {
-    let secs = duration.num_seconds();
+/// Formats the time from `since` to `now` for display, e.g. `"5m ago"`.
+///
+/// Counts whole seconds, so `since` up to a second after `now` reads
+/// `"0s ago"`; a second or more after reads `"now"`.
+#[must_use]
+pub fn format_age(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = now.signed_duration_since(since).num_seconds();
     if secs < 0 {
         return "now".to_string();
     }
@@ -1455,6 +1460,27 @@ mod tests {
         assert_eq!(SessionDuration::from_total_ms(35_000).format(), "35s");
         assert_eq!(SessionDuration::from_total_ms(135_000).format(), "2m 15s");
         assert_eq!(SessionDuration::from_total_ms(5_400_000).format(), "1h 30m");
+    }
+
+    #[test]
+    fn test_format_age_boundaries() {
+        let now = DateTime::parse_from_rfc3339("2026-01-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ago = |secs: i64| format_age(now - chrono::Duration::seconds(secs), now);
+
+        assert_eq!(ago(0), "0s ago");
+        assert_eq!(ago(59), "59s ago");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(3_599), "59m ago");
+        assert_eq!(ago(3_600), "1h ago");
+        assert_eq!(ago(86_399), "23h ago");
+        assert_eq!(ago(86_400), "1d ago");
+        assert_eq!(
+            format_age(now + chrono::Duration::milliseconds(500), now),
+            "0s ago"
+        );
+        assert_eq!(ago(-1), "now");
     }
 
     #[test]

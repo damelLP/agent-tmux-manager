@@ -23,6 +23,7 @@ use atm_tui::ui::{
     session_list::{render_compact_session_list, render_session_list},
     status_bar::{render_compact_footer, render_footer, render_header},
 };
+use chrono::{DateTime, Utc};
 use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
 
 /// Serializes the `#[test]` functions in this binary that mutate
@@ -380,6 +381,14 @@ fn compact_session_list_connected_empty() {
 
 // ---- Split layout: detail_panel -------------------------------------------
 
+/// Frame time for detail-panel snapshots: 10s after the fixtures'
+/// `last_activity` (`2026-01-15T10:05:00Z`), so "Activity" reads "10s ago".
+fn detail_frame_time() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-01-15T10:05:10Z")
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
 #[test]
 fn detail_panel_inline_no_capture() {
     let session = make_session(
@@ -394,7 +403,7 @@ fn detail_panel_inline_no_capture() {
         "2026-01-15T10:05:00Z",
     );
     let buf = render_buffer(60, 20, |frame, area| {
-        render_detail_panel_inline(frame, area, Some(&session), &[]);
+        render_detail_panel_inline(frame, area, Some(&session), &[], detail_frame_time());
     });
     insta::assert_debug_snapshot!(buf);
 }
@@ -402,7 +411,7 @@ fn detail_panel_inline_no_capture() {
 #[test]
 fn detail_panel_inline_empty() {
     let buf = render_buffer(60, 20, |frame, area| {
-        render_detail_panel_inline(frame, area, None, &[]);
+        render_detail_panel_inline(frame, area, None, &[], detail_frame_time());
     });
     insta::assert_debug_snapshot!(buf);
 }
@@ -429,7 +438,7 @@ fn detail_panel_inline_with_capture_split() {
         "test ui::snapshot ... ok".to_string(),
     ];
     let buf = render_buffer(60, 24, |frame, area| {
-        render_detail_panel_inline(frame, area, Some(&session), &capture);
+        render_detail_panel_inline(frame, area, Some(&session), &capture, detail_frame_time());
     });
     insta::assert_debug_snapshot!(buf);
 }

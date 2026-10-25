@@ -4,7 +4,8 @@
 //! in the right panel of the split layout.
 
 use crate::ui::theme::{context_color, status_color};
-use atm_core::{SessionStatus, SessionView};
+use atm_core::{format_age, SessionStatus, SessionView};
+use chrono::{DateTime, Utc};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -23,16 +24,18 @@ use ratatui::{
 /// * `frame` - The frame to render into
 /// * `area` - The rectangular area to fill
 /// * `session` - The session to display (or None for empty state)
+/// * `now` - Time of this frame, used for the relative "Activity" age
 pub fn render_detail_panel_inline(
     frame: &mut Frame,
     area: Rect,
     session: Option<&SessionView>,
     captured_output: &[String],
+    now: DateTime<Utc>,
 ) {
     match session {
         Some(session) => {
             // Build the detail content (reuse existing logic)
-            let lines = build_detail_lines_inline(session);
+            let lines = build_detail_lines_inline(session, now);
 
             // Determine border color based on session state
             let border_color = if session.context_critical {
@@ -104,7 +107,7 @@ pub fn render_detail_panel_inline(
 }
 
 /// Builds detail lines for inline panel (condensed format).
-fn build_detail_lines_inline(session: &SessionView) -> Vec<Line<'static>> {
+fn build_detail_lines_inline(session: &SessionView, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let label_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
@@ -176,7 +179,7 @@ fn build_detail_lines_inline(session: &SessionView) -> Vec<Line<'static>> {
             Span::styled("  Duration: ", label_style),
             Span::styled(session.duration_display.clone(), value_style),
             Span::styled("    Activity: ", label_style),
-            Span::styled(session.last_activity_display.clone(), value_style),
+            Span::styled(last_activity_age(session, now), value_style),
         ]),
         // Lines changed
         Line::from(vec![
@@ -206,6 +209,16 @@ fn build_detail_lines_inline(session: &SessionView) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// Age of the session's last activity at `now`.
+///
+/// Falls back to the daemon's preformatted string when `last_activity`
+/// is not RFC 3339.
+fn last_activity_age(session: &SessionView, now: DateTime<Utc>) -> String {
+    DateTime::parse_from_rfc3339(&session.last_activity)
+        .map(|at| format_age(at.with_timezone(&Utc), now))
+        .unwrap_or_else(|_| session.last_activity_display.clone())
 }
 
 /// Builds an ASCII progress bar for context usage.
@@ -361,4 +374,48 @@ mod tests {
     }
 
     // Note: context_color tests are now in ui::theme module
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn detail_text(session: &SessionView, now: DateTime<Utc>) -> String {
+        build_detail_lines_inline(session, now)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_activity_age_follows_frame_time() {
+        // The daemon formatted "0s ago" when it published this view; an
+        // idle session sends nothing newer, so the panel must age it.
+        let session = SessionView {
+            last_activity: "2026-01-15T10:05:00+00:00".to_string(),
+            last_activity_display: "0s ago".to_string(),
+            ..Default::default()
+        };
+
+        assert!(detail_text(&session, at("2026-01-15T10:05:00Z")).contains("Activity: 0s ago"));
+        assert!(detail_text(&session, at("2026-01-15T10:05:36Z")).contains("Activity: 36s ago"));
+    }
+
+    #[test]
+    fn test_activity_age_falls_back_to_daemon_text() {
+        for last_activity in ["", "not a timestamp"] {
+            let session = SessionView {
+                last_activity: last_activity.to_string(),
+                last_activity_display: "10s ago".to_string(),
+                ..Default::default()
+            };
+
+            let text = detail_text(&session, at("2026-01-15T10:05:36Z"));
+            assert!(
+                text.contains("Activity: 10s ago"),
+                "{last_activity:?}: {text}"
+            );
+        }
+    }
 }

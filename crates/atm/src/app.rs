@@ -63,6 +63,10 @@ pub struct App {
     /// Timestamp of the last data update from the daemon.
     pub last_update: DateTime<Utc>,
 
+    /// Wall-clock time of the frame being drawn. The event loop sets it
+    /// before each draw, so rendering never reads the clock itself.
+    pub now: DateTime<Utc>,
+
     /// Whether blinking status icons are currently visible.
     /// Toggles every 500ms (5 ticks at 100ms tick rate).
     pub blink_visible: bool,
@@ -138,6 +142,7 @@ impl App {
             selected_index: 0,
             should_quit: false,
             last_update: Utc::now(),
+            now: Utc::now(),
             blink_visible: true,
             tick_count: 0,
             pick_mode: false,

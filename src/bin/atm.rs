@@ -372,6 +372,7 @@ async fn run_event_loop(
 
     loop {
         app.tick();
+        app.now = chrono::Utc::now();
 
         // Render the UI and capture viewport height for half-page navigation
         terminal.draw(|frame| {

@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use atm_core::beads::BeadsTask;
 use atm_core::SessionView;
 use crossterm::event::KeyEvent;
 
@@ -42,6 +43,12 @@ pub enum Event {
 
     /// Updated pane capture output for a specific pane.
     CaptureUpdate { pane_id: String, lines: Vec<String> },
+
+    /// A background Beads read finished for a project directory.
+    BeadsUpdate {
+        dir: String,
+        task: Option<BeadsTask>,
+    },
 
     /// Updated set of tmux pane IDs that belong to the filtered tmux session.
     FilterUpdate(HashSet<String>),

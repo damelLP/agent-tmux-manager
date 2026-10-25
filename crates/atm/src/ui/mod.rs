@@ -98,6 +98,7 @@ pub fn render_compact(frame: &mut Frame, app: &App) {
         layout.preview_area,
         app.selected_session(),
         &app.captured_output,
+        app.selected_beads_task(),
     );
 
     if app.show_help {

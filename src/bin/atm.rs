@@ -50,6 +50,7 @@ use atm_core::{
 use atm_protocol::{ClientMessage, DaemonMessage};
 use atm_tmux::{RealTmuxClient, TmuxClient, TmuxError};
 use atm_tui::app::App;
+use atm_tui::beads::BeadsReader;
 use atm_tui::client::DaemonClient;
 use atm_tui::daemon;
 use atm_tui::error::{Result as TuiResult, TuiError};
@@ -347,6 +348,35 @@ fn spawn_capture_task(
     })
 }
 
+/// Spawns a task that reads the selected session's in-progress Beads task
+/// off the render path, so a slow or hung mount never stalls drawing.
+fn spawn_beads_task(
+    event_tx: mpsc::UnboundedSender<Event>,
+    cancel_token: CancellationToken,
+    beads_dir_rx: tokio::sync::watch::Receiver<Option<String>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut reader = BeadsReader::new(atm_core::beads::find_in_progress_tasks);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if cancel_token.is_cancelled() {
+                break;
+            }
+
+            let dir = beads_dir_rx.borrow().clone();
+            if let Some((dir, task)) = reader
+                .poll(dir.as_deref(), Duration::from_millis(500))
+                .await
+            {
+                if event_tx.send(Event::BeadsUpdate { dir, task }).is_err() {
+                    break;
+                }
+            }
+        }
+    })
+}
+
 // ============================================================================
 // Main Event Loop
 // ============================================================================
@@ -358,6 +388,7 @@ async fn run_event_loop(
     command_tx: &mpsc::UnboundedSender<ClientCommand>,
     cancel_token: &CancellationToken,
     capture_pane_tx: &tokio::sync::watch::Sender<Option<String>>,
+    beads_dir_tx: &tokio::sync::watch::Sender<Option<String>>,
 ) -> Result<()> {
     let tick_rate = Duration::from_millis(100);
 
@@ -373,6 +404,7 @@ async fn run_event_loop(
     loop {
         app.tick();
         app.now = chrono::Utc::now();
+        beads_dir_tx.send_replace(app.selected_beads_dir().map(str::to_owned));
 
         // Render the UI and capture viewport height for half-page navigation
         terminal.draw(|frame| {
@@ -632,6 +664,9 @@ async fn run_event_loop(
                 }
                 Event::CaptureUpdate { pane_id, lines } => {
                     app.update_capture(&pane_id, lines);
+                }
+                Event::BeadsUpdate { dir, task } => {
+                    app.update_beads_task(dir, task);
                 }
                 Event::Resize(_width, _height) => {
                     debug!("Terminal resized");
@@ -2314,6 +2349,12 @@ async fn main() -> Result<()> {
         .tmux_session
         .map(|session| spawn_filter_task(session, event_tx.clone(), cancel_token.clone()));
 
+    // Spawn the Beads read task; its preview only shows in compact mode
+    let (beads_dir_tx, beads_dir_rx) = tokio::sync::watch::channel(None::<String>);
+    let beads_handle = app
+        .compact
+        .then(|| spawn_beads_task(event_tx.clone(), cancel_token.clone(), beads_dir_rx));
+
     // Create watch channel for selected pane ID and spawn capture polling task
     let (capture_pane_tx, capture_pane_rx) = tokio::sync::watch::channel(None::<String>);
     let capture_handle = spawn_capture_task(event_tx, cancel_token.clone(), capture_pane_rx);
@@ -2325,6 +2366,7 @@ async fn main() -> Result<()> {
         &command_tx,
         &cancel_token,
         &capture_pane_tx,
+        &beads_dir_tx,
     )
     .await;
 
@@ -2334,6 +2376,9 @@ async fn main() -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_millis(100), keyboard_handle).await;
     let _ = tokio::time::timeout(Duration::from_millis(100), capture_handle).await;
     if let Some(handle) = filter_handle {
+        let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+    }
+    if let Some(handle) = beads_handle {
         let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
     }
 

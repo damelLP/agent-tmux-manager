@@ -29,7 +29,7 @@ pub fn find_in_progress_tasks(working_dir: &str) -> Vec<BeadsTask> {
 
 /// Parses `issues.jsonl` content into its in-progress tasks, most recently
 /// updated first. Malformed lines and entries without an ID or title are skipped.
-pub fn parse_in_progress_tasks(content: &str) -> Vec<BeadsTask> {
+fn parse_in_progress_tasks(content: &str) -> Vec<BeadsTask> {
     let mut tasks: Vec<(String, BeadsTask)> = Vec::new(); // (updated_at, task) for sorting
 
     for line in content.lines() {

@@ -917,8 +917,9 @@ impl RegistryActor {
         self.publish_removed(session_id, reason);
     }
 
-    /// Removes the row at `pid` and `session_id`'s index entry, then
-    /// detaches the removed session from its parent and children.
+    /// Removes the row at `pid` and `session_id`'s index entry, wherever
+    /// that entry points, then detaches the removed session from its parent
+    /// and children.
     fn remove_entry(&mut self, pid: u32, session_id: &SessionId, reason: RemovalReason) {
         let removed = self.sessions_by_pid.remove(&pid);
         self.session_id_to_pid.remove(session_id);
@@ -3257,37 +3258,49 @@ mod tests {
         )
     }
 
+    /// Drains setup events, failing loudly if setup overflowed the channel.
+    fn drain_setup(rx: &mut broadcast::Receiver<SessionEvent>) {
+        loop {
+            match rx.try_recv() {
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => return,
+                Err(error) => panic!("setup overflowed the event channel: {error:?}"),
+            }
+        }
+    }
+
+    /// A `sleep` process, killed and reaped when dropped.
+    struct Sleep(std::process::Child);
+
+    impl Drop for Sleep {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// Starts `sleep` and registers it as `id` through a lifecycle event,
     /// so the row tracks a real pid that cleanup can find dead.
-    fn register_sleep(
-        actor: &mut RegistryActor,
-        id: &str,
-        context: LifecycleContext,
-    ) -> std::process::Child {
-        let process = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
+    fn register_sleep(actor: &mut RegistryActor, id: &str, context: LifecycleContext) -> Sleep {
+        let process = Sleep(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = process.0.id();
         let (respond_to, _) = oneshot::channel();
         actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
             session_id: SessionId::new(id),
             event: LifecycleEvent::WorkingStart,
             harness: atm_core::Harness::ClaudeCode,
-            pid: Some(process.id()),
+            pid: Some(pid),
             tmux_pane: None,
             context,
             respond_to,
         });
-        assert_eq!(
-            actor.sessions_by_pid[&process.id()].1.pid,
-            Some(process.id())
-        );
+        assert_eq!(actor.sessions_by_pid[&pid].1.pid, Some(pid));
         process
-    }
-
-    fn kill(mut process: std::process::Child) {
-        process.kill().unwrap();
-        process.wait().unwrap();
     }
 
     /// `capture_logs` of a cleanup, without the liveness checks' DEBUG
@@ -3311,12 +3324,13 @@ mod tests {
         let working = LifecycleEvent::WorkingStart;
         apply_with_context(&mut actor, &lead, working.clone(), alias("rev", "agent-1"));
         apply_with_context(&mut actor, &other, working, alias("tester", "agent-3"));
+        drain_setup(&mut event_rx);
         start_child(&mut actor, &lead, "agent-1");
         start_child(&mut actor, &lead, "agent-2");
         start_child(&mut actor, &other, "agent-3");
         let [lead_pid, agent_1, agent_2] =
             ["lead", "agent-1", "agent-2"].map(|id| pid_of(&actor, id));
-        drain_events(&mut event_rx);
+        drain_setup(&mut event_rx);
 
         let logs = capture_logs(|| {
             apply_with_context(
@@ -3374,6 +3388,7 @@ mod tests {
         let working = LifecycleEvent::WorkingStart;
         apply_with_context(&mut actor, &lead, working.clone(), alias("rev", "mid"));
         apply_with_context(&mut actor, &lead, working, alias("helper", "sibling"));
+        drain_setup(&mut event_rx);
         start_child(&mut actor, &lead, "mid");
         start_child(&mut actor, &lead, "sibling");
         let mid = SessionId::new("mid");
@@ -3391,7 +3406,7 @@ mod tests {
             },
         );
         let [lead_pid, mid_pid, leaf_pid] = ["lead", "mid", "leaf"].map(|id| pid_of(&actor, id));
-        drain_events(&mut event_rx);
+        drain_setup(&mut event_rx);
 
         let logs = capture_logs(|| {
             apply_with_context(
@@ -3495,8 +3510,9 @@ mod tests {
     fn cleanup_removes_a_dead_sessions_children_before_it() {
         let (_, mut actor, mut event_rx) = create_actor();
         let process = register_sleep(&mut actor, "dead-lead", alias("rev", "agent-1"));
-        let pid = process.id();
+        let pid = process.0.id();
         start_child(&mut actor, &SessionId::new("dead-lead"), "agent-1");
+        drain_setup(&mut event_rx);
         let live = register_test_session(&mut actor, "live");
         apply_with_context(
             &mut actor,
@@ -3506,13 +3522,21 @@ mod tests {
         );
         start_child(&mut actor, &live, "agent-2");
         let child_pid = pid_of(&actor, "agent-1");
-        kill(process);
+        drop(process);
         actor.sessions_by_pid.get_mut(&pid).unwrap().0.last_activity =
             Utc::now() - chrono::Duration::seconds(300);
-        drain_events(&mut event_rx);
+        drain_setup(&mut event_rx);
 
         let logs = capture_cleanup_logs(&mut actor);
 
+        // Cleanup reads the clock itself, so allow for a stalled runner.
+        let secs = logs
+            .split("last_activity=")
+            .nth(1)
+            .and_then(|rest| rest.split('s').next())
+            .unwrap_or_default();
+        assert!((300..310).contains(&secs.parse::<i64>().unwrap()), "{logs}");
+        let logs = logs.replace(&format!("last_activity={secs}s"), "last_activity=300s");
         assert_eq!(
             logs,
             format!(
@@ -3586,10 +3610,10 @@ mod tests {
         // Cleanup of the dead row the index no longer points at.
         let (_, mut actor, _) = create_actor();
         let process = register_sleep(&mut actor, "dup", LifecycleContext::default());
-        let dead_pid = process.id();
+        let dead_pid = process.0.id();
         working_at(&mut actor, own_pid);
         assert_eq!(pid_of(&actor, "dup"), own_pid);
-        kill(process);
+        drop(process);
         actor.handle_command(RegistryCommand::CleanupStale);
         assert!(!actor.sessions_by_pid.contains_key(&dead_pid));
         assert_eq!(index_and_row_ids(&actor), (ids(&[]), ids(&["dup"])));

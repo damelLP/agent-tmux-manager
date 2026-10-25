@@ -373,7 +373,7 @@ impl RegistryActor {
             self.publish_updated(pid);
 
             // Update the session_id index
-            self.session_id_to_pid.remove(&old_id);
+            self.unindex(&old_id, pid);
             self.session_id_to_pid.insert(session_id, pid);
 
             return Ok(());
@@ -429,7 +429,7 @@ impl RegistryActor {
         session.id = new_id.clone();
         let agent_type = session.agent_type.clone();
 
-        self.session_id_to_pid.remove(&old_id);
+        self.unindex(&old_id, pid);
         self.session_id_to_pid.insert(new_id.clone(), pid);
 
         info!(
@@ -917,14 +917,22 @@ impl RegistryActor {
         self.publish_removed(session_id, reason);
     }
 
-    /// Removes the row at `pid` and `session_id`'s index entry, wherever
-    /// that entry points, then detaches the removed session from its parent
-    /// and children.
+    /// Removes the row at `pid` and `session_id`'s index entry if it points
+    /// at `pid`, then detaches the removed session from its parent and
+    /// children.
     fn remove_entry(&mut self, pid: u32, session_id: &SessionId, reason: RemovalReason) {
         let removed = self.sessions_by_pid.remove(&pid);
-        self.session_id_to_pid.remove(session_id);
+        self.unindex(session_id, pid);
         if let Some((session, _)) = removed {
             self.detach_removed_session(&session, reason);
+        }
+    }
+
+    /// Drops `session_id`'s index entry only if it points at `pid`. Another
+    /// process can report the same id, and its row keeps the entry.
+    fn unindex(&mut self, session_id: &SessionId, pid: u32) {
+        if self.session_id_to_pid.get(session_id) == Some(&pid) {
+            self.session_id_to_pid.remove(session_id);
         }
     }
 
@@ -3569,11 +3577,11 @@ mod tests {
         );
     }
 
-    /// Today both by-pid paths drop the removed row's id from the index
-    /// even when it points at another row with the same id, which leaves
-    /// that row unreachable by id (#53 survey gap G2a).
+    /// Both by-pid paths keep the removed row's id in the index when it
+    /// points at another row with the same id, so that row stays
+    /// reachable by id (#53 survey gap G2a).
     #[test]
-    fn by_pid_removal_drops_a_shared_ids_index_entry() {
+    fn by_pid_removal_keeps_a_shared_ids_index_entry() {
         let own_pid = std::process::id();
         let working_at = |actor: &mut RegistryActor, pid| {
             let (respond_to, _) = oneshot::channel();
@@ -3604,8 +3612,11 @@ mod tests {
             context: LifecycleContext::default(),
             respond_to,
         });
-        assert_eq!(index_and_row_ids(&actor), (ids(&[]), ids(&["dup"])));
+        assert_eq!(index_and_row_ids(&actor), (ids(&["dup"]), ids(&["dup"])));
         assert!(actor.sessions_by_pid.contains_key(&own_pid));
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&own_pid].0.cost, cost);
 
         // Cleanup of the dead row the index no longer points at.
         let (_, mut actor, _) = create_actor();
@@ -3616,6 +3627,117 @@ mod tests {
         drop(process);
         actor.handle_command(RegistryCommand::CleanupStale);
         assert!(!actor.sessions_by_pid.contains_key(&dead_pid));
+        assert_eq!(index_and_row_ids(&actor), (ids(&["dup"]), ids(&["dup"])));
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&own_pid].0.cost, cost);
+    }
+
+    /// Two live processes reporting one id: two rows, and the index points
+    /// at the newer pid. Returns (older, newer).
+    fn register_shared_id(actor: &mut RegistryActor) -> (Sleep, Sleep) {
+        let older = register_sleep(actor, "dup", LifecycleContext::default());
+        let newer = register_sleep(actor, "dup", LifecycleContext::default());
+        assert_eq!(pid_of(actor, "dup"), newer.0.id());
+        assert_eq!(
+            index_and_row_ids(actor),
+            (ids(&["dup"]), ids(&["dup", "dup"]))
+        );
+        (older, newer)
+    }
+
+    /// Sends a pid-less status line for `dup` and returns the cost it
+    /// carries. Without a pid it reaches a row only through the id index.
+    fn send_pidless_dup_status(actor: &mut RegistryActor) -> atm_core::Money {
+        send_status_line(
+            actor,
+            serde_json::json!({
+                "session_id": "dup",
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.42, "total_duration_ms": 6000}
+            }),
+        );
+        atm_core::Money::from_usd(0.42)
+    }
+
+    /// Known limit, left for the insert-side follow-up (#53 survey G2):
+    /// removing the row the index points at drops the shared id's entry,
+    /// so the other row with that id is unreachable by id.
+    #[test]
+    fn removing_the_indexed_row_orphans_a_shared_ids_other_row() {
+        let (_, mut actor, _) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new("dup"),
+            event: LifecycleEvent::SessionEnd { reason: None },
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(newer.0.id()),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
         assert_eq!(index_and_row_ids(&actor), (ids(&[]), ids(&["dup"])));
+
+        send_pidless_dup_status(&mut actor);
+
+        assert_eq!(
+            actor.sessions_by_pid[&older.0.id()].0.cost,
+            atm_core::Money::zero()
+        );
+    }
+
+    /// Rediscovery that renames the row the index does not point at keeps
+    /// the shared id's entry on the other row (#53 survey gap G2a).
+    #[test]
+    fn rediscovery_rename_keeps_a_shared_ids_index_entry() {
+        let (_, mut actor, _) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let dir = tempfile::tempdir().unwrap();
+
+        discover(
+            &mut actor,
+            SessionId::new("fresh"),
+            older.0.id(),
+            dir.path(),
+            None,
+        );
+
+        let both = ids(&["dup", "fresh"]);
+        assert_eq!(index_and_row_ids(&actor), (both.clone(), both));
+        assert_eq!(pid_of(&actor, "dup"), newer.0.id());
+        assert_eq!(pid_of(&actor, "fresh"), older.0.id());
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&newer.0.id()].0.cost, cost);
+    }
+
+    /// A status line that renames the row the index does not point at
+    /// keeps the shared id's entry on the other row (#53 survey gap G2a).
+    #[test]
+    fn status_line_rename_keeps_a_shared_ids_index_entry() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        drain_setup(&mut event_rx);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "fresh",
+                "pid": older.0.id(),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.30, "total_duration_ms": 5000}
+            }),
+        );
+
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            ["Removed dup Upgraded", "Registered fresh", "Updated fresh"]
+        );
+        let both = ids(&["dup", "fresh"]);
+        assert_eq!(index_and_row_ids(&actor), (both.clone(), both));
+        assert_eq!(pid_of(&actor, "dup"), newer.0.id());
+        assert_eq!(pid_of(&actor, "fresh"), older.0.id());
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&newer.0.id()].0.cost, cost);
     }
 }

@@ -858,6 +858,31 @@ fn tmux_shell_prefix(socket: Option<String>) -> String {
     }
 }
 
+/// `run-shell`'s argument to run the script at `path` with `args`: each one
+/// `sh -c` word, with `#` doubled because run-shell format-expands its
+/// argument (tmux 3.8: `#S` becomes the session name).
+fn run_shell_arg(path: &std::path::Path, args: &[&str]) -> String {
+    let mut cmd = shell_quote(&path.display().to_string());
+    for arg in args {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(arg));
+    }
+    cmd.replace('#', "##")
+}
+
+/// [`run_shell_arg`] as one tmux command string, for `set-hook` and
+/// `bind-key`, which parse it: inside tmux's double quotes `'` is literal,
+/// `\`, `"` and `$` (an environment variable) need a `\`, and a newline is
+/// written `\n` because tmux drops the spaces after a raw one.
+fn run_shell_command(path: &std::path::Path, args: &[&str]) -> String {
+    let arg = run_shell_arg(path, args)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('\n', "\\n");
+    format!("run-shell \"{arg}\"")
+}
+
 /// Build the shell command string sent to a freshly-split tmux pane.
 ///
 /// Honors spawn override environment variables (all treat empty as unset):
@@ -1680,7 +1705,7 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
-    let hook_cmd = format!("run-shell '{}'", script_path.display());
+    let hook_cmd = run_shell_command(&script_path, &[]);
     tmux_run(
         client,
         &[
@@ -1696,7 +1721,7 @@ where
     // sidebar) to 30%. The script's own resize-pane re-fires this hook, so in
     // `hook` mode it stops after 5 tries that don't reach the target width
     // (e.g. a window too small to fit it); reaching the target resets the count.
-    let pane_hook_cmd = format!("run-shell '{} hook'", script_path.display());
+    let pane_hook_cmd = run_shell_command(&script_path, &["hook"]);
     tmux_run(
         client,
         &[
@@ -1811,7 +1836,7 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
-    let hook_cmd = format!("run-shell '{}'", script_path.display());
+    let hook_cmd = run_shell_command(&script_path, &[]);
     tmux_run(
         client,
         &[
@@ -2105,11 +2130,7 @@ async fn cmd_workspace_attach(session: Option<String>, isolate: bool) -> Result<
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("atm")
         .join(format!("resize-sidebar-{session_name}.sh"));
-    let _ = tmux_run(
-        &client,
-        &["run-shell", &format!("{}", script_path.display())],
-    )
-    .await;
+    let _ = tmux_run(&client, &["run-shell", &run_shell_arg(&script_path, &[])]).await;
 
     // 7. Attach
     exec_attach(&socket_name, &session_name)
@@ -2521,7 +2542,38 @@ mod prompt_tests {
 
 #[cfg(test)]
 mod shell_quote_tests {
-    use super::tmux_shell_prefix;
+    use super::{run_shell_arg, run_shell_command, tmux_shell_prefix};
+    use std::path::Path;
+
+    #[test]
+    fn run_shell_arg_quotes_each_word_and_doubles_hash() {
+        assert_eq!(
+            run_shell_arg(Path::new("/data/atm/r.sh"), &[]),
+            "'/data/atm/r.sh'"
+        );
+        // macOS's data dir has a space; run-shell would expand `#S`.
+        assert_eq!(
+            run_shell_arg(Path::new("/Application Support/it's #S/r.sh"), &["hook"]),
+            "'/Application Support/it'\\''s ##S/r.sh' 'hook'"
+        );
+    }
+
+    #[test]
+    fn run_shell_command_escapes_for_tmux_double_quotes() {
+        assert_eq!(
+            run_shell_command(Path::new("/data dir/r.sh"), &[]),
+            "run-shell \"'/data dir/r.sh'\""
+        );
+        assert_eq!(
+            run_shell_command(Path::new("/a\"b $HOME it's #S\\c/r.sh"), &["hook"]),
+            r#"run-shell "'/a\"b \$HOME it'\\''s ##S\\c/r.sh' 'hook'""#
+        );
+        // Inside double quotes tmux drops the spaces after a raw newline.
+        assert_eq!(
+            run_shell_command(Path::new("/a\n  b/r.sh"), &[]),
+            r#"run-shell "'/a\n  b/r.sh'""#
+        );
+    }
 
     #[test]
     fn tmux_shell_prefix_quotes_socket_label() {
@@ -2598,6 +2650,34 @@ mod has_session_tests {
             })
             .collect();
         assert_eq!(targets, vec!["=my.proj:"; 3]);
+
+        // Each hook and prefix-R quote their script path; the e2e test proves
+        // the quoting with real tmux but skips where tmux is missing.
+        let commands: Vec<String> = client
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                MockCall::RawCommand { subcommand, args }
+                    if subcommand == "set-hook"
+                        || (subcommand == "bind-key"
+                            && args.get(2).is_some_and(|key| key == "R")) =>
+                {
+                    args.get(3).cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        let script = |name: &str| data_home.path().join("atm").join(name);
+        let resize = script("resize-sidebar-my.proj.sh");
+        assert_eq!(
+            commands,
+            vec![
+                super::run_shell_command(&resize, &[]),
+                super::run_shell_command(&resize, &["hook"]),
+                super::run_shell_command(&resize, &[]),
+                super::run_shell_command(&script("inject-sidebar-my.proj.sh"), &[]),
+            ]
+        );
     }
 
     /// tmux's own "no" (`can't find session`, or no server yet) means the

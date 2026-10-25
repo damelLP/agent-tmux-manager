@@ -235,12 +235,7 @@ impl RegistryActor {
         // Resolve project/worktree if not already set
         let mut session = session;
         if session.project_root.is_none() {
-            if let Some(ref cwd) = session.working_directory {
-                session.project_root = atm_core::resolve_project_root(cwd);
-                let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                session.worktree_path = wt_path;
-                session.worktree_branch = wt_branch;
-            }
+            apply_git_context(&mut session);
         }
 
         let session_id = session.id.clone();
@@ -362,11 +357,8 @@ impl RegistryActor {
             // Update session_id to match the new discovery
             existing_session.id = session_id.clone();
 
-            existing_session.working_directory = Some(cwd_str.clone());
-            existing_session.project_root = atm_core::resolve_project_root(&cwd_str);
-            let (wt_path, wt_branch) = atm_core::resolve_worktree_info(&cwd_str);
-            existing_session.worktree_path = wt_path;
-            existing_session.worktree_branch = wt_branch;
+            existing_session.working_directory = Some(cwd_str);
+            apply_git_context(existing_session);
             if tmux_pane.is_some() {
                 existing_session.tmux_pane = tmux_pane;
             }
@@ -501,10 +493,7 @@ impl RegistryActor {
                                 "Working directory changed, re-resolving git info"
                             );
                         }
-                        session.project_root = atm_core::resolve_project_root(cwd);
-                        let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                        session.worktree_path = wt_path;
-                        session.worktree_branch = wt_branch;
+                        apply_git_context(session);
                     }
                 }
 
@@ -567,10 +556,7 @@ impl RegistryActor {
                             "Working directory changed, re-resolving git info"
                         );
                     }
-                    session.project_root = atm_core::resolve_project_root(cwd);
-                    let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                    session.worktree_path = wt_path;
-                    session.worktree_branch = wt_branch;
+                    apply_git_context(session);
                 }
             }
 
@@ -591,12 +577,7 @@ impl RegistryActor {
             session.harness = harness;
 
             // Resolve project/worktree from working directory
-            if let Some(ref cwd) = session.working_directory {
-                session.project_root = atm_core::resolve_project_root(cwd);
-                let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                session.worktree_path = wt_path;
-                session.worktree_branch = wt_branch;
-            }
+            apply_git_context(&mut session);
 
             self.insert_new_session(pid, session)?;
 
@@ -1074,8 +1055,7 @@ impl RegistryActor {
                 None => continue,
             };
 
-            let new_project_root = atm_core::resolve_project_root(&cwd);
-            let (new_wt_path, new_wt_branch) = atm_core::resolve_worktree_info(&cwd);
+            let (new_project_root, new_wt_path, new_wt_branch) = resolve_git_context(&cwd);
 
             let changed = session.project_root != new_project_root
                 || session.worktree_path != new_wt_path
@@ -1146,13 +1126,35 @@ fn build_session_from_pid(
         // Note: resolve_* are local stat() calls walking up ~5 dirs (~5μs),
         // acceptable inline per Tokio guidelines for sub-100μs sync work.
         let cwd_str = cwd.to_string_lossy().to_string();
-        session.project_root = atm_core::resolve_project_root(&cwd_str);
-        let (wt_path, wt_branch) = atm_core::resolve_worktree_info(&cwd_str);
-        session.worktree_path = wt_path;
-        session.worktree_branch = wt_branch;
+        (
+            session.project_root,
+            session.worktree_path,
+            session.worktree_branch,
+        ) = resolve_git_context(&cwd_str);
         session.working_directory = Some(cwd_str);
     }
     session
+}
+
+/// Resolves the git context of `cwd`: its project root, worktree path and
+/// worktree branch. The worktree fields are only set when `cwd` is itself a
+/// repo or worktree root (see `atm_core::resolve_worktree_info`).
+fn resolve_git_context(cwd: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let project_root = atm_core::resolve_project_root(cwd);
+    let (worktree_path, worktree_branch) = atm_core::resolve_worktree_info(cwd);
+    (project_root, worktree_path, worktree_branch)
+}
+
+/// Sets `session`'s project root and worktree fields from its working
+/// directory. Leaves them alone when it has none.
+fn apply_git_context(session: &mut SessionDomain) {
+    if let Some(cwd) = &session.working_directory {
+        (
+            session.project_root,
+            session.worktree_path,
+            session.worktree_branch,
+        ) = resolve_git_context(cwd);
+    }
 }
 
 /// Extracts a tool name from a `LifecycleEvent`, when present.
@@ -2338,6 +2340,171 @@ mod tests {
             Some(repo_b.to_str().unwrap()),
             "project_root should point to repo_b"
         );
+    }
+
+    /// Creates a git repo at `path` whose HEAD names `branch`.
+    fn init_repo(path: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        std::fs::write(
+            path.join(".git/HEAD"),
+            format!("ref: refs/heads/{branch}\n"),
+        )
+        .unwrap();
+    }
+
+    fn register_session_in(actor: &mut RegistryActor, session: SessionDomain) {
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Register {
+            session: Box::new(session),
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_register_resolves_git_unless_project_root_is_set() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("register-repo");
+        init_repo(&repo, "main");
+        let repo = repo.to_str().unwrap();
+
+        let mut fresh = create_test_session("register-fresh");
+        fresh.working_directory = Some(repo.to_string());
+        register_session_in(&mut actor, fresh);
+        let mut preset = create_test_session("register-preset");
+        preset.working_directory = Some(repo.to_string());
+        preset.project_root = Some("/preset".to_string());
+        register_session_in(&mut actor, preset);
+        let mut no_cwd = create_test_session("register-no-cwd");
+        no_cwd.worktree_branch = Some("kept".to_string());
+        register_session_in(&mut actor, no_cwd);
+
+        let fresh = session_view(&actor, "register-fresh").unwrap();
+        assert_eq!(fresh.project_root.as_deref(), Some(repo));
+        assert_eq!(fresh.worktree_path.as_deref(), Some(repo));
+        assert_eq!(fresh.worktree_branch.as_deref(), Some("main"));
+        let preset = session_view(&actor, "register-preset").unwrap();
+        assert_eq!(preset.project_root.as_deref(), Some("/preset"));
+        assert_eq!(
+            preset.worktree_branch, None,
+            "a preset project root skips git resolution"
+        );
+        let no_cwd = session_view(&actor, "register-no-cwd").unwrap();
+        assert_eq!(
+            no_cwd.worktree_branch.as_deref(),
+            Some("kept"),
+            "without a working directory the git fields are left alone"
+        );
+    }
+
+    #[test]
+    fn test_status_line_without_pid_re_resolves_git_on_cwd_change() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let mut session = create_test_session("no-pid-cwd");
+        session.working_directory = Some(repo_a.to_str().unwrap().to_string());
+        register_session_in(&mut actor, session);
+
+        // No "pid" field: the registry finds the session by its id.
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "no-pid-cwd",
+            "cwd": repo_b.to_str().unwrap(),
+            "model": {"id": "claude-sonnet-4-20250514"}
+        }))
+        .unwrap();
+        assert_eq!(pid, None);
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id: SessionId::new("no-pid-cwd"),
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+
+        let view = session_view(&actor, "no-pid-cwd").unwrap();
+        assert_eq!(view.project_root.as_deref(), repo_b.to_str());
+        assert_eq!(view.worktree_branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn test_status_line_auto_register_resolves_linked_worktree() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let main_repo = dir.path().join("main-repo");
+        let gitdir = main_repo.join(".git/worktrees/wt");
+        let worktree = dir.path().join("wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "wt-session",
+            "pid": std::process::id(),
+            "cwd": worktree.to_str().unwrap(),
+            "model": {"id": "claude-sonnet-4-20250514"}
+        }))
+        .unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id: SessionId::new("wt-session"),
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+
+        let view = session_view(&actor, "wt-session").unwrap();
+        assert_eq!(view.project_root.as_deref(), main_repo.to_str());
+        assert_eq!(view.worktree_path.as_deref(), worktree.to_str());
+        assert_eq!(view.worktree_branch.as_deref(), Some("wt-branch"));
+    }
+
+    #[test]
+    fn test_lifecycle_event_for_new_pid_resolves_git_from_proc_cwd() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("lifecycle-repo");
+        init_repo(&repo, "main");
+        // /proc/{pid}/cwd is canonical, so compare against the canonical path.
+        let repo = repo.canonicalize().unwrap();
+        // `read` blocks sh on stdin, so the process lives until `kill`.
+        let mut process = std::process::Command::new("sh")
+            .args(["-c", "read _"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in agent");
+
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new("lifecycle-git"),
+            event: LifecycleEvent::WorkingStart,
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(process.id()),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        let view = session_view(&actor, "lifecycle-git");
+        let _ = process.kill();
+        let _ = process.wait();
+
+        let view = view.unwrap();
+        assert_eq!(view.project_root.as_deref(), repo.to_str());
+        assert_eq!(view.worktree_branch.as_deref(), Some("main"));
     }
 
     fn register_test_session(actor: &mut RegistryActor, id: &str) -> SessionId {

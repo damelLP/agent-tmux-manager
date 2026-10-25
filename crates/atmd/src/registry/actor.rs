@@ -3613,7 +3613,10 @@ mod tests {
             respond_to,
         });
         assert_eq!(index_and_row_ids(&actor), (ids(&["dup"]), ids(&["dup"])));
+        assert!(actor.sessions_by_pid.contains_key(&own_pid));
         assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&own_pid].0.cost, cost);
 
         // Cleanup of the dead row the index no longer points at.
         let (_, mut actor, _) = create_actor();
@@ -3626,6 +3629,8 @@ mod tests {
         assert!(!actor.sessions_by_pid.contains_key(&dead_pid));
         assert_eq!(index_and_row_ids(&actor), (ids(&["dup"]), ids(&["dup"])));
         assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&own_pid].0.cost, cost);
     }
 
     /// Two live processes reporting one id: two rows, and the index points
@@ -3639,6 +3644,47 @@ mod tests {
             (ids(&["dup"]), ids(&["dup", "dup"]))
         );
         (older, newer)
+    }
+
+    /// Sends a pid-less status line for `dup` and returns the cost it
+    /// carries. Without a pid it reaches a row only through the id index.
+    fn send_pidless_dup_status(actor: &mut RegistryActor) -> atm_core::Money {
+        send_status_line(
+            actor,
+            serde_json::json!({
+                "session_id": "dup",
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.42, "total_duration_ms": 6000}
+            }),
+        );
+        atm_core::Money::from_usd(0.42)
+    }
+
+    /// Known limit, left for the insert-side follow-up (#53 survey G2):
+    /// removing the row the index points at drops the shared id's entry,
+    /// so the other row with that id is unreachable by id.
+    #[test]
+    fn removing_the_indexed_row_orphans_a_shared_ids_other_row() {
+        let (_, mut actor, _) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new("dup"),
+            event: LifecycleEvent::SessionEnd { reason: None },
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(newer.0.id()),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        assert_eq!(index_and_row_ids(&actor), (ids(&[]), ids(&["dup"])));
+
+        send_pidless_dup_status(&mut actor);
+
+        assert_eq!(
+            actor.sessions_by_pid[&older.0.id()].0.cost,
+            atm_core::Money::zero()
+        );
     }
 
     /// Rediscovery that renames the row the index does not point at keeps
@@ -3661,6 +3707,8 @@ mod tests {
         assert_eq!(index_and_row_ids(&actor), (both.clone(), both));
         assert_eq!(pid_of(&actor, "dup"), newer.0.id());
         assert_eq!(pid_of(&actor, "fresh"), older.0.id());
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&newer.0.id()].0.cost, cost);
     }
 
     /// A status line that renames the row the index does not point at
@@ -3689,5 +3737,7 @@ mod tests {
         assert_eq!(index_and_row_ids(&actor), (both.clone(), both));
         assert_eq!(pid_of(&actor, "dup"), newer.0.id());
         assert_eq!(pid_of(&actor, "fresh"), older.0.id());
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&newer.0.id()].0.cost, cost);
     }
 }

@@ -235,12 +235,7 @@ impl RegistryActor {
         // Resolve project/worktree if not already set
         let mut session = session;
         if session.project_root.is_none() {
-            if let Some(ref cwd) = session.working_directory {
-                session.project_root = atm_core::resolve_project_root(cwd);
-                let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                session.worktree_path = wt_path;
-                session.worktree_branch = wt_branch;
-            }
+            apply_git_context(&mut session);
         }
 
         let session_id = session.id.clone();
@@ -362,11 +357,8 @@ impl RegistryActor {
             // Update session_id to match the new discovery
             existing_session.id = session_id.clone();
 
-            existing_session.working_directory = Some(cwd_str.clone());
-            existing_session.project_root = atm_core::resolve_project_root(&cwd_str);
-            let (wt_path, wt_branch) = atm_core::resolve_worktree_info(&cwd_str);
-            existing_session.worktree_path = wt_path;
-            existing_session.worktree_branch = wt_branch;
+            existing_session.working_directory = Some(cwd_str);
+            apply_git_context(existing_session);
             if tmux_pane.is_some() {
                 existing_session.tmux_pane = tmux_pane;
             }
@@ -501,10 +493,7 @@ impl RegistryActor {
                                 "Working directory changed, re-resolving git info"
                             );
                         }
-                        session.project_root = atm_core::resolve_project_root(cwd);
-                        let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                        session.worktree_path = wt_path;
-                        session.worktree_branch = wt_branch;
+                        apply_git_context(session);
                     }
                 }
 
@@ -567,10 +556,7 @@ impl RegistryActor {
                             "Working directory changed, re-resolving git info"
                         );
                     }
-                    session.project_root = atm_core::resolve_project_root(cwd);
-                    let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                    session.worktree_path = wt_path;
-                    session.worktree_branch = wt_branch;
+                    apply_git_context(session);
                 }
             }
 
@@ -591,12 +577,7 @@ impl RegistryActor {
             session.harness = harness;
 
             // Resolve project/worktree from working directory
-            if let Some(ref cwd) = session.working_directory {
-                session.project_root = atm_core::resolve_project_root(cwd);
-                let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                session.worktree_path = wt_path;
-                session.worktree_branch = wt_branch;
-            }
+            apply_git_context(&mut session);
 
             self.insert_new_session(pid, session)?;
 
@@ -1074,8 +1055,7 @@ impl RegistryActor {
                 None => continue,
             };
 
-            let new_project_root = atm_core::resolve_project_root(&cwd);
-            let (new_wt_path, new_wt_branch) = atm_core::resolve_worktree_info(&cwd);
+            let (new_project_root, new_wt_path, new_wt_branch) = resolve_git_context(&cwd);
 
             let changed = session.project_root != new_project_root
                 || session.worktree_path != new_wt_path
@@ -1146,13 +1126,34 @@ fn build_session_from_pid(
         // Note: resolve_* are local stat() calls walking up ~5 dirs (~5μs),
         // acceptable inline per Tokio guidelines for sub-100μs sync work.
         let cwd_str = cwd.to_string_lossy().to_string();
-        session.project_root = atm_core::resolve_project_root(&cwd_str);
-        let (wt_path, wt_branch) = atm_core::resolve_worktree_info(&cwd_str);
-        session.worktree_path = wt_path;
-        session.worktree_branch = wt_branch;
+        (
+            session.project_root,
+            session.worktree_path,
+            session.worktree_branch,
+        ) = resolve_git_context(&cwd_str);
         session.working_directory = Some(cwd_str);
     }
     session
+}
+
+/// Resolves the git context of `cwd`: its project root, worktree path and
+/// worktree branch.
+fn resolve_git_context(cwd: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let project_root = atm_core::resolve_project_root(cwd);
+    let (worktree_path, worktree_branch) = atm_core::resolve_worktree_info(cwd);
+    (project_root, worktree_path, worktree_branch)
+}
+
+/// Sets `session`'s project root and worktree fields from its working
+/// directory. Leaves them alone when it has none.
+fn apply_git_context(session: &mut SessionDomain) {
+    if let Some(cwd) = &session.working_directory {
+        (
+            session.project_root,
+            session.worktree_path,
+            session.worktree_branch,
+        ) = resolve_git_context(cwd);
+    }
 }
 
 /// Extracts a tool name from a `LifecycleEvent`, when present.

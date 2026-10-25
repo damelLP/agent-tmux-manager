@@ -167,46 +167,30 @@ impl RawStatusLine {
         })
     }
 
-    /// Converts to SessionDomain.
+    /// Converts to SessionDomain, tagged as a Claude Code session.
     /// Returns None if required fields (model) are missing.
     pub fn to_session_domain(&self) -> Option<SessionDomain> {
         let data = self.to_status_line_data()?;
-        Some(SessionDomain::from_status_line(&data))
+        let mut session = SessionDomain::from_status_line(&data);
+        session.harness = atm_core::Harness::ClaudeCode;
+        Some(session)
     }
 
     /// Updates an existing SessionDomain with new data.
     /// Only updates fields that are present in this status line.
     /// Returns `true` if the working directory changed.
     pub fn update_session(&self, session: &mut SessionDomain) -> bool {
-        use atm_core::Model;
-
-        // Update model if present (fills in Unknown for discovered/hook-created sessions)
-        if let Some(model) = &self.model {
-            let parsed = Model::from_id(&model.id);
-            session.model = parsed;
-
-            // For unknown models, store display name fallback
-            if parsed.is_unknown() && !model.id.is_empty() {
-                session.model_display_override = Some(
-                    model
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| atm_core::derive_display_name(&model.id)),
-                );
-            } else {
-                session.model_display_override = None;
-            }
-        }
-
-        // Build StatusLineData for the update (model_id not used in update)
+        // An absent model or window size maps to "" or 0, which
+        // update_from_status_line reads as not reported.
+        let model = self.model.as_ref();
         let cost = self.cost.as_ref();
         let context = self.context_window.as_ref();
         let current = context.and_then(|c| c.current_usage.as_ref());
 
         let data = StatusLineData {
             session_id: self.session_id.clone(),
-            model_id: String::new(),  // Not used in update
-            model_display_name: None, // Not used in update
+            model_id: model.map(|m| m.id.clone()).unwrap_or_default(),
+            model_display_name: model.and_then(|m| m.display_name.clone()),
             cost_usd: cost.map(|c| c.total_cost_usd).unwrap_or(0.0),
             total_duration_ms: cost.map(|c| c.total_duration_ms).unwrap_or(0),
             api_duration_ms: cost.map(|c| c.total_api_duration_ms).unwrap_or(0),
@@ -214,10 +198,7 @@ impl RawStatusLine {
             lines_removed: cost.map(|c| c.total_lines_removed).unwrap_or(0),
             total_input_tokens: context.map(|c| c.total_input_tokens).unwrap_or(0),
             total_output_tokens: context.map(|c| c.total_output_tokens).unwrap_or(0),
-            context_window_size: context
-                .map(|c| c.context_window_size)
-                .filter(|size| *size > 0)
-                .unwrap_or(session.context.context_window_size),
+            context_window_size: context.map(|c| c.context_window_size).unwrap_or(0),
             current_input_tokens: current.map(|c| c.input_tokens).unwrap_or(0),
             current_output_tokens: current.map(|c| c.output_tokens).unwrap_or(0),
             cache_creation_tokens: current.map(|c| c.cache_creation_input_tokens).unwrap_or(0),

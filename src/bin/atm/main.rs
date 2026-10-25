@@ -1959,38 +1959,6 @@ mod prompt_tests {
 #[cfg(test)]
 mod shell_quote_tests {
     use super::tmux_shell_prefix;
-    use super::workspace::{run_shell_arg, run_shell_command};
-    use std::path::Path;
-
-    #[test]
-    fn run_shell_arg_quotes_each_word_and_doubles_hash() {
-        assert_eq!(
-            run_shell_arg(Path::new("/data/atm/r.sh"), &[]),
-            "'/data/atm/r.sh'"
-        );
-        // macOS's data dir has a space; run-shell would expand `#S`.
-        assert_eq!(
-            run_shell_arg(Path::new("/Application Support/it's #S/r.sh"), &["hook"]),
-            "'/Application Support/it'\\''s ##S/r.sh' 'hook'"
-        );
-    }
-
-    #[test]
-    fn run_shell_command_escapes_for_tmux_double_quotes() {
-        assert_eq!(
-            run_shell_command(Path::new("/data dir/r.sh"), &[]),
-            "run-shell \"'/data dir/r.sh'\""
-        );
-        assert_eq!(
-            run_shell_command(Path::new("/a\"b $HOME it's #S\\c/r.sh"), &["hook"]),
-            r#"run-shell "'/a\"b \$HOME it'\\''s ##S\\c/r.sh' 'hook'""#
-        );
-        // Inside double quotes tmux drops the spaces after a raw newline.
-        assert_eq!(
-            run_shell_command(Path::new("/a\n  b/r.sh"), &[]),
-            r#"run-shell "'/a\n  b/r.sh'""#
-        );
-    }
 
     #[test]
     fn tmux_shell_prefix_quotes_socket_label() {

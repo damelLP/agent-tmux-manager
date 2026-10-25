@@ -604,6 +604,7 @@ impl RegistryActor {
     /// Special cases:
     /// - An untagged `SessionEnd` immediately removes the session from the
     ///   registry, and marks it ended in that process (see `ended_sessions`).
+    ///   An untagged `SessionStart` for the same id and process clears the mark.
     /// - `ChildSessionStart`/`ChildSessionEnd` create and remove in-process children.
     fn handle_apply_lifecycle_event(
         &mut self,
@@ -635,6 +636,14 @@ impl RegistryActor {
                 "SessionEnd for non-existent session (already cleaned up or never created)"
             );
             return Ok(());
+        }
+
+        // A session started again in the process it ended in (an in-process
+        // resume) takes its status lines again.
+        if context.child.is_none() && matches!(event, LifecycleEvent::SessionStart { .. }) {
+            if let Some(p) = target_pid {
+                self.ended_sessions.remove(&(session_id.clone(), p));
+            }
         }
 
         // Pending → real upgrade: a session discovered via /proc starts
@@ -4340,6 +4349,27 @@ mod tests {
         assert!(marker_live(ended_at, ended_at + ENDED_SESSION_TTL - ms(1)));
         assert!(!marker_live(ended_at, ended_at + ENDED_SESSION_TTL));
         assert!(!marker_live(ended_at, ended_at - ms(1)));
+    }
+
+    /// An in-process `/resume` back to a session that ended in this pid
+    /// moments ago starts it again, so its redraw status line counts. The
+    /// marker of the session it left stays.
+    #[test]
+    fn session_start_in_the_ended_process_clears_that_pairs_marker() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        session_start(&mut actor, NEW, pid, "clear");
+        session_end(&mut actor, NEW, pid, "resume");
+        session_start(&mut actor, OLD, pid, "resume");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        assert_eq!(session_view(&actor, OLD).unwrap().cost_usd, OLD_COST);
+        let markers: Vec<_> = actor.ended_sessions.keys().cloned().collect();
+        assert_eq!(markers, [(SessionId::new(NEW), pid)]);
     }
 
     /// Only a `SessionEnd` removal records a marker; cleanup's removal of a

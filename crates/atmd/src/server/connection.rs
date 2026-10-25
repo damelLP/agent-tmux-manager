@@ -1041,6 +1041,44 @@ mod tests {
         assert!(err.to_string().contains("2000000"));
     }
 
+    // Synthetic: the status lines below are hand-written, trimmed to the
+    // fields each test needs. Captured lines are tested in atm-protocol.
+
+    #[test]
+    fn test_parse_status_line_returns_pid_and_data() {
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "sl-test",
+            "pid": 4242,
+            "model": {"id": "claude-sonnet-4-20250514"},
+            "cost": {"total_cost_usd": 0.25, "total_duration_ms": 15000}
+        }))
+        .unwrap();
+
+        assert_eq!(pid, Some(4242));
+        assert_eq!(data.session_id, "sl-test");
+        assert_eq!(data.model_id, "claude-sonnet-4-20250514");
+        assert_eq!(data.cost_usd, 0.25);
+        assert_eq!(data.total_duration_ms, 15000);
+    }
+
+    /// A malformed line fails here as a ParseError, the variant a line
+    /// without a session_id already gets, so `process_messages` replies
+    /// with the error and keeps the connection open for both.
+    #[test]
+    fn test_parse_status_line_malformed_is_parse_error() {
+        let err = parse_status_line(serde_json::json!({
+            "session_id": "sl-test",
+            "cost": {"total_cost_usd": "x", "total_duration_ms": 0}
+        }))
+        .unwrap_err();
+
+        assert!(matches!(err, ConnectionError::ParseError(_)));
+        assert_eq!(
+            err.to_string(),
+            "Parse error: invalid type: string \"x\", expected f64"
+        );
+    }
+
     /// A subscriber writer on one end of a socket pair, plus the peer end.
     fn subscriber_pair() -> (SubscriberWriter, UnixStream) {
         let (ours, peer) = UnixStream::pair().expect("socket pair");

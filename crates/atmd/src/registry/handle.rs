@@ -437,13 +437,16 @@ mod tests {
         let cmd_handler = tokio::spawn(async move {
             if let Some(RegistryCommand::UpdateFromStatusLine {
                 session_id,
+                pid,
                 data,
+                harness,
                 respond_to,
-                ..
             }) = rx.recv().await
             {
                 assert_eq!(session_id.as_str(), "test-123");
                 assert_eq!(data.model_id, "claude-sonnet-4-20250514");
+                assert_eq!(pid, Some(12345));
+                assert_eq!(harness, Harness::ClaudeCode);
                 let _ = respond_to.send(Ok(()));
                 return true;
             }
@@ -453,6 +456,7 @@ mod tests {
         // The status line parser needs a session_id, and a cost's duration
         let data = serde_json::json!({
             "session_id": "test-123",
+            "pid": 12345,
             "model": {"id": "claude-sonnet-4-20250514"},
             "cost": {"total_cost_usd": 0.25, "total_duration_ms": 15000}
         });

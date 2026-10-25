@@ -1163,7 +1163,8 @@ async fn scenario_workspace_create(env: &E2eEnv) {
 /// server (attach's `--isolate` flag hardcodes the socket label as
 /// `atm-<sessname>`, so it can't share the primary scenario server).
 /// Asserts every window gets an `@atm-sidebar=1` pane, both hooks are
-/// installed, and the second invocation is idempotent.
+/// installed, and the second invocation is idempotent and runs the resize
+/// script once.
 async fn scenario_workspace_attach(env: &E2eEnv) {
     let attach_session_name = format!("jghatt{}", std::process::id());
     let attach_socket_label = format!("atm-{attach_session_name}");
@@ -1205,52 +1206,6 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
         pre_attach_window_count, 3,
         "expected 3 windows in the simulated workspace, got {pre_attach_window_count}"
     );
-
-    // The current window already has a sidebar, at the wrong width. Attach
-    // skips injecting there, so only the resize script it runs once before
-    // attaching can fix the width.
-    let stale_sidebar = tmux_run_capture(
-        attach_tmux.label(),
-        &[
-            "split-window",
-            "-hb",
-            "-d",
-            "-t",
-            &format!("={attach_session_name}:"),
-            "-l",
-            "30",
-            "-P",
-            "-F",
-            "#{pane_id}",
-        ],
-    )
-    .expect("split a stale sidebar")
-    .trim()
-    .to_string();
-    tmux_run_capture(
-        attach_tmux.label(),
-        &[
-            "set-option",
-            "-p",
-            "-t",
-            &stale_sidebar,
-            "@atm-sidebar",
-            "1",
-        ],
-    )
-    .expect("mark the stale sidebar");
-    let read_stale = |format: &str| {
-        tmux_run_capture(
-            attach_tmux.label(),
-            &["display-message", "-p", "-t", &stale_sidebar, format],
-        )
-        .expect("read stale sidebar")
-        .trim()
-        .parse::<u32>()
-        .expect("a number")
-    };
-    let expected_width = (read_stale("#{window_width}") * 16 / 100).clamp(20, 40);
-    assert_ne!(read_stale("#{pane_width}"), expected_width);
 
     let attach_output = Command::new(&env.atm_path)
         .args(["workspace", "attach", &attach_session_name, "--isolate"])
@@ -1295,11 +1250,6 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
             "window {window} should have exactly one sidebar pane, got {count}"
         );
     }
-    assert_eq!(
-        read_stale("#{pane_width}"),
-        expected_width,
-        "attach should run the resize script once before attaching"
-    );
 
     // Verify both hooks attach is responsible for are installed on the
     // session (the divergence with create lives here: create installs
@@ -1319,6 +1269,58 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
          note in cmd_workspace) should be present; got: {installed_hooks}"
     );
 
+    // Attach runs the resize script once before attaching. Skew the current
+    // window's sidebar with its after-resize-pane hook parked (it skips a
+    // sidebar at its 5-try cap), so only that one-off run can fix it.
+    let current_sidebar = tmux_run_capture(
+        attach_tmux.label(),
+        &[
+            "list-panes",
+            "-t",
+            &format!("={attach_session_name}:"),
+            "-F",
+            "#{@atm-sidebar} #{pane_id}",
+        ],
+    )
+    .expect("list the current window's panes")
+    .lines()
+    .find_map(|line| line.strip_prefix("1 ").map(str::to_string))
+    .expect("the current window has a sidebar");
+    let read_sidebar = |format: &str| {
+        tmux_run_capture(
+            attach_tmux.label(),
+            &["display-message", "-p", "-t", &current_sidebar, format],
+        )
+        .expect("read the current sidebar")
+        .trim()
+        .parse::<u32>()
+        .expect("a number")
+    };
+    let expected_width = (read_sidebar("#{window_width}") * 16 / 100).clamp(20, 40);
+    tmux_run_capture(
+        attach_tmux.label(),
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            &current_sidebar,
+            "@atm-sidebar-tries",
+            "5",
+        ],
+    )
+    .expect("park the after-resize-pane hook");
+    tmux_run_capture(
+        attach_tmux.label(),
+        &[
+            "resize-pane",
+            "-t",
+            &current_sidebar,
+            "-x",
+            &(expected_width + 10).to_string(),
+        ],
+    )
+    .expect("skew the current sidebar");
+
     // Idempotency: running attach a second time must NOT add another
     // sidebar to any window. The production code keys off `@atm-sidebar`.
     let attach_output_2 = Command::new(&env.atm_path)
@@ -1333,6 +1335,11 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
         attach_output_2.status.success(),
         "second attach failed: stderr={}",
         String::from_utf8_lossy(&attach_output_2.stderr)
+    );
+    assert_eq!(
+        read_sidebar("#{pane_width}"),
+        expected_width,
+        "attach should run the resize script once before attaching"
     );
 
     let final_panes = list_panes_with_sidebar_marker(attach_tmux.label())
@@ -1562,11 +1569,11 @@ fn awkward_data_dir() -> TempDir {
         .expect("create workspace data tempdir")
 }
 
-/// Presses prefix-`key` as if typed, through a control-mode client
-/// attached to `session`, and keeps the client until
-/// `done` or a deadline: the binding runs in that client's queue. Running
-/// the binding's `list-keys` line instead would re-parse tmux's printed
-/// form, and tmux 3.4 prints a `$` in it as `\\$`.
+/// Presses prefix-`key` as if typed, through a control-mode client attached
+/// to `session`, and keeps the client until `done` or a deadline: the
+/// binding runs in that client's queue. Running the binding's `list-keys`
+/// line instead would re-parse tmux's printed form, and tmux 3.4 prints a
+/// `$` in it as `\\$`.
 async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: impl Fn() -> bool) {
     let mut client = Command::new("tmux")
         .args([

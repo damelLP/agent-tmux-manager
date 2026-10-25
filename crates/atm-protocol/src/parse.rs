@@ -155,6 +155,12 @@ impl RawStatusLine {
     /// Only updates fields that are present in this status line.
     /// Returns `true` if the working directory changed.
     pub fn update_session(&self, session: &mut SessionDomain) -> bool {
+        // Core skips an empty model id as not reported, but this parser
+        // has always reset the model on one.
+        if self.model.as_ref().is_some_and(|m| m.id.is_empty()) {
+            session.model = atm_core::Model::Unknown;
+            session.model_display_override = None;
+        }
         session.update_from_status_line(&self.status_line_data())
     }
 
@@ -384,22 +390,25 @@ mod tests {
     }
 
     #[test]
-    fn test_update_session_keeps_model_on_empty_id() {
+    fn test_update_session_resets_model_on_empty_id() {
         use atm_core::{AgentType, SessionDomain};
 
-        let mut session = SessionDomain::new(
-            atm_core::SessionId::new("test-empty-id"),
-            AgentType::GeneralPurpose,
-            Model::Opus45,
-        );
+        // A known model, then an unknown one with its display override.
+        for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
+            let mut session = SessionDomain::new(
+                atm_core::SessionId::new("test-empty-id"),
+                AgentType::GeneralPurpose,
+                model,
+            );
+            session.model_display_override = display_override.map(str::to_string);
 
-        // An empty id reports no model. Until #53 step 2.1 it reset the
-        // model to Unknown.
-        let json = r#"{"session_id": "test-empty-id", "model": {"id": ""}}"#;
-        let raw: RawStatusLine = serde_json::from_str(json).unwrap();
-        raw.update_session(&mut session);
+            let json = r#"{"session_id": "test-empty-id", "model": {"id": ""}}"#;
+            let raw: RawStatusLine = serde_json::from_str(json).unwrap();
+            raw.update_session(&mut session);
 
-        assert_eq!(session.model, Model::Opus45);
+            assert_eq!(session.model, Model::Unknown);
+            assert!(session.model_display_override.is_none());
+        }
     }
 
     #[test]

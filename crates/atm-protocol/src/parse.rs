@@ -4,7 +4,7 @@
 //! Claude raw hook event vocabulary lives in the `atm-claude-adapter`
 //! crate; pi-shaped wire data lives in `atm-pi-adapter`. Future:
 //! `RawStatusLine` likely also moves to `atm-claude-adapter`, with its
-//! fixture.
+//! fixtures.
 //!
 //! ## Captured payloads
 //!
@@ -21,6 +21,17 @@
 //! carry fields the parser ignores: `effort`, `thinking`, `fast_mode`,
 //! `output_style`, `prompt_cache`, `prompt_id` and
 //! `workspace.added_dirs`.
+//!
+//! `tests/fixtures/claude_status_line_blank_model_2.1.310.json` is the
+//! first status line of a TUI started with `--model " "`. Captured:
+//! Claude Code 2.1.310, 2026-10-25, a TUI with no network and no model
+//! call (paths rewritten to `/home/user`). A whitespace model setting
+//! (`--model " "`, also under `--bare`, or `ANTHROPIC_MODEL=" "`)
+//! makes Claude report `"model": {"id": "", "display_name": "unknown
+//! model"}`: the configured model is blank, a real if misconfigured
+//! session, so the line still creates one, as `Model::Unknown`. An empty
+//! setting (`--model ""`, `ANTHROPIC_MODEL=`) falls back to the default
+//! model instead.
 //!
 //! Claude's mapping violates atm-core's cumulative contract for
 //! `ContextUsage::total_input_tokens` and `total_output_tokens`, which
@@ -136,14 +147,14 @@ pub struct RawCurrentUsage {
 impl RawStatusLine {
     /// Converts raw JSON data to a StatusLineData struct.
     ///
-    /// Returns None if required fields (model) are missing.
+    /// Always `Some`: an absent or empty model id maps to "", which core
+    /// reads as not reported.
     pub fn to_status_line_data(&self) -> Option<StatusLineData> {
-        self.model.as_ref()?;
         Some(self.status_line_data())
     }
 
     /// Converts to SessionDomain, tagged as a Claude Code session.
-    /// Returns None if required fields (model) are missing.
+    /// Always `Some`: an absent or empty model id gives `Model::Unknown`.
     pub fn to_session_domain(&self) -> Option<SessionDomain> {
         let data = self.to_status_line_data()?;
         let mut session = SessionDomain::from_status_line(&data);
@@ -152,15 +163,10 @@ impl RawStatusLine {
     }
 
     /// Updates an existing SessionDomain with new data.
-    /// Only updates fields that are present in this status line.
+    /// An absent or empty model id and an absent window size leave the
+    /// session's own alone; other absent fields map to 0.
     /// Returns `true` if the working directory changed.
     pub fn update_session(&self, session: &mut SessionDomain) -> bool {
-        // Core skips an empty model id as not reported, but this parser
-        // has always reset the model on one.
-        if self.model.as_ref().is_some_and(|m| m.id.is_empty()) {
-            session.model = atm_core::Model::Unknown;
-            session.model_display_override = None;
-        }
         session.update_from_status_line(&self.status_line_data())
     }
 
@@ -207,7 +213,7 @@ mod tests {
     // hand-written, with placeholder ids (`test-123`) and models chosen
     // for the case (`gpt-4o`, `gemini-1.5-pro`), Claude Code version not
     // recorded. They were added in c2a89f0 (2026-01-25), d0147d7
-    // (2026-02-11) and ada96c5 (2026-10-18).
+    // (2026-02-11), ada96c5 (2026-10-18), #87 and #88 (2026-10-25).
 
     #[test]
     fn test_raw_status_line_parsing() {
@@ -304,12 +310,18 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_status_line_missing_model_returns_none() {
-        // Status line without model should not create a session
+    fn test_raw_status_line_missing_model_creates_unknown_session() {
+        // A status line comes from a live Claude process, so it is a
+        // session even when it reports no model. Until #88 this returned
+        // None, which also dropped the real blank-model sessions in
+        // `captured_blank_model_status_line_creates_unknown_session`.
         let json = r#"{"session_id": "test-789"}"#;
 
         let raw: RawStatusLine = serde_json::from_str(json).unwrap();
-        assert!(raw.to_session_domain().is_none());
+        let session = raw.to_session_domain().expect("creates a session");
+        assert_eq!(session.model, Model::Unknown);
+        assert!(session.model_display_override.is_none());
+        assert_eq!(session.harness, atm_core::Harness::ClaudeCode);
     }
 
     #[test]
@@ -390,10 +402,12 @@ mod tests {
     }
 
     #[test]
-    fn test_update_session_resets_model_on_empty_id() {
+    fn test_update_session_keeps_model_on_empty_id() {
         use atm_core::{AgentType, SessionDomain};
 
-        // A known model, then an unknown one with its display override.
+        // An empty id is not reported, like an absent model: a known
+        // model, then an unknown one with its display override, survive,
+        // while the line's other fields still apply.
         for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
             let mut session = SessionDomain::new(
                 atm_core::SessionId::new("test-empty-id"),
@@ -402,12 +416,71 @@ mod tests {
             );
             session.model_display_override = display_override.map(str::to_string);
 
-            let json = r#"{"session_id": "test-empty-id", "model": {"id": ""}}"#;
+            let json = r#"{
+                "session_id": "test-empty-id",
+                "model": {"id": ""},
+                "cwd": "/home/user/project",
+                "cost": {"total_cost_usd": 0.5, "total_duration_ms": 1000}
+            }"#;
             let raw: RawStatusLine = serde_json::from_str(json).unwrap();
             raw.update_session(&mut session);
 
-            assert_eq!(session.model, Model::Unknown);
-            assert!(session.model_display_override.is_none());
+            assert_eq!(session.model, model);
+            assert_eq!(session.model_display_override.as_deref(), display_override);
+            assert!((session.cost.as_usd() - 0.5).abs() < 1e-9);
+            assert_eq!(
+                session.working_directory.as_deref(),
+                Some("/home/user/project")
+            );
+        }
+    }
+
+    #[test]
+    fn captured_blank_model_status_line_creates_unknown_session() {
+        // Captured: Claude Code 2.1.310, 2026-10-25, the TUI's first
+        // status line under `--model " "` (see the module docs).
+        let raw: RawStatusLine = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude_status_line_blank_model_2.1.310.json"
+        ))
+        .expect("fixture line");
+        let model = raw.model.as_ref().expect("model is present");
+        assert_eq!(model.id, "");
+        assert_eq!(model.display_name.as_deref(), Some("unknown model"));
+
+        let session = raw.to_session_domain().expect("creates a session");
+        assert_eq!(session.model, Model::Unknown);
+        assert!(session.model_display_override.is_none());
+        assert_eq!(session.harness, atm_core::Harness::ClaudeCode);
+        assert_eq!(session.claude_code_version.as_deref(), Some("2.1.310"));
+        assert_eq!(
+            session.working_directory.as_deref(),
+            Some("/home/user/project")
+        );
+    }
+
+    #[test]
+    fn captured_blank_model_status_line_keeps_existing_model() {
+        use atm_core::{AgentType, SessionDomain};
+
+        // The same captured line on a session that already has a model:
+        // the empty id and Claude's "unknown model" display name leave
+        // the model and its override alone.
+        let raw: RawStatusLine = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude_status_line_blank_model_2.1.310.json"
+        ))
+        .expect("fixture line");
+        for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
+            let mut session = SessionDomain::new(
+                atm_core::SessionId::new("test-blank-model"),
+                AgentType::GeneralPurpose,
+                model,
+            );
+            session.model_display_override = display_override.map(str::to_string);
+
+            raw.update_session(&mut session);
+
+            assert_eq!(session.model, model);
+            assert_eq!(session.model_display_override.as_deref(), display_override);
         }
     }
 

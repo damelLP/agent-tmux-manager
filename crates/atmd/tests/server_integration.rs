@@ -1422,6 +1422,78 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
 }
 
 #[tokio::test]
+async fn test_e2e_claude_captured_blank_model_status_line_creates_row() {
+    // Captured: Claude Code 2.1.310, 2026-10-25, the first status line of
+    // a TUI started with `--model " "` (see atm-protocol's parse.rs docs).
+    // Claude reports the blank model as `"id": ""`. The session is real,
+    // so the line creates its row, as Unknown, even with no hook before
+    // it (`--bare` sends status lines only).
+    let fixture = "claude_status_line_blank_model_2.1.310.json";
+    let Some(lines) = captured_hook_payloads("atm-protocol", fixture) else {
+        return;
+    };
+    let [line] = lines.as_slice() else {
+        panic!("{fixture} holds one line");
+    };
+    assert_eq!(line["model"]["id"], "");
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    send_applied(&mut client, 1, ClientMessage::status_update(line.clone())).await;
+
+    let id = SessionId::new(line["session_id"].as_str().expect("session_id"));
+    let view = registry
+        .get_session(id)
+        .await
+        .expect("the line creates the row");
+    assert_eq!(view.model, "Unknown");
+    assert_eq!(view.harness, "claude");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_status_line_without_model_creates_row_and_empty_id_keeps_model() {
+    // Synthetic: a status line with a pid creates its row even without a
+    // model, and Claude's blank model (`"id": ""`, as captured above)
+    // keeps the model an earlier line reported.
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    let id = SessionId::new("e2e-status-line-model");
+    let pid = std::process::id();
+
+    let no_model = serde_json::json!({"session_id": id.as_str(), "pid": pid});
+    send_applied(&mut client, 1, ClientMessage::status_update(no_model)).await;
+    let view = registry
+        .get_session(id.clone())
+        .await
+        .expect("a line without a model creates the row");
+    assert_eq!(view.model, "Unknown");
+
+    let opus = serde_json::json!({
+        "session_id": id.as_str(),
+        "pid": pid,
+        "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"}
+    });
+    send_applied(&mut client, 2, ClientMessage::status_update(opus)).await;
+    let view = registry.get_session(id.clone()).await.expect("row");
+    assert_eq!(view.model, "Opus 5.5");
+
+    let blank = serde_json::json!({
+        "session_id": id.as_str(),
+        "pid": pid,
+        "model": {"id": "", "display_name": "unknown model"}
+    });
+    send_applied(&mut client, 3, ClientMessage::status_update(blank)).await;
+    let view = registry.get_session(id).await.expect("row");
+    assert_eq!(view.model, "Opus 5.5");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_e2e_claude_captured_stop_failure_replay() {
     // Captured: Claude Code 2.1.310, 2026-10-25, three TUI turns ended by
     // API errors (see atm-claude-adapter's crate docs). Claude sends

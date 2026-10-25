@@ -4519,18 +4519,22 @@ mod tests {
         );
     }
 
+    /// What [`resume_old`] leaves behind.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Resumed {
+        /// The index and row ids once both hooks are in.
+        rows: (Vec<String>, Vec<String>),
+        /// `OLD`'s cost after the redraw, if it has a row.
+        cost: Option<f64>,
+        /// The ended-session markers left.
+        markers: Vec<(SessionId, u32)>,
+    }
+
     /// Claude Code 2.1.310's in-process `/resume` from `NEW` back to `OLD`
     /// (#101): `SessionEnd(NEW, resume)` and `SessionStart(OLD, resume)`,
     /// which can reach atmd in either order, then `OLD`'s redraw status
-    /// line. Returns the index and row ids once both hooks are in, then
-    /// `OLD`'s cost after the redraw and the markers left.
-    fn resume_old(
-        end_first: bool,
-    ) -> (
-        (Vec<String>, Vec<String>),
-        Option<f64>,
-        Vec<(SessionId, u32)>,
-    ) {
+    /// line.
+    fn resume_old(end_first: bool) -> Resumed {
         let (_, mut actor, mut event_rx) = create_actor();
         let pid = std::process::id();
         old_session_at(&mut actor, &mut event_rx);
@@ -4548,9 +4552,11 @@ mod tests {
         let rows = index_and_row_ids(&actor);
         status_line_costing(&mut actor, pid, OLD, OLD_COST);
 
-        let cost = session_view(&actor, OLD).map(|view| view.cost_usd);
-        let markers = actor.ended_sessions.keys().cloned().collect();
-        (rows, cost, markers)
+        Resumed {
+            rows,
+            cost: session_view(&actor, OLD).map(|view| view.cost_usd),
+            markers: actor.ended_sessions.keys().cloned().collect(),
+        }
     }
 
     /// Both orders of `/resume`'s hooks leave one `OLD` row as soon as
@@ -4558,11 +4564,11 @@ mod tests {
     /// this process.
     #[test]
     fn in_process_resume_leaves_one_row_under_the_resumed_id_in_both_orders() {
-        let expected = (
-            (ids(&[OLD]), ids(&[OLD])),
-            Some(OLD_COST),
-            vec![(SessionId::new(NEW), std::process::id())],
-        );
+        let expected = Resumed {
+            rows: (ids(&[OLD]), ids(&[OLD])),
+            cost: Some(OLD_COST),
+            markers: vec![(SessionId::new(NEW), std::process::id())],
+        };
         assert_eq!(
             [
                 ("end first", resume_old(true)),

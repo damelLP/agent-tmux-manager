@@ -29,7 +29,7 @@ workspace = true
 
 [[bin]]
 name = "atm"
-path = "src/bin/atm.rs"
+path = "src/bin/atm/main.rs"
 
 [[bin]]
 name = "atmd"

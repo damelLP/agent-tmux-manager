@@ -370,10 +370,7 @@ impl RegistryActor {
                 "Re-discovered existing session, refreshed git info (metadata preserved)"
             );
 
-            let view = SessionView::from_domain(existing_session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
+            self.publish_updated(pid);
 
             // Update the session_id index
             self.session_id_to_pid.remove(&old_id);
@@ -406,12 +403,7 @@ impl RegistryActor {
         );
 
         // Also publish an initial Updated event so TUI shows it
-        if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
-            let view = SessionView::from_domain(session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
-        }
+        self.publish_updated(pid);
 
         Ok(())
     }
@@ -479,23 +471,7 @@ impl RegistryActor {
         // Fallback: lookup by session_id (when no PID available)
         if let Some(&pid) = self.session_id_to_pid.get(&session_id) {
             if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-                let cwd_changed = session.update_from_status_line(&data);
-                infra.record_update();
-
-                // Resolve project/worktree if not yet set, or if cwd changed
-                if session.project_root.is_none() || cwd_changed {
-                    if let Some(ref cwd) = session.working_directory {
-                        if cwd_changed {
-                            info!(
-                                session_id = %session_id,
-                                pid = pid,
-                                new_cwd = %cwd,
-                                "Working directory changed, re-resolving git info"
-                            );
-                        }
-                        apply_git_context(session);
-                    }
-                }
+                apply_status_line(session, infra, &data, &session_id, pid);
 
                 debug!(
                     session_id = %session_id,
@@ -504,10 +480,7 @@ impl RegistryActor {
                     "Session updated from status line (by session_id)"
                 );
 
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
+                self.publish_updated(pid);
             }
             return Ok(());
         }
@@ -542,23 +515,8 @@ impl RegistryActor {
         }
 
         if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-            let cwd_changed = session.update_from_status_line(&data);
-            infra.record_update();
-
-            // Resolve project/worktree if not yet set, or if cwd changed
-            if session.project_root.is_none() || cwd_changed {
-                if let Some(ref cwd) = session.working_directory {
-                    if cwd_changed {
-                        info!(
-                            session_id = %session.id,
-                            pid = pid,
-                            new_cwd = %cwd,
-                            "Working directory changed, re-resolving git info"
-                        );
-                    }
-                    apply_git_context(session);
-                }
-            }
+            // The reconcile above made `session.id` equal `session_id`.
+            apply_status_line(session, infra, &data, &session_id, pid);
 
             debug!(
                 session_id = %session_id,
@@ -567,10 +525,7 @@ impl RegistryActor {
                 "Session updated from status line"
             );
 
-            let view = SessionView::from_domain(session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
+            self.publish_updated(pid);
         } else {
             // Session doesn't exist - create it
             let mut session = SessionDomain::from_status_line(&data);
@@ -587,12 +542,7 @@ impl RegistryActor {
                 "Session auto-registered from status line"
             );
 
-            if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
-            }
+            self.publish_updated(pid);
         }
 
         Ok(())
@@ -1047,7 +997,7 @@ impl RegistryActor {
     /// Detects branch switches that happen without a working directory change
     /// (e.g., `git checkout other-branch` in the same directory).
     fn handle_refresh_git_info(&mut self) {
-        let mut updated_count = 0;
+        let mut updated_pids = Vec::new();
 
         for (pid, (session, _)) in self.sessions_by_pid.iter_mut() {
             let cwd = match &session.working_directory {
@@ -1072,15 +1022,16 @@ impl RegistryActor {
                 session.project_root = new_project_root;
                 session.worktree_path = new_wt_path;
                 session.worktree_branch = new_wt_branch;
-                updated_count += 1;
-
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
+                updated_pids.push(*pid);
             }
         }
 
+        // Publish in loop order once the loop's borrow has ended
+        for pid in &updated_pids {
+            self.publish_updated(*pid);
+        }
+
+        let updated_count = updated_pids.len();
         if updated_count > 0 {
             info!(updated_count, "Git info refresh completed with changes");
         }
@@ -1154,6 +1105,35 @@ fn apply_git_context(session: &mut SessionDomain) {
             session.worktree_path,
             session.worktree_branch,
         ) = resolve_git_context(cwd);
+    }
+}
+
+/// Applies a status line to a stored session and counts the update. Then
+/// re-resolves the git context if the project root is unset or the working
+/// directory changed, logging `log_id` on a change.
+fn apply_status_line(
+    session: &mut SessionDomain,
+    infra: &mut SessionInfrastructure,
+    data: &StatusLineData,
+    log_id: &SessionId,
+    pid: u32,
+) {
+    let cwd_changed = session.update_from_status_line(data);
+    infra.record_update();
+
+    // Resolve project/worktree if not yet set, or if cwd changed
+    if session.project_root.is_none() || cwd_changed {
+        if let Some(ref cwd) = session.working_directory {
+            if cwd_changed {
+                info!(
+                    session_id = %log_id,
+                    pid = pid,
+                    new_cwd = %cwd,
+                    "Working directory changed, re-resolving git info"
+                );
+            }
+            apply_git_context(session);
+        }
     }
 }
 

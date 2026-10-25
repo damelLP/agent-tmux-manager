@@ -4117,4 +4117,126 @@ mod tests {
         assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
         assert_parent_follows(&mut actor);
     }
+
+    // ========================================================================
+    // Late status lines after SessionEnd (#53 survey gap G5)
+    // ========================================================================
+
+    const OLD: &str = "old-session";
+    const NEW: &str = "new-session";
+    const OLD_COST: f64 = 0.09;
+
+    /// Sends a status line from `pid` reporting `id` and `cost`, so a test
+    /// can tell whose data a row holds.
+    fn status_line_costing(actor: &mut RegistryActor, pid: u32, id: &str, cost: f64) {
+        send_status_line(
+            actor,
+            serde_json::json!({
+                "session_id": id,
+                "pid": pid,
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": cost, "total_duration_ms": 1000}
+            }),
+        );
+    }
+
+    fn session_end(actor: &mut RegistryActor, id: &str, pid: u32, reason: &str) {
+        let event = LifecycleEvent::SessionEnd {
+            reason: Some(reason.into()),
+        };
+        apply_event(actor, id, Some(pid), event).unwrap();
+    }
+
+    fn session_start(actor: &mut RegistryActor, id: &str, pid: u32, source: &str) {
+        let event = LifecycleEvent::SessionStart {
+            source: Some(source.into()),
+        };
+        apply_event(actor, id, Some(pid), event).unwrap();
+    }
+
+    /// A Claude session `OLD` at `pid` that has had a status line, as
+    /// before `/clear` or `/exit`, with the setup events drained.
+    fn old_session_at(actor: &mut RegistryActor, rx: &mut broadcast::Receiver<SessionEvent>) {
+        status_line_costing(actor, std::process::id(), OLD, OLD_COST);
+        drain_setup(rx);
+    }
+
+    /// Claude Code 2.1.310's `/clear` order: `SessionEnd(old)`, a status
+    /// line still carrying the old id ~30 ms later, then
+    /// `SessionStart(new)`. The late line must not bring the old session
+    /// back, so `SessionStart(new)` creates the new row.
+    #[test]
+    fn clear_drops_a_late_old_status_line_that_arrives_before_session_start() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(actor.session_count(), 0);
+
+        session_start(&mut actor, NEW, pid, "clear");
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.0);
+
+        status_line_costing(&mut actor, pid, NEW, 0.01);
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.01);
+    }
+
+    /// The other arrival order: `atm-hook` sends each frame from its own
+    /// process, so `SessionStart(new)` can reach atmd before the late
+    /// line. The late line must not rename the new row back.
+    #[test]
+    fn clear_drops_a_late_old_status_line_that_arrives_after_session_start() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        session_start(&mut actor, NEW, pid, "clear");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.0);
+    }
+
+    /// `/exit`: a status line after `SessionEnd` must not leave a ghost
+    /// row that lasts until cleanup finds the process dead.
+    #[test]
+    fn exit_drops_a_late_status_line() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, std::process::id(), "prompt_input_exit");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, std::process::id(), OLD, OLD_COST);
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(actor.session_count(), 0);
+    }
+
+    /// `claude --resume <id>` brings an ended id back in a new process.
+    /// Its status lines count at once: only the ended process's are late.
+    #[test]
+    fn a_resumed_id_from_a_new_pid_is_accepted_right_after_session_end() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, std::process::id(), "prompt_input_exit");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, UNUSED_PID, OLD, OLD_COST);
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [format!("Registered {OLD}"), format!("Updated {OLD}")]
+        );
+        assert_eq!(pid_of(&actor, OLD), UNUSED_PID);
+        assert_eq!(session_view(&actor, OLD).unwrap().cost_usd, OLD_COST);
+    }
 }

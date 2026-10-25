@@ -191,19 +191,26 @@
 //!   $0). The old instance's connection stays open until atmd closes it
 //!   after 300 s idle. Over rpc, `new_session` and `clone` fired
 //!   `session_start` twice; the TUI's `/new` fired it once.
-//! - atmd renames a row only from `pending-<pid>` to a real id. So if the
-//!   old instance's `session_shutdown` is lost (pi-atm drops sends during
-//!   its 1 s reconnect back-off), the new session's events land on the
-//!   old row, which keeps the old id. And if it arrives after the new
-//!   `session_start` (both instances connect afresh when atmd has closed
-//!   the idle connection), it removes the new session's row until that
-//!   session's next event. Both unverified; queued as atmd registry items.
+//! - atmd renames a row from `pending-<pid>` to a real id on any event,
+//!   but from one real id to another only on `session_start`, which also
+//!   marks the old id ended in that pid. So if the old instance's
+//!   `session_shutdown` is lost (pi-atm drops sends during its 1 s
+//!   reconnect back-off), the new `session_start` moves the old row to the
+//!   new id. And if the shutdown arrives after the new `session_start`
+//!   (both instances connect afresh when atmd has closed the idle
+//!   connection), atmd keeps the moved row. Both are pinned by atmd's
+//!   registry tests, not run with pi. An in-memory fork's shutdown carries
+//!   the fork's new id (see pi-atm), which no `session_start` moved the
+//!   row from, so atmd still ends that row by pid; if the fork's
+//!   `session_start` came first, that shutdown removes the fork's row until
+//!   its next event.
 //! - pi 0.50.0 to 0.64.0 switch sessions in place: one pi-atm instance
 //!   throughout, and only `session_switch`, which pi-atm doesn't forward.
 //!   pi-atm reads the id on every event, so its frames follow the switch,
-//!   but atmd keeps the row's first id (the rename rule above). Checked
-//!   with pi 0.64.0 over rpc: after `new_session`, frames carried the new
-//!   id and `atm list` still showed the first.
+//!   but atmd keeps the row's first id: with no `session_start`, nothing
+//!   renames a real id. Checked with pi 0.64.0 over rpc: after
+//!   `new_session`, frames carried the new id and `atm list` still showed
+//!   the first.
 
 pub mod event;
 pub mod translate;

@@ -76,8 +76,10 @@ pub struct RegistryActor {
     /// resolved to, learned from aliases.
     child_refs: HashMap<(SessionId, ChildRef), SessionId>,
 
-    /// When each `(session_id, pid)` was removed by its `SessionEnd`. A
-    /// status line for a pair is dropped until [`ENDED_SESSION_TTL`] passes.
+    /// When each `(session_id, pid)` ended: its `SessionEnd` removed it, or
+    /// a new session's `SessionStart` took over its row. Until
+    /// [`ENDED_SESSION_TTL`] passes, a status line for a pair is dropped,
+    /// and so is a `SessionEnd` that no longer names the pid's row.
     ended_sessions: HashMap<(SessionId, u32), DateTime<Utc>>,
 }
 
@@ -533,8 +535,8 @@ impl RegistryActor {
     /// Updates an existing session by PID, or creates a new one.
     ///
     /// This is the core logic for status line handling with PID as primary key.
-    /// A late status line for a session that `SessionEnd` just removed from
-    /// this PID is dropped, so it can't bring the ended session back.
+    /// A late status line for a session that just ended in this PID is
+    /// dropped, so it can't bring the ended session back.
     fn update_or_create_by_pid(
         &mut self,
         pid: u32,
@@ -542,8 +544,7 @@ impl RegistryActor {
         data: StatusLineData,
         harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
-        let ended_at = self.ended_sessions.get(&(session_id.clone(), pid));
-        if ended_at.is_some_and(|ended_at| marker_live(*ended_at, Utc::now())) {
+        if self.ended_in(&session_id, pid, Utc::now()) {
             debug!(
                 session_id = %session_id,
                 pid = pid,
@@ -605,6 +606,9 @@ impl RegistryActor {
     /// - An untagged `SessionEnd` immediately removes the session from the
     ///   registry, and marks it ended in that process (see `ended_sessions`).
     ///   An untagged `SessionStart` for the same id and process clears the mark.
+    /// - An untagged `SessionStart` with a new id moves its process's row to
+    ///   that id and marks the row's old id ended there. A `SessionEnd` for
+    ///   the old id that arrives afterwards then keeps the row.
     /// - `ChildSessionStart`/`ChildSessionEnd` create and remove in-process children.
     fn handle_apply_lifecycle_event(
         &mut self,
@@ -620,13 +624,25 @@ impl RegistryActor {
         // Untagged SessionEnd: remove session immediately.
         if context.child.is_none() && matches!(event, LifecycleEvent::SessionEnd { .. }) {
             if let Some(p) = target_pid {
-                if self.sessions_by_pid.contains_key(&p) {
+                if let Some((session, _)) = self.sessions_by_pid.get(&p) {
+                    let now = Utc::now();
+                    // A SessionStart already moved this row on from
+                    // `session_id`, so the row is a newer session's.
+                    if session.id != session_id && self.ended_in(&session_id, p, now) {
+                        info!(
+                            session_id = %session_id,
+                            pid = p,
+                            current_id = %session.id,
+                            "SessionEnd for a session this process moved on from, keeping the row"
+                        );
+                        return Ok(());
+                    }
                     info!(
                         session_id = %session_id,
                         pid = p,
                         "SessionEnd received, removing session"
                     );
-                    self.record_session_end(session_id, p, Utc::now());
+                    self.record_session_end(session_id, p, now);
                     return self.handle_remove_by_pid(p, RemovalReason::SessionEnded);
                 }
             }
@@ -640,7 +656,9 @@ impl RegistryActor {
 
         // A session started again in the process it ended in (an in-process
         // resume) takes its status lines again.
-        if context.child.is_none() && matches!(event, LifecycleEvent::SessionStart { .. }) {
+        let starts_session =
+            context.child.is_none() && matches!(event, LifecycleEvent::SessionStart { .. });
+        if starts_session {
             if let Some(p) = target_pid {
                 self.ended_sessions.remove(&(session_id.clone(), p));
             }
@@ -649,13 +667,23 @@ impl RegistryActor {
         // Pending → real upgrade: a session discovered via /proc starts
         // life as `pending-{pid}`. The first vendor-adapter event with
         // a real session_id is our signal to reconcile, mirroring the
-        // Claude status-line upgrade path. Limited to pending → real
-        // so that ordinary pi events (which carry session_id on every
-        // frame) don't thrash the index.
+        // Claude status-line upgrade path. A real id is renamed only by
+        // an untagged SessionStart, which means a new session took over
+        // the process (`/clear`, an in-process resume), so the row's
+        // session ended there. Other events keep it, so that ordinary pi
+        // events (which carry session_id on every frame) don't thrash
+        // the index.
         if let Some(p) = target_pid {
             if let Some((existing, _)) = self.sessions_by_pid.get(&p) {
                 let current_id = existing.id.clone();
-                if current_id.is_pending() && !session_id.is_pending() && current_id != session_id {
+                let pending = current_id.is_pending();
+                if (pending || starts_session)
+                    && !session_id.is_pending()
+                    && current_id != session_id
+                {
+                    if !pending {
+                        self.record_session_end(current_id.clone(), p, Utc::now());
+                    }
                     self.reconcile_session_id(p, current_id, session_id.clone());
                 }
             }
@@ -1005,6 +1033,13 @@ impl RegistryActor {
         self.ended_sessions
             .retain(|_, ended_at| marker_live(*ended_at, now));
         self.ended_sessions.insert((session_id, pid), now);
+    }
+
+    /// Whether `session_id` ended in `pid` within [`ENDED_SESSION_TTL`]
+    /// before `now`.
+    fn ended_in(&self, session_id: &SessionId, pid: u32, now: DateTime<Utc>) -> bool {
+        let ended_at = self.ended_sessions.get(&(session_id.clone(), pid));
+        ended_at.is_some_and(|ended_at| marker_live(*ended_at, now))
     }
 
     /// Handles cleanup of dead-process sessions.

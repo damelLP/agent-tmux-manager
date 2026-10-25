@@ -134,7 +134,12 @@
 //!   - every session's hooks report the daemon's pid, so atmd, which
 //!     keys sessions by pid, folds all codex sessions into one row, and
 //!     discovery's `pending-<pid>` row for each TUI never reconciles.
-//!     The first `SessionEnd` from any session removes that shared row;
+//!     Each session's `SessionStart` (startup, resume, clear or compact)
+//!     renames that shared row to its id, so the row follows the session
+//!     that started last. The first `SessionEnd` from any session removes
+//!     the row, unless a `SessionStart` moved the row off that session in
+//!     the last 10 s (atmd's ended-session marker). From atmd's registry
+//!     tests, not run with codex;
 //!   - `TMUX_PANE` in the hook's environment is the daemon's, inherited
 //!     from whichever TUI started it, so other sessions show that pane;
 //!   - `/quit` detaches ("Any running work continues") and fires no

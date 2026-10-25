@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
@@ -75,6 +75,10 @@ pub struct RegistryActor {
     /// Parent-scoped child references mapped to the child session ids they
     /// resolved to, learned from aliases.
     child_refs: HashMap<(SessionId, ChildRef), SessionId>,
+
+    /// When each `(session_id, pid)` was removed by its `SessionEnd`. A
+    /// status line for a pair is dropped until [`ENDED_SESSION_TTL`] passes.
+    ended_sessions: HashMap<(SessionId, u32), DateTime<Utc>>,
 }
 
 impl RegistryActor {
@@ -94,6 +98,7 @@ impl RegistryActor {
             session_id_to_pid: HashMap::new(),
             event_publisher,
             child_refs: HashMap::new(),
+            ended_sessions: HashMap::new(),
         }
     }
 
@@ -528,6 +533,8 @@ impl RegistryActor {
     /// Updates an existing session by PID, or creates a new one.
     ///
     /// This is the core logic for status line handling with PID as primary key.
+    /// A late status line for a session that `SessionEnd` just removed from
+    /// this PID is dropped, so it can't bring the ended session back.
     fn update_or_create_by_pid(
         &mut self,
         pid: u32,
@@ -535,6 +542,16 @@ impl RegistryActor {
         data: StatusLineData,
         harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
+        let ended_at = self.ended_sessions.get(&(session_id.clone(), pid));
+        if ended_at.is_some_and(|ended_at| marker_live(*ended_at, Utc::now())) {
+            debug!(
+                session_id = %session_id,
+                pid = pid,
+                "Status line for a session that ended in this process, ignoring"
+            );
+            return Ok(());
+        }
+
         // If a session already exists at this PID with a different id
         // (e.g. pending → real), reconcile *before* taking the mutable
         // borrow below so the helper can access `self` cleanly. The
@@ -585,7 +602,8 @@ impl RegistryActor {
     /// With PID as primary key, we can look up by PID when available.
     ///
     /// Special cases:
-    /// - An untagged `SessionEnd` immediately removes the session from the registry.
+    /// - An untagged `SessionEnd` immediately removes the session from the
+    ///   registry, and marks it ended in that process (see `ended_sessions`).
     /// - `ChildSessionStart`/`ChildSessionEnd` create and remove in-process children.
     fn handle_apply_lifecycle_event(
         &mut self,
@@ -607,6 +625,7 @@ impl RegistryActor {
                         pid = p,
                         "SessionEnd received, removing session"
                     );
+                    self.record_session_end(session_id, p, Utc::now());
                     return self.handle_remove_by_pid(p, RemovalReason::SessionEnded);
                 }
             }
@@ -971,6 +990,14 @@ impl RegistryActor {
         }
     }
 
+    /// Marks `session_id` as ended in `pid` at `now`, first dropping the
+    /// markers that have expired, which bounds the map.
+    fn record_session_end(&mut self, session_id: SessionId, pid: u32, now: DateTime<Utc>) {
+        self.ended_sessions
+            .retain(|_, ended_at| marker_live(*ended_at, now));
+        self.ended_sessions.insert((session_id, pid), now);
+    }
+
     /// Handles cleanup of dead-process sessions.
     ///
     /// Removes sessions whose Claude Code process has terminated
@@ -1167,6 +1194,19 @@ fn apply_status_line(
             apply_git_context(session);
         }
     }
+}
+
+/// How long after a `SessionEnd` its process's status lines for the ended
+/// session are dropped. Claude Code 2.1.310 sends one ~30 ms after
+/// `SessionEnd` on `/clear`; 10 s leaves a wide margin for a loaded host.
+const ENDED_SESSION_TTL: chrono::Duration = chrono::Duration::seconds(10);
+
+/// Whether a `SessionEnd` marker set at `ended_at` still drops status lines
+/// at `now`. A clock that went backwards expires it, accepting them as
+/// before the marker existed.
+fn marker_live(ended_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now.signed_duration_since(ended_at);
+    age >= chrono::Duration::zero() && age < ENDED_SESSION_TTL
 }
 
 /// Extracts a tool name from a `LifecycleEvent`, when present.
@@ -4238,5 +4278,72 @@ mod tests {
         );
         assert_eq!(pid_of(&actor, OLD), UNUSED_PID);
         assert_eq!(session_view(&actor, OLD).unwrap().cost_usd, OLD_COST);
+    }
+
+    /// Once the marker expires, a status line for the ended pair is
+    /// applied as on main. The marker is aged instead of sleeping.
+    #[test]
+    fn a_status_line_after_the_marker_expires_is_applied() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        drain_setup(&mut event_rx);
+        *actor
+            .ended_sessions
+            .get_mut(&(SessionId::new(OLD), pid))
+            .unwrap() -= ENDED_SESSION_TTL;
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [format!("Registered {OLD}"), format!("Updated {OLD}")]
+        );
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD])));
+    }
+
+    /// Each new marker first drops the expired ones, so the map holds only
+    /// the SessionEnds of the last `ENDED_SESSION_TTL`.
+    #[test]
+    fn recording_a_session_end_prunes_expired_markers() {
+        let (_, mut actor, _) = create_actor();
+        let now = Utc::now();
+        let just_live = now - ENDED_SESSION_TTL + chrono::Duration::milliseconds(1);
+        actor.record_session_end(SessionId::new("expired"), 1, now - ENDED_SESSION_TTL);
+        actor.record_session_end(SessionId::new("just-live"), 2, just_live);
+
+        actor.record_session_end(SessionId::new(OLD), 3, now);
+
+        let mut markers: Vec<String> = (actor.ended_sessions.keys())
+            .map(|(id, pid)| format!("{id}@{pid}"))
+            .collect();
+        markers.sort();
+        assert_eq!(markers, ["just-live@2", "old-session@3"]);
+    }
+
+    #[test]
+    fn a_marker_lives_for_the_ttl_and_a_backwards_clock_expires_it() {
+        let ended_at = Utc::now();
+        let ms = chrono::Duration::milliseconds;
+        assert!(marker_live(ended_at, ended_at));
+        assert!(marker_live(ended_at, ended_at + ENDED_SESSION_TTL - ms(1)));
+        assert!(!marker_live(ended_at, ended_at + ENDED_SESSION_TTL));
+        assert!(!marker_live(ended_at, ended_at - ms(1)));
+    }
+
+    /// Only a `SessionEnd` removal records a marker; cleanup's removal of a
+    /// dead process doesn't.
+    #[test]
+    fn cleanup_of_a_dead_process_records_no_marker() {
+        let (_, mut actor, _) = create_actor();
+        let sleep = register_sleep(&mut actor, OLD, LifecycleContext::default());
+        drop(sleep);
+
+        actor.handle_command(RegistryCommand::CleanupStale);
+
+        assert_eq!(actor.session_count(), 0);
+        assert!(actor.ended_sessions.is_empty());
     }
 }

@@ -3740,4 +3740,303 @@ mod tests {
         let cost = send_pidless_dup_status(&mut actor);
         assert_eq!(actor.sessions_by_pid[&newer.0.id()].0.cost, cost);
     }
+
+    // ========================================================================
+    // Rename link pins (#53 survey gap G3)
+    // ========================================================================
+
+    /// Sends a status line for `pid` reporting `id`. The status-line path
+    /// renames the session at `pid` on any id mismatch.
+    fn status_line_as(actor: &mut RegistryActor, pid: u32, id: &str) {
+        send_status_line(
+            actor,
+            serde_json::json!({
+                "session_id": id,
+                "pid": pid,
+                "model": {"id": "claude-sonnet-4-20250514"}
+            }),
+        );
+    }
+
+    /// Sends a `WorkingStart` for `pid` reporting `id`. The lifecycle path
+    /// creates the session if `pid` has none, and renames only a pending id.
+    fn working_as(actor: &mut RegistryActor, pid: u32, id: &str) {
+        let (respond_to, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new(id),
+            event: LifecycleEvent::WorkingStart,
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(pid),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    /// Starts in-process children `agent-1` (alias `rev`) and `agent-2`
+    /// (alias `helper`) under `parent`.
+    fn start_aliased_children(actor: &mut RegistryActor, parent: &SessionId) {
+        for (name, id) in [("rev", "agent-1"), ("helper", "agent-2")] {
+            apply_with_context(actor, parent, LifecycleEvent::WorkingStart, alias(name, id));
+            start_child(actor, parent, id);
+        }
+    }
+
+    /// `Updated <id>` for each of `ids`, in the registry's map order.
+    fn updated_in_map_order(actor: &RegistryActor, ids: &[&str]) -> Vec<String> {
+        actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| session.id.as_str())
+            .filter(|id| ids.contains(id))
+            .map(|id| format!("Updated {id}"))
+            .collect()
+    }
+
+    /// A child event that names `name` under `parent`, as a teammate's
+    /// events do.
+    fn by_name(name: &str) -> LifecycleContext {
+        LifecycleContext {
+            child: Some(ChildAgent {
+                reference: ChildRef::Name(name.into()),
+                agent_type: AgentType::Teammate,
+            }),
+            ..LifecycleContext::default()
+        }
+    }
+
+    /// Asserts that `parent` and its children `agent-1` and `agent-2` link
+    /// to each other in all three stores, and that a by-name child event
+    /// sent to `parent` still reaches `agent-1`.
+    fn assert_children_follow(actor: &mut RegistryActor, parent: &str) {
+        let parent_id = SessionId::new(parent);
+        for child in ["agent-1", "agent-2"] {
+            let stored = &actor.sessions_by_pid[&pid_of(actor, child)].0;
+            assert_eq!(
+                stored.parent_session_id.as_ref(),
+                Some(&parent_id),
+                "{child}"
+            );
+        }
+        assert_eq!(
+            actor.sessions_by_pid[&pid_of(actor, parent)]
+                .0
+                .child_session_ids,
+            [SessionId::new("agent-1"), SessionId::new("agent-2")]
+        );
+        assert_eq!(
+            child_refs(actor),
+            [
+                format!("{parent}/Id(\"agent-1\")->agent-1"),
+                format!("{parent}/Id(\"agent-2\")->agent-2"),
+                format!("{parent}/Name(\"helper\")->agent-2"),
+                format!("{parent}/Name(\"rev\")->agent-1"),
+            ]
+        );
+
+        let count = actor.session_count();
+        needs_input_from(actor, &parent_id, by_name("rev"));
+        assert_eq!(
+            session_view(actor, "agent-1").map(|view| view.status),
+            Some(atm_core::SessionStatus::AttentionNeeded)
+        );
+        assert_eq!(actor.session_count(), count, "no placeholder child");
+    }
+
+    /// A status line with a new id for a parent's pid (real → real, e.g.
+    /// after `/clear`) moves the parent's links: its children point at
+    /// the new id, and its aliases resolve under it. Each child's view is
+    /// published after the rename's Removed/Registered pair, before the
+    /// parent's own Updated.
+    #[test]
+    fn status_line_rename_of_a_parent_carries_its_children() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        working_as(&mut actor, pid, "lead");
+        drain_setup(&mut event_rx);
+        start_aliased_children(&mut actor, &SessionId::new("lead"));
+        drain_setup(&mut event_rx);
+
+        status_line_as(&mut actor, pid, "lead-2");
+
+        let mut expected = vec!["Removed lead Upgraded".into(), "Registered lead-2".into()];
+        expected.extend(updated_in_map_order(&actor, &["agent-1", "agent-2"]));
+        expected.push("Updated lead-2".into());
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["agent-1", "agent-2", "lead-2"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_children_follow(&mut actor, "lead-2");
+    }
+
+    /// A lifecycle event with the real id for a pending parent (pending →
+    /// real) moves the parent's links, as the status-line path does.
+    #[test]
+    fn lifecycle_rename_of_a_pending_parent_carries_its_children() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, dir.path(), None);
+        drain_setup(&mut event_rx);
+        start_aliased_children(&mut actor, &pending);
+        drain_setup(&mut event_rx);
+
+        working_as(&mut actor, pid, "lead-real");
+
+        let mut expected = vec![
+            format!("Removed {pending} Upgraded"),
+            "Registered lead-real".into(),
+        ];
+        expected.extend(updated_in_map_order(&actor, &["agent-1", "agent-2"]));
+        expected.push("Updated lead-real".into());
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["agent-1", "agent-2", "lead-real"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_children_follow(&mut actor, "lead-real");
+    }
+
+    /// Rediscovery that renames a parent (real → real; production
+    /// discovery sends only pending ids today) moves the parent's links.
+    /// The children's views follow the parent's own Updated.
+    #[test]
+    fn rediscovery_rename_of_a_parent_carries_its_children() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        working_as(&mut actor, pid, "lead");
+        drain_setup(&mut event_rx);
+        start_aliased_children(&mut actor, &SessionId::new("lead"));
+        drain_setup(&mut event_rx);
+
+        discover(&mut actor, SessionId::new("lead-b"), pid, dir.path(), None);
+
+        let mut expected = vec!["Updated lead-b".to_string()];
+        expected.extend(updated_in_map_order(&actor, &["agent-1", "agent-2"]));
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["agent-1", "agent-2", "lead-b"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_children_follow(&mut actor, "lead-b");
+    }
+
+    /// Discovers this process as a pending child of a new `lead` session.
+    /// The parent's links to the child (its child list and a `mate` alias)
+    /// are set by hand: no production path links a real-pid child from
+    /// its parent today. Returns the pending id.
+    fn pending_child_of_lead(actor: &mut RegistryActor) -> SessionId {
+        let dir = tempfile::tempdir().unwrap();
+        let lead = register_test_session(actor, "lead");
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(actor, pending.clone(), pid, dir.path(), None);
+        actor
+            .sessions_by_pid
+            .get_mut(&pid)
+            .unwrap()
+            .0
+            .parent_session_id = Some(lead.clone());
+        let lead_pid = pid_of(actor, "lead");
+        let lead_session = &mut actor.sessions_by_pid.get_mut(&lead_pid).unwrap().0;
+        lead_session.child_session_ids.push(pending.clone());
+        actor
+            .child_refs
+            .insert((lead, ChildRef::Name("mate".into())), pending.clone());
+        pending
+    }
+
+    /// Asserts that `lead` and its renamed child `mate` link to each other
+    /// in all three stores, and that a by-name `mate` event sent to `lead`
+    /// reaches the renamed row instead of creating a new child.
+    fn assert_parent_follows(actor: &mut RegistryActor) {
+        let lead = SessionId::new("lead");
+        let pid = std::process::id();
+        assert_eq!(
+            actor.sessions_by_pid[&pid].0.parent_session_id.as_ref(),
+            Some(&lead)
+        );
+        assert_eq!(
+            actor.sessions_by_pid[&pid_of(actor, "lead")]
+                .0
+                .child_session_ids,
+            [SessionId::new("mate")]
+        );
+        assert_eq!(child_refs(actor), ["lead/Name(\"mate\")->mate"]);
+
+        let count = actor.session_count();
+        needs_input_from(actor, &lead, by_name("mate"));
+        assert_eq!(
+            actor.sessions_by_pid[&pid].0.status,
+            atm_core::SessionStatus::AttentionNeeded
+        );
+        assert_eq!(actor.session_count(), count, "no duplicate child");
+    }
+
+    /// A status line with the real id for a pending child renames it in
+    /// its parent's child list and aliases. The parent's view is published
+    /// after the rename's Removed/Registered pair.
+    #[test]
+    fn status_line_rename_of_a_child_updates_its_parent() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pending = pending_child_of_lead(&mut actor);
+        drain_setup(&mut event_rx);
+
+        status_line_as(&mut actor, std::process::id(), "mate");
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                format!("Removed {pending} Upgraded"),
+                "Registered mate".into(),
+                "Updated lead".into(),
+                "Updated mate".into(),
+            ]
+        );
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["lead", "mate"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_parent_follows(&mut actor);
+    }
+
+    /// The lifecycle path's pending → real rename of a child updates its
+    /// parent, as the status-line path does.
+    #[test]
+    fn lifecycle_rename_of_a_pending_child_updates_its_parent() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pending = pending_child_of_lead(&mut actor);
+        drain_setup(&mut event_rx);
+
+        working_as(&mut actor, std::process::id(), "mate");
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                format!("Removed {pending} Upgraded"),
+                "Registered mate".into(),
+                "Updated lead".into(),
+                "Updated mate".into(),
+            ]
+        );
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["lead", "mate"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_parent_follows(&mut actor);
+    }
 }

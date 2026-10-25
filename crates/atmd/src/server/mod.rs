@@ -39,7 +39,8 @@
 mod connection;
 
 pub use connection::{
-    ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter, SubscribersMap,
+    parse_status_line, ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter,
+    SubscribersMap,
 };
 
 use connection::subscriber_key;

@@ -19,9 +19,8 @@ use tracing::{debug, info, warn};
 
 use atm_core::{
     AgentType, BackgroundActivity, ChildAlias, ChildRef, LifecycleContext, LifecycleEvent,
-    NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure, SessionView,
+    NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure, SessionView, StatusLineData,
 };
-use atm_protocol::RawStatusLine;
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
 use crate::discovery::read_parent_session_id;
@@ -129,10 +128,12 @@ impl RegistryActor {
             }
             RegistryCommand::UpdateFromStatusLine {
                 session_id,
+                pid,
                 data,
+                harness,
                 respond_to,
             } => {
-                let result = self.handle_update_from_status_line(session_id, data);
+                let result = self.handle_update_from_status_line(session_id, pid, data, harness);
                 let _ = respond_to.send(result);
             }
             RegistryCommand::ApplyLifecycleEvent {
@@ -472,26 +473,21 @@ impl RegistryActor {
     fn handle_update_from_status_line(
         &mut self,
         session_id: SessionId,
-        data: serde_json::Value,
+        status_pid: Option<u32>,
+        data: StatusLineData,
+        harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
-        // Parse the raw status line
-        let raw_status: RawStatusLine =
-            serde_json::from_value(data).map_err(RegistryError::parse)?;
-
-        // Extract PID from status line
-        let status_pid = raw_status.pid;
-
         // Primary lookup: by PID (preferred)
         if let Some(pid) = status_pid {
             if pid != 0 {
-                return self.update_or_create_by_pid(pid, session_id, raw_status);
+                return self.update_or_create_by_pid(pid, session_id, data, harness);
             }
         }
 
         // Fallback: lookup by session_id (when no PID available)
         if let Some(&pid) = self.session_id_to_pid.get(&session_id) {
             if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-                let cwd_changed = raw_status.update_session(session);
+                let cwd_changed = session.update_from_status_line(&data);
                 infra.record_update();
 
                 // Resolve project/worktree if not yet set, or if cwd changed
@@ -542,7 +538,8 @@ impl RegistryActor {
         &mut self,
         pid: u32,
         session_id: SessionId,
-        raw_status: RawStatusLine,
+        data: StatusLineData,
+        harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
         // If a session already exists at this PID with a different id
         // (e.g. pending → real), reconcile *before* taking the mutable
@@ -556,7 +553,7 @@ impl RegistryActor {
         }
 
         if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-            let cwd_changed = raw_status.update_session(session);
+            let cwd_changed = session.update_from_status_line(&data);
             infra.record_update();
 
             // Resolve project/worktree if not yet set, or if cwd changed
@@ -590,17 +587,8 @@ impl RegistryActor {
             });
         } else {
             // Session doesn't exist - create it
-            let mut session = match raw_status.to_session_domain() {
-                Some(s) => s,
-                None => {
-                    debug!(
-                        session_id = %session_id,
-                        pid = pid,
-                        "Status line missing required fields for session creation"
-                    );
-                    return Ok(());
-                }
-            };
+            let mut session = SessionDomain::from_status_line(&data);
+            session.harness = harness;
 
             // Resolve project/worktree from working directory
             if let Some(ref cwd) = session.working_directory {
@@ -1187,6 +1175,7 @@ fn tool_name_from_event(event: &LifecycleEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::parse_status_line;
     use atm_core::ChildAgent;
     use atm_core::{AgentType, Model, Tool};
     use tokio::sync::oneshot;
@@ -1642,15 +1631,19 @@ mod tests {
         fill_registry(&mut actor, MAX_SESSIONS);
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "one-too-many",
+            "pid": UNUSED_PID,
+            "model": {"id": "claude-sonnet-4-20250514"},
+            "cost": {"total_cost_usd": 0.10, "total_duration_ms": 5000},
+            "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
+        }))
+        .unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("one-too-many"),
-            data: serde_json::json!({
-                "session_id": "one-too-many",
-                "pid": UNUSED_PID,
-                "model": {"id": "claude-sonnet-4-20250514"},
-                "cost": {"total_cost_usd": 0.10, "total_duration_ms": 5000},
-                "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
-            }),
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
 
@@ -1683,9 +1676,12 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("test-123"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
 
@@ -1721,9 +1717,12 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("new-session"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
 
@@ -1792,9 +1791,12 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         let cmd = RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("real-session-uuid"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         };
         actor.handle_command(cmd);
@@ -2025,9 +2027,12 @@ mod tests {
             "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
         });
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         let cmd = RegistryCommand::UpdateFromStatusLine {
             session_id: real_id.clone(),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         };
         actor.handle_command(cmd);
@@ -2204,9 +2209,12 @@ mod tests {
             }
         });
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("real-id"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();
@@ -2303,9 +2311,12 @@ mod tests {
             "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
         });
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("cwd-test"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();

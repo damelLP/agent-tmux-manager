@@ -12,7 +12,10 @@
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use atm_core::{Harness, LifecycleContext, LifecycleEvent, SessionDomain, SessionId, SessionView};
+use atm_core::{
+    Harness, LifecycleContext, LifecycleEvent, SessionDomain, SessionId, SessionView,
+    StatusLineData,
+};
 
 use super::commands::{RegistryCommand, RegistryError, SessionEvent};
 
@@ -90,27 +93,31 @@ impl RegistryHandle {
         rx.await.map_err(|_| RegistryError::ChannelClosed)?
     }
 
-    /// Update a session from Claude Code status line data.
+    /// Update a session from status line data.
     ///
-    /// Parses the raw JSON and applies updates to the session's
-    /// cost, duration, context usage, and lines changed.
+    /// Applies updates to the session's cost, duration, context usage,
+    /// and lines changed. The connection layer parses the vendor's
+    /// status line into `StatusLineData` before calling this method.
     ///
     /// # Errors
     ///
     /// - `RegistryError::RegistryFull` if it would create a session in a full registry
-    /// - `RegistryError::ParseError` if the JSON is malformed
     /// - `RegistryError::ChannelClosed` if the actor has shut down
     pub async fn update_from_status_line(
         &self,
         session_id: SessionId,
-        data: serde_json::Value,
+        pid: Option<u32>,
+        data: StatusLineData,
+        harness: Harness,
     ) -> Result<(), RegistryError> {
         let (tx, rx) = oneshot::channel();
 
         self.sender
             .send(RegistryCommand::UpdateFromStatusLine {
                 session_id,
+                pid,
                 data,
+                harness,
                 respond_to: tx,
             })
             .await
@@ -430,25 +437,33 @@ mod tests {
         let cmd_handler = tokio::spawn(async move {
             if let Some(RegistryCommand::UpdateFromStatusLine {
                 session_id,
+                pid,
                 data,
+                harness,
                 respond_to,
             }) = rx.recv().await
             {
                 assert_eq!(session_id.as_str(), "test-123");
-                assert!(data.get("model").is_some());
+                assert_eq!(data.model_id, "claude-sonnet-4-20250514");
+                assert_eq!(pid, Some(12345));
+                assert_eq!(harness, Harness::ClaudeCode);
                 let _ = respond_to.send(Ok(()));
                 return true;
             }
             false
         });
 
+        // The status line parser needs a session_id, and a cost's duration
         let data = serde_json::json!({
+            "session_id": "test-123",
+            "pid": 12345,
             "model": {"id": "claude-sonnet-4-20250514"},
-            "cost": {"total_cost_usd": 0.25}
+            "cost": {"total_cost_usd": 0.25, "total_duration_ms": 15000}
         });
 
+        let (pid, data) = crate::server::parse_status_line(data).unwrap();
         let result = handle
-            .update_from_status_line(SessionId::new("test-123"), data)
+            .update_from_status_line(SessionId::new("test-123"), pid, data, Harness::ClaudeCode)
             .await;
         assert!(result.is_ok());
         assert!(cmd_handler.await.unwrap());

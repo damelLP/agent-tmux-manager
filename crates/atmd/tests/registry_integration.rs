@@ -11,6 +11,7 @@ use atmd::registry::{
     spawn_registry, spawn_registry_with_cancel, supervise_actor, ActorStopped, RegistryError,
     RemovalReason, SessionEvent, MAX_SESSIONS,
 };
+use atmd::server::parse_status_line;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -849,8 +850,14 @@ async fn test_update_from_status_line_auto_registers() {
         "context_window": {"total_input_tokens": 2500, "context_window_size": 200000}
     });
 
+    let (pid, data) = parse_status_line(status_json).unwrap();
     let result = handle
-        .update_from_status_line(SessionId::new("auto-register-test"), status_json)
+        .update_from_status_line(
+            SessionId::new("auto-register-test"),
+            pid,
+            data,
+            atm_core::Harness::ClaudeCode,
+        )
         .await;
 
     assert!(result.is_ok(), "auto-registration should succeed");
@@ -878,8 +885,14 @@ async fn test_update_from_status_line_updates_existing() {
         "context_window": {"total_input_tokens": 10000, "context_window_size": 200000}
     });
 
+    let (pid, data) = parse_status_line(status_json).unwrap();
     let result = handle
-        .update_from_status_line(SessionId::new("update-test"), status_json)
+        .update_from_status_line(
+            SessionId::new("update-test"),
+            pid,
+            data,
+            atm_core::Harness::ClaudeCode,
+        )
         .await;
 
     assert!(result.is_ok(), "update should succeed");
@@ -1043,8 +1056,14 @@ async fn test_status_line_cwd_change_updates_git_info() {
         "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
     });
 
+    let (pid, data) = parse_status_line(status_json).unwrap();
     handle
-        .update_from_status_line(SessionId::new("cwd-change-test"), status_json)
+        .update_from_status_line(
+            SessionId::new("cwd-change-test"),
+            pid,
+            data,
+            atm_core::Harness::ClaudeCode,
+        )
         .await
         .expect("status update should succeed");
 
@@ -1108,8 +1127,14 @@ async fn test_status_line_same_cwd_does_not_re_resolve() {
         "context_window": {"total_input_tokens": 500, "context_window_size": 200000}
     });
 
+    let (pid, data) = parse_status_line(status_json).unwrap();
     handle
-        .update_from_status_line(SessionId::new("same-cwd-test"), status_json)
+        .update_from_status_line(
+            SessionId::new("same-cwd-test"),
+            pid,
+            data,
+            atm_core::Harness::ClaudeCode,
+        )
         .await
         .unwrap();
 
@@ -1162,8 +1187,14 @@ async fn test_rescan_preserves_metadata_for_existing_pid() {
         }
     });
 
+    let (pid, data) = parse_status_line(status_json).unwrap();
     handle
-        .update_from_status_line(SessionId::new("real-session-id"), status_json)
+        .update_from_status_line(
+            SessionId::new("real-session-id"),
+            pid,
+            data,
+            atm_core::Harness::ClaudeCode,
+        )
         .await
         .unwrap();
 

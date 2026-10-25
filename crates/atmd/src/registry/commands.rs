@@ -9,6 +9,7 @@
 
 use atm_core::{
     AgentType, Harness, LifecycleContext, LifecycleEvent, SessionDomain, SessionId, SessionView,
+    StatusLineData,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -48,19 +49,24 @@ pub enum RegistryCommand {
         respond_to: oneshot::Sender<Result<(), RegistryError>>,
     },
 
-    /// Update a session from Claude Code status line data.
+    /// Update a session from status line data.
     ///
-    /// Parses the raw JSON and applies updates to the session's
-    /// cost, duration, context usage, and lines changed.
+    /// Applies updates to the session's cost, duration, context usage,
+    /// and lines changed. The connection layer is responsible for parsing
+    /// the vendor's status line into `StatusLineData` before constructing
+    /// this command.
     ///
     /// # Errors
     /// - `RegistryError::RegistryFull` if it would create a session in a full registry
-    /// - `RegistryError::ParseError` if the JSON is malformed
     UpdateFromStatusLine {
         /// ID of the session to update
         session_id: SessionId,
-        /// Raw status line JSON from Claude Code
-        data: serde_json::Value,
+        /// Process ID of the agent process, if the line carried one
+        pid: Option<u32>,
+        /// The parsed status line
+        data: StatusLineData,
+        /// Which adapter sent the line. Tags a session the line creates.
+        harness: Harness,
         /// Channel to send the result
         respond_to: oneshot::Sender<Result<(), RegistryError>>,
     },

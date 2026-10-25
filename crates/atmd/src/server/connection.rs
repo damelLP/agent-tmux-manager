@@ -27,9 +27,9 @@ use tracing::{debug, error, info, warn};
 
 use atm_claude_adapter::RawHookEvent;
 use atm_codex_adapter::RawCodexEvent;
-use atm_core::SessionId;
+use atm_core::{SessionId, StatusLineData};
 use atm_pi_adapter::RawPiEvent;
-use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
+use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion, RawStatusLine};
 
 use super::MAX_TUI_CLIENTS;
 use crate::discovery::{DiscoveryResult, DiscoveryService};
@@ -458,6 +458,10 @@ impl ConnectionHandler {
     }
 
     /// Handles a status update from Claude Code.
+    ///
+    /// Parses the Claude status line at this boundary, as
+    /// [`Self::handle_hook_event`] does for hook events, so the registry
+    /// below sees only `StatusLineData`.
     async fn handle_status_update(
         &mut self,
         data: serde_json::Value,
@@ -468,10 +472,11 @@ impl ConnectionHandler {
             .and_then(|v| v.as_str())
             .map(SessionId::new)
             .ok_or_else(|| ConnectionError::ParseError("Missing session_id".to_string()))?;
+        let (pid, status) = parse_status_line(data)?;
 
         // Send to registry for processing
         self.registry
-            .update_from_status_line(session_id, data)
+            .update_from_status_line(session_id, pid, status, atm_core::Harness::ClaudeCode)
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
 
@@ -810,6 +815,25 @@ impl ConnectionHandler {
     pub fn client_id(&self) -> Option<&str> {
         self.client_id.as_deref()
     }
+}
+
+/// Parses a Claude status line from the wire into the pid `atm-hook`
+/// added and the status line's vendor-neutral data.
+///
+/// # Errors
+///
+/// `ConnectionError::ParseError` if the line doesn't parse as a
+/// `RawStatusLine`.
+pub fn parse_status_line(
+    data: serde_json::Value,
+) -> Result<(Option<u32>, StatusLineData), ConnectionError> {
+    let raw: RawStatusLine =
+        serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+    // Always Some today; the Option predates the empty-model rules
+    let status = raw
+        .to_status_line_data()
+        .ok_or_else(|| ConnectionError::ParseError("status line has no data".to_string()))?;
+    Ok((raw.pid, status))
 }
 
 /// Errors that can occur during connection handling.

@@ -1981,19 +1981,17 @@ mod tests {
                 None,
                 Kept,
             ),
+            // A child's start or stop says nothing about the parent's own
+            // turn, and must not hide a parent's open dialog.
             (
                 LifecycleEvent::ChildSessionStart {
                     id: None,
                     role: None,
                 },
-                Some(SessionStatus::Working),
+                None,
                 Kept,
             ),
-            (
-                LifecycleEvent::ChildSessionEnd { id: None },
-                Some(SessionStatus::Working),
-                Kept,
-            ),
+            (LifecycleEvent::ChildSessionEnd { id: None }, None, Kept),
         ];
 
         let starts = [

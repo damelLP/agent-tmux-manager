@@ -1478,6 +1478,98 @@ async fn test_e2e_claude_captured_stop_failure_replay() {
     }
 }
 
+#[tokio::test]
+async fn test_e2e_claude_captured_background_agent_dialog_replay() {
+    // Captured: Claude Code 2.1.310, 2026-10-25, two TUI turns whose
+    // permission dialog stayed open while background subagents started
+    // and stopped (see atm-claude-adapter's crate docs). Claude sends no
+    // other hook while a dialog waits, so a child event that turned the
+    // lead working hid the dialog until the user answered it.
+    let fixture = "claude_background_agent_dialog_2.1.310.jsonl";
+    let Some(events) = captured_hook_payloads("atm-claude-adapter", fixture) else {
+        return;
+    };
+    assert_eq!(events.len(), 34, "{fixture}");
+    let (race, deep) = events.split_at(14);
+    // The lead's row after each hook: status, needs_attention, and how
+    // many child rows it has.
+    let idle = |children: usize| Some(("idle".to_string(), false, children));
+    let working = |children: usize| Some(("working".to_string(), false, children));
+    let asking = |children: usize| Some(("needs input".to_string(), true, children));
+    let sessions = [
+        // A background agent, then a gated Bash call; the agent stops
+        // while the dialog is open.
+        (
+            race,
+            vec![
+                ("SessionStart", idle(0)),
+                ("UserPromptSubmit", working(0)),
+                ("PreToolUse", working(0)),
+                ("SubagentStart", working(1)),
+                ("PostToolUse", working(1)),
+                ("PreToolUse", working(1)),
+                ("PermissionRequest", asking(1)),
+                ("Notification", asking(1)),
+                ("SubagentStop", asking(0)),
+                ("PostToolUse", working(0)),
+                ("UserPromptSubmit", working(0)),
+                ("Stop", idle(0)),
+                ("Notification", idle(0)),
+                ("SessionEnd", None),
+            ],
+        ),
+        // The background agent spawns a nested one during the dialog;
+        // Claude restarts it when the nested agent finishes. Its own
+        // tool calls carry its agent_id and go to its row.
+        (
+            deep,
+            vec![
+                ("SessionStart", idle(0)),
+                ("UserPromptSubmit", working(0)),
+                ("PreToolUse", working(0)),
+                ("SubagentStart", working(1)),
+                ("PostToolUse", working(1)),
+                ("PreToolUse", working(1)),
+                ("PermissionRequest", asking(1)),
+                ("Notification", asking(1)),
+                ("PreToolUse", asking(1)),
+                ("SubagentStart", asking(2)),
+                ("PostToolUse", asking(2)),
+                ("SubagentStop", asking(1)),
+                ("SubagentStop", asking(0)),
+                ("SubagentStart", asking(1)),
+                ("SubagentStop", asking(0)),
+                ("PostToolUse", working(0)),
+                ("UserPromptSubmit", working(0)),
+                ("Stop", idle(0)),
+                ("Notification", idle(0)),
+                ("SessionEnd", None),
+            ],
+        ),
+    ];
+    for (session, expected) in sessions {
+        let lead = SessionId::new(session[0]["session_id"].as_str().expect("session_id"));
+        let (server, registry) = TestServer::spawn_with_registry().await;
+        let mut client = server.connect().await;
+        client.handshake(None).await;
+        let mut seen = Vec::new();
+        for (seq, event) in (1..).zip(session) {
+            send_applied(&mut client, seq, ClientMessage::hook_event(event.clone())).await;
+            let row = registry.get_session(lead.clone()).await.map(|view| {
+                (
+                    view.status_label,
+                    view.needs_attention,
+                    view.child_session_ids.len(),
+                )
+            });
+            let name = event["hook_event_name"].as_str().unwrap_or_default();
+            seen.push((name, row));
+        }
+        assert_eq!(seen, expected, "session {lead}");
+        server.shutdown().await;
+    }
+}
+
 // ============================================================================
 // Pi Event → LifecycleEvent translation (end-to-end, wire-level)
 //

@@ -2305,19 +2305,19 @@ mod tests {
 
     #[test]
     fn test_update_from_status_line_keeps_unreported_model() {
-        let mut session = SessionDomain::new(
-            SessionId::new("test"),
-            AgentType::GeneralPurpose,
-            Model::Unknown,
-        );
-        session.model_display_override = Some("GPT-4o".to_string());
-        let mut data = make_status_data(None);
-        data.model_id = String::new();
+        // A known model, then an unknown one with its display override.
+        for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
+            let mut session =
+                SessionDomain::new(SessionId::new("test"), AgentType::GeneralPurpose, model);
+            session.model_display_override = display_override.map(str::to_string);
+            let mut data = make_status_data(None);
+            data.model_id = String::new();
 
-        session.update_from_status_line(&data);
+            session.update_from_status_line(&data);
 
-        assert_eq!(session.model, Model::Unknown);
-        assert_eq!(session.model_display_override.as_deref(), Some("GPT-4o"));
+            assert_eq!(session.model, model);
+            assert_eq!(session.model_display_override.as_deref(), display_override);
+        }
     }
 
     #[test]

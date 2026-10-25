@@ -3214,4 +3214,396 @@ mod tests {
             assert_eq!(view.worktree_branch.as_deref(), Some("develop"));
         }
     }
+
+    // ========================================================================
+    // Removal pins
+    // ========================================================================
+
+    /// The sorted ids in the session_id index, then in the rows.
+    fn index_and_row_ids(actor: &RegistryActor) -> (Vec<String>, Vec<String>) {
+        let mut index: Vec<String> = actor
+            .session_id_to_pid
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        let mut rows: Vec<String> = actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| session.id.to_string())
+            .collect();
+        index.sort();
+        rows.sort();
+        (index, rows)
+    }
+
+    /// The sorted `parent/reference->child` entries of `child_refs`.
+    fn child_refs(actor: &RegistryActor) -> Vec<String> {
+        let mut refs: Vec<String> = actor
+            .child_refs
+            .iter()
+            .map(|((parent, reference), child)| format!("{parent}/{reference:?}->{child}"))
+            .collect();
+        refs.sort();
+        refs
+    }
+
+    fn alias(name: &str, id: &str) -> LifecycleContext {
+        LifecycleContext {
+            child_alias: Some(ChildAlias {
+                name: name.into(),
+                id: id.into(),
+            }),
+            ..LifecycleContext::default()
+        }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(ToString::to_string).collect()
+    }
+
+    /// The line `handle_remove` and `handle_remove_by_pid` log.
+    fn removed_log(id: &str, pid: u32, reason: &str, remaining: usize) -> String {
+        format!(
+            " INFO Session removed session_id={id} pid={pid} reason={reason} \
+             remaining_sessions={remaining}\n"
+        )
+    }
+
+    /// Starts `sleep` and registers it as `id` through a lifecycle event,
+    /// so the row tracks a real pid that cleanup can find dead.
+    fn register_sleep(
+        actor: &mut RegistryActor,
+        id: &str,
+        context: LifecycleContext,
+    ) -> std::process::Child {
+        let process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new(id),
+            event: LifecycleEvent::WorkingStart,
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(process.id()),
+            tmux_pane: None,
+            context,
+            respond_to,
+        });
+        assert_eq!(
+            actor.sessions_by_pid[&process.id()].1.pid,
+            Some(process.id())
+        );
+        process
+    }
+
+    fn kill(mut process: std::process::Child) {
+        process.kill().unwrap();
+        process.wait().unwrap();
+    }
+
+    /// `capture_logs` of a cleanup, without the liveness checks' DEBUG
+    /// lines, which come in map order.
+    fn capture_cleanup_logs(actor: &mut RegistryActor) -> String {
+        capture_logs(|| actor.handle_command(RegistryCommand::CleanupStale))
+            .lines()
+            .filter(|line| !line.contains("is_process_alive"))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    /// SessionEnd → `handle_remove_by_pid`: the parent's in-process
+    /// children are removed, logged and published first, then the parent
+    /// logs and publishes. Its index entry and child refs go with it.
+    #[test]
+    fn session_end_removes_children_before_the_parent() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let lead = register_test_session(&mut actor, "lead");
+        let other = register_test_session(&mut actor, "other");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &lead, working.clone(), alias("rev", "agent-1"));
+        apply_with_context(&mut actor, &other, working, alias("tester", "agent-3"));
+        start_child(&mut actor, &lead, "agent-1");
+        start_child(&mut actor, &lead, "agent-2");
+        start_child(&mut actor, &other, "agent-3");
+        let [lead_pid, agent_1, agent_2] =
+            ["lead", "agent-1", "agent-2"].map(|id| pid_of(&actor, id));
+        drain_events(&mut event_rx);
+
+        let logs = capture_logs(|| {
+            apply_with_context(
+                &mut actor,
+                &lead,
+                LifecycleEvent::SessionEnd { reason: None },
+                LifecycleContext::default(),
+            );
+        });
+
+        assert_eq!(
+            logs,
+            format!(
+                " INFO SessionEnd received, removing session session_id=lead pid={lead_pid}\n{}{}{}",
+                removed_log("agent-1", agent_1, "session ended", 3),
+                removed_log("agent-2", agent_2, "session ended", 2),
+                removed_log("lead", lead_pid, "session ended", 2),
+            )
+        );
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            [
+                "Removed agent-1 SessionEnded",
+                "Removed agent-2 SessionEnded",
+                "Removed lead SessionEnded"
+            ]
+        );
+        let remaining = ids(&["agent-3", "other"]);
+        assert_eq!(index_and_row_ids(&actor), (remaining.clone(), remaining));
+        assert_eq!(
+            child_refs(&actor),
+            [
+                "other/Id(\"agent-3\")->agent-3",
+                "other/Name(\"tester\")->agent-3"
+            ]
+        );
+
+        // A pid with no row reports a synthetic `pid-{pid}` id.
+        let result = actor.handle_remove_by_pid(lead_pid, RemovalReason::SessionEnded);
+        assert!(
+            matches!(&result, Err(RegistryError::SessionNotFound(id)) if *id == SessionId::new(format!("pid-{lead_pid}"))),
+            "{result:?}"
+        );
+        assert!(drain_events(&mut event_rx).0.is_empty());
+    }
+
+    /// ChildSessionEnd → `handle_remove`: a nested child goes first, then
+    /// the parent drops the child from its list and publishes, then the
+    /// child logs and publishes `Removed`. Refs to and under the child are
+    /// pruned; a sibling's stay.
+    #[test]
+    fn child_session_end_updates_the_parent_before_the_childs_removed() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let lead = register_test_session(&mut actor, "lead");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &lead, working.clone(), alias("rev", "mid"));
+        apply_with_context(&mut actor, &lead, working, alias("helper", "sibling"));
+        start_child(&mut actor, &lead, "mid");
+        start_child(&mut actor, &lead, "sibling");
+        let mid = SessionId::new("mid");
+        actor.ensure_child_session(
+            pid_of(&actor, "mid"),
+            SessionId::new("leaf"),
+            AgentType::Subagent,
+            atm_core::Harness::ClaudeCode,
+        );
+        actor.register_child_alias(
+            &mid,
+            &ChildAlias {
+                name: "nested".into(),
+                id: "leaf".into(),
+            },
+        );
+        let [lead_pid, mid_pid, leaf_pid] = ["lead", "mid", "leaf"].map(|id| pid_of(&actor, id));
+        drain_events(&mut event_rx);
+
+        let logs = capture_logs(|| {
+            apply_with_context(
+                &mut actor,
+                &lead,
+                LifecycleEvent::ChildSessionEnd {
+                    id: Some("mid".into()),
+                },
+                LifecycleContext::default(),
+            );
+        });
+
+        let applied = logs.lines().nth(2).unwrap_or_default();
+        assert!(applied.starts_with("DEBUG Lifecycle event applied session_id=lead"));
+        assert_eq!(
+            logs,
+            format!(
+                "{}{}{applied}\n",
+                removed_log("leaf", leaf_pid, "session ended", 2),
+                removed_log("mid", mid_pid, "session ended", 2),
+            )
+        );
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                "Removed leaf SessionEnded",
+                "Updated lead",
+                "Removed mid SessionEnded",
+                "Updated lead"
+            ]
+        );
+        assert_eq!(views[0].child_session_ids, [SessionId::new("sibling")]);
+        let remaining = ids(&["lead", "sibling"]);
+        assert_eq!(index_and_row_ids(&actor), (remaining.clone(), remaining));
+        assert_eq!(
+            child_refs(&actor),
+            [
+                "lead/Id(\"sibling\")->sibling",
+                "lead/Name(\"helper\")->sibling"
+            ]
+        );
+        assert_eq!(
+            actor.sessions_by_pid[&lead_pid].0.child_session_ids,
+            [SessionId::new("sibling")]
+        );
+    }
+
+    /// `handle_remove` trusts the index: it removes the row the id maps to
+    /// and reports the id it was given, even when that row has another id
+    /// or is gone. An id not in the index is an error naming that id.
+    #[test]
+    fn remove_reports_the_id_it_was_given() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        register_test_session(&mut actor, "renamed");
+        let renamed_pid = pid_of(&actor, "renamed");
+        actor
+            .session_id_to_pid
+            .insert(SessionId::new("stale-alias"), renamed_pid);
+        actor
+            .session_id_to_pid
+            .insert(SessionId::new("ghost"), 4242);
+        drain_events(&mut event_rx);
+
+        let mut results = Vec::new();
+        let logs = capture_logs(|| {
+            for id in ["stale-alias", "ghost", "missing"] {
+                let (respond_to, mut rx) = oneshot::channel();
+                actor.handle_command(RegistryCommand::Remove {
+                    session_id: SessionId::new(id),
+                    respond_to,
+                });
+                results.push(rx.try_recv().unwrap());
+            }
+        });
+
+        assert_eq!(
+            logs,
+            format!(
+                "{}{}",
+                removed_log("stale-alias", renamed_pid, "explicitly removed", 0),
+                removed_log("ghost", 4242, "explicitly removed", 0),
+            )
+        );
+        assert!(results[0].is_ok() && results[1].is_ok());
+        assert!(
+            matches!(&results[2], Err(RegistryError::SessionNotFound(id)) if id.as_str() == "missing"),
+            "{results:?}"
+        );
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            ["Removed stale-alias Explicit", "Removed ghost Explicit"]
+        );
+        assert_eq!(index_and_row_ids(&actor), (ids(&["renamed"]), ids(&[])));
+    }
+
+    /// Cleanup of a dead process: its in-process children go first (an
+    /// INFO line and `Removed` each), then its WARN line with the last
+    /// activity, then its `Removed{ProcessDied}`.
+    #[test]
+    fn cleanup_removes_a_dead_sessions_children_before_it() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let process = register_sleep(&mut actor, "dead-lead", alias("rev", "agent-1"));
+        let pid = process.id();
+        start_child(&mut actor, &SessionId::new("dead-lead"), "agent-1");
+        let live = register_test_session(&mut actor, "live");
+        apply_with_context(
+            &mut actor,
+            &live,
+            LifecycleEvent::WorkingStart,
+            alias("helper", "agent-2"),
+        );
+        start_child(&mut actor, &live, "agent-2");
+        let child_pid = pid_of(&actor, "agent-1");
+        kill(process);
+        actor.sessions_by_pid.get_mut(&pid).unwrap().0.last_activity =
+            Utc::now() - chrono::Duration::seconds(300);
+        drain_events(&mut event_rx);
+
+        let logs = capture_cleanup_logs(&mut actor);
+
+        assert_eq!(
+            logs,
+            format!(
+                " INFO Cleaning up dead-process sessions count=1\n{} WARN Session removed by \
+                 cleanup session_id=dead-lead reason=process died without a session-end signal \
+                 details=last_activity=300s ago, pid={pid}\n",
+                removed_log(
+                    "agent-1",
+                    child_pid,
+                    "process died without a session-end signal",
+                    2
+                ),
+            )
+        );
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            [
+                "Removed agent-1 ProcessDied",
+                "Removed dead-lead ProcessDied"
+            ]
+        );
+        let remaining = ids(&["agent-2", "live"]);
+        assert_eq!(index_and_row_ids(&actor), (remaining.clone(), remaining));
+        assert_eq!(
+            child_refs(&actor),
+            [
+                "live/Id(\"agent-2\")->agent-2",
+                "live/Name(\"helper\")->agent-2"
+            ]
+        );
+    }
+
+    /// Today both by-pid paths drop the removed row's id from the index
+    /// even when it points at another row with the same id, which leaves
+    /// that row unreachable by id (#53 survey gap G2a).
+    #[test]
+    fn by_pid_removal_drops_a_shared_ids_index_entry() {
+        let own_pid = std::process::id();
+        let working_at = |actor: &mut RegistryActor, pid| {
+            let (respond_to, _) = oneshot::channel();
+            actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+                session_id: SessionId::new("dup"),
+                event: LifecycleEvent::WorkingStart,
+                harness: atm_core::Harness::ClaudeCode,
+                pid: Some(pid),
+                tmux_pane: None,
+                context: LifecycleContext::default(),
+                respond_to,
+            });
+        };
+
+        // SessionEnd for the row the index no longer points at.
+        let (_, mut actor, _) = create_actor();
+        let dup = register_test_session(&mut actor, "dup");
+        let synthetic_pid = pid_of(&actor, "dup");
+        working_at(&mut actor, own_pid);
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: dup,
+            event: LifecycleEvent::SessionEnd { reason: None },
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(synthetic_pid),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        assert_eq!(index_and_row_ids(&actor), (ids(&[]), ids(&["dup"])));
+        assert!(actor.sessions_by_pid.contains_key(&own_pid));
+
+        // Cleanup of the dead row the index no longer points at.
+        let (_, mut actor, _) = create_actor();
+        let process = register_sleep(&mut actor, "dup", LifecycleContext::default());
+        let dead_pid = process.id();
+        working_at(&mut actor, own_pid);
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        kill(process);
+        actor.handle_command(RegistryCommand::CleanupStale);
+        assert!(!actor.sessions_by_pid.contains_key(&dead_pid));
+        assert_eq!(index_and_row_ids(&actor), (ids(&[]), ids(&["dup"])));
+    }
 }

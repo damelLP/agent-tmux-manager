@@ -270,25 +270,44 @@ pub struct ActivityDetail {
 impl ActivityDetail {
     /// Creates a new ActivityDetail for a tool operation.
     pub fn new(tool_name: &str) -> Self {
+        Self::new_at(tool_name, Utc::now())
+    }
+
+    /// Creates a new ActivityDetail for a tool operation started at `started_at`.
+    #[must_use]
+    pub fn new_at(tool_name: &str, started_at: DateTime<Utc>) -> Self {
         Self {
             tool_name: Some(tool_name.to_string()),
-            started_at: Utc::now(),
+            started_at,
             context: None,
         }
     }
 
     /// Creates an ActivityDetail with context but no specific tool.
     pub fn with_context(context: &str) -> Self {
+        Self::with_context_at(context, Utc::now())
+    }
+
+    /// Creates an ActivityDetail with context but no specific tool,
+    /// started at `started_at`.
+    #[must_use]
+    pub fn with_context_at(context: &str, started_at: DateTime<Utc>) -> Self {
         Self {
             tool_name: None,
-            started_at: Utc::now(),
+            started_at,
             context: Some(context.to_string()),
         }
     }
 
     /// Creates an ActivityDetail for "thinking" state.
     pub fn thinking() -> Self {
-        Self::with_context("Thinking")
+        Self::thinking_at(Utc::now())
+    }
+
+    /// Creates an ActivityDetail for "thinking" state started at `started_at`.
+    #[must_use]
+    pub fn thinking_at(started_at: DateTime<Utc>) -> Self {
+        Self::with_context_at("Thinking", started_at)
     }
 
     /// Returns how long this activity has been running.
@@ -718,12 +737,19 @@ impl SessionDomain {
         cwd_changed
     }
 
-    /// Updates status from a vendor-neutral lifecycle event.
+    /// Updates status from a vendor-neutral lifecycle event happening now.
+    /// See [`Self::apply_lifecycle_event_at`].
+    pub fn apply_lifecycle_event(&mut self, event: &LifecycleEvent) {
+        self.apply_lifecycle_event_at(event, Utc::now());
+    }
+
+    /// Updates status from a vendor-neutral lifecycle event that happened
+    /// at `now`, which stamps `last_activity` and any new activity.
     ///
     /// Single source of truth for session-state transitions. Every
     /// adapter (Claude, pi, future) funnels through this method.
-    pub fn apply_lifecycle_event(&mut self, event: &LifecycleEvent) {
-        self.last_activity = Utc::now();
+    pub fn apply_lifecycle_event_at(&mut self, event: &LifecycleEvent, now: DateTime<Utc>) {
+        self.last_activity = now;
 
         match event {
             LifecycleEvent::SessionStart { .. } => {
@@ -751,19 +777,19 @@ impl SessionDomain {
             }
             LifecycleEvent::NeedsInput { reason } => {
                 self.status = SessionStatus::AttentionNeeded;
-                self.current_activity = Some(activity_for_needs_input(reason));
+                self.current_activity = Some(activity_for_needs_input(reason, now));
             }
             LifecycleEvent::ToolCallStart { name, .. } => {
                 self.status = SessionStatus::Working;
-                self.current_activity = Some(ActivityDetail::new(name.as_str()));
+                self.current_activity = Some(ActivityDetail::new_at(name.as_str(), now));
             }
             LifecycleEvent::ToolCallEnd { .. } => {
                 self.status = SessionStatus::Working;
-                self.current_activity = Some(ActivityDetail::thinking());
+                self.current_activity = Some(ActivityDetail::thinking_at(now));
             }
             LifecycleEvent::ContextCompactStart { .. } => {
                 self.status = SessionStatus::Working;
-                self.current_activity = Some(ActivityDetail::with_context("Compacting"));
+                self.current_activity = Some(ActivityDetail::with_context_at("Compacting", now));
             }
             LifecycleEvent::ContextUpdate {
                 tokens,
@@ -825,7 +851,7 @@ impl SessionDomain {
             LifecycleEvent::Notification { kind, .. } => {
                 if matches!(kind, Some(NotificationKind::Setup)) {
                     self.status = SessionStatus::Working;
-                    self.current_activity = Some(ActivityDetail::with_context("Setup"));
+                    self.current_activity = Some(ActivityDetail::with_context_at("Setup", now));
                 }
                 // Other notifications: no status change. Permission /
                 // elicitation prompts arrive as `NeedsInput`, not
@@ -1072,10 +1098,10 @@ impl SessionInfrastructure {
 }
 
 /// Activity-detail string for an `AttentionNeeded` state.
-fn activity_for_needs_input(reason: &NeedsInputReason) -> ActivityDetail {
+fn activity_for_needs_input(reason: &NeedsInputReason, now: DateTime<Utc>) -> ActivityDetail {
     match reason {
         NeedsInputReason::InteractiveTool { tool } | NeedsInputReason::PermissionGate { tool } => {
-            ActivityDetail::new(tool.as_str())
+            ActivityDetail::new_at(tool.as_str(), now)
         }
         NeedsInputReason::Notification { kind, label } => {
             // When the vendor-supplied label is present (e.g. pi
@@ -1083,13 +1109,19 @@ fn activity_for_needs_input(reason: &NeedsInputReason) -> ActivityDetail {
             // it over the kind-derived static string — it tells the
             // user what's actually being asked.
             if let Some(text) = label.as_deref() {
-                return ActivityDetail::with_context(text);
+                return ActivityDetail::with_context_at(text, now);
             }
             match kind {
-                NotificationKind::PermissionPrompt => ActivityDetail::with_context("Permission"),
-                NotificationKind::ElicitationDialog => ActivityDetail::with_context("MCP Input"),
-                NotificationKind::AgentNeedsInput => ActivityDetail::with_context("Agent Input"),
-                other => ActivityDetail::with_context(other.as_str()),
+                NotificationKind::PermissionPrompt => {
+                    ActivityDetail::with_context_at("Permission", now)
+                }
+                NotificationKind::ElicitationDialog => {
+                    ActivityDetail::with_context_at("MCP Input", now)
+                }
+                NotificationKind::AgentNeedsInput => {
+                    ActivityDetail::with_context_at("Agent Input", now)
+                }
+                other => ActivityDetail::with_context_at(other.as_str(), now),
             }
         }
     }
@@ -1232,10 +1264,14 @@ pub struct SessionView {
 }
 
 impl SessionView {
-    /// Creates a SessionView from a SessionDomain.
+    /// Creates a SessionView from a SessionDomain, with ages as of now.
     pub fn from_domain(session: &SessionDomain) -> Self {
-        let now = Utc::now();
+        Self::from_domain_at(session, Utc::now())
+    }
 
+    /// Creates a SessionView from a SessionDomain, with ages as of `now`.
+    #[must_use]
+    pub fn from_domain_at(session: &SessionDomain, now: DateTime<Utc>) -> Self {
         Self {
             id: session.id.clone(),
             id_short: session.id.short().to_string(),
@@ -1331,6 +1367,13 @@ mod tests {
     /// Creates a test session with default values.
     fn create_test_session(id: &str) -> SessionDomain {
         SessionDomain::new(SessionId::new(id), AgentType::GeneralPurpose, Model::Opus45)
+    }
+
+    /// A fixed instant for tests that pass `now` explicitly.
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     #[test]
@@ -1481,6 +1524,22 @@ mod tests {
             "0s ago"
         );
         assert_eq!(ago(-1), "now");
+    }
+
+    #[test]
+    fn test_session_view_formats_ages_at_a_fixed_instant() {
+        let now = fixed_now();
+        let mut session = create_test_session("test-view-at");
+        session.started_at = now - chrono::Duration::hours(2);
+        session.last_activity = now - chrono::Duration::seconds(90);
+
+        let view = SessionView::from_domain_at(&session, now);
+        assert_eq!(view.age_display, "2h ago");
+        assert_eq!(view.last_activity_display, "1m ago");
+
+        let later = SessionView::from_domain_at(&session, now + chrono::Duration::hours(1));
+        assert_eq!(later.age_display, "3h ago");
+        assert_eq!(later.last_activity_display, "1h ago");
     }
 
     #[test]
@@ -1778,6 +1837,128 @@ mod tests {
                 .as_deref(),
             Some("custom_pi_tool")
         );
+    }
+
+    #[test]
+    fn lifecycle_transitions_at_a_fixed_instant() {
+        let now = fixed_now();
+        let earlier = now - chrono::Duration::minutes(5);
+        // Each row starts from an AttentionNeeded session with an older
+        // activity, so clearing, replacing and keeping are all visible.
+        let table = [
+            (
+                LifecycleEvent::SessionStart { source: None },
+                SessionStatus::Idle,
+                None,
+            ),
+            (
+                LifecycleEvent::SessionEnd { reason: None },
+                SessionStatus::Idle,
+                None,
+            ),
+            (LifecycleEvent::WorkingStart, SessionStatus::Working, None),
+            (LifecycleEvent::WorkingEnd, SessionStatus::Idle, None),
+            (LifecycleEvent::Idle, SessionStatus::Idle, None),
+            (
+                LifecycleEvent::PromptSubmit { prompt: None },
+                SessionStatus::Working,
+                None,
+            ),
+            (
+                LifecycleEvent::NeedsInput {
+                    reason: NeedsInputReason::PermissionGate { tool: Tool::Bash },
+                },
+                SessionStatus::AttentionNeeded,
+                Some(("Bash", now)),
+            ),
+            (
+                LifecycleEvent::NeedsInput {
+                    reason: NeedsInputReason::Notification {
+                        kind: NotificationKind::PermissionPrompt,
+                        label: None,
+                    },
+                },
+                SessionStatus::AttentionNeeded,
+                Some(("Permission", now)),
+            ),
+            (
+                LifecycleEvent::ToolCallStart {
+                    name: Tool::Bash,
+                    tool_use_id: None,
+                    input: None,
+                },
+                SessionStatus::Working,
+                Some(("Bash", now)),
+            ),
+            (
+                LifecycleEvent::ToolCallEnd {
+                    name: Tool::Bash,
+                    tool_use_id: None,
+                    is_error: false,
+                },
+                SessionStatus::Working,
+                Some(("Thinking", now)),
+            ),
+            (
+                LifecycleEvent::ContextCompactStart { trigger: None },
+                SessionStatus::Working,
+                Some(("Compacting", now)),
+            ),
+            (
+                LifecycleEvent::Notification {
+                    message: None,
+                    kind: Some(NotificationKind::Setup),
+                },
+                SessionStatus::Working,
+                Some(("Setup", now)),
+            ),
+            (
+                LifecycleEvent::Notification {
+                    message: None,
+                    kind: Some(NotificationKind::PermissionPrompt),
+                },
+                SessionStatus::AttentionNeeded,
+                Some(("AskUserQuestion", earlier)),
+            ),
+            (
+                LifecycleEvent::ContextUpdate {
+                    tokens: None,
+                    current_tokens: None,
+                    context_window_size: None,
+                    cost_usd: None,
+                },
+                SessionStatus::AttentionNeeded,
+                Some(("AskUserQuestion", earlier)),
+            ),
+            (
+                LifecycleEvent::ChildSessionStart {
+                    id: None,
+                    role: None,
+                },
+                SessionStatus::Working,
+                Some(("AskUserQuestion", earlier)),
+            ),
+        ];
+
+        for (event, status, activity) in table {
+            let mut session = create_test_session("test-at");
+            session.status = SessionStatus::AttentionNeeded;
+            session.current_activity = Some(ActivityDetail::new_at("AskUserQuestion", earlier));
+            session.last_activity = earlier;
+
+            session.apply_lifecycle_event_at(&event, now);
+
+            assert_eq!(session.status, status, "{event:?}");
+            assert_eq!(session.last_activity, now, "{event:?}");
+            assert_eq!(
+                session
+                    .current_activity
+                    .as_ref()
+                    .map(|a| (a.display().into_owned(), a.started_at)),
+                activity.map(|(name, at)| (name.to_string(), at)),
+                "{event:?}"
+            );
+        }
     }
 
     #[test]

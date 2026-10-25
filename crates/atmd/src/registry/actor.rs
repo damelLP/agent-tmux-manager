@@ -451,7 +451,10 @@ impl RegistryActor {
     /// Points every parent/child link to `old` at `new` after a session
     /// rename, then publishes each session whose links changed.
     fn rename_links(&mut self, old: &SessionId, new: &SessionId) {
-        if old == new {
+        // A row still holds `old` when nothing was renamed, or when another
+        // row shares the id and may own these links; shared ids are the
+        // user's open question (#97), so they stay as they are.
+        if self.sessions_by_pid.values().any(|(s, _)| s.id == *old) {
             return;
         }
         let mut relinked = Vec::new();
@@ -3956,6 +3959,54 @@ mod tests {
         let all = ids(&["agent-1", "agent-2", "lead-b"]);
         assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
         assert_children_follow(&mut actor, "lead-b");
+    }
+
+    /// Gives the newer of two `dup` rows a child `agent-1` (alias `rev`),
+    /// runs `rename` on the older row's pid, and asserts the events and
+    /// that every link still names `dup`.
+    fn assert_shared_id_rename_keeps_links(
+        rename: impl FnOnce(&mut RegistryActor, u32),
+        expected: &[&str],
+    ) {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let dup = SessionId::new("dup");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &dup, working, alias("rev", "agent-1"));
+        start_child(&mut actor, &dup, "agent-1");
+        drain_setup(&mut event_rx);
+
+        rename(&mut actor, older.0.id());
+
+        assert_eq!(drain_events(&mut event_rx).0, expected);
+        let child = &actor.sessions_by_pid[&pid_of(&actor, "agent-1")].0;
+        assert_eq!(child.parent_session_id.as_ref(), Some(&dup));
+        assert_eq!(
+            actor.sessions_by_pid[&newer.0.id()].0.child_session_ids,
+            [SessionId::new("agent-1")]
+        );
+        assert_eq!(
+            child_refs(&actor),
+            ["dup/Id(\"agent-1\")->agent-1", "dup/Name(\"rev\")->agent-1"]
+        );
+    }
+
+    /// Renaming one of two rows that share an id leaves every link to that
+    /// id alone, as on main: the links may belong to the other row, which
+    /// still holds it (shared ids are open, #97). Covers both rename sites.
+    #[test]
+    fn rename_of_a_shared_id_leaves_its_links() {
+        assert_shared_id_rename_keeps_links(
+            |actor, pid| status_line_as(actor, pid, "fresh"),
+            &["Removed dup Upgraded", "Registered fresh", "Updated fresh"],
+        );
+        assert_shared_id_rename_keeps_links(
+            |actor, pid| {
+                let dir = tempfile::tempdir().unwrap();
+                discover(actor, SessionId::new("fresh"), pid, dir.path(), None);
+            },
+            &["Updated fresh"],
+        );
     }
 
     /// Discovers this process as a pending child of a new `lead` session.

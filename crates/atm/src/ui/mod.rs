@@ -244,6 +244,37 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn test_render_ages_activity_at_app_now() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.state = AppState::Connected;
+        app.update_sessions(vec![create_test_session("session-1-abcdef")]);
+        app.select_next(); // from the project header to the agent row
+        assert!(app.selected_session().is_some());
+        // 36s after the fixture's last_activity (2024-01-15T10:05:00Z).
+        app.now = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:05:36Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        terminal
+            .draw(|frame| {
+                render(frame, &app);
+            })
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Activity: 36s ago"));
+    }
+
     // -- Compact rendering tests ----------------------------------------------
 
     #[test]

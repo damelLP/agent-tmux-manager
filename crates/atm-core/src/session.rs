@@ -1188,10 +1188,13 @@ pub struct SessionView {
     /// Whether session needs attention (permission wait, high context)
     pub needs_attention: bool,
 
-    /// Time since last activity (formatted)
+    /// Time since last activity (formatted) when this view was built.
+    /// It goes stale in a view kept by a subscriber; format
+    /// `last_activity` with [`format_age`] at display time instead.
     pub last_activity_display: String,
 
-    /// Session age (formatted)
+    /// Session age (formatted) when this view was built. Goes stale like
+    /// `last_activity_display`; format `started_at` with [`format_age`].
     pub age_display: String,
 
     /// Session start time (ISO 8601)
@@ -1298,7 +1301,8 @@ impl From<&SessionDomain> for SessionView {
 
 /// Formats the time from `since` to `now` for display, e.g. `"5m ago"`.
 ///
-/// Returns `"now"` when `since` is later than `now`.
+/// Counts whole seconds, so `since` up to a second after `now` reads
+/// `"0s ago"`; a second or more after reads `"now"`.
 #[must_use]
 pub fn format_age(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let secs = now.signed_duration_since(since).num_seconds();
@@ -1472,6 +1476,10 @@ mod tests {
         assert_eq!(ago(3_600), "1h ago");
         assert_eq!(ago(86_399), "23h ago");
         assert_eq!(ago(86_400), "1d ago");
+        assert_eq!(
+            format_age(now + chrono::Duration::milliseconds(500), now),
+            "0s ago"
+        );
         assert_eq!(ago(-1), "now");
     }
 

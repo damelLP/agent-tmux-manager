@@ -142,7 +142,7 @@ impl App {
             selected_index: 0,
             should_quit: false,
             last_update: Utc::now(),
-            now: DateTime::default(),
+            now: Utc::now(),
             blink_visible: true,
             tick_count: 0,
             pick_mode: false,

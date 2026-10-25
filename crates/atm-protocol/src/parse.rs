@@ -136,14 +136,14 @@ pub struct RawCurrentUsage {
 impl RawStatusLine {
     /// Converts raw JSON data to a StatusLineData struct.
     ///
-    /// Returns None if required fields (model) are missing.
+    /// Returns None if required fields (a non-empty model id) are missing.
     pub fn to_status_line_data(&self) -> Option<StatusLineData> {
-        self.model.as_ref()?;
+        self.model.as_ref().filter(|m| !m.id.is_empty())?;
         Some(self.status_line_data())
     }
 
     /// Converts to SessionDomain, tagged as a Claude Code session.
-    /// Returns None if required fields (model) are missing.
+    /// Returns None if required fields (a non-empty model id) are missing.
     pub fn to_session_domain(&self) -> Option<SessionDomain> {
         let data = self.to_status_line_data()?;
         let mut session = SessionDomain::from_status_line(&data);
@@ -155,12 +155,6 @@ impl RawStatusLine {
     /// Only updates fields that are present in this status line.
     /// Returns `true` if the working directory changed.
     pub fn update_session(&self, session: &mut SessionDomain) -> bool {
-        // Core skips an empty model id as not reported, but this parser
-        // has always reset the model on one.
-        if self.model.as_ref().is_some_and(|m| m.id.is_empty()) {
-            session.model = atm_core::Model::Unknown;
-            session.model_display_override = None;
-        }
         session.update_from_status_line(&self.status_line_data())
     }
 
@@ -390,10 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn test_update_session_resets_model_on_empty_id() {
+    fn test_update_session_keeps_model_on_empty_id() {
         use atm_core::{AgentType, SessionDomain};
 
-        // A known model, then an unknown one with its display override.
+        // An empty id is not reported, like an absent model: a known
+        // model, then an unknown one with its display override, survive.
         for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
             let mut session = SessionDomain::new(
                 atm_core::SessionId::new("test-empty-id"),
@@ -406,8 +401,22 @@ mod tests {
             let raw: RawStatusLine = serde_json::from_str(json).unwrap();
             raw.update_session(&mut session);
 
-            assert_eq!(session.model, Model::Unknown);
-            assert!(session.model_display_override.is_none());
+            assert_eq!(session.model, model);
+            assert_eq!(session.model_display_override.as_deref(), display_override);
+        }
+    }
+
+    #[test]
+    fn test_new_session_needs_a_non_empty_model_id() {
+        // An empty id is not reported, like an absent model, so neither
+        // line can create a session.
+        for json in [
+            r#"{"session_id": "test-empty-id", "model": {"id": ""}}"#,
+            r#"{"session_id": "test-empty-id"}"#,
+        ] {
+            let raw: RawStatusLine = serde_json::from_str(json).unwrap();
+            assert!(raw.to_status_line_data().is_none(), "{json}");
+            assert!(raw.to_session_domain().is_none(), "{json}");
         }
     }
 

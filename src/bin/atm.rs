@@ -2026,6 +2026,10 @@ async fn cmd_workspace_attach(session: Option<String>, isolate: bool) -> Result<
             .next()
             .map(|(_, name)| name)
             .ok_or_else(|| anyhow::anyhow!("No tmux sessions found"))?;
+        validate_session_name(&session_name).context(
+            "Can't attach to the most recently attached tmux session; \
+             rename it with `tmux rename-session`",
+        )?;
         (session_name, socket)
     };
     let client = workspace_tmux_client(&socket_name);

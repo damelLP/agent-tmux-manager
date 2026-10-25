@@ -1285,17 +1285,35 @@ async fn scenario_workspace_attach_autopick_rejects_unsupported_name(env: &E2eEn
     // A detached session has an empty #{session_last_attached}, which the
     // auto-pick skips. A control-mode client attaches without a tty and
     // exits when stdin closes, leaving "my work" the most recently attached.
-    let mut cmd = Command::new("tmux");
-    cmd.args([
-        "-L",
-        tmux.label(),
-        "-C",
-        "attach-session",
-        "-t",
-        "=my work:",
-    ])
-    .stdin(Stdio::null());
-    run_tmux_or_panic(&mut cmd, "control-mode attach to 'my work'");
+    // The deadline turns a client that ignores EOF into a failure, not a hang.
+    let mut ctl = Command::new("tmux")
+        .args([
+            "-L",
+            tmux.label(),
+            "-C",
+            "attach-session",
+            "-t",
+            "=my work:",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn control-mode attach");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ctl.try_wait().expect("poll control-mode attach").is_none() {
+        if Instant::now() >= deadline {
+            let _ = ctl.kill();
+            panic!("control-mode attach to 'my work' didn't exit on stdin EOF");
+        }
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+    let ctl = ctl.wait_with_output().expect("collect control-mode attach");
+    assert!(
+        ctl.status.success(),
+        "control-mode attach to 'my work' failed: {}",
+        String::from_utf8_lossy(&ctl.stderr)
+    );
 
     let run_autopick_attach = || {
         Command::new(&env.atm_path)
@@ -1337,14 +1355,14 @@ async fn scenario_workspace_attach_autopick_rejects_unsupported_name(env: &E2eEn
     let hooks = tmux_run_capture(tmux.label(), &["show-hooks", "-t", "=my work:"])
         .expect("show-hooks after rejected attach");
     assert!(
-        !hooks.contains("after-resize-window") && !hooks.contains("after-new-window"),
-        "a rejected attach must not install hooks; got: {hooks}"
+        hooks.trim().is_empty(),
+        "a rejected attach must not install any session hook; got: {hooks}"
     );
-    let keys = tmux_run_capture(tmux.label(), &["list-keys", "-T", "prefix"])
-        .expect("list-keys after rejected attach");
+    let keys =
+        tmux_run_capture(tmux.label(), &["list-keys"]).expect("list-keys after rejected attach");
     assert!(
-        !keys.contains("resize-sidebar"),
-        "a rejected attach must not bind prefix-R; got: {keys}"
+        !keys.contains("resize-sidebar") && !keys.contains("@atm-sidebar"),
+        "a rejected attach must not bind prefix-R or prefix-a; got: {keys}"
     );
     assert!(
         !data_dir.path().join("atm").exists(),
@@ -1373,15 +1391,21 @@ async fn scenario_workspace_attach_autopick_rejects_unsupported_name(env: &E2eEn
     );
     let hooks = tmux_run_capture(tmux.label(), &["show-hooks", "-t", "=mywork:"])
         .expect("show-hooks after control attach");
+    for hook in [
+        "after-resize-window",
+        "after-resize-pane",
+        "after-new-window",
+    ] {
+        assert!(
+            hooks.contains(hook),
+            "control attach should install {hook}; got: {hooks}"
+        );
+    }
+    let keys =
+        tmux_run_capture(tmux.label(), &["list-keys"]).expect("list-keys after control attach");
     assert!(
-        hooks.contains("after-new-window"),
-        "control attach should install the new-window hook; got: {hooks}"
-    );
-    let keys = tmux_run_capture(tmux.label(), &["list-keys", "-T", "prefix"])
-        .expect("list-keys after control attach");
-    assert!(
-        keys.contains("resize-sidebar-mywork.sh"),
-        "control attach should bind prefix-R to its resize script; got: {keys}"
+        keys.contains("resize-sidebar-mywork.sh") && keys.contains("@atm-sidebar"),
+        "control attach should bind prefix-R and prefix-a; got: {keys}"
     );
 }
 

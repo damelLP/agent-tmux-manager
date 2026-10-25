@@ -839,36 +839,6 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         "after-new-window hook should be installed after create; got: {installed_hooks}"
     );
 
-    // tmux 3.7 `list-keys` ignores a key filter, so find the binding line
-    // and run its command via source-file (as a keypress would).
-    let run_prefix_key = |key: &str| {
-        let prefix_keys = tmux_run_capture(create_tmux.label(), &["list-keys", "-T", "prefix"])
-            .expect("list keys");
-        let cmd = prefix_keys
-            .lines()
-            .find_map(|line| {
-                let rest = line
-                    .strip_prefix("bind-key")?
-                    .trim_start()
-                    .strip_prefix("-T")?
-                    .trim_start()
-                    .strip_prefix("prefix")?
-                    .trim_start()
-                    .strip_prefix(key)?;
-                // Verbatim: a path in the command may hold whitespace runs.
-                rest.starts_with(' ').then(|| rest.trim_start().to_string())
-            })
-            .unwrap_or_else(|| panic!("prefix-{key} binding installed; keys: {prefix_keys}"));
-        let cmd_file = create_data_dir.path().join(format!("prefix-{key}.conf"));
-        std::fs::write(&cmd_file, &cmd).expect("write prefix key command");
-        tmux_run_capture(
-            create_tmux.label(),
-            &["source-file", &cmd_file.display().to_string()],
-        )
-        .unwrap_or_else(|| panic!("run prefix-{key} command: {cmd}"));
-        cmd
-    };
-
     let initial_panes = list_panes_with_sidebar_marker(create_tmux.label())
         .expect("list panes with sidebar marker after create");
     let initial_sidebar_count = initial_panes.iter().filter(|p| p.is_sidebar).count();
@@ -925,18 +895,24 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         &["resize-pane", "-t", &sidebar_pane, "-x", &skewed_width],
     )
     .expect("skew sidebar width");
-    run_prefix_key("R");
-    let resized_width = tmux_run_capture(
-        create_tmux.label(),
-        &[
-            "display-message",
-            "-p",
-            "-t",
-            &sidebar_pane,
-            "#{pane_width}",
-        ],
-    )
-    .expect("read sidebar width");
+    let sidebar_width = || {
+        tmux_run_capture(
+            create_tmux.label(),
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &sidebar_pane,
+                "#{pane_width}",
+            ],
+        )
+        .expect("read sidebar width")
+    };
+    press_prefix_key(create_tmux.label(), &create_session_name, "R", || {
+        sidebar_width().trim() == expected_width.to_string()
+    })
+    .await;
+    let resized_width = sidebar_width();
     assert_eq!(
         resized_width.trim(),
         expected_width.to_string(),
@@ -1107,7 +1083,28 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     .expect("swap sidebar out of index 0");
     tmux_run_capture(create_tmux.label(), &["select-pane", "-t", &other_pane])
         .expect("focus non-sidebar pane");
-    let prefix_a_cmd = run_prefix_key("a");
+    // tmux 3.7 `list-keys` ignores a key filter, so find the binding line
+    // and run its command via source-file (as a keypress would).
+    let prefix_keys =
+        tmux_run_capture(create_tmux.label(), &["list-keys", "-T", "prefix"]).expect("list keys");
+    let prefix_a_cmd = prefix_keys
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            (parts.next() == Some("bind-key")
+                && parts.next() == Some("-T")
+                && parts.next() == Some("prefix")
+                && parts.next() == Some("a"))
+            .then(|| parts.collect::<Vec<_>>().join(" "))
+        })
+        .expect("prefix-a binding installed");
+    let prefix_a_file = create_data_dir.path().join("prefix-a.conf");
+    std::fs::write(&prefix_a_file, &prefix_a_cmd).expect("write prefix-a command");
+    tmux_run_capture(
+        create_tmux.label(),
+        &["source-file", &prefix_a_file.display().to_string()],
+    )
+    .expect("run prefix-a command");
     let active_pane = tmux_run_capture(
         create_tmux.label(),
         &[
@@ -1563,6 +1560,62 @@ fn awkward_data_dir() -> TempDir {
         .prefix("atm data 'q\" $HOME #S ")
         .tempdir()
         .expect("create workspace data tempdir")
+}
+
+/// Presses prefix-`key` as if typed, through a control-mode client
+/// attached to `session`, and keeps the client until
+/// `done` or a deadline: the binding runs in that client's queue. Running
+/// the binding's `list-keys` line instead would re-parse tmux's printed
+/// form, and tmux 3.4 prints a `$` in it as `\\$`.
+async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: impl Fn() -> bool) {
+    let mut client = Command::new("tmux")
+        .args([
+            "-L",
+            socket_label,
+            "-C",
+            "attach-session",
+            "-t",
+            &format!("={session}:"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("attach a control client");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    let name = loop {
+        let clients = tmux_run_capture(
+            socket_label,
+            &[
+                "list-clients",
+                "-F",
+                "#{client_control_mode} #{client_name}",
+            ],
+        )
+        .unwrap_or_default();
+        if let Some(name) = clients.lines().find_map(|line| line.strip_prefix("1 ")) {
+            break name.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control client should attach; clients: {clients}"
+        );
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    };
+    // The server may have loaded the developer's ~/.tmux.conf.
+    let prefix = tmux_run_capture(socket_label, &["show-options", "-gv", "prefix"])
+        .expect("read the prefix key");
+    tmux_run_capture(
+        socket_label,
+        &["send-keys", "-K", "-c", &name, prefix.trim(), key],
+    )
+    .expect("press the prefix key");
+    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
+    while !done() && Instant::now() < deadline {
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+    let _ = client.kill();
+    let _ = client.wait();
 }
 
 /// Tiny `tmux -L <label> ...` helper for scenario 5's hook-inspection

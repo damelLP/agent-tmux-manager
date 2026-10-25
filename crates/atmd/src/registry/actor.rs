@@ -371,6 +371,7 @@ impl RegistryActor {
             );
 
             self.publish_updated(pid);
+            self.rename_links(&old_id, &session_id);
 
             // Update the session_id index
             self.unindex(&old_id, pid);
@@ -411,7 +412,7 @@ impl RegistryActor {
     /// Renames an existing session at `pid` from `old_id` to `new_id`,
     /// updates the session_id index, and publishes the
     /// `Removed{Upgraded}` + `Registered` event pair so TUI subscribers
-    /// see the id transition cleanly.
+    /// see the id transition cleanly. Links to `old_id` follow the rename.
     ///
     /// Used by both the Claude status-line path and any vendor adapter
     /// (pi today) whose first events arrive before the real session_id
@@ -439,11 +440,42 @@ impl RegistryActor {
             "Session ID upgraded"
         );
 
-        self.publish_removed(old_id, RemovalReason::Upgraded);
+        self.publish_removed(old_id.clone(), RemovalReason::Upgraded);
         let _ = self.event_publisher.send(SessionEvent::Registered {
-            session_id: new_id,
+            session_id: new_id.clone(),
             agent_type,
         });
+        self.rename_links(&old_id, &new_id);
+    }
+
+    /// Points every parent/child link to `old` at `new` after a session
+    /// rename, then publishes each session whose links changed.
+    fn rename_links(&mut self, old: &SessionId, new: &SessionId) {
+        if old == new {
+            return;
+        }
+        let mut relinked = Vec::new();
+        for (pid, (session, _)) in &mut self.sessions_by_pid {
+            let links = (session.parent_session_id.iter_mut())
+                .chain(&mut session.child_session_ids)
+                .filter(|id| *id == old);
+            let mut changed = false;
+            for id in links {
+                *id = new.clone();
+                changed = true;
+            }
+            if changed {
+                relinked.push(*pid);
+            }
+        }
+        let rename = |id: SessionId| if id == *old { new.clone() } else { id };
+        self.child_refs = std::mem::take(&mut self.child_refs)
+            .into_iter()
+            .map(|((parent, reference), child)| ((rename(parent), reference), rename(child)))
+            .collect();
+        for pid in relinked {
+            self.publish_updated(pid);
+        }
     }
 
     /// Handles status line update.
@@ -3906,7 +3938,8 @@ mod tests {
 
     /// Rediscovery that renames a parent (real → real; production
     /// discovery sends only pending ids today) moves the parent's links.
-    /// The children's views follow the parent's own Updated.
+    /// The children's views follow the parent's own Updated. Rediscovery
+    /// with a pending id keeps the real one, so nothing is relinked.
     #[test]
     fn rediscovery_rename_of_a_parent_carries_its_children() {
         let (_, mut actor, mut event_rx) = create_actor();
@@ -3916,6 +3949,10 @@ mod tests {
         drain_setup(&mut event_rx);
         start_aliased_children(&mut actor, &SessionId::new("lead"));
         drain_setup(&mut event_rx);
+
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending, pid, dir.path(), None);
+        assert_eq!(drain_events(&mut event_rx).0, ["Updated lead"]);
 
         discover(&mut actor, SessionId::new("lead-b"), pid, dir.path(), None);
 

@@ -358,21 +358,24 @@ fn spawn_beads_task(
     tokio::spawn(async move {
         let mut reader = BeadsReader::new(atm_core::beads::find_in_progress_tasks);
         let mut interval = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            if cancel_token.is_cancelled() {
-                break;
-            }
-
-            let dir = beads_dir_rx.borrow().clone();
-            if let Some((dir, task)) = reader
-                .poll(dir.as_deref(), Duration::from_millis(500))
-                .await
-            {
-                if event_tx.send(Event::BeadsUpdate { dir, task }).is_err() {
-                    break;
+        let poll_loop = async {
+            loop {
+                interval.tick().await;
+                let dir = beads_dir_rx.borrow().clone();
+                if let Some((dir, task)) = reader
+                    .poll(dir.as_deref(), Duration::from_millis(500))
+                    .await
+                {
+                    if event_tx.send(Event::BeadsUpdate { dir, task }).is_err() {
+                        break;
+                    }
                 }
             }
+        };
+        // Stop mid-wait on cancel, so quitting never waits out a tick or a read.
+        tokio::select! {
+            () = cancel_token.cancelled() => {}
+            () = poll_loop => {}
         }
     })
 }

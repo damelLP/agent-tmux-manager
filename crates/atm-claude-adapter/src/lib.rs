@@ -37,7 +37,10 @@
 //! - The lead gets no `SubagentStart` for tmux teammates. Its `Stop`
 //!   lists them in `background_tasks` with `"type": "teammate"`. It did
 //!   get `SubagentStop`s with `agent_type: ""` and agent ids matching no
-//!   teammate.
+//!   teammate. Like every child event, they leave the lead's status
+//!   alone. Until 2026-10-25 one that reached an idle lead turned it
+//!   working until its next hook (read from the code; when they arrive
+//!   was not captured).
 //! - **in-process mode.** No `TeammateIdle` fired. The named teammate
 //!   ran as a background subagent: `SubagentStart`/`SubagentStop` with
 //!   `agent_id`, its own hooks carry that `agent_id`, and the `Agent`
@@ -108,6 +111,15 @@
 //! above. The fake API's `127.0.0.1` port in `last_assistant_message` is
 //! verbatim.
 //!
+//! `tests/fixtures/claude_background_agent_dialog_2.1.310.jsonl` holds
+//! two TUI sessions, 14 hooks and then 20, whose permission dialog stayed
+//! open while background subagents started and stopped (see Background
+//! agents and dialogs below). Captured: Claude Code 2.1.310, 2026-10-25,
+//! by the method above in manual mode, with the fake Messages API holding
+//! a subagent's replies for seconds to keep it running. Each ends with a
+//! `SessionEnd` (reason `other`) from tearing the capture down. Paths
+//! were rewritten as above.
+//!
 //! The JSON payloads in the `wire.rs` tests are hand-written (see
 //! `Synthetic:` there). Tests that build `RawHookEvent` structs check
 //! mapping logic and claim no capture. Claude-shaped JSON in other
@@ -159,8 +171,44 @@
 //!   such as a quota auto-resume after `rate_limit`. The row would read
 //!   idle until the next hook.
 //!
+//! ## Background agents and dialogs (captured 2026-10-25)
+//!
+//! Background subagents start and stop on their own schedule, so their
+//! `SubagentStart` and `SubagentStop` can reach the lead while it waits on
+//! a permission dialog. The lead sends no hook of its own while its
+//! dialog waits; a background agent's own hooks carry its `agent_id` and
+//! go to its row. So child events leave the lead's status alone: until
+//! 2026-10-25 they set it working, and the row lost its needs input until
+//! the user answered. Sealed TUI runs on Claude Code 2.1.310 in manual
+//! mode, with `atm list` polled every 200 ms:
+//!
+//! - A background agent that finished 15 s into the dialog sent its
+//!   `SubagentStop` then. The task notification's `UserPromptSubmit`
+//!   came only after the answer, in the same turn as the approved call.
+//! - Subagents get the `Agent` tool. A background agent that spawned a
+//!   nested agent during the dialog sent a `SubagentStart` then; when the
+//!   nested agent finished, Claude restarted its spawner with the task
+//!   notification, a new `SubagentStart` under the spawner's old id.
+//! - The lead's own calls can't do it: given `[gated Bash, Agent]` in one
+//!   message, Claude started the agent 71 ms after the dialog's answer.
+//! - Stopping a background agent from the task list (`x`) sent no
+//!   `SubagentStop`, only the task notification's `UserPromptSubmit` and
+//!   a quiet `Stop`. That `Stop` swept the child because it still read
+//!   working; the sweep skips a child waiting on input, so a child stopped
+//!   while it waits keeps its row (read from the code, not run; it
+//!   predates 2026-10-25). A natural `SubagentStop` at
+//!   an idle lead was followed by that `UserPromptSubmit` 53 ms later, so
+//!   no captured case needed a child event to mark the lead working.
+//!
 //! ## Known gaps (Claude Code 2.1.310)
 //!
+//! - **A nested subagent's row sits directly under the lead.** Its
+//!   `SubagentStart` carries only `agent_id` and `agent_type`, nothing
+//!   naming the subagent that spawned it, so atmd nests it under the
+//!   lead, beside its spawner. A fix can't just nest it under the
+//!   spawner: the spawner's `SubagentStop` came before the nested
+//!   agent's, and removing a session removes its children, so the running
+//!   nested agent's row would go with it.
 //! - **`claude --bare` runs the statusLine but no hooks, so ATM can't
 //!   see its turns.** A sealed TUI run with `--bare` sent status lines at
 //!   startup, after a permission-mode change and after a turn, and no

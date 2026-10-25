@@ -857,9 +857,10 @@ impl SessionDomain {
                 // `Notification`, after translation.
             }
             LifecycleEvent::ChildSessionStart { .. } | LifecycleEvent::ChildSessionEnd { .. } => {
-                // Children are tracked by the registry as in-process sessions;
-                // status remains Working.
-                self.status = SessionStatus::Working;
+                // Status unchanged: the registry tracks children as their
+                // own sessions, and a child's start or stop says nothing
+                // about this session's turn. A background child can start
+                // or stop while this session waits on a permission dialog.
             }
         }
     }
@@ -1981,19 +1982,17 @@ mod tests {
                 None,
                 Kept,
             ),
+            // A child's start or stop says nothing about the parent's own
+            // turn, and must not hide a parent's open dialog.
             (
                 LifecycleEvent::ChildSessionStart {
                     id: None,
                     role: None,
                 },
-                Some(SessionStatus::Working),
+                None,
                 Kept,
             ),
-            (
-                LifecycleEvent::ChildSessionEnd { id: None },
-                Some(SessionStatus::Working),
-                Kept,
-            ),
+            (LifecycleEvent::ChildSessionEnd { id: None }, None, Kept),
         ];
 
         let starts = [

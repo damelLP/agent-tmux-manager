@@ -1478,6 +1478,110 @@ async fn test_e2e_claude_captured_stop_failure_replay() {
     }
 }
 
+#[tokio::test]
+async fn test_e2e_claude_captured_background_agent_dialog_replay() {
+    // Captured: Claude Code 2.1.310, 2026-10-25, two TUI turns whose
+    // permission dialog stayed open while background subagents started
+    // and stopped (see atm-claude-adapter's crate docs). The lead sends no
+    // hook of its own while its dialog waits, so a child event that turned
+    // it working hid the dialog until the user answered it.
+    let fixture = "claude_background_agent_dialog_2.1.310.jsonl";
+    let Some(events) = captured_hook_payloads("atm-claude-adapter", fixture) else {
+        return;
+    };
+    assert_eq!(events.len(), 34, "{fixture}");
+    let (race, deep) = events.split_at(14);
+    // The lead's row after each hook: status, activity, needs_attention,
+    // and how many child rows it has.
+    let row = |status: &str, activity: Option<&str>, children: usize| {
+        let needs_attention = status == "needs input";
+        Some((
+            status.to_string(),
+            activity.map(String::from),
+            needs_attention,
+            children,
+        ))
+    };
+    let idle = |children| row("idle", None, children);
+    let working = |activity, children| row("working", activity, children);
+    let asking = |activity, children| row("needs input", Some(activity), children);
+    let (agent, thinking) = (Some("Agent"), Some("Thinking"));
+    let (bash, permission) = ("Bash: touch atm-probe.txt && echo atm-probe", "Permission");
+    let sessions = [
+        // A background agent, then a gated Bash call; the agent stops
+        // while the dialog is open.
+        (
+            race,
+            vec![
+                ("SessionStart", idle(0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("PreToolUse", working(agent, 0)),
+                ("SubagentStart", working(agent, 1)),
+                ("PostToolUse", working(thinking, 1)),
+                ("PreToolUse", working(Some("Bash"), 1)),
+                ("PermissionRequest", asking(bash, 1)),
+                ("Notification", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("PostToolUse", working(thinking, 0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("Stop", idle(0)),
+                ("Notification", idle(0)),
+                ("SessionEnd", None),
+            ],
+        ),
+        // The background agent spawns a nested one during the dialog;
+        // Claude restarts it when the nested agent finishes. Its own
+        // tool calls carry its agent_id and go to its row.
+        (
+            deep,
+            vec![
+                ("SessionStart", idle(0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("PreToolUse", working(agent, 0)),
+                ("SubagentStart", working(agent, 1)),
+                ("PostToolUse", working(thinking, 1)),
+                ("PreToolUse", working(Some("Bash"), 1)),
+                ("PermissionRequest", asking(bash, 1)),
+                ("Notification", asking(permission, 1)),
+                ("PreToolUse", asking(permission, 1)),
+                ("SubagentStart", asking(permission, 2)),
+                ("PostToolUse", asking(permission, 2)),
+                ("SubagentStop", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("SubagentStart", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("PostToolUse", working(thinking, 0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("Stop", idle(0)),
+                ("Notification", idle(0)),
+                ("SessionEnd", None),
+            ],
+        ),
+    ];
+    for (session, expected) in sessions {
+        let lead = SessionId::new(session[0]["session_id"].as_str().expect("session_id"));
+        let (server, registry) = TestServer::spawn_with_registry().await;
+        let mut client = server.connect().await;
+        client.handshake(None).await;
+        let mut seen = Vec::new();
+        for (seq, event) in (1..).zip(session) {
+            send_applied(&mut client, seq, ClientMessage::hook_event(event.clone())).await;
+            let row = registry.get_session(lead.clone()).await.map(|view| {
+                (
+                    view.status_label,
+                    view.activity_detail,
+                    view.needs_attention,
+                    view.child_session_ids.len(),
+                )
+            });
+            let name = event["hook_event_name"].as_str().unwrap_or_default();
+            seen.push((name, row));
+        }
+        assert_eq!(seen, expected, "session {lead}");
+        server.shutdown().await;
+    }
+}
+
 // ============================================================================
 // Pi Event → LifecycleEvent translation (end-to-end, wire-level)
 //

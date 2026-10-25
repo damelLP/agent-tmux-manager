@@ -515,8 +515,8 @@ impl RegistryActor {
         }
 
         if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-            // The reconcile above made `session.id` equal `session_id`.
-            apply_status_line(session, infra, &data, &session_id, pid);
+            let log_id = session.id.clone();
+            apply_status_line(session, infra, &data, &log_id, pid);
 
             debug!(
                 session_id = %session_id,

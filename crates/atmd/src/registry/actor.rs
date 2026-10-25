@@ -1137,7 +1137,8 @@ fn build_session_from_pid(
 }
 
 /// Resolves the git context of `cwd`: its project root, worktree path and
-/// worktree branch.
+/// worktree branch. The worktree fields are only set when `cwd` is itself a
+/// repo or worktree root (see `atm_core::resolve_worktree_info`).
 fn resolve_git_context(cwd: &str) -> (Option<String>, Option<String>, Option<String>) {
     let project_root = atm_core::resolve_project_root(cwd);
     let (worktree_path, worktree_branch) = atm_core::resolve_worktree_info(cwd);
@@ -2375,6 +2376,9 @@ mod tests {
         preset.working_directory = Some(repo.to_string());
         preset.project_root = Some("/preset".to_string());
         register_session_in(&mut actor, preset);
+        let mut no_cwd = create_test_session("register-no-cwd");
+        no_cwd.worktree_branch = Some("kept".to_string());
+        register_session_in(&mut actor, no_cwd);
 
         let fresh = session_view(&actor, "register-fresh").unwrap();
         assert_eq!(fresh.project_root.as_deref(), Some(repo));
@@ -2385,6 +2389,12 @@ mod tests {
         assert_eq!(
             preset.worktree_branch, None,
             "a preset project root skips git resolution"
+        );
+        let no_cwd = session_view(&actor, "register-no-cwd").unwrap();
+        assert_eq!(
+            no_cwd.worktree_branch.as_deref(),
+            Some("kept"),
+            "without a working directory the git fields are left alone"
         );
     }
 

@@ -499,7 +499,7 @@ impl fmt::Display for LinesChanged {
 pub struct StatusLineData {
     /// Session ID from Claude Code
     pub session_id: String,
-    /// Model ID (e.g., "claude-sonnet-4-20250514")
+    /// Model ID (e.g., "claude-sonnet-4-20250514"); empty when not reported
     pub model_id: String,
     /// Display name from the provider (e.g., "Claude Opus 4.6"), if provided
     pub model_display_name: Option<String>,
@@ -517,7 +517,7 @@ pub struct StatusLineData {
     pub total_input_tokens: u64,
     /// Total output tokens across all responses
     pub total_output_tokens: u64,
-    /// Context window size for the model
+    /// Context window size for the model; 0 when not reported
     pub context_window_size: u32,
     /// Input tokens in current context
     pub current_input_tokens: u64,
@@ -660,29 +660,18 @@ impl SessionDomain {
         }
     }
 
-    /// Creates a SessionDomain from Claude Code status line data.
+    /// Creates a SessionDomain from status line data.
+    ///
+    /// Leaves `harness` at its default: the caller knows which harness
+    /// sent the data. An unreported context window keeps the model's
+    /// default size.
     pub fn from_status_line(data: &StatusLineData) -> Self {
-        use crate::model::derive_display_name;
-
-        let model = Model::from_id(&data.model_id);
-
         let mut session = Self::new(
             SessionId::new(&data.session_id),
             AgentType::GeneralPurpose, // Default, may be updated by hook events
-            model,
+            Model::from_id(&data.model_id),
         );
-        // Status-line input is only emitted by Claude Code today.
-        session.harness = crate::Harness::ClaudeCode;
-
-        // For unknown models, store a display name fallback:
-        // prefer provider-supplied display_name, then derive from raw ID
-        if model.is_unknown() && !data.model_id.is_empty() {
-            session.model_display_override = Some(
-                data.model_display_name
-                    .clone()
-                    .unwrap_or_else(|| derive_display_name(&data.model_id)),
-            );
-        }
+        session.set_status_line_model(data);
 
         session.cost = Money::from_usd(data.cost_usd);
         session.duration = SessionDuration::new(data.total_duration_ms, data.api_duration_ms);
@@ -690,7 +679,9 @@ impl SessionDomain {
         session.context = ContextUsage {
             total_input_tokens: TokenCount::new(data.total_input_tokens),
             total_output_tokens: TokenCount::new(data.total_output_tokens),
-            context_window_size: data.context_window_size,
+            context_window_size: Some(data.context_window_size)
+                .filter(|size| *size > 0)
+                .unwrap_or(session.context.context_window_size),
             current_input_tokens: TokenCount::new(data.current_input_tokens),
             current_output_tokens: TokenCount::new(data.current_output_tokens),
             cache_creation_tokens: TokenCount::new(data.cache_creation_tokens),
@@ -710,15 +701,20 @@ impl SessionDomain {
     ///
     /// Leaves `status` alone: lifecycle events own it, and a status line
     /// carries no turn state (see atm-claude-adapter's Known gaps).
+    /// Leaves the model and the context window size alone when the data
+    /// doesn't report them.
     ///
     /// Returns `true` if the working directory changed (caller should re-resolve git info).
     pub fn update_from_status_line(&mut self, data: &StatusLineData) -> bool {
+        self.set_status_line_model(data);
         self.cost = Money::from_usd(data.cost_usd);
         self.duration = SessionDuration::new(data.total_duration_ms, data.api_duration_ms);
         self.lines_changed = LinesChanged::new(data.lines_added, data.lines_removed);
         self.context.total_input_tokens = TokenCount::new(data.total_input_tokens);
         self.context.total_output_tokens = TokenCount::new(data.total_output_tokens);
-        self.context.context_window_size = data.context_window_size;
+        if data.context_window_size > 0 {
+            self.context.context_window_size = data.context_window_size;
+        }
         self.context.current_input_tokens = TokenCount::new(data.current_input_tokens);
         self.context.current_output_tokens = TokenCount::new(data.current_output_tokens);
         self.context.cache_creation_tokens = TokenCount::new(data.cache_creation_tokens);
@@ -735,6 +731,22 @@ impl SessionDomain {
             self.working_directory = data.cwd.clone();
         }
         cwd_changed
+    }
+
+    /// Applies a status line's model, if it reports one. For unknown
+    /// models, stores a display name fallback: prefer the provider-supplied
+    /// display name, then derive one from the raw ID.
+    fn set_status_line_model(&mut self, data: &StatusLineData) {
+        if data.model_id.is_empty() {
+            return;
+        }
+        let model = Model::from_id(&data.model_id);
+        self.model = model;
+        self.model_display_override = model.is_unknown().then(|| {
+            data.model_display_name
+                .clone()
+                .unwrap_or_else(|| crate::model::derive_display_name(&data.model_id))
+        });
     }
 
     /// Updates status from a vendor-neutral lifecycle event.
@@ -2254,5 +2266,93 @@ mod tests {
 
             assert_eq!(session.status, status);
         }
+    }
+
+    #[test]
+    fn test_update_from_status_line_applies_model() {
+        // (model_id, display name, expected model, expected override)
+        let cases = [
+            ("claude-opus-4-5-20251101", None, Model::Opus45, None),
+            ("gpt-4o", Some("GPT-4o"), Model::Unknown, Some("GPT-4o")),
+            (
+                "gemini-1.5-pro",
+                None,
+                Model::Unknown,
+                Some("gemini-1.5-pro"),
+            ),
+        ];
+        for (model_id, display_name, model, display_override) in cases {
+            let mut session = SessionDomain::new(
+                SessionId::new("test"),
+                AgentType::GeneralPurpose,
+                Model::Unknown,
+            );
+            session.model_display_override = Some("stale".to_string());
+            let mut data = make_status_data(None);
+            data.model_id = model_id.to_string();
+            data.model_display_name = display_name.map(str::to_string);
+
+            session.update_from_status_line(&data);
+
+            assert_eq!(session.model, model, "{model_id}");
+            assert_eq!(
+                session.model_display_override.as_deref(),
+                display_override,
+                "{model_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_from_status_line_keeps_unreported_model() {
+        // A known model, then an unknown one with its display override.
+        for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
+            let mut session =
+                SessionDomain::new(SessionId::new("test"), AgentType::GeneralPurpose, model);
+            session.model_display_override = display_override.map(str::to_string);
+            let mut data = make_status_data(None);
+            data.model_id = String::new();
+
+            session.update_from_status_line(&data);
+
+            assert_eq!(session.model, model);
+            assert_eq!(session.model_display_override.as_deref(), display_override);
+        }
+    }
+
+    #[test]
+    fn test_update_from_status_line_keeps_unreported_context_window_size() {
+        let mut session = SessionDomain::new(
+            SessionId::new("test"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+        session.context.context_window_size = 1_000_000;
+        let mut data = make_status_data(None);
+        data.context_window_size = 0;
+
+        session.update_from_status_line(&data);
+
+        assert_eq!(session.context.context_window_size, 1_000_000);
+    }
+
+    #[test]
+    fn test_from_status_line_defaults_unreported_context_window_size() {
+        let mut data = make_status_data(None);
+        data.context_window_size = 0;
+
+        let session = SessionDomain::from_status_line(&data);
+
+        assert_eq!(
+            session.context.context_window_size,
+            Model::Sonnet4.context_window_size()
+        );
+    }
+
+    #[test]
+    fn test_from_status_line_leaves_harness_to_caller() {
+        let session = SessionDomain::from_status_line(&make_status_data(None));
+
+        assert_eq!(session.harness, crate::Harness::Unknown);
     }
 }

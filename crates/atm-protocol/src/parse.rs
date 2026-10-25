@@ -138,75 +138,44 @@ impl RawStatusLine {
     ///
     /// Returns None if required fields (model) are missing.
     pub fn to_status_line_data(&self) -> Option<StatusLineData> {
-        let model = self.model.as_ref()?;
-        let cost = self.cost.as_ref();
-        let context = self.context_window.as_ref();
-        let current = context.and_then(|c| c.current_usage.as_ref());
-
-        Some(StatusLineData {
-            session_id: self.session_id.clone(),
-            model_id: model.id.clone(),
-            model_display_name: model.display_name.clone(),
-            cost_usd: cost.map(|c| c.total_cost_usd).unwrap_or(0.0),
-            total_duration_ms: cost.map(|c| c.total_duration_ms).unwrap_or(0),
-            api_duration_ms: cost.map(|c| c.total_api_duration_ms).unwrap_or(0),
-            lines_added: cost.map(|c| c.total_lines_added).unwrap_or(0),
-            lines_removed: cost.map(|c| c.total_lines_removed).unwrap_or(0),
-            total_input_tokens: context.map(|c| c.total_input_tokens).unwrap_or(0),
-            total_output_tokens: context.map(|c| c.total_output_tokens).unwrap_or(0),
-            context_window_size: context
-                .map(|c| c.context_window_size)
-                .filter(|size| *size > 0)
-                .unwrap_or(200_000),
-            current_input_tokens: current.map(|c| c.input_tokens).unwrap_or(0),
-            current_output_tokens: current.map(|c| c.output_tokens).unwrap_or(0),
-            cache_creation_tokens: current.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
-            cache_read_tokens: current.map(|c| c.cache_read_input_tokens).unwrap_or(0),
-            cwd: self.cwd.clone(),
-            version: self.version.clone(),
-        })
+        self.model.as_ref()?;
+        Some(self.status_line_data())
     }
 
-    /// Converts to SessionDomain.
+    /// Converts to SessionDomain, tagged as a Claude Code session.
     /// Returns None if required fields (model) are missing.
     pub fn to_session_domain(&self) -> Option<SessionDomain> {
         let data = self.to_status_line_data()?;
-        Some(SessionDomain::from_status_line(&data))
+        let mut session = SessionDomain::from_status_line(&data);
+        session.harness = atm_core::Harness::ClaudeCode;
+        Some(session)
     }
 
     /// Updates an existing SessionDomain with new data.
     /// Only updates fields that are present in this status line.
     /// Returns `true` if the working directory changed.
     pub fn update_session(&self, session: &mut SessionDomain) -> bool {
-        use atm_core::Model;
-
-        // Update model if present (fills in Unknown for discovered/hook-created sessions)
-        if let Some(model) = &self.model {
-            let parsed = Model::from_id(&model.id);
-            session.model = parsed;
-
-            // For unknown models, store display name fallback
-            if parsed.is_unknown() && !model.id.is_empty() {
-                session.model_display_override = Some(
-                    model
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| atm_core::derive_display_name(&model.id)),
-                );
-            } else {
-                session.model_display_override = None;
-            }
+        // Core skips an empty model id as not reported, but this parser
+        // has always reset the model on one.
+        if self.model.as_ref().is_some_and(|m| m.id.is_empty()) {
+            session.model = atm_core::Model::Unknown;
+            session.model_display_override = None;
         }
+        session.update_from_status_line(&self.status_line_data())
+    }
 
-        // Build StatusLineData for the update (model_id not used in update)
+    /// Maps every field. An absent model or window size maps to "" or 0,
+    /// which core reads as not reported.
+    fn status_line_data(&self) -> StatusLineData {
+        let model = self.model.as_ref();
         let cost = self.cost.as_ref();
         let context = self.context_window.as_ref();
         let current = context.and_then(|c| c.current_usage.as_ref());
 
-        let data = StatusLineData {
+        StatusLineData {
             session_id: self.session_id.clone(),
-            model_id: String::new(),  // Not used in update
-            model_display_name: None, // Not used in update
+            model_id: model.map(|m| m.id.clone()).unwrap_or_default(),
+            model_display_name: model.and_then(|m| m.display_name.clone()),
             cost_usd: cost.map(|c| c.total_cost_usd).unwrap_or(0.0),
             total_duration_ms: cost.map(|c| c.total_duration_ms).unwrap_or(0),
             api_duration_ms: cost.map(|c| c.total_api_duration_ms).unwrap_or(0),
@@ -214,19 +183,14 @@ impl RawStatusLine {
             lines_removed: cost.map(|c| c.total_lines_removed).unwrap_or(0),
             total_input_tokens: context.map(|c| c.total_input_tokens).unwrap_or(0),
             total_output_tokens: context.map(|c| c.total_output_tokens).unwrap_or(0),
-            context_window_size: context
-                .map(|c| c.context_window_size)
-                .filter(|size| *size > 0)
-                .unwrap_or(session.context.context_window_size),
+            context_window_size: context.map(|c| c.context_window_size).unwrap_or(0),
             current_input_tokens: current.map(|c| c.input_tokens).unwrap_or(0),
             current_output_tokens: current.map(|c| c.output_tokens).unwrap_or(0),
             cache_creation_tokens: current.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
             cache_read_tokens: current.map(|c| c.cache_read_input_tokens).unwrap_or(0),
             cwd: self.cwd.clone(),
             version: self.version.clone(),
-        };
-
-        session.update_from_status_line(&data)
+        }
     }
 }
 
@@ -423,6 +387,28 @@ mod tests {
             session.model_display_override.as_deref(),
             Some("gemini-1.5-pro")
         );
+    }
+
+    #[test]
+    fn test_update_session_resets_model_on_empty_id() {
+        use atm_core::{AgentType, SessionDomain};
+
+        // A known model, then an unknown one with its display override.
+        for (model, display_override) in [(Model::Opus45, None), (Model::Unknown, Some("GPT-4o"))] {
+            let mut session = SessionDomain::new(
+                atm_core::SessionId::new("test-empty-id"),
+                AgentType::GeneralPurpose,
+                model,
+            );
+            session.model_display_override = display_override.map(str::to_string);
+
+            let json = r#"{"session_id": "test-empty-id", "model": {"id": ""}}"#;
+            let raw: RawStatusLine = serde_json::from_str(json).unwrap();
+            raw.update_session(&mut session);
+
+            assert_eq!(session.model, Model::Unknown);
+            assert!(session.model_display_override.is_none());
+        }
     }
 
     #[test]

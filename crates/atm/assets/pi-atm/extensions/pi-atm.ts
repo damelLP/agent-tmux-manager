@@ -79,6 +79,7 @@ function logDebug(msg: string): void {
 	} catch {
 		// Logging is best-effort.
 	}
+}
 
 /**
  * Persistent socket connection to atmd for the lifetime of this pi-atm

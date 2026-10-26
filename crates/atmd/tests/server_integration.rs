@@ -1507,6 +1507,43 @@ async fn test_e2e_status_line_without_model_creates_row_and_empty_id_keeps_model
 }
 
 #[tokio::test]
+async fn test_e2e_status_line_session_id_comes_from_the_line() {
+    // Synthetic: status lines whose session_id is missing or not a string
+    // get a parse error reply and the connection keeps serving. A string
+    // id, even an empty one, keys the row.
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    let pid = std::process::id();
+
+    for bad in [
+        serde_json::json!({"pid": pid}),
+        serde_json::json!({"session_id": 7, "pid": pid}),
+        serde_json::json!({"session_id": null, "pid": pid}),
+    ] {
+        client.send(ClientMessage::status_update(bad.clone())).await;
+        match client.recv().await {
+            DaemonMessage::Error { message, .. } => {
+                assert!(message.starts_with("Parse error: "), "{bad}: {message:?}");
+            }
+            other => panic!("{bad}: expected a parse error, got {other:?}"),
+        }
+    }
+
+    for (seq, id) in [(1, "e2e-status-line-id"), (2, "")] {
+        let line = serde_json::json!({"session_id": id, "pid": pid});
+        send_applied(&mut client, seq, ClientMessage::status_update(line)).await;
+        let view = registry
+            .get_session(SessionId::new(id))
+            .await
+            .unwrap_or_else(|| panic!("no row for {id:?}"));
+        assert_eq!(view.id.as_str(), id);
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_e2e_claude_captured_stop_failure_replay() {
     // Captured: Claude Code 2.1.310, 2026-10-25, three TUI turns ended by
     // API errors (see atm-claude-adapter's crate docs). Claude sends

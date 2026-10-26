@@ -448,12 +448,10 @@ pub(super) async fn cmd_workspace(name: Option<String>, isolate: bool, editor: b
         .await?;
     }
 
-    // 8. Launch the configured harness in agent pane
-    tmux_run(
-        &client,
-        &["send-keys", "-t", &agent_pane, &agent_cmd, "Enter"],
-    )
-    .await?;
+    // 8. Launch the configured harness in agent pane. Enter goes in its own
+    //    call: tmux reads an argument ending in `;` as a command separator
+    tmux_run(&client, &["send-keys", "-t", &agent_pane, &agent_cmd]).await?;
+    tmux_run(&client, &["send-keys", "-t", &agent_pane, "Enter"]).await?;
 
     // 9. Install resize/new-window hooks + keybindings
     install_resize_hooks(&client, &socket_name, &session_name).await?;

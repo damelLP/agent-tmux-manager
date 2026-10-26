@@ -619,7 +619,8 @@ pub fn atm_config_path() -> Option<PathBuf> {
 fn default_atm_config_text() -> &'static str {
     r#"# ATM configuration
 #
-# The default harness is used when `atm spawn` omits `--harness`.
+# The default harness is used by `atm workspace create`, and by `atm spawn`
+# when it omits `--harness`.
 [harness]
 default = "claude"
 

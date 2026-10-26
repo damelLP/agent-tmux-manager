@@ -203,10 +203,11 @@ covers the steps below. Codex (#30) touched 23 files:
 - Mark each real capture where it's documented (the adapter's crate or
   module docs, or a comment beside the test) with
   `Captured: <harness> <version>, <YYYY-MM-DD>, <method>.`, writing
-  "not recorded" for any part nobody recorded. Mark a hand-built payload in an adapter's tests with
-  `Synthetic: <why>`. Unmarked payloads in other crates' tests are
-  hand-written, and the adapter's crate docs say so. Put the harness version
-  in captured fixture filenames (`claude_tui_session_2.1.310.jsonl`).
+  "not recorded" for any part nobody recorded. Mark a hand-built payload in
+  an adapter's tests with `Synthetic: <why>`. Unmarked payloads in other
+  crates' tests are hand-written, and the adapter's crate docs say so. Put
+  the harness version in captured fixture filenames
+  (`claude_tui_session_2.1.310.jsonl`).
 
 ## 4. Workflow and guardrails
 

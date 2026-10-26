@@ -99,14 +99,25 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 | root `atm` package | `atm` / `atmd` binaries | everything |
 
 - **Vendor knowledge lives only in its adapter.** `atm-core`, `atm-protocol`
-  and `atmd`'s registry stay vendor-neutral. Adding a harness means a new
-  adapter crate, not `if vendor == ..` branches elsewhere.
-  - **Exception: built-in harness metadata.** `Harness` (`harness.rs`) and
-    `BUILTIN_HARNESSES` (`harness_registry.rs`) in `atm-core` hold static
-    facts about each CLI as data: its name, command, process matchers and
-    prompt mode. Spawning and discovery read them instead of branching per
-    vendor (c23888d, #44). They never hold payload schemas, event names or
-    parsing; those stay in the adapter.
+  and `atmd`'s registry stay vendor-neutral. A harness's events, payloads and
+  parsing go in its adapter crate; other crates get only the data entries
+  and the one dispatch arm listed in "Adding a harness", never
+  `if vendor == ..` logic. Two documented exceptions:
+  - **Built-in harness metadata.** `atm-core`'s `Harness` (`harness.rs`) and
+    `HarnessDefinition`, `BUILTIN_HARNESSES`, `ProcessMatcher`,
+    `ArgvExclude` and `PromptMode` (`harness_registry.rs`) hold static facts
+    about each CLI as data: its name, command, process matchers and prompt
+    mode. Spawning and discovery read them instead of branching per vendor
+    (c23888d, #44). They never hold payload schemas, event names or parsing.
+  - **Per-harness wire envelopes.** `atm-protocol`'s `MessageType` has one
+    variant per harness (`PiEvent`, `CodexEvent`; Claude's predates the
+    naming as `HookEvent`). It carries the payload as opaque JSON that only
+    the adapter parses.
+  - Not exceptions: Claude-specific code that predates this rule and is
+    still in `atm-core` (model ids and pricing in `model.rs`,
+    `AgentType::from_subagent_type`, tool classification in `tool.rs`) and
+    `atm-protocol` (the status-line parser in `parse.rs`). Each moves out in
+    its own approved refactor, never inside an unrelated change.
 - Adapters never depend on each other.
 - One definition per concept, in `atm-core`. Never create a field-for-field
   copy of an existing type; an adapter's raw payload type exists only because
@@ -114,27 +125,38 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 
 ### Adding a harness
 
-A new harness touches these places (Codex, #30, touched 23 files):
+Steps 2 and 3 change public `atm-core` and `atm-protocol` types, so agree a
+new harness with the user before starting (principle 2). That one approval
+covers the steps below. Codex (#30) touched 23 files:
 
 1. A new `crates/atm-<vendor>-adapter`: raw payload types, event vocabulary
    and the mapping to `atm-core` lifecycle events. Its crate docs (`//!`)
    record the verified payloads, quirks and harness version.
 2. `atm-core`: a `Harness` variant and a `BUILTIN_HARNESSES` entry, static
-   facts only (see the exception above).
+   facts only. Amp, Qwen and Gemini already have both, with
+   `discovery_enabled: false`. Set it to `true` once the adapter exists, and
+   update `discovery.rs`'s test that lists the enabled harnesses.
 3. `atm-protocol`: a `MessageType::<Vendor>Event { data }` variant and its
-   constructor (`message.rs`), carrying the payload as opaque JSON, plus an
-   arm in `tests/proptest_roundtrip.rs`, whose coverage guard fails without
-   one.
+   constructor (`message.rs`), plus an arm in `tests/proptest_roundtrip.rs`,
+   whose coverage guard fails without one. `version.rs` says additive
+   changes bump the minor version, but `CURRENT` stayed 1.0 through
+   `PiEvent` and `CodexEvent`, and the hook scripts hard-code 1.0; decide
+   the bump with the user.
 4. `atmd`: the adapter dependency, and dispatch of the new message to the
    adapter in `server/connection.rs`. Discovery reads the registry entry;
    add the harness's process shapes to `discovery.rs`'s tests.
-5. The forwarder the harness runs: a hook script under `crates/atm/scripts/`,
-   or an extension (`extensions/pi-atm` is authoritative and
-   `crates/atm/assets/pi-atm` is its install mirror).
-6. `atm` (crate `atm-tui`): install and uninstall in `setup.rs`. A badge
-   colour in `ui/session_list.rs` is optional (unknown harnesses get grey).
+5. The forwarder the harness runs: a hook script under `crates/atm/scripts/`
+   or an extension. It must honour `ATM_SOCKET` (default `/tmp/atm.sock`),
+   as `atm-hook` and `atm-codex-hook` do. `extensions/pi-atm` is
+   authoritative, `crates/atm/assets/pi-atm` is its install mirror, and
+   `tests/setup_pi_package.rs` guards them.
+6. `atm` (crate `atm-tui`): the adapter dependency in `crates/atm/Cargo.toml`
+   (`setup.rs` reads the adapter's hook event list), and install and
+   uninstall in `setup.rs`. A badge colour in `ui/session_list.rs` is
+   optional; unknown harnesses get grey.
 7. The root `Cargo.toml` (`[workspace.dependencies]` and members) and
-   `.github/workflows/release.yml` (§2).
+   `.github/workflows/release.yml` (§2): the adapter publishes before
+   `atmd` and `atm-tui`.
 8. Tests: adapter tests on real captures (§3), an end-to-end replay in
    `crates/atmd/tests/server_integration.rs`, and setup tests in
    `tests/setup_*.rs`.
@@ -143,11 +165,15 @@ A new harness touches these places (Codex, #30, touched 23 files):
 ### Async rules
 
 - Never block the runtime; use `spawn_blocking` for sync work.
-  - **Exception: a read that can hang forever** (a FIFO, a stuck
-    filesystem) runs on a detached `std::thread` and reports back through a
-    `oneshot` with a timeout. tokio's runtime waits for every
-    `spawn_blocking` task when it drops, so a hung one stops the process
-    from ever exiting (#84).
+  - **Exception: blocking I/O that can hang forever** (a read of a FIFO, a
+    stuck filesystem) runs on a detached thread instead. tokio's runtime
+    waits for every `spawn_blocking` task when it drops, so a hung one stops
+    the process from ever exiting. Spawn it with `std::thread::Builder`, so
+    a failed spawn is an error rather than a panic. Report back through a
+    `oneshot` with a timeout, and keep at most one call in flight per
+    resource: keep the pending receiver instead of spawning again, or hung
+    calls pile up threads. #84 introduces the pattern. Older
+    `spawn_blocking` reads of hook-supplied paths predate this rule.
 - Every external operation (tmux, socket, subprocess) has a timeout.
 - Handle channel closure (`None`/`Err`) as a normal shutdown path.
 - Use `CancellationToken` for cooperative shutdown.
@@ -172,11 +198,13 @@ A new harness touches these places (Codex, #30, touched 23 files):
   the commit message. Never accept just to make a test pass.
 - Adapters: test against **real captured payloads** from the harness, not
   hand-imagined ones (principle 3).
-- Record every payload's provenance next to it, in the adapter's crate docs
-  or a comment beside the test: `Captured: <harness> <version>, <YYYY-MM-DD>,
-  <method>.` for a real capture, or `Synthetic: <why>` for a hand-built one.
-  Put the harness version in captured fixture filenames
-  (`claude_tui_session_2.1.310.jsonl`).
+- Mark each real capture where it's documented (the adapter's crate docs,
+  or a comment beside the test) with `Captured: <harness> <version>,
+  <YYYY-MM-DD>, <method>.`, writing "not recorded" for any part nobody
+  recorded. Mark a hand-built payload in an adapter's tests with
+  `Synthetic: <why>`. Unmarked payloads in other crates' tests are
+  hand-written, and the adapter's crate docs say so. Put the harness version
+  in captured fixture filenames (`claude_tui_session_2.1.310.jsonl`).
 
 ## 4. Workflow and guardrails
 

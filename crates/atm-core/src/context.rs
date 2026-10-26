@@ -97,7 +97,9 @@ impl fmt::Display for TokenCount {
 /// which correctly shows 0% context usage.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ContextUsage {
-    /// Total input tokens across all turns (cumulative, for reference)
+    /// Total input tokens across all turns (cumulative, for reference).
+    /// 0 with `total_output_tokens` when not reported: Claude reports
+    /// neither (see atm-claude-adapter's `status_line` module docs).
     pub total_input_tokens: TokenCount,
 
     /// Total output tokens across all turns (cumulative, for reference)

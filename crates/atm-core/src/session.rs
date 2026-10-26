@@ -513,9 +513,9 @@ pub struct StatusLineData {
     pub lines_added: u64,
     /// Lines of code removed
     pub lines_removed: u64,
-    /// Total input tokens across all requests
+    /// Total input tokens across all requests; 0 when not reported
     pub total_input_tokens: u64,
-    /// Total output tokens across all responses
+    /// Total output tokens across all responses; 0 when not reported
     pub total_output_tokens: u64,
     /// Context window size for the model; 0 when not reported
     pub context_window_size: u32,

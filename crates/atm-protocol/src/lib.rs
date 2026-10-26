@@ -3,8 +3,8 @@
 //! This crate provides vendor-neutral message types and parsing for
 //! communication between hook/extension scripts and the daemon, and
 //! between the daemon and TUI clients. Vendor-specific wire payloads
-//! (Claude `RawHookEvent`, pi `RawPiEvent`) live in their respective
-//! adapter crates.
+//! (Claude `RawHookEvent` and `RawStatusLine`, pi `RawPiEvent`) live in
+//! their respective adapter crates.
 
 pub mod message;
 pub mod version;

@@ -98,8 +98,7 @@ impl fmt::Display for TokenCount {
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ContextUsage {
     /// Total input tokens across all turns (cumulative, for reference).
-    /// 0 with `total_output_tokens` when not reported: Claude reports
-    /// neither (see atm-claude-adapter's `status_line` module docs).
+    /// 0 while the harness reports no session total.
     pub total_input_tokens: TokenCount,
 
     /// Total output tokens across all turns (cumulative, for reference)

@@ -30,15 +30,17 @@
 //!
 //! Claude reports no session token totals, so the parser maps
 //! `ContextUsage::total_input_tokens` and `total_output_tokens` to 0, the
-//! "not reported" value pi and Codex also leave there until their first
-//! usage. Both fields are cumulative in atm-core, and pi and Codex fill
-//! them with session totals. Claude's `context_window.total_input_tokens`
-//! is not a session total. On every line it equals the sum of the latest
-//! request's `input_tokens`, `cache_creation_input_tokens` and
-//! `cache_read_input_tokens`, and `total_output_tokens` stays at one
-//! request's 42 across requests. Both drop to 0 after `/compact`, while
-//! `cost.total_cost_usd` keeps growing. The 2.1.302 capture below shows
-//! the same: its 45772 is the sum of its `current_usage` input fields.
+//! value they hold until a harness reports a session total. atm-core
+//! documents both as cumulative; current pi-atm and Codex put their
+//! session total in `total_input_tokens`. Claude's
+//! `context_window.total_input_tokens` is not a session total. On every
+//! line it equals the sum of the latest request's `input_tokens`,
+//! `cache_creation_input_tokens` and `cache_read_input_tokens`, and
+//! `total_output_tokens` stays at one request's 42 across requests. Both
+//! drop to 0 after `/compact`, while `cost.total_cost_usd` keeps growing.
+//! The 2.1.302 line below fits too (its 45772 is the sum of its
+//! `current_usage` input fields), but alone it can't tell the two apart:
+//! a session's first request reads the same either way.
 //! Summing them per line wouldn't give a total either: consecutive lines
 //! can repeat one request's figures with no request between them (the
 //! cost doesn't change), and one line can follow several requests.
@@ -114,9 +116,10 @@ pub struct RawCost {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawContextWindow {
-    /// Unread, like `total_output_tokens`: one request's figures, not session totals (see the module docs)
+    /// Unread: one request's figures, not a session total (see the module docs)
     #[serde(default)]
     pub total_input_tokens: u64,
+    /// Unread: one request's figures, not a session total (see the module docs)
     #[serde(default)]
     pub total_output_tokens: u64,
     /// 0 when omitted, meaning "not reported"
@@ -170,7 +173,8 @@ impl RawStatusLine {
         session.update_from_status_line(&self.status_line_data())
     }
 
-    /// Maps every field. An absent model or window size maps to "" or 0,
+    /// Maps every field except the token totals, which are always 0 (see
+    /// the module docs). An absent model or window size maps to "" or 0,
     /// which core reads as not reported.
     fn status_line_data(&self) -> StatusLineData {
         let model = self.model.as_ref();
@@ -646,7 +650,10 @@ mod tests {
         );
         assert!(sessions.iter().all(|s| s.context.total_tokens().is_zero()));
         let mut updated = lines[0].to_session_domain().expect("model is present");
-        for raw in &lines[1..] {
+        let same_session = lines[1..]
+            .iter()
+            .filter(|raw| raw.session_id == lines[0].session_id);
+        for raw in same_session {
             raw.update_session(&mut updated);
             assert!(updated.context.total_tokens().is_zero());
         }

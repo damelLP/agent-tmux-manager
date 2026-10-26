@@ -643,8 +643,7 @@ impl RegistryActor {
                         pid = p,
                         "SessionEnd received, removing session"
                     );
-                    self.record_session_end(session_id, p, now);
-                    return self.handle_remove_by_pid(p, RemovalReason::SessionEnded);
+                    return self.end_session_in(session_id, p, now);
                 }
             }
 
@@ -670,29 +669,27 @@ impl RegistryActor {
         // a real session_id is our signal to reconcile, mirroring the
         // Claude status-line upgrade path. Limited to pending → real
         // so that ordinary pi events (which carry session_id on every
-        // frame) don't thrash the index.
+        // frame) don't thrash the index. A real id is replaced only by an
+        // untagged SessionStart, below.
         if let Some(p) = target_pid {
             if let Some((existing, _)) = self.sessions_by_pid.get(&p) {
                 let current_id = existing.id.clone();
                 if current_id.is_pending() && !session_id.is_pending() && current_id != session_id {
                     self.reconcile_session_id(p, current_id, session_id.clone());
-                } else if starts_session
-                    && pid == Some(p)
-                    && !session_id.is_pending()
-                    && current_id != session_id
-                {
+                } else if starts_session && !session_id.is_pending() && current_id != session_id {
                     // A new session took over the process (`/clear`, an
                     // in-process resume), so the one its row held ended
                     // there. End it as its SessionEnd would; the event
-                    // then starts a fresh row for its pid below.
+                    // then starts a fresh row for the pid below. (A
+                    // pid-less event finds its row through the id index,
+                    // so its row already has its id.)
                     info!(
                         session_id = %current_id,
                         pid = p,
                         new_id = %session_id,
                         "SessionStart of a new session, ending the session this process's row held"
                     );
-                    self.record_session_end(current_id, p, Utc::now());
-                    self.handle_remove_by_pid(p, RemovalReason::SessionEnded)?;
+                    self.end_session_in(current_id, p, Utc::now())?;
                 }
             }
         }
@@ -1041,6 +1038,18 @@ impl RegistryActor {
         self.ended_sessions
             .retain(|_, ended_at| marker_live(*ended_at, now));
         self.ended_sessions.insert((session_id, pid), now);
+    }
+
+    /// Ends `session_id` in `pid` at `now`, as its `SessionEnd` does: marks
+    /// it ended there and removes the pid's row, detaching its children.
+    fn end_session_in(
+        &mut self,
+        session_id: SessionId,
+        pid: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(), RegistryError> {
+        self.record_session_end(session_id, pid, now);
+        self.handle_remove_by_pid(pid, RemovalReason::SessionEnded)
     }
 
     /// Whether `session_id` ended in `pid` within [`ENDED_SESSION_TTL`]
@@ -2058,7 +2067,8 @@ mod tests {
         // adapter events with different real session_ids on the same
         // PID must NOT thrash the index — that would mean some other
         // bug (PID reuse, stale state) and the daemon shouldn't paper
-        // over it by silently renaming.
+        // over it by silently renaming. (Only an untagged SessionStart
+        // acts on a new real id: it ends the row's session.)
         let (_, mut actor, _) = create_actor();
         let current_pid = std::process::id();
 
@@ -4417,8 +4427,9 @@ mod tests {
         assert_eq!(markers, [(SessionId::new(NEW), pid)]);
     }
 
-    /// Only a `SessionEnd` removal records a marker; cleanup's removal of a
-    /// dead process doesn't.
+    /// Ending a session records a marker (its `SessionEnd`, or a new
+    /// session's `SessionStart` in its pid); cleanup's removal of a dead
+    /// process doesn't.
     #[test]
     fn cleanup_of_a_dead_process_records_no_marker() {
         let (_, mut actor, _) = create_actor();
@@ -4773,8 +4784,8 @@ mod tests {
     }
 
     /// A `SessionStart` with a pending id (older pi-atm sends
-    /// `pending-<pid>`) never ends a real row, and rediscovery doesn't
-    /// rename one to a pending id either.
+    /// `pending-<pid>`) never ends a real row. The same rule as
+    /// rediscovery, which keeps a real id over a pending one.
     #[test]
     fn session_start_with_a_pending_id_keeps_a_real_row() {
         let (_, mut actor, mut event_rx) = create_actor();

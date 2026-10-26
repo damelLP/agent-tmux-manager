@@ -67,7 +67,9 @@ pub enum MessageType {
     /// Client disconnecting gracefully
     Disconnect,
 
-    /// Request daemon to discover existing Claude sessions
+    /// Request daemon to discover existing sessions of each built-in
+    /// harness with
+    /// [`discovery_enabled`](atm_core::HarnessDefinition::discovery_enabled)
     Discover,
 }
 

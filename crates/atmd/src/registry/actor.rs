@@ -203,7 +203,8 @@ impl RegistryActor {
     /// Handles session registration.
     ///
     /// Note: This is now primarily used for testing. Most sessions are
-    /// registered via `handle_register_discovered` or status line updates.
+    /// registered via `handle_register_discovered`, status line updates or
+    /// adapter events.
     /// Without a PID, this creates a session that cannot be looked up by PID.
     fn handle_register(
         &mut self,

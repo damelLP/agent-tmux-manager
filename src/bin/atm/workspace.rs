@@ -3,7 +3,9 @@ use atm_tmux::{RealTmuxClient, TmuxClient, TmuxError};
 
 #[cfg(test)]
 use super::TEST_ENV_LOCK;
-use super::{shell_quote, tmux_shell_prefix};
+use super::{
+    build_spawn_command_for_harness, resolve_spawn_harness, shell_quote, tmux_shell_prefix,
+};
 
 /// `run-shell`'s argument to run the script at `path` with `args`: each one
 /// `sh -c` word, with `#` doubled because run-shell format-expands its
@@ -348,6 +350,10 @@ fn exec_attach(socket: &Option<String>, session_name: &str) -> Result<()> {
 // ============================================================================
 
 pub(super) async fn cmd_workspace(name: Option<String>, isolate: bool, editor: bool) -> Result<()> {
+    // 0. Resolve the agent command before any tmux call, so a bad harness
+    //    config fails with nothing created
+    let agent_cmd = build_spawn_command_for_harness(&resolve_spawn_harness(None)?, None, None);
+
     // 1. Determine session name, sanitized to safe characters
     let session_name = name.unwrap_or_else(default_session_name);
     validate_session_name(&session_name)?;
@@ -442,10 +448,10 @@ pub(super) async fn cmd_workspace(name: Option<String>, isolate: bool, editor: b
         .await?;
     }
 
-    // 8. Launch claude in agent pane
+    // 8. Launch the configured harness in agent pane
     tmux_run(
         &client,
-        &["send-keys", "-t", &agent_pane, "claude", "Enter"],
+        &["send-keys", "-t", &agent_pane, &agent_cmd, "Enter"],
     )
     .await?;
 

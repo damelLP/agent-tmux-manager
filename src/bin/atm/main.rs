@@ -634,7 +634,7 @@ async fn run_event_loop(
                                         // including ATM_SPAWN_BIN.
                                         let cmd = build_spawn_command(cwd.as_deref(), None);
                                         // Split without a command to get an interactive shell
-                                        // (ensures claude is on PATH), then send-keys.
+                                        // (the user's PATH and aliases), then send-keys.
                                         match client
                                             .split_window(target, "50%", direction, None)
                                             .await
@@ -891,6 +891,22 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Leaves a command word bare when it is only `[A-Za-z0-9_./-]`, so the
+/// shell still expands an alias of that name; quoting it would skip the
+/// alias. Anything else (including empty) goes through `shell_quote`, and
+/// so does a leading `-`, which `tmux send-keys` would read as its own flag.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'));
+    if plain {
+        s.to_string()
+    } else {
+        shell_quote(s)
+    }
+}
+
 /// Builds a shell-safe `tmux` command prefix for generated hook scripts.
 fn tmux_shell_prefix(socket: Option<String>) -> String {
     match socket {
@@ -1094,17 +1110,7 @@ fn build_spawn_command_for_harness(
 ) -> String {
     let spawn_bin = spawn_env_override(harness, "BIN");
     let base = spawn_bin.as_deref().unwrap_or(&harness.binary);
-    // A plain word stays bare so the shell still expands an alias of that
-    // name; quoting it would skip the alias.
-    let plain = !base.is_empty()
-        && base
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'));
-    let mut cmd = if plain {
-        base.to_string()
-    } else {
-        shell_quote(base)
-    };
+    let mut cmd = shell_word(base);
 
     if spawn_bin.is_none() {
         for arg in &harness.default_args {
@@ -1183,8 +1189,8 @@ async fn cmd_spawn(
 
     let pane_dir: atm_tmux::PaneDirection = direction.into();
     // Split without a command so the pane gets an interactive shell (which has
-    // claude on PATH).  Then send the command via send-keys, matching the
-    // approach used by `workspace create`.
+    // the user's PATH and aliases).  Then send the command via send-keys,
+    // matching the approach used by `workspace create`.
     let new_pane = client
         .split_window(current_pane, &size, pane_dir, None)
         .await
@@ -2019,7 +2025,48 @@ mod prompt_tests {
 
 #[cfg(test)]
 mod shell_quote_tests {
-    use super::tmux_shell_prefix;
+    use super::{shell_word, tmux_shell_prefix};
+
+    /// The spawn binary is the pane shell's command word. bash and zsh
+    /// expand an alias only for an unquoted word, and Claude Code's local
+    /// install is reachable only as `alias claude="~/.claude/local/claude"`
+    /// (2.1.310's "Local installation not accessible" fix text). So a plain
+    /// word is typed bare, and anything a shell could expand or split stays
+    /// quoted. A leading `-` stays quoted too: the command goes through
+    /// `tmux send-keys -t <pane> <keys>` first, and when there is no `cd`
+    /// prefix, tmux reads a bare `-x` as its own flag
+    /// (`command send-keys: unknown flag -x`, tmux 3.8).
+    #[test]
+    fn shell_word_leaves_only_plain_words_bare() {
+        for plain in [
+            "claude",
+            "pi",
+            "codex",
+            "/home/u/.claude/local/claude",
+            "./bin/agent-1.2_x",
+            "x-",
+        ] {
+            assert_eq!(shell_word(plain), plain, "{plain:?} should be bare");
+        }
+
+        for (word, quoted) in [
+            ("my agent", "'my agent'"),
+            ("it's", "'it'\\''s'"),
+            ("$HOME/claude", "'$HOME/claude'"),
+            ("~/.claude/local/claude", "'~/.claude/local/claude'"),
+            ("=claude", "'=claude'"),
+            ("FOO=1", "'FOO=1'"),
+            ("", "''"),
+            ("-x", "'-x'"),
+            ("-", "'-'"),
+            ("claude;id", "'claude;id'"),
+            ("cla*de", "'cla*de'"),
+            ("`id`", "'`id`'"),
+            ("claud\u{e9}", "'claud\u{e9}'"),
+        ] {
+            assert_eq!(shell_word(word), quoted, "{word:?} should stay quoted");
+        }
+    }
 
     #[test]
     fn tmux_shell_prefix_quotes_socket_label() {
@@ -2246,94 +2293,22 @@ mod spawn_command_tests {
             "custom-agent '--profile' 'atm' --model-id 'abc'"
         );
 
+        // 18. Only the command word may go bare. Default args, the model and
+        //     the cwd are still quoted, even when they are plain words too.
+        let plain_word_harness = SpawnHarnessDefinition {
+            id: "word-probe".to_string(),
+            binary: "claude".to_string(),
+            default_args: vec!["--profile".to_string(), "a b".to_string()],
+            model_flag: Some("--model".to_string()),
+        };
+        assert_eq!(
+            build_spawn_command_for_harness(&plain_word_harness, Some("/work dir"), Some("opus")),
+            "cd '/work dir' && claude '--profile' 'a b' --model 'opus'"
+        );
+
         // env's Drop restores the captured values, even if any of the
         // assert_eq!s above panicked.
         let _ = config_home;
         let _ = config_dir;
-    }
-
-    /// A harness with no default args or model flag, under an id no
-    /// `ATM_SPAWN_<HARNESS>_*` variable names.
-    fn harness_with_binary(binary: &str) -> SpawnHarnessDefinition {
-        SpawnHarnessDefinition {
-            id: "word-probe".to_string(),
-            binary: binary.to_string(),
-            default_args: Vec::new(),
-            model_flag: None,
-        }
-    }
-
-    /// The binary is the pane shell's command word. bash and zsh expand an
-    /// alias only for an unquoted word, and Claude Code's local install is
-    /// reachable only as `alias claude="~/.claude/local/claude"` (2.1.310's
-    /// "Local installation not accessible" fix text). So a plain word is
-    /// typed bare, and anything a shell could expand or split stays quoted.
-    #[test]
-    fn spawn_binary_is_bare_only_when_shell_safe() {
-        let _guard = super::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bin = EnvGuard::capture("ATM_SPAWN_BIN");
-        let args = EnvGuard::capture("ATM_SPAWN_ARGS");
-        bin.unset();
-        args.unset();
-
-        for safe in [
-            "claude",
-            "pi",
-            "codex",
-            "/home/u/.claude/local/claude",
-            "./bin/agent-1.2_x",
-            "-x",
-        ] {
-            assert_eq!(
-                build_spawn_command_for_harness(&harness_with_binary(safe), None, None),
-                safe,
-                "{safe:?} should be typed bare"
-            );
-        }
-
-        for (unsafe_bin, quoted) in [
-            ("my agent", "'my agent'"),
-            ("it's", "'it'\\''s'"),
-            ("$HOME/claude", "'$HOME/claude'"),
-            ("~/.claude/local/claude", "'~/.claude/local/claude'"),
-            ("=claude", "'=claude'"),
-            ("FOO=1", "'FOO=1'"),
-            ("", "''"),
-            ("claude;id", "'claude;id'"),
-            ("cla*de", "'cla*de'"),
-            ("`id`", "'`id`'"),
-            ("claud\u{e9}", "'claud\u{e9}'"),
-        ] {
-            assert_eq!(
-                build_spawn_command_for_harness(&harness_with_binary(unsafe_bin), None, None),
-                quoted,
-                "{unsafe_bin:?} should stay quoted"
-            );
-        }
-    }
-
-    /// Only the command word may go bare. Default args, the model and the
-    /// cwd are still quoted, even when they are plain words too.
-    #[test]
-    fn spawn_args_stay_quoted_after_a_bare_binary() {
-        let _guard = super::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bin = EnvGuard::capture("ATM_SPAWN_BIN");
-        let args = EnvGuard::capture("ATM_SPAWN_ARGS");
-        bin.unset();
-        args.unset();
-
-        let harness = SpawnHarnessDefinition {
-            default_args: vec!["--profile".to_string(), "a b".to_string()],
-            model_flag: Some("--model".to_string()),
-            ..harness_with_binary("claude")
-        };
-        assert_eq!(
-            build_spawn_command_for_harness(&harness, Some("/work dir"), Some("opus")),
-            "cd '/work dir' && claude '--profile' 'a b' --model 'opus'"
-        );
     }
 }

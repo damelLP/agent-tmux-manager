@@ -28,16 +28,22 @@
 //! setting (`--model ""`, `ANTHROPIC_MODEL=`) falls back to the default
 //! model instead.
 //!
-//! Claude's mapping violates atm-core's cumulative contract for
-//! `ContextUsage::total_input_tokens` and `total_output_tokens`, which
-//! pi and Codex fill with session totals; no consumer reads them today.
-//! Claude's `context_window.total_input_tokens` is not a session total.
-//! On every line it equals the sum of the latest request's
-//! `input_tokens`, `cache_creation_input_tokens` and
-//! `cache_read_input_tokens`, and `total_output_tokens` stays at one
-//! request's 42 across requests. Both drop to 0 after `/compact`, while
-//! `cost.total_cost_usd` keeps growing. The 2.1.302 capture below shows
-//! the same: its 45772 is the sum of its `current_usage` input fields.
+//! Claude reports no session token totals, so the parser maps
+//! `ContextUsage::total_input_tokens` and `total_output_tokens` to 0, the
+//! value they hold until a harness reports a session total. atm-core
+//! documents both as cumulative; current pi-atm and Codex put their
+//! session total in `total_input_tokens`. Claude's
+//! `context_window.total_input_tokens` is not a session total. On every
+//! line it equals the sum of the latest request's `input_tokens`,
+//! `cache_creation_input_tokens` and `cache_read_input_tokens`, and
+//! `total_output_tokens` stays at one request's 42 across requests. Both
+//! drop to 0 after `/compact`, while `cost.total_cost_usd` keeps growing.
+//! The 2.1.302 line below fits too (its 45772 is the sum of its
+//! `current_usage` input fields), but alone it can't tell the two apart:
+//! a session's first request reads the same either way.
+//! Summing them per line wouldn't give a total either: consecutive lines
+//! can repeat one request's figures with no request between them (the
+//! cost doesn't change), and one line can follow several requests.
 //!
 //! `test_update_session_applies_context_window_size` uses one status
 //! line trimmed to the fields read. Captured: Claude Code 2.1.302, a
@@ -110,8 +116,10 @@ pub struct RawCost {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawContextWindow {
+    /// Unread: one request's figures, not a session total (see the module docs)
     #[serde(default)]
     pub total_input_tokens: u64,
+    /// Unread: one request's figures, not a session total (see the module docs)
     #[serde(default)]
     pub total_output_tokens: u64,
     /// 0 when omitted, meaning "not reported"
@@ -165,7 +173,8 @@ impl RawStatusLine {
         session.update_from_status_line(&self.status_line_data())
     }
 
-    /// Maps every field. An absent model or window size maps to "" or 0,
+    /// Maps every field except the token totals, which are always 0 (see
+    /// the module docs). An absent model or window size maps to "" or 0,
     /// which core reads as not reported.
     fn status_line_data(&self) -> StatusLineData {
         let model = self.model.as_ref();
@@ -182,8 +191,8 @@ impl RawStatusLine {
             api_duration_ms: cost.map(|c| c.total_api_duration_ms).unwrap_or(0),
             lines_added: cost.map(|c| c.total_lines_added).unwrap_or(0),
             lines_removed: cost.map(|c| c.total_lines_removed).unwrap_or(0),
-            total_input_tokens: context.map(|c| c.total_input_tokens).unwrap_or(0),
-            total_output_tokens: context.map(|c| c.total_output_tokens).unwrap_or(0),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             context_window_size: context.map(|c| c.context_window_size).unwrap_or(0),
             current_input_tokens: current.map(|c| c.input_tokens).unwrap_or(0),
             current_output_tokens: current.map(|c| c.output_tokens).unwrap_or(0),
@@ -221,7 +230,9 @@ mod tests {
         assert_eq!(session.id.as_str(), "test-123");
         assert_eq!(session.model, Model::Opus45);
         assert!((session.cost.as_usd() - 0.35).abs() < 0.001);
-        assert_eq!(session.context.total_input_tokens.as_u64(), 5000);
+        // Claude's totals are per-request figures, so they map to the
+        // "not reported" 0 (see the module docs).
+        assert_eq!(session.context.total_input_tokens.as_u64(), 0);
     }
 
     #[test]
@@ -629,6 +640,23 @@ mod tests {
         // a side request with no tools.
         assert_eq!(sessions[2].context.context_tokens().as_u64(), 5302);
         assert!((sessions[2].cost.as_usd() - 0.014292).abs() < 1e-9);
+
+        // `context_window.total_input_tokens` repeats that request's 5302
+        // rather than a session total, so neither path reports totals.
+        let window = lines[2].context_window.as_ref().expect("window is present");
+        assert_eq!(
+            (window.total_input_tokens, window.total_output_tokens),
+            (5302, 42)
+        );
+        assert!(sessions.iter().all(|s| s.context.total_tokens().is_zero()));
+        let mut updated = lines[0].to_session_domain().expect("model is present");
+        let same_session = lines[1..]
+            .iter()
+            .filter(|raw| raw.session_id == lines[0].session_id);
+        for raw in same_session {
+            raw.update_session(&mut updated);
+            assert!(updated.context.total_tokens().is_zero());
+        }
     }
 
     #[test]

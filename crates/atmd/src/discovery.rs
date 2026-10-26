@@ -2,9 +2,10 @@
 //!
 //! Scans `/proc` for running agent processes and registers them with
 //! minimal data. Each process is tested against per-harness detectors
-//! (Claude Code, pi, future) and the matching `Harness` is recorded so
-//! the registry tags the session correctly. Full session data arrives
-//! via status-line updates (Claude) or extension events (pi).
+//! (Claude Code, pi, Codex, future) and the matching `Harness` is recorded
+//! so the registry tags the session correctly. Full session data arrives
+//! via status-line updates (Claude), extension events (pi) or hook events
+//! (Codex).
 //!
 //! # Async Safety
 //!
@@ -98,9 +99,9 @@ struct DiscoveredProcess {
 // Discovery Service
 // ============================================================================
 
-/// Service for discovering existing Claude Code sessions.
+/// Service for discovering existing coding-agent sessions.
 ///
-/// Scans `/proc` for Claude processes and registers them in the registry.
+/// Scans `/proc` for agent processes and registers them in the registry.
 /// Called on daemon startup and when TUI requests a rescan.
 pub struct DiscoveryService {
     registry: RegistryHandle,
@@ -142,10 +143,10 @@ impl DiscoveryService {
         }
     }
 
-    /// Discover and register existing Claude sessions.
+    /// Discover and register existing coding-agent sessions.
     ///
-    /// Scans `/proc` for Claude processes, finds their transcripts,
-    /// and registers minimal sessions in the registry.
+    /// Scans `/proc` for agent processes and registers minimal sessions
+    /// in the registry.
     ///
     /// # Returns
     ///
@@ -231,11 +232,11 @@ impl DiscoveryService {
         result
     }
 
-    /// Discovers a session for a Claude process.
+    /// Discovers a session for an agent process.
     ///
     /// Always registers a pending session with ID `pending-{pid}`. The real
-    /// session_id will be set when the first status line update arrives
-    /// (which includes both session_id and pid).
+    /// session_id will be set when the first status line update or adapter
+    /// event carrying both session_id and pid arrives.
     ///
     /// We intentionally avoid using transcript filenames as session IDs because:
     /// - Multiple Claude processes in the same directory share the same transcript folder
@@ -648,7 +649,8 @@ use std::time::{Duration, SystemTime};
 /// Example: `/home/user/code/project` -> `~/.claude/projects/-home-user-code-project/`
 ///
 /// Note: This function is no longer used in production discovery.
-/// We now always use pending-{pid} and let status line updates provide the real session ID.
+/// We now always use pending-{pid} and let status line updates or adapter
+/// events provide the real session ID.
 /// Kept for tests and potential future use.
 #[cfg(test)]
 fn cwd_to_project_dir(cwd: &Path) -> PathBuf {
@@ -673,7 +675,8 @@ fn cwd_to_project_dir(cwd: &Path) -> PathBuf {
 /// This function performs blocking I/O and should be called via `spawn_blocking`.
 ///
 /// Note: This function is no longer used in production discovery.
-/// We now always use pending-{pid} and let status line updates provide the real session ID.
+/// We now always use pending-{pid} and let status line updates or adapter
+/// events provide the real session ID.
 /// Kept for tests and potential future use.
 #[cfg(test)]
 fn find_active_transcript(project_dir: &Path, max_age_secs: u64) -> Option<PathBuf> {

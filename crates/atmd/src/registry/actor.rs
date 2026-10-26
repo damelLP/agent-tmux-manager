@@ -62,7 +62,7 @@ pub struct RegistryActor {
     receiver: mpsc::Receiver<RegistryCommand>,
 
     /// Primary session storage: PID → (SessionDomain, SessionInfrastructure)
-    /// PID is the primary key because one Claude process = one session.
+    /// PID is the primary key because one agent process = one session.
     sessions_by_pid: HashMap<u32, (SessionDomain, SessionInfrastructure)>,
 
     /// Index for session_id → PID lookups.
@@ -422,7 +422,7 @@ impl RegistryActor {
     /// see the id transition cleanly. Links to `old_id` follow the rename.
     ///
     /// Used by both the Claude status-line path and any vendor adapter
-    /// (pi today) whose first events arrive before the real session_id
+    /// (pi and Codex today) whose first events arrive before the real session_id
     /// is known. Without this, a session discovered as `pending-{pid}`
     /// stays at that id forever even after real adapter events fire.
     ///
@@ -1061,7 +1061,7 @@ impl RegistryActor {
 
     /// Handles cleanup of dead-process sessions.
     ///
-    /// Removes sessions whose Claude Code process has terminated
+    /// Removes sessions whose agent process has terminated
     /// (PID no longer exists or was reused by a different process).
     fn handle_cleanup_stale(&mut self) {
         let now = Utc::now();

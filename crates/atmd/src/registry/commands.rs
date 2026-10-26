@@ -75,8 +75,9 @@ pub enum RegistryCommand {
     ///
     /// Updates session status by dispatching on the `LifecycleEvent`
     /// variant. The connection layer is responsible for translating raw
-    /// vendor events (Claude `RawHookEvent`, pi extension messages) into
-    /// `LifecycleEvent` before constructing this command.
+    /// vendor events (Claude `RawHookEvent`, pi extension messages, Codex
+    /// `RawCodexEvent`) into `LifecycleEvent` before constructing this
+    /// command.
     ///
     /// # Errors
     /// - `RegistryError::RegistryFull` if it would create a session in a full registry
@@ -131,7 +132,7 @@ pub enum RegistryCommand {
     /// Trigger cleanup of dead-process sessions.
     ///
     /// This is a fire-and-forget command used by the cleanup task.
-    /// Sessions whose Claude Code process has died are removed.
+    /// Sessions whose agent process has died are removed.
     CleanupStale,
 
     /// Refresh git info (branch, worktree) for all sessions.
@@ -144,13 +145,13 @@ pub enum RegistryCommand {
     /// Register a discovered session (minimal data from /proc scan).
     ///
     /// Creates a minimal session with defaults that will be filled in
-    /// when status line updates arrive.
+    /// when status line updates or adapter events arrive.
     ///
     /// # Errors
     /// - `RegistryError::SessionAlreadyExists` if a session with this ID exists
     /// - `RegistryError::RegistryFull` if at maximum capacity
     RegisterDiscovered {
-        /// ID of the discovered session (from transcript filename)
+        /// ID of the discovered session (`pending-{pid}` from discovery)
         session_id: SessionId,
         /// Process ID of the discovered agent process
         pid: u32,
@@ -158,7 +159,7 @@ pub enum RegistryCommand {
         cwd: std::path::PathBuf,
         /// Tmux pane ID if running in tmux
         tmux_pane: Option<String>,
-        /// Which harness the discoverer matched (Claude / pi / future).
+        /// Which harness the discoverer matched (Claude / pi / Codex / future).
         harness: Harness,
         /// Channel to send the result
         respond_to: oneshot::Sender<Result<(), RegistryError>>,
@@ -251,7 +252,7 @@ pub enum RemovalReason {
     /// Removed to make room for new sessions when registry was full.
     RegistryFull,
 
-    /// Adapter (Claude or pi) emitted a session-end lifecycle event
+    /// Adapter (Claude, pi or Codex) emitted a session-end lifecycle event
     /// indicating the agent closed normally.
     SessionEnded,
 

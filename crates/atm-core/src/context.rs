@@ -89,9 +89,10 @@ impl fmt::Display for TokenCount {
 
 /// Context window usage information.
 ///
-/// Tracks token counts and calculates usage percentage based on `current_usage`
-/// from Claude Code's status line. The `current_usage` object reflects the actual
-/// tokens being sent to the API in the current context window.
+/// Tracks token counts and calculates usage percentage from the tokens in the
+/// current context window. Claude Code reports them in its status line's
+/// `current_usage` object, which reflects the actual tokens being sent to the
+/// API; other harnesses report them through `LifecycleEvent::ContextUpdate`.
 ///
 /// When `current_usage` is null (e.g., during /clear), all current_* fields are 0,
 /// which correctly shows 0% context usage.

@@ -19,10 +19,11 @@ use tracing::{debug, info, warn};
 
 use atm_core::{
     AgentType, BackgroundActivity, ChildAlias, ChildRef, LifecycleContext, LifecycleEvent,
-    SessionDomain, SessionId, SessionInfrastructure, SessionView, StatusLineData,
+    SessionDomain, SessionId, SessionView, StatusLineData,
 };
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
+use super::infra::SessionInfrastructure;
 use crate::discovery::read_parent_session_id;
 
 // ============================================================================

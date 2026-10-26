@@ -153,7 +153,6 @@ name = "atm-core"
 version = "0.2.7"
 dependencies = [
  "chrono",
- "procfs",
  "proptest",
  "serde",
  "serde_json",
@@ -236,6 +235,7 @@ dependencies = [
  "atm-tmux",
  "chrono",
  "clap",
+ "procfs",
  "serde",
  "serde_json",
  "sysinfo",

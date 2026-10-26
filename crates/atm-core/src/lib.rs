@@ -38,7 +38,7 @@ pub use model::{derive_display_name, Model};
 pub use project::{resolve_project_root, resolve_worktree_info};
 pub use session::{
     format_age, ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId,
-    SessionInfrastructure, SessionStatus, SessionView, StatusLineData,
+    SessionStatus, SessionView, StatusLineData,
 };
 pub use tool::Tool;
 pub use tree::{

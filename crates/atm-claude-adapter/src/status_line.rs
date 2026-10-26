@@ -195,10 +195,6 @@ impl RawStatusLine {
     }
 }
 
-// `RawHookEvent` and the Claude→LifecycleEvent translation moved to the
-// `atm-claude-adapter` crate (see `atm_claude_adapter::wire::RawHookEvent`
-// and `atm_claude_adapter::translate`).
-
 #[cfg(test)]
 mod tests {
     use super::*;

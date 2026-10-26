@@ -1042,7 +1042,8 @@ mod tests {
     }
 
     // Synthetic: the status lines below are hand-written, trimmed to the
-    // fields each test needs. Captured lines are tested in atm-protocol.
+    // fields each test needs. Captured lines are tested in
+    // atm-claude-adapter's status_line.rs.
 
     #[test]
     fn test_parse_status_line_returns_pid_and_data() {

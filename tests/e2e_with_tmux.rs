@@ -41,7 +41,9 @@
 //!    anything. Create runs the configured default harness in the agent
 //!    pane (a stand-in `pi` named by an isolated config), and an unknown
 //!    default fails before tmux runs, leaving nothing behind. An
-//!    `ATM_SPAWN_*_ARGS` override ending in `;` still launches it.
+//!    `ATM_SPAWN_*_ARGS` override ending in `;` still launches it. With no
+//!    config, create types exactly `claude`, then `Enter` on its own; a
+//!    logging `tmux` on atm's PATH swallows that `Enter`, so nothing runs.
 //!
 //! The test skips cleanly (printed message, returns Ok) when `tmux` is
 //! absent from PATH, when the binaries weren't built, or — for scenario
@@ -1708,6 +1710,101 @@ fn write_pi_standin(dir: &Path, log: &Path) -> PathBuf {
     path
 }
 
+/// Scenario 5g — with no config, create types exactly `claude` into the agent
+/// pane, then `Enter` in its own `send-keys`: the same keys it typed before it
+/// read the config. A logging `tmux` first on atm's PATH records every argv
+/// and forwards it to the real tmux, except that lone `Enter`, so the pane
+/// never runs a harness.
+async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
+    let session_name = format!("jghkeys{}", std::process::id());
+    // Kills the workspace's server however the scenario ends.
+    let tmux = PrivateTmux {
+        socket_label: format!("atm-{session_name}"),
+    };
+    let data_dir = tempfile::tempdir().expect("create keys data tempdir");
+    let config_home = tempfile::tempdir().expect("create keys config tempdir");
+    let wrapper_dir = tempfile::tempdir().expect("create tmux wrapper tempdir");
+    let log = wrapper_dir.path().join("tmux-argv.log");
+    write_tmux_logging_wrapper(wrapper_dir.path(), &log);
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(wrapper_dir.path().to_path_buf()).chain(std::env::split_paths(&path_var)),
+    )
+    .expect("join PATH");
+
+    let output = Command::new(&env.atm_path)
+        .args(["workspace", "create", "--name", &session_name, "--isolate"])
+        .env("ATM_NO_ATTACH", "1")
+        .env("PATH", &path)
+        // Empty: no config.toml, so the built-in default applies.
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_DATA_HOME", data_dir.path())
+        .env("XDG_STATE_HOME", &env.daemon.state_dir)
+        .env("ATM_SOCKET", &env.daemon.socket_path)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("ATM_TMUX_SOCKET")
+        // These change the keys; the runner's must not leak in.
+        .env_remove("ATM_SPAWN_BIN")
+        .env_remove("ATM_SPAWN_ARGS")
+        .env_remove("ATM_SPAWN_CLAUDE_BIN")
+        .env_remove("ATM_SPAWN_CLAUDE_ARGS")
+        .output()
+        .expect("run atm workspace create (no config)");
+    assert!(
+        output.status.success(),
+        "atm workspace create with no config failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let agent_pane = top_non_sidebar_pane(tmux.label(), &session_name);
+    let logged = std::fs::read_to_string(&log).expect("read the tmux argv log");
+    let target = format!("[send-keys] [-t] [{agent_pane}] ");
+    let agent_keys: Vec<&str> = logged.lines().filter(|l| l.contains(&target)).collect();
+    let call = format!("[-L] [{}] {target}", tmux.label());
+    assert_eq!(
+        agent_keys,
+        [
+            format!("{call}[claude]"),
+            format!("{call}[Enter] swallowed")
+        ],
+        "create should send `claude`, then `Enter` alone, to agent pane {agent_pane}; \
+         tmux argv log:\n{logged}"
+    );
+}
+
+/// Writes a `tmux` into `dir` that appends its argv to `log`, one `[arg]` per
+/// argument, then execs the real tmux. A lone `-L <label> send-keys -t <pane>
+/// Enter` is logged with ` swallowed` and not forwarded.
+fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
+    let path_var = std::env::var_os("PATH").expect("PATH is set");
+    let real = std::env::split_paths(&path_var)
+        .map(|dir| dir.join("tmux"))
+        .find(|candidate| candidate.is_file())
+        .expect("tmux on PATH (checked at setup)");
+    let (real, log) = (real.display().to_string(), log.display().to_string());
+    // Both paths go inside single quotes in the script.
+    assert!(
+        !real.contains('\'') && !log.contains('\''),
+        "wrapper paths must not contain a single quote: {real} {log}"
+    );
+    let body = format!(
+        "#!/bin/sh\nline=\nfor arg in \"$@\"; do line=\"$line [$arg]\"; done\n\
+         if [ \"$#\" -eq 6 ] && [ \"$3\" = send-keys ] && [ \"$6\" = Enter ]; then\n\
+         \x20 printf '%s swallowed\\n' \"${{line# }}\" >> '{log}'\n\x20 exit 0\nfi\n\
+         printf '%s\\n' \"${{line# }}\" >> '{log}'\nexec '{real}' \"$@\"\n"
+    );
+    let path = dir.join("tmux");
+    std::fs::write(&path, body).expect("write tmux wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&path)
+        .expect("stat tmux wrapper")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod tmux wrapper");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn atm_atmd_tmux_end_to_end() {
     let Some(env) = E2eEnv::try_setup().await else {
@@ -1734,6 +1831,7 @@ async fn atm_atmd_tmux_end_to_end() {
     scenario_workspace_create_launches_configured_harness(&env).await;
     scenario_workspace_create_rejects_unknown_harness(&env).await;
     scenario_workspace_create_sends_args_ending_in_semicolon(&env).await;
+    scenario_workspace_create_sends_default_keys(&env).await;
 }
 
 #[derive(Debug)]

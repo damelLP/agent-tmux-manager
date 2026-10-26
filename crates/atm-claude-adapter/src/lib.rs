@@ -278,7 +278,12 @@
 //!   the cleared session sends `SessionEnd` (reason `resume`), then
 //!   `SessionStart` (source `resume`) for the old id in the same pid, and
 //!   a redraw status line ~50 ms later; that `SessionStart` lifts the
-//!   drop, so the redraw line counts (sealed TUI run, 2.1.310).
+//!   drop, so the redraw line counts (sealed TUI run, 2.1.310). atm-hook
+//!   sends each call from its own process, so `SessionStart(new)` can
+//!   reach atmd before `SessionEnd(old)`. A `SessionStart` with a new id
+//!   ends the session the pid's row held, so the late `SessionEnd(old)`
+//!   keeps the new session's row (sealed TUI run, 2.1.310, with the
+//!   `SessionEnd` delivered 0.5 s late).
 //! - **A user's interrupt fires no hook.** In sealed TUI runs, pressing
 //!   Esc while Claude streamed a reply, and denying a permission dialog
 //!   in manual mode (Esc or "No"), sent no hook at all: no `Stop`, no

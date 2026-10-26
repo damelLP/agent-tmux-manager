@@ -1240,14 +1240,16 @@ fn apply_status_line(
     }
 }
 
-/// How long after a `SessionEnd` its process's status lines for the ended
-/// session are dropped. Claude Code 2.1.310 sends one ~30 ms after
-/// `SessionEnd` on `/clear`; 10 s leaves a wide margin for a loaded host.
+/// How long after a session ends in a process (see `ended_sessions`) its
+/// status lines from that process are dropped, and a `SessionEnd` that no
+/// longer names the process's row keeps it. Claude Code 2.1.310 sends a
+/// status line ~30 ms after `SessionEnd` on `/clear`; 10 s leaves a wide
+/// margin for a loaded host.
 const ENDED_SESSION_TTL: chrono::Duration = chrono::Duration::seconds(10);
 
-/// Whether a `SessionEnd` marker set at `ended_at` still drops status lines
-/// at `now`. A clock that went backwards expires it, accepting them as
-/// before the marker existed.
+/// Whether an ended-session marker set at `ended_at` is still live at
+/// `now`. A clock that went backwards expires it, which restores the
+/// behaviour from before the marker existed.
 fn marker_live(ended_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     let age = now.signed_duration_since(ended_at);
     age >= chrono::Duration::zero() && age < ENDED_SESSION_TTL
@@ -4630,7 +4632,7 @@ mod tests {
     #[test]
     fn session_start_from_a_new_pid_creates_its_own_row() {
         let pid = std::process::id();
-        let new_pid = std::os::unix::process::parent_id();
+        let new_pid = UNUSED_PID;
         let (_, mut actor, mut event_rx) = create_actor();
         old_session_at(&mut actor, &mut event_rx);
         session_end(&mut actor, OLD, pid, "prompt_input_exit");

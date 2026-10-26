@@ -495,8 +495,10 @@ export default function (pi: ExtensionAPI): void {
 	// (/new, /resume, /fork) in place under this same instance, while pi
 	// 0.65+ loads a new instance per session. One frame gets the wrong id:
 	// an in-memory fork (`--no-session`) moves the session manager to the
-	// new id before the old instance's `session_shutdown`. atmd ends
-	// sessions by pid, so it doesn't use that id.
+	// new id before the old instance's `session_shutdown`. atmd still ends
+	// that session by pid: a SessionEnd naming another id keeps the row only
+	// when a `session_start` already moved the row off that id, and none
+	// has here.
 	let cachedSessionId: string | undefined;
 	let uiPatched = false;
 

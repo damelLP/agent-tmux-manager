@@ -13,15 +13,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use atm_core::{
     AgentType, BackgroundActivity, ChildAlias, ChildRef, LifecycleContext, LifecycleEvent,
-    NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure, SessionView,
+    NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure, SessionView, StatusLineData,
 };
-use atm_protocol::RawStatusLine;
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
 use crate::discovery::read_parent_session_id;
@@ -76,6 +75,12 @@ pub struct RegistryActor {
     /// Parent-scoped child references mapped to the child session ids they
     /// resolved to, learned from aliases.
     child_refs: HashMap<(SessionId, ChildRef), SessionId>,
+
+    /// When each `(session_id, pid)` ended: its `SessionEnd` removed it, or
+    /// a new session's `SessionStart` in that pid ended it. Until
+    /// [`ENDED_SESSION_TTL`] passes, a status line for a pair is dropped,
+    /// and so is a `SessionEnd` that no longer names the pid's row.
+    ended_sessions: HashMap<(SessionId, u32), DateTime<Utc>>,
 }
 
 impl RegistryActor {
@@ -95,6 +100,7 @@ impl RegistryActor {
             session_id_to_pid: HashMap::new(),
             event_publisher,
             child_refs: HashMap::new(),
+            ended_sessions: HashMap::new(),
         }
     }
 
@@ -129,10 +135,12 @@ impl RegistryActor {
             }
             RegistryCommand::UpdateFromStatusLine {
                 session_id,
+                pid,
                 data,
+                harness,
                 respond_to,
             } => {
-                let result = self.handle_update_from_status_line(session_id, data);
+                let result = self.handle_update_from_status_line(session_id, pid, data, harness);
                 let _ = respond_to.send(result);
             }
             RegistryCommand::ApplyLifecycleEvent {
@@ -234,12 +242,7 @@ impl RegistryActor {
         // Resolve project/worktree if not already set
         let mut session = session;
         if session.project_root.is_none() {
-            if let Some(ref cwd) = session.working_directory {
-                session.project_root = atm_core::resolve_project_root(cwd);
-                let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                session.worktree_path = wt_path;
-                session.worktree_branch = wt_branch;
-            }
+            apply_git_context(&mut session);
         }
 
         let session_id = session.id.clone();
@@ -361,11 +364,8 @@ impl RegistryActor {
             // Update session_id to match the new discovery
             existing_session.id = session_id.clone();
 
-            existing_session.working_directory = Some(cwd_str.clone());
-            existing_session.project_root = atm_core::resolve_project_root(&cwd_str);
-            let (wt_path, wt_branch) = atm_core::resolve_worktree_info(&cwd_str);
-            existing_session.worktree_path = wt_path;
-            existing_session.worktree_branch = wt_branch;
+            existing_session.working_directory = Some(cwd_str);
+            apply_git_context(existing_session);
             if tmux_pane.is_some() {
                 existing_session.tmux_pane = tmux_pane;
             }
@@ -377,13 +377,11 @@ impl RegistryActor {
                 "Re-discovered existing session, refreshed git info (metadata preserved)"
             );
 
-            let view = SessionView::from_domain(existing_session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
+            self.publish_updated(pid);
+            self.rename_links(&old_id, &session_id);
 
             // Update the session_id index
-            self.session_id_to_pid.remove(&old_id);
+            self.unindex(&old_id, pid);
             self.session_id_to_pid.insert(session_id, pid);
 
             return Ok(());
@@ -413,12 +411,7 @@ impl RegistryActor {
         );
 
         // Also publish an initial Updated event so TUI shows it
-        if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
-            let view = SessionView::from_domain(session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
-        }
+        self.publish_updated(pid);
 
         Ok(())
     }
@@ -426,7 +419,7 @@ impl RegistryActor {
     /// Renames an existing session at `pid` from `old_id` to `new_id`,
     /// updates the session_id index, and publishes the
     /// `Removed{Upgraded}` + `Registered` event pair so TUI subscribers
-    /// see the id transition cleanly.
+    /// see the id transition cleanly. Links to `old_id` follow the rename.
     ///
     /// Used by both the Claude status-line path and any vendor adapter
     /// (pi today) whose first events arrive before the real session_id
@@ -444,7 +437,7 @@ impl RegistryActor {
         session.id = new_id.clone();
         let agent_type = session.agent_type.clone();
 
-        self.session_id_to_pid.remove(&old_id);
+        self.unindex(&old_id, pid);
         self.session_id_to_pid.insert(new_id.clone(), pid);
 
         info!(
@@ -454,14 +447,45 @@ impl RegistryActor {
             "Session ID upgraded"
         );
 
-        let _ = self.event_publisher.send(SessionEvent::Removed {
-            session_id: old_id,
-            reason: RemovalReason::Upgraded,
-        });
+        self.publish_removed(old_id.clone(), RemovalReason::Upgraded);
         let _ = self.event_publisher.send(SessionEvent::Registered {
-            session_id: new_id,
+            session_id: new_id.clone(),
             agent_type,
         });
+        self.rename_links(&old_id, &new_id);
+    }
+
+    /// Points every parent/child link to `old` at `new` after a session
+    /// rename, then publishes each session whose links changed.
+    fn rename_links(&mut self, old: &SessionId, new: &SessionId) {
+        // A row still holds `old` when nothing was renamed, or when another
+        // row shares the id and may own these links; shared ids are the
+        // user's open question (#97), so they stay as they are.
+        if self.sessions_by_pid.values().any(|(s, _)| s.id == *old) {
+            return;
+        }
+        let mut relinked = Vec::new();
+        for (pid, (session, _)) in &mut self.sessions_by_pid {
+            let links = (session.parent_session_id.iter_mut())
+                .chain(&mut session.child_session_ids)
+                .filter(|id| *id == old);
+            let mut changed = false;
+            for id in links {
+                *id = new.clone();
+                changed = true;
+            }
+            if changed {
+                relinked.push(*pid);
+            }
+        }
+        let rename = |id: SessionId| if id == *old { new.clone() } else { id };
+        self.child_refs = std::mem::take(&mut self.child_refs)
+            .into_iter()
+            .map(|((parent, reference), child)| ((rename(parent), reference), rename(child)))
+            .collect();
+        for pid in relinked {
+            self.publish_updated(pid);
+        }
     }
 
     /// Handles status line update.
@@ -472,45 +496,21 @@ impl RegistryActor {
     fn handle_update_from_status_line(
         &mut self,
         session_id: SessionId,
-        data: serde_json::Value,
+        status_pid: Option<u32>,
+        data: StatusLineData,
+        harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
-        // Parse the raw status line
-        let raw_status: RawStatusLine =
-            serde_json::from_value(data).map_err(RegistryError::parse)?;
-
-        // Extract PID from status line
-        let status_pid = raw_status.pid;
-
         // Primary lookup: by PID (preferred)
         if let Some(pid) = status_pid {
             if pid != 0 {
-                return self.update_or_create_by_pid(pid, session_id, raw_status);
+                return self.update_or_create_by_pid(pid, session_id, data, harness);
             }
         }
 
         // Fallback: lookup by session_id (when no PID available)
         if let Some(&pid) = self.session_id_to_pid.get(&session_id) {
             if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-                let cwd_changed = raw_status.update_session(session);
-                infra.record_update();
-
-                // Resolve project/worktree if not yet set, or if cwd changed
-                if session.project_root.is_none() || cwd_changed {
-                    if let Some(ref cwd) = session.working_directory {
-                        if cwd_changed {
-                            info!(
-                                session_id = %session_id,
-                                pid = pid,
-                                new_cwd = %cwd,
-                                "Working directory changed, re-resolving git info"
-                            );
-                        }
-                        session.project_root = atm_core::resolve_project_root(cwd);
-                        let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                        session.worktree_path = wt_path;
-                        session.worktree_branch = wt_branch;
-                    }
-                }
+                apply_status_line(session, infra, &data, &session_id, pid);
 
                 debug!(
                     session_id = %session_id,
@@ -519,10 +519,7 @@ impl RegistryActor {
                     "Session updated from status line (by session_id)"
                 );
 
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
+                self.publish_updated(pid);
             }
             return Ok(());
         }
@@ -538,12 +535,24 @@ impl RegistryActor {
     /// Updates an existing session by PID, or creates a new one.
     ///
     /// This is the core logic for status line handling with PID as primary key.
+    /// A late status line for a session that just ended in this PID is
+    /// dropped, so it can't bring the ended session back.
     fn update_or_create_by_pid(
         &mut self,
         pid: u32,
         session_id: SessionId,
-        raw_status: RawStatusLine,
+        data: StatusLineData,
+        harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
+        if self.ended_in(&session_id, pid, Utc::now()) {
+            debug!(
+                session_id = %session_id,
+                pid = pid,
+                "Status line for a session that ended in this process, ignoring"
+            );
+            return Ok(());
+        }
+
         // If a session already exists at this PID with a different id
         // (e.g. pending → real), reconcile *before* taking the mutable
         // borrow below so the helper can access `self` cleanly. The
@@ -556,26 +565,8 @@ impl RegistryActor {
         }
 
         if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-            let cwd_changed = raw_status.update_session(session);
-            infra.record_update();
-
-            // Resolve project/worktree if not yet set, or if cwd changed
-            if session.project_root.is_none() || cwd_changed {
-                if let Some(ref cwd) = session.working_directory {
-                    if cwd_changed {
-                        info!(
-                            session_id = %session.id,
-                            pid = pid,
-                            new_cwd = %cwd,
-                            "Working directory changed, re-resolving git info"
-                        );
-                    }
-                    session.project_root = atm_core::resolve_project_root(cwd);
-                    let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                    session.worktree_path = wt_path;
-                    session.worktree_branch = wt_branch;
-                }
-            }
+            let log_id = session.id.clone();
+            apply_status_line(session, infra, &data, &log_id, pid);
 
             debug!(
                 session_id = %session_id,
@@ -584,31 +575,14 @@ impl RegistryActor {
                 "Session updated from status line"
             );
 
-            let view = SessionView::from_domain(session);
-            let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(view),
-            });
+            self.publish_updated(pid);
         } else {
             // Session doesn't exist - create it
-            let mut session = match raw_status.to_session_domain() {
-                Some(s) => s,
-                None => {
-                    debug!(
-                        session_id = %session_id,
-                        pid = pid,
-                        "Status line missing required fields for session creation"
-                    );
-                    return Ok(());
-                }
-            };
+            let mut session = SessionDomain::from_status_line(&data);
+            session.harness = harness;
 
             // Resolve project/worktree from working directory
-            if let Some(ref cwd) = session.working_directory {
-                session.project_root = atm_core::resolve_project_root(cwd);
-                let (wt_path, wt_branch) = atm_core::resolve_worktree_info(cwd);
-                session.worktree_path = wt_path;
-                session.worktree_branch = wt_branch;
-            }
+            apply_git_context(&mut session);
 
             self.insert_new_session(pid, session)?;
 
@@ -618,12 +592,7 @@ impl RegistryActor {
                 "Session auto-registered from status line"
             );
 
-            if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
-            }
+            self.publish_updated(pid);
         }
 
         Ok(())
@@ -634,7 +603,13 @@ impl RegistryActor {
     /// With PID as primary key, we can look up by PID when available.
     ///
     /// Special cases:
-    /// - An untagged `SessionEnd` immediately removes the session from the registry.
+    /// - An untagged `SessionEnd` immediately removes the session from the
+    ///   registry, and marks it ended in that process (see `ended_sessions`).
+    ///   An untagged `SessionStart` for the same id and process clears the mark.
+    /// - An untagged `SessionStart` with a new id ends the session its
+    ///   process's row held, as that session's `SessionEnd` would, and starts
+    ///   a fresh row. A `SessionEnd` for the old id that arrives afterwards
+    ///   keeps the new row.
     /// - `ChildSessionStart`/`ChildSessionEnd` create and remove in-process children.
     fn handle_apply_lifecycle_event(
         &mut self,
@@ -650,13 +625,25 @@ impl RegistryActor {
         // Untagged SessionEnd: remove session immediately.
         if context.child.is_none() && matches!(event, LifecycleEvent::SessionEnd { .. }) {
             if let Some(p) = target_pid {
-                if self.sessions_by_pid.contains_key(&p) {
+                if let Some((session, _)) = self.sessions_by_pid.get(&p) {
+                    let now = Utc::now();
+                    // A SessionStart already ended `session_id` in this
+                    // process, so the row is a newer session's.
+                    if session.id != session_id && self.ended_in(&session_id, p, now) {
+                        info!(
+                            session_id = %session_id,
+                            pid = p,
+                            current_id = %session.id,
+                            "SessionEnd for a session this process moved on from, keeping the row"
+                        );
+                        return Ok(());
+                    }
                     info!(
                         session_id = %session_id,
                         pid = p,
                         "SessionEnd received, removing session"
                     );
-                    return self.handle_remove_by_pid(p, RemovalReason::SessionEnded);
+                    return self.end_session_in(session_id, p, now);
                 }
             }
 
@@ -667,17 +654,42 @@ impl RegistryActor {
             return Ok(());
         }
 
+        // A session started again in the process it ended in (an in-process
+        // resume) takes its status lines again.
+        let starts_session =
+            context.child.is_none() && matches!(event, LifecycleEvent::SessionStart { .. });
+        if starts_session {
+            if let Some(p) = target_pid {
+                self.ended_sessions.remove(&(session_id.clone(), p));
+            }
+        }
+
         // Pending → real upgrade: a session discovered via /proc starts
         // life as `pending-{pid}`. The first vendor-adapter event with
         // a real session_id is our signal to reconcile, mirroring the
         // Claude status-line upgrade path. Limited to pending → real
         // so that ordinary pi events (which carry session_id on every
-        // frame) don't thrash the index.
+        // frame) don't thrash the index. A real id is replaced only by an
+        // untagged SessionStart, below.
         if let Some(p) = target_pid {
             if let Some((existing, _)) = self.sessions_by_pid.get(&p) {
                 let current_id = existing.id.clone();
                 if current_id.is_pending() && !session_id.is_pending() && current_id != session_id {
                     self.reconcile_session_id(p, current_id, session_id.clone());
+                } else if starts_session && !session_id.is_pending() && current_id != session_id {
+                    // A new session took over the process (`/clear`, an
+                    // in-process resume), so the one its row held ended
+                    // there. End it as its SessionEnd would; the event
+                    // then starts a fresh row for the pid below. (A
+                    // pid-less event finds its row through the id index,
+                    // so its row already has its id.)
+                    info!(
+                        session_id = %current_id,
+                        pid = p,
+                        new_id = %session_id,
+                        "SessionStart of a new session, ending the session this process's row held"
+                    );
+                    self.end_session_in(current_id, p, Utc::now())?;
                 }
             }
         }
@@ -780,6 +792,13 @@ impl RegistryActor {
                 session: Box::new(SessionView::from_domain(session)),
             });
         }
+    }
+
+    /// Publishes that `session_id` left the registry.
+    fn publish_removed(&self, session_id: SessionId, reason: RemovalReason) {
+        let _ = self
+            .event_publisher
+            .send(SessionEvent::Removed { session_id, reason });
     }
 
     /// Applies `event` to the session stored under `pid` and publishes it.
@@ -952,28 +971,11 @@ impl RegistryActor {
         session_id: SessionId,
         reason: RemovalReason,
     ) -> Result<(), RegistryError> {
-        let pid = match self.session_id_to_pid.remove(&session_id) {
-            Some(p) => p,
+        let pid = match self.session_id_to_pid.get(&session_id) {
+            Some(p) => *p,
             None => return Err(RegistryError::SessionNotFound(session_id)),
         };
-
-        if let Some((session, _)) = self.sessions_by_pid.remove(&pid) {
-            self.detach_removed_session(&session, reason);
-        }
-
-        info!(
-            session_id = %session_id,
-            pid = pid,
-            reason = %reason,
-            remaining_sessions = self.sessions_by_pid.len(),
-            "Session removed"
-        );
-
-        // Publish removed event
-        let _ = self
-            .event_publisher
-            .send(SessionEvent::Removed { session_id, reason });
-
+        self.remove_and_announce(pid, session_id, reason);
         Ok(())
     }
 
@@ -983,18 +985,22 @@ impl RegistryActor {
         pid: u32,
         reason: RemovalReason,
     ) -> Result<(), RegistryError> {
-        let (session, _) = match self.sessions_by_pid.remove(&pid) {
-            Some(entry) => entry,
+        let session_id = match self.sessions_by_pid.get(&pid) {
+            Some((session, _)) => session.id.clone(),
             None => {
                 return Err(RegistryError::SessionNotFound(SessionId::new(format!(
                     "pid-{pid}"
                 ))));
             }
         };
+        self.remove_and_announce(pid, session_id, reason);
+        Ok(())
+    }
 
-        let session_id = session.id.clone();
-        self.session_id_to_pid.remove(&session_id);
-        self.detach_removed_session(&session, reason);
+    /// Removes the session at `pid`, then logs and publishes its removal
+    /// as `session_id`.
+    fn remove_and_announce(&mut self, pid: u32, session_id: SessionId, reason: RemovalReason) {
+        self.remove_entry(pid, &session_id, reason);
 
         info!(
             session_id = %session_id,
@@ -1004,12 +1010,53 @@ impl RegistryActor {
             "Session removed"
         );
 
-        // Publish removed event
-        let _ = self
-            .event_publisher
-            .send(SessionEvent::Removed { session_id, reason });
+        self.publish_removed(session_id, reason);
+    }
 
-        Ok(())
+    /// Removes the row at `pid` and `session_id`'s index entry if it points
+    /// at `pid`, then detaches the removed session from its parent and
+    /// children.
+    fn remove_entry(&mut self, pid: u32, session_id: &SessionId, reason: RemovalReason) {
+        let removed = self.sessions_by_pid.remove(&pid);
+        self.unindex(session_id, pid);
+        if let Some((session, _)) = removed {
+            self.detach_removed_session(&session, reason);
+        }
+    }
+
+    /// Drops `session_id`'s index entry only if it points at `pid`. Another
+    /// process can report the same id, and its row keeps the entry.
+    fn unindex(&mut self, session_id: &SessionId, pid: u32) {
+        if self.session_id_to_pid.get(session_id) == Some(&pid) {
+            self.session_id_to_pid.remove(session_id);
+        }
+    }
+
+    /// Marks `session_id` as ended in `pid` at `now`, first dropping the
+    /// markers that have expired, which bounds the map.
+    fn record_session_end(&mut self, session_id: SessionId, pid: u32, now: DateTime<Utc>) {
+        self.ended_sessions
+            .retain(|_, ended_at| marker_live(*ended_at, now));
+        self.ended_sessions.insert((session_id, pid), now);
+    }
+
+    /// Ends `session_id` in `pid` at `now`, as its `SessionEnd` does: marks
+    /// it ended there and removes the pid's row, detaching its children.
+    fn end_session_in(
+        &mut self,
+        session_id: SessionId,
+        pid: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(), RegistryError> {
+        self.record_session_end(session_id, pid, now);
+        self.handle_remove_by_pid(pid, RemovalReason::SessionEnded)
+    }
+
+    /// Whether `session_id` ended in `pid` within [`ENDED_SESSION_TTL`]
+    /// before `now`.
+    fn ended_in(&self, session_id: &SessionId, pid: u32, now: DateTime<Utc>) -> bool {
+        let ended_at = self.ended_sessions.get(&(session_id.clone(), pid));
+        ended_at.is_some_and(|ended_at| marker_live(*ended_at, now))
     }
 
     /// Handles cleanup of dead-process sessions.
@@ -1051,11 +1098,7 @@ impl RegistryActor {
                 })
                 .unwrap_or_default();
 
-            let removed = self.sessions_by_pid.remove(&pid);
-            self.session_id_to_pid.remove(&session_id);
-            if let Some((session, _)) = removed {
-                self.detach_removed_session(&session, RemovalReason::ProcessDied);
-            }
+            self.remove_entry(pid, &session_id, RemovalReason::ProcessDied);
 
             // Use warn! so it shows up without RUST_LOG=debug
             warn!(
@@ -1065,11 +1108,7 @@ impl RegistryActor {
                 "Session removed by cleanup"
             );
 
-            // Publish removed event
-            let _ = self.event_publisher.send(SessionEvent::Removed {
-                session_id,
-                reason: RemovalReason::ProcessDied,
-            });
+            self.publish_removed(session_id, RemovalReason::ProcessDied);
         }
     }
 
@@ -1078,7 +1117,7 @@ impl RegistryActor {
     /// Detects branch switches that happen without a working directory change
     /// (e.g., `git checkout other-branch` in the same directory).
     fn handle_refresh_git_info(&mut self) {
-        let mut updated_count = 0;
+        let mut updated_pids = Vec::new();
 
         for (pid, (session, _)) in self.sessions_by_pid.iter_mut() {
             let cwd = match &session.working_directory {
@@ -1086,8 +1125,7 @@ impl RegistryActor {
                 None => continue,
             };
 
-            let new_project_root = atm_core::resolve_project_root(&cwd);
-            let (new_wt_path, new_wt_branch) = atm_core::resolve_worktree_info(&cwd);
+            let (new_project_root, new_wt_path, new_wt_branch) = resolve_git_context(&cwd);
 
             let changed = session.project_root != new_project_root
                 || session.worktree_path != new_wt_path
@@ -1104,15 +1142,16 @@ impl RegistryActor {
                 session.project_root = new_project_root;
                 session.worktree_path = new_wt_path;
                 session.worktree_branch = new_wt_branch;
-                updated_count += 1;
-
-                let view = SessionView::from_domain(session);
-                let _ = self.event_publisher.send(SessionEvent::Updated {
-                    session: Box::new(view),
-                });
+                updated_pids.push(*pid);
             }
         }
 
+        // Publish in loop order once the loop's borrow has ended
+        for pid in &updated_pids {
+            self.publish_updated(*pid);
+        }
+
+        let updated_count = updated_pids.len();
         if updated_count > 0 {
             info!(updated_count, "Git info refresh completed with changes");
         }
@@ -1158,13 +1197,79 @@ fn build_session_from_pid(
         // Note: resolve_* are local stat() calls walking up ~5 dirs (~5μs),
         // acceptable inline per Tokio guidelines for sub-100μs sync work.
         let cwd_str = cwd.to_string_lossy().to_string();
-        session.project_root = atm_core::resolve_project_root(&cwd_str);
-        let (wt_path, wt_branch) = atm_core::resolve_worktree_info(&cwd_str);
-        session.worktree_path = wt_path;
-        session.worktree_branch = wt_branch;
+        (
+            session.project_root,
+            session.worktree_path,
+            session.worktree_branch,
+        ) = resolve_git_context(&cwd_str);
         session.working_directory = Some(cwd_str);
     }
     session
+}
+
+/// Resolves the git context of `cwd`: its project root, worktree path and
+/// worktree branch. The worktree fields are only set when `cwd` is itself a
+/// repo or worktree root (see `atm_core::resolve_worktree_info`).
+fn resolve_git_context(cwd: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let project_root = atm_core::resolve_project_root(cwd);
+    let (worktree_path, worktree_branch) = atm_core::resolve_worktree_info(cwd);
+    (project_root, worktree_path, worktree_branch)
+}
+
+/// Sets `session`'s project root and worktree fields from its working
+/// directory. Leaves them alone when it has none.
+fn apply_git_context(session: &mut SessionDomain) {
+    if let Some(cwd) = &session.working_directory {
+        (
+            session.project_root,
+            session.worktree_path,
+            session.worktree_branch,
+        ) = resolve_git_context(cwd);
+    }
+}
+
+/// Applies a status line to a stored session and counts the update. Then
+/// re-resolves the git context if the project root is unset or the working
+/// directory changed, logging `log_id` on a change.
+fn apply_status_line(
+    session: &mut SessionDomain,
+    infra: &mut SessionInfrastructure,
+    data: &StatusLineData,
+    log_id: &SessionId,
+    pid: u32,
+) {
+    let cwd_changed = session.update_from_status_line(data);
+    infra.record_update();
+
+    // Resolve project/worktree if not yet set, or if cwd changed
+    if session.project_root.is_none() || cwd_changed {
+        if let Some(ref cwd) = session.working_directory {
+            if cwd_changed {
+                info!(
+                    session_id = %log_id,
+                    pid = pid,
+                    new_cwd = %cwd,
+                    "Working directory changed, re-resolving git info"
+                );
+            }
+            apply_git_context(session);
+        }
+    }
+}
+
+/// How long after a session ends in a process (see `ended_sessions`) its
+/// status lines from that process are dropped, and a `SessionEnd` that no
+/// longer names the process's row keeps it. Claude Code 2.1.310 sends a
+/// status line ~30 ms after `SessionEnd` on `/clear`; 10 s leaves a wide
+/// margin for a loaded host.
+const ENDED_SESSION_TTL: chrono::Duration = chrono::Duration::seconds(10);
+
+/// Whether an ended-session marker set at `ended_at` is still live at
+/// `now`. A clock that went backwards expires it, which restores the
+/// behaviour from before the marker existed.
+fn marker_live(ended_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now.signed_duration_since(ended_at);
+    age >= chrono::Duration::zero() && age < ENDED_SESSION_TTL
 }
 
 /// Extracts a tool name from a `LifecycleEvent`, when present.
@@ -1187,6 +1292,7 @@ fn tool_name_from_event(event: &LifecycleEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::parse_status_line;
     use atm_core::ChildAgent;
     use atm_core::{AgentType, Model, Tool};
     use tokio::sync::oneshot;
@@ -1642,15 +1748,19 @@ mod tests {
         fill_registry(&mut actor, MAX_SESSIONS);
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "one-too-many",
+            "pid": UNUSED_PID,
+            "model": {"id": "claude-sonnet-4-20250514"},
+            "cost": {"total_cost_usd": 0.10, "total_duration_ms": 5000},
+            "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
+        }))
+        .unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("one-too-many"),
-            data: serde_json::json!({
-                "session_id": "one-too-many",
-                "pid": UNUSED_PID,
-                "model": {"id": "claude-sonnet-4-20250514"},
-                "cost": {"total_cost_usd": 0.10, "total_duration_ms": 5000},
-                "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
-            }),
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
 
@@ -1683,9 +1793,12 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("test-123"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
 
@@ -1721,9 +1834,12 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("new-session"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
 
@@ -1792,9 +1908,12 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         let cmd = RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("real-session-uuid"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         };
         actor.handle_command(cmd);
@@ -1948,7 +2067,8 @@ mod tests {
         // adapter events with different real session_ids on the same
         // PID must NOT thrash the index — that would mean some other
         // bug (PID reuse, stale state) and the daemon shouldn't paper
-        // over it by silently renaming.
+        // over it by silently renaming. (Only an untagged SessionStart
+        // acts on a new real id: it ends the row's session.)
         let (_, mut actor, _) = create_actor();
         let current_pid = std::process::id();
 
@@ -2025,9 +2145,12 @@ mod tests {
             "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
         });
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         let cmd = RegistryCommand::UpdateFromStatusLine {
             session_id: real_id.clone(),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         };
         actor.handle_command(cmd);
@@ -2204,9 +2327,12 @@ mod tests {
             }
         });
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("real-id"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();
@@ -2303,9 +2429,12 @@ mod tests {
             "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
         });
         let (tx, rx) = oneshot::channel();
+        let (pid, data) = parse_status_line(status_json).unwrap();
         actor.handle_command(RegistryCommand::UpdateFromStatusLine {
             session_id: SessionId::new("cwd-test"),
-            data: status_json,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();
@@ -2327,6 +2456,171 @@ mod tests {
             Some(repo_b.to_str().unwrap()),
             "project_root should point to repo_b"
         );
+    }
+
+    /// Creates a git repo at `path` whose HEAD names `branch`.
+    fn init_repo(path: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        std::fs::write(
+            path.join(".git/HEAD"),
+            format!("ref: refs/heads/{branch}\n"),
+        )
+        .unwrap();
+    }
+
+    fn register_session_in(actor: &mut RegistryActor, session: SessionDomain) {
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Register {
+            session: Box::new(session),
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_register_resolves_git_unless_project_root_is_set() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("register-repo");
+        init_repo(&repo, "main");
+        let repo = repo.to_str().unwrap();
+
+        let mut fresh = create_test_session("register-fresh");
+        fresh.working_directory = Some(repo.to_string());
+        register_session_in(&mut actor, fresh);
+        let mut preset = create_test_session("register-preset");
+        preset.working_directory = Some(repo.to_string());
+        preset.project_root = Some("/preset".to_string());
+        register_session_in(&mut actor, preset);
+        let mut no_cwd = create_test_session("register-no-cwd");
+        no_cwd.worktree_branch = Some("kept".to_string());
+        register_session_in(&mut actor, no_cwd);
+
+        let fresh = session_view(&actor, "register-fresh").unwrap();
+        assert_eq!(fresh.project_root.as_deref(), Some(repo));
+        assert_eq!(fresh.worktree_path.as_deref(), Some(repo));
+        assert_eq!(fresh.worktree_branch.as_deref(), Some("main"));
+        let preset = session_view(&actor, "register-preset").unwrap();
+        assert_eq!(preset.project_root.as_deref(), Some("/preset"));
+        assert_eq!(
+            preset.worktree_branch, None,
+            "a preset project root skips git resolution"
+        );
+        let no_cwd = session_view(&actor, "register-no-cwd").unwrap();
+        assert_eq!(
+            no_cwd.worktree_branch.as_deref(),
+            Some("kept"),
+            "without a working directory the git fields are left alone"
+        );
+    }
+
+    #[test]
+    fn test_status_line_without_pid_re_resolves_git_on_cwd_change() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let mut session = create_test_session("no-pid-cwd");
+        session.working_directory = Some(repo_a.to_str().unwrap().to_string());
+        register_session_in(&mut actor, session);
+
+        // No "pid" field: the registry finds the session by its id.
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "no-pid-cwd",
+            "cwd": repo_b.to_str().unwrap(),
+            "model": {"id": "claude-sonnet-4-20250514"}
+        }))
+        .unwrap();
+        assert_eq!(pid, None);
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id: SessionId::new("no-pid-cwd"),
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+
+        let view = session_view(&actor, "no-pid-cwd").unwrap();
+        assert_eq!(view.project_root.as_deref(), repo_b.to_str());
+        assert_eq!(view.worktree_branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn test_status_line_auto_register_resolves_linked_worktree() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let main_repo = dir.path().join("main-repo");
+        let gitdir = main_repo.join(".git/worktrees/wt");
+        let worktree = dir.path().join("wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "wt-session",
+            "pid": std::process::id(),
+            "cwd": worktree.to_str().unwrap(),
+            "model": {"id": "claude-sonnet-4-20250514"}
+        }))
+        .unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id: SessionId::new("wt-session"),
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+
+        let view = session_view(&actor, "wt-session").unwrap();
+        assert_eq!(view.project_root.as_deref(), main_repo.to_str());
+        assert_eq!(view.worktree_path.as_deref(), worktree.to_str());
+        assert_eq!(view.worktree_branch.as_deref(), Some("wt-branch"));
+    }
+
+    #[test]
+    fn test_lifecycle_event_for_new_pid_resolves_git_from_proc_cwd() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("lifecycle-repo");
+        init_repo(&repo, "main");
+        // /proc/{pid}/cwd is canonical, so compare against the canonical path.
+        let repo = repo.canonicalize().unwrap();
+        // `read` blocks sh on stdin, so the process lives until `kill`.
+        let mut process = std::process::Command::new("sh")
+            .args(["-c", "read _"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in agent");
+
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new("lifecycle-git"),
+            event: LifecycleEvent::WorkingStart,
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(process.id()),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        let view = session_view(&actor, "lifecycle-git");
+        let _ = process.kill();
+        let _ = process.wait();
+
+        let view = view.unwrap();
+        assert_eq!(view.project_root.as_deref(), repo.to_str());
+        assert_eq!(view.worktree_branch.as_deref(), Some("main"));
     }
 
     fn register_test_session(actor: &mut RegistryActor, id: &str) -> SessionId {
@@ -2405,14 +2699,16 @@ mod tests {
             }),
             ..LifecycleContext::default()
         };
+        let lead_status = session_view(&actor, "lead").map(|view| view.status);
         needs_input_from(&mut actor, &parent, child_context.clone());
         assert_eq!(
             session_view(&actor, "agent-1").map(|view| view.status),
             Some(atm_core::SessionStatus::AttentionNeeded)
         );
+        // The child's needs-input stays on the child's row.
         assert_eq!(
             session_view(&actor, "lead").map(|view| view.status),
-            Some(atm_core::SessionStatus::Working)
+            lead_status
         );
 
         apply_with_context(
@@ -2576,5 +2872,1959 @@ mod tests {
 
         apply_with_context(&mut actor, &parent, LifecycleEvent::WorkingEnd, stop(0, 0));
         assert!(session_view(&actor, "agent-1").is_none());
+    }
+
+    // ========================================================================
+    // Status-line and Updated-event pins
+    // ========================================================================
+
+    /// Drains the queued events. Returns a `"<kind> <id>"` summary of each,
+    /// in order, and the views the `Updated` events carried.
+    fn drain_events(rx: &mut broadcast::Receiver<SessionEvent>) -> (Vec<String>, Vec<SessionView>) {
+        let mut summaries = Vec::new();
+        let mut views = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            summaries.push(match event {
+                SessionEvent::Registered { session_id, .. } => format!("Registered {session_id}"),
+                SessionEvent::Updated { session } => {
+                    let summary = format!("Updated {}", session.id);
+                    views.push(*session);
+                    summary
+                }
+                SessionEvent::Removed { session_id, reason } => {
+                    format!("Removed {session_id} {reason:?}")
+                }
+            });
+        }
+        (summaries, views)
+    }
+
+    /// `view` as JSON without its clock-derived age fields.
+    fn view_json(view: &SessionView) -> serde_json::Value {
+        let mut json = serde_json::to_value(view).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("last_activity_display").unwrap();
+        fields.remove("age_display").unwrap();
+        json
+    }
+
+    /// Asserts that a published view matches a fresh view of the same session.
+    fn assert_view_is_current(actor: &RegistryActor, view: &SessionView) {
+        let current = session_view(actor, view.id.as_str()).unwrap();
+        assert_eq!(view_json(view), view_json(&current));
+    }
+
+    fn send_status_line(actor: &mut RegistryActor, json: serde_json::Value) {
+        let session_id = SessionId::new(json["session_id"].as_str().unwrap());
+        let (pid, data) = parse_status_line(json).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id,
+            pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    fn discover(
+        actor: &mut RegistryActor,
+        id: SessionId,
+        pid: u32,
+        cwd: &std::path::Path,
+        tmux_pane: Option<&str>,
+    ) {
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::RegisterDiscovered {
+            session_id: id,
+            pid,
+            cwd: cwd.to_path_buf(),
+            tmux_pane: tmux_pane.map(String::from),
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to: tx,
+        });
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    fn pid_of(actor: &RegistryActor, id: &str) -> u32 {
+        actor.session_id_to_pid[&SessionId::new(id)]
+    }
+
+    fn update_count(actor: &RegistryActor, id: &str) -> u64 {
+        actor.sessions_by_pid[&pid_of(actor, id)].1.update_count
+    }
+
+    fn path_str(path: &std::path::Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    /// Runs `f` and returns what it logged, up to DEBUG, one line per event.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        // tracing caches each callsite's interest. While only one
+        // dispatcher is registered it asks just the thread that hits the
+        // callsite first, so a parallel test could switch a line off for
+        // this one. An idle second dispatcher makes it ask every live one.
+        static IDLE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        IDLE.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn rediscovery_of_an_upgraded_session_publishes_one_updated_view() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, &repo_a, None);
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "real-a",
+                "pid": pid,
+                "cwd": path_str(&repo_a),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.30, "total_duration_ms": 5000}
+            }),
+        );
+        drain_events(&mut event_rx);
+
+        // Discovery only knows the pending id; the session keeps its real one.
+        discover(&mut actor, pending, pid, &repo_b, Some("%7"));
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated real-a"]);
+        let view = &views[0];
+        assert_view_is_current(&actor, view);
+        // The view shortens long paths, so check the stored session's cwd.
+        let stored = &actor.sessions_by_pid[&pid].0;
+        assert_eq!(stored.working_directory.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(view.project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(view.worktree_branch.as_deref(), Some("feature"));
+        assert_eq!(view.tmux_pane.as_deref(), Some("%7"));
+        assert_eq!(
+            view.cost_usd, 0.30,
+            "rediscovery keeps the session's metadata"
+        );
+    }
+
+    #[test]
+    fn new_discovery_publishes_registered_then_updated() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo, "main");
+        let pid = std::process::id();
+        let id = SessionId::pending_from_pid(pid);
+
+        discover(&mut actor, id.clone(), pid, &repo, None);
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [format!("Registered {id}"), format!("Updated {id}")]
+        );
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn status_line_by_session_id_updates_counts_and_publishes() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let mut session = create_test_session("by-id");
+        session.working_directory = Some(path_str(&repo_a).to_string());
+        register_session_in(&mut actor, session);
+        drain_events(&mut event_rx);
+
+        // No "pid" field: the registry finds the session by its id.
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "by-id",
+                "cwd": path_str(&repo_b),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.50, "total_duration_ms": 5000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated by-id"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.50);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
+        assert_eq!(update_count(&actor, "by-id"), 1);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "by-id",
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.75, "total_duration_ms": 6000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated by-id"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.75);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(update_count(&actor, "by-id"), 2);
+    }
+
+    #[test]
+    fn status_line_by_pid_upgrade_publishes_removed_registered_updated() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, &repo_a, None);
+        drain_events(&mut event_rx);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "real-d",
+                "pid": pid,
+                "cwd": path_str(&repo_b),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.40, "total_duration_ms": 5000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                format!("Removed {pending} Upgraded"),
+                "Registered real-d".to_string(),
+                "Updated real-d".to_string(),
+            ]
+        );
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.40);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
+        assert_eq!(update_count(&actor, "real-d"), 1);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "real-d",
+                "pid": pid,
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.60, "total_duration_ms": 6000}
+            }),
+        );
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated real-d"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.60);
+        assert_eq!(update_count(&actor, "real-d"), 2);
+    }
+
+    #[test]
+    fn status_line_auto_register_publishes_registered_then_updated() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo, "main");
+        let status_line = |cost: f64| {
+            serde_json::json!({
+                "session_id": "auto-e",
+                "pid": std::process::id(),
+                "cwd": path_str(&repo),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": cost, "total_duration_ms": 5000}
+            })
+        };
+
+        send_status_line(&mut actor, status_line(0.10));
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Registered auto-e", "Updated auto-e"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.10);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("main"));
+        assert_eq!(
+            update_count(&actor, "auto-e"),
+            0,
+            "creating a session is not counted as an update"
+        );
+
+        send_status_line(&mut actor, status_line(0.20));
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated auto-e"]);
+        assert_view_is_current(&actor, &views[0]);
+        assert_eq!(views[0].cost_usd, 0.20);
+        assert_eq!(update_count(&actor, "auto-e"), 1);
+    }
+
+    #[test]
+    fn status_line_resolves_git_when_project_root_is_unset() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "main");
+        let mut by_id = create_test_session("unset-by-id");
+        by_id.working_directory = Some(path_str(&repo_a).to_string());
+        register_session_in(&mut actor, by_id);
+        let pid = std::process::id();
+        discover(
+            &mut actor,
+            SessionId::new("unset-by-pid"),
+            pid,
+            &repo_b,
+            None,
+        );
+        // As if the directories were not repos when the sessions were
+        // resolved. Clearing the fields directly keeps the test independent
+        // of whether TMPDIR sits inside some other checkout.
+        for id in ["unset-by-id", "unset-by-pid"] {
+            let session = &mut actor
+                .sessions_by_pid
+                .get_mut(&pid_of(&actor, id))
+                .unwrap()
+                .0;
+            session.project_root = None;
+            session.worktree_path = None;
+            session.worktree_branch = None;
+        }
+
+        // The status lines report no cwd change.
+        let model = serde_json::json!({"id": "claude-sonnet-4-20250514"});
+        send_status_line(
+            &mut actor,
+            serde_json::json!({"session_id": "unset-by-id", "model": model}),
+        );
+        send_status_line(
+            &mut actor,
+            serde_json::json!({"session_id": "unset-by-pid", "pid": pid, "model": model}),
+        );
+
+        let by_id = session_view(&actor, "unset-by-id").unwrap();
+        assert_eq!(by_id.project_root.as_deref(), Some(path_str(&repo_a)));
+        assert_eq!(by_id.worktree_branch.as_deref(), Some("main"));
+        let by_pid = session_view(&actor, "unset-by-pid").unwrap();
+        assert_eq!(by_pid.project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(by_pid.worktree_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn status_line_logs_keep_each_paths_session_id() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
+        init_repo(&repo_a, "main");
+        init_repo(&repo_b, "feature");
+
+        // A stale index entry: "stale-alias" still points at the session
+        // now called "renamed". The by-session_id path logs the id it
+        // looked up, not the session's own.
+        let mut renamed = create_test_session("renamed");
+        renamed.working_directory = Some(path_str(&repo_a).to_string());
+        register_session_in(&mut actor, renamed);
+        let renamed_pid = pid_of(&actor, "renamed");
+        actor
+            .session_id_to_pid
+            .insert(SessionId::new("stale-alias"), renamed_pid);
+        let logs = capture_logs(|| {
+            send_status_line(
+                &mut actor,
+                serde_json::json!({
+                    "session_id": "stale-alias",
+                    "cwd": path_str(&repo_b),
+                    "model": {"id": "claude-sonnet-4-20250514"},
+                    "cost": {"total_cost_usd": 0.50, "total_duration_ms": 5000}
+                }),
+            );
+        });
+        assert_eq!(
+            logs,
+            format!(
+                " INFO Working directory changed, re-resolving git info \
+                 session_id=stale-alias pid={renamed_pid} new_cwd={}\n\
+                 DEBUG Session updated from status line (by session_id) \
+                 session_id=stale-alias pid={renamed_pid} cost=$0.50\n",
+                path_str(&repo_b)
+            )
+        );
+
+        // By pid: the session is renamed first, so it logs the new id.
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, &repo_a, None);
+        let logs = capture_logs(|| {
+            send_status_line(
+                &mut actor,
+                serde_json::json!({
+                    "session_id": "real-p",
+                    "pid": pid,
+                    "cwd": path_str(&repo_b),
+                    "model": {"id": "claude-sonnet-4-20250514"},
+                    "cost": {"total_cost_usd": 0.25, "total_duration_ms": 5000}
+                }),
+            );
+        });
+        assert_eq!(
+            logs,
+            format!(
+                " INFO Session ID upgraded old_id={pending} new_id=real-p pid={pid}\n \
+                 INFO Working directory changed, re-resolving git info \
+                 session_id=real-p pid={pid} new_cwd={}\n\
+                 DEBUG Session updated from status line session_id=real-p pid={pid} \
+                 cost=$0.25\n",
+                path_str(&repo_b)
+            )
+        );
+    }
+
+    #[test]
+    fn refresh_git_info_publishes_each_changed_session_in_map_order() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["git-0", "git-1", "git-2", "git-3"];
+        for id in ids {
+            let repo = dir.path().join(id);
+            init_repo(&repo, "main");
+            let mut session = create_test_session(id);
+            session.working_directory = Some(path_str(&repo).to_string());
+            register_session_in(&mut actor, session);
+        }
+        drain_events(&mut event_rx);
+        let changed = ["git-0", "git-1", "git-3"];
+        for id in changed {
+            init_repo(&dir.path().join(id), "develop");
+        }
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+
+        let expected: Vec<String> = actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| session.id.as_str())
+            .filter(|id| changed.contains(id))
+            .map(|id| format!("Updated {id}"))
+            .collect();
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+            assert_eq!(view.worktree_branch.as_deref(), Some("develop"));
+        }
+    }
+
+    // ========================================================================
+    // Removal pins
+    // ========================================================================
+
+    /// The sorted ids in the session_id index, then in the rows.
+    fn index_and_row_ids(actor: &RegistryActor) -> (Vec<String>, Vec<String>) {
+        let mut index: Vec<String> = actor
+            .session_id_to_pid
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        let mut rows: Vec<String> = actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| session.id.to_string())
+            .collect();
+        index.sort();
+        rows.sort();
+        (index, rows)
+    }
+
+    /// The sorted `parent/reference->child` entries of `child_refs`.
+    fn child_refs(actor: &RegistryActor) -> Vec<String> {
+        let mut refs: Vec<String> = actor
+            .child_refs
+            .iter()
+            .map(|((parent, reference), child)| format!("{parent}/{reference:?}->{child}"))
+            .collect();
+        refs.sort();
+        refs
+    }
+
+    fn alias(name: &str, id: &str) -> LifecycleContext {
+        LifecycleContext {
+            child_alias: Some(ChildAlias {
+                name: name.into(),
+                id: id.into(),
+            }),
+            ..LifecycleContext::default()
+        }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(ToString::to_string).collect()
+    }
+
+    /// The line `handle_remove` and `handle_remove_by_pid` log.
+    fn removed_log(id: &str, pid: u32, reason: &str, remaining: usize) -> String {
+        format!(
+            " INFO Session removed session_id={id} pid={pid} reason={reason} \
+             remaining_sessions={remaining}\n"
+        )
+    }
+
+    /// Drains setup events, failing loudly if setup overflowed the channel.
+    fn drain_setup(rx: &mut broadcast::Receiver<SessionEvent>) {
+        loop {
+            match rx.try_recv() {
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => return,
+                Err(error) => panic!("setup overflowed the event channel: {error:?}"),
+            }
+        }
+    }
+
+    /// A `sleep` process, killed and reaped when dropped.
+    struct Sleep(std::process::Child);
+
+    impl Drop for Sleep {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Starts `sleep` and registers it as `id` through a lifecycle event,
+    /// so the row tracks a real pid that cleanup can find dead.
+    fn register_sleep(actor: &mut RegistryActor, id: &str, context: LifecycleContext) -> Sleep {
+        let process = Sleep(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = process.0.id();
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new(id),
+            event: LifecycleEvent::WorkingStart,
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(pid),
+            tmux_pane: None,
+            context,
+            respond_to,
+        });
+        assert_eq!(actor.sessions_by_pid[&pid].1.pid, Some(pid));
+        process
+    }
+
+    /// `capture_logs` of a cleanup, without the liveness checks' DEBUG
+    /// lines, which come in map order.
+    fn capture_cleanup_logs(actor: &mut RegistryActor) -> String {
+        capture_logs(|| actor.handle_command(RegistryCommand::CleanupStale))
+            .lines()
+            .filter(|line| !line.contains("is_process_alive"))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    /// SessionEnd → `handle_remove_by_pid`: the parent's in-process
+    /// children are removed, logged and published first, then the parent
+    /// logs and publishes. Its index entry and child refs go with it.
+    #[test]
+    fn session_end_removes_children_before_the_parent() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let lead = register_test_session(&mut actor, "lead");
+        let other = register_test_session(&mut actor, "other");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &lead, working.clone(), alias("rev", "agent-1"));
+        apply_with_context(&mut actor, &other, working, alias("tester", "agent-3"));
+        drain_setup(&mut event_rx);
+        start_child(&mut actor, &lead, "agent-1");
+        start_child(&mut actor, &lead, "agent-2");
+        start_child(&mut actor, &other, "agent-3");
+        let [lead_pid, agent_1, agent_2] =
+            ["lead", "agent-1", "agent-2"].map(|id| pid_of(&actor, id));
+        drain_setup(&mut event_rx);
+
+        let logs = capture_logs(|| {
+            apply_with_context(
+                &mut actor,
+                &lead,
+                LifecycleEvent::SessionEnd { reason: None },
+                LifecycleContext::default(),
+            );
+        });
+
+        assert_eq!(
+            logs,
+            format!(
+                " INFO SessionEnd received, removing session session_id=lead pid={lead_pid}\n{}{}{}",
+                removed_log("agent-1", agent_1, "session ended", 3),
+                removed_log("agent-2", agent_2, "session ended", 2),
+                removed_log("lead", lead_pid, "session ended", 2),
+            )
+        );
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            [
+                "Removed agent-1 SessionEnded",
+                "Removed agent-2 SessionEnded",
+                "Removed lead SessionEnded"
+            ]
+        );
+        let remaining = ids(&["agent-3", "other"]);
+        assert_eq!(index_and_row_ids(&actor), (remaining.clone(), remaining));
+        assert_eq!(
+            child_refs(&actor),
+            [
+                "other/Id(\"agent-3\")->agent-3",
+                "other/Name(\"tester\")->agent-3"
+            ]
+        );
+
+        // A pid with no row reports a synthetic `pid-{pid}` id.
+        let result = actor.handle_remove_by_pid(lead_pid, RemovalReason::SessionEnded);
+        assert!(
+            matches!(&result, Err(RegistryError::SessionNotFound(id)) if *id == SessionId::new(format!("pid-{lead_pid}"))),
+            "{result:?}"
+        );
+        assert!(drain_events(&mut event_rx).0.is_empty());
+    }
+
+    /// ChildSessionEnd → `handle_remove`: a nested child goes first, then
+    /// the parent drops the child from its list and publishes, then the
+    /// child logs and publishes `Removed`. Refs to and under the child are
+    /// pruned; a sibling's stay.
+    #[test]
+    fn child_session_end_updates_the_parent_before_the_childs_removed() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let lead = register_test_session(&mut actor, "lead");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &lead, working.clone(), alias("rev", "mid"));
+        apply_with_context(&mut actor, &lead, working, alias("helper", "sibling"));
+        drain_setup(&mut event_rx);
+        start_child(&mut actor, &lead, "mid");
+        start_child(&mut actor, &lead, "sibling");
+        let mid = SessionId::new("mid");
+        actor.ensure_child_session(
+            pid_of(&actor, "mid"),
+            SessionId::new("leaf"),
+            AgentType::Subagent,
+            atm_core::Harness::ClaudeCode,
+        );
+        actor.register_child_alias(
+            &mid,
+            &ChildAlias {
+                name: "nested".into(),
+                id: "leaf".into(),
+            },
+        );
+        let [lead_pid, mid_pid, leaf_pid] = ["lead", "mid", "leaf"].map(|id| pid_of(&actor, id));
+        drain_setup(&mut event_rx);
+
+        let logs = capture_logs(|| {
+            apply_with_context(
+                &mut actor,
+                &lead,
+                LifecycleEvent::ChildSessionEnd {
+                    id: Some("mid".into()),
+                },
+                LifecycleContext::default(),
+            );
+        });
+
+        let applied = logs.lines().nth(2).unwrap_or_default();
+        assert!(applied.starts_with("DEBUG Lifecycle event applied session_id=lead"));
+        assert_eq!(
+            logs,
+            format!(
+                "{}{}{applied}\n",
+                removed_log("leaf", leaf_pid, "session ended", 2),
+                removed_log("mid", mid_pid, "session ended", 2),
+            )
+        );
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                "Removed leaf SessionEnded",
+                "Updated lead",
+                "Removed mid SessionEnded",
+                "Updated lead"
+            ]
+        );
+        assert_eq!(views[0].child_session_ids, [SessionId::new("sibling")]);
+        let remaining = ids(&["lead", "sibling"]);
+        assert_eq!(index_and_row_ids(&actor), (remaining.clone(), remaining));
+        assert_eq!(
+            child_refs(&actor),
+            [
+                "lead/Id(\"sibling\")->sibling",
+                "lead/Name(\"helper\")->sibling"
+            ]
+        );
+        assert_eq!(
+            actor.sessions_by_pid[&lead_pid].0.child_session_ids,
+            [SessionId::new("sibling")]
+        );
+    }
+
+    /// `handle_remove` trusts the index: it removes the row the id maps to
+    /// and reports the id it was given, even when that row has another id
+    /// or is gone. An id not in the index is an error naming that id.
+    #[test]
+    fn remove_reports_the_id_it_was_given() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        register_test_session(&mut actor, "renamed");
+        let renamed_pid = pid_of(&actor, "renamed");
+        actor
+            .session_id_to_pid
+            .insert(SessionId::new("stale-alias"), renamed_pid);
+        actor
+            .session_id_to_pid
+            .insert(SessionId::new("ghost"), 4242);
+        drain_events(&mut event_rx);
+
+        let mut results = Vec::new();
+        let logs = capture_logs(|| {
+            for id in ["stale-alias", "ghost", "missing"] {
+                let (respond_to, mut rx) = oneshot::channel();
+                actor.handle_command(RegistryCommand::Remove {
+                    session_id: SessionId::new(id),
+                    respond_to,
+                });
+                results.push(rx.try_recv().unwrap());
+            }
+        });
+
+        assert_eq!(
+            logs,
+            format!(
+                "{}{}",
+                removed_log("stale-alias", renamed_pid, "explicitly removed", 0),
+                removed_log("ghost", 4242, "explicitly removed", 0),
+            )
+        );
+        assert!(results[0].is_ok() && results[1].is_ok());
+        assert!(
+            matches!(&results[2], Err(RegistryError::SessionNotFound(id)) if id.as_str() == "missing"),
+            "{results:?}"
+        );
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            ["Removed stale-alias Explicit", "Removed ghost Explicit"]
+        );
+        assert_eq!(index_and_row_ids(&actor), (ids(&["renamed"]), ids(&[])));
+    }
+
+    /// Cleanup of a dead process: its in-process children go first (an
+    /// INFO line and `Removed` each), then its WARN line with the last
+    /// activity, then its `Removed{ProcessDied}`.
+    #[test]
+    fn cleanup_removes_a_dead_sessions_children_before_it() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let process = register_sleep(&mut actor, "dead-lead", alias("rev", "agent-1"));
+        let pid = process.0.id();
+        start_child(&mut actor, &SessionId::new("dead-lead"), "agent-1");
+        drain_setup(&mut event_rx);
+        let live = register_test_session(&mut actor, "live");
+        apply_with_context(
+            &mut actor,
+            &live,
+            LifecycleEvent::WorkingStart,
+            alias("helper", "agent-2"),
+        );
+        start_child(&mut actor, &live, "agent-2");
+        let child_pid = pid_of(&actor, "agent-1");
+        drop(process);
+        actor.sessions_by_pid.get_mut(&pid).unwrap().0.last_activity =
+            Utc::now() - chrono::Duration::seconds(300);
+        drain_setup(&mut event_rx);
+
+        let logs = capture_cleanup_logs(&mut actor);
+
+        // Cleanup reads the clock itself, so allow for a stalled runner.
+        let secs = logs
+            .split("last_activity=")
+            .nth(1)
+            .and_then(|rest| rest.split('s').next())
+            .unwrap_or_default();
+        assert!((300..310).contains(&secs.parse::<i64>().unwrap()), "{logs}");
+        let logs = logs.replace(&format!("last_activity={secs}s"), "last_activity=300s");
+        assert_eq!(
+            logs,
+            format!(
+                " INFO Cleaning up dead-process sessions count=1\n{} WARN Session removed by \
+                 cleanup session_id=dead-lead reason=process died without a session-end signal \
+                 details=last_activity=300s ago, pid={pid}\n",
+                removed_log(
+                    "agent-1",
+                    child_pid,
+                    "process died without a session-end signal",
+                    2
+                ),
+            )
+        );
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            [
+                "Removed agent-1 ProcessDied",
+                "Removed dead-lead ProcessDied"
+            ]
+        );
+        let remaining = ids(&["agent-2", "live"]);
+        assert_eq!(index_and_row_ids(&actor), (remaining.clone(), remaining));
+        assert_eq!(
+            child_refs(&actor),
+            [
+                "live/Id(\"agent-2\")->agent-2",
+                "live/Name(\"helper\")->agent-2"
+            ]
+        );
+    }
+
+    /// Both by-pid paths keep the removed row's id in the index when it
+    /// points at another row with the same id, so that row stays
+    /// reachable by id (#53 survey gap G2a).
+    #[test]
+    fn by_pid_removal_keeps_a_shared_ids_index_entry() {
+        let own_pid = std::process::id();
+        let working_at = |actor: &mut RegistryActor, pid| {
+            let (respond_to, _) = oneshot::channel();
+            actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+                session_id: SessionId::new("dup"),
+                event: LifecycleEvent::WorkingStart,
+                harness: atm_core::Harness::ClaudeCode,
+                pid: Some(pid),
+                tmux_pane: None,
+                context: LifecycleContext::default(),
+                respond_to,
+            });
+        };
+
+        // SessionEnd for the row the index no longer points at.
+        let (_, mut actor, _) = create_actor();
+        let dup = register_test_session(&mut actor, "dup");
+        let synthetic_pid = pid_of(&actor, "dup");
+        working_at(&mut actor, own_pid);
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: dup,
+            event: LifecycleEvent::SessionEnd { reason: None },
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(synthetic_pid),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        assert_eq!(index_and_row_ids(&actor), (ids(&["dup"]), ids(&["dup"])));
+        assert!(actor.sessions_by_pid.contains_key(&own_pid));
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&own_pid].0.cost, cost);
+
+        // Cleanup of the dead row the index no longer points at.
+        let (_, mut actor, _) = create_actor();
+        let process = register_sleep(&mut actor, "dup", LifecycleContext::default());
+        let dead_pid = process.0.id();
+        working_at(&mut actor, own_pid);
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        drop(process);
+        actor.handle_command(RegistryCommand::CleanupStale);
+        assert!(!actor.sessions_by_pid.contains_key(&dead_pid));
+        assert_eq!(index_and_row_ids(&actor), (ids(&["dup"]), ids(&["dup"])));
+        assert_eq!(pid_of(&actor, "dup"), own_pid);
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&own_pid].0.cost, cost);
+    }
+
+    /// Two live processes reporting one id: two rows, and the index points
+    /// at the newer pid. Returns (older, newer).
+    fn register_shared_id(actor: &mut RegistryActor) -> (Sleep, Sleep) {
+        let older = register_sleep(actor, "dup", LifecycleContext::default());
+        let newer = register_sleep(actor, "dup", LifecycleContext::default());
+        assert_eq!(pid_of(actor, "dup"), newer.0.id());
+        assert_eq!(
+            index_and_row_ids(actor),
+            (ids(&["dup"]), ids(&["dup", "dup"]))
+        );
+        (older, newer)
+    }
+
+    /// Sends a pid-less status line for `dup` and returns the cost it
+    /// carries. Without a pid it reaches a row only through the id index.
+    fn send_pidless_dup_status(actor: &mut RegistryActor) -> atm_core::Money {
+        send_status_line(
+            actor,
+            serde_json::json!({
+                "session_id": "dup",
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.42, "total_duration_ms": 6000}
+            }),
+        );
+        atm_core::Money::from_usd(0.42)
+    }
+
+    /// Known limit, left for the insert-side follow-up (#53 survey G2):
+    /// removing the row the index points at drops the shared id's entry,
+    /// so the other row with that id is unreachable by id.
+    #[test]
+    fn removing_the_indexed_row_orphans_a_shared_ids_other_row() {
+        let (_, mut actor, _) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let (respond_to, _) = oneshot::channel();
+        actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
+            session_id: SessionId::new("dup"),
+            event: LifecycleEvent::SessionEnd { reason: None },
+            harness: atm_core::Harness::ClaudeCode,
+            pid: Some(newer.0.id()),
+            tmux_pane: None,
+            context: LifecycleContext::default(),
+            respond_to,
+        });
+        assert_eq!(index_and_row_ids(&actor), (ids(&[]), ids(&["dup"])));
+
+        send_pidless_dup_status(&mut actor);
+
+        assert_eq!(
+            actor.sessions_by_pid[&older.0.id()].0.cost,
+            atm_core::Money::zero()
+        );
+    }
+
+    /// Rediscovery that renames the row the index does not point at keeps
+    /// the shared id's entry on the other row (#53 survey gap G2a).
+    #[test]
+    fn rediscovery_rename_keeps_a_shared_ids_index_entry() {
+        let (_, mut actor, _) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let dir = tempfile::tempdir().unwrap();
+
+        discover(
+            &mut actor,
+            SessionId::new("fresh"),
+            older.0.id(),
+            dir.path(),
+            None,
+        );
+
+        let both = ids(&["dup", "fresh"]);
+        assert_eq!(index_and_row_ids(&actor), (both.clone(), both));
+        assert_eq!(pid_of(&actor, "dup"), newer.0.id());
+        assert_eq!(pid_of(&actor, "fresh"), older.0.id());
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&newer.0.id()].0.cost, cost);
+    }
+
+    /// A status line that renames the row the index does not point at
+    /// keeps the shared id's entry on the other row (#53 survey gap G2a).
+    #[test]
+    fn status_line_rename_keeps_a_shared_ids_index_entry() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        drain_setup(&mut event_rx);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "fresh",
+                "pid": older.0.id(),
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": 0.30, "total_duration_ms": 5000}
+            }),
+        );
+
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            ["Removed dup Upgraded", "Registered fresh", "Updated fresh"]
+        );
+        let both = ids(&["dup", "fresh"]);
+        assert_eq!(index_and_row_ids(&actor), (both.clone(), both));
+        assert_eq!(pid_of(&actor, "dup"), newer.0.id());
+        assert_eq!(pid_of(&actor, "fresh"), older.0.id());
+        let cost = send_pidless_dup_status(&mut actor);
+        assert_eq!(actor.sessions_by_pid[&newer.0.id()].0.cost, cost);
+    }
+
+    // ========================================================================
+    // Rename link pins (#53 survey gap G3)
+    // ========================================================================
+
+    /// Sends a status line for `pid` reporting `id`. The status-line path
+    /// renames the session at `pid` on any id mismatch.
+    fn status_line_as(actor: &mut RegistryActor, pid: u32, id: &str) {
+        send_status_line(
+            actor,
+            serde_json::json!({
+                "session_id": id,
+                "pid": pid,
+                "model": {"id": "claude-sonnet-4-20250514"}
+            }),
+        );
+    }
+
+    /// Sends a `WorkingStart` for `pid` reporting `id`. The lifecycle path
+    /// creates the session if `pid` has none, and renames only a pending id.
+    fn working_as(actor: &mut RegistryActor, pid: u32, id: &str) {
+        apply_event(actor, id, Some(pid), LifecycleEvent::WorkingStart).unwrap();
+    }
+
+    /// Starts in-process children `agent-1` (alias `rev`) and `agent-2`
+    /// (alias `helper`) under `parent`.
+    fn start_aliased_children(actor: &mut RegistryActor, parent: &SessionId) {
+        for (name, id) in [("rev", "agent-1"), ("helper", "agent-2")] {
+            apply_with_context(actor, parent, LifecycleEvent::WorkingStart, alias(name, id));
+            start_child(actor, parent, id);
+        }
+    }
+
+    /// `Updated <id>` for each of `ids`, in the registry's map order.
+    fn updated_in_map_order(actor: &RegistryActor, ids: &[&str]) -> Vec<String> {
+        actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| session.id.as_str())
+            .filter(|id| ids.contains(id))
+            .map(|id| format!("Updated {id}"))
+            .collect()
+    }
+
+    /// A child event that names `name` under `parent`, as a teammate's
+    /// events do.
+    fn by_name(name: &str) -> LifecycleContext {
+        LifecycleContext {
+            child: Some(ChildAgent {
+                reference: ChildRef::Name(name.into()),
+                agent_type: AgentType::Teammate,
+            }),
+            ..LifecycleContext::default()
+        }
+    }
+
+    /// Asserts that `parent` and its children `agent-1` and `agent-2` link
+    /// to each other in all three stores, and that a by-name child event
+    /// sent to `parent` still reaches `agent-1`.
+    fn assert_children_follow(actor: &mut RegistryActor, parent: &str) {
+        let parent_id = SessionId::new(parent);
+        for child in ["agent-1", "agent-2"] {
+            let stored = &actor.sessions_by_pid[&pid_of(actor, child)].0;
+            assert_eq!(
+                stored.parent_session_id.as_ref(),
+                Some(&parent_id),
+                "{child}"
+            );
+        }
+        assert_eq!(
+            actor.sessions_by_pid[&pid_of(actor, parent)]
+                .0
+                .child_session_ids,
+            [SessionId::new("agent-1"), SessionId::new("agent-2")]
+        );
+        assert_eq!(
+            child_refs(actor),
+            [
+                format!("{parent}/Id(\"agent-1\")->agent-1"),
+                format!("{parent}/Id(\"agent-2\")->agent-2"),
+                format!("{parent}/Name(\"helper\")->agent-2"),
+                format!("{parent}/Name(\"rev\")->agent-1"),
+            ]
+        );
+
+        let count = actor.session_count();
+        needs_input_from(actor, &parent_id, by_name("rev"));
+        assert_eq!(
+            session_view(actor, "agent-1").map(|view| view.status),
+            Some(atm_core::SessionStatus::AttentionNeeded)
+        );
+        assert_eq!(actor.session_count(), count, "no placeholder child");
+    }
+
+    /// A status line with a new id for a parent's pid (real → real, e.g.
+    /// after `/clear`) moves the parent's links: its children point at
+    /// the new id, and its aliases resolve under it. Each child's view is
+    /// published after the rename's Removed/Registered pair, before the
+    /// parent's own Updated.
+    #[test]
+    fn status_line_rename_of_a_parent_carries_its_children() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        working_as(&mut actor, pid, "lead");
+        drain_setup(&mut event_rx);
+        start_aliased_children(&mut actor, &SessionId::new("lead"));
+        drain_setup(&mut event_rx);
+
+        status_line_as(&mut actor, pid, "lead-2");
+
+        let mut expected = vec!["Removed lead Upgraded".into(), "Registered lead-2".into()];
+        expected.extend(updated_in_map_order(&actor, &["agent-1", "agent-2"]));
+        expected.push("Updated lead-2".into());
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["agent-1", "agent-2", "lead-2"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_children_follow(&mut actor, "lead-2");
+    }
+
+    /// A lifecycle event with the real id for a pending parent (pending →
+    /// real) moves the parent's links, as the status-line path does.
+    #[test]
+    fn lifecycle_rename_of_a_pending_parent_carries_its_children() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending.clone(), pid, dir.path(), None);
+        drain_setup(&mut event_rx);
+        start_aliased_children(&mut actor, &pending);
+        drain_setup(&mut event_rx);
+
+        working_as(&mut actor, pid, "lead-real");
+
+        let mut expected = vec![
+            format!("Removed {pending} Upgraded"),
+            "Registered lead-real".into(),
+        ];
+        expected.extend(updated_in_map_order(&actor, &["agent-1", "agent-2"]));
+        expected.push("Updated lead-real".into());
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["agent-1", "agent-2", "lead-real"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_children_follow(&mut actor, "lead-real");
+    }
+
+    /// Rediscovery that renames a parent (real → real; production
+    /// discovery sends only pending ids today) moves the parent's links.
+    /// The children's views follow the parent's own Updated. Rediscovery
+    /// with a pending id keeps the real one, so nothing is relinked.
+    #[test]
+    fn rediscovery_rename_of_a_parent_carries_its_children() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        working_as(&mut actor, pid, "lead");
+        drain_setup(&mut event_rx);
+        start_aliased_children(&mut actor, &SessionId::new("lead"));
+        drain_setup(&mut event_rx);
+
+        let pending = SessionId::pending_from_pid(pid);
+        discover(&mut actor, pending, pid, dir.path(), None);
+        assert_eq!(drain_events(&mut event_rx).0, ["Updated lead"]);
+
+        discover(&mut actor, SessionId::new("lead-b"), pid, dir.path(), None);
+
+        let mut expected = vec!["Updated lead-b".to_string()];
+        expected.extend(updated_in_map_order(&actor, &["agent-1", "agent-2"]));
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["agent-1", "agent-2", "lead-b"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_children_follow(&mut actor, "lead-b");
+    }
+
+    /// Gives the newer of two `dup` rows a child `agent-1` (alias `rev`),
+    /// runs `rename` on the older row's pid, and asserts the events and
+    /// that every link still names `dup`.
+    fn assert_shared_id_rename_keeps_links(
+        rename: impl FnOnce(&mut RegistryActor, u32),
+        expected: &[&str],
+    ) {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let dup = SessionId::new("dup");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &dup, working, alias("rev", "agent-1"));
+        start_child(&mut actor, &dup, "agent-1");
+        drain_setup(&mut event_rx);
+
+        rename(&mut actor, older.0.id());
+
+        assert_eq!(drain_events(&mut event_rx).0, expected);
+        let child = &actor.sessions_by_pid[&pid_of(&actor, "agent-1")].0;
+        assert_eq!(child.parent_session_id.as_ref(), Some(&dup));
+        assert_eq!(
+            actor.sessions_by_pid[&newer.0.id()].0.child_session_ids,
+            [SessionId::new("agent-1")]
+        );
+        assert_eq!(
+            child_refs(&actor),
+            ["dup/Id(\"agent-1\")->agent-1", "dup/Name(\"rev\")->agent-1"]
+        );
+    }
+
+    /// Renaming one of two rows that share an id leaves every link to that
+    /// id alone, as on main: the links may belong to the other row, which
+    /// still holds it (shared ids are open, #97). Covers both rename sites.
+    #[test]
+    fn rename_of_a_shared_id_leaves_its_links() {
+        assert_shared_id_rename_keeps_links(
+            |actor, pid| status_line_as(actor, pid, "fresh"),
+            &["Removed dup Upgraded", "Registered fresh", "Updated fresh"],
+        );
+        assert_shared_id_rename_keeps_links(
+            |actor, pid| {
+                let dir = tempfile::tempdir().unwrap();
+                discover(actor, SessionId::new("fresh"), pid, dir.path(), None);
+            },
+            &["Updated fresh"],
+        );
+    }
+
+    /// Discovers this process as a pending child of a new `lead` session.
+    /// The parent's links to the child (its child list and a `mate` alias)
+    /// are set by hand: no production path links a real-pid child from
+    /// its parent today. Returns the pending id.
+    fn pending_child_of_lead(actor: &mut RegistryActor) -> SessionId {
+        let dir = tempfile::tempdir().unwrap();
+        let lead = register_test_session(actor, "lead");
+        let pid = std::process::id();
+        let pending = SessionId::pending_from_pid(pid);
+        discover(actor, pending.clone(), pid, dir.path(), None);
+        actor
+            .sessions_by_pid
+            .get_mut(&pid)
+            .unwrap()
+            .0
+            .parent_session_id = Some(lead.clone());
+        let lead_pid = pid_of(actor, "lead");
+        let lead_session = &mut actor.sessions_by_pid.get_mut(&lead_pid).unwrap().0;
+        lead_session.child_session_ids.push(pending.clone());
+        actor
+            .child_refs
+            .insert((lead, ChildRef::Name("mate".into())), pending.clone());
+        pending
+    }
+
+    /// Asserts that `lead` and its renamed child `mate` link to each other
+    /// in all three stores, and that a by-name `mate` event sent to `lead`
+    /// reaches the renamed row instead of creating a new child.
+    fn assert_parent_follows(actor: &mut RegistryActor) {
+        let lead = SessionId::new("lead");
+        let pid = std::process::id();
+        assert_eq!(
+            actor.sessions_by_pid[&pid].0.parent_session_id.as_ref(),
+            Some(&lead)
+        );
+        assert_eq!(
+            actor.sessions_by_pid[&pid_of(actor, "lead")]
+                .0
+                .child_session_ids,
+            [SessionId::new("mate")]
+        );
+        assert_eq!(child_refs(actor), ["lead/Name(\"mate\")->mate"]);
+
+        let count = actor.session_count();
+        needs_input_from(actor, &lead, by_name("mate"));
+        assert_eq!(
+            actor.sessions_by_pid[&pid].0.status,
+            atm_core::SessionStatus::AttentionNeeded
+        );
+        assert_eq!(actor.session_count(), count, "no duplicate child");
+    }
+
+    /// A status line with the real id for a pending child renames it in
+    /// its parent's child list and aliases. The parent's view is published
+    /// after the rename's Removed/Registered pair.
+    #[test]
+    fn status_line_rename_of_a_child_updates_its_parent() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pending = pending_child_of_lead(&mut actor);
+        drain_setup(&mut event_rx);
+
+        status_line_as(&mut actor, std::process::id(), "mate");
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                format!("Removed {pending} Upgraded"),
+                "Registered mate".into(),
+                "Updated lead".into(),
+                "Updated mate".into(),
+            ]
+        );
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["lead", "mate"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_parent_follows(&mut actor);
+    }
+
+    /// The lifecycle path's pending → real rename of a child updates its
+    /// parent, as the status-line path does.
+    #[test]
+    fn lifecycle_rename_of_a_pending_child_updates_its_parent() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pending = pending_child_of_lead(&mut actor);
+        drain_setup(&mut event_rx);
+
+        working_as(&mut actor, std::process::id(), "mate");
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [
+                format!("Removed {pending} Upgraded"),
+                "Registered mate".into(),
+                "Updated lead".into(),
+                "Updated mate".into(),
+            ]
+        );
+        for view in &views {
+            assert_view_is_current(&actor, view);
+        }
+        let all = ids(&["lead", "mate"]);
+        assert_eq!(index_and_row_ids(&actor), (all.clone(), all));
+        assert_parent_follows(&mut actor);
+    }
+
+    // ========================================================================
+    // Late status lines after SessionEnd (#53 survey gap G5)
+    // ========================================================================
+
+    const OLD: &str = "old-session";
+    const NEW: &str = "new-session";
+    const OLD_COST: f64 = 0.09;
+
+    /// Sends a status line from `pid` reporting `id` and `cost`, so a test
+    /// can tell whose data a row holds.
+    fn status_line_costing(actor: &mut RegistryActor, pid: u32, id: &str, cost: f64) {
+        send_status_line(
+            actor,
+            serde_json::json!({
+                "session_id": id,
+                "pid": pid,
+                "model": {"id": "claude-sonnet-4-20250514"},
+                "cost": {"total_cost_usd": cost, "total_duration_ms": 1000}
+            }),
+        );
+    }
+
+    fn session_end(actor: &mut RegistryActor, id: &str, pid: u32, reason: &str) {
+        let event = LifecycleEvent::SessionEnd {
+            reason: Some(reason.into()),
+        };
+        apply_event(actor, id, Some(pid), event).unwrap();
+    }
+
+    fn session_start(actor: &mut RegistryActor, id: &str, pid: u32, source: &str) {
+        let event = LifecycleEvent::SessionStart {
+            source: Some(source.into()),
+        };
+        apply_event(actor, id, Some(pid), event).unwrap();
+    }
+
+    /// A Claude session `OLD` at `pid` that has had a status line, as
+    /// before `/clear` or `/exit`, with the setup events drained.
+    fn old_session_at(actor: &mut RegistryActor, rx: &mut broadcast::Receiver<SessionEvent>) {
+        status_line_costing(actor, std::process::id(), OLD, OLD_COST);
+        drain_setup(rx);
+    }
+
+    /// Claude Code 2.1.310's `/clear` order: `SessionEnd(old)`, a status
+    /// line still carrying the old id ~30 ms later, then
+    /// `SessionStart(new)`. The late line must not bring the old session
+    /// back, so `SessionStart(new)` creates the new row.
+    #[test]
+    fn clear_drops_a_late_old_status_line_that_arrives_before_session_start() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(actor.session_count(), 0);
+
+        session_start(&mut actor, NEW, pid, "clear");
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.0);
+
+        status_line_costing(&mut actor, pid, NEW, 0.01);
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.01);
+    }
+
+    /// The other arrival order: `atm-hook` sends each frame from its own
+    /// process, so `SessionStart(new)` can reach atmd before the late
+    /// line. The late line must not rename the new row back.
+    #[test]
+    fn clear_drops_a_late_old_status_line_that_arrives_after_session_start() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        session_start(&mut actor, NEW, pid, "clear");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.0);
+    }
+
+    /// `/exit`: a status line after `SessionEnd` must not leave a ghost
+    /// row that lasts until cleanup finds the process dead. The drop logs
+    /// at DEBUG.
+    #[test]
+    fn exit_drops_a_late_status_line() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "prompt_input_exit");
+        drain_setup(&mut event_rx);
+
+        let logs = capture_logs(|| status_line_costing(&mut actor, pid, OLD, OLD_COST));
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(actor.session_count(), 0);
+        assert_eq!(
+            logs,
+            format!(
+                "DEBUG Status line for a session that ended in this process, ignoring \
+                 session_id={OLD} pid={pid}\n"
+            )
+        );
+    }
+
+    /// `claude --resume <id>` brings an ended id back in a new process.
+    /// Its status lines count at once: only the ended process's are late.
+    #[test]
+    fn a_resumed_id_from_a_new_pid_is_accepted_right_after_session_end() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, std::process::id(), "prompt_input_exit");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, UNUSED_PID, OLD, OLD_COST);
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [format!("Registered {OLD}"), format!("Updated {OLD}")]
+        );
+        assert_eq!(pid_of(&actor, OLD), UNUSED_PID);
+        assert_eq!(session_view(&actor, OLD).unwrap().cost_usd, OLD_COST);
+    }
+
+    /// Once the marker expires, a status line for the ended pair is
+    /// applied as on main. The marker is aged instead of sleeping.
+    #[test]
+    fn a_status_line_after_the_marker_expires_is_applied() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        drain_setup(&mut event_rx);
+        *actor
+            .ended_sessions
+            .get_mut(&(SessionId::new(OLD), pid))
+            .unwrap() -= ENDED_SESSION_TTL;
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(
+            events,
+            [format!("Registered {OLD}"), format!("Updated {OLD}")]
+        );
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD])));
+    }
+
+    /// Each new marker first drops the expired ones, so the map holds only
+    /// the SessionEnds of the last `ENDED_SESSION_TTL`.
+    #[test]
+    fn recording_a_session_end_prunes_expired_markers() {
+        let (_, mut actor, _) = create_actor();
+        let now = Utc::now();
+        let just_live = now - ENDED_SESSION_TTL + chrono::Duration::milliseconds(1);
+        actor.record_session_end(SessionId::new("expired"), 1, now - ENDED_SESSION_TTL);
+        actor.record_session_end(SessionId::new("just-live"), 2, just_live);
+
+        actor.record_session_end(SessionId::new(OLD), 3, now);
+
+        let mut markers: Vec<String> = (actor.ended_sessions.keys())
+            .map(|(id, pid)| format!("{id}@{pid}"))
+            .collect();
+        markers.sort();
+        assert_eq!(markers, ["just-live@2", "old-session@3"]);
+    }
+
+    #[test]
+    fn a_marker_lives_for_the_ttl_and_a_backwards_clock_expires_it() {
+        let ended_at = Utc::now();
+        let ms = chrono::Duration::milliseconds;
+        assert!(marker_live(ended_at, ended_at));
+        assert!(marker_live(ended_at, ended_at + ENDED_SESSION_TTL - ms(1)));
+        assert!(!marker_live(ended_at, ended_at + ENDED_SESSION_TTL));
+        assert!(!marker_live(ended_at, ended_at - ms(1)));
+    }
+
+    /// An in-process `/resume` back to a session that ended in this pid
+    /// moments ago starts it again, so its redraw status line counts. The
+    /// marker of the session it left stays.
+    #[test]
+    fn session_start_in_the_ended_process_clears_that_pairs_marker() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        session_start(&mut actor, NEW, pid, "clear");
+        session_end(&mut actor, NEW, pid, "resume");
+        session_start(&mut actor, OLD, pid, "resume");
+        drain_setup(&mut event_rx);
+
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        assert_eq!(session_view(&actor, OLD).unwrap().cost_usd, OLD_COST);
+        let markers: Vec<_> = actor.ended_sessions.keys().cloned().collect();
+        assert_eq!(markers, [(SessionId::new(NEW), pid)]);
+    }
+
+    /// Ending a session records a marker (its `SessionEnd`, or a new
+    /// session's `SessionStart` in its pid); cleanup's removal of a dead
+    /// process doesn't.
+    #[test]
+    fn cleanup_of_a_dead_process_records_no_marker() {
+        let (_, mut actor, _) = create_actor();
+        let sleep = register_sleep(&mut actor, OLD, LifecycleContext::default());
+        drop(sleep);
+
+        actor.handle_command(RegistryCommand::CleanupStale);
+
+        assert_eq!(actor.session_count(), 0);
+        assert!(actor.ended_sessions.is_empty());
+    }
+
+    // ========================================================================
+    // SessionStart ends the session its process's row held (#53 goal 4, R1)
+    // ========================================================================
+
+    /// The cost of a late status line, so a test can tell whether it was
+    /// applied.
+    const LATE_COST: f64 = 0.5;
+
+    /// One of `/clear`'s three frames from one Claude Code 2.1.310 process.
+    #[derive(Clone, Copy, Debug)]
+    enum Clear {
+        /// `SessionEnd(OLD, reason clear)`.
+        End,
+        /// The status line still carrying `OLD`, costing [`LATE_COST`].
+        Late,
+        /// `SessionStart(NEW, source clear)`.
+        Start,
+    }
+
+    /// Sends `/clear`'s frames in `order` to an `OLD` row, and returns the
+    /// index and row ids, then `NEW`'s cost if it has a row.
+    fn clear_in_order(order: [Clear; 3]) -> ((Vec<String>, Vec<String>), Option<f64>) {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        for frame in order {
+            match frame {
+                Clear::End => session_end(&mut actor, OLD, pid, "clear"),
+                Clear::Late => status_line_costing(&mut actor, pid, OLD, LATE_COST),
+                Clear::Start => session_start(&mut actor, NEW, pid, "clear"),
+            }
+        }
+        let cost = session_view(&actor, NEW).map(|view| view.cost_usd);
+        (index_and_row_ids(&actor), cost)
+    }
+
+    /// `atm-hook` sends each frame from its own process, so atmd can get
+    /// `/clear`'s three frames in any order. Every order leaves what the
+    /// end-first order does: one fresh row under `NEW`, which no `OLD`
+    /// status line reaches once `SessionStart` or `SessionEnd` is in. A
+    /// status line before both hooks is `OLD`'s last, and applies to `OLD`'s
+    /// row before it ends.
+    #[test]
+    fn clear_leaves_one_row_under_the_new_id_in_every_arrival_order() {
+        use Clear::{End, Late, Start};
+        let orders = [
+            [End, Late, Start],
+            [End, Start, Late],
+            [Start, End, Late],
+            [Start, Late, End],
+            [Late, End, Start],
+            [Late, Start, End],
+        ];
+        let fresh_new_row = ((ids(&[NEW]), ids(&[NEW])), Some(0.0));
+
+        let outcomes: Vec<_> = (orders.iter())
+            .map(|order| (format!("{order:?}"), clear_in_order(*order)))
+            .collect();
+
+        let expected: Vec<_> = (orders.iter())
+            .map(|order| (format!("{order:?}"), fresh_new_row.clone()))
+            .collect();
+        assert_eq!(outcomes, expected);
+    }
+
+    /// `/clear` with `start_first` or end first, after `OLD` took a prompt
+    /// and started an in-process child. Returns `NEW`'s view without its
+    /// clock fields, the index and row ids, and the child references.
+    fn cleared_row(
+        start_first: bool,
+    ) -> (serde_json::Value, (Vec<String>, Vec<String>), Vec<String>) {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        let prompt = LifecycleEvent::PromptSubmit {
+            prompt: Some("fix the bug".into()),
+        };
+        apply_event(&mut actor, OLD, Some(pid), prompt).unwrap();
+        apply_with_context(
+            &mut actor,
+            &SessionId::new(OLD),
+            LifecycleEvent::WorkingStart,
+            alias("rev", "agent-1"),
+        );
+        start_child(&mut actor, &SessionId::new(OLD), "agent-1");
+        assert_eq!(actor.session_count(), 2);
+
+        if start_first {
+            session_start(&mut actor, NEW, pid, "clear");
+            session_end(&mut actor, OLD, pid, "clear");
+        } else {
+            session_end(&mut actor, OLD, pid, "clear");
+            session_start(&mut actor, NEW, pid, "clear");
+        }
+
+        let mut view = view_json(&session_view(&actor, NEW).unwrap());
+        let fields = view.as_object_mut().unwrap();
+        fields.remove("started_at").unwrap();
+        fields.remove("last_activity").unwrap();
+        (view, index_and_row_ids(&actor), child_refs(&actor))
+    }
+
+    /// Whichever hook comes first, `NEW` gets the same fresh row: `OLD`'s
+    /// prompt, cost and in-process child end with `OLD`.
+    #[test]
+    fn clear_leaves_the_same_row_in_either_order() {
+        let end_first = cleared_row(false);
+        assert_eq!(end_first.1, (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(end_first.0["first_prompt"], serde_json::Value::Null);
+
+        assert_eq!(cleared_row(true), end_first);
+    }
+
+    /// `SessionStart(NEW)` before `SessionEnd(OLD)` ends `OLD` as its
+    /// `SessionEnd` would, logging why, then starts `NEW`'s row. The
+    /// `SessionEnd(OLD)` after it publishes nothing and logs at INFO that
+    /// the process moved on.
+    #[test]
+    fn a_session_start_ends_the_rows_session_and_its_late_end_keeps_the_new_row() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+
+        let logs = capture_logs(|| session_start(&mut actor, NEW, pid, "clear"));
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            [
+                format!("Removed {OLD} SessionEnded"),
+                format!("Registered {NEW}"),
+                format!("Updated {NEW}"),
+            ]
+        );
+        let info: String = (logs.lines())
+            .filter(|line| line.starts_with(" INFO "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            info,
+            format!(
+                " INFO SessionStart of a new session, ending the session this process's row held \
+                 session_id={OLD} pid={pid} new_id={NEW}\n{}",
+                removed_log(OLD, pid, "session ended", 0)
+            )
+        );
+
+        let logs = capture_logs(|| session_end(&mut actor, OLD, pid, "clear"));
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(
+            logs,
+            format!(
+                " INFO SessionEnd for a session this process moved on from, keeping the row \
+                 session_id={OLD} pid={pid} current_id={NEW}\n"
+            )
+        );
+    }
+
+    /// What [`resume_old`] leaves behind.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Resumed {
+        /// The index and row ids once both hooks are in.
+        rows: (Vec<String>, Vec<String>),
+        /// `OLD`'s cost once both hooks are in, if it has a row.
+        hooks_cost: Option<f64>,
+        /// `OLD`'s cost after the redraw, if it has a row.
+        cost: Option<f64>,
+        /// The ended-session markers left.
+        markers: Vec<(SessionId, u32)>,
+    }
+
+    /// Claude Code 2.1.310's in-process `/resume` from `NEW` back to `OLD`
+    /// (#101): `SessionEnd(NEW, resume)` and `SessionStart(OLD, resume)`,
+    /// which can reach atmd in either order, then `OLD`'s redraw status
+    /// line.
+    fn resume_old(end_first: bool) -> Resumed {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        session_start(&mut actor, NEW, pid, "clear");
+        status_line_costing(&mut actor, pid, NEW, 0.01);
+
+        if end_first {
+            session_end(&mut actor, NEW, pid, "resume");
+            session_start(&mut actor, OLD, pid, "resume");
+        } else {
+            session_start(&mut actor, OLD, pid, "resume");
+            session_end(&mut actor, NEW, pid, "resume");
+        }
+        let rows = index_and_row_ids(&actor);
+        let hooks_cost = session_view(&actor, OLD).map(|view| view.cost_usd);
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        Resumed {
+            rows,
+            hooks_cost,
+            cost: session_view(&actor, OLD).map(|view| view.cost_usd),
+            markers: actor.ended_sessions.keys().cloned().collect(),
+        }
+    }
+
+    /// Both orders of `/resume`'s hooks leave one fresh `OLD` row as soon
+    /// as both are in, the redraw applies to it, and `NEW` stays ended in
+    /// this process.
+    #[test]
+    fn in_process_resume_leaves_one_row_under_the_resumed_id_in_both_orders() {
+        let expected = Resumed {
+            rows: (ids(&[OLD]), ids(&[OLD])),
+            hooks_cost: Some(0.0),
+            cost: Some(OLD_COST),
+            markers: vec![(SessionId::new(NEW), std::process::id())],
+        };
+        assert_eq!(
+            [
+                ("end first", resume_old(true)),
+                ("start first", resume_old(false))
+            ],
+            [("end first", expected.clone()), ("start first", expected)]
+        );
+    }
+
+    /// A row discovery registered as `pending-<pid>`, which no event
+    /// renamed, is still removed by its process's `SessionEnd`.
+    #[test]
+    fn session_end_with_a_real_id_removes_a_pending_row() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        discover(
+            &mut actor,
+            SessionId::pending_from_pid(pid),
+            pid,
+            dir.path(),
+            None,
+        );
+
+        session_end(&mut actor, OLD, pid, "prompt_input_exit");
+
+        assert_eq!(actor.session_count(), 0);
+    }
+
+    /// pi's in-memory fork: the old pi-atm instance's `session_shutdown`
+    /// carries the fork's new id (#74, pi 0.73.1), and pi-atm relies on
+    /// atmd ending the session by pid. No `SessionStart` moved the row
+    /// off that id, so the row is removed, and the fork's `session_start`
+    /// gets a fresh row. In the other order the start ends the row's
+    /// session and starts the fork's row, and the end, which names that
+    /// row's id, removes it, as on main.
+    #[test]
+    fn a_session_end_naming_another_id_still_removes_the_row() {
+        let pid = std::process::id();
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+
+        session_end(&mut actor, NEW, pid, "fork");
+        assert_eq!(actor.session_count(), 0);
+        session_start(&mut actor, NEW, pid, "fork");
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.0);
+
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_start(&mut actor, NEW, pid, "fork");
+        session_end(&mut actor, NEW, pid, "fork");
+        assert_eq!(actor.session_count(), 0);
+    }
+
+    /// `claude --resume OLD` starts `OLD` in a new process. Its
+    /// `SessionStart` creates that process's row and leaves the ended
+    /// process alone. While the first process still holds `OLD`, the id
+    /// has two rows, as on main.
+    #[test]
+    fn session_start_from_a_new_pid_creates_its_own_row() {
+        let pid = std::process::id();
+        let new_pid = UNUSED_PID;
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "prompt_input_exit");
+
+        session_start(&mut actor, OLD, new_pid, "resume");
+        status_line_costing(&mut actor, new_pid, OLD, OLD_COST);
+
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD])));
+        assert_eq!(pid_of(&actor, OLD), new_pid);
+        assert_eq!(session_view(&actor, OLD).unwrap().cost_usd, OLD_COST);
+
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_start(&mut actor, OLD, new_pid, "resume");
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD, OLD])));
+    }
+
+    /// Of two rows sharing the id `dup`, the newer has a child `agent-1`
+    /// (alias `rev`). Ends the older row with a `SessionEnd(dup)` or, with
+    /// `start`, a `SessionStart(fresh)`, and returns the index and row
+    /// ids, the child's parent, the newer row's children and the child
+    /// references.
+    fn end_older_shared_row(
+        start: bool,
+    ) -> (Vec<String>, Vec<String>, String, String, Vec<String>) {
+        let (_, mut actor, _) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let dup = SessionId::new("dup");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &dup, working, alias("rev", "agent-1"));
+        start_child(&mut actor, &dup, "agent-1");
+
+        if start {
+            session_start(&mut actor, "fresh", older.0.id(), "clear");
+        } else {
+            session_end(&mut actor, "dup", older.0.id(), "clear");
+        }
+
+        let (index, rows) = index_and_row_ids(&actor);
+        let child = &actor.sessions_by_pid[&pid_of(&actor, "agent-1")].0;
+        let children = &actor.sessions_by_pid[&newer.0.id()].0.child_session_ids;
+        (
+            index,
+            rows,
+            format!("{:?}", child.parent_session_id),
+            format!("{children:?}"),
+            child_refs(&actor),
+        )
+    }
+
+    /// A `SessionStart` on one of two rows that share an id ends that row
+    /// as its `SessionEnd` does on main, links included, then adds the new
+    /// session's row.
+    #[test]
+    fn session_start_on_a_shared_id_row_ends_it_as_session_end_does() {
+        let (mut index, mut rows, parent, children, refs) = end_older_shared_row(false);
+        index.push("fresh".into());
+        rows.push("fresh".into());
+
+        assert_eq!(
+            end_older_shared_row(true),
+            (index, rows, parent, children, refs)
+        );
+    }
+
+    /// A `SessionStart` with a pending id (older pi-atm sends
+    /// `pending-<pid>`) never ends a real row. The same rule as
+    /// rediscovery, which keeps a real id over a pending one.
+    #[test]
+    fn session_start_with_a_pending_id_keeps_a_real_row() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+
+        let pending = SessionId::pending_from_pid(pid);
+        session_start(&mut actor, pending.as_str(), pid, "startup");
+
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD])));
+        assert!(actor.ended_sessions.is_empty());
+    }
+
+    /// One process serving several sessions, as codex's shared app-server
+    /// daemon does: its row follows each new session's `SessionStart`,
+    /// while other events keep today's pending → real-only rename. A
+    /// `SessionEnd` from a session the row moved on from keeps the row
+    /// while that session's marker lives, and removes it, as on main,
+    /// once the marker expires.
+    #[test]
+    fn a_shared_process_row_follows_each_new_session_start() {
+        let (_, mut actor, _) = create_actor();
+        let pid = std::process::id();
+        session_start(&mut actor, "a", pid, "startup");
+
+        session_start(&mut actor, "b", pid, "startup");
+        assert_eq!(index_and_row_ids(&actor), (ids(&["b"]), ids(&["b"])));
+        apply_event(&mut actor, "a", Some(pid), LifecycleEvent::WorkingStart).unwrap();
+        session_start(&mut actor, "b", pid, "compact");
+        assert_eq!(index_and_row_ids(&actor), (ids(&["b"]), ids(&["b"])));
+
+        session_end(&mut actor, "a", pid, "other");
+        assert_eq!(index_and_row_ids(&actor), (ids(&["b"]), ids(&["b"])));
+
+        *actor
+            .ended_sessions
+            .get_mut(&(SessionId::new("a"), pid))
+            .unwrap() -= ENDED_SESSION_TTL;
+        session_end(&mut actor, "a", pid, "other");
+        assert_eq!(actor.session_count(), 0);
     }
 }

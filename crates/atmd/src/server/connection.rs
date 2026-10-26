@@ -27,9 +27,9 @@ use tracing::{debug, error, info, warn};
 
 use atm_claude_adapter::RawHookEvent;
 use atm_codex_adapter::RawCodexEvent;
-use atm_core::SessionId;
+use atm_core::{SessionId, StatusLineData};
 use atm_pi_adapter::RawPiEvent;
-use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
+use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion, RawStatusLine};
 
 use super::MAX_TUI_CLIENTS;
 use crate::discovery::{DiscoveryResult, DiscoveryService};
@@ -458,6 +458,10 @@ impl ConnectionHandler {
     }
 
     /// Handles a status update from Claude Code.
+    ///
+    /// Parses the Claude status line at this boundary, as
+    /// [`Self::handle_hook_event`] does for hook events, so the registry
+    /// below sees only `StatusLineData`.
     async fn handle_status_update(
         &mut self,
         data: serde_json::Value,
@@ -468,10 +472,11 @@ impl ConnectionHandler {
             .and_then(|v| v.as_str())
             .map(SessionId::new)
             .ok_or_else(|| ConnectionError::ParseError("Missing session_id".to_string()))?;
+        let (pid, status) = parse_status_line(data)?;
 
         // Send to registry for processing
         self.registry
-            .update_from_status_line(session_id, data)
+            .update_from_status_line(session_id, pid, status, atm_core::Harness::ClaudeCode)
             .await
             .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
 
@@ -812,6 +817,25 @@ impl ConnectionHandler {
     }
 }
 
+/// Parses a Claude status line from the wire into the pid `atm-hook`
+/// added and the status line's vendor-neutral data.
+///
+/// # Errors
+///
+/// `ConnectionError::ParseError` if the line doesn't parse as a
+/// `RawStatusLine`.
+pub fn parse_status_line(
+    data: serde_json::Value,
+) -> Result<(Option<u32>, StatusLineData), ConnectionError> {
+    let raw: RawStatusLine =
+        serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+    // Always Some today; the Option predates the empty-model rules
+    let status = raw
+        .to_status_line_data()
+        .ok_or_else(|| ConnectionError::ParseError("status line has no data".to_string()))?;
+    Ok((raw.pid, status))
+}
+
 /// Errors that can occur during connection handling.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
@@ -1015,6 +1039,44 @@ mod tests {
             max: MAX_MESSAGE_SIZE,
         };
         assert!(err.to_string().contains("2000000"));
+    }
+
+    // Synthetic: the status lines below are hand-written, trimmed to the
+    // fields each test needs. Captured lines are tested in atm-protocol.
+
+    #[test]
+    fn test_parse_status_line_returns_pid_and_data() {
+        let (pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "sl-test",
+            "pid": 4242,
+            "model": {"id": "claude-sonnet-4-20250514"},
+            "cost": {"total_cost_usd": 0.25, "total_duration_ms": 15000}
+        }))
+        .unwrap();
+
+        assert_eq!(pid, Some(4242));
+        assert_eq!(data.session_id, "sl-test");
+        assert_eq!(data.model_id, "claude-sonnet-4-20250514");
+        assert_eq!(data.cost_usd, 0.25);
+        assert_eq!(data.total_duration_ms, 15000);
+    }
+
+    /// A malformed line fails here as a ParseError, the variant a line
+    /// without a session_id already gets, so `process_messages` replies
+    /// with the error and keeps the connection open for both.
+    #[test]
+    fn test_parse_status_line_malformed_is_parse_error() {
+        let err = parse_status_line(serde_json::json!({
+            "session_id": "sl-test",
+            "cost": {"total_cost_usd": "x", "total_duration_ms": 0}
+        }))
+        .unwrap_err();
+
+        assert!(matches!(err, ConnectionError::ParseError(_)));
+        assert_eq!(
+            err.to_string(),
+            "Parse error: invalid type: string \"x\", expected f64"
+        );
     }
 
     /// A subscriber writer on one end of a socket pair, plus the peer end.

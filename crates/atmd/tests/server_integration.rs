@@ -1380,6 +1380,7 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
     let state = |view: Option<SessionView>| view.map(|v| (v.status_label, v.activity_detail));
     let mut seen = Vec::new();
     let mut changed = Vec::new();
+    let mut dropped = Vec::new();
     for (seq, (i, (kind, payload))) in (1..).zip(calls.iter().enumerate()) {
         let message = match kind.as_str() {
             "hook" => ClientMessage::hook_event(payload.clone()),
@@ -1393,9 +1394,16 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
         if kind == "status_line" {
             let unchanged = match (&before, &after) {
                 (Some(before), Some(after)) => after == before,
-                // A status line for an ended session re-creates its row
-                // (see atm-claude-adapter's Known gaps), which starts idle.
+                // Each process's first status line creates its row, which
+                // starts idle: call 0, before SessionStart(startup), and
+                // call 42, from the resumed process's new pid.
                 (None, Some((label, _))) => label == "idle",
+                // A late status line for a session that SessionEnd just
+                // removed in the same process is dropped.
+                (None, None) => {
+                    dropped.push(i);
+                    true
+                }
                 _ => false,
             };
             if !unchanged {
@@ -1412,11 +1420,86 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
         changed.is_empty(),
         "status lines changed rows: {changed:#?}"
     );
+    // The lines that followed SessionEnd: /clear, /exit, and the resumed
+    // session's /exit.
+    assert_eq!(dropped, [37, 41, 45]);
     let expected: Vec<_> = checkpoints
         .iter()
         .map(|&(i, _)| (i, "status_line", Some("idle".to_string())))
         .collect();
     assert_eq!(seen, expected);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_claude_captured_blank_model_status_line_creates_row() {
+    // Captured: Claude Code 2.1.310, 2026-10-25, the first status line of
+    // a TUI started with `--model " "` (see atm-protocol's parse.rs docs).
+    // Claude reports the blank model as `"id": ""`. The session is real,
+    // so the line creates its row, as Unknown, even with no hook before
+    // it (`--bare` sends status lines only).
+    let fixture = "claude_status_line_blank_model_2.1.310.json";
+    let Some(lines) = captured_hook_payloads("atm-protocol", fixture) else {
+        return;
+    };
+    let [line] = lines.as_slice() else {
+        panic!("{fixture} holds one line");
+    };
+    assert_eq!(line["model"]["id"], "");
+
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    send_applied(&mut client, 1, ClientMessage::status_update(line.clone())).await;
+
+    let id = SessionId::new(line["session_id"].as_str().expect("session_id"));
+    let view = registry
+        .get_session(id)
+        .await
+        .expect("the line creates the row");
+    assert_eq!(view.model, "Unknown");
+    assert_eq!(view.harness, "claude");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_e2e_status_line_without_model_creates_row_and_empty_id_keeps_model() {
+    // Synthetic: a status line with a pid creates its row even without a
+    // model, and Claude's blank model (`"id": ""`, as captured above)
+    // keeps the model an earlier line reported.
+    let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    let id = SessionId::new("e2e-status-line-model");
+    let pid = std::process::id();
+
+    let no_model = serde_json::json!({"session_id": id.as_str(), "pid": pid});
+    send_applied(&mut client, 1, ClientMessage::status_update(no_model)).await;
+    let view = registry
+        .get_session(id.clone())
+        .await
+        .expect("a line without a model creates the row");
+    assert_eq!(view.model, "Unknown");
+
+    let opus = serde_json::json!({
+        "session_id": id.as_str(),
+        "pid": pid,
+        "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"}
+    });
+    send_applied(&mut client, 2, ClientMessage::status_update(opus)).await;
+    let view = registry.get_session(id.clone()).await.expect("row");
+    assert_eq!(view.model, "Opus 5.5");
+
+    let blank = serde_json::json!({
+        "session_id": id.as_str(),
+        "pid": pid,
+        "model": {"id": "", "display_name": "unknown model"}
+    });
+    send_applied(&mut client, 3, ClientMessage::status_update(blank)).await;
+    let view = registry.get_session(id).await.expect("row");
+    assert_eq!(view.model, "Opus 5.5");
 
     server.shutdown().await;
 }
@@ -1474,6 +1557,110 @@ async fn test_e2e_claude_captured_stop_failure_replay() {
             vec![],
         ];
         assert_eq!(seen, expected, "session {}", session[0]["session_id"]);
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_claude_captured_background_agent_dialog_replay() {
+    // Captured: Claude Code 2.1.310, 2026-10-25, two TUI turns whose
+    // permission dialog stayed open while background subagents started
+    // and stopped (see atm-claude-adapter's crate docs). The lead sends no
+    // hook of its own while its dialog waits, so a child event that turned
+    // it working hid the dialog until the user answered it.
+    let fixture = "claude_background_agent_dialog_2.1.310.jsonl";
+    let Some(events) = captured_hook_payloads("atm-claude-adapter", fixture) else {
+        return;
+    };
+    assert_eq!(events.len(), 34, "{fixture}");
+    let (race, deep) = events.split_at(14);
+    // The lead's row after each hook: status, activity, needs_attention,
+    // and how many child rows it has.
+    let row = |status: &str, activity: Option<&str>, children: usize| {
+        let needs_attention = status == "needs input";
+        Some((
+            status.to_string(),
+            activity.map(String::from),
+            needs_attention,
+            children,
+        ))
+    };
+    let idle = |children| row("idle", None, children);
+    let working = |activity, children| row("working", activity, children);
+    let asking = |activity, children| row("needs input", Some(activity), children);
+    let (agent, thinking) = (Some("Agent"), Some("Thinking"));
+    let (bash, permission) = ("Bash: touch atm-probe.txt && echo atm-probe", "Permission");
+    let sessions = [
+        // A background agent, then a gated Bash call; the agent stops
+        // while the dialog is open.
+        (
+            race,
+            vec![
+                ("SessionStart", idle(0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("PreToolUse", working(agent, 0)),
+                ("SubagentStart", working(agent, 1)),
+                ("PostToolUse", working(thinking, 1)),
+                ("PreToolUse", working(Some("Bash"), 1)),
+                ("PermissionRequest", asking(bash, 1)),
+                ("Notification", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("PostToolUse", working(thinking, 0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("Stop", idle(0)),
+                ("Notification", idle(0)),
+                ("SessionEnd", None),
+            ],
+        ),
+        // The background agent spawns a nested one during the dialog;
+        // Claude restarts it when the nested agent finishes. Its own
+        // tool calls carry its agent_id and go to its row.
+        (
+            deep,
+            vec![
+                ("SessionStart", idle(0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("PreToolUse", working(agent, 0)),
+                ("SubagentStart", working(agent, 1)),
+                ("PostToolUse", working(thinking, 1)),
+                ("PreToolUse", working(Some("Bash"), 1)),
+                ("PermissionRequest", asking(bash, 1)),
+                ("Notification", asking(permission, 1)),
+                ("PreToolUse", asking(permission, 1)),
+                ("SubagentStart", asking(permission, 2)),
+                ("PostToolUse", asking(permission, 2)),
+                ("SubagentStop", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("SubagentStart", asking(permission, 1)),
+                ("SubagentStop", asking(permission, 0)),
+                ("PostToolUse", working(thinking, 0)),
+                ("UserPromptSubmit", working(None, 0)),
+                ("Stop", idle(0)),
+                ("Notification", idle(0)),
+                ("SessionEnd", None),
+            ],
+        ),
+    ];
+    for (session, expected) in sessions {
+        let lead = SessionId::new(session[0]["session_id"].as_str().expect("session_id"));
+        let (server, registry) = TestServer::spawn_with_registry().await;
+        let mut client = server.connect().await;
+        client.handshake(None).await;
+        let mut seen = Vec::new();
+        for (seq, event) in (1..).zip(session) {
+            send_applied(&mut client, seq, ClientMessage::hook_event(event.clone())).await;
+            let row = registry.get_session(lead.clone()).await.map(|view| {
+                (
+                    view.status_label,
+                    view.activity_detail,
+                    view.needs_attention,
+                    view.child_session_ids.len(),
+                )
+            });
+            let name = event["hook_event_name"].as_str().unwrap_or_default();
+            seen.push((name, row));
+        }
+        assert_eq!(seen, expected, "session {lead}");
         server.shutdown().await;
     }
 }

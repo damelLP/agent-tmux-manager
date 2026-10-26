@@ -37,7 +37,10 @@
 //! - The lead gets no `SubagentStart` for tmux teammates. Its `Stop`
 //!   lists them in `background_tasks` with `"type": "teammate"`. It did
 //!   get `SubagentStop`s with `agent_type: ""` and agent ids matching no
-//!   teammate.
+//!   teammate. Like every child event, they leave the lead's status
+//!   alone. Until 2026-10-25 one that reached an idle lead turned it
+//!   working until its next hook (read from the code; when they arrive
+//!   was not captured).
 //! - **in-process mode.** No `TeammateIdle` fired. The named teammate
 //!   ran as a background subagent: `SubagentStart`/`SubagentStop` with
 //!   `agent_id`, its own hooks carry that `agent_id`, and the `Agent`
@@ -88,7 +91,11 @@
 //!
 //! The same run's 14 status lines are in `atm-protocol`, at
 //! `tests/fixtures/claude_status_line_2.1.310.jsonl` next to
-//! `RawStatusLine`. The fixture moves here when `RawStatusLine` does.
+//! `RawStatusLine`. Beside them, `claude_status_line_blank_model_2.1.310.json`
+//! records a status-line quirk: Claude reports a whitespace model setting
+//! (`--model " "`, `ANTHROPIC_MODEL=" "`) as `"model": {"id": "",
+//! "display_name": "unknown model"}`; `atm-protocol`'s `parse.rs` docs
+//! describe it. The fixtures move here when `RawStatusLine` does.
 //!
 //! `tests/fixtures/claude_subagent_run_2.1.267.jsonl` holds one Agent
 //! run that finished inside the Agent call. Captured: Claude Code
@@ -107,6 +114,15 @@
 //! after its first text delta (`unknown`). Paths were rewritten as
 //! above. The fake API's `127.0.0.1` port in `last_assistant_message` is
 //! verbatim.
+//!
+//! `tests/fixtures/claude_background_agent_dialog_2.1.310.jsonl` holds
+//! two TUI sessions, 14 hooks and then 20, whose permission dialog stayed
+//! open while background subagents started and stopped (see Background
+//! agents and dialogs below). Captured: Claude Code 2.1.310, 2026-10-25,
+//! by the method above in manual mode, with the fake Messages API holding
+//! a subagent's replies for seconds to keep it running. Each ends with a
+//! `SessionEnd` (reason `other`) from tearing the capture down. Paths
+//! were rewritten as above.
 //!
 //! The JSON payloads in the `wire.rs` tests are hand-written (see
 //! `Synthetic:` there). Tests that build `RawHookEvent` structs check
@@ -159,8 +175,44 @@
 //!   such as a quota auto-resume after `rate_limit`. The row would read
 //!   idle until the next hook.
 //!
+//! ## Background agents and dialogs (captured 2026-10-25)
+//!
+//! Background subagents start and stop on their own schedule, so their
+//! `SubagentStart` and `SubagentStop` can reach the lead while it waits on
+//! a permission dialog. The lead sends no hook of its own while its
+//! dialog waits; a background agent's own hooks carry its `agent_id` and
+//! go to its row. So child events leave the lead's status alone: until
+//! 2026-10-25 they set it working, and the row lost its needs input until
+//! the user answered. Sealed TUI runs on Claude Code 2.1.310 in manual
+//! mode, with `atm list` polled every 200 ms:
+//!
+//! - A background agent that finished 15 s into the dialog sent its
+//!   `SubagentStop` then. The task notification's `UserPromptSubmit`
+//!   came only after the answer, in the same turn as the approved call.
+//! - Subagents get the `Agent` tool. A background agent that spawned a
+//!   nested agent during the dialog sent a `SubagentStart` then; when the
+//!   nested agent finished, Claude restarted its spawner with the task
+//!   notification, a new `SubagentStart` under the spawner's old id.
+//! - The lead's own calls can't do it: given `[gated Bash, Agent]` in one
+//!   message, Claude started the agent 71 ms after the dialog's answer.
+//! - Stopping a background agent from the task list (`x`) sent no
+//!   `SubagentStop`, only the task notification's `UserPromptSubmit` and
+//!   a quiet `Stop`. That `Stop` swept the child because it still read
+//!   working; the sweep skips a child waiting on input, so a child stopped
+//!   while it waits keeps its row (read from the code, not run; it
+//!   predates 2026-10-25). A natural `SubagentStop` at
+//!   an idle lead was followed by that `UserPromptSubmit` 53 ms later, so
+//!   no captured case needed a child event to mark the lead working.
+//!
 //! ## Known gaps (Claude Code 2.1.310)
 //!
+//! - **A nested subagent's row sits directly under the lead.** Its
+//!   `SubagentStart` carries only `agent_id` and `agent_type`, nothing
+//!   naming the subagent that spawned it, so atmd nests it under the
+//!   lead, beside its spawner. A fix can't just nest it under the
+//!   spawner: the spawner's `SubagentStop` came before the nested
+//!   agent's, and removing a session removes its children, so the running
+//!   nested agent's row would go with it.
 //! - **`claude --bare` runs the statusLine but no hooks, so ATM can't
 //!   see its turns.** A sealed TUI run with `--bare` sent status lines at
 //!   startup, after a permission-mode change and after a turn, and no
@@ -218,11 +270,20 @@
 //!   of the unmatched `SubagentStop`s in the agent-teams notes above
 //!   (unverified for teams).
 //! - **A status line also follows `SessionEnd`** (`/clear` and `/exit`),
-//!   still carrying the ended session's id, and atmd re-creates the row
-//!   from it. After `/clear`, the new session's first status line
-//!   renames that row to the new id. After `/exit`, atmd's dead-process
-//!   cleanup removes it about 1 s later, logging "process died without
-//!   a session-end signal" although one arrived.
+//!   8 to 30 ms later in the captures, still carrying the ended session's
+//!   id. atmd drops status lines with that id from the same pid for 10 s
+//!   after the `SessionEnd`. Before that, the late line re-created the
+//!   ended session's row. `claude --resume <id>` runs in a new process,
+//!   so its status lines count at once. An in-process `/resume` back to
+//!   the cleared session sends `SessionEnd` (reason `resume`), then
+//!   `SessionStart` (source `resume`) for the old id in the same pid, and
+//!   a redraw status line ~50 ms later; that `SessionStart` lifts the
+//!   drop, so the redraw line counts (sealed TUI run, 2.1.310). atm-hook
+//!   sends each call from its own process, so `SessionStart(new)` can
+//!   reach atmd before `SessionEnd(old)`. A `SessionStart` with a new id
+//!   ends the session the pid's row held, so the late `SessionEnd(old)`
+//!   keeps the new session's row (sealed TUI run, 2.1.310, with the
+//!   `SessionEnd` delivered 0.5 s late).
 //! - **A user's interrupt fires no hook.** In sealed TUI runs, pressing
 //!   Esc while Claude streamed a reply, and denying a permission dialog
 //!   in manual mode (Esc or "No"), sent no hook at all: no `Stop`, no

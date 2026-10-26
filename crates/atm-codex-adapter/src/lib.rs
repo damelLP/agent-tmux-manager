@@ -4,10 +4,9 @@
 //! payload shape, and the translation into vendor-neutral
 //! `atm_core::LifecycleEvent` — lives in this crate. The daemon
 //! (`atmd`) calls into the adapter at the connection boundary.
-//! `atm-core` and `atm-protocol` name Codex through the two exceptions
-//! AGENTS.md §1 documents: its built-in harness metadata in `atm-core`
-//! and the `CodexEvent` wire envelope in `atm-protocol`. Neither parses
-//! Codex payloads.
+//! `atm-core` holds Codex's built-in harness metadata and `atm-protocol`
+//! its `CodexEvent` wire envelope, two exceptions documented in the
+//! Architecture section of the repository's AGENTS.md.
 //!
 //! ## Relationship to the Claude adapter
 //!

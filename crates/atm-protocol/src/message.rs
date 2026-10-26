@@ -67,8 +67,9 @@ pub enum MessageType {
     /// Client disconnecting gracefully
     Disconnect,
 
-    /// Request daemon to discover existing agent sessions: running
-    /// processes of each `BUILTIN_HARNESSES` entry with `discovery_enabled`
+    /// Request daemon to discover existing sessions of each built-in
+    /// harness with
+    /// [`discovery_enabled`](atm_core::HarnessDefinition::discovery_enabled)
     Discover,
 }
 

@@ -466,6 +466,12 @@ impl ConnectionHandler {
         &mut self,
         data: serde_json::Value,
     ) -> Result<(), ConnectionError> {
+        // serde would also fill the line from an array, by field position
+        if !data.is_object() {
+            return Err(ConnectionError::ParseError(
+                "status line is not a JSON object".to_string(),
+            ));
+        }
         let (pid, status) = parse_status_line(data)?;
         let session_id = SessionId::new(status.session_id.clone());
 

@@ -1508,39 +1508,58 @@ async fn test_e2e_status_line_without_model_creates_row_and_empty_id_keeps_model
 
 #[tokio::test]
 async fn test_e2e_status_line_session_id_comes_from_the_line() {
-    // Synthetic: status lines whose session_id is missing or not a string
-    // get a parse error reply and the connection keeps serving. A string
-    // id, even an empty one, keys the row.
+    // Synthetic: status lines whose session_id is missing or not a string,
+    // or that aren't JSON objects, get a parse error reply and the
+    // connection keeps serving. A string id, even an empty one, creates
+    // the row.
     let (server, registry) = TestServer::spawn_with_registry().await;
     let mut client = server.connect().await;
     client.handshake(None).await;
     let pid = std::process::id();
 
+    // serde can fill a struct from an array by field position. The second
+    // array puts the pid at RawStatusLine's pid, field 9, so on its own it
+    // would parse and create a row.
+    let mut array_with_pid = vec![serde_json::json!("e2e-array-id")];
+    array_with_pid.extend((0..8).map(|_| serde_json::Value::Null));
+    array_with_pid.push(serde_json::json!(pid));
     for bad in [
         serde_json::json!({"pid": pid}),
         serde_json::json!({"session_id": 7, "pid": pid}),
         serde_json::json!({"session_id": null, "pid": pid}),
+        serde_json::json!("x"),
+        serde_json::json!(["e2e-array-id"]),
+        serde_json::Value::Array(array_with_pid),
     ] {
         client.send(ClientMessage::status_update(bad.clone())).await;
-        match client.recv().await {
-            DaemonMessage::Error { message, .. } => {
+        let reply = timeout(NOT_STALLED, client.recv()).await;
+        match reply {
+            Ok(DaemonMessage::Error { message, .. }) => {
                 assert!(message.starts_with("Parse error: "), "{bad}: {message:?}");
             }
             other => panic!("{bad}: expected a parse error, got {other:?}"),
         }
     }
+    assert!(registry
+        .get_session(SessionId::new("e2e-array-id"))
+        .await
+        .is_none());
+    server.shutdown().await;
 
-    for (seq, id) in [(1, "e2e-status-line-id"), (2, "")] {
+    // A fresh server per id, so each line creates its row
+    for id in ["e2e-status-line-id", ""] {
+        let (server, registry) = TestServer::spawn_with_registry().await;
+        let mut client = server.connect().await;
+        client.handshake(None).await;
         let line = serde_json::json!({"session_id": id, "pid": pid});
-        send_applied(&mut client, seq, ClientMessage::status_update(line)).await;
+        send_applied(&mut client, 1, ClientMessage::status_update(line)).await;
         let view = registry
             .get_session(SessionId::new(id))
             .await
             .unwrap_or_else(|| panic!("no row for {id:?}"));
         assert_eq!(view.id.as_str(), id);
+        server.shutdown().await;
     }
-
-    server.shutdown().await;
 }
 
 #[tokio::test]

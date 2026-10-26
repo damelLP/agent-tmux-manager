@@ -15,7 +15,8 @@ pub enum MessageType {
         client_id: Option<String>,
     },
 
-    /// Status line update from Claude Code
+    /// Status line update from Claude Code (raw `RawStatusLine` payload).
+    /// Parsed by `atm-claude-adapter` at the daemon boundary.
     StatusUpdate {
         /// The raw status line JSON (to be parsed)
         data: serde_json::Value,

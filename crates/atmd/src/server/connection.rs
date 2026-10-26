@@ -25,11 +25,11 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use atm_claude_adapter::RawHookEvent;
+use atm_claude_adapter::{RawHookEvent, RawStatusLine};
 use atm_codex_adapter::RawCodexEvent;
 use atm_core::{SessionId, StatusLineData};
 use atm_pi_adapter::RawPiEvent;
-use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion, RawStatusLine};
+use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 
 use super::MAX_TUI_CLIENTS;
 use crate::discovery::{DiscoveryResult, DiscoveryService};
@@ -1042,7 +1042,8 @@ mod tests {
     }
 
     // Synthetic: the status lines below are hand-written, trimmed to the
-    // fields each test needs. Captured lines are tested in atm-protocol.
+    // fields each test needs. Captured lines are tested in
+    // atm-claude-adapter's status_line.rs.
 
     #[test]
     fn test_parse_status_line_returns_pid_and_data() {

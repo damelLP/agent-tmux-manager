@@ -13,6 +13,9 @@
 //! - [`wire`] — `RawHookEvent` struct (deserialized JSON Claude sends
 //!   on stdin to the hook script)
 //! - [`translate`] — translation from raw event to `LifecycleEvent`
+//! - [`status_line`] — `RawStatusLine` struct (the status-line JSON
+//!   Claude sends to the statusLine command) and its mapping to
+//!   `StatusLineData`
 //!
 //! ## Agent teams (captured 2026-10-04)
 //!
@@ -89,13 +92,13 @@
 //! here for the first time, so their fields have no earlier capture to
 //! compare with.
 //!
-//! The same run's 14 status lines are in `atm-protocol`, at
-//! `tests/fixtures/claude_status_line_2.1.310.jsonl` next to
-//! `RawStatusLine`. Beside them, `claude_status_line_blank_model_2.1.310.json`
-//! records a status-line quirk: Claude reports a whitespace model setting
-//! (`--model " "`, `ANTHROPIC_MODEL=" "`) as `"model": {"id": "",
-//! "display_name": "unknown model"}`; `atm-protocol`'s `parse.rs` docs
-//! describe it. The fixtures move here when `RawStatusLine` does.
+//! The same run's 14 status lines are in
+//! `tests/fixtures/claude_status_line_2.1.310.jsonl`, which
+//! [`status_line`]'s tests read. Beside them,
+//! `claude_status_line_blank_model_2.1.310.json` records a status-line
+//! quirk: Claude reports a whitespace model setting (`--model " "`,
+//! `ANTHROPIC_MODEL=" "`) as `"model": {"id": "", "display_name":
+//! "unknown model"}`; [`status_line`]'s docs describe it.
 //!
 //! `tests/fixtures/claude_subagent_run_2.1.267.jsonl` holds one Agent
 //! run that finished inside the Agent call. Captured: Claude Code
@@ -124,11 +127,12 @@
 //! `SessionEnd` (reason `other`) from tearing the capture down. Paths
 //! were rewritten as above.
 //!
-//! The JSON payloads in the `wire.rs` tests are hand-written (see
+//! The JSON payloads in the `wire.rs` tests, and those in the
+//! `status_line.rs` tests not marked `Captured:`, are hand-written (see
 //! `Synthetic:` there). Tests that build `RawHookEvent` structs check
 //! mapping logic and claim no capture. Claude-shaped JSON in other
 //! crates' tests is hand-written too unless marked `Captured:`: in
-//! atm-protocol (`message.rs`, `parse.rs`, `tests/proptest_roundtrip.rs`),
+//! atm-protocol (`message.rs`, `tests/proptest_roundtrip.rs`),
 //! in atmd (the registry actor's and handle's unit tests,
 //! `tests/registry_integration.rs`, `tests/robustness_tests.rs`,
 //! `tests/server_integration.rs`) and in the root
@@ -328,8 +332,10 @@
 //!   checked). `PermissionRequest` has no `tool_use_id`.
 
 pub mod event;
+pub mod status_line;
 pub mod translate;
 pub mod wire;
 
 pub use event::ClaudeEventType;
+pub use status_line::{RawContextWindow, RawCost, RawModel, RawStatusLine, RawWorkspace};
 pub use wire::RawHookEvent;

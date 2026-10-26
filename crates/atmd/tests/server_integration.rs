@@ -1265,7 +1265,7 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
 /// 2026-10-24, the run described under "Captured payloads" in
 /// atm-claude-adapter's crate docs; paths rewritten to `/home/user` and
 /// `/tmp/claude-user`. The payloads are those of atm-claude-adapter's
-/// `claude_tui_session_2.1.310.jsonl` and atm-protocol's
+/// `claude_tui_session_2.1.310.jsonl` and
 /// `claude_status_line_2.1.310.jsonl`; this file adds their order.
 const CLAUDE_INTERLEAVED: &str = "tests/fixtures/claude_tui_interleaved_2.1.310.jsonl";
 
@@ -1318,7 +1318,8 @@ fn test_claude_interleaved_fixture_matches_its_sources() {
     let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let hooks_path =
         crates.join("atm-claude-adapter/tests/fixtures/claude_tui_session_2.1.310.jsonl");
-    let status_path = crates.join("atm-protocol/tests/fixtures/claude_status_line_2.1.310.jsonl");
+    let status_path =
+        crates.join("atm-claude-adapter/tests/fixtures/claude_status_line_2.1.310.jsonl");
     if !hooks_path.exists() || !status_path.exists() {
         // atmd's tests ship in its crates.io package without those crates.
         eprintln!("skipped: no source fixtures outside the workspace");
@@ -1435,12 +1436,13 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
 #[tokio::test]
 async fn test_e2e_claude_captured_blank_model_status_line_creates_row() {
     // Captured: Claude Code 2.1.310, 2026-10-25, the first status line of
-    // a TUI started with `--model " "` (see atm-protocol's parse.rs docs).
+    // a TUI started with `--model " "` (see atm-claude-adapter's
+    // status_line.rs docs).
     // Claude reports the blank model as `"id": ""`. The session is real,
     // so the line creates its row, as Unknown, even with no hook before
     // it (`--bare` sends status lines only).
     let fixture = "claude_status_line_blank_model_2.1.310.json";
-    let Some(lines) = captured_hook_payloads("atm-protocol", fixture) else {
+    let Some(lines) = captured_hook_payloads("atm-claude-adapter", fixture) else {
         return;
     };
     let [line] = lines.as_slice() else {

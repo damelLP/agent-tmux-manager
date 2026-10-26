@@ -1,10 +1,5 @@
-//! Parsing of vendor-shaped wire payloads carried by `MessageType` envelopes.
-//!
-//! Currently houses Claude's status-line JSON parser. The
-//! Claude raw hook event vocabulary lives in the `atm-claude-adapter`
-//! crate; pi-shaped wire data lives in `atm-pi-adapter`. Future:
-//! `RawStatusLine` likely also moves to `atm-claude-adapter`, with its
-//! fixtures.
+//! Parsing of Claude's status-line JSON, carried by
+//! `MessageType::StatusUpdate` envelopes.
 //!
 //! ## Captured payloads
 //!
@@ -199,10 +194,6 @@ impl RawStatusLine {
         }
     }
 }
-
-// `RawHookEvent` and the Claude→LifecycleEvent translation moved to the
-// `atm-claude-adapter` crate (see `atm_claude_adapter::wire::RawHookEvent`
-// and `atm_claude_adapter::translate`).
 
 #[cfg(test)]
 mod tests {

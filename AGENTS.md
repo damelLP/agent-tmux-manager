@@ -238,6 +238,7 @@ them with `/hooks`.
 | Lints, warnings | `clippy -D warnings` — pre-push, CI |
 | Tests pass | `cargo test --workspace` — pre-push, CI |
 | No `unwrap`/`expect` in production code | `clippy::unwrap_used`/`expect_used` — pre-push, CI (tests exempt via `clippy.toml`) |
+| pi-atm extension parses | strip types, then `node --check` — CI only (#106) |
 | No other panics (`panic!`, indexing, ...) | review only |
 | Vendor isolation, crate deps | review only |
 | Release publish order | review only (`release.yml`) |

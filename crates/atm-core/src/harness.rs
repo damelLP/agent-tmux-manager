@@ -3,7 +3,7 @@
 //! "Harness" matches the term used in the user-facing config (see bead
 //! `agent-tmux-manager-bva`'s TOML `[harness.<name>]` sections) and in
 //! pi's three-axis model (`harness × provider × model`). It's the
-//! wrapper program a user runs — Claude Code, pi, future others —
+//! wrapper program a user runs — Claude Code, pi, Codex, future others —
 //! distinct from the LLM provider/model it talks to.
 //!
 //! Distinct from `AgentType` (which currently enumerates Claude
@@ -12,8 +12,9 @@
 //! `AgentType`). `Harness` is the actual harness identity.
 //!
 //! Set at session-creation time by whichever adapter is feeding the
-//! daemon (Claude adapter → `ClaudeCode`; pi adapter → `Pi`; pure
-//! `/proc` discovery → `Unknown` until we wire bead `hfv`).
+//! daemon (Claude adapter → `ClaudeCode`; pi adapter → `Pi`; Codex
+//! adapter → `Codex`; `/proc` discovery → the harness whose process
+//! matcher matched).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -43,7 +44,7 @@ pub enum Harness {
 }
 
 impl Harness {
-    /// Short tag suitable for a TUI badge (`[claude]`, `[pi]`, `[?]`).
+    /// Short tag suitable for a TUI badge (e.g. `[claude]`, `[pi]`, `[codex]`, `[?]`).
     #[must_use]
     pub fn short_tag(&self) -> &'static str {
         match self {

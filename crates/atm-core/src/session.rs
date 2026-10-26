@@ -16,8 +16,10 @@ use tracing::debug;
 
 /// Unique identifier for a coding-agent session.
 ///
-/// Wraps a UUID string (e.g., "8e11bfb5-7dc2-432b-9206-928fa5c35731").
-/// Obtained from the `session_id` field the harness sends.
+/// Usually the `session_id` field the harness sends, a UUID string (e.g.,
+/// "8e11bfb5-7dc2-432b-9206-928fa5c35731"). [`SessionId::pending_from_pid`]
+/// and [`SessionId::scoped`] build ids for sessions whose real id is not
+/// yet known.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
@@ -1170,7 +1172,7 @@ pub struct SessionView {
     /// Agent type label
     pub agent_type: String,
 
-    /// Coding-agent harness short tag (`"claude"`, `"pi"`, `"codex"`, `"?"`).
+    /// Coding-agent harness short tag (e.g. `"claude"`, `"pi"`, `"codex"`, `"?"`).
     /// Drives the vendor badge in the TUI.
     #[serde(default)]
     pub harness: String,

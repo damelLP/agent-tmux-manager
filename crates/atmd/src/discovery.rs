@@ -5,7 +5,8 @@
 //! (Claude Code, pi, Codex, future) and the matching `Harness` is recorded
 //! so the registry tags the session correctly. Full session data arrives
 //! via status-line updates (Claude), extension events (pi) or hook events
-//! (Codex).
+//! (Codex, but not under its default shared daemon: see
+//! atm-codex-adapter's Known gaps).
 //!
 //! # Async Safety
 //!
@@ -236,7 +237,7 @@ impl DiscoveryService {
     ///
     /// Always registers a pending session with ID `pending-{pid}`. The real
     /// session_id will be set when the first status line update or adapter
-    /// event carrying both session_id and pid arrives.
+    /// event carrying the session_id and this process's pid arrives.
     ///
     /// We intentionally avoid using transcript filenames as session IDs because:
     /// - Multiple Claude processes in the same directory share the same transcript folder

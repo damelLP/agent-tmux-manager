@@ -94,8 +94,8 @@ impl fmt::Display for TokenCount {
 /// `current_usage` object, which reflects the actual tokens being sent to the
 /// API; other harnesses report them through `LifecycleEvent::ContextUpdate`.
 ///
-/// When `current_usage` is null (e.g., during /clear), all current_* fields are 0,
-/// which correctly shows 0% context usage.
+/// When Claude's `current_usage` is null (e.g., during /clear), all current_*
+/// fields are 0, which correctly shows 0% context usage.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ContextUsage {
     /// Total input tokens across all turns (cumulative, for reference).

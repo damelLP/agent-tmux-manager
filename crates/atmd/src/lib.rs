@@ -1,7 +1,7 @@
 //! ATM Daemon - Session registry and broadcast server
 //!
 //! This crate provides the core infrastructure for the ATM daemon:
-//! - `registry` - Session registry actor for tracking Claude Code sessions
+//! - `registry` - Session registry actor for tracking coding-agent sessions
 //! - `server` - Unix socket server for client connections
 //! - `monitor` - Process monitoring for CPU/memory tracking
 //!

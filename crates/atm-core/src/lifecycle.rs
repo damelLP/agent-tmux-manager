@@ -1,7 +1,7 @@
 //! Vendor-neutral agent lifecycle events.
 //!
 //! `LifecycleEvent` is the abstraction that crosses the daemon boundary —
-//! every vendor adapter (Claude Code, pi, future) translates its native
+//! every vendor adapter (Claude Code, pi, Codex, future) translates its native
 //! event vocabulary into this enum. The daemon's session state machine
 //! only ever pattern-matches on `LifecycleEvent`, never on a raw vendor
 //! event type.

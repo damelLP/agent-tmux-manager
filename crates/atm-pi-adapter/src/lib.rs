@@ -3,7 +3,9 @@
 //! All pi-specific knowledge — the event vocabulary, the wire payload
 //! shape, and the translation into vendor-neutral
 //! `atm_core::LifecycleEvent` — lives in this crate. Symmetric with
-//! `atm_claude_adapter`.
+//! `atm_claude_adapter`. `atm-core` holds pi's built-in harness metadata
+//! and `atm-protocol` its `PiEvent` wire envelope, two exceptions
+//! documented in the Architecture section of the repository's AGENTS.md.
 //!
 //! Pi is a coding agent (<https://pi.dev/>, npm package
 //! `@mariozechner/pi-coding-agent`) that exposes a TypeScript extension

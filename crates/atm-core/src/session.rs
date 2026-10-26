@@ -14,10 +14,12 @@ use tracing::debug;
 // Type-Safe Identifiers
 // ============================================================================
 
-/// Unique identifier for a Claude Code session.
+/// Unique identifier for a coding-agent session.
 ///
-/// Wraps a UUID string (e.g., "8e11bfb5-7dc2-432b-9206-928fa5c35731").
-/// Obtained from Claude Code's status line JSON `session_id` field.
+/// Usually the `session_id` field the harness sends, a UUID string (e.g.,
+/// "8e11bfb5-7dc2-432b-9206-928fa5c35731"). [`SessionId::pending_from_pid`]
+/// and [`SessionId::scoped`] build ids for sessions whose real id is not
+/// yet known.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
@@ -28,7 +30,7 @@ pub const PENDING_SESSION_PREFIX: &str = "pending-";
 impl SessionId {
     /// Creates a new SessionId from a string.
     ///
-    /// Note: This does not validate UUID format. Claude Code provides
+    /// Note: This does not validate UUID format. The harness provides
     /// the session_id, so we trust its format.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
@@ -36,10 +38,9 @@ impl SessionId {
 
     /// Creates a pending session ID from a process ID.
     ///
-    /// Used when a Claude process is discovered but no transcript exists yet
-    /// (e.g., session just started, no conversation has occurred).
-    /// The pending session will be upgraded to the real session ID when
-    /// it arrives via hook event or status line.
+    /// Used while a session's real ID is not yet known, e.g. for an agent
+    /// process found by discovery. The pending session will be upgraded to
+    /// the real session ID when it arrives via status line or adapter event.
     pub fn pending_from_pid(pid: u32) -> Self {
         Self(format!("{PENDING_SESSION_PREFIX}{pid}"))
     }
@@ -177,18 +178,18 @@ impl AsRef<Path> for TranscriptPath {
 /// Current operational status of a session.
 ///
 /// Three fundamental states based on user action requirements:
-/// - **Idle**: Nothing happening - Claude finished, waiting for user
-/// - **Working**: Claude is actively processing - user just waits
+/// - **Idle**: Nothing happening - the agent finished, waiting for user
+/// - **Working**: The agent is actively processing - user just waits
 /// - **AttentionNeeded**: User must act for session to proceed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
-    /// Session is idle - Claude finished, waiting for user's next action.
+    /// Session is idle - the agent finished, waiting for user's next action.
     /// User can take their time, no urgency.
     #[default]
     Idle,
 
-    /// Claude is actively processing - user just waits.
+    /// The agent is actively processing - user just waits.
     /// Work is happening, no user action needed.
     Working,
 
@@ -537,7 +538,7 @@ pub struct StatusLineData {
 // Domain Entity
 // ============================================================================
 
-/// Core domain model for a Claude Code session.
+/// Core domain model for a coding-agent session.
 ///
 /// Contains pure business logic and state. Does NOT include
 /// infrastructure concerns (PIDs, sockets, file paths).
@@ -552,7 +553,7 @@ pub struct SessionDomain {
     pub agent_type: AgentType,
 
     /// Which coding-agent harness drives this session (Claude Code,
-    /// pi, future). Distinct from `agent_type` (which today encodes
+    /// pi, Codex, future). Distinct from `agent_type` (which today encodes
     /// Claude subagent role) — see `crate::harness::Harness`.
     #[serde(default)]
     pub harness: crate::Harness,
@@ -752,7 +753,7 @@ impl SessionDomain {
     /// Updates status from a vendor-neutral lifecycle event.
     ///
     /// Single source of truth for session-state transitions. Every
-    /// adapter (Claude, pi, future) funnels through this method.
+    /// adapter (Claude, pi, Codex, future) funnels through this method.
     pub fn apply_lifecycle_event(&mut self, event: &LifecycleEvent) {
         self.apply_lifecycle_event_at(event, Utc::now());
     }
@@ -940,7 +941,7 @@ pub struct ToolUsageRecord {
 /// Owned by RegistryActor alongside SessionDomain.
 #[derive(Debug, Clone)]
 pub struct SessionInfrastructure {
-    /// Process ID of the Claude Code process (if known)
+    /// Process ID of the agent process (if known)
     pub pid: Option<u32>,
 
     /// Process start time in clock ticks (from /proc/{pid}/stat field 22).
@@ -1171,7 +1172,7 @@ pub struct SessionView {
     /// Agent type label
     pub agent_type: String,
 
-    /// Coding-agent harness short tag (`"claude"`, `"pi"`, `"?"`).
+    /// Coding-agent harness short tag (e.g. `"claude"`, `"pi"`, `"codex"`, `"?"`).
     /// Drives the vendor badge in the TUI.
     #[serde(default)]
     pub harness: String,

@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "OpenAI Codex CLI adapter for ATM — translates Codex raw hook events into vendor-neutral LifecycleEvent"
+description = "OpenAI Codex CLI adapter for ATM — translates Codex raw hook events into vendor-neutral LifecycleEvent and reads token usage from Codex rollout transcripts"
 
 [dependencies]
 atm-core = { workspace = true }

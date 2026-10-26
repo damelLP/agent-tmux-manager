@@ -203,7 +203,8 @@ impl RegistryActor {
     /// Handles session registration.
     ///
     /// Note: This is now primarily used for testing. Most sessions are
-    /// registered via `handle_register_discovered` or status line updates.
+    /// registered via `handle_register_discovered`, status line updates or
+    /// adapter events.
     /// Without a PID, this creates a session that cannot be looked up by PID.
     fn handle_register(
         &mut self,
@@ -317,7 +318,7 @@ impl RegistryActor {
     /// Handles registration of a discovered session.
     ///
     /// Creates a minimal session with defaults. The session will be updated
-    /// with full data when status line updates arrive.
+    /// with full data when status line updates or adapter events arrive.
     ///
     /// With PID as primary key, if a session already exists for this PID,
     /// we update its session_id rather than creating a duplicate.
@@ -388,9 +389,11 @@ impl RegistryActor {
         }
 
         // Create minimal session with defaults (genuinely new process).
-        // Agent type and model will be updated when the status line arrives.
+        // Agent type and model will be updated when the status line or
+        // adapter events arrive.
         // Harness tag comes from whichever discoverer matched (Claude, pi,
-        // future); subsequent adapter events can refine but not change identity.
+        // Codex, future); subsequent adapter events can refine but not change
+        // identity.
         use atm_core::Model;
         let session = build_session_from_pid(
             session_id.clone(),
@@ -422,8 +425,8 @@ impl RegistryActor {
     /// see the id transition cleanly. Links to `old_id` follow the rename.
     ///
     /// Used by both the Claude status-line path and any vendor adapter
-    /// (pi today) whose first events arrive before the real session_id
-    /// is known. Without this, a session discovered as `pending-{pid}`
+    /// whose first events arrive before the real session_id is known.
+    /// Without this, a session discovered as `pending-{pid}`
     /// stays at that id forever even after real adapter events fire.
     ///
     /// No-op if the session is not present at `pid`.
@@ -1061,7 +1064,7 @@ impl RegistryActor {
 
     /// Handles cleanup of dead-process sessions.
     ///
-    /// Removes sessions whose Claude Code process has terminated
+    /// Removes sessions whose agent process has terminated
     /// (PID no longer exists or was reused by a different process).
     fn handle_cleanup_stale(&mut self) {
         let now = Utc::now();

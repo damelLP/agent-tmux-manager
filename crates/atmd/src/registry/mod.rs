@@ -1,6 +1,6 @@
 //! Session registry using Actor pattern.
 //!
-//! The registry is the central state manager for all active Claude Code sessions.
+//! The registry is the central state manager for all active coding-agent sessions.
 //! It receives commands via a tokio mpsc channel and maintains the canonical
 //! source of truth for session data.
 //!

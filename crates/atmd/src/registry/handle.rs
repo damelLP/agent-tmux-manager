@@ -129,7 +129,7 @@ impl RegistryHandle {
     /// Apply a vendor-neutral lifecycle event to a session.
     ///
     /// The connection layer translates raw vendor events (Claude
-    /// `RawHookEvent`, future pi extension messages) into
+    /// `RawHookEvent`, pi extension messages, Codex `RawCodexEvent`) into
     /// `LifecycleEvent` before calling this method.
     ///
     /// # Errors
@@ -252,8 +252,8 @@ impl RegistryHandle {
     /// Register a discovered session (minimal data from /proc scan).
     ///
     /// Creates a minimal session with defaults that will be filled in
-    /// when status line updates arrive. If the session already exists,
-    /// this is a no-op (returns Ok).
+    /// when status line updates or adapter events arrive. If the session
+    /// already exists, this is a no-op (returns Ok).
     ///
     /// # Errors
     ///

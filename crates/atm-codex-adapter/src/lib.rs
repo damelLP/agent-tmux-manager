@@ -1,9 +1,10 @@
 //! OpenAI Codex CLI adapter for ATM.
 //!
 //! All Codex-specific knowledge — the raw event vocabulary, the wire
-//! payload shape, and the translation into vendor-neutral
-//! `atm_core::LifecycleEvent` — lives in this crate. The daemon
-//! (`atmd`) calls into the adapter at the connection boundary.
+//! payload shape, the rollout transcript's token-usage records, and the
+//! translation into vendor-neutral `atm_core::LifecycleEvent` — lives in
+//! this crate. The daemon (`atmd`) calls into the adapter at the
+//! connection boundary.
 //! `atm-core` holds Codex's built-in harness metadata and `atm-protocol`
 //! its `CodexEvent` wire envelope, two exceptions documented in the
 //! Architecture section of the repository's AGENTS.md.

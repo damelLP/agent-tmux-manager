@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Claude Code adapter for ATM — translates Claude raw hook events into vendor-neutral LifecycleEvent"
+description = "Claude Code adapter for ATM — translates Claude raw hook events into vendor-neutral LifecycleEvent and status lines into StatusLineData"
 
 [dependencies]
 atm-core = { workspace = true }

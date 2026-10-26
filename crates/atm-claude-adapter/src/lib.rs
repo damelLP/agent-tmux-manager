@@ -1,10 +1,16 @@
 //! Claude Code adapter for ATM.
 //!
-//! All Claude-specific knowledge — the raw event vocabulary, the wire
-//! payload shape, and the translation into vendor-neutral
-//! `atm_core::LifecycleEvent` — lives in this crate. The daemon
-//! (`atmd`) calls into the adapter at the connection boundary; nothing
-//! in `atm-core` or `atm-protocol` references Claude.
+//! Claude's raw event vocabulary, its hook and status-line payload
+//! shapes, and their translation into vendor-neutral `atm_core` types
+//! (`LifecycleEvent` and `StatusLineData`) live in this crate. The
+//! daemon (`atmd`) calls into the adapter at the connection boundary.
+//!
+//! `atm-core` and `atm-protocol` still name Claude. AGENTS.md §1
+//! documents two exceptions, Claude's built-in harness metadata in
+//! `atm-core` and its `HookEvent` and `StatusUpdate` wire envelopes in
+//! `atm-protocol`, and lists older Claude-specific code still in
+//! `atm-core` (model ids and pricing in `model.rs`, for example) that
+//! moves out in its own approved refactors.
 //!
 //! ## Layers
 //!

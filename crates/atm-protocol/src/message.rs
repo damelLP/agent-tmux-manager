@@ -67,7 +67,8 @@ pub enum MessageType {
     /// Client disconnecting gracefully
     Disconnect,
 
-    /// Request daemon to discover existing Claude sessions
+    /// Request daemon to discover existing agent sessions: running
+    /// processes of each `BUILTIN_HARNESSES` entry with `discovery_enabled`
     Discover,
 }
 

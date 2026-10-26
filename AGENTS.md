@@ -91,7 +91,7 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 | Crate | Responsibility | May depend on |
 |---|---|---|
 | `atm-core` | Vendor-neutral domain types | nothing internal |
-| `atm-protocol` | Vendor-neutral wire messages + parsing | `atm-core` |
+| `atm-protocol` | Vendor-neutral wire messages and protocol versioning | `atm-core` |
 | `atm-<vendor>-adapter` | **All** knowledge of one harness: event vocabulary, payload shapes, mapping to core types | `atm-core` only |
 | `atm-tmux` | Thin async wrapper over the tmux CLI (`TmuxClient` trait + `MockTmuxClient`) | no internal crates |
 | `atmd` | Session registry, broadcast server | core, protocol, tmux, adapters |
@@ -109,13 +109,15 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
     about each CLI as data: its name, command, process matchers and prompt
     mode. Spawning and discovery read them instead of branching per vendor
     (c23888d, #44). They never hold payload schemas, event names or parsing.
-  - **Per-harness wire envelopes.** `atm-protocol`'s `MessageType` has one
-    variant per harness (`PiEvent`, `CodexEvent`; Claude's predates the
-    naming as `HookEvent`). It carries the payload as opaque JSON that only
+  - **Per-harness wire envelopes.** `atm-protocol`'s `MessageType` has an
+    envelope variant for each kind of payload a harness sends: `PiEvent`
+    and `CodexEvent`, and Claude's `HookEvent` and `StatusUpdate`, which
+    predate the naming. Each carries the payload as opaque JSON that only
     the adapter parses.
   - Not exceptions: Claude-specific code that predates this rule and is
-    still in `atm-core` (model ids and pricing in `model.rs`,
-    `AgentType::from_subagent_type`, tool classification in `tool.rs`).
+    still in `atm-core`, for example model ids and pricing in `model.rs`,
+    `AgentType::from_subagent_type`, tool classification in `tool.rs`,
+    `SessionDomain::claude_code_version` and `ContextUsage::exceeds_200k`.
     Each moves out in its own approved refactor, never inside an unrelated
     change.
 - Adapters never depend on each other.
@@ -130,8 +132,8 @@ new harness with the user before starting (principle 2). That one approval
 covers the steps below. Codex (#30) touched 23 files:
 
 1. A new `crates/atm-<vendor>-adapter`: raw payload types, event vocabulary
-   and the mapping to `atm-core` lifecycle events. Its crate docs (`//!`)
-   record the verified payloads, quirks and harness version.
+   and the mapping to `atm-core` lifecycle events. Its crate and module docs
+   (`//!`) record the verified payloads, quirks and harness version.
 2. `atm-core`: a `Harness` variant and a `BUILTIN_HARNESSES` entry, static
    facts only. Amp, Qwen and Gemini already have both, with
    `discovery_enabled: false`. Set it to `true` once the adapter exists, and
@@ -198,8 +200,8 @@ covers the steps below. Codex (#30) touched 23 files:
   the commit message. Never accept just to make a test pass.
 - Adapters: test against **real captured payloads** from the harness, not
   hand-imagined ones (principle 3).
-- Mark each real capture where it's documented (the adapter's crate docs,
-  or a comment beside the test) with `Captured: <harness> <version>,
+- Mark each real capture where it's documented (the adapter's crate or
+  module docs, or a comment beside the test) with `Captured: <harness> <version>,
   <YYYY-MM-DD>, <method>.`, writing "not recorded" for any part nobody
   recorded. Mark a hand-built payload in an adapter's tests with
   `Synthetic: <why>`. Unmarked payloads in other crates' tests are
@@ -270,9 +272,9 @@ them with `/hooks`.
 ## 5. Pointers
 
 - Harness integration findings (actual payloads, event names, quirks): the
-  relevant adapter's crate and module docs (`//!` in its `lib.rs`, and in
-  modules with their own payloads, e.g. `atm-claude-adapter`'s
-  `status_line.rs`).
+  relevant adapter's crate docs (`//!` in its `lib.rs`) and module docs
+  (`//!` atop each module, e.g. `atm-claude-adapter`'s `status_line.rs` and
+  `atm-codex-adapter`'s `translate.rs`).
 - Plans and specs: `docs/plans/` — **local, git-ignored working files**.
   They are point-in-time snapshots and go stale. Never treat one as current
   truth. Anything durable must land in code, tests, this file, or a PR

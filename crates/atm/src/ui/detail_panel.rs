@@ -4,6 +4,7 @@
 //! in the right panel of the split layout.
 
 use crate::ui::theme::{context_color, status_color};
+use atm_core::beads::BeadsTask;
 use atm_core::{format_age, SessionStatus, SessionView};
 use chrono::{DateTime, Utc};
 use ratatui::{
@@ -255,11 +256,15 @@ fn build_progress_bar(percentage: f64, width: usize) -> String {
 /// - Beads in-progress task title (cyan, bold)
 /// - First user prompt
 /// - Fallback: status info if nothing else available
+///
+/// `beads_task` is the cached task for the session's project directory;
+/// rendering never reads `.beads/` itself.
 pub fn render_compact_preview(
     frame: &mut Frame,
     area: Rect,
     session: Option<&SessionView>,
     _captured_output: &[String],
+    beads_task: Option<&BeadsTask>,
 ) {
     let block = Block::default()
         .title(" Summary ")
@@ -270,17 +275,7 @@ pub fn render_compact_preview(
         Some(s) => {
             let mut result: Vec<Line<'_>> = Vec::new();
 
-            // Beads task: try project_root first (where .beads/ lives), then worktree_path
-            let beads_task = s
-                .project_root
-                .as_deref()
-                .or(s.worktree_path.as_deref())
-                .and_then(|dir| {
-                    let tasks = atm_core::beads::find_in_progress_tasks(dir);
-                    tasks.into_iter().next()
-                });
-
-            if let Some(ref task) = beads_task {
+            if let Some(task) = beads_task {
                 result.push(Line::from(Span::styled(
                     task.title.clone(),
                     Style::default()

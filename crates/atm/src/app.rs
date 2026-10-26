@@ -6,6 +6,7 @@
 //! All code follows the panic-free policy: no `.unwrap()`, `.expect()`,
 //! `panic!()`, `unreachable!()`, `todo!()`, or direct indexing `[i]`.
 
+use atm_core::beads::BeadsTask;
 use atm_core::{
     all_node_ids, build_tree, flatten_tree, SessionId, SessionView, TreeNode, TreeNodeId, TreeRow,
     TreeRowKind,
@@ -98,6 +99,10 @@ pub struct App {
     /// The pane ID currently being captured (to detect selection changes).
     pub capture_pane_id: Option<String>,
 
+    /// Latest in-progress Beads task read for each project directory,
+    /// filled by a background read so rendering never touches the disk.
+    beads_tasks: HashMap<String, Option<BeadsTask>>,
+
     /// If set, only show sessions whose tmux pane belongs to this tmux session.
     pub tmux_session_filter: Option<String>,
 
@@ -153,6 +158,7 @@ impl App {
             tree_rows: Vec::new(),
             captured_output: Vec::new(),
             capture_pane_id: None,
+            beads_tasks: HashMap::new(),
             tmux_session_filter: None,
             filter_pane_ids: HashSet::new(),
             compact: false,
@@ -586,6 +592,26 @@ impl App {
         }
     }
 
+    /// Directory whose `.beads/` the selected session's preview shows: the
+    /// project root (where `.beads/` lives), else the worktree path.
+    pub fn selected_beads_dir(&self) -> Option<&str> {
+        let session = self.selected_session()?;
+        session
+            .project_root
+            .as_deref()
+            .or(session.worktree_path.as_deref())
+    }
+
+    /// Cached in-progress Beads task for the selected session's directory.
+    pub fn selected_beads_task(&self) -> Option<&BeadsTask> {
+        self.beads_tasks.get(self.selected_beads_dir()?)?.as_ref()
+    }
+
+    /// Records the result of a completed Beads read for `dir`.
+    pub fn update_beads_task(&mut self, dir: String, task: Option<BeadsTask>) {
+        self.beads_tasks.insert(dir, task);
+    }
+
     /// Navigates to the next row (downward), wrapping around if needed.
     pub fn select_next(&mut self) {
         let row_count = self.tree_rows.len();
@@ -799,6 +825,92 @@ mod tests {
             tmux_pane: None,
             ..Default::default()
         }
+    }
+
+    fn beads_task(id: &str) -> BeadsTask {
+        BeadsTask {
+            id: id.to_string(),
+            title: format!("{id} title"),
+            description: None,
+        }
+    }
+
+    fn select(app: &mut App, id: &str) {
+        app.expand_all();
+        app.selected_index = app
+            .tree_rows
+            .iter()
+            .position(
+                |r| matches!(&r.kind, TreeRowKind::Agent { session } if session.id.as_str() == id),
+            )
+            .unwrap();
+    }
+
+    fn selected_beads_id(app: &App) -> Option<&str> {
+        app.selected_beads_task().map(|t| t.id.as_str())
+    }
+
+    /// Two sessions in different projects: `aaa` in /p/alpha, `bbb` in /p/beta.
+    fn two_project_app() -> App {
+        let mut a = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        a.project_root = Some("/p/alpha".to_string());
+        let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
+        b.project_root = Some("/p/beta".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![a, b]);
+        app
+    }
+
+    #[test]
+    fn test_beads_task_follows_selected_sessions_dir() {
+        let mut app = two_project_app();
+        app.update_beads_task("/p/alpha".to_string(), Some(beads_task("alpha-1")));
+
+        select(&mut app, "aaa");
+        assert_eq!(app.selected_beads_dir(), Some("/p/alpha"));
+        assert_eq!(selected_beads_id(&app), Some("alpha-1"));
+
+        select(&mut app, "bbb");
+        assert_eq!(app.selected_beads_dir(), Some("/p/beta"));
+        assert_eq!(selected_beads_id(&app), None, "beta has not been read yet");
+    }
+
+    #[test]
+    fn test_beads_update_replaces_only_that_dirs_entry() {
+        let mut app = two_project_app();
+        app.update_beads_task("/p/alpha".to_string(), Some(beads_task("alpha-1")));
+        app.update_beads_task("/p/beta".to_string(), Some(beads_task("beta-1")));
+
+        // A read that found no in-progress task (or no file) clears alpha only.
+        app.update_beads_task("/p/alpha".to_string(), None);
+        select(&mut app, "aaa");
+        assert_eq!(selected_beads_id(&app), None);
+        select(&mut app, "bbb");
+        assert_eq!(selected_beads_id(&app), Some("beta-1"));
+
+        app.update_beads_task("/p/beta".to_string(), Some(beads_task("beta-2")));
+        assert_eq!(selected_beads_id(&app), Some("beta-2"));
+    }
+
+    #[test]
+    fn test_beads_dir_prefers_project_root_then_worktree() {
+        let mut s = create_test_session("aaa", "2024-01-15T10:00:00Z");
+        s.project_root = Some("/p/root".to_string());
+        s.worktree_path = Some("/p/root/.worktrees/x".to_string());
+        let mut app = App::new();
+        app.update_sessions(vec![s.clone()]);
+        select(&mut app, "aaa");
+        assert_eq!(app.selected_beads_dir(), Some("/p/root"));
+
+        s.project_root = None;
+        app.update_sessions(vec![s.clone()]);
+        select(&mut app, "aaa");
+        assert_eq!(app.selected_beads_dir(), Some("/p/root/.worktrees/x"));
+
+        s.worktree_path = None;
+        app.update_sessions(vec![s]);
+        select(&mut app, "aaa");
+        assert_eq!(app.selected_beads_dir(), None);
     }
 
     fn type_query(app: &mut App, query: &str) {

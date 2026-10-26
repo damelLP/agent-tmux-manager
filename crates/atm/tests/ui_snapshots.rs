@@ -14,6 +14,7 @@
 
 use std::sync::Mutex;
 
+use atm_core::beads::BeadsTask;
 use atm_core::{SessionId, SessionStatus, SessionView};
 use atm_tui::app::{App, AppState};
 use atm_tui::error::TuiError;
@@ -547,11 +548,8 @@ fn compact_session_list_subscriber_cap_rejected() {
 
 #[test]
 fn compact_preview_falls_back_to_status() {
-    // Both project_root and worktree_path are None, so the renderer's
-    // beads lookup short-circuits before touching the filesystem and the
-    // status-line fallback kicks in. Strictly deterministic — no probe,
-    // no chance of a stray .beads/ on the dev/CI host changing the snapshot.
-    let mut session = make_session(
+    // No cached Beads task, so the status-line fallback kicks in.
+    let session = make_session(
         "abc12345-aaaa-bbbb-cccc-000000000001",
         "/home/dev/project-alpha",
         "main",
@@ -562,10 +560,34 @@ fn compact_preview_falls_back_to_status() {
         0.50,
         "2026-01-15T10:05:00Z",
     );
-    session.project_root = None;
-    session.worktree_path = None;
     let buf = render_buffer(30, 8, |frame, area| {
-        render_compact_preview(frame, area, Some(&session), &[]);
+        render_compact_preview(frame, area, Some(&session), &[], None);
+    });
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn compact_preview_shows_cached_beads_task() {
+    // The task comes from App's cache as plain data; the renderer reads no
+    // file, so a stray .beads/ on the host can't change the snapshot.
+    let session = make_session(
+        "abc12345-aaaa-bbbb-cccc-000000000001",
+        "/home/dev/project-alpha",
+        "main",
+        "Opus 4.5",
+        SessionStatus::Working,
+        "working",
+        45.0,
+        0.50,
+        "2026-01-15T10:05:00Z",
+    );
+    let task = BeadsTask {
+        id: "project-alpha-7kq".to_string(),
+        title: "Cache beads reads".to_string(),
+        description: Some("Read off the render path.\nKeep the last value.".to_string()),
+    };
+    let buf = render_buffer(30, 8, |frame, area| {
+        render_compact_preview(frame, area, Some(&session), &[], Some(&task));
     });
     insta::assert_debug_snapshot!(buf);
 }

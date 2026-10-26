@@ -13,6 +13,7 @@
 //! All tasks respect a shared `CancellationToken` for graceful shutdown.
 
 pub mod app;
+pub mod beads;
 pub mod client;
 pub mod daemon;
 pub mod error;

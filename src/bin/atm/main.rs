@@ -930,7 +930,8 @@ struct AtmConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HarnessConfig {
-    /// Default harness id/alias used when `atm spawn` omits `--harness`.
+    /// Default harness id/alias used by `atm workspace create`, and by
+    /// `atm spawn` when it omits `--harness`.
     default: Option<String>,
     /// Per-harness spawn overrides from `[harness.<name>]` tables.
     #[serde(flatten)]

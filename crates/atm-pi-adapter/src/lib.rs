@@ -198,12 +198,16 @@
 //!   during its 1 s reconnect back-off), the new session still gets its
 //!   own row. And if the shutdown arrives after the new `session_start`
 //!   (both instances connect afresh when atmd has closed the idle
-//!   connection), atmd keeps the new row. Both are pinned by atmd's
-//!   registry tests, not run with pi. An in-memory fork's shutdown carries
-//!   the fork's new id (see pi-atm), which no `session_start` ended in that
-//!   pid, so atmd still ends that row by pid; if the fork's `session_start`
-//!   came first, that shutdown removes the fork's row until its next
-//!   event.
+//!   connection), atmd keeps the new row. An in-memory fork's shutdown
+//!   carries the fork's new id (see pi-atm), which no `session_start`
+//!   ended in that pid, so atmd still ends that row by pid; if the fork's
+//!   `session_start` came first, that shutdown removes the fork's row
+//!   until its next event. Checked with pi 0.73.1 over rpc (`--offline
+//!   --no-session`, a fake provider, 2026-10-26): `new_session` and
+//!   `clone` each sent the old instance's shutdown ~3 ms before the new
+//!   one's start, the fork's shutdown carried the new id, and with the
+//!   shutdown held 0.5 s by a socket proxy, `new_session` kept the new
+//!   row while `clone` lost it, as described.
 //! - pi 0.50.0 to 0.64.0 switch sessions in place: one pi-atm instance
 //!   throughout, and only `session_switch`, which pi-atm doesn't forward.
 //!   pi-atm reads the id on every event, so its frames follow the switch,

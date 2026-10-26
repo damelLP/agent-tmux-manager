@@ -139,8 +139,11 @@
 //!     under its id, so the row follows the session that started last. The
 //!     first `SessionEnd` from any session removes the row, unless a
 //!     `SessionStart` ended that session in the daemon's pid in the last
-//!     10 s (atmd's ended-session marker). From atmd's registry tests, not
-//!     run with codex;
+//!     10 s (atmd's ended-session marker). Checked with two TUIs on one
+//!     daemon (codex-cli 0.163.0, sealed fake provider, 2026-10-26): B's
+//!     `SessionStart{startup}` and then A's `SessionStart{compact}` after
+//!     an auto compaction each moved the row, and stopping the daemon
+//!     fired `SessionEnd{other}` for both sessions;
 //!   - `TMUX_PANE` in the hook's environment is the daemon's, inherited
 //!     from whichever TUI started it, so other sessions show that pane;
 //!   - `/quit` detaches ("Any running work continues") and fires no

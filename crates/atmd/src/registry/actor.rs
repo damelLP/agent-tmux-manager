@@ -76,8 +76,10 @@ pub struct RegistryActor {
     /// resolved to, learned from aliases.
     child_refs: HashMap<(SessionId, ChildRef), SessionId>,
 
-    /// When each `(session_id, pid)` was removed by its `SessionEnd`. A
-    /// status line for a pair is dropped until [`ENDED_SESSION_TTL`] passes.
+    /// When each `(session_id, pid)` ended: its `SessionEnd` removed it, or
+    /// a new session's `SessionStart` in that pid ended it. Until
+    /// [`ENDED_SESSION_TTL`] passes, a status line for a pair is dropped,
+    /// and so is a `SessionEnd` that no longer names the pid's row.
     ended_sessions: HashMap<(SessionId, u32), DateTime<Utc>>,
 }
 
@@ -533,8 +535,8 @@ impl RegistryActor {
     /// Updates an existing session by PID, or creates a new one.
     ///
     /// This is the core logic for status line handling with PID as primary key.
-    /// A late status line for a session that `SessionEnd` just removed from
-    /// this PID is dropped, so it can't bring the ended session back.
+    /// A late status line for a session that just ended in this PID is
+    /// dropped, so it can't bring the ended session back.
     fn update_or_create_by_pid(
         &mut self,
         pid: u32,
@@ -542,8 +544,7 @@ impl RegistryActor {
         data: StatusLineData,
         harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
-        let ended_at = self.ended_sessions.get(&(session_id.clone(), pid));
-        if ended_at.is_some_and(|ended_at| marker_live(*ended_at, Utc::now())) {
+        if self.ended_in(&session_id, pid, Utc::now()) {
             debug!(
                 session_id = %session_id,
                 pid = pid,
@@ -605,6 +606,10 @@ impl RegistryActor {
     /// - An untagged `SessionEnd` immediately removes the session from the
     ///   registry, and marks it ended in that process (see `ended_sessions`).
     ///   An untagged `SessionStart` for the same id and process clears the mark.
+    /// - An untagged `SessionStart` with a new id ends the session its
+    ///   process's row held, as that session's `SessionEnd` would, and starts
+    ///   a fresh row. A `SessionEnd` for the old id that arrives afterwards
+    ///   keeps the new row.
     /// - `ChildSessionStart`/`ChildSessionEnd` create and remove in-process children.
     fn handle_apply_lifecycle_event(
         &mut self,
@@ -620,14 +625,25 @@ impl RegistryActor {
         // Untagged SessionEnd: remove session immediately.
         if context.child.is_none() && matches!(event, LifecycleEvent::SessionEnd { .. }) {
             if let Some(p) = target_pid {
-                if self.sessions_by_pid.contains_key(&p) {
+                if let Some((session, _)) = self.sessions_by_pid.get(&p) {
+                    let now = Utc::now();
+                    // A SessionStart already ended `session_id` in this
+                    // process, so the row is a newer session's.
+                    if session.id != session_id && self.ended_in(&session_id, p, now) {
+                        info!(
+                            session_id = %session_id,
+                            pid = p,
+                            current_id = %session.id,
+                            "SessionEnd for a session this process moved on from, keeping the row"
+                        );
+                        return Ok(());
+                    }
                     info!(
                         session_id = %session_id,
                         pid = p,
                         "SessionEnd received, removing session"
                     );
-                    self.record_session_end(session_id, p, Utc::now());
-                    return self.handle_remove_by_pid(p, RemovalReason::SessionEnded);
+                    return self.end_session_in(session_id, p, now);
                 }
             }
 
@@ -640,7 +656,9 @@ impl RegistryActor {
 
         // A session started again in the process it ended in (an in-process
         // resume) takes its status lines again.
-        if context.child.is_none() && matches!(event, LifecycleEvent::SessionStart { .. }) {
+        let starts_session =
+            context.child.is_none() && matches!(event, LifecycleEvent::SessionStart { .. });
+        if starts_session {
             if let Some(p) = target_pid {
                 self.ended_sessions.remove(&(session_id.clone(), p));
             }
@@ -651,12 +669,27 @@ impl RegistryActor {
         // a real session_id is our signal to reconcile, mirroring the
         // Claude status-line upgrade path. Limited to pending → real
         // so that ordinary pi events (which carry session_id on every
-        // frame) don't thrash the index.
+        // frame) don't thrash the index. A real id is replaced only by an
+        // untagged SessionStart, below.
         if let Some(p) = target_pid {
             if let Some((existing, _)) = self.sessions_by_pid.get(&p) {
                 let current_id = existing.id.clone();
                 if current_id.is_pending() && !session_id.is_pending() && current_id != session_id {
                     self.reconcile_session_id(p, current_id, session_id.clone());
+                } else if starts_session && !session_id.is_pending() && current_id != session_id {
+                    // A new session took over the process (`/clear`, an
+                    // in-process resume), so the one its row held ended
+                    // there. End it as its SessionEnd would; the event
+                    // then starts a fresh row for the pid below. (A
+                    // pid-less event finds its row through the id index,
+                    // so its row already has its id.)
+                    info!(
+                        session_id = %current_id,
+                        pid = p,
+                        new_id = %session_id,
+                        "SessionStart of a new session, ending the session this process's row held"
+                    );
+                    self.end_session_in(current_id, p, Utc::now())?;
                 }
             }
         }
@@ -1007,6 +1040,25 @@ impl RegistryActor {
         self.ended_sessions.insert((session_id, pid), now);
     }
 
+    /// Ends `session_id` in `pid` at `now`, as its `SessionEnd` does: marks
+    /// it ended there and removes the pid's row, detaching its children.
+    fn end_session_in(
+        &mut self,
+        session_id: SessionId,
+        pid: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(), RegistryError> {
+        self.record_session_end(session_id, pid, now);
+        self.handle_remove_by_pid(pid, RemovalReason::SessionEnded)
+    }
+
+    /// Whether `session_id` ended in `pid` within [`ENDED_SESSION_TTL`]
+    /// before `now`.
+    fn ended_in(&self, session_id: &SessionId, pid: u32, now: DateTime<Utc>) -> bool {
+        let ended_at = self.ended_sessions.get(&(session_id.clone(), pid));
+        ended_at.is_some_and(|ended_at| marker_live(*ended_at, now))
+    }
+
     /// Handles cleanup of dead-process sessions.
     ///
     /// Removes sessions whose Claude Code process has terminated
@@ -1205,14 +1257,16 @@ fn apply_status_line(
     }
 }
 
-/// How long after a `SessionEnd` its process's status lines for the ended
-/// session are dropped. Claude Code 2.1.310 sends one ~30 ms after
-/// `SessionEnd` on `/clear`; 10 s leaves a wide margin for a loaded host.
+/// How long after a session ends in a process (see `ended_sessions`) its
+/// status lines from that process are dropped, and a `SessionEnd` that no
+/// longer names the process's row keeps it. Claude Code 2.1.310 sends a
+/// status line ~30 ms after `SessionEnd` on `/clear`; 10 s leaves a wide
+/// margin for a loaded host.
 const ENDED_SESSION_TTL: chrono::Duration = chrono::Duration::seconds(10);
 
-/// Whether a `SessionEnd` marker set at `ended_at` still drops status lines
-/// at `now`. A clock that went backwards expires it, accepting them as
-/// before the marker existed.
+/// Whether an ended-session marker set at `ended_at` is still live at
+/// `now`. A clock that went backwards expires it, which restores the
+/// behaviour from before the marker existed.
 fn marker_live(ended_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     let age = now.signed_duration_since(ended_at);
     age >= chrono::Duration::zero() && age < ENDED_SESSION_TTL
@@ -2013,7 +2067,8 @@ mod tests {
         // adapter events with different real session_ids on the same
         // PID must NOT thrash the index — that would mean some other
         // bug (PID reuse, stale state) and the daemon shouldn't paper
-        // over it by silently renaming.
+        // over it by silently renaming. (Only an untagged SessionStart
+        // acts on a new real id: it ends the row's session.)
         let (_, mut actor, _) = create_actor();
         let current_pid = std::process::id();
 
@@ -4372,8 +4427,9 @@ mod tests {
         assert_eq!(markers, [(SessionId::new(NEW), pid)]);
     }
 
-    /// Only a `SessionEnd` removal records a marker; cleanup's removal of a
-    /// dead process doesn't.
+    /// Ending a session records a marker (its `SessionEnd`, or a new
+    /// session's `SessionStart` in its pid); cleanup's removal of a dead
+    /// process doesn't.
     #[test]
     fn cleanup_of_a_dead_process_records_no_marker() {
         let (_, mut actor, _) = create_actor();
@@ -4384,5 +4440,391 @@ mod tests {
 
         assert_eq!(actor.session_count(), 0);
         assert!(actor.ended_sessions.is_empty());
+    }
+
+    // ========================================================================
+    // SessionStart ends the session its process's row held (#53 goal 4, R1)
+    // ========================================================================
+
+    /// The cost of a late status line, so a test can tell whether it was
+    /// applied.
+    const LATE_COST: f64 = 0.5;
+
+    /// One of `/clear`'s three frames from one Claude Code 2.1.310 process.
+    #[derive(Clone, Copy, Debug)]
+    enum Clear {
+        /// `SessionEnd(OLD, reason clear)`.
+        End,
+        /// The status line still carrying `OLD`, costing [`LATE_COST`].
+        Late,
+        /// `SessionStart(NEW, source clear)`.
+        Start,
+    }
+
+    /// Sends `/clear`'s frames in `order` to an `OLD` row, and returns the
+    /// index and row ids, then `NEW`'s cost if it has a row.
+    fn clear_in_order(order: [Clear; 3]) -> ((Vec<String>, Vec<String>), Option<f64>) {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        for frame in order {
+            match frame {
+                Clear::End => session_end(&mut actor, OLD, pid, "clear"),
+                Clear::Late => status_line_costing(&mut actor, pid, OLD, LATE_COST),
+                Clear::Start => session_start(&mut actor, NEW, pid, "clear"),
+            }
+        }
+        let cost = session_view(&actor, NEW).map(|view| view.cost_usd);
+        (index_and_row_ids(&actor), cost)
+    }
+
+    /// `atm-hook` sends each frame from its own process, so atmd can get
+    /// `/clear`'s three frames in any order. Every order leaves what the
+    /// end-first order does: one fresh row under `NEW`, which no `OLD`
+    /// status line reaches once `SessionStart` or `SessionEnd` is in. A
+    /// status line before both hooks is `OLD`'s last, and applies to `OLD`'s
+    /// row before it ends.
+    #[test]
+    fn clear_leaves_one_row_under_the_new_id_in_every_arrival_order() {
+        use Clear::{End, Late, Start};
+        let orders = [
+            [End, Late, Start],
+            [End, Start, Late],
+            [Start, End, Late],
+            [Start, Late, End],
+            [Late, End, Start],
+            [Late, Start, End],
+        ];
+        let fresh_new_row = ((ids(&[NEW]), ids(&[NEW])), Some(0.0));
+
+        let outcomes: Vec<_> = (orders.iter())
+            .map(|order| (format!("{order:?}"), clear_in_order(*order)))
+            .collect();
+
+        let expected: Vec<_> = (orders.iter())
+            .map(|order| (format!("{order:?}"), fresh_new_row.clone()))
+            .collect();
+        assert_eq!(outcomes, expected);
+    }
+
+    /// `/clear` with `start_first` or end first, after `OLD` took a prompt
+    /// and started an in-process child. Returns `NEW`'s view without its
+    /// clock fields, the index and row ids, and the child references.
+    fn cleared_row(
+        start_first: bool,
+    ) -> (serde_json::Value, (Vec<String>, Vec<String>), Vec<String>) {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        let prompt = LifecycleEvent::PromptSubmit {
+            prompt: Some("fix the bug".into()),
+        };
+        apply_event(&mut actor, OLD, Some(pid), prompt).unwrap();
+        apply_with_context(
+            &mut actor,
+            &SessionId::new(OLD),
+            LifecycleEvent::WorkingStart,
+            alias("rev", "agent-1"),
+        );
+        start_child(&mut actor, &SessionId::new(OLD), "agent-1");
+        assert_eq!(actor.session_count(), 2);
+
+        if start_first {
+            session_start(&mut actor, NEW, pid, "clear");
+            session_end(&mut actor, OLD, pid, "clear");
+        } else {
+            session_end(&mut actor, OLD, pid, "clear");
+            session_start(&mut actor, NEW, pid, "clear");
+        }
+
+        let mut view = view_json(&session_view(&actor, NEW).unwrap());
+        let fields = view.as_object_mut().unwrap();
+        fields.remove("started_at").unwrap();
+        fields.remove("last_activity").unwrap();
+        (view, index_and_row_ids(&actor), child_refs(&actor))
+    }
+
+    /// Whichever hook comes first, `NEW` gets the same fresh row: `OLD`'s
+    /// prompt, cost and in-process child end with `OLD`.
+    #[test]
+    fn clear_leaves_the_same_row_in_either_order() {
+        let end_first = cleared_row(false);
+        assert_eq!(end_first.1, (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(end_first.0["first_prompt"], serde_json::Value::Null);
+
+        assert_eq!(cleared_row(true), end_first);
+    }
+
+    /// `SessionStart(NEW)` before `SessionEnd(OLD)` ends `OLD` as its
+    /// `SessionEnd` would, logging why, then starts `NEW`'s row. The
+    /// `SessionEnd(OLD)` after it publishes nothing and logs at INFO that
+    /// the process moved on.
+    #[test]
+    fn a_session_start_ends_the_rows_session_and_its_late_end_keeps_the_new_row() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+
+        let logs = capture_logs(|| session_start(&mut actor, NEW, pid, "clear"));
+        assert_eq!(
+            drain_events(&mut event_rx).0,
+            [
+                format!("Removed {OLD} SessionEnded"),
+                format!("Registered {NEW}"),
+                format!("Updated {NEW}"),
+            ]
+        );
+        let info: String = (logs.lines())
+            .filter(|line| line.starts_with(" INFO "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            info,
+            format!(
+                " INFO SessionStart of a new session, ending the session this process's row held \
+                 session_id={OLD} pid={pid} new_id={NEW}\n{}",
+                removed_log(OLD, pid, "session ended", 0)
+            )
+        );
+
+        let logs = capture_logs(|| session_end(&mut actor, OLD, pid, "clear"));
+
+        assert_eq!(drain_events(&mut event_rx).0, Vec::<String>::new());
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(
+            logs,
+            format!(
+                " INFO SessionEnd for a session this process moved on from, keeping the row \
+                 session_id={OLD} pid={pid} current_id={NEW}\n"
+            )
+        );
+    }
+
+    /// What [`resume_old`] leaves behind.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Resumed {
+        /// The index and row ids once both hooks are in.
+        rows: (Vec<String>, Vec<String>),
+        /// `OLD`'s cost once both hooks are in, if it has a row.
+        hooks_cost: Option<f64>,
+        /// `OLD`'s cost after the redraw, if it has a row.
+        cost: Option<f64>,
+        /// The ended-session markers left.
+        markers: Vec<(SessionId, u32)>,
+    }
+
+    /// Claude Code 2.1.310's in-process `/resume` from `NEW` back to `OLD`
+    /// (#101): `SessionEnd(NEW, resume)` and `SessionStart(OLD, resume)`,
+    /// which can reach atmd in either order, then `OLD`'s redraw status
+    /// line.
+    fn resume_old(end_first: bool) -> Resumed {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "clear");
+        session_start(&mut actor, NEW, pid, "clear");
+        status_line_costing(&mut actor, pid, NEW, 0.01);
+
+        if end_first {
+            session_end(&mut actor, NEW, pid, "resume");
+            session_start(&mut actor, OLD, pid, "resume");
+        } else {
+            session_start(&mut actor, OLD, pid, "resume");
+            session_end(&mut actor, NEW, pid, "resume");
+        }
+        let rows = index_and_row_ids(&actor);
+        let hooks_cost = session_view(&actor, OLD).map(|view| view.cost_usd);
+        status_line_costing(&mut actor, pid, OLD, OLD_COST);
+
+        Resumed {
+            rows,
+            hooks_cost,
+            cost: session_view(&actor, OLD).map(|view| view.cost_usd),
+            markers: actor.ended_sessions.keys().cloned().collect(),
+        }
+    }
+
+    /// Both orders of `/resume`'s hooks leave one fresh `OLD` row as soon
+    /// as both are in, the redraw applies to it, and `NEW` stays ended in
+    /// this process.
+    #[test]
+    fn in_process_resume_leaves_one_row_under_the_resumed_id_in_both_orders() {
+        let expected = Resumed {
+            rows: (ids(&[OLD]), ids(&[OLD])),
+            hooks_cost: Some(0.0),
+            cost: Some(OLD_COST),
+            markers: vec![(SessionId::new(NEW), std::process::id())],
+        };
+        assert_eq!(
+            [
+                ("end first", resume_old(true)),
+                ("start first", resume_old(false))
+            ],
+            [("end first", expected.clone()), ("start first", expected)]
+        );
+    }
+
+    /// A row discovery registered as `pending-<pid>`, which no event
+    /// renamed, is still removed by its process's `SessionEnd`.
+    #[test]
+    fn session_end_with_a_real_id_removes_a_pending_row() {
+        let (_, mut actor, _) = create_actor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        discover(
+            &mut actor,
+            SessionId::pending_from_pid(pid),
+            pid,
+            dir.path(),
+            None,
+        );
+
+        session_end(&mut actor, OLD, pid, "prompt_input_exit");
+
+        assert_eq!(actor.session_count(), 0);
+    }
+
+    /// pi's in-memory fork: the old pi-atm instance's `session_shutdown`
+    /// carries the fork's new id (#74, pi 0.73.1), and pi-atm relies on
+    /// atmd ending the session by pid. No `SessionStart` moved the row
+    /// off that id, so the row is removed, and the fork's `session_start`
+    /// gets a fresh row. In the other order the start ends the row's
+    /// session and starts the fork's row, and the end, which names that
+    /// row's id, removes it, as on main.
+    #[test]
+    fn a_session_end_naming_another_id_still_removes_the_row() {
+        let pid = std::process::id();
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+
+        session_end(&mut actor, NEW, pid, "fork");
+        assert_eq!(actor.session_count(), 0);
+        session_start(&mut actor, NEW, pid, "fork");
+        assert_eq!(index_and_row_ids(&actor), (ids(&[NEW]), ids(&[NEW])));
+        assert_eq!(session_view(&actor, NEW).unwrap().cost_usd, 0.0);
+
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_start(&mut actor, NEW, pid, "fork");
+        session_end(&mut actor, NEW, pid, "fork");
+        assert_eq!(actor.session_count(), 0);
+    }
+
+    /// `claude --resume OLD` starts `OLD` in a new process. Its
+    /// `SessionStart` creates that process's row and leaves the ended
+    /// process alone. While the first process still holds `OLD`, the id
+    /// has two rows, as on main.
+    #[test]
+    fn session_start_from_a_new_pid_creates_its_own_row() {
+        let pid = std::process::id();
+        let new_pid = UNUSED_PID;
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_end(&mut actor, OLD, pid, "prompt_input_exit");
+
+        session_start(&mut actor, OLD, new_pid, "resume");
+        status_line_costing(&mut actor, new_pid, OLD, OLD_COST);
+
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD])));
+        assert_eq!(pid_of(&actor, OLD), new_pid);
+        assert_eq!(session_view(&actor, OLD).unwrap().cost_usd, OLD_COST);
+
+        let (_, mut actor, mut event_rx) = create_actor();
+        old_session_at(&mut actor, &mut event_rx);
+        session_start(&mut actor, OLD, new_pid, "resume");
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD, OLD])));
+    }
+
+    /// Of two rows sharing the id `dup`, the newer has a child `agent-1`
+    /// (alias `rev`). Ends the older row with a `SessionEnd(dup)` or, with
+    /// `start`, a `SessionStart(fresh)`, and returns the index and row
+    /// ids, the child's parent, the newer row's children and the child
+    /// references.
+    fn end_older_shared_row(
+        start: bool,
+    ) -> (Vec<String>, Vec<String>, String, String, Vec<String>) {
+        let (_, mut actor, _) = create_actor();
+        let (older, newer) = register_shared_id(&mut actor);
+        let dup = SessionId::new("dup");
+        let working = LifecycleEvent::WorkingStart;
+        apply_with_context(&mut actor, &dup, working, alias("rev", "agent-1"));
+        start_child(&mut actor, &dup, "agent-1");
+
+        if start {
+            session_start(&mut actor, "fresh", older.0.id(), "clear");
+        } else {
+            session_end(&mut actor, "dup", older.0.id(), "clear");
+        }
+
+        let (index, rows) = index_and_row_ids(&actor);
+        let child = &actor.sessions_by_pid[&pid_of(&actor, "agent-1")].0;
+        let children = &actor.sessions_by_pid[&newer.0.id()].0.child_session_ids;
+        (
+            index,
+            rows,
+            format!("{:?}", child.parent_session_id),
+            format!("{children:?}"),
+            child_refs(&actor),
+        )
+    }
+
+    /// A `SessionStart` on one of two rows that share an id ends that row
+    /// as its `SessionEnd` does on main, links included, then adds the new
+    /// session's row.
+    #[test]
+    fn session_start_on_a_shared_id_row_ends_it_as_session_end_does() {
+        let (mut index, mut rows, parent, children, refs) = end_older_shared_row(false);
+        index.push("fresh".into());
+        rows.push("fresh".into());
+
+        assert_eq!(
+            end_older_shared_row(true),
+            (index, rows, parent, children, refs)
+        );
+    }
+
+    /// A `SessionStart` with a pending id (older pi-atm sends
+    /// `pending-<pid>`) never ends a real row. The same rule as
+    /// rediscovery, which keeps a real id over a pending one.
+    #[test]
+    fn session_start_with_a_pending_id_keeps_a_real_row() {
+        let (_, mut actor, mut event_rx) = create_actor();
+        let pid = std::process::id();
+        old_session_at(&mut actor, &mut event_rx);
+
+        let pending = SessionId::pending_from_pid(pid);
+        session_start(&mut actor, pending.as_str(), pid, "startup");
+
+        assert_eq!(index_and_row_ids(&actor), (ids(&[OLD]), ids(&[OLD])));
+        assert!(actor.ended_sessions.is_empty());
+    }
+
+    /// One process serving several sessions, as codex's shared app-server
+    /// daemon does: its row follows each new session's `SessionStart`,
+    /// while other events keep today's pending → real-only rename. A
+    /// `SessionEnd` from a session the row moved on from keeps the row
+    /// while that session's marker lives, and removes it, as on main,
+    /// once the marker expires.
+    #[test]
+    fn a_shared_process_row_follows_each_new_session_start() {
+        let (_, mut actor, _) = create_actor();
+        let pid = std::process::id();
+        session_start(&mut actor, "a", pid, "startup");
+
+        session_start(&mut actor, "b", pid, "startup");
+        assert_eq!(index_and_row_ids(&actor), (ids(&["b"]), ids(&["b"])));
+        apply_event(&mut actor, "a", Some(pid), LifecycleEvent::WorkingStart).unwrap();
+        session_start(&mut actor, "b", pid, "compact");
+        assert_eq!(index_and_row_ids(&actor), (ids(&["b"]), ids(&["b"])));
+
+        session_end(&mut actor, "a", pid, "other");
+        assert_eq!(index_and_row_ids(&actor), (ids(&["b"]), ids(&["b"])));
+
+        *actor
+            .ended_sessions
+            .get_mut(&(SessionId::new("a"), pid))
+            .unwrap() -= ENDED_SESSION_TTL;
+        session_end(&mut actor, "a", pid, "other");
+        assert_eq!(actor.session_count(), 0);
     }
 }

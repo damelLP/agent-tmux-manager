@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use atm_core::{
     AgentType, BackgroundActivity, ChildAlias, ChildRef, LifecycleContext, LifecycleEvent,
-    NeedsInputReason, SessionDomain, SessionId, SessionInfrastructure, SessionView, StatusLineData,
+    SessionDomain, SessionId, SessionInfrastructure, SessionView, StatusLineData,
 };
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
@@ -512,8 +512,8 @@ impl RegistryActor {
 
         // Fallback: lookup by session_id (when no PID available)
         if let Some(&pid) = self.session_id_to_pid.get(&session_id) {
-            if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
-                apply_status_line(session, infra, &data, &session_id, pid);
+            if let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) {
+                apply_status_line(session, &data, &session_id, pid);
 
                 debug!(
                     session_id = %session_id,
@@ -567,9 +567,9 @@ impl RegistryActor {
             }
         }
 
-        if let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) {
+        if let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) {
             let log_id = session.id.clone();
-            apply_status_line(session, infra, &data, &log_id, pid);
+            apply_status_line(session, &data, &log_id, pid);
 
             debug!(
                 session_id = %session_id,
@@ -806,16 +806,13 @@ impl RegistryActor {
 
     /// Applies `event` to the session stored under `pid` and publishes it.
     fn apply_to_session(&mut self, pid: u32, event: &LifecycleEvent, tmux_pane: Option<String>) {
-        let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) else {
+        let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) else {
             return;
         };
         session.apply_lifecycle_event(event);
         session.set_first_prompt_from_event(event);
         if tmux_pane.is_some() && session.tmux_pane.is_none() {
             session.tmux_pane = tmux_pane;
-        }
-        if let Some(name) = tool_name_from_event(event) {
-            infra.record_tool_use(&name, None);
         }
         debug!(
             session_id = %session.id,
@@ -1231,18 +1228,16 @@ fn apply_git_context(session: &mut SessionDomain) {
     }
 }
 
-/// Applies a status line to a stored session and counts the update. Then
-/// re-resolves the git context if the project root is unset or the working
-/// directory changed, logging `log_id` on a change.
+/// Applies a status line to a stored session. Then re-resolves the git
+/// context if the project root is unset or the working directory changed,
+/// logging `log_id` on a change.
 fn apply_status_line(
     session: &mut SessionDomain,
-    infra: &mut SessionInfrastructure,
     data: &StatusLineData,
     log_id: &SessionId,
     pid: u32,
 ) {
     let cwd_changed = session.update_from_status_line(data);
-    infra.record_update();
 
     // Resolve project/worktree if not yet set, or if cwd changed
     if session.project_root.is_none() || cwd_changed {
@@ -1275,29 +1270,12 @@ fn marker_live(ended_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     age >= chrono::Duration::zero() && age < ENDED_SESSION_TTL
 }
 
-/// Extracts a tool name from a `LifecycleEvent`, when present.
-///
-/// Used to record tool usage on the session's infrastructure record.
-fn tool_name_from_event(event: &LifecycleEvent) -> Option<String> {
-    match event {
-        LifecycleEvent::ToolCallStart { name, .. } | LifecycleEvent::ToolCallEnd { name, .. } => {
-            Some(name.as_str().to_string())
-        }
-        LifecycleEvent::NeedsInput { reason } => match reason {
-            NeedsInputReason::InteractiveTool { tool }
-            | NeedsInputReason::PermissionGate { tool } => Some(tool.as_str().to_string()),
-            NeedsInputReason::Notification { .. } => None,
-        },
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::parse_status_line;
     use atm_core::ChildAgent;
-    use atm_core::{AgentType, Model, Tool};
+    use atm_core::{AgentType, Model, NeedsInputReason, Tool};
     use tokio::sync::oneshot;
 
     fn create_test_session(id: &str) -> SessionDomain {
@@ -2954,10 +2932,6 @@ mod tests {
         actor.session_id_to_pid[&SessionId::new(id)]
     }
 
-    fn update_count(actor: &RegistryActor, id: &str) -> u64 {
-        actor.sessions_by_pid[&pid_of(actor, id)].1.update_count
-    }
-
     fn path_str(path: &std::path::Path) -> &str {
         path.to_str().unwrap()
     }
@@ -3058,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn status_line_by_session_id_updates_counts_and_publishes() {
+    fn status_line_by_session_id_updates_and_publishes() {
         let (_, mut actor, mut event_rx) = create_actor();
         let dir = tempfile::tempdir().unwrap();
         let (repo_a, repo_b) = (dir.path().join("repo-a"), dir.path().join("repo-b"));
@@ -3086,7 +3060,6 @@ mod tests {
         assert_eq!(views[0].cost_usd, 0.50);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
-        assert_eq!(update_count(&actor, "by-id"), 1);
 
         send_status_line(
             &mut actor,
@@ -3102,7 +3075,6 @@ mod tests {
         assert_view_is_current(&actor, &views[0]);
         assert_eq!(views[0].cost_usd, 0.75);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
-        assert_eq!(update_count(&actor, "by-id"), 2);
     }
 
     #[test]
@@ -3141,7 +3113,6 @@ mod tests {
         assert_eq!(views[0].cost_usd, 0.40);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
-        assert_eq!(update_count(&actor, "real-d"), 1);
 
         send_status_line(
             &mut actor,
@@ -3157,7 +3128,6 @@ mod tests {
         assert_eq!(events, ["Updated real-d"]);
         assert_view_is_current(&actor, &views[0]);
         assert_eq!(views[0].cost_usd, 0.60);
-        assert_eq!(update_count(&actor, "real-d"), 2);
     }
 
     #[test]
@@ -3184,11 +3154,6 @@ mod tests {
         assert_eq!(views[0].cost_usd, 0.10);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo)));
         assert_eq!(views[0].worktree_branch.as_deref(), Some("main"));
-        assert_eq!(
-            update_count(&actor, "auto-e"),
-            0,
-            "creating a session is not counted as an update"
-        );
 
         send_status_line(&mut actor, status_line(0.20));
 
@@ -3196,7 +3161,6 @@ mod tests {
         assert_eq!(events, ["Updated auto-e"]);
         assert_view_is_current(&actor, &views[0]);
         assert_eq!(views[0].cost_usd, 0.20);
-        assert_eq!(update_count(&actor, "auto-e"), 1);
     }
 
     #[test]

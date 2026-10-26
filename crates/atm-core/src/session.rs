@@ -5,9 +5,7 @@ use crate::{AgentType, ContextUsage, Model, Money, TokenCount};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::fmt;
-use std::path::{Path, PathBuf};
 use tracing::debug;
 
 // ============================================================================
@@ -103,70 +101,6 @@ impl From<&str> for SessionId {
 
 impl AsRef<str> for SessionId {
     fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Unique identifier for a tool invocation.
-///
-/// Format: "toolu_..." (e.g., "toolu_01ABC123XYZ")
-/// Provided by Claude Code in hook events.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ToolUseId(String);
-
-impl ToolUseId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ToolUseId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<String> for ToolUseId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-/// Path to a session's transcript JSONL file.
-///
-/// Example: "/home/user/.claude/projects/.../session.jsonl"
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TranscriptPath(PathBuf);
-
-impl TranscriptPath {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(path.into())
-    }
-
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-
-    /// Returns the filename portion of the path.
-    pub fn filename(&self) -> Option<&str> {
-        self.0.file_name().and_then(|n| n.to_str())
-    }
-}
-
-impl fmt::Display for TranscriptPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.display())
-    }
-}
-
-impl AsRef<Path> for TranscriptPath {
-    fn as_ref(&self) -> &Path {
         &self.0
     }
 }
@@ -924,17 +858,6 @@ impl Default for SessionDomain {
 // Infrastructure Entity
 // ============================================================================
 
-/// Record of a tool invocation.
-#[derive(Debug, Clone)]
-pub struct ToolUsageRecord {
-    /// Name of the tool (e.g., "Bash", "Read", "Write")
-    pub tool_name: String,
-    /// Unique ID for this tool invocation
-    pub tool_use_id: Option<ToolUseId>,
-    /// When the tool was invoked
-    pub timestamp: DateTime<Utc>,
-}
-
 /// Infrastructure-level data for a session.
 ///
 /// Contains OS/system concerns that don't belong in the domain model.
@@ -947,41 +870,14 @@ pub struct SessionInfrastructure {
     /// Process start time in clock ticks (from /proc/{pid}/stat field 22).
     /// Used to detect PID reuse - if the start time changes, it's a different process.
     pub process_start_time: Option<u64>,
-
-    /// Path to the Unix socket for this session (if applicable)
-    pub socket_path: Option<PathBuf>,
-
-    /// Path to the transcript JSONL file
-    pub transcript_path: Option<TranscriptPath>,
-
-    /// Recent tool usage history (bounded FIFO queue)
-    pub recent_tools: VecDeque<ToolUsageRecord>,
-
-    /// Number of status updates received
-    pub update_count: u64,
-
-    /// Number of hook events received
-    pub hook_event_count: u64,
-
-    /// Last error encountered (for debugging)
-    pub last_error: Option<String>,
 }
 
 impl SessionInfrastructure {
-    /// Maximum number of tool records to keep.
-    const MAX_TOOL_HISTORY: usize = 50;
-
     /// Creates new SessionInfrastructure.
     pub fn new() -> Self {
         Self {
             pid: None,
             process_start_time: None,
-            socket_path: None,
-            transcript_path: None,
-            recent_tools: VecDeque::with_capacity(Self::MAX_TOOL_HISTORY),
-            update_count: 0,
-            hook_event_count: 0,
-            last_error: None,
         }
     }
 
@@ -1069,44 +965,6 @@ impl SessionInfrastructure {
                 false
             }
         }
-    }
-
-    /// Records a tool usage.
-    pub fn record_tool_use(&mut self, tool_name: &str, tool_use_id: Option<ToolUseId>) {
-        let record = ToolUsageRecord {
-            tool_name: tool_name.to_string(),
-            tool_use_id,
-            timestamp: Utc::now(),
-        };
-
-        self.recent_tools.push_back(record);
-
-        // Maintain bounded size using safe VecDeque operations
-        while self.recent_tools.len() > Self::MAX_TOOL_HISTORY {
-            self.recent_tools.pop_front();
-        }
-
-        self.hook_event_count += 1;
-    }
-
-    /// Increments the update count.
-    pub fn record_update(&mut self) {
-        self.update_count += 1;
-    }
-
-    /// Records an error.
-    pub fn record_error(&mut self, error: &str) {
-        self.last_error = Some(error.to_string());
-    }
-
-    /// Returns the most recent tool used.
-    pub fn last_tool(&self) -> Option<&ToolUsageRecord> {
-        self.recent_tools.back()
-    }
-
-    /// Returns recent tools (most recent first).
-    pub fn recent_tools_iter(&self) -> impl Iterator<Item = &ToolUsageRecord> {
-        self.recent_tools.iter().rev()
     }
 }
 

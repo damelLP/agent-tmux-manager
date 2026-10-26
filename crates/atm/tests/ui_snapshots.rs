@@ -549,7 +549,7 @@ fn compact_session_list_subscriber_cap_rejected() {
 #[test]
 fn compact_preview_falls_back_to_status() {
     // No cached Beads task, so the status-line fallback kicks in.
-    let mut session = make_session(
+    let session = make_session(
         "abc12345-aaaa-bbbb-cccc-000000000001",
         "/home/dev/project-alpha",
         "main",
@@ -560,8 +560,6 @@ fn compact_preview_falls_back_to_status() {
         0.50,
         "2026-01-15T10:05:00Z",
     );
-    session.project_root = None;
-    session.worktree_path = None;
     let buf = render_buffer(30, 8, |frame, area| {
         render_compact_preview(frame, area, Some(&session), &[], None);
     });

@@ -24,6 +24,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Install Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # `node --check` never strips a .ts file's types and passes anything
+      # after its first import, so strip them first, then parse the result.
+      # `shell: bash` adds pipefail, so a failed strip fails the step.
+      - name: Syntax-check pi-atm
+        shell: bash
+        run: |
+          node --disable-warning=ExperimentalWarning -e 'process.stdout.write(require("node:module").stripTypeScriptTypes(require("node:fs").readFileSync(process.argv[1], "utf8")))' extensions/pi-atm/extensions/pi-atm.ts \
+            | node --check --input-type=module -
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

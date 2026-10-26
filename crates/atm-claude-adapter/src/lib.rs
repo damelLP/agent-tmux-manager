@@ -328,8 +328,10 @@
 //!   checked). `PermissionRequest` has no `tool_use_id`.
 
 pub mod event;
+pub mod status_line;
 pub mod translate;
 pub mod wire;
 
 pub use event::ClaudeEventType;
+pub use status_line::{RawContextWindow, RawCost, RawModel, RawStatusLine, RawWorkspace};
 pub use wire::RawHookEvent;

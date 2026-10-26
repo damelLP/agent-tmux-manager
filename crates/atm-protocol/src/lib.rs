@@ -7,9 +7,7 @@
 //! adapter crates.
 
 pub mod message;
-pub mod parse;
 pub mod version;
 
 pub use message::{ClientMessage, DaemonMessage, MessageType};
-pub use parse::{RawContextWindow, RawCost, RawModel, RawStatusLine, RawWorkspace};
 pub use version::ProtocolVersion;

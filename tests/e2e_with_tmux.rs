@@ -76,12 +76,12 @@ const SESSION_APPEAR_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-/// Returns `Some(())` if `tmux` is on PATH, `None` otherwise.
-fn tmux_on_path() -> Option<()> {
+/// Returns `Some(path)` if `tmux` is on PATH, `None` otherwise.
+fn tmux_on_path() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         if dir.join("tmux").is_file() {
-            return Some(());
+            return Some(dir.join("tmux"));
         }
     }
     None
@@ -1525,13 +1525,14 @@ async fn create_workspace_with_pi_default(
     spawn_pi_args: Option<&str>,
 ) -> String {
     let session_name = format!("{prefix}{}", std::process::id());
-    // Kills the workspace's server however the scenario ends.
-    let tmux = PrivateTmux {
-        socket_label: format!("atm-{session_name}"),
-    };
     let data_dir = tempfile::tempdir().expect("create pi data tempdir");
     let config_home = tempfile::tempdir().expect("create pi config tempdir");
     let standin_dir = tempfile::tempdir().expect("create pi stand-in tempdir");
+    // Kills the workspace's server however the scenario ends, before the
+    // dirs above go.
+    let tmux = PrivateTmux {
+        socket_label: format!("atm-{session_name}"),
+    };
     let log = standin_dir.path().join("pi.log");
     let pi = write_pi_standin(standin_dir.path(), &log);
     write_atm_config(
@@ -1542,24 +1543,8 @@ async fn create_workspace_with_pi_default(
         ),
     );
 
-    let mut create = Command::new(&env.atm_path);
-    create
-        .args(["workspace", "create", "--name", &session_name, "--isolate"])
-        .env("ATM_NO_ATTACH", "1")
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .env("XDG_DATA_HOME", data_dir.path())
-        .env("XDG_STATE_HOME", &env.daemon.state_dir)
-        .env("ATM_SOCKET", &env.daemon.socket_path)
-        // The runner's tmux must not reach the workspace's server or its
-        // hook jobs.
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .env_remove("ATM_TMUX_SOCKET")
-        // These override the config's binary; the runner's must not leak in.
-        .env_remove("ATM_SPAWN_BIN")
-        .env_remove("ATM_SPAWN_ARGS")
-        .env_remove("ATM_SPAWN_PI_BIN")
-        .env_remove("ATM_SPAWN_PI_ARGS");
+    let mut create =
+        workspace_create_command(env, &session_name, config_home.path(), data_dir.path());
     if let Some(args) = spawn_pi_args {
         create.env("ATM_SPAWN_PI_ARGS", args);
     }
@@ -1598,6 +1583,40 @@ async fn create_workspace_with_pi_default(
     lines.next().unwrap_or_default().to_string()
 }
 
+/// `atm workspace create --name <session> --isolate`, without attaching,
+/// reading its config from `config_home` and writing scripts to `data_dir`.
+/// The runner's tmux variables must not reach the workspace's server or its
+/// hook jobs, and its `ATM_SPAWN_*` would change the agent command.
+fn workspace_create_command(
+    env: &E2eEnv,
+    session: &str,
+    config_home: &Path,
+    data_dir: &Path,
+) -> Command {
+    let mut create = Command::new(&env.atm_path);
+    create
+        .args(["workspace", "create", "--name", session, "--isolate"])
+        .env("ATM_NO_ATTACH", "1")
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_DATA_HOME", data_dir)
+        .env("XDG_STATE_HOME", &env.daemon.state_dir)
+        .env("ATM_SOCKET", &env.daemon.socket_path);
+    for key in [
+        "TMUX",
+        "TMUX_PANE",
+        "ATM_TMUX_SOCKET",
+        "ATM_SPAWN_BIN",
+        "ATM_SPAWN_ARGS",
+        "ATM_SPAWN_CLAUDE_BIN",
+        "ATM_SPAWN_CLAUDE_ARGS",
+        "ATM_SPAWN_PI_BIN",
+        "ATM_SPAWN_PI_ARGS",
+    ] {
+        create.env_remove(key);
+    }
+    create
+}
+
 /// The agent pane, found from the layout rather than focus: the topmost pane
 /// of `session` that isn't the sidebar. The sidebar is full height on the
 /// left and the shell sits below the agent.
@@ -1634,24 +1653,15 @@ fn top_non_sidebar_pane(socket_label: &str, session: &str) -> String {
 /// before it runs tmux, so no server, session, hook or script is left behind.
 async fn scenario_workspace_create_rejects_unknown_harness(env: &E2eEnv) {
     let session_name = format!("jghbad{}", std::process::id());
+    let data_dir = tempfile::tempdir().expect("create unknown-harness data tempdir");
+    let config_home = tempfile::tempdir().expect("create unknown-harness config tempdir");
     // Kills the server if create wrongly made one.
     let tmux = PrivateTmux {
         socket_label: format!("atm-{session_name}"),
     };
-    let data_dir = tempfile::tempdir().expect("create unknown-harness data tempdir");
-    let config_home = tempfile::tempdir().expect("create unknown-harness config tempdir");
     write_atm_config(config_home.path(), "[harness]\ndefault = 'nope'\n");
 
-    let output = Command::new(&env.atm_path)
-        .args(["workspace", "create", "--name", &session_name, "--isolate"])
-        .env("ATM_NO_ATTACH", "1")
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .env("XDG_DATA_HOME", data_dir.path())
-        .env("XDG_STATE_HOME", &env.daemon.state_dir)
-        .env("ATM_SOCKET", &env.daemon.socket_path)
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .env_remove("ATM_TMUX_SOCKET")
+    let output = workspace_create_command(env, &session_name, config_home.path(), data_dir.path())
         .output()
         .expect("run atm workspace create (unknown default)");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1702,11 +1712,8 @@ fn write_pi_standin(dir: &Path, log: &Path) -> PathBuf {
     );
     std::fs::write(&path, body).expect("write pi stand-in");
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&path)
-        .expect("stat pi stand-in")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("chmod pi stand-in");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod pi stand-in");
     path
 }
 
@@ -1717,13 +1724,14 @@ fn write_pi_standin(dir: &Path, log: &Path) -> PathBuf {
 /// never runs a harness.
 async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
     let session_name = format!("jghkeys{}", std::process::id());
-    // Kills the workspace's server however the scenario ends.
-    let tmux = PrivateTmux {
-        socket_label: format!("atm-{session_name}"),
-    };
     let data_dir = tempfile::tempdir().expect("create keys data tempdir");
     let config_home = tempfile::tempdir().expect("create keys config tempdir");
     let wrapper_dir = tempfile::tempdir().expect("create tmux wrapper tempdir");
+    // Kills the workspace's server however the scenario ends, before the
+    // dirs above go.
+    let tmux = PrivateTmux {
+        socket_label: format!("atm-{session_name}"),
+    };
     let log = wrapper_dir.path().join("tmux-argv.log");
     write_tmux_logging_wrapper(wrapper_dir.path(), &log);
     let path_var = std::env::var_os("PATH").unwrap_or_default();
@@ -1732,23 +1740,9 @@ async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
     )
     .expect("join PATH");
 
-    let output = Command::new(&env.atm_path)
-        .args(["workspace", "create", "--name", &session_name, "--isolate"])
-        .env("ATM_NO_ATTACH", "1")
+    // config_home stays empty: no config.toml, so the built-in default applies.
+    let output = workspace_create_command(env, &session_name, config_home.path(), data_dir.path())
         .env("PATH", &path)
-        // Empty: no config.toml, so the built-in default applies.
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .env("XDG_DATA_HOME", data_dir.path())
-        .env("XDG_STATE_HOME", &env.daemon.state_dir)
-        .env("ATM_SOCKET", &env.daemon.socket_path)
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .env_remove("ATM_TMUX_SOCKET")
-        // These change the keys; the runner's must not leak in.
-        .env_remove("ATM_SPAWN_BIN")
-        .env_remove("ATM_SPAWN_ARGS")
-        .env_remove("ATM_SPAWN_CLAUDE_BIN")
-        .env_remove("ATM_SPAWN_CLAUDE_ARGS")
         .output()
         .expect("run atm workspace create (no config)");
     assert!(
@@ -1778,11 +1772,7 @@ async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
 /// argument, then execs the real tmux. A lone `-L <label> send-keys -t <pane>
 /// Enter` is logged with ` swallowed` and not forwarded.
 fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
-    let path_var = std::env::var_os("PATH").expect("PATH is set");
-    let real = std::env::split_paths(&path_var)
-        .map(|dir| dir.join("tmux"))
-        .find(|candidate| candidate.is_file())
-        .expect("tmux on PATH (checked at setup)");
+    let real = tmux_on_path().expect("tmux on PATH (checked at setup)");
     let (real, log) = (real.display().to_string(), log.display().to_string());
     // Both paths go inside single quotes in the script.
     assert!(
@@ -1798,11 +1788,8 @@ fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
     let path = dir.join("tmux");
     std::fs::write(&path, body).expect("write tmux wrapper");
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&path)
-        .expect("stat tmux wrapper")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("chmod tmux wrapper");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod tmux wrapper");
 }
 
 #[tokio::test(flavor = "current_thread")]

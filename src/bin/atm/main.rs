@@ -913,8 +913,11 @@ fn tmux_shell_prefix(socket: Option<String>) -> String {
 ///   harness-specific variables are unset. These intentionally override the
 ///   selected harness command and are mainly for tests or whole-install wrappers.
 ///
-/// `*_BIN` is shell-quoted as one token, so spaces/specials in a path "just
-/// work." `*_ARGS` is inserted *between* the bin and appended model flag and is
+/// `*_BIN` is one token: a plain word is typed bare so a shell alias of that
+/// name still works, and anything else is shell-quoted, so spaces/specials in
+/// a path "just work."
+///
+/// `*_ARGS` is inserted *between* the bin and appended model flag and is
 /// interpolated verbatim — the user's intent is multi-token wrapper syntax. The
 /// user is responsible for quoting anything inside `*_ARGS` that needs to be
 /// one token (same contract as `bash -c "..."`).
@@ -1091,7 +1094,17 @@ fn build_spawn_command_for_harness(
 ) -> String {
     let spawn_bin = spawn_env_override(harness, "BIN");
     let base = spawn_bin.as_deref().unwrap_or(&harness.binary);
-    let mut cmd = shell_quote(base);
+    // A plain word stays bare so the shell still expands an alias of that
+    // name; quoting it would skip the alias.
+    let plain = !base.is_empty()
+        && base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'));
+    let mut cmd = if plain {
+        base.to_string()
+    } else {
+        shell_quote(base)
+    };
 
     if spawn_bin.is_none() {
         for arg in &harness.default_args {
@@ -2024,7 +2037,10 @@ mod shell_quote_tests {
 
 #[cfg(test)]
 mod spawn_command_tests {
-    use super::{build_spawn_command, build_spawn_command_for_harness, resolve_spawn_harness};
+    use super::{
+        build_spawn_command, build_spawn_command_for_harness, resolve_spawn_harness,
+        SpawnHarnessDefinition,
+    };
     use std::fs;
 
     /// RAII guard that captures an env var's current value on construction
@@ -2084,12 +2100,12 @@ mod spawn_command_tests {
         pi_args.unset();
         std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
 
-        // 1. Unset env/config → default to single-quoted "claude".
-        //    `'claude'` is identical to bare `claude` for execve;
-        //    quoting just removes shell-parsing surprises elsewhere.
+        // 1. Unset env/config → default to bare `claude`. A plain word is
+        //    typed unquoted so the pane's shell still expands an alias of
+        //    that name; `'claude'` would skip it.
         //    spawn must NOT materialize the user's config.toml — that's
         //    the job of `atm setup`. (beads agent-tmux-manager-6fb)
-        assert_eq!(build_spawn_command(None, None), "'claude'");
+        assert_eq!(build_spawn_command(None, None), "claude");
         assert!(
             !config_dir.path().join("atm/config.toml").exists(),
             "spawn must not create atm/config.toml as a side effect"
@@ -2097,7 +2113,7 @@ mod spawn_command_tests {
 
         // 2. Empty value is treated as unset.
         bin.set("");
-        assert_eq!(build_spawn_command(None, None), "'claude'");
+        assert_eq!(build_spawn_command(None, None), "claude");
 
         // 3. Path containing a space is single-quoted, so the pane's
         //    shell sees one token instead of re-tokenizing on space.
@@ -2112,24 +2128,24 @@ mod spawn_command_tests {
         bin.set("/path/it's/claude");
         assert_eq!(build_spawn_command(None, None), "'/path/it'\\''s/claude'");
 
-        // 5. Cwd and model compose around the quoted command.
+        // 5. Cwd and model compose around the command.
         bin.unset();
         assert_eq!(
             build_spawn_command(Some("/work/dir"), Some("opus")),
-            "cd '/work/dir' && 'claude' --model 'opus'"
+            "cd '/work/dir' && claude --model 'opus'"
         );
 
         // 6. Model containing a space is quoted, so the pane's shell
         //    treats it as a single argument value to `--model`.
         assert_eq!(
             build_spawn_command(None, Some("opus 4.5")),
-            "'claude' --model 'opus 4.5'"
+            "claude --model 'opus 4.5'"
         );
 
         // 7. Cwd with a single quote in it composes safely too.
         assert_eq!(
             build_spawn_command(Some("/work/it's"), None),
-            "cd '/work/it'\\''s' && 'claude'"
+            "cd '/work/it'\\''s' && claude"
         );
 
         // ----- ATM_SPAWN_ARGS -----
@@ -2141,32 +2157,32 @@ mod spawn_command_tests {
         args.set("x claude");
         assert_eq!(
             build_spawn_command(None, Some("opus")),
-            "'mise' x claude --model 'opus'"
+            "mise x claude --model 'opus'"
         );
 
         // 9. `env FOO=1 claude` style.
         bin.set("env");
         args.set("FOO=1 claude");
-        assert_eq!(build_spawn_command(None, None), "'env' FOO=1 claude");
+        assert_eq!(build_spawn_command(None, None), "env FOO=1 claude");
 
         // 10. Empty ATM_SPAWN_ARGS is treated as unset (no extra
         //     whitespace inserted).
         bin.unset();
         args.set("");
-        assert_eq!(build_spawn_command(None, None), "'claude'");
+        assert_eq!(build_spawn_command(None, None), "claude");
 
         // 11. Surrounding whitespace in ATM_SPAWN_ARGS is trimmed so
         //     copy-paste mistakes don't produce stray spaces.
         bin.set("mise");
         args.set("  x claude  ");
-        assert_eq!(build_spawn_command(None, None), "'mise' x claude");
+        assert_eq!(build_spawn_command(None, None), "mise x claude");
 
         // 12. With cwd, args sit between bin and model as expected.
         bin.set("direnv");
         args.set("exec . claude");
         assert_eq!(
             build_spawn_command(Some("/work/dir"), Some("opus")),
-            "cd '/work/dir' && 'direnv' exec . claude --model 'opus'"
+            "cd '/work/dir' && direnv exec . claude --model 'opus'"
         );
 
         // 13. Explicit harness selection changes the launched binary while
@@ -2176,14 +2192,11 @@ mod spawn_command_tests {
         let pi = resolve_spawn_harness(Some("pi")).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             build_spawn_command_for_harness(&pi, Some("/work/dir"), Some("gpt-5.5")),
-            "cd '/work/dir' && 'pi' --model 'gpt-5.5'"
+            "cd '/work/dir' && pi --model 'gpt-5.5'"
         );
 
         let codex = resolve_spawn_harness(Some("codex")).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            build_spawn_command_for_harness(&codex, None, None),
-            "'codex'"
-        );
+        assert_eq!(build_spawn_command_for_harness(&codex, None, None), "codex");
 
         // 14. Harness-specific overrides take precedence over the legacy
         //     global overrides, so users can customize one harness without
@@ -2194,7 +2207,7 @@ mod spawn_command_tests {
         pi_args.set("x pi");
         assert_eq!(
             build_spawn_command_for_harness(&pi, None, Some("gpt-5.5")),
-            "'mise' x pi --model 'gpt-5.5'"
+            "mise x pi --model 'gpt-5.5'"
         );
 
         // 15. Without a harness-specific override, legacy globals still apply
@@ -2203,7 +2216,7 @@ mod spawn_command_tests {
         pi_args.unset();
         assert_eq!(
             build_spawn_command_for_harness(&pi, None, None),
-            "'global-bin' global args"
+            "global-bin global args"
         );
 
         // 16. Config can set the default harness and per-harness spawn defaults.
@@ -2218,7 +2231,7 @@ mod spawn_command_tests {
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             build_spawn_command(None, Some("gpt-5.5")),
-            "'mise' 'x' 'pi' --model 'gpt-5.5'"
+            "mise 'x' 'pi' --model 'gpt-5.5'"
         );
 
         // 17. Config can define a custom harness.
@@ -2230,12 +2243,97 @@ mod spawn_command_tests {
         let custom = resolve_spawn_harness(Some("custom")).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             build_spawn_command_for_harness(&custom, None, Some("abc")),
-            "'custom-agent' '--profile' 'atm' --model-id 'abc'"
+            "custom-agent '--profile' 'atm' --model-id 'abc'"
         );
 
         // env's Drop restores the captured values, even if any of the
         // assert_eq!s above panicked.
         let _ = config_home;
         let _ = config_dir;
+    }
+
+    /// A harness with no default args or model flag, under an id no
+    /// `ATM_SPAWN_<HARNESS>_*` variable names.
+    fn harness_with_binary(binary: &str) -> SpawnHarnessDefinition {
+        SpawnHarnessDefinition {
+            id: "word-probe".to_string(),
+            binary: binary.to_string(),
+            default_args: Vec::new(),
+            model_flag: None,
+        }
+    }
+
+    /// The binary is the pane shell's command word. bash and zsh expand an
+    /// alias only for an unquoted word, and Claude Code's local install is
+    /// reachable only as `alias claude="~/.claude/local/claude"` (2.1.310's
+    /// "Local installation not accessible" fix text). So a plain word is
+    /// typed bare, and anything a shell could expand or split stays quoted.
+    #[test]
+    fn spawn_binary_is_bare_only_when_shell_safe() {
+        let _guard = super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bin = EnvGuard::capture("ATM_SPAWN_BIN");
+        let args = EnvGuard::capture("ATM_SPAWN_ARGS");
+        bin.unset();
+        args.unset();
+
+        for safe in [
+            "claude",
+            "pi",
+            "codex",
+            "/home/u/.claude/local/claude",
+            "./bin/agent-1.2_x",
+            "-x",
+        ] {
+            assert_eq!(
+                build_spawn_command_for_harness(&harness_with_binary(safe), None, None),
+                safe,
+                "{safe:?} should be typed bare"
+            );
+        }
+
+        for (unsafe_bin, quoted) in [
+            ("my agent", "'my agent'"),
+            ("it's", "'it'\\''s'"),
+            ("$HOME/claude", "'$HOME/claude'"),
+            ("~/.claude/local/claude", "'~/.claude/local/claude'"),
+            ("=claude", "'=claude'"),
+            ("FOO=1", "'FOO=1'"),
+            ("", "''"),
+            ("claude;id", "'claude;id'"),
+            ("cla*de", "'cla*de'"),
+            ("`id`", "'`id`'"),
+            ("claud\u{e9}", "'claud\u{e9}'"),
+        ] {
+            assert_eq!(
+                build_spawn_command_for_harness(&harness_with_binary(unsafe_bin), None, None),
+                quoted,
+                "{unsafe_bin:?} should stay quoted"
+            );
+        }
+    }
+
+    /// Only the command word may go bare. Default args, the model and the
+    /// cwd are still quoted, even when they are plain words too.
+    #[test]
+    fn spawn_args_stay_quoted_after_a_bare_binary() {
+        let _guard = super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bin = EnvGuard::capture("ATM_SPAWN_BIN");
+        let args = EnvGuard::capture("ATM_SPAWN_ARGS");
+        bin.unset();
+        args.unset();
+
+        let harness = SpawnHarnessDefinition {
+            default_args: vec!["--profile".to_string(), "a b".to_string()],
+            model_flag: Some("--model".to_string()),
+            ..harness_with_binary("claude")
+        };
+        assert_eq!(
+            build_spawn_command_for_harness(&harness, Some("/work dir"), Some("opus")),
+            "cd '/work dir' && claude '--profile' 'a b' --model 'opus'"
+        );
     }
 }

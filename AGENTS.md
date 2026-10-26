@@ -115,9 +115,9 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
     the adapter parses.
   - Not exceptions: Claude-specific code that predates this rule and is
     still in `atm-core` (model ids and pricing in `model.rs`,
-    `AgentType::from_subagent_type`, tool classification in `tool.rs`) and
-    `atm-protocol` (the status-line parser in `parse.rs`). Each moves out in
-    its own approved refactor, never inside an unrelated change.
+    `AgentType::from_subagent_type`, tool classification in `tool.rs`).
+    Each moves out in its own approved refactor, never inside an unrelated
+    change.
 - Adapters never depend on each other.
 - One definition per concept, in `atm-core`. Never create a field-for-field
   copy of an existing type; an adapter's raw payload type exists only because
@@ -270,7 +270,9 @@ them with `/hooks`.
 ## 5. Pointers
 
 - Harness integration findings (actual payloads, event names, quirks): the
-  relevant adapter's crate docs (`//!` in its `lib.rs`).
+  relevant adapter's crate and module docs (`//!` in its `lib.rs`, and in
+  modules with their own payloads, e.g. `atm-claude-adapter`'s
+  `status_line.rs`).
 - Plans and specs: `docs/plans/` — **local, git-ignored working files**.
   They are point-in-time snapshots and go stale. Never treat one as current
   truth. Anything durable must land in code, tests, this file, or a PR

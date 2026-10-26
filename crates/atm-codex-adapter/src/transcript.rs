@@ -66,7 +66,7 @@ impl CodexTokenUsage {
 
 /// Reads the latest usable token-count record from a Codex JSONL rollout.
 ///
-/// Only the final [`MAX_TRAILING_BYTES`] bytes are inspected. A valid
+/// Only the final `MAX_TRAILING_BYTES` bytes are inspected. A valid
 /// transcript with no recent usage record returns `Ok(None)`; I/O
 /// failures are returned so the daemon can log and ignore them.
 pub fn read_token_usage(path: impl AsRef<Path>) -> io::Result<Option<CodexTokenUsage>> {

@@ -891,8 +891,9 @@ async fn daemon_sessions() -> Result<Vec<SessionView>> {
     fetch_sessions().await
 }
 
-/// Resolves a CLI target to a tmux pane ID using the daemon's session list.
-async fn target_pane(target: &str) -> Result<String> {
+/// Fetches the daemon's session list, then resolves a CLI target in it with
+/// `resolve_pane_id` (which returns a `%` pane ID as is).
+async fn pane_for_target(target: &str) -> Result<String> {
     resolve_pane_id(&daemon_sessions().await?, target)
 }
 
@@ -1221,7 +1222,7 @@ async fn cmd_spawn(
 }
 
 async fn cmd_kill(target: String) -> Result<()> {
-    let pane_id = target_pane(&target).await?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
     client
         .kill_pane(&pane_id)
@@ -1232,7 +1233,7 @@ async fn cmd_kill(target: String) -> Result<()> {
 }
 
 async fn cmd_interrupt(target: String) -> Result<()> {
-    let pane_id = target_pane(&target).await?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
     // C-c sends SIGINT to the foreground process in the pane
     client
@@ -1244,7 +1245,7 @@ async fn cmd_interrupt(target: String) -> Result<()> {
 }
 
 async fn cmd_send(target: String, text: String) -> Result<()> {
-    let pane_id = target_pane(&target).await?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
     client
         .send_keys(&pane_id, &text)
@@ -1333,7 +1334,7 @@ async fn cmd_list(
 }
 
 async fn cmd_reply(target: String, option: Option<usize>, yes: bool, no: bool) -> Result<()> {
-    let pane_id = target_pane(&target).await?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
 
     if no {
@@ -1423,7 +1424,7 @@ fn find_selected_option(lines: &[String]) -> Option<usize> {
 }
 
 async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) -> Result<()> {
-    let pane_id = target_pane(&target).await?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
     let lines = client
         .capture_pane(&pane_id)

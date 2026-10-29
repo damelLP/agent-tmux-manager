@@ -5,16 +5,18 @@
 //!
 //! Nothing here reaches a real atmd or tmux server: `atm` runs with a
 //! cleared environment whose `ATM_SOCKET`, `XDG_STATE_HOME` and
-//! `TMUX_TMPDIR` sit in the test's temp dir, and whose `PATH` is an empty
-//! dir, so neither `atmd` nor `tmux` can be found there.
+//! `TMUX_TMPDIR` sit in the test's temp dir, and whose `PATH` holds no
+//! `atmd` and at most a stand-in `tmux` that only logs its arguments.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use atm_core::{SessionId, SessionView};
 use atm_protocol::DaemonMessage;
 
 /// The five commands that act on one agent's pane.
@@ -36,14 +38,15 @@ fn all_commands() -> Vec<Vec<&'static str>> {
     commands
 }
 
-/// Runs `exe` with a cleared environment rooted in `dir`.
+/// Runs `exe` with a cleared environment rooted in `dir`. `PATH` is
+/// `dir/path`, which is empty unless a test puts a stand-in there.
 fn atm(exe: &Path, dir: &Path, args: &[&str]) -> Output {
-    let empty = dir.join("empty-path");
-    std::fs::create_dir_all(&empty).expect("mkdir empty PATH dir");
+    let path = dir.join("path");
+    std::fs::create_dir_all(&path).expect("mkdir PATH dir");
     Command::new(exe)
         .args(args)
         .env_clear()
-        .env("PATH", &empty)
+        .env("PATH", &path)
         .env("HOME", dir)
         .env("ATM_SOCKET", dir.join("atmd.sock"))
         .env("XDG_STATE_HOME", dir.join("state"))
@@ -53,13 +56,15 @@ fn atm(exe: &Path, dir: &Path, args: &[&str]) -> Output {
 }
 
 /// A stand-in daemon on `dir/atmd.sock`. It answers `connect` with
-/// Connected, then answers ListSessions with an empty SessionList, or
-/// hangs up first when `send_list` is false.
-fn fake_daemon(dir: &Path, send_list: bool) {
+/// Connected, then answers ListSessions with `sessions`, or hangs up
+/// first when `sessions` is None.
+fn fake_daemon(dir: &Path, sessions: Option<Vec<SessionView>>) {
     let listener = UnixListener::bind(dir.join("atmd.sock")).expect("bind");
     let connected =
         serde_json::to_string(&DaemonMessage::connected("cli".to_string())).expect("serialize");
-    let list = serde_json::to_string(&DaemonMessage::session_list(Vec::new())).expect("serialize");
+    let list = sessions.map(|sessions| {
+        serde_json::to_string(&DaemonMessage::session_list(sessions)).expect("serialize")
+    });
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = stream.expect("accept");
@@ -75,7 +80,7 @@ fn fake_daemon(dir: &Path, send_list: bool) {
             // Read ListSessions
             line.clear();
             let _ = reader.read_line(&mut line);
-            if send_list {
+            if let Some(list) = &list {
                 let _ = (&stream).write_all(format!("{list}\n").as_bytes());
                 // Read Disconnect
                 line.clear();
@@ -126,7 +131,7 @@ fn test_commands_fail_when_the_daemon_cannot_start() {
 #[test]
 fn test_commands_fail_when_the_daemon_closes_before_the_session_list() {
     let dir = tempfile::tempdir().expect("tempdir");
-    fake_daemon(dir.path(), false);
+    fake_daemon(dir.path(), None);
 
     for args in all_commands() {
         let out = atm(Path::new(env!("CARGO_BIN_EXE_atm")), dir.path(), &args);
@@ -139,34 +144,62 @@ fn test_commands_fail_when_the_daemon_closes_before_the_session_list() {
 }
 
 /// `list` and `status` print the daemon's list, and the pane commands
-/// look their target up in it.
+/// look their target up in it: a known prefix reaches tmux with the
+/// session's pane, and an unknown one fails before tmux.
 #[test]
 fn test_commands_read_the_daemons_session_list() {
     let dir = tempfile::tempdir().expect("tempdir");
-    fake_daemon(dir.path(), true);
+    fake_daemon(
+        dir.path(),
+        Some(vec![SessionView {
+            id: SessionId::new("abc-session-1"),
+            id_short: "abc-sess".to_string(),
+            tmux_pane: Some("%5".to_string()),
+            ..SessionView::default()
+        }]),
+    );
     let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
+    // A stand-in `tmux` that logs each call and succeeds.
+    let tmux_log = dir.path().join("tmux.log");
+    let tmux = dir.path().join("path").join("tmux");
+    std::fs::create_dir_all(dir.path().join("path")).expect("mkdir PATH dir");
+    std::fs::write(
+        &tmux,
+        format!("#!/bin/sh\necho \"$*\" >> '{}'\n", tmux_log.display()),
+    )
+    .expect("write stand-in tmux");
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).expect("chmod tmux");
 
-    // `status` is checked up to its cost: an empty list's total prints as
-    // `$-0.00` today, which isn't what this file pins.
-    for (args, expected) in [
-        (vec!["list", "--format", "json"], "[]"),
-        (vec!["status"], "0\u{2191} $"),
-    ] {
+    let list = atm(exe, dir.path(), &["list", "--format", "json"]);
+    assert!(list.status.success(), "atm list: {list:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list JSON");
+    let ids: Vec<&str> = listed
+        .as_array()
+        .expect("JSON array")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["abc-session-1"]);
+
+    let status = atm(exe, dir.path(), &["status"]);
+    assert!(status.status.success(), "atm status: {status:?}");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "1\u{2191} $0.00\n");
+
+    for args in pane_commands("abc") {
+        let _ = std::fs::remove_file(&tmux_log);
         let out = atm(exe, dir.path(), &args);
+        assert!(out.status.success(), "atm {args:?}: {out:?}");
+        let calls = std::fs::read_to_string(&tmux_log).expect("tmux was called");
         assert!(
-            out.status.success(),
-            "atm {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.trim_end().starts_with(expected),
-            "atm {args:?}: {stdout:?}"
+            calls.lines().all(|call| call.contains("-t %5")),
+            "atm {args:?} called tmux with {calls:?}"
         );
     }
 
+    let _ = std::fs::remove_file(&tmux_log);
     for args in pane_commands("nope") {
         let out = atm(exe, dir.path(), &args);
         assert_fails_with(&out, &args, "Error: No session matching 'nope'");
     }
+    assert!(!tmux_log.exists(), "an unknown target reached tmux");
 }

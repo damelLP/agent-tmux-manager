@@ -34,6 +34,7 @@ use tracing::{debug, error};
 mod actor;
 mod commands;
 mod handle;
+mod infra;
 
 pub use actor::{RegistryActor, MAX_SESSIONS};
 pub use commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};

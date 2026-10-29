@@ -43,16 +43,27 @@ fn all_commands() -> Vec<Vec<&'static str>> {
 fn atm(exe: &Path, dir: &Path, args: &[&str]) -> Output {
     let path = dir.join("path");
     std::fs::create_dir_all(&path).expect("mkdir PATH dir");
-    Command::new(exe)
-        .args(args)
-        .env_clear()
-        .env("PATH", &path)
-        .env("HOME", dir)
-        .env("ATM_SOCKET", dir.join("atmd.sock"))
-        .env("XDG_STATE_HOME", dir.join("state"))
-        .env("TMUX_TMPDIR", dir)
-        .output()
-        .expect("run atm")
+    let mut tries = 0;
+    loop {
+        let run = Command::new(exe)
+            .args(args)
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", dir)
+            .env("ATM_SOCKET", dir.join("atmd.sock"))
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("TMUX_TMPDIR", dir)
+            .output();
+        match run {
+            // A freshly copied `exe` is busy while a child that a sibling
+            // test forked mid-copy still holds the copy's write fd.
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            run => return run.expect("run atm"),
+        }
+    }
 }
 
 /// A stand-in daemon on `dir/atmd.sock`. It answers `connect` with
@@ -107,11 +118,14 @@ fn assert_fails_with(out: &Output, args: &[&str], expected: &str) {
 fn test_commands_fail_when_the_daemon_cannot_start() {
     let dir = tempfile::tempdir().expect("tempdir");
     // The auto-start looks for `atmd` beside `atm` first, and cargo builds
-    // one there, so run a copy from a dir without it.
+    // one there, so run `atm` from a dir without it. A hard link opens no
+    // writable fd; a copy (across filesystems) does, so `atm()` retries.
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).expect("mkdir bin");
     let exe = bin.join("atm");
-    std::fs::copy(env!("CARGO_BIN_EXE_atm"), &exe).expect("copy atm");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_atm"), &exe).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_atm"), &exe).expect("copy atm");
+    }
 
     for args in all_commands() {
         let out = atm(&exe, dir.path(), &args);
@@ -185,15 +199,25 @@ fn test_commands_read_the_daemons_session_list() {
     assert!(status.status.success(), "atm status: {status:?}");
     assert_eq!(String::from_utf8_lossy(&status.stdout), "1\u{2191} $0.00\n");
 
-    for args in pane_commands("abc") {
+    // Each command's tmux subcommand, in `pane_commands` order.
+    let subcommands = [
+        "kill-pane",
+        "send-keys",
+        "send-keys",
+        "send-keys",
+        "capture-pane",
+    ];
+    for (args, subcommand) in pane_commands("abc").into_iter().zip(subcommands) {
         let _ = std::fs::remove_file(&tmux_log);
         let out = atm(exe, dir.path(), &args);
         assert!(out.status.success(), "atm {args:?}: {out:?}");
         let calls = std::fs::read_to_string(&tmux_log).expect("tmux was called");
-        assert!(
-            calls.lines().all(|call| call.contains("-t %5")),
-            "atm {args:?} called tmux with {calls:?}"
-        );
+        for call in calls.lines() {
+            let words: Vec<&str> = call.split(' ').collect();
+            assert_eq!(words.first(), Some(&subcommand), "atm {args:?}: {call:?}");
+            let pane = words.iter().skip_while(|w| **w != "-t").nth(1);
+            assert_eq!(pane, Some(&"%5"), "atm {args:?}: {call:?}");
+        }
     }
 
     let _ = std::fs::remove_file(&tmux_log);

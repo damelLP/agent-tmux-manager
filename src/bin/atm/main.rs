@@ -926,32 +926,6 @@ fn tmux_shell_prefix(socket: Option<String>) -> String {
     }
 }
 
-/// Build the shell command string sent to a freshly-split tmux pane.
-///
-/// Honors spawn override environment variables (all treat empty as unset):
-///
-/// - `ATM_SPAWN_<HARNESS>_BIN` / `ATM_SPAWN_<HARNESS>_ARGS`: harness-specific
-///   overrides, where `<HARNESS>` is the canonical id uppercased with `-`
-///   replaced by `_` (for example `ATM_SPAWN_PI_BIN=mise` and
-///   `ATM_SPAWN_PI_ARGS='x pi'`). Use these when one harness needs a custom
-///   launcher without changing other harnesses.
-///
-/// - `ATM_SPAWN_BIN` / `ATM_SPAWN_ARGS`: legacy global overrides used when the
-///   harness-specific variables are unset. These intentionally override the
-///   selected harness command and are mainly for tests or whole-install wrappers.
-///
-/// `*_BIN` is one token: a plain word is typed bare so a shell alias of that
-/// name still works, and anything else is shell-quoted, so spaces/specials in
-/// a path "just work."
-///
-/// `*_ARGS` is inserted *between* the bin and appended model flag and is
-/// interpolated verbatim — the user's intent is multi-token wrapper syntax. The
-/// user is responsible for quoting anything inside `*_ARGS` that needs to be
-/// one token (same contract as `bash -c "..."`).
-///
-/// `cwd` and `model` go through `shell_quote`, so a model name like
-/// `opus 4.5` or a cwd with spaces compose safely without the caller
-/// thinking about it.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AtmConfig {
     #[serde(default)]
@@ -1115,6 +1089,32 @@ fn spawn_env_override(harness: &SpawnHarnessDefinition, suffix: &str) -> Option<
     non_empty_env(&harness_key).or_else(|| non_empty_env(&format!("ATM_SPAWN_{suffix}")))
 }
 
+/// Build the shell command string sent to a freshly-split tmux pane.
+///
+/// Honors spawn override environment variables (all treat empty as unset):
+///
+/// - `ATM_SPAWN_<HARNESS>_BIN` / `ATM_SPAWN_<HARNESS>_ARGS`: harness-specific
+///   overrides, where `<HARNESS>` is the canonical id uppercased with `-`
+///   replaced by `_` (for example `ATM_SPAWN_PI_BIN=mise` and
+///   `ATM_SPAWN_PI_ARGS='x pi'`). Use these when one harness needs a custom
+///   launcher without changing other harnesses.
+///
+/// - `ATM_SPAWN_BIN` / `ATM_SPAWN_ARGS`: legacy global overrides used when the
+///   harness-specific variables are unset. These intentionally override the
+///   selected harness command and are mainly for tests or whole-install wrappers.
+///
+/// `*_BIN` is one token: a plain word is typed bare so a shell alias of that
+/// name still works, and anything else is shell-quoted, so spaces/specials in
+/// a path "just work."
+///
+/// `*_ARGS` is inserted *between* the bin and appended model flag and is
+/// interpolated verbatim — the user's intent is multi-token wrapper syntax. The
+/// user is responsible for quoting anything inside `*_ARGS` that needs to be
+/// one token (same contract as `bash -c "..."`).
+///
+/// `cwd` and `model` go through `shell_quote`, so a model name like
+/// `opus 4.5` or a cwd with spaces compose safely without the caller
+/// thinking about it.
 fn build_spawn_command_for_harness(
     harness: &SpawnHarnessDefinition,
     cwd: Option<&str>,

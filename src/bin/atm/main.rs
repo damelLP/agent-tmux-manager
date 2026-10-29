@@ -10,7 +10,7 @@
 //! atm spawn                  # Spawn a new coding agent
 //! atm kill <session-id>      # Kill an agent
 //! atm interrupt <session-id> # Send SIGINT to an agent
-//! atm send <session-id> <text> # Send text to agent pane
+//! atm send <session-id> <text> # Paste text into an agent pane and submit it
 //! atm list                   # List agents (tab-separated)
 //! atm status                 # One-line summary for tmux status bar
 //! atm setup                  # Configure agent integrations
@@ -60,6 +60,7 @@ use atm_tui::setup;
 use atm_tui::tmux;
 use atm_tui::ui;
 
+mod send;
 mod workspace;
 use workspace::{cmd_workspace, cmd_workspace_attach};
 
@@ -126,12 +127,19 @@ enum Command {
         /// Session ID (short form) or tmux pane ID
         target: String,
     },
-    /// Send text to an agent's tmux pane
+    /// Paste text into an agent's tmux pane and submit it
+    ///
+    /// Text starting with `/` or `!` is a command the harness runs (e.g.
+    /// `/clear`). atm refuses it unless `--force` is given, because a
+    /// half-typed draft in the input would turn it into plain text.
     Send {
         /// Session ID (short form) or tmux pane ID
         target: String,
         /// Text to send
         text: String,
+        /// Send a command even though a draft in the input could merge with it
+        #[arg(long)]
+        force: bool,
     },
     /// List agents for scripting
     List {
@@ -863,22 +871,28 @@ fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
         return Ok(target.to_string());
     }
 
-    // Search by session ID prefix
+    let session = find_session(sessions, target)?;
+    match &session.tmux_pane {
+        Some(pane) => Ok(pane.clone()),
+        None => bail!("Session {} has no tmux pane", session.id_short),
+    }
+}
+
+/// Finds the one session whose ID starts with `target`.
+fn find_session<'a>(sessions: &'a [SessionView], target: &str) -> Result<&'a SessionView> {
     let matches: Vec<&SessionView> = sessions
         .iter()
         .filter(|s| s.id.as_str().starts_with(target) || s.id_short.starts_with(target))
         .collect();
 
-    match matches.len() {
-        0 => bail!("No session matching '{target}'"),
-        1 => match &matches[0].tmux_pane {
-            Some(pane) => Ok(pane.clone()),
-            None => bail!("Session {} has no tmux pane", matches[0].id_short),
-        },
-        n => {
+    match matches.as_slice() {
+        [] => bail!("No session matching '{target}'"),
+        [session] => Ok(session),
+        _ => {
             let ids: Vec<&str> = matches.iter().map(|s| s.id_short.as_str()).collect();
             bail!(
-                "Ambiguous target '{target}' matches {n} sessions: {}",
+                "Ambiguous target '{target}' matches {} sessions: {}",
+                matches.len(),
                 ids.join(", ")
             )
         }
@@ -1236,20 +1250,14 @@ async fn cmd_interrupt(target: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_send(target: String, text: String) -> Result<()> {
+async fn cmd_send(target: String, text: String, force: bool) -> Result<()> {
     daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
     let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let (pane_id, session) = send::resolve_target(&sessions, &target)?;
+    let harness = session.and_then(|s| find_harness_definition(&s.harness));
     let client = RealTmuxClient::new();
-    client
-        .send_keys(&pane_id, &text)
-        .await
-        .context(format!("Failed to send keys to pane {pane_id}"))?;
-    // Send Enter to submit the text
-    client
-        .send_keys(&pane_id, "Enter")
-        .await
-        .context(format!("Failed to send Enter to pane {pane_id}"))?;
+    let class = send::send_to_pane(&client, &pane_id, &text, harness, force).await?;
+    println!("Sent {class} message to {pane_id} by tmux paste");
     Ok(())
 }
 
@@ -1676,8 +1684,12 @@ async fn main() -> Result<()> {
         Some(Command::Interrupt { target }) => {
             return cmd_interrupt(target).await;
         }
-        Some(Command::Send { target, text }) => {
-            return cmd_send(target, text).await;
+        Some(Command::Send {
+            target,
+            text,
+            force,
+        }) => {
+            return cmd_send(target, text, force).await;
         }
         Some(Command::List {
             format,

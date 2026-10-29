@@ -885,6 +885,17 @@ fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
     }
 }
 
+/// Starts the daemon if needed, then fetches its session list.
+async fn daemon_sessions() -> Result<Vec<SessionView>> {
+    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
+    fetch_sessions().await
+}
+
+/// Resolves a CLI target to a tmux pane ID using the daemon's session list.
+async fn target_pane(target: &str) -> Result<String> {
+    resolve_pane_id(&daemon_sessions().await?, target)
+}
+
 /// POSIX shell-quote `s` by single-quoting and escaping embedded `'`.
 /// Result is exactly one shell token regardless of spaces or specials.
 fn shell_quote(s: &str) -> String {
@@ -1210,9 +1221,7 @@ async fn cmd_spawn(
 }
 
 async fn cmd_kill(target: String) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = target_pane(&target).await?;
     let client = RealTmuxClient::new();
     client
         .kill_pane(&pane_id)
@@ -1223,9 +1232,7 @@ async fn cmd_kill(target: String) -> Result<()> {
 }
 
 async fn cmd_interrupt(target: String) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = target_pane(&target).await?;
     let client = RealTmuxClient::new();
     // C-c sends SIGINT to the foreground process in the pane
     client
@@ -1237,9 +1244,7 @@ async fn cmd_interrupt(target: String) -> Result<()> {
 }
 
 async fn cmd_send(target: String, text: String) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = target_pane(&target).await?;
     let client = RealTmuxClient::new();
     client
         .send_keys(&pane_id, &text)
@@ -1258,8 +1263,7 @@ async fn cmd_list(
     status_filter: Option<String>,
     project_filter: Option<String>,
 ) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
+    let sessions = daemon_sessions().await?;
 
     // Apply filters
     let filtered: Vec<&SessionView> = sessions
@@ -1329,9 +1333,7 @@ async fn cmd_list(
 }
 
 async fn cmd_reply(target: String, option: Option<usize>, yes: bool, no: bool) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = target_pane(&target).await?;
     let client = RealTmuxClient::new();
 
     if no {
@@ -1421,9 +1423,7 @@ fn find_selected_option(lines: &[String]) -> Option<usize> {
 }
 
 async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = target_pane(&target).await?;
     let client = RealTmuxClient::new();
     let lines = client
         .capture_pane(&pane_id)
@@ -1580,8 +1580,7 @@ fn is_separator_line(trimmed: &str) -> bool {
 }
 
 async fn cmd_status() -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
+    let sessions = daemon_sessions().await?;
 
     let active = sessions
         .iter()

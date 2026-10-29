@@ -123,18 +123,13 @@ impl RealTmuxClient {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            let written = match child.stdin.take() {
-                // Dropping the pipe closes it, so tmux sees end of input.
-                Some(mut pipe) => pipe.write_all(input.as_bytes()).await,
-                None => Ok(()),
-            };
-            let output = child.wait_with_output().await?;
-            // When tmux fails before reading its input (no server, say),
-            // its status and stderr say more than the broken pipe does.
-            if output.status.success() {
-                written?;
+            if let Some(mut pipe) = child.stdin.take() {
+                // A failed write means tmux stopped reading (no server, say);
+                // its exit status and stderr say why. Dropping the pipe
+                // closes it, so tmux sees end of input.
+                let _ = pipe.write_all(input.as_bytes()).await;
             }
-            Ok(output)
+            child.wait_with_output().await
         };
         let output = tokio::time::timeout(timeout, output)
             .await

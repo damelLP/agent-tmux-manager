@@ -891,6 +891,18 @@ fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
     }
 }
 
+/// Starts the daemon if needed, then fetches its session list.
+async fn daemon_sessions() -> Result<Vec<SessionView>> {
+    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
+    fetch_sessions().await
+}
+
+/// Fetches the daemon's session list, then resolves a CLI target in it with
+/// `resolve_pane_id` (which returns a `%` pane ID as is).
+async fn pane_for_target(target: &str) -> Result<String> {
+    resolve_pane_id(&daemon_sessions().await?, target)
+}
+
 /// POSIX shell-quote `s` by single-quoting and escaping embedded `'`.
 /// Result is exactly one shell token regardless of spaces or specials.
 fn shell_quote(s: &str) -> String {
@@ -921,32 +933,6 @@ fn tmux_shell_prefix(socket: Option<String>) -> String {
     }
 }
 
-/// Build the shell command string sent to a freshly-split tmux pane.
-///
-/// Honors spawn override environment variables (all treat empty as unset):
-///
-/// - `ATM_SPAWN_<HARNESS>_BIN` / `ATM_SPAWN_<HARNESS>_ARGS`: harness-specific
-///   overrides, where `<HARNESS>` is the canonical id uppercased with `-`
-///   replaced by `_` (for example `ATM_SPAWN_PI_BIN=mise` and
-///   `ATM_SPAWN_PI_ARGS='x pi'`). Use these when one harness needs a custom
-///   launcher without changing other harnesses.
-///
-/// - `ATM_SPAWN_BIN` / `ATM_SPAWN_ARGS`: legacy global overrides used when the
-///   harness-specific variables are unset. These intentionally override the
-///   selected harness command and are mainly for tests or whole-install wrappers.
-///
-/// `*_BIN` is one token: a plain word is typed bare so a shell alias of that
-/// name still works, and anything else is shell-quoted, so spaces/specials in
-/// a path "just work."
-///
-/// `*_ARGS` is inserted *between* the bin and appended model flag and is
-/// interpolated verbatim — the user's intent is multi-token wrapper syntax. The
-/// user is responsible for quoting anything inside `*_ARGS` that needs to be
-/// one token (same contract as `bash -c "..."`).
-///
-/// `cwd` and `model` go through `shell_quote`, so a model name like
-/// `opus 4.5` or a cwd with spaces compose safely without the caller
-/// thinking about it.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AtmConfig {
     #[serde(default)]
@@ -1110,6 +1096,32 @@ fn spawn_env_override(harness: &SpawnHarnessDefinition, suffix: &str) -> Option<
     non_empty_env(&harness_key).or_else(|| non_empty_env(&format!("ATM_SPAWN_{suffix}")))
 }
 
+/// Build the shell command string sent to a freshly-split tmux pane.
+///
+/// Honors spawn override environment variables (all treat empty as unset):
+///
+/// - `ATM_SPAWN_<HARNESS>_BIN` / `ATM_SPAWN_<HARNESS>_ARGS`: harness-specific
+///   overrides, where `<HARNESS>` is the canonical id uppercased with `-`
+///   replaced by `_` (for example `ATM_SPAWN_PI_BIN=mise` and
+///   `ATM_SPAWN_PI_ARGS='x pi'`). Use these when one harness needs a custom
+///   launcher without changing other harnesses.
+///
+/// - `ATM_SPAWN_BIN` / `ATM_SPAWN_ARGS`: legacy global overrides used when the
+///   harness-specific variables are unset. These intentionally override the
+///   selected harness command and are mainly for tests or whole-install wrappers.
+///
+/// `*_BIN` is one token: a plain word is typed bare so a shell alias of that
+/// name still works, and anything else is shell-quoted, so spaces/specials in
+/// a path "just work."
+///
+/// `*_ARGS` is inserted *between* the bin and appended model flag and is
+/// interpolated verbatim — the user's intent is multi-token wrapper syntax. The
+/// user is responsible for quoting anything inside `*_ARGS` that needs to be
+/// one token (same contract as `bash -c "..."`).
+///
+/// `cwd` and `model` go through `shell_quote`, so a model name like
+/// `opus 4.5` or a cwd with spaces compose safely without the caller
+/// thinking about it.
 fn build_spawn_command_for_harness(
     harness: &SpawnHarnessDefinition,
     cwd: Option<&str>,
@@ -1216,9 +1228,7 @@ async fn cmd_spawn(
 }
 
 async fn cmd_kill(target: String) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
     client
         .kill_pane(&pane_id)
@@ -1229,9 +1239,7 @@ async fn cmd_kill(target: String) -> Result<()> {
 }
 
 async fn cmd_interrupt(target: String) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
     // C-c sends SIGINT to the foreground process in the pane
     client
@@ -1243,8 +1251,7 @@ async fn cmd_interrupt(target: String) -> Result<()> {
 }
 
 async fn cmd_send(target: String, text: String) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
+    let sessions = daemon_sessions().await?;
     let pane_id = resolve_pane_id(&sessions, &target)?;
     let client = RealTmuxClient::new();
     let pane_state = client
@@ -1326,8 +1333,7 @@ async fn cmd_list(
     status_filter: Option<String>,
     project_filter: Option<String>,
 ) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
+    let sessions = daemon_sessions().await?;
 
     // Apply filters
     let filtered: Vec<&SessionView> = sessions
@@ -1397,9 +1403,7 @@ async fn cmd_list(
 }
 
 async fn cmd_reply(target: String, option: Option<usize>, yes: bool, no: bool) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
 
     if no {
@@ -1489,9 +1493,7 @@ fn find_selected_option(lines: &[String]) -> Option<usize> {
 }
 
 async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
+    let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
     let lines = client
         .capture_pane(&pane_id)
@@ -1648,8 +1650,7 @@ fn is_separator_line(trimmed: &str) -> bool {
 }
 
 async fn cmd_status() -> Result<()> {
-    daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
-    let sessions = fetch_sessions().await?;
+    let sessions = daemon_sessions().await?;
 
     let active = sessions
         .iter()

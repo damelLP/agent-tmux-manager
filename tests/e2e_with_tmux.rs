@@ -17,7 +17,9 @@
 //!    Pastes into panes running `cat` through a named buffer: a trailing
 //!    `;` and a newline arrive intact, `-p` brackets the paste only when
 //!    the program asked for it, and no buffer is left behind, even after a
-//!    failed paste. Reads copy mode and bracketed paste from the pane.
+//!    failed paste. An empty paste is a no-op, and a paste with no server
+//!    reports tmux's error. Reads copy mode, disabled input,
+//!    synchronize-panes and (tmux 3.7 and later) bracketed paste.
 //!
 //! 4. **`atm spawn` with a `claude` fixture**: run the actual `atm spawn`
 //!    subcommand against our isolated tmux server (via `ATM_TMUX_SOCKET`),
@@ -676,26 +678,29 @@ async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
         .pane_id;
     let atm_buffers = || {
         tmux_run_capture(label, &["list-buffers", "-F", "#{buffer_name}"])
-            .unwrap_or_default()
+            .expect("list-buffers")
             .lines()
             .filter(|name| name.starts_with("atm-send-"))
             .map(str::to_string)
             .collect::<Vec<_>>()
     };
 
-    // `cat` never asks for bracketed paste.
+    // `cat` never asks for bracketed paste. Each pane prints READY once its
+    // escape sequences have gone out; tmux reads them in order, so READY on
+    // screen means tmux has seen the bracketed-paste request.
     let plain = env
         .tmux
         .split_window(
             &probe_pane,
             "20%",
             PaneDirection::Below,
-            Some(&format!("exec cat > '{}'", plain_file.display())),
+            Some(&format!(
+                "printf READY; exec cat > '{}'",
+                plain_file.display()
+            )),
         )
         .await
         .expect("split plain cat pane");
-    // tmux reports the flag once the program has asked for it, so wait for
-    // the second pane's shell to print the request before reading it.
     let bracketed = env
         .tmux
         .split_window(
@@ -703,36 +708,52 @@ async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
             "20%",
             PaneDirection::Below,
             Some(&format!(
-                "printf '\\033[?2004h'; exec cat > '{}'",
+                "printf '\\033[?2004hREADY'; exec cat > '{}'",
                 bracketed_file.display()
             )),
         )
         .await
         .expect("split bracketed cat pane");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut bracketed_state = env.tmux.get_pane_input_state(&bracketed).await;
-    while !bracketed_state
-        .as_ref()
-        .is_ok_and(|state| state.bracketed_paste)
-        && Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        bracketed_state = env.tmux.get_pane_input_state(&bracketed).await;
-    }
-    assert_eq!(
-        bracketed_state.expect("bracketed pane state"),
-        atm_tmux::PaneInputState {
-            in_mode: false,
-            bracketed_paste: true,
+    for pane in [&plain, &bracketed] {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !env
+            .tmux
+            .capture_pane(pane)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|line| line.contains("READY"))
+        {
+            assert!(Instant::now() < deadline, "pane {pane} never printed READY");
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+    // `bracket_paste_flag` arrived in tmux 3.7; older tmux can't report it.
+    let reports_bracketed_paste = tmux_version_at_least(3, 7);
+    let state = |bracketed_paste: bool| atm_tmux::PaneInputState {
+        bracketed_paste: reports_bracketed_paste.then_some(bracketed_paste),
+        ..atm_tmux::PaneInputState::default()
+    };
+    assert_eq!(
+        env.tmux
+            .get_pane_input_state(&bracketed)
+            .await
+            .expect("bracketed pane state"),
+        state(true)
     );
     assert_eq!(
         env.tmux
             .get_pane_input_state(&plain)
             .await
             .expect("plain pane state"),
-        atm_tmux::PaneInputState::default()
+        state(false)
     );
+
+    // Empty text is a no-op rather than a paste of a missing buffer.
+    env.tmux
+        .paste_text(&plain, "")
+        .await
+        .expect("empty paste is a no-op");
 
     // A trailing `;` survives (send-keys drops it), a newline stays inside
     // the paste, and `Enter` goes on its own call.
@@ -789,6 +810,52 @@ async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
         "failed paste left a buffer: {:?}",
         atm_buffers()
     );
+
+    // With no server, tmux exits before reading its input. The error must
+    // be tmux's own, not the broken pipe from the 1 MiB write.
+    let no_server = RealTmuxClient::with_socket(format!("{label}-none"));
+    let error = no_server
+        .paste_text("%0", &"a".repeat(1 << 20))
+        .await
+        .expect_err("no server");
+    assert!(
+        matches!(&error, atm_tmux::TmuxError::CommandFailed { command, .. } if command == "load-buffer"),
+        "{error:?}"
+    );
+
+    tmux_run_capture(label, &["select-pane", "-d", "-t", &plain]).expect("disable input");
+    assert!(
+        env.tmux
+            .get_pane_input_state(&plain)
+            .await
+            .expect("input-off state")
+            .input_off
+    );
+    tmux_run_capture(label, &["select-pane", "-e", "-t", &plain]).expect("enable input");
+
+    tmux_run_capture(
+        label,
+        &["set-window-option", "-t", &plain, "synchronize-panes", "on"],
+    )
+    .expect("synchronize panes");
+    assert!(
+        env.tmux
+            .get_pane_input_state(&plain)
+            .await
+            .expect("synchronized state")
+            .synchronized
+    );
+    tmux_run_capture(
+        label,
+        &[
+            "set-window-option",
+            "-t",
+            &plain,
+            "synchronize-panes",
+            "off",
+        ],
+    )
+    .expect("unsynchronize panes");
 
     tmux_run_capture(label, &["copy-mode", "-t", &plain]).expect("enter copy mode");
     assert!(
@@ -2082,6 +2149,30 @@ async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: im
 
 /// Tiny `tmux -L <label> ...` helper for scenario 5's hook-inspection
 /// queries. Returns stdout on success.
+/// Whether the `tmux` on PATH is at least `major.minor`. A version tmux
+/// prints without numbers (a `master` build) counts as new.
+fn tmux_version_at_least(major: u32, minor: u32) -> bool {
+    let output = Command::new("tmux").arg("-V").output().expect("tmux -V");
+    let version = String::from_utf8_lossy(&output.stdout);
+    let numbers: Vec<u32> = version
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_start_matches("next-")
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .map_while(|digits| digits.parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [found_major, found_minor, ..] => (*found_major, *found_minor) >= (major, minor),
+        _ => true,
+    }
+}
+
 fn tmux_run_capture(socket_label: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("tmux");
     cmd.args(["-L", socket_label]);

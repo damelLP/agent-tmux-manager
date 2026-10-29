@@ -62,9 +62,17 @@ pub struct PaneInputState {
     /// The pane is in a mode such as copy mode, so keys go to tmux instead
     /// of the program (`#{pane_in_mode}`). A paste still reaches it.
     pub in_mode: bool,
-    /// The program asked for bracketed paste, so a paste with newlines
-    /// arrives as one unit (`#{bracket_paste_flag}`).
-    pub bracketed_paste: bool,
+    /// Input to the pane is disabled (`select-pane -d`,
+    /// `#{pane_input_off}`): tmux drops pastes and keys, yet reports
+    /// success.
+    pub input_off: bool,
+    /// `synchronize-panes` is on (`#{pane_synchronized}`): keys sent to the
+    /// pane also reach every other pane in its window, but a paste doesn't.
+    pub synchronized: bool,
+    /// Whether the program asked for bracketed paste, so a paste with
+    /// newlines arrives as one unit (`#{bracket_paste_flag}`). `None` on
+    /// tmux before 3.7, which can't report it.
+    pub bracketed_paste: Option<bool>,
 }
 
 /// Async interface for tmux pane management.
@@ -118,17 +126,20 @@ pub trait TmuxClient: Send + Sync {
     /// Sends keystrokes to a pane.
     async fn send_keys(&self, pane: &str, keys: &str) -> Result<(), TmuxError>;
 
-    /// Pastes `text` into a pane exactly as given, without submitting it.
+    /// Pastes `text` into a pane without submitting it.
     ///
-    /// Unlike [`Self::send_keys`], key names, a trailing `;` and newlines
-    /// stay literal. When the program asked for bracketed paste, the text
-    /// arrives as one bracketed paste. The text goes through a uniquely
-    /// named buffer that is deleted afterwards, so it never touches the
-    /// user's buffers.
+    /// Unlike [`Self::send_keys`], key names and a trailing `;` stay
+    /// literal. tmux turns each newline into a carriage return, as Enter
+    /// sends: a program that asked for bracketed paste gets the text as one
+    /// bracketed paste, and any other program gets each line submitted on
+    /// its own. From tmux 3.7 other control characters arrive as caret text
+    /// (`^[`); older tmux pastes them raw. Empty text is a no-op. The text
+    /// goes through a uniquely named buffer that is deleted afterwards, so
+    /// it never touches the user's buffers.
     async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError>;
 
-    /// Returns whether a pane is in a mode and whether its program asked
-    /// for bracketed paste.
+    /// Returns whether input reaches a pane's program, and whether that
+    /// program asked for bracketed paste.
     async fn get_pane_input_state(&self, pane: &str) -> Result<PaneInputState, TmuxError>;
 
     /// Lists all panes across all sessions.

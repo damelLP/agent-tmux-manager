@@ -42,23 +42,36 @@ fn unique_buffer_name() -> String {
     )
 }
 
-/// Parses `#{pane_in_mode} #{bracket_paste_flag}`. tmux expands an unknown
-/// format variable to nothing, which is an error here rather than a guess.
+/// The `display-message` format behind [`parse_pane_input_state`].
+/// `bracket_paste_flag` goes last: tmux before 3.7 doesn't know it and
+/// expands it to nothing.
+const PANE_INPUT_STATE_FORMAT: &str =
+    "#{pane_in_mode} #{pane_input_off} #{pane_synchronized} #{bracket_paste_flag}";
+
+/// Parses [`PANE_INPUT_STATE_FORMAT`]. A missing last field means tmux
+/// can't report bracketed paste; anything else unexpected is an error
+/// rather than a guess.
 fn parse_pane_input_state(output: &str) -> Result<PaneInputState, TmuxError> {
-    let fields: Vec<&str> = output.split_whitespace().collect();
-    let (in_mode, bracketed_paste) = match fields.as_slice() {
-        [modes, flag] => (modes.parse::<u32>().ok(), flag.parse::<u8>().ok()),
-        _ => (None, None),
+    let error = || TmuxError::ParseError(format!("unexpected pane input state {output:?}"));
+    let flag = |field: &str| match field {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(error()),
     };
-    match (in_mode, bracketed_paste) {
-        (Some(modes), Some(flag @ (0 | 1))) => Ok(PaneInputState {
-            in_mode: modes > 0,
-            bracketed_paste: flag == 1,
-        }),
-        _ => Err(TmuxError::ParseError(format!(
-            "unexpected pane input state {output:?}"
-        ))),
-    }
+    let fields: Vec<&str> = output.split_whitespace().collect();
+    let (modes, input_off, synchronized, bracketed_paste) = match fields.as_slice() {
+        [modes, input_off, synchronized] => (modes, input_off, synchronized, None),
+        [modes, input_off, synchronized, bracketed] => {
+            (modes, input_off, synchronized, Some(flag(bracketed)?))
+        }
+        _ => return Err(error()),
+    };
+    Ok(PaneInputState {
+        in_mode: modes.parse::<u32>().map_err(|_| error())? > 0,
+        input_off: flag(input_off)?,
+        synchronized: flag(synchronized)?,
+        bracketed_paste,
+    })
 }
 
 /// Real tmux client that invokes the `tmux` CLI.
@@ -142,11 +155,18 @@ impl RealTmuxClient {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            if let Some(mut pipe) = child.stdin.take() {
-                pipe.write_all(input.as_bytes()).await?;
+            let written = match child.stdin.take() {
                 // Dropping the pipe closes it, so tmux sees end of input.
+                Some(mut pipe) => pipe.write_all(input.as_bytes()).await,
+                None => Ok(()),
+            };
+            let output = child.wait_with_output().await?;
+            // When tmux fails before reading its input (no server, say),
+            // its status and stderr say more than the broken pipe does.
+            if output.status.success() {
+                written?;
             }
-            child.wait_with_output().await
+            Ok(output)
         };
         let output = tokio::time::timeout(timeout, output)
             .await
@@ -273,6 +293,11 @@ impl TmuxClient for RealTmuxClient {
     }
 
     async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError> {
+        if text.is_empty() {
+            // `load-buffer -` makes no buffer from empty input (tmux 3.8),
+            // so the paste would fail on a missing buffer.
+            return Ok(());
+        }
         let buffer = unique_buffer_name();
         self.run_with_stdin("load-buffer", &["-b", &buffer, "-"], Some(text))
             .await?;
@@ -291,7 +316,7 @@ impl TmuxClient for RealTmuxClient {
         let output = self
             .run(
                 "display-message",
-                &["-p", "-t", pane, "#{pane_in_mode} #{bracket_paste_flag}"],
+                &["-p", "-t", pane, PANE_INPUT_STATE_FORMAT],
             )
             .await?;
         parse_pane_input_state(&output)
@@ -421,26 +446,53 @@ mod tests {
     #[test]
     fn parses_pane_input_state() {
         assert_eq!(
-            parse_pane_input_state("0 1\n").unwrap(),
+            parse_pane_input_state("0 0 0 1\n").unwrap(),
             PaneInputState {
                 in_mode: false,
-                bracketed_paste: true,
+                input_off: false,
+                synchronized: false,
+                bracketed_paste: Some(true),
             }
         );
         // `pane_in_mode` counts modes, so any non-zero count is a mode.
         assert_eq!(
-            parse_pane_input_state("2 0\n").unwrap(),
+            parse_pane_input_state("2 1 1 0\n").unwrap(),
             PaneInputState {
                 in_mode: true,
-                bracketed_paste: false,
+                input_off: true,
+                synchronized: true,
+                bracketed_paste: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_before_3_7_cannot_report_bracketed_paste() {
+        // `bracket_paste_flag` arrived in tmux 3.7; tmux 3.4 expands it to
+        // nothing, so the query prints only the first three fields.
+        assert_eq!(
+            parse_pane_input_state("0 0 0 \n").unwrap(),
+            PaneInputState {
+                in_mode: false,
+                input_off: false,
+                synchronized: false,
+                bracketed_paste: None,
             }
         );
     }
 
     #[test]
     fn rejects_unparseable_pane_input_state() {
-        // tmux expands an unknown format variable to nothing.
-        for output in ["", "0", "0 \n", "x 1", "0 2", "0 1 1"] {
+        for output in [
+            "",
+            "0",
+            "0 0",
+            "x 0 0 1",
+            "0 2 0 1",
+            "0 0 2 1",
+            "0 0 0 2",
+            "0 0 0 1 1",
+        ] {
             assert!(
                 matches!(
                     parse_pane_input_state(output),

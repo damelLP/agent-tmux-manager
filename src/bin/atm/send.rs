@@ -11,8 +11,12 @@
 //!   input merges with the paste, which would submit the command as plain
 //!   text. No harness has a stash key ATM can press safely (see
 //!   [`DraftStash`]), so commands need `--force`.
-//! - In copy mode, `Enter` goes to tmux and nothing is submitted.
-//! - Without bracketed paste, each pasted newline submits a line.
+//! - In copy mode, `Enter` goes to tmux and nothing is submitted. With
+//!   input disabled, tmux drops both; with `synchronize-panes`, `Enter`
+//!   reaches every pane in the window but the paste doesn't.
+//! - Without bracketed paste, each pasted newline submits a line. tmux
+//!   reports bracketed paste only from 3.7, and before 3.7 a paste carries
+//!   control characters raw, so an embedded `ESC[201~` could end it early.
 
 use std::fmt;
 
@@ -64,12 +68,22 @@ pub fn classify(text: &str, harness: Option<&HarnessDefinition>) -> MessageClass
 pub enum Refusal {
     /// There is nothing to paste.
     Empty,
+    /// A control character other than a newline or tab: the program would
+    /// read it as a key, and tmux before 3.7 pastes it raw.
+    ControlCharacter,
     /// The pane is in copy mode or another tmux mode.
     PaneInMode,
+    /// Input to the pane is disabled, so tmux would drop the message.
+    PaneInputOff,
+    /// `synchronize-panes` is on, so `Enter` would reach every pane in the
+    /// window.
+    PanesSynchronized,
     /// A command spans lines.
     MultiLineCommand,
     /// Multi-line content for a program that didn't ask for bracketed paste.
     NoBracketedPaste,
+    /// Multi-line content, and tmux can't report bracketed paste.
+    BracketedPasteUnknown,
     /// A draft in the input would turn the command into plain text.
     DraftUnprotected {
         harness: &'static str,
@@ -81,14 +95,30 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("the message is empty"),
+            Self::ControlCharacter => f.write_str(
+                "the message holds a control character other than a newline or tab, \
+                 which the program would read as a key",
+            ),
             Self::PaneInMode => f.write_str(
                 "the pane is in copy mode or another tmux mode, so Enter would not reach \
                  the program; leave the mode first",
+            ),
+            Self::PaneInputOff => f.write_str(
+                "input to the pane is disabled (select-pane -d), so tmux would drop the \
+                 message",
+            ),
+            Self::PanesSynchronized => f.write_str(
+                "synchronize-panes is on, so Enter would also reach the other panes in \
+                 the window",
             ),
             Self::MultiLineCommand => f.write_str("a command must be a single line"),
             Self::NoBracketedPaste => f.write_str(
                 "the program in the pane did not ask for bracketed paste, so each line \
                  would be submitted on its own",
+            ),
+            Self::BracketedPasteUnknown => f.write_str(
+                "this tmux (older than 3.7) can't report whether the program asked for \
+                 bracketed paste, so each line could be submitted on its own",
             ),
             Self::DraftUnprotected { harness, stash } => {
                 write!(
@@ -121,19 +151,30 @@ pub fn check(
     if text.is_empty() {
         return Err(Refusal::Empty);
     }
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(Refusal::ControlCharacter);
+    }
     if state.in_mode {
         return Err(Refusal::PaneInMode);
     }
+    if state.input_off {
+        return Err(Refusal::PaneInputOff);
+    }
+    if state.synchronized {
+        return Err(Refusal::PanesSynchronized);
+    }
     let multi_line = text.contains(['\n', '\r']);
-    match class {
-        MessageClass::Operational if multi_line => Err(Refusal::MultiLineCommand),
-        MessageClass::Operational if !force => Err(Refusal::DraftUnprotected {
+    match (class, state.bracketed_paste) {
+        (MessageClass::Operational, _) if multi_line => Err(Refusal::MultiLineCommand),
+        (MessageClass::Operational, _) if !force => Err(Refusal::DraftUnprotected {
             harness: harness.map_or("the harness", |definition| definition.display_name),
             stash: harness.and_then(|definition| definition.draft_stash),
         }),
-        MessageClass::Content if multi_line && !state.bracketed_paste => {
-            Err(Refusal::NoBracketedPaste)
-        }
+        (MessageClass::Content, Some(false)) if multi_line => Err(Refusal::NoBracketedPaste),
+        (MessageClass::Content, None) if multi_line => Err(Refusal::BracketedPasteUnknown),
         _ => Ok(()),
     }
 }
@@ -141,6 +182,9 @@ pub fn check(
 /// True when `session` carries its parent's pane: an in-process child,
 /// such as a Claude background subagent. Typing there reaches the lead.
 fn shares_lead_pane(session: &SessionView, sessions: &[SessionView]) -> bool {
+    if session.tmux_pane.is_none() {
+        return false;
+    }
     session.parent_session_id.as_ref().is_some_and(|parent| {
         sessions
             .iter()
@@ -225,11 +269,18 @@ mod tests {
 
     const PLAIN: PaneInputState = PaneInputState {
         in_mode: false,
-        bracketed_paste: false,
+        input_off: false,
+        synchronized: false,
+        bracketed_paste: Some(false),
     };
     const BRACKETED: PaneInputState = PaneInputState {
-        in_mode: false,
-        bracketed_paste: true,
+        bracketed_paste: Some(true),
+        ..PLAIN
+    };
+    /// tmux before 3.7 can't report bracketed paste.
+    const OLD_TMUX: PaneInputState = PaneInputState {
+        bracketed_paste: None,
+        ..PLAIN
     };
 
     #[test]
@@ -282,7 +333,7 @@ mod tests {
     fn a_pane_in_a_mode_refuses_both_classes() {
         let in_mode = PaneInputState {
             in_mode: true,
-            bracketed_paste: true,
+            ..BRACKETED
         };
         let claude = Some(harness("claude"));
         assert_eq!(
@@ -293,6 +344,57 @@ mod tests {
             check("/clear", MessageClass::Operational, claude, in_mode, true),
             Err(Refusal::PaneInMode)
         );
+    }
+
+    #[test]
+    fn control_characters_are_refused_even_with_force() {
+        // Before tmux 3.7 a paste carries these raw: ESC[201~ would end the
+        // bracket early, and the `/clear` after it would run as typed.
+        let claude = Some(harness("claude"));
+        for text in ["hi\x1b[201~\r/clear", "stop\x03", "\x15wipe", "del\x7f"] {
+            for class in [MessageClass::Content, MessageClass::Operational] {
+                assert_eq!(
+                    check(text, class, claude, BRACKETED, true),
+                    Err(Refusal::ControlCharacter),
+                    "{text:?} {class}"
+                );
+            }
+        }
+        assert_eq!(
+            check("a\tb", MessageClass::Content, claude, PLAIN, false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn disabled_input_and_synchronized_panes_refuse_both_classes() {
+        let claude = Some(harness("claude"));
+        let cases = [
+            (
+                PaneInputState {
+                    input_off: true,
+                    ..BRACKETED
+                },
+                Refusal::PaneInputOff,
+            ),
+            (
+                PaneInputState {
+                    synchronized: true,
+                    ..BRACKETED
+                },
+                Refusal::PanesSynchronized,
+            ),
+        ];
+        for (state, refusal) in cases {
+            assert_eq!(
+                check("hello", MessageClass::Content, claude, state, false),
+                Err(refusal.clone())
+            );
+            assert_eq!(
+                check("/clear", MessageClass::Operational, claude, state, true),
+                Err(refusal)
+            );
+        }
     }
 
     #[test]
@@ -384,6 +486,25 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_content_is_refused_when_tmux_cannot_report_bracketed_paste() {
+        let pi = Some(harness("pi"));
+        assert_eq!(
+            check(
+                "line one\nline two",
+                MessageClass::Content,
+                pi,
+                OLD_TMUX,
+                true
+            ),
+            Err(Refusal::BracketedPasteUnknown)
+        );
+        assert_eq!(
+            check("one line", MessageClass::Content, pi, OLD_TMUX, false),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn a_session_id_resolves_to_its_pane_and_session() {
         let sessions = [session("lead-aaaa", "codex", Some("%5"), None)];
         let (pane, found) = resolve_target(&sessions, "lead").expect("resolves");
@@ -433,6 +554,18 @@ mod tests {
     fn a_session_without_a_pane_is_refused() {
         let sessions = [session("solo-dddd", "pi", None, None)];
         assert!(resolve_target(&sessions, "solo").is_err());
+    }
+
+    #[test]
+    fn a_child_and_lead_without_panes_are_not_sharing_one() {
+        let sessions = [
+            session("lead-aaaa", "claude", None, None),
+            session("child-bbbb", "claude", None, Some("lead-aaaa")),
+        ];
+        let message = resolve_target(&sessions, "child")
+            .expect_err("refused")
+            .to_string();
+        assert!(message.contains("has no tmux pane"), "{message}");
     }
 
     #[tokio::test]

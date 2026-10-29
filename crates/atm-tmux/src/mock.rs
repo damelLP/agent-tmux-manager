@@ -571,7 +571,9 @@ mod tests {
         let mock = MockTmuxClient::new();
         let state = PaneInputState {
             in_mode: true,
-            bracketed_paste: true,
+            input_off: false,
+            synchronized: true,
+            bracketed_paste: Some(true),
         };
         mock.set_pane_input_state("%5", state);
 

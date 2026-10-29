@@ -214,6 +214,21 @@
 //!   an idle lead was followed by that `UserPromptSubmit` 53 ms later, so
 //!   no captured case needed a child event to mark the lead working.
 //!
+//! ## Typing into the TUI (captured 2026-10-29)
+//!
+//! Not hooks, but facts `atm send` relies on, from a sealed Claude Code
+//! 2.1.312 TUI driven through tmux 3.8 with hooks logged (#116):
+//!
+//! - **ctrl+s is a one-slot stash toggle.** On a draft it stashes the
+//!   draft, replacing an earlier stash; on an empty input it restores the
+//!   stash. A stashed draft returns after the next submit, `/clear`
+//!   included. Pressed before an injected `/clear` on an empty input, it
+//!   restored an earlier draft, and `DRAFT-B/clear` reached the model as a
+//!   prompt. `atm-core` records the key as `DraftStash::Toggle` in
+//!   `HarnessDefinition::draft_stash`, and `atm send` never presses it.
+//! - A leading space escapes a command: ` /clear` was submitted as a prompt
+//!   and no `SessionEnd` fired.
+//!
 //! ## Known gaps (Claude Code 2.1.310)
 //!
 //! - **A nested subagent's row sits directly under the lead.** Its

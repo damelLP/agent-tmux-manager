@@ -15,7 +15,6 @@ pub mod harness;
 pub mod harness_registry;
 pub mod lifecycle;
 pub mod model;
-pub mod project;
 pub mod session;
 pub mod tool;
 pub mod tree;
@@ -35,7 +34,6 @@ pub use lifecycle::{
     NeedsInputReason, NotificationKind,
 };
 pub use model::{derive_display_name, Model};
-pub use project::{resolve_project_root, resolve_worktree_info};
 pub use session::{
     format_age, ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId,
     SessionStatus, SessionView, StatusLineData,

@@ -952,9 +952,9 @@ async fn test_hook_event_forwards_agent_fields() {
 #[tokio::test]
 async fn test_project_resolution_on_discovery() {
     // This test verifies that project resolution functions work correctly
-    // when given a real git repo path. The functions are in atm-core and
+    // when given a real git repo path. The functions are in atmd and
     // will be wired into the actor in a later phase.
-    use atm_core::{resolve_project_root, resolve_worktree_info};
+    use atmd::project::{resolve_project_root, resolve_worktree_info};
     use std::fs;
 
     let handle = spawn_registry();

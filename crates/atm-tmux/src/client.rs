@@ -2,13 +2,16 @@
 //!
 //! Shells out to the `tmux` binary via `tokio::process::Command`.
 
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, trace};
 
-use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
+use crate::{PaneDirection, PaneInfo, PaneInputState, TmuxClient, TmuxError};
 
 /// Deadline for one tmux command. tmux normally answers in milliseconds, but
 /// a stopped or wedged server never answers and the client waits forever.
@@ -25,6 +28,36 @@ fn command_timeout(subcommand: &str) -> Duration {
         NEW_SESSION_TIMEOUT
     } else {
         COMMAND_TIMEOUT
+    }
+}
+
+/// A paste-buffer name no other live `atm` process or call is using.
+/// Buffers belong to the whole tmux server, not to one client.
+fn unique_buffer_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "atm-send-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Parses `#{pane_in_mode} #{bracket_paste_flag}`. tmux expands an unknown
+/// format variable to nothing, which is an error here rather than a guess.
+fn parse_pane_input_state(output: &str) -> Result<PaneInputState, TmuxError> {
+    let fields: Vec<&str> = output.split_whitespace().collect();
+    let (in_mode, bracketed_paste) = match fields.as_slice() {
+        [modes, flag] => (modes.parse::<u32>().ok(), flag.parse::<u8>().ok()),
+        _ => (None, None),
+    };
+    match (in_mode, bracketed_paste) {
+        (Some(modes), Some(flag @ (0 | 1))) => Ok(PaneInputState {
+            in_mode: modes > 0,
+            bracketed_paste: flag == 1,
+        }),
+        _ => Err(TmuxError::ParseError(format!(
+            "unexpected pane input state {output:?}"
+        ))),
     }
 }
 
@@ -84,15 +117,37 @@ impl RealTmuxClient {
     /// Gives up after [`command_timeout`] with [`TmuxError::Timeout`]; the
     /// `tmux` process is killed rather than left blocked on the server.
     async fn run(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError> {
+        self.run_with_stdin(subcommand, args, None).await
+    }
+
+    /// Like [`Self::run`], writing `stdin` (when given) to the command's
+    /// standard input. The deadline covers the write too.
+    async fn run_with_stdin(
+        &self,
+        subcommand: &str,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Result<String, TmuxError> {
         trace!(subcommand, ?args, "running tmux command");
 
         let timeout = command_timeout(subcommand);
-        let output = self
-            .tmux_cmd()
-            .arg(subcommand)
-            .args(args)
-            .kill_on_drop(true)
-            .output();
+        let mut cmd = self.tmux_cmd();
+        cmd.arg(subcommand).args(args).kill_on_drop(true);
+        let output = async {
+            let Some(input) = stdin else {
+                return cmd.output().await;
+            };
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            if let Some(mut pipe) = child.stdin.take() {
+                pipe.write_all(input.as_bytes()).await?;
+                // Dropping the pipe closes it, so tmux sees end of input.
+            }
+            child.wait_with_output().await
+        };
         let output = tokio::time::timeout(timeout, output)
             .await
             .map_err(|_| TmuxError::Timeout {
@@ -217,6 +272,31 @@ impl TmuxClient for RealTmuxClient {
         self.run_silent("send-keys", &["-t", pane, keys]).await
     }
 
+    async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError> {
+        let buffer = unique_buffer_name();
+        self.run_with_stdin("load-buffer", &["-b", &buffer, "-"], Some(text))
+            .await?;
+        // `-p` brackets the paste when the program asked for it; `-d`
+        // deletes the buffer, but only once the paste has happened.
+        let pasted = self
+            .run_silent("paste-buffer", &["-p", "-d", "-b", &buffer, "-t", pane])
+            .await;
+        if pasted.is_err() {
+            let _ = self.run_silent("delete-buffer", &["-b", &buffer]).await;
+        }
+        pasted
+    }
+
+    async fn get_pane_input_state(&self, pane: &str) -> Result<PaneInputState, TmuxError> {
+        let output = self
+            .run(
+                "display-message",
+                &["-p", "-t", pane, "#{pane_in_mode} #{bracket_paste_flag}"],
+            )
+            .await?;
+        parse_pane_input_state(&output)
+    }
+
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError> {
         let format = "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}";
         let output = self.run("list-panes", &["-a", "-F", format]).await?;
@@ -336,6 +416,49 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn parses_pane_input_state() {
+        assert_eq!(
+            parse_pane_input_state("0 1\n").unwrap(),
+            PaneInputState {
+                in_mode: false,
+                bracketed_paste: true,
+            }
+        );
+        // `pane_in_mode` counts modes, so any non-zero count is a mode.
+        assert_eq!(
+            parse_pane_input_state("2 0\n").unwrap(),
+            PaneInputState {
+                in_mode: true,
+                bracketed_paste: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unparseable_pane_input_state() {
+        // tmux expands an unknown format variable to nothing.
+        for output in ["", "0", "0 \n", "x 1", "0 2", "0 1 1"] {
+            assert!(
+                matches!(
+                    parse_pane_input_state(output),
+                    Err(TmuxError::ParseError(_))
+                ),
+                "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_buffer_names_differ_per_call() {
+        let first = unique_buffer_name();
+        let second = unique_buffer_name();
+        assert_ne!(first, second);
+        let prefix = format!("atm-send-{}-", std::process::id());
+        assert!(first.starts_with(&prefix), "{first}");
+        assert!(second.starts_with(&prefix), "{second}");
     }
 
     #[test]

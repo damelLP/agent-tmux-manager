@@ -14,6 +14,10 @@
 //! 3. **Real tmux library against an isolated server**: drive
 //!    `atm_tmux::RealTmuxClient::with_socket(label)` against the private
 //!    tmux server we spun up. Splits a pane, sends keys, captures output.
+//!    Pastes into panes running `cat` through a named buffer: a trailing
+//!    `;` and a newline arrive intact, `-p` brackets the paste only when
+//!    the program asked for it, and no buffer is left behind, even after a
+//!    failed paste. Reads copy mode and bracketed paste from the pane.
 //!
 //! 4. **`atm spawn` with a `claude` fixture**: run the actual `atm spawn`
 //!    subcommand against our isolated tmux server (via `ATM_TMUX_SOCKET`),
@@ -651,6 +655,153 @@ async fn scenario_real_tmux_lib(env: &E2eEnv) {
         panes_before.len() + 1,
         "split-window should add exactly one pane to the private server"
     );
+}
+
+/// Scenario 3b: `RealTmuxClient::paste_text` and `get_pane_input_state`
+/// against panes running `cat > file`, so the file holds exactly the bytes
+/// the program read.
+async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
+    let label = &env.tmux_server.socket_label;
+    let out = TempDir::new().expect("paste output dir");
+    let plain_file = out.path().join("plain");
+    let bracketed_file = out.path().join("bracketed");
+    let probe_pane = env
+        .tmux
+        .list_panes()
+        .await
+        .expect("list panes")
+        .into_iter()
+        .find(|p| p.session_name == "probe")
+        .expect("probe session present")
+        .pane_id;
+    let atm_buffers = || {
+        tmux_run_capture(label, &["list-buffers", "-F", "#{buffer_name}"])
+            .unwrap_or_default()
+            .lines()
+            .filter(|name| name.starts_with("atm-send-"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // `cat` never asks for bracketed paste.
+    let plain = env
+        .tmux
+        .split_window(
+            &probe_pane,
+            "20%",
+            PaneDirection::Below,
+            Some(&format!("exec cat > '{}'", plain_file.display())),
+        )
+        .await
+        .expect("split plain cat pane");
+    // tmux reports the flag once the program has asked for it, so wait for
+    // the second pane's shell to print the request before reading it.
+    let bracketed = env
+        .tmux
+        .split_window(
+            &probe_pane,
+            "20%",
+            PaneDirection::Below,
+            Some(&format!(
+                "printf '\\033[?2004h'; exec cat > '{}'",
+                bracketed_file.display()
+            )),
+        )
+        .await
+        .expect("split bracketed cat pane");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut bracketed_state = env.tmux.get_pane_input_state(&bracketed).await;
+    while !bracketed_state
+        .as_ref()
+        .is_ok_and(|state| state.bracketed_paste)
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bracketed_state = env.tmux.get_pane_input_state(&bracketed).await;
+    }
+    assert_eq!(
+        bracketed_state.expect("bracketed pane state"),
+        atm_tmux::PaneInputState {
+            in_mode: false,
+            bracketed_paste: true,
+        }
+    );
+    assert_eq!(
+        env.tmux
+            .get_pane_input_state(&plain)
+            .await
+            .expect("plain pane state"),
+        atm_tmux::PaneInputState::default()
+    );
+
+    // A trailing `;` survives (send-keys drops it), a newline stays inside
+    // the paste, and `Enter` goes on its own call.
+    env.tmux
+        .paste_text(&plain, "a;\nb")
+        .await
+        .expect("paste into plain pane");
+    env.tmux
+        .send_keys(&plain, "Enter")
+        .await
+        .expect("Enter in plain pane");
+    env.tmux
+        .paste_text(&bracketed, "x;")
+        .await
+        .expect("paste into bracketed pane");
+    env.tmux
+        .send_keys(&bracketed, "Enter")
+        .await
+        .expect("Enter in bracketed pane");
+
+    let read_when = |path: &Path, want: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let got = std::fs::read(path).unwrap_or_default();
+            if got == want || Instant::now() >= deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // paste-buffer turns LF into CR, and the tty turns CR back into LF.
+    let plain_want = b"a;\nb\n";
+    assert_eq!(
+        read_when(&plain_file, plain_want),
+        plain_want,
+        "plain pane read"
+    );
+    let bracketed_want = b"\x1b[200~x;\x1b[201~\n";
+    assert_eq!(
+        read_when(&bracketed_file, bracketed_want),
+        bracketed_want,
+        "bracketed pane read"
+    );
+    assert!(
+        atm_buffers().is_empty(),
+        "paste must delete its buffer: {:?}",
+        atm_buffers()
+    );
+
+    // A failed paste must not leave the text behind in a buffer.
+    assert!(env.tmux.paste_text("%999999", "secret").await.is_err());
+    assert!(
+        atm_buffers().is_empty(),
+        "failed paste left a buffer: {:?}",
+        atm_buffers()
+    );
+
+    tmux_run_capture(label, &["copy-mode", "-t", &plain]).expect("enter copy mode");
+    assert!(
+        env.tmux
+            .get_pane_input_state(&plain)
+            .await
+            .expect("copy-mode state")
+            .in_mode
+    );
+
+    for pane in [&plain, &bracketed] {
+        env.tmux.kill_pane(pane).await.expect("kill cat pane");
+    }
 }
 
 /// Scenario 4 — `atm spawn` end-to-end. Splits a pane in our isolated
@@ -1805,6 +1956,7 @@ async fn atm_atmd_tmux_end_to_end() {
     let session_id = scenario_protocol_e2e(&env).await;
     scenario_atm_list_client(&env, &session_id).await;
     scenario_real_tmux_lib(&env).await;
+    scenario_paste_text_and_input_state(&env).await;
 
     if python3_on_path().is_some() {
         scenario_atm_spawn(&env).await;

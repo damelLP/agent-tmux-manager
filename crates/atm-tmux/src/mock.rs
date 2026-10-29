@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
+use crate::{PaneDirection, PaneInfo, PaneInputState, TmuxClient, TmuxError};
 
 /// A recorded call to the mock tmux client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,13 @@ pub enum MockCall {
     SendKeys {
         pane: String,
         keys: String,
+    },
+    PasteText {
+        pane: String,
+        text: String,
+    },
+    GetPaneInputState {
+        pane: String,
     },
     ListPanes,
     DisplayPopup {
@@ -98,6 +105,9 @@ struct MockState {
     pane_content: HashMap<String, Vec<String>>,
     /// Working directory returned by get_pane_cwd, keyed by pane ID.
     pane_cwd: HashMap<String, String>,
+    /// State returned by get_pane_input_state, keyed by pane ID. Unset
+    /// panes report the default: no mode, no bracketed paste.
+    pane_input: HashMap<String, PaneInputState>,
     /// Queue of stdout strings returned by raw_command.
     raw_command_outputs: VecDeque<String>,
     /// If set, the next call will return this error.
@@ -114,6 +124,7 @@ impl MockTmuxClient {
                 panes: Vec::new(),
                 pane_content: HashMap::new(),
                 pane_cwd: HashMap::new(),
+                pane_input: HashMap::new(),
                 raw_command_outputs: VecDeque::new(),
                 next_error: None,
             })),
@@ -145,6 +156,13 @@ impl MockTmuxClient {
     pub fn set_pane_cwd(&self, pane: &str, cwd: &str) {
         if let Ok(mut state) = self.inner.lock() {
             state.pane_cwd.insert(pane.to_string(), cwd.to_string());
+        }
+    }
+
+    /// Sets the state returned by `get_pane_input_state` for a specific pane.
+    pub fn set_pane_input_state(&self, pane: &str, state: PaneInputState) {
+        if let Ok(mut state_map) = self.inner.lock() {
+            state_map.pane_input.insert(pane.to_string(), state);
         }
     }
 
@@ -288,6 +306,26 @@ impl TmuxClient for MockTmuxClient {
             pane: pane.to_string(),
             keys: keys.to_string(),
         })
+    }
+
+    async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError> {
+        self.record(MockCall::PasteText {
+            pane: pane.to_string(),
+            text: text.to_string(),
+        })
+    }
+
+    async fn get_pane_input_state(&self, pane: &str) -> Result<PaneInputState, TmuxError> {
+        self.record(MockCall::GetPaneInputState {
+            pane: pane.to_string(),
+        })?;
+        let state = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|state| state.pane_input.get(pane).copied())
+            .unwrap_or_default();
+        Ok(state)
     }
 
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError> {
@@ -512,6 +550,47 @@ mod tests {
             &calls[0],
             MockCall::DisplayPopup { command, .. } if command == "atm"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_mock_paste_text_records_the_text() {
+        let mock = MockTmuxClient::new();
+        mock.paste_text("%5", "a;\nb").await.unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![MockCall::PasteText {
+                pane: "%5".to_string(),
+                text: "a;\nb".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_pane_input_state() {
+        let mock = MockTmuxClient::new();
+        let state = PaneInputState {
+            in_mode: true,
+            bracketed_paste: true,
+        };
+        mock.set_pane_input_state("%5", state);
+
+        assert_eq!(mock.get_pane_input_state("%5").await.unwrap(), state);
+        assert_eq!(
+            mock.get_pane_input_state("%6").await.unwrap(),
+            PaneInputState::default()
+        );
+        assert_eq!(
+            mock.calls(),
+            vec![
+                MockCall::GetPaneInputState {
+                    pane: "%5".to_string()
+                },
+                MockCall::GetPaneInputState {
+                    pane: "%6".to_string()
+                },
+            ]
+        );
     }
 
     #[tokio::test]

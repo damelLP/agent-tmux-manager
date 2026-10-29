@@ -56,25 +56,6 @@ pub struct PaneInfo {
     pub is_active: bool,
 }
 
-/// Whether typed or pasted input reaches a pane's program, and how.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PaneInputState {
-    /// The pane is in a mode such as copy mode, so keys go to tmux instead
-    /// of the program (`#{pane_in_mode}`). A paste still reaches it.
-    pub in_mode: bool,
-    /// Input to the pane is disabled (`select-pane -d`,
-    /// `#{pane_input_off}`): tmux drops pastes and keys, yet reports
-    /// success.
-    pub input_off: bool,
-    /// `synchronize-panes` is on (`#{pane_synchronized}`): keys sent to the
-    /// pane also reach every other pane in its window, but a paste doesn't.
-    pub synchronized: bool,
-    /// Whether the program asked for bracketed paste, so a paste with
-    /// newlines arrives as one unit (`#{bracket_paste_flag}`). `None` on
-    /// tmux before 3.7, which can't report it.
-    pub bracketed_paste: Option<bool>,
-}
-
 /// Async interface for tmux pane management.
 ///
 /// The real implementation shells out to the `tmux` CLI. The mock records
@@ -137,10 +118,6 @@ pub trait TmuxClient: Send + Sync {
     /// goes through a uniquely named buffer that is deleted afterwards, so
     /// it never touches the user's buffers.
     async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError>;
-
-    /// Returns whether input reaches a pane's program, and whether that
-    /// program asked for bracketed paste.
-    async fn get_pane_input_state(&self, pane: &str) -> Result<PaneInputState, TmuxError>;
 
     /// Lists all panes across all sessions.
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError>;

@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, trace};
 
-use crate::{PaneDirection, PaneInfo, PaneInputState, TmuxClient, TmuxError};
+use crate::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
 
 /// Deadline for one tmux command. tmux normally answers in milliseconds, but
 /// a stopped or wedged server never answers and the client waits forever.
@@ -40,38 +40,6 @@ fn unique_buffer_name() -> String {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// The `display-message` format behind [`parse_pane_input_state`].
-/// `bracket_paste_flag` goes last: tmux before 3.7 doesn't know it and
-/// expands it to nothing.
-const PANE_INPUT_STATE_FORMAT: &str =
-    "#{pane_in_mode} #{pane_input_off} #{pane_synchronized} #{bracket_paste_flag}";
-
-/// Parses [`PANE_INPUT_STATE_FORMAT`]. A missing last field means tmux
-/// can't report bracketed paste; anything else unexpected is an error
-/// rather than a guess.
-fn parse_pane_input_state(output: &str) -> Result<PaneInputState, TmuxError> {
-    let error = || TmuxError::ParseError(format!("unexpected pane input state {output:?}"));
-    let flag = |field: &str| match field {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(error()),
-    };
-    let fields: Vec<&str> = output.split_whitespace().collect();
-    let (modes, input_off, synchronized, bracketed_paste) = match fields.as_slice() {
-        [modes, input_off, synchronized] => (modes, input_off, synchronized, None),
-        [modes, input_off, synchronized, bracketed] => {
-            (modes, input_off, synchronized, Some(flag(bracketed)?))
-        }
-        _ => return Err(error()),
-    };
-    Ok(PaneInputState {
-        in_mode: modes.parse::<u32>().map_err(|_| error())? > 0,
-        input_off: flag(input_off)?,
-        synchronized: flag(synchronized)?,
-        bracketed_paste,
-    })
 }
 
 /// Real tmux client that invokes the `tmux` CLI.
@@ -312,16 +280,6 @@ impl TmuxClient for RealTmuxClient {
         pasted
     }
 
-    async fn get_pane_input_state(&self, pane: &str) -> Result<PaneInputState, TmuxError> {
-        let output = self
-            .run(
-                "display-message",
-                &["-p", "-t", pane, PANE_INPUT_STATE_FORMAT],
-            )
-            .await?;
-        parse_pane_input_state(&output)
-    }
-
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError> {
         let format = "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}";
         let output = self.run("list-panes", &["-a", "-F", format]).await?;
@@ -440,66 +398,6 @@ mod tests {
                 Some(v) => std::env::set_var(self.key, v),
                 None => std::env::remove_var(self.key),
             }
-        }
-    }
-
-    #[test]
-    fn parses_pane_input_state() {
-        assert_eq!(
-            parse_pane_input_state("0 0 0 1\n").unwrap(),
-            PaneInputState {
-                in_mode: false,
-                input_off: false,
-                synchronized: false,
-                bracketed_paste: Some(true),
-            }
-        );
-        // `pane_in_mode` counts modes, so any non-zero count is a mode.
-        assert_eq!(
-            parse_pane_input_state("2 1 1 0\n").unwrap(),
-            PaneInputState {
-                in_mode: true,
-                input_off: true,
-                synchronized: true,
-                bracketed_paste: Some(false),
-            }
-        );
-    }
-
-    #[test]
-    fn tmux_before_3_7_cannot_report_bracketed_paste() {
-        // `bracket_paste_flag` arrived in tmux 3.7; tmux 3.4 expands it to
-        // nothing, so the query prints only the first three fields.
-        assert_eq!(
-            parse_pane_input_state("0 0 0 \n").unwrap(),
-            PaneInputState {
-                in_mode: false,
-                input_off: false,
-                synchronized: false,
-                bracketed_paste: None,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_unparseable_pane_input_state() {
-        for output in [
-            "",
-            "0",
-            "0 0",
-            "x 0 0 1",
-            "0 2 0 1",
-            "0 0 2 1",
-            "0 0 0 2",
-            "0 0 0 1 1",
-        ] {
-            assert!(
-                matches!(
-                    parse_pane_input_state(output),
-                    Err(TmuxError::ParseError(_))
-                ),
-                "{output:?}"
-            );
         }
     }
 

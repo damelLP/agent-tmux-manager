@@ -10,7 +10,7 @@
 //! atm spawn                  # Spawn a new coding agent
 //! atm kill <session-id>      # Kill an agent
 //! atm interrupt <session-id> # Send SIGINT to an agent
-//! atm send <session-id> <text> # Paste text into an agent pane and submit it
+//! atm send <session-id> <text> # Send text to agent pane
 //! atm list                   # List agents (tab-separated)
 //! atm status                 # One-line summary for tmux status bar
 //! atm setup                  # Configure agent integrations
@@ -60,7 +60,6 @@ use atm_tui::setup;
 use atm_tui::tmux;
 use atm_tui::ui;
 
-mod send;
 mod workspace;
 use workspace::{cmd_workspace, cmd_workspace_attach};
 
@@ -127,19 +126,18 @@ enum Command {
         /// Session ID (short form) or tmux pane ID
         target: String,
     },
-    /// Paste text into an agent's tmux pane and submit it
+    /// Send text to an agent's tmux pane
     ///
-    /// Text starting with `/` or `!` is a command the harness runs (e.g.
-    /// `/clear`). atm refuses it unless `--force` is given, because a
-    /// half-typed draft in the input would turn it into plain text.
+    /// Pastes the text, then presses Enter, as if the user typed it: `/clear`
+    /// runs, and a half-typed draft in the input merges with the text. Refuses
+    /// a session waiting on a dialog (answer it with `atm reply`), a subagent
+    /// that shares its lead's pane, a pane in copy mode, and multi-line text
+    /// for a program that didn't ask for bracketed paste.
     Send {
         /// Session ID (short form) or tmux pane ID
         target: String,
         /// Text to send
         text: String,
-        /// Send a command even though a draft in the input could merge with it
-        #[arg(long)]
-        force: bool,
     },
     /// List agents for scripting
     List {
@@ -871,28 +869,22 @@ fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
         return Ok(target.to_string());
     }
 
-    let session = find_session(sessions, target)?;
-    match &session.tmux_pane {
-        Some(pane) => Ok(pane.clone()),
-        None => bail!("Session {} has no tmux pane", session.id_short),
-    }
-}
-
-/// Finds the one session whose ID starts with `target`.
-fn find_session<'a>(sessions: &'a [SessionView], target: &str) -> Result<&'a SessionView> {
+    // Search by session ID prefix
     let matches: Vec<&SessionView> = sessions
         .iter()
         .filter(|s| s.id.as_str().starts_with(target) || s.id_short.starts_with(target))
         .collect();
 
-    match matches.as_slice() {
-        [] => bail!("No session matching '{target}'"),
-        [session] => Ok(session),
-        _ => {
+    match matches.len() {
+        0 => bail!("No session matching '{target}'"),
+        1 => match &matches[0].tmux_pane {
+            Some(pane) => Ok(pane.clone()),
+            None => bail!("Session {} has no tmux pane", matches[0].id_short),
+        },
+        n => {
             let ids: Vec<&str> = matches.iter().map(|s| s.id_short.as_str()).collect();
             bail!(
-                "Ambiguous target '{target}' matches {} sessions: {}",
-                matches.len(),
+                "Ambiguous target '{target}' matches {n} sessions: {}",
                 ids.join(", ")
             )
         }
@@ -1250,15 +1242,83 @@ async fn cmd_interrupt(target: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_send(target: String, text: String, force: bool) -> Result<()> {
+async fn cmd_send(target: String, text: String) -> Result<()> {
     daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
     let sessions = fetch_sessions().await?;
-    let (pane_id, session) = send::resolve_target(&sessions, &target)?;
-    let harness = session.and_then(|s| find_harness_definition(&s.harness));
+    let pane_id = resolve_pane_id(&sessions, &target)?;
     let client = RealTmuxClient::new();
-    let class = send::send_to_pane(&client, &pane_id, &text, harness, force).await?;
-    println!("Sent {class} message to {pane_id} by tmux paste");
+    let pane_state = client
+        .raw_command(
+            "display-message",
+            &[
+                "-p",
+                "-t",
+                &pane_id,
+                "#{pane_in_mode} #{bracket_paste_flag}",
+            ],
+        )
+        .await
+        .context(format!("Failed to read the state of pane {pane_id}"))?;
+    if let Some(reason) = send_refusal(&sessions, &target, &pane_id, &pane_state, &text) {
+        bail!("Refusing to send to {pane_id}: {reason}");
+    }
+    client
+        .paste_text(&pane_id, &text)
+        .await
+        .context(format!("Failed to paste into pane {pane_id}"))?;
+    // Send Enter to submit the text, on its own call: tmux reads an
+    // argument ending in `;` as a command separator.
+    client
+        .send_keys(&pane_id, "Enter")
+        .await
+        .context(format!("Failed to send Enter to pane {pane_id}"))?;
+    println!("Sent to {pane_id} by tmux paste");
     Ok(())
+}
+
+/// Why `atm send` must not paste `text` into `pane` for `target`, if it
+/// must not (#116). `pane_state` is `#{pane_in_mode} #{bracket_paste_flag}`;
+/// tmux before 3.7 has no `bracket_paste_flag` and leaves it empty, which
+/// counts as unknown.
+fn send_refusal(
+    sessions: &[SessionView],
+    target: &str,
+    pane: &str,
+    pane_state: &str,
+    text: &str,
+) -> Option<&'static str> {
+    let mut fields = pane_state.split_whitespace();
+    let in_mode = fields.next().is_some_and(|modes| modes != "0");
+    let bracketed_paste = fields.next();
+    let in_pane = || {
+        sessions
+            .iter()
+            .filter(|s| s.tmux_pane.as_deref() == Some(pane))
+    };
+    let named = sessions
+        .iter()
+        .find(|s| s.id.as_str().starts_with(target) || s.id_short.starts_with(target));
+    // An in-process child, such as a Claude background subagent, carries its
+    // lead's pane. A `%N` target names the pane itself.
+    if !target.starts_with('%')
+        && named
+            .and_then(|s| s.parent_session_id.as_ref())
+            .is_some_and(|parent| in_pane().any(|s| &s.id == parent))
+    {
+        return Some("the session is a subagent in its lead's pane; the text would reach the lead");
+    }
+    // A dialog (permission, question, plan) takes the paste, and Enter picks
+    // its highlighted option. A subagent's dialog shows in its lead's pane.
+    if in_pane().any(|s| s.status == atm_core::SessionStatus::AttentionNeeded) {
+        return Some("the session is waiting on a dialog that Enter would answer; use `atm reply`");
+    }
+    if in_mode {
+        return Some("the pane is in copy mode (or another mode), so Enter would go to tmux");
+    }
+    if bracketed_paste == Some("0") && text.contains(['\n', '\r']) {
+        return Some("the program didn't ask for bracketed paste, so each line would submit alone");
+    }
+    None
 }
 
 async fn cmd_list(
@@ -1684,12 +1744,8 @@ async fn main() -> Result<()> {
         Some(Command::Interrupt { target }) => {
             return cmd_interrupt(target).await;
         }
-        Some(Command::Send {
-            target,
-            text,
-            force,
-        }) => {
-            return cmd_send(target, text, force).await;
+        Some(Command::Send { target, text }) => {
+            return cmd_send(target, text).await;
         }
         Some(Command::List {
             format,
@@ -2323,5 +2379,107 @@ mod spawn_command_tests {
         // assert_eq!s above panicked.
         let _ = config_home;
         let _ = config_dir;
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::send_refusal;
+    use atm_core::{SessionId, SessionStatus, SessionView};
+
+    fn row(id: &str, pane: Option<&str>, parent: Option<&str>) -> SessionView {
+        SessionView {
+            id: SessionId::new(id),
+            id_short: id.chars().take(8).collect(),
+            tmux_pane: pane.map(str::to_string),
+            parent_session_id: parent.map(SessionId::new),
+            ..SessionView::default()
+        }
+    }
+
+    fn needs_input(mut session: SessionView) -> SessionView {
+        session.status = SessionStatus::AttentionNeeded;
+        session
+    }
+
+    #[test]
+    fn a_command_or_message_to_an_idle_lead_is_sent() {
+        let sessions = [row("lead-aaaa", Some("%5"), None)];
+        for text in ["/clear", "!ls", "run the tests;"] {
+            assert_eq!(
+                send_refusal(&sessions, "lead", "%5", "0 1\n", text),
+                None,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_in_copy_mode_is_refused() {
+        let sessions = [row("lead-aaaa", Some("%5"), None)];
+        let reason = send_refusal(&sessions, "%5", "%5", "1 1\n", "hello");
+        assert!(reason.is_some_and(|r| r.contains("copy mode")));
+    }
+
+    #[test]
+    fn multi_line_text_is_refused_only_when_the_flag_is_explicitly_off() {
+        let sessions = [row("lead-aaaa", Some("%5"), None)];
+        let two_lines = "line one\nline two";
+        assert!(send_refusal(&sessions, "%5", "%5", "0 0\n", two_lines)
+            .is_some_and(|r| r.contains("bracketed paste")));
+        assert!(send_refusal(&sessions, "%5", "%5", "0 0\n", "a\rb").is_some());
+        assert_eq!(
+            send_refusal(&sessions, "%5", "%5", "0 1\n", two_lines),
+            None
+        );
+        // tmux before 3.7 has no `bracket_paste_flag` and prints it empty.
+        assert_eq!(send_refusal(&sessions, "%5", "%5", "0 \n", two_lines), None);
+        assert_eq!(
+            send_refusal(&sessions, "%5", "%5", "0 0\n", "one line"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_subagent_in_its_leads_pane_is_refused() {
+        let sessions = [
+            row("lead-aaaa", Some("%5"), None),
+            row("child-bbbb", Some("%5"), Some("lead-aaaa")),
+        ];
+        let reason = send_refusal(&sessions, "child", "%5", "0 1\n", "hi");
+        assert!(reason.is_some_and(|r| r.contains("subagent") && r.contains("lead")));
+        // A pane target means the pane itself, which the lead reads.
+        assert_eq!(send_refusal(&sessions, "%5", "%5", "0 1\n", "hi"), None);
+    }
+
+    #[test]
+    fn a_teammate_with_its_own_pane_is_sent() {
+        let sessions = [
+            row("lead-aaaa", Some("%5"), None),
+            row("mate-cccc", Some("%7"), Some("lead-aaaa")),
+        ];
+        assert_eq!(send_refusal(&sessions, "mate", "%7", "0 1\n", "hi"), None);
+    }
+
+    #[test]
+    fn a_dialog_in_the_target_pane_is_refused() {
+        let reason = |sessions: &[SessionView], target| {
+            send_refusal(sessions, target, "%5", "0 1\n", "/clear")
+        };
+        let lead_at_dialog = [needs_input(row("lead-aaaa", Some("%5"), None))];
+        assert!(reason(&lead_at_dialog, "lead").is_some_and(|r| r.contains("atm reply")));
+        assert!(reason(&lead_at_dialog, "%5").is_some());
+        // A background subagent's dialog shows in its lead's pane.
+        let child_at_dialog = [
+            row("lead-aaaa", Some("%5"), None),
+            needs_input(row("child-bbbb", Some("%5"), Some("lead-aaaa"))),
+        ];
+        assert!(reason(&child_at_dialog, "lead").is_some());
+        // A dialog in another pane doesn't matter.
+        let other_pane = [
+            row("lead-aaaa", Some("%5"), None),
+            needs_input(row("else-dddd", Some("%9"), None)),
+        ];
+        assert_eq!(reason(&other_pane, "lead"), None);
     }
 }

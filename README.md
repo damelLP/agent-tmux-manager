@@ -61,8 +61,7 @@ Environment overrides still take precedence when set (`ATM_SPAWN_PI_BIN/ARGS`, t
 ```
 atm kill <id>                      # kill agent and close pane
 atm interrupt <id>                 # Ctrl+C an agent
-atm send <id> "fix the tests"     # paste text into the agent pane and submit it
-atm send <id> /clear --force       # a harness command; refused without --force
+atm send <id> "fix the tests"     # send text to agent
 atm reply <id> --yes               # accept a permission prompt
 atm peek <id> --prompt             # extract the active prompt
 atm list -f json --status working  # list working agents as JSON

@@ -18,8 +18,9 @@
 //!    `;` and a newline arrive intact, `-p` brackets the paste only when
 //!    the program asked for it, and no buffer is left behind, even after a
 //!    failed paste. An empty paste is a no-op, and a paste with no server
-//!    reports tmux's error. Reads copy mode, disabled input,
-//!    synchronize-panes and (tmux 3.7 and later) bracketed paste.
+//!    reports tmux's error. Then the real `atm send` pastes to those panes
+//!    and refuses copy mode, and multi-line text to `cat` from tmux 3.7
+//!    (older tmux can't report bracketed paste).
 //!
 //! 4. **`atm spawn` with a `claude` fixture**: run the actual `atm spawn`
 //!    subcommand against our isolated tmux server (via `ATM_TMUX_SOCKET`),
@@ -659,10 +660,10 @@ async fn scenario_real_tmux_lib(env: &E2eEnv) {
     );
 }
 
-/// Scenario 3b: `RealTmuxClient::paste_text` and `get_pane_input_state`
-/// against panes running `cat > file`, so the file holds exactly the bytes
-/// the program read.
-async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
+/// Scenario 3b: `RealTmuxClient::paste_text`, then the real `atm send`,
+/// against panes running `cat > file`, so each file holds exactly the
+/// bytes its program read.
+async fn scenario_paste_text_and_atm_send(env: &E2eEnv) {
     let label = &env.tmux_server.socket_label;
     let out = TempDir::new().expect("paste output dir");
     let plain_file = out.path().join("plain");
@@ -683,6 +684,16 @@ async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
             .filter(|name| name.starts_with("atm-send-"))
             .map(str::to_string)
             .collect::<Vec<_>>()
+    };
+    let read_when = |path: &Path, want: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let got = std::fs::read(path).unwrap_or_default();
+            if got == want || Instant::now() >= deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     };
 
     // `cat` never asks for bracketed paste. Each pane prints READY once its
@@ -728,35 +739,14 @@ async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    // `bracket_paste_flag` arrived in tmux 3.7; older tmux can't report it.
-    let reports_bracketed_paste = tmux_version_at_least(3, 7);
-    let state = |bracketed_paste: bool| atm_tmux::PaneInputState {
-        bracketed_paste: reports_bracketed_paste.then_some(bracketed_paste),
-        ..atm_tmux::PaneInputState::default()
-    };
-    assert_eq!(
-        env.tmux
-            .get_pane_input_state(&bracketed)
-            .await
-            .expect("bracketed pane state"),
-        state(true)
-    );
-    assert_eq!(
-        env.tmux
-            .get_pane_input_state(&plain)
-            .await
-            .expect("plain pane state"),
-        state(false)
-    );
 
-    // Empty text is a no-op rather than a paste of a missing buffer.
+    // The library: empty text is a no-op, a trailing `;` survives
+    // (send-keys drops it), a newline stays inside the paste, and `Enter`
+    // goes on its own call.
     env.tmux
         .paste_text(&plain, "")
         .await
         .expect("empty paste is a no-op");
-
-    // A trailing `;` survives (send-keys drops it), a newline stays inside
-    // the paste, and `Enter` goes on its own call.
     env.tmux
         .paste_text(&plain, "a;\nb")
         .await
@@ -773,27 +763,16 @@ async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
         .send_keys(&bracketed, "Enter")
         .await
         .expect("Enter in bracketed pane");
-
-    let read_when = |path: &Path, want: &[u8]| {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let got = std::fs::read(path).unwrap_or_default();
-            if got == want || Instant::now() >= deadline {
-                return got;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
     // paste-buffer turns LF into CR, and the tty turns CR back into LF.
-    let plain_want = b"a;\nb\n";
+    let mut plain_want = b"a;\nb\n".to_vec();
     assert_eq!(
-        read_when(&plain_file, plain_want),
+        read_when(&plain_file, &plain_want),
         plain_want,
         "plain pane read"
     );
-    let bracketed_want = b"\x1b[200~x;\x1b[201~\n";
+    let mut bracketed_want = b"\x1b[200~x;\x1b[201~\n".to_vec();
     assert_eq!(
-        read_when(&bracketed_file, bracketed_want),
+        read_when(&bracketed_file, &bracketed_want),
         bracketed_want,
         "bracketed pane read"
     );
@@ -823,47 +802,64 @@ async fn scenario_paste_text_and_input_state(env: &E2eEnv) {
         "{error:?}"
     );
 
-    tmux_run_capture(label, &["select-pane", "-d", "-t", &plain]).expect("disable input");
-    assert!(
-        env.tmux
-            .get_pane_input_state(&plain)
-            .await
-            .expect("input-off state")
-            .input_off
+    // The real `atm send`, on whatever tmux this machine has.
+    let atm_send = |pane: &str, text: &str| {
+        Command::new(&env.atm_path)
+            .args(["send", pane, text])
+            .env("ATM_SOCKET", &env.daemon.socket_path)
+            .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_TMUX_SOCKET", label)
+            .output()
+            .expect("run atm send")
+    };
+    let sent = atm_send(&plain, "/clear;");
+    assert!(sent.status.success(), "{sent:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&sent.stdout).trim(),
+        format!("Sent to {plain} by tmux paste")
     );
-    tmux_run_capture(label, &["select-pane", "-e", "-t", &plain]).expect("enable input");
+    plain_want.extend_from_slice(b"/clear;\n");
+    assert_eq!(
+        read_when(&plain_file, &plain_want),
+        plain_want,
+        "atm send /clear;"
+    );
 
-    tmux_run_capture(
-        label,
-        &["set-window-option", "-t", &plain, "synchronize-panes", "on"],
-    )
-    .expect("synchronize panes");
-    assert!(
-        env.tmux
-            .get_pane_input_state(&plain)
-            .await
-            .expect("synchronized state")
-            .synchronized
+    let sent = atm_send(&bracketed, "m1\nm2");
+    assert!(sent.status.success(), "{sent:?}");
+    bracketed_want.extend_from_slice(b"\x1b[200~m1\nm2\x1b[201~\n");
+    assert_eq!(
+        read_when(&bracketed_file, &bracketed_want),
+        bracketed_want,
+        "atm send of two lines to a bracketed pane"
     );
-    tmux_run_capture(
-        label,
-        &[
-            "set-window-option",
-            "-t",
-            &plain,
-            "synchronize-panes",
-            "off",
-        ],
-    )
-    .expect("unsynchronize panes");
+
+    // `bracket_paste_flag` arrived in tmux 3.7. On older tmux it reads as
+    // unknown, so atm sends multi-line text to `cat` too.
+    let sent = atm_send(&plain, "p1\np2");
+    if tmux_version_at_least(3, 7) {
+        assert!(!sent.status.success(), "{sent:?}");
+        assert!(
+            String::from_utf8_lossy(&sent.stderr).contains("bracketed paste"),
+            "{sent:?}"
+        );
+    } else {
+        assert!(sent.status.success(), "{sent:?}");
+        plain_want.extend_from_slice(b"p1\np2\n");
+    }
 
     tmux_run_capture(label, &["copy-mode", "-t", &plain]).expect("enter copy mode");
+    let sent = atm_send(&plain, "hi");
+    assert!(!sent.status.success(), "{sent:?}");
     assert!(
-        env.tmux
-            .get_pane_input_state(&plain)
-            .await
-            .expect("copy-mode state")
-            .in_mode
+        String::from_utf8_lossy(&sent.stderr).contains("copy mode"),
+        "{sent:?}"
+    );
+    tmux_run_capture(label, &["send-keys", "-t", &plain, "-X", "cancel"]).expect("leave copy mode");
+    assert_eq!(
+        read_when(&plain_file, &plain_want),
+        plain_want,
+        "refused sends must not reach the pane"
     );
 
     for pane in [&plain, &bracketed] {
@@ -2023,7 +2019,7 @@ async fn atm_atmd_tmux_end_to_end() {
     let session_id = scenario_protocol_e2e(&env).await;
     scenario_atm_list_client(&env, &session_id).await;
     scenario_real_tmux_lib(&env).await;
-    scenario_paste_text_and_input_state(&env).await;
+    scenario_paste_text_and_atm_send(&env).await;
 
     if python3_on_path().is_some() {
         scenario_atm_spawn(&env).await;

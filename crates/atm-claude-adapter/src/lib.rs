@@ -224,8 +224,7 @@
 //!   stash. A stashed draft returns after the next submit, `/clear`
 //!   included. Pressed before an injected `/clear` on an empty input, it
 //!   restored an earlier draft, and `DRAFT-B/clear` reached the model as a
-//!   prompt. `atm-core` records the key as `DraftStash::Toggle` in
-//!   `HarnessDefinition::draft_stash`, and `atm send` never presses it.
+//!   prompt, so `atm send` never presses it.
 //! - A leading space escapes a command: ` /clear` was submitted as a prompt
 //!   and no `SessionEnd` fired.
 //!

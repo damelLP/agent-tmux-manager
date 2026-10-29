@@ -1210,10 +1210,10 @@ fn build_session_from_pid(
 
 /// Resolves the git context of `cwd`: its project root, worktree path and
 /// worktree branch. The worktree fields are only set when `cwd` is itself a
-/// repo or worktree root (see `atm_core::resolve_worktree_info`).
+/// repo or worktree root (see `crate::project::resolve_worktree_info`).
 fn resolve_git_context(cwd: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let project_root = atm_core::resolve_project_root(cwd);
-    let (worktree_path, worktree_branch) = atm_core::resolve_worktree_info(cwd);
+    let project_root = crate::project::resolve_project_root(cwd);
+    let (worktree_path, worktree_branch) = crate::project::resolve_worktree_info(cwd);
     (project_root, worktree_path, worktree_branch)
 }
 

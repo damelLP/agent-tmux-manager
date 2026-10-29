@@ -18,6 +18,19 @@ pub enum PromptMode {
     Unsupported,
 }
 
+/// A key that moves a half-typed draft out of a harness's input box.
+///
+/// A draft left in the input merges with injected text, so an injected
+/// `/clear` would be submitted as plain text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftStash {
+    /// One tmux key that stashes a non-empty draft into a single slot,
+    /// replacing an earlier stash, but restores the stash when the input is
+    /// empty. Pressed blind, it can bring an earlier draft back into the
+    /// input, so ATM never sends it without knowing the input's state.
+    Toggle(&'static str),
+}
+
 /// A declarative process-path matcher used by daemon discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessMatcher {
@@ -90,6 +103,11 @@ pub struct HarnessDefinition {
     pub parent_session_flag: Option<&'static str>,
     /// How to pass an initial prompt, when/if spawn grows that option.
     pub prompt_mode: PromptMode,
+    /// Leading characters that make typed input a command the harness runs
+    /// itself (e.g. `/clear`, `!ls`) instead of a message to the agent.
+    pub command_prefixes: &'static [char],
+    /// The harness's draft-stash key, when known.
+    pub draft_stash: Option<DraftStash>,
     /// Arguments used for installation/version probing.
     pub version_args: &'static [&'static str],
     /// Process path/argv matchers used by discovery.
@@ -151,6 +169,12 @@ const CODEX_EXCLUDES: &[ArgvExclude] = &[
     ArgvExclude::Command(ProcessMatcher::Suffix("/bwrap")),
 ];
 
+/// `/` runs a slash command and `!` a shell command. Verified by pasting
+/// into the TUIs of Claude Code 2.1.311, pi 0.73.1 and codex-cli 0.163.0
+/// (#116, 2026-10-26). Harnesses without an adapter get the same prefixes
+/// unverified, so ATM refuses rather than types a command as a message.
+const SLASH_AND_BANG: &[char] = &['/', '!'];
+
 const AMP_MATCHERS: &[ProcessMatcher] =
     &[ProcessMatcher::Exact("amp"), ProcessMatcher::Suffix("/amp")];
 
@@ -180,6 +204,12 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         // Verified against Claude Code 2.1.288 tmux-mode teammates.
         parent_session_flag: Some("--parent-session-id"),
         prompt_mode: PromptMode::KeystrokeInjection,
+        command_prefixes: SLASH_AND_BANG,
+        // Verified against Claude Code 2.1.312 (2026-10-29): ctrl+s stashes
+        // a draft, replacing an earlier stash, and restores the stash on an
+        // empty input. A stashed draft returns after the next submit,
+        // including after `/clear`.
+        draft_stash: Some(DraftStash::Toggle("C-s")),
         version_args: &["--version"],
         process_matchers: CLAUDE_MATCHERS,
         discovery_enabled: true,
@@ -196,6 +226,9 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         model_flag: Some("--model"),
         parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
+        command_prefixes: SLASH_AND_BANG,
+        // No stash action in pi 0.73.1's keybindings list (2026-10-29).
+        draft_stash: None,
         version_args: &["--version"],
         process_matchers: PI_MATCHERS,
         discovery_enabled: true,
@@ -212,6 +245,9 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         model_flag: None,
         parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
+        command_prefixes: SLASH_AND_BANG,
+        // No stash action in codex-cli 0.163.0's keymap (2026-10-29).
+        draft_stash: None,
         version_args: &["--version"],
         process_matchers: CODEX_MATCHERS,
         // Enabled since atm-codex-adapter landed: hook events flow via
@@ -233,6 +269,8 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         model_flag: None,
         parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
+        command_prefixes: SLASH_AND_BANG,
+        draft_stash: None,
         version_args: &["--version"],
         process_matchers: AMP_MATCHERS,
         discovery_enabled: false,
@@ -249,6 +287,8 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         model_flag: None,
         parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
+        command_prefixes: SLASH_AND_BANG,
+        draft_stash: None,
         version_args: &["--version"],
         process_matchers: QWEN_MATCHERS,
         discovery_enabled: false,
@@ -265,6 +305,8 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         model_flag: None,
         parent_session_flag: None,
         prompt_mode: PromptMode::KeystrokeInjection,
+        command_prefixes: SLASH_AND_BANG,
+        draft_stash: None,
         version_args: &["--version"],
         process_matchers: GEMINI_MATCHERS,
         discovery_enabled: false,
@@ -299,6 +341,8 @@ const FALLBACK_HARNESS_DEFINITION: HarnessDefinition = HarnessDefinition {
     model_flag: None,
     parent_session_flag: None,
     prompt_mode: PromptMode::Unsupported,
+    command_prefixes: SLASH_AND_BANG,
+    draft_stash: None,
     version_args: &[],
     process_matchers: &[],
     discovery_enabled: false,
@@ -403,6 +447,22 @@ mod tests {
             );
         }
         assert_eq!(FALLBACK_HARNESS_DEFINITION.parent_session_flag, None);
+    }
+
+    #[test]
+    fn every_harness_treats_slash_and_bang_as_command_prefixes() {
+        for definition in builtin_harnesses().chain([&FALLBACK_HARNESS_DEFINITION]) {
+            assert_eq!(definition.command_prefixes, ['/', '!'], "{}", definition.id);
+        }
+    }
+
+    #[test]
+    fn only_claude_declares_a_draft_stash_and_it_is_a_toggle() {
+        for definition in builtin_harnesses() {
+            let expected = (definition.id == "claude").then_some(DraftStash::Toggle("C-s"));
+            assert_eq!(definition.draft_stash, expected, "{}", definition.id);
+        }
+        assert_eq!(FALLBACK_HARNESS_DEFINITION.draft_stash, None);
     }
 
     #[test]

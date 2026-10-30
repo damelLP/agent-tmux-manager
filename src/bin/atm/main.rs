@@ -132,7 +132,8 @@ enum Command {
     /// runs, and a half-typed draft in the input merges with the text. Refuses
     /// a session waiting on a dialog (answer it with `atm reply`), a subagent
     /// that shares its lead's pane, a pane in copy mode, and multi-line text
-    /// for a program that didn't ask for bracketed paste.
+    /// for a program that didn't ask for bracketed paste (tmux 3.7 and later
+    /// report this; with older tmux, multi-line text is sent).
     Send {
         /// Session ID (short form) or tmux pane ID
         target: String,

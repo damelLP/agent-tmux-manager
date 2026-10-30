@@ -219,10 +219,14 @@ fn test_commands_read_the_daemons_session_list() {
         let out = atm(exe, dir.path(), &args);
         assert!(out.status.success(), "atm {args:?}: {out:?}");
         let calls = std::fs::read_to_string(&tmux_log).expect("tmux was called");
+        let called: Vec<&str> = calls
+            .lines()
+            .map(|call| call.split(' ').next().unwrap_or_default())
+            .collect();
+        assert_eq!(called, subcommands, "atm {args:?}: {calls:?}");
         for call in calls.lines() {
             let words: Vec<&str> = call.split(' ').collect();
             let subcommand = words.first().copied().unwrap_or_default();
-            assert!(subcommands.contains(&subcommand), "atm {args:?}: {call:?}");
             if subcommand == "load-buffer" {
                 continue;
             }

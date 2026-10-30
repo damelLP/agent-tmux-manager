@@ -4,7 +4,7 @@
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
@@ -32,11 +32,16 @@ fn command_timeout(subcommand: &str) -> Duration {
 }
 
 /// A paste-buffer name no other live `atm` process or call is using.
-/// Buffers belong to the whole tmux server, not to one client.
+/// Buffers belong to the whole tmux server, not to one client, and a pid
+/// can repeat across PID namespaces that share one server (a container
+/// using the host's socket), so the name carries the time too.
 fn unique_buffer_name() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
     format!(
-        "atm-send-{}-{}",
+        "atm-send-{}-{nanos}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
@@ -262,13 +267,20 @@ impl TmuxClient for RealTmuxClient {
             return Ok(());
         }
         let buffer = unique_buffer_name();
-        self.run_with_stdin("load-buffer", &["-b", &buffer, "-"], Some(text))
-            .await?;
         // `-p` brackets the paste when the program asked for it; `-d`
         // deletes the buffer, but only once the paste has happened.
-        let pasted = self
-            .run_silent("paste-buffer", &["-p", "-d", "-b", &buffer, "-t", pane])
-            .await;
+        let pasted = match self
+            .run_with_stdin("load-buffer", &["-b", &buffer, "-"], Some(text))
+            .await
+        {
+            Ok(_) => {
+                self.run_silent("paste-buffer", &["-p", "-d", "-b", &buffer, "-t", pane])
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        // A load that timed out after sending its text can still have made
+        // the buffer, so clean up after either failure.
         if pasted.is_err() {
             let _ = self.run_silent("delete-buffer", &["-b", &buffer]).await;
         }
@@ -404,6 +416,14 @@ mod tests {
         let prefix = format!("atm-send-{}-", std::process::id());
         assert!(first.starts_with(&prefix), "{first}");
         assert!(second.starts_with(&prefix), "{second}");
+        // A pid can repeat across PID namespaces sharing one tmux server,
+        // so the name also carries the time: atm-send-<pid>-<nanos>-<n>.
+        let parts: Vec<&str> = first.split('-').collect();
+        assert_eq!(parts.len(), 5, "{first}");
+        assert!(
+            parts.iter().skip(2).all(|p| p.parse::<u128>().is_ok()),
+            "{first}"
+        );
     }
 
     #[test]

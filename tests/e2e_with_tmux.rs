@@ -2143,8 +2143,6 @@ async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: im
     let _ = client.wait();
 }
 
-/// Tiny `tmux -L <label> ...` helper for scenario 5's hook-inspection
-/// queries. Returns stdout on success.
 /// Whether the `tmux` on PATH is at least `major.minor`. A version tmux
 /// prints without numbers (a `master` build) counts as new.
 fn tmux_version_at_least(major: u32, minor: u32) -> bool {
@@ -2169,6 +2167,8 @@ fn tmux_version_at_least(major: u32, minor: u32) -> bool {
     }
 }
 
+/// Tiny `tmux -L <label> ...` helper for scenario 5's hook-inspection
+/// queries. Returns stdout on success.
 fn tmux_run_capture(socket_label: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("tmux");
     cmd.args(["-L", socket_label]);

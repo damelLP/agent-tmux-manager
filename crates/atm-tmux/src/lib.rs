@@ -113,8 +113,9 @@ pub trait TmuxClient: Send + Sync {
     /// literal. tmux turns each newline into a carriage return, as Enter
     /// sends: a program that asked for bracketed paste gets the text as one
     /// bracketed paste, and any other program gets each line submitted on
-    /// its own. From tmux 3.7 other control characters arrive as caret text
-    /// (`^[`); older tmux pastes them raw. Empty text is a no-op. The text
+    /// its own. From tmux 3.7 most other control characters arrive as caret
+    /// text (`^[`), but tab, backspace and BEL pass raw (tmux 3.8); older
+    /// tmux pastes them all raw. Empty text is a no-op. The text
     /// goes through a uniquely named buffer that is deleted afterwards, so
     /// it never touches the user's buffers.
     async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError>;

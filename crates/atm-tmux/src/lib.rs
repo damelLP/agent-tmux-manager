@@ -107,6 +107,19 @@ pub trait TmuxClient: Send + Sync {
     /// Sends keystrokes to a pane.
     async fn send_keys(&self, pane: &str, keys: &str) -> Result<(), TmuxError>;
 
+    /// Pastes `text` into a pane without submitting it.
+    ///
+    /// Unlike [`Self::send_keys`], key names and a trailing `;` stay
+    /// literal. tmux turns each newline into a carriage return, as Enter
+    /// sends: a program that asked for bracketed paste gets the text as one
+    /// bracketed paste, and any other program gets each line submitted on
+    /// its own. From tmux 3.7 most other control characters arrive as caret
+    /// text (`^[`), but tab, backspace and BEL pass raw (tmux 3.8); older
+    /// tmux pastes them all raw. Empty text is a no-op. The text
+    /// goes through a uniquely named buffer that is deleted afterwards, so
+    /// it never touches the user's buffers.
+    async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError>;
+
     /// Lists all panes across all sessions.
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError>;
 

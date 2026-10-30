@@ -199,22 +199,37 @@ fn test_commands_read_the_daemons_session_list() {
     assert!(status.status.success(), "atm status: {status:?}");
     assert_eq!(String::from_utf8_lossy(&status.stdout), "1\u{2191} $0.00\n");
 
-    // Each command's tmux subcommand, in `pane_commands` order.
-    let subcommands = [
-        "kill-pane",
-        "send-keys",
-        "send-keys",
-        "send-keys",
-        "capture-pane",
+    // Each command's tmux subcommands, in `pane_commands` order. `send`
+    // reads the pane's state, then pastes through a buffer (#116);
+    // `load-buffer` fills the buffer and names no pane.
+    let subcommands: [&[&str]; 5] = [
+        &["kill-pane"],
+        &["send-keys"],
+        &[
+            "display-message",
+            "load-buffer",
+            "paste-buffer",
+            "send-keys",
+        ],
+        &["send-keys"],
+        &["capture-pane"],
     ];
-    for (args, subcommand) in pane_commands("abc").into_iter().zip(subcommands) {
+    for (args, subcommands) in pane_commands("abc").into_iter().zip(subcommands) {
         let _ = std::fs::remove_file(&tmux_log);
         let out = atm(exe, dir.path(), &args);
         assert!(out.status.success(), "atm {args:?}: {out:?}");
         let calls = std::fs::read_to_string(&tmux_log).expect("tmux was called");
+        let called: Vec<&str> = calls
+            .lines()
+            .map(|call| call.split(' ').next().unwrap_or_default())
+            .collect();
+        assert_eq!(called, subcommands, "atm {args:?}: {calls:?}");
         for call in calls.lines() {
             let words: Vec<&str> = call.split(' ').collect();
-            assert_eq!(words.first(), Some(&subcommand), "atm {args:?}: {call:?}");
+            let subcommand = words.first().copied().unwrap_or_default();
+            if subcommand == "load-buffer" {
+                continue;
+            }
             let pane = words.iter().skip_while(|w| **w != "-t").nth(1);
             assert_eq!(pane, Some(&"%5"), "atm {args:?}: {call:?}");
         }

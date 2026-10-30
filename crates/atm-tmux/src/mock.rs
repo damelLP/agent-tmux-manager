@@ -38,6 +38,10 @@ pub enum MockCall {
         pane: String,
         keys: String,
     },
+    PasteText {
+        pane: String,
+        text: String,
+    },
     ListPanes,
     DisplayPopup {
         width: String,
@@ -290,6 +294,13 @@ impl TmuxClient for MockTmuxClient {
         })
     }
 
+    async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError> {
+        self.record(MockCall::PasteText {
+            pane: pane.to_string(),
+            text: text.to_string(),
+        })
+    }
+
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError> {
         self.record(MockCall::ListPanes)?;
         let panes = self
@@ -512,6 +523,20 @@ mod tests {
             &calls[0],
             MockCall::DisplayPopup { command, .. } if command == "atm"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_mock_paste_text_records_the_text() {
+        let mock = MockTmuxClient::new();
+        mock.paste_text("%5", "a;\nb").await.unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![MockCall::PasteText {
+                pane: "%5".to_string(),
+                text: "a;\nb".to_string(),
+            }]
+        );
     }
 
     #[tokio::test]

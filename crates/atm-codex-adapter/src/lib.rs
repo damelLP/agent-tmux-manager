@@ -210,6 +210,17 @@
 //!   rate-limit headers, so the real backend is unverified.
 //!   [`read_token_usage`] still skips them.
 //! - `SubagentStart` and `SubagentStop` have never been captured.
+//! - **A denied approval leaves the row needing input.** Captured:
+//!   codex-cli 0.163.0, 2026-10-30, a sealed TUI on its default shared
+//!   daemon with `approval_policy = "on-request"`, a fake provider whose
+//!   `exec_command` asked for `sandbox_permissions: "require_escalated"`,
+//!   and `atm send` driving it (#116). `PermissionRequest` fired about
+//!   1 s before the approval dialog drew, with "1. Yes, proceed" picked by
+//!   Enter. Esc on the dialog ("You canceled the request") sent no hook,
+//!   so the row kept reading needs input until the next prompt, and
+//!   `atm send` refused until then. The first Enter after very fast typed
+//!   input (tmux `send-keys -l`) stayed in the composer, probably as part
+//!   of a paste burst; a bracketed paste then Enter submitted at once.
 //!
 //! ## Layers
 //!

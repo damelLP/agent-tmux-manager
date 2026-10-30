@@ -209,10 +209,27 @@
 //!   `SubagentStop`, only the task notification's `UserPromptSubmit` and
 //!   a quiet `Stop`. That `Stop` swept the child because it still read
 //!   working; the sweep skips a child waiting on input, so a child stopped
-//!   while it waits keeps its row (read from the code, not run; it
-//!   predates 2026-10-25). A natural `SubagentStop` at
+//!   while it waits keeps its row. Captured: Claude Code 2.1.312,
+//!   2026-10-29, a sealed TUI: a background agent stopped with ctrl+x ctrl+k
+//!   twice during its permission dialog sent no `SubagentStop`, and its row
+//!   still read needs input 12 s later. A natural `SubagentStop` at
 //!   an idle lead was followed by that `UserPromptSubmit` 53 ms later, so
 //!   no captured case needed a child event to mark the lead working.
+//!
+//! ## Typing into the TUI (captured 2026-10-29)
+//!
+//! Not hooks, but facts `atm send` relies on (#116). Captured: Claude Code
+//! 2.1.312, 2026-10-29, a sealed TUI driven through tmux 3.8 with every
+//! hook logged.
+//!
+//! - **ctrl+s is a one-slot stash toggle.** On a draft it stashes the
+//!   draft, replacing an earlier stash; on an empty input it restores the
+//!   stash. A stashed draft returns after the next submit, `/clear`
+//!   included. Pressed before an injected `/clear` on an empty input, it
+//!   restored an earlier draft, and `DRAFT-B/clear` reached the model as a
+//!   prompt, so `atm send` never presses it.
+//! - A leading space escapes a command: ` /clear` was submitted as a prompt
+//!   and no `SessionEnd` fired.
 //!
 //! ## Known gaps (Claude Code 2.1.310)
 //!

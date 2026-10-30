@@ -2,9 +2,12 @@
 //!
 //! Shells out to the `tmux` binary via `tokio::process::Command`.
 
-use std::time::Duration;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, trace};
 
@@ -26,6 +29,22 @@ fn command_timeout(subcommand: &str) -> Duration {
     } else {
         COMMAND_TIMEOUT
     }
+}
+
+/// A paste-buffer name no other live `atm` process or call is using.
+/// Buffers belong to the whole tmux server, not to one client, and a pid
+/// can repeat across PID namespaces that share one server (a container
+/// using the host's socket), so the name carries the time too.
+fn unique_buffer_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!(
+        "atm-send-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Real tmux client that invokes the `tmux` CLI.
@@ -84,15 +103,39 @@ impl RealTmuxClient {
     /// Gives up after [`command_timeout`] with [`TmuxError::Timeout`]; the
     /// `tmux` process is killed rather than left blocked on the server.
     async fn run(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError> {
+        self.run_with_stdin(subcommand, args, None).await
+    }
+
+    /// Like [`Self::run`], writing `stdin` (when given) to the command's
+    /// standard input. The deadline covers the write too.
+    async fn run_with_stdin(
+        &self,
+        subcommand: &str,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Result<String, TmuxError> {
         trace!(subcommand, ?args, "running tmux command");
 
         let timeout = command_timeout(subcommand);
-        let output = self
-            .tmux_cmd()
-            .arg(subcommand)
-            .args(args)
-            .kill_on_drop(true)
-            .output();
+        let mut cmd = self.tmux_cmd();
+        cmd.arg(subcommand).args(args).kill_on_drop(true);
+        let output = async {
+            let Some(input) = stdin else {
+                return cmd.output().await;
+            };
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            if let Some(mut pipe) = child.stdin.take() {
+                // A failed write means tmux stopped reading (no server, say);
+                // its exit status and stderr say why. Dropping the pipe
+                // closes it, so tmux sees end of input.
+                let _ = pipe.write_all(input.as_bytes()).await;
+            }
+            child.wait_with_output().await
+        };
         let output = tokio::time::timeout(timeout, output)
             .await
             .map_err(|_| TmuxError::Timeout {
@@ -217,6 +260,33 @@ impl TmuxClient for RealTmuxClient {
         self.run_silent("send-keys", &["-t", pane, keys]).await
     }
 
+    async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError> {
+        if text.is_empty() {
+            // `load-buffer -` makes no buffer from empty input (tmux 3.8),
+            // so the paste would fail on a missing buffer.
+            return Ok(());
+        }
+        let buffer = unique_buffer_name();
+        // `-p` brackets the paste when the program asked for it; `-d`
+        // deletes the buffer, but only once the paste has happened.
+        let pasted = match self
+            .run_with_stdin("load-buffer", &["-b", &buffer, "-"], Some(text))
+            .await
+        {
+            Ok(_) => {
+                self.run_silent("paste-buffer", &["-p", "-d", "-b", &buffer, "-t", pane])
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        // A load that timed out after sending its text can still have made
+        // the buffer, so clean up after either failure.
+        if pasted.is_err() {
+            let _ = self.run_silent("delete-buffer", &["-b", &buffer]).await;
+        }
+        pasted
+    }
+
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError> {
         let format = "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}";
         let output = self.run("list-panes", &["-a", "-F", format]).await?;
@@ -336,6 +406,24 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn paste_buffer_names_differ_per_call() {
+        let first = unique_buffer_name();
+        let second = unique_buffer_name();
+        assert_ne!(first, second);
+        let prefix = format!("atm-send-{}-", std::process::id());
+        assert!(first.starts_with(&prefix), "{first}");
+        assert!(second.starts_with(&prefix), "{second}");
+        // A pid can repeat across PID namespaces sharing one tmux server,
+        // so the name also carries the time: atm-send-<pid>-<nanos>-<n>.
+        let parts: Vec<&str> = first.split('-').collect();
+        assert_eq!(parts.len(), 5, "{first}");
+        assert!(
+            parts.iter().skip(2).all(|p| p.parse::<u128>().is_ok()),
+            "{first}"
+        );
     }
 
     #[test]

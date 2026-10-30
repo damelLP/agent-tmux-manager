@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use atm_core::beads::BeadsTask;
+use crate::beads::BeadsTask;
 use atm_core::SessionView;
 use crossterm::event::KeyEvent;
 

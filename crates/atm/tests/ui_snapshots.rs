@@ -14,9 +14,9 @@
 
 use std::sync::Mutex;
 
-use atm_core::beads::BeadsTask;
 use atm_core::{SessionId, SessionStatus, SessionView};
 use atm_tui::app::{App, AppState};
+use atm_tui::beads::BeadsTask;
 use atm_tui::error::TuiError;
 use atm_tui::ui::{
     detail_panel::{render_compact_preview, render_detail_panel_inline},

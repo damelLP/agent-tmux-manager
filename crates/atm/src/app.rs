@@ -6,7 +6,7 @@
 //! All code follows the panic-free policy: no `.unwrap()`, `.expect()`,
 //! `panic!()`, `unreachable!()`, `todo!()`, or direct indexing `[i]`.
 
-use atm_core::beads::BeadsTask;
+use crate::beads::BeadsTask;
 use atm_core::{
     all_node_ids, build_tree, flatten_tree, SessionId, SessionView, TreeNode, TreeNodeId, TreeRow,
     TreeRowKind,

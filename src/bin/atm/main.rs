@@ -1316,8 +1316,12 @@ fn send_refusal(
     }
     // A dialog (permission, question, plan) takes the paste, and Enter picks
     // its highlighted option. A subagent's dialog shows in its lead's pane.
+    // A dialog denied with Esc sends no event, so the status can outlast it.
     if in_pane().any(|s| s.status == atm_core::SessionStatus::AttentionNeeded) {
-        return Some("the session is waiting on a dialog that Enter would answer; use `atm reply`");
+        return Some(
+            "the session is waiting on a dialog that Enter would answer; use `atm reply`, \
+             or, if the dialog is gone, type in the pane",
+        );
     }
     if in_mode {
         return Some("the pane is in copy mode (or another mode), so Enter would go to tmux");
@@ -2468,7 +2472,10 @@ mod send_tests {
             send_refusal(sessions, target, "%5", "0 1\n", "/clear")
         };
         let lead_at_dialog = [needs_input(row("lead-aaaa", Some("%5"), None))];
-        assert!(reason(&lead_at_dialog, "lead").is_some_and(|r| r.contains("atm reply")));
+        // The status can outlive a dialog denied with Esc, so the reason
+        // names the way out too.
+        assert!(reason(&lead_at_dialog, "lead")
+            .is_some_and(|r| r.contains("atm reply") && r.contains("type in the pane")));
         assert!(reason(&lead_at_dialog, "%5").is_some());
         // A background subagent's dialog shows in its lead's pane.
         let child_at_dialog = [

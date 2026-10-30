@@ -7,7 +7,6 @@
 //! `panic!()`, `unreachable!()`, `todo!()`, or direct indexing `[i]`.
 
 pub mod agent;
-pub mod beads;
 pub mod context;
 pub mod cost;
 pub mod error;

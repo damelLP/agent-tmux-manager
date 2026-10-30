@@ -4,7 +4,9 @@
 //! drop waits forever for blocking-pool threads, so a read stuck on a hung
 //! mount or a FIFO would keep `atm` from exiting after quit.
 
-use atm_core::beads::BeadsTask;
+mod task;
+pub use task::{find_in_progress_tasks, BeadsTask};
+
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::oneshot;

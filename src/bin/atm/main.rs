@@ -359,7 +359,7 @@ fn spawn_beads_task(
     beads_dir_rx: tokio::sync::watch::Receiver<Option<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut reader = BeadsReader::new(atm_core::beads::find_in_progress_tasks);
+        let mut reader = BeadsReader::new(atm_tui::beads::find_in_progress_tasks);
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let poll_loop = async {
             loop {

@@ -3,8 +3,8 @@
 //! Displays detailed information about a selected session
 //! in the right panel of the split layout.
 
+use crate::beads::BeadsTask;
 use crate::ui::theme::{context_color, status_color};
-use atm_core::beads::BeadsTask;
 use atm_core::{format_age, SessionStatus, SessionView};
 use chrono::{DateTime, Utc};
 use ratatui::{

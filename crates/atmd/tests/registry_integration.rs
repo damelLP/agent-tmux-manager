@@ -9,7 +9,7 @@
 use atm_core::{AgentType, LifecycleEvent, Model, SessionDomain, SessionId, Tool};
 use atmd::registry::{
     spawn_registry, spawn_registry_with_cancel, supervise_actor, ActorStopped, RegistryError,
-    RemovalReason, SessionEvent, MAX_SESSIONS,
+    RegistryHandle, RemovalReason, SessionEvent, MAX_SESSIONS,
 };
 use atmd::server::parse_status_line;
 use std::time::Duration;
@@ -1012,6 +1012,24 @@ async fn test_project_resolution_on_discovery() {
 // CWD Change Detection Tests
 // ============================================================================
 
+/// Git context resolves off the actor, so a session's branch fills in shortly
+/// after a command. Returns the session's view once its branch is `branch`, or
+/// after a timeout, so the caller's assertions report what it has instead.
+async fn view_with_branch(
+    handle: &RegistryHandle,
+    id: &str,
+    branch: &str,
+) -> Option<atm_core::SessionView> {
+    for _ in 0..1000 {
+        let view = handle.get_session(SessionId::new(id)).await?;
+        if view.worktree_branch.as_deref() == Some(branch) {
+            return Some(view);
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    handle.get_session(SessionId::new(id)).await
+}
+
 #[tokio::test]
 async fn test_status_line_cwd_change_updates_git_info() {
     let handle = spawn_registry();
@@ -1039,8 +1057,7 @@ async fn test_status_line_cwd_change_updates_git_info() {
         .await
         .expect("should register");
 
-    let view = handle
-        .get_session(SessionId::new("cwd-change-test"))
+    let view = view_with_branch(&handle, "cwd-change-test", "main")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("main"));
@@ -1068,8 +1085,7 @@ async fn test_status_line_cwd_change_updates_git_info() {
         .expect("status update should succeed");
 
     // Verify git info was re-resolved to repo_b
-    let view = handle
-        .get_session(SessionId::new("cwd-change-test"))
+    let view = view_with_branch(&handle, "cwd-change-test", "feature-x")
         .await
         .unwrap();
     assert_eq!(
@@ -1139,8 +1155,7 @@ async fn test_status_line_same_cwd_does_not_re_resolve() {
         .unwrap();
 
     // Session should still have correct info
-    let view = handle
-        .get_session(SessionId::new("same-cwd-test"))
+    let view = view_with_branch(&handle, "same-cwd-test", "main")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("main"));
@@ -1256,8 +1271,7 @@ async fn test_rescan_refreshes_git_info() {
         .await
         .unwrap();
 
-    let view = handle
-        .get_session(SessionId::new("rescan-git-test"))
+    let view = view_with_branch(&handle, "rescan-git-test", "old-branch")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("old-branch"));
@@ -1277,8 +1291,7 @@ async fn test_rescan_refreshes_git_info() {
         .await
         .unwrap();
 
-    let view = handle
-        .get_session(SessionId::new("rescan-git-test-2"))
+    let view = view_with_branch(&handle, "rescan-git-test-2", "new-branch")
         .await
         .unwrap();
     assert_eq!(

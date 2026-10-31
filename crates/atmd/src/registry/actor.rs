@@ -4925,6 +4925,16 @@ mod tests {
             assert_eq!(self.calls.recv_timeout(GIT_WAIT).unwrap(), cwd);
         }
 
+        /// Lookups started together report in either order.
+        fn expect_calls_in_any_order(&self, cwds: &[&str]) {
+            let mut calls: Vec<String> = cwds
+                .iter()
+                .map(|_| self.calls.recv_timeout(GIT_WAIT).unwrap())
+                .collect();
+            calls.sort();
+            assert_eq!(calls, cwds);
+        }
+
         fn assert_no_more_calls(&self) {
             let extra = self
                 .calls
@@ -5099,8 +5109,7 @@ mod tests {
             register_session_in(&mut actor, session_in(id, "/a"));
         }
         register_session_in(&mut actor, session_in("elsewhere", "/b"));
-        gate.expect_call("/a");
-        gate.expect_call("/b");
+        gate.expect_calls_in_any_order(&["/a", "/b"]);
         drain_events(&mut event_rx);
 
         // Both lookups are blocked on one gate, so they may land in either

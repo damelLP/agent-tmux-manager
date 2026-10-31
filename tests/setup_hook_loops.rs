@@ -585,3 +585,69 @@ fn claude_status_line_write_persists_the_empty_arrays_the_hook_loop_dropped() {
         pretty(&json!({"hooks": {}}))
     );
 }
+
+/// Every hook is there but the statusLine isn't: the statusLine alone
+/// makes setup write the file.
+#[test]
+fn claude_setup_writes_when_only_the_status_line_changes() {
+    let home = CLAUDE.home();
+    let home = home.path();
+    let mut seed = CLAUDE.first_install(home);
+    seed.as_object_mut().unwrap().remove("statusLine");
+    fs::write(CLAUDE.path(home), unwritable_by_atm(&seed)).unwrap();
+
+    let stdout = run_atm_ok(home, "setup");
+
+    assert_eq!(
+        stdout,
+        CLAUDE.setup_stdout(
+            home,
+            &event_lines(CLAUDE.events, "already configured"),
+            CLAUDE.written,
+            "created"
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(CLAUDE.path(home)).unwrap(),
+        pretty(&CLAUDE.first_install(home))
+    );
+}
+
+/// The statusLine is ATM's already but a hook is missing: the added entry
+/// alone makes setup write the file.
+#[test]
+fn claude_setup_writes_when_only_a_hook_is_added() {
+    let home = CLAUDE.home();
+    let home = home.path();
+    let mut seed = CLAUDE.first_install(home);
+    seed["hooks"].as_object_mut().unwrap().remove("Stop");
+    fs::write(CLAUDE.path(home), unwritable_by_atm(&seed)).unwrap();
+
+    let stdout = run_atm_ok(home, "setup");
+
+    let lines: String = CLAUDE
+        .events
+        .iter()
+        .map(|event| {
+            let outcome = if *event == "Stop" {
+                "added"
+            } else {
+                "already configured"
+            };
+            format!("    {event} - {outcome}\n")
+        })
+        .collect();
+    assert_eq!(
+        stdout,
+        CLAUDE.setup_stdout(
+            home,
+            &lines,
+            "    statusLine - already configured\n  Claude Code configuration written.\n",
+            "created"
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(CLAUDE.path(home)).unwrap(),
+        pretty(&CLAUDE.first_install(home))
+    );
+}

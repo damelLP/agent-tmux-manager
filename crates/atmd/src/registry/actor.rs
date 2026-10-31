@@ -10,8 +10,9 @@
 //! - All fallible operations use `?`, pattern matching, or `unwrap_or`
 //! - Channel send failures are logged but don't panic
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
@@ -23,6 +24,7 @@ use atm_core::{
 };
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
+use super::git::{GitContext, GitLookups, GitResult};
 use super::infra::SessionInfrastructure;
 use crate::discovery::read_parent_session_id;
 
@@ -82,6 +84,12 @@ pub struct RegistryActor {
     /// [`ENDED_SESSION_TTL`] passes, a status line for a pair is dropped,
     /// and so is a `SessionEnd` that no longer names the pid's row.
     ended_sessions: HashMap<(SessionId, u32), DateTime<Utc>>,
+
+    /// Git-context lookups running off this task.
+    git_lookups: GitLookups,
+
+    /// Where finished git-context lookups report back.
+    git_results: mpsc::UnboundedReceiver<GitResult>,
 }
 
 impl RegistryActor {
@@ -95,6 +103,16 @@ impl RegistryActor {
         receiver: mpsc::Receiver<RegistryCommand>,
         event_publisher: broadcast::Sender<SessionEvent>,
     ) -> Self {
+        Self::with_git_resolver(receiver, event_publisher, resolve_git_context)
+    }
+
+    /// Creates a registry actor whose git-context lookups call `resolve`.
+    fn with_git_resolver(
+        receiver: mpsc::Receiver<RegistryCommand>,
+        event_publisher: broadcast::Sender<SessionEvent>,
+        resolve: impl Fn(&str) -> GitContext + Send + Sync + 'static,
+    ) -> Self {
+        let (git_lookups, git_results) = GitLookups::new(resolve);
         Self {
             receiver,
             sessions_by_pid: HashMap::new(),
@@ -102,18 +120,30 @@ impl RegistryActor {
             event_publisher,
             child_refs: HashMap::new(),
             ended_sessions: HashMap::new(),
+            git_lookups,
+            git_results,
         }
     }
 
     /// Runs the actor event loop.
     ///
-    /// Processes commands until the channel closes (all senders dropped).
+    /// Processes commands and finished git lookups until the command channel
+    /// closes (all senders dropped). A lookup still running doesn't delay that.
     /// This is the main entry point - call this in a spawned task.
     pub async fn run(mut self) {
         info!("Registry actor starting");
 
-        while let Some(cmd) = self.receiver.recv().await {
-            self.handle_command(cmd);
+        loop {
+            tokio::select! {
+                cmd = self.receiver.recv() => match cmd {
+                    Some(cmd) => self.handle_command(cmd),
+                    None => break,
+                },
+                // `git_lookups` holds a sender, so this channel stays open.
+                Some((cwd, context)) = self.git_results.recv() => {
+                    self.apply_git_result(cwd, context);
+                }
+            }
         }
 
         info!(
@@ -241,12 +271,6 @@ impl RegistryActor {
             return Err(RegistryError::SessionAlreadyExists(session.id));
         }
 
-        // Resolve project/worktree if not already set
-        let mut session = session;
-        if session.project_root.is_none() {
-            apply_git_context(&mut session);
-        }
-
         let session_id = session.id.clone();
         let agent_type = session.agent_type.clone();
         self.insert_new_session(pid, session)?;
@@ -285,6 +309,13 @@ impl RegistryActor {
 
         let session_id = session.id.clone();
         let agent_type = session.agent_type.clone();
+
+        // Resolve project/worktree if not already set
+        if session.project_root.is_none() {
+            if let Some(cwd) = &session.working_directory {
+                self.git_lookups.request(cwd, Instant::now());
+            }
+        }
 
         let mut infra = SessionInfrastructure::new();
         infra.set_pid(pid);
@@ -366,8 +397,8 @@ impl RegistryActor {
             // Update session_id to match the new discovery
             existing_session.id = session_id.clone();
 
+            self.git_lookups.request(&cwd_str, Instant::now());
             existing_session.working_directory = Some(cwd_str);
-            apply_git_context(existing_session);
             if tmux_pane.is_some() {
                 existing_session.tmux_pane = tmux_pane;
             }
@@ -376,7 +407,7 @@ impl RegistryActor {
                 old_id = %old_id,
                 new_id = %session_id,
                 pid = pid,
-                "Re-discovered existing session, refreshed git info (metadata preserved)"
+                "Re-discovered existing session, refreshing git info (metadata preserved)"
             );
 
             self.publish_updated(pid);
@@ -514,7 +545,7 @@ impl RegistryActor {
         // Fallback: lookup by session_id (when no PID available)
         if let Some(&pid) = self.session_id_to_pid.get(&session_id) {
             if let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) {
-                apply_status_line(session, &data, &session_id, pid);
+                apply_status_line(session, &data, &session_id, pid, &mut self.git_lookups);
 
                 debug!(
                     session_id = %session_id,
@@ -570,7 +601,7 @@ impl RegistryActor {
 
         if let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) {
             let log_id = session.id.clone();
-            apply_status_line(session, &data, &log_id, pid);
+            apply_status_line(session, &data, &log_id, pid, &mut self.git_lookups);
 
             debug!(
                 session_id = %session_id,
@@ -584,9 +615,6 @@ impl RegistryActor {
             // Session doesn't exist - create it
             let mut session = SessionDomain::from_status_line(&data);
             session.harness = harness;
-
-            // Resolve project/worktree from working directory
-            apply_git_context(&mut session);
 
             self.insert_new_session(pid, session)?;
 
@@ -717,9 +745,9 @@ impl RegistryActor {
                 "Creating session from lifecycle event"
             );
             // Read cwd from /proc/{pid}/cwd so a session created
-            // via a vendor adapter event lands grouped under the
-            // right project / branch from frame one. Without this,
-            // lifecycle-event-created sessions fall into the
+            // via a vendor adapter event gets grouped under the
+            // right project / branch once its git lookup lands. Without
+            // this, lifecycle-event-created sessions stay in the
             // "Other" tree bucket because working_directory is None.
             let proc_cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok();
             let session = build_session_from_pid(
@@ -1118,15 +1146,36 @@ impl RegistryActor {
     /// Detects branch switches that happen without a working directory change
     /// (e.g., `git checkout other-branch` in the same directory).
     fn handle_refresh_git_info(&mut self) {
+        let now = Instant::now();
+        let cwds: HashSet<&str> = self
+            .sessions_by_pid
+            .values()
+            .filter_map(|(session, _)| session.working_directory.as_deref())
+            .collect();
+        for cwd in cwds {
+            self.git_lookups.request(cwd, now);
+        }
+
+        for cwd in self.git_lookups.newly_stuck(now) {
+            warn!(cwd = %cwd, "Git lookup is stuck; keeping its slot until it returns");
+        }
+    }
+
+    /// Applies a finished git-context lookup to every session in `cwd`,
+    /// children included. A session that has left `cwd` keeps its fields, and
+    /// so does every session when the lookup panicked.
+    fn apply_git_result(&mut self, cwd: String, context: Option<GitContext>) {
+        self.git_lookups.finished(&cwd);
+        let Some((new_project_root, new_wt_path, new_wt_branch)) = context else {
+            warn!(cwd = %cwd, "Git lookup panicked; the next refresh retries");
+            return;
+        };
         let mut updated_pids = Vec::new();
 
         for (pid, (session, _)) in self.sessions_by_pid.iter_mut() {
-            let cwd = match &session.working_directory {
-                Some(cwd) => cwd.clone(),
-                None => continue,
-            };
-
-            let (new_project_root, new_wt_path, new_wt_branch) = resolve_git_context(&cwd);
+            if session.working_directory.as_deref() != Some(cwd.as_str()) {
+                continue;
+            }
 
             let changed = session.project_root != new_project_root
                 || session.worktree_path != new_wt_path
@@ -1140,21 +1189,16 @@ impl RegistryActor {
                     new_branch = ?new_wt_branch,
                     "Git info changed, updating session"
                 );
-                session.project_root = new_project_root;
-                session.worktree_path = new_wt_path;
-                session.worktree_branch = new_wt_branch;
+                session.project_root = new_project_root.clone();
+                session.worktree_path = new_wt_path.clone();
+                session.worktree_branch = new_wt_branch.clone();
                 updated_pids.push(*pid);
             }
         }
 
         // Publish in loop order once the loop's borrow has ended
-        for pid in &updated_pids {
-            self.publish_updated(*pid);
-        }
-
-        let updated_count = updated_pids.len();
-        if updated_count > 0 {
-            info!(updated_count, "Git info refresh completed with changes");
+        for pid in updated_pids {
+            self.publish_updated(pid);
         }
     }
 
@@ -1169,16 +1213,15 @@ impl RegistryActor {
     }
 }
 
-/// Builds a fresh `SessionDomain` for a newly-observed PID and resolves
-/// cwd-derived fields (project root, worktree info, working directory).
+/// Builds a fresh `SessionDomain` for a newly-observed PID.
 ///
 /// Used by both the /proc-discovery path (`handle_register_discovered`)
-/// and the create-on-event path inside `handle_apply_lifecycle_event` so
-/// that sessions land grouped under the right project / branch from frame
-/// one regardless of how they were first observed.
+/// and the create-on-event path inside `handle_apply_lifecycle_event`.
+/// `insert_new_session` starts the lookup of the project / worktree fields,
+/// which fill in shortly after the session first appears.
 ///
 /// When `cwd` is `None` (e.g., `/proc/{pid}/cwd` read failed) the
-/// project/worktree/working_directory fields are left at their defaults.
+/// working directory stays unset and no lookup runs.
 /// `parent_session_id` nests a separate-process child (e.g. a tmux-mode
 /// teammate) under the session that spawned it.
 fn build_session_from_pid(
@@ -1194,49 +1237,30 @@ fn build_session_from_pid(
     session.harness = harness;
     session.tmux_pane = tmux_pane;
     session.parent_session_id = parent_session_id;
-    if let Some(cwd) = cwd {
-        // Note: resolve_* are local stat() calls walking up ~5 dirs (~5μs),
-        // acceptable inline per Tokio guidelines for sub-100μs sync work.
-        let cwd_str = cwd.to_string_lossy().to_string();
-        (
-            session.project_root,
-            session.worktree_path,
-            session.worktree_branch,
-        ) = resolve_git_context(&cwd_str);
-        session.working_directory = Some(cwd_str);
-    }
+    session.working_directory = cwd.map(|cwd| cwd.to_string_lossy().to_string());
     session
 }
 
 /// Resolves the git context of `cwd`: its project root, worktree path and
 /// worktree branch. The worktree fields are only set when `cwd` is itself a
 /// repo or worktree root (see `crate::project::resolve_worktree_info`).
-fn resolve_git_context(cwd: &str) -> (Option<String>, Option<String>, Option<String>) {
+/// This reads files under `.git` and can block, so it only runs through
+/// [`GitLookups`].
+fn resolve_git_context(cwd: &str) -> GitContext {
     let project_root = crate::project::resolve_project_root(cwd);
     let (worktree_path, worktree_branch) = crate::project::resolve_worktree_info(cwd);
     (project_root, worktree_path, worktree_branch)
 }
 
-/// Sets `session`'s project root and worktree fields from its working
-/// directory. Leaves them alone when it has none.
-fn apply_git_context(session: &mut SessionDomain) {
-    if let Some(cwd) = &session.working_directory {
-        (
-            session.project_root,
-            session.worktree_path,
-            session.worktree_branch,
-        ) = resolve_git_context(cwd);
-    }
-}
-
-/// Applies a status line to a stored session. Then re-resolves the git
-/// context if the project root is unset or the working directory changed,
-/// logging `log_id` on a change.
+/// Applies a status line to a stored session. Then requests a new git context
+/// if the project root is unset or the working directory changed, logging
+/// `log_id` on a change. The old fields stay until the lookup lands.
 fn apply_status_line(
     session: &mut SessionDomain,
     data: &StatusLineData,
     log_id: &SessionId,
     pid: u32,
+    git_lookups: &mut GitLookups,
 ) {
     let cwd_changed = session.update_from_status_line(data);
 
@@ -1251,7 +1275,7 @@ fn apply_status_line(
                     "Working directory changed, re-resolving git info"
                 );
             }
-            apply_git_context(session);
+            git_lookups.request(cwd, Instant::now());
         }
     }
 }
@@ -2197,6 +2221,7 @@ mod tests {
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();
+        actor.finish_git_lookups();
 
         // Drain events
         while event_rx.try_recv().is_ok() {}
@@ -2215,6 +2240,7 @@ mod tests {
 
         // Trigger git info refresh
         actor.handle_command(RegistryCommand::RefreshGitInfo);
+        actor.finish_git_lookups();
 
         // Verify branch was updated
         let (tx, rx) = oneshot::channel();
@@ -2391,6 +2417,7 @@ mod tests {
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();
+        actor.finish_git_lookups();
 
         // Verify initial state
         let (tx, rx) = oneshot::channel();
@@ -2420,6 +2447,7 @@ mod tests {
             respond_to: tx,
         });
         rx.await.unwrap().unwrap();
+        actor.finish_git_lookups();
 
         // Verify git info re-resolved
         let (tx, rx) = oneshot::channel();
@@ -2466,17 +2494,22 @@ mod tests {
         let repo = dir.path().join("register-repo");
         init_repo(&repo, "main");
         let repo = repo.to_str().unwrap();
+        // A lookup applies to every session in its directory, so the preset
+        // session needs its own.
+        let other = dir.path().join("preset-repo");
+        init_repo(&other, "main");
 
         let mut fresh = create_test_session("register-fresh");
         fresh.working_directory = Some(repo.to_string());
         register_session_in(&mut actor, fresh);
         let mut preset = create_test_session("register-preset");
-        preset.working_directory = Some(repo.to_string());
+        preset.working_directory = Some(other.to_str().unwrap().to_string());
         preset.project_root = Some("/preset".to_string());
         register_session_in(&mut actor, preset);
         let mut no_cwd = create_test_session("register-no-cwd");
         no_cwd.worktree_branch = Some("kept".to_string());
         register_session_in(&mut actor, no_cwd);
+        actor.finish_git_lookups();
 
         let fresh = session_view(&actor, "register-fresh").unwrap();
         assert_eq!(fresh.project_root.as_deref(), Some(repo));
@@ -2525,6 +2558,7 @@ mod tests {
             respond_to: tx,
         });
         rx.try_recv().unwrap().unwrap();
+        actor.finish_git_lookups();
 
         let view = session_view(&actor, "no-pid-cwd").unwrap();
         assert_eq!(view.project_root.as_deref(), repo_b.to_str());
@@ -2563,6 +2597,7 @@ mod tests {
             respond_to: tx,
         });
         rx.try_recv().unwrap().unwrap();
+        actor.finish_git_lookups();
 
         let view = session_view(&actor, "wt-session").unwrap();
         assert_eq!(view.project_root.as_deref(), main_repo.to_str());
@@ -2596,6 +2631,7 @@ mod tests {
             context: LifecycleContext::default(),
             respond_to,
         });
+        actor.finish_git_lookups();
         let view = session_view(&actor, "lifecycle-git");
         let _ = process.kill();
         let _ = process.wait();
@@ -2990,6 +3026,7 @@ mod tests {
                 "cost": {"total_cost_usd": 0.30, "total_duration_ms": 5000}
             }),
         );
+        actor.finish_git_lookups();
         drain_events(&mut event_rx);
 
         // Discovery only knows the pending id; the session keeps its real one.
@@ -3002,13 +3039,18 @@ mod tests {
         // The view shortens long paths, so check the stored session's cwd.
         let stored = &actor.sessions_by_pid[&pid].0;
         assert_eq!(stored.working_directory.as_deref(), Some(path_str(&repo_b)));
-        assert_eq!(view.project_root.as_deref(), Some(path_str(&repo_b)));
-        assert_eq!(view.worktree_branch.as_deref(), Some("feature"));
         assert_eq!(view.tmux_pane.as_deref(), Some("%7"));
         assert_eq!(
             view.cost_usd, 0.30,
             "rediscovery keeps the session's metadata"
         );
+
+        actor.finish_git_lookups();
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated real-a"]);
+        assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
+        assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
     }
 
     #[test]
@@ -3028,6 +3070,11 @@ mod tests {
             [format!("Registered {id}"), format!("Updated {id}")]
         );
         assert_view_is_current(&actor, &views[0]);
+
+        actor.finish_git_lookups();
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, [format!("Updated {id}")]);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo)));
         assert_eq!(views[0].worktree_branch.as_deref(), Some("main"));
     }
@@ -3059,6 +3106,11 @@ mod tests {
         assert_eq!(events, ["Updated by-id"]);
         assert_view_is_current(&actor, &views[0]);
         assert_eq!(views[0].cost_usd, 0.50);
+
+        actor.finish_git_lookups();
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated by-id"]);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
 
@@ -3112,6 +3164,11 @@ mod tests {
         );
         assert_view_is_current(&actor, &views[0]);
         assert_eq!(views[0].cost_usd, 0.40);
+
+        actor.finish_git_lookups();
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated real-d"]);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo_b)));
         assert_eq!(views[0].worktree_branch.as_deref(), Some("feature"));
 
@@ -3153,6 +3210,11 @@ mod tests {
         assert_eq!(events, ["Registered auto-e", "Updated auto-e"]);
         assert_view_is_current(&actor, &views[0]);
         assert_eq!(views[0].cost_usd, 0.10);
+
+        actor.finish_git_lookups();
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated auto-e"]);
         assert_eq!(views[0].project_root.as_deref(), Some(path_str(&repo)));
         assert_eq!(views[0].worktree_branch.as_deref(), Some("main"));
 
@@ -3182,6 +3244,7 @@ mod tests {
             &repo_b,
             None,
         );
+        actor.finish_git_lookups();
         // As if the directories were not repos when the sessions were
         // resolved. Clearing the fields directly keeps the test independent
         // of whether TMPDIR sits inside some other checkout.
@@ -3206,6 +3269,7 @@ mod tests {
             &mut actor,
             serde_json::json!({"session_id": "unset-by-pid", "pid": pid, "model": model}),
         );
+        actor.finish_git_lookups();
 
         let by_id = session_view(&actor, "unset-by-id").unwrap();
         assert_eq!(by_id.project_root.as_deref(), Some(path_str(&repo_a)));
@@ -3285,7 +3349,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_git_info_publishes_each_changed_session_in_map_order() {
+    fn refresh_git_info_publishes_each_changed_session() {
         let (_, mut actor, mut event_rx) = create_actor();
         let dir = tempfile::tempdir().unwrap();
         let ids = ["git-0", "git-1", "git-2", "git-3"];
@@ -3296,6 +3360,7 @@ mod tests {
             session.working_directory = Some(path_str(&repo).to_string());
             register_session_in(&mut actor, session);
         }
+        actor.finish_git_lookups();
         drain_events(&mut event_rx);
         let changed = ["git-0", "git-1", "git-3"];
         for id in changed {
@@ -3303,15 +3368,13 @@ mod tests {
         }
 
         actor.handle_command(RegistryCommand::RefreshGitInfo);
+        actor.finish_git_lookups();
 
-        let expected: Vec<String> = actor
-            .sessions_by_pid
-            .values()
-            .map(|(session, _)| session.id.as_str())
-            .filter(|id| changed.contains(id))
-            .map(|id| format!("Updated {id}"))
-            .collect();
-        let (events, views) = drain_events(&mut event_rx);
+        let expected: Vec<String> = changed.iter().map(|id| format!("Updated {id}")).collect();
+        let (mut events, views) = drain_events(&mut event_rx);
+        // Each directory's result lands on its own; order within one is pinned
+        // by `a_result_is_published_in_map_order_within_a_cwd`.
+        events.sort();
         assert_eq!(events, expected);
         for view in &views {
             assert_view_is_current(&actor, view);
@@ -4794,5 +4857,528 @@ mod tests {
             .unwrap() -= ENDED_SESSION_TTL;
         session_end(&mut actor, "a", pid, "other");
         assert_eq!(actor.session_count(), 0);
+    }
+
+    // ========================================================================
+    // Git lookups off the actor
+    // ========================================================================
+
+    const GIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    impl RegistryActor {
+        /// Applies results until no git lookup is in flight. Polls with real
+        /// sleeps so it works in sync tests and under a paused tokio clock.
+        fn finish_git_lookups(&mut self) {
+            let deadline = std::time::Instant::now() + GIT_WAIT;
+            while self.git_lookups.has_in_flight() {
+                match self.git_results.try_recv() {
+                    Ok((cwd, context)) => self.apply_git_result(cwd, context),
+                    Err(_) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "git lookups did not land"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The context the gated resolver answers for `cwd`.
+    fn gated_context(cwd: &str) -> GitContext {
+        (
+            Some(format!("{cwd}-root")),
+            Some(cwd.to_string()),
+            Some("main".to_string()),
+        )
+    }
+
+    /// A test git resolver: each lookup reports its cwd, then blocks until
+    /// it takes a token from `release` (or `release` is dropped).
+    struct GitGate {
+        calls: std::sync::mpsc::Receiver<String>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    impl GitGate {
+        /// Lets one blocked lookup land, and applies it.
+        fn land_one(&self, actor: &mut RegistryActor, cwd: &str) {
+            self.release.send(()).unwrap();
+            let deadline = std::time::Instant::now() + GIT_WAIT;
+            loop {
+                match actor.git_results.try_recv() {
+                    Ok((got, context)) => {
+                        assert_eq!(got, cwd);
+                        actor.apply_git_result(got, context);
+                        return;
+                    }
+                    Err(_) => {
+                        assert!(std::time::Instant::now() < deadline, "lookup did not land");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+
+        fn expect_call(&self, cwd: &str) {
+            assert_eq!(self.calls.recv_timeout(GIT_WAIT).unwrap(), cwd);
+        }
+
+        /// Lookups started together report in either order.
+        fn expect_calls_in_any_order(&self, cwds: &[&str]) {
+            let mut calls: Vec<String> = cwds
+                .iter()
+                .map(|_| self.calls.recv_timeout(GIT_WAIT).unwrap())
+                .collect();
+            calls.sort();
+            assert_eq!(calls, cwds);
+        }
+
+        fn assert_no_more_calls(&self) {
+            let extra = self
+                .calls
+                .recv_timeout(std::time::Duration::from_millis(100));
+            assert!(extra.is_err(), "unexpected git lookup: {extra:?}");
+        }
+    }
+
+    fn create_gated_actor() -> (
+        mpsc::Sender<RegistryCommand>,
+        RegistryActor,
+        broadcast::Receiver<SessionEvent>,
+        GitGate,
+    ) {
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (release, tokens) = std::sync::mpsc::channel::<()>();
+        let tokens = std::sync::Mutex::new(tokens);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = broadcast::channel(64);
+        let actor = RegistryActor::with_git_resolver(cmd_rx, event_tx, move |cwd: &str| {
+            calls_tx.send(cwd.to_string()).unwrap();
+            let _ = tokens.lock().unwrap().recv();
+            gated_context(cwd)
+        });
+        (cmd_tx, actor, event_rx, GitGate { calls, release })
+    }
+
+    fn session_in(id: &str, cwd: &str) -> SessionDomain {
+        let mut session = create_test_session(id);
+        session.working_directory = Some(cwd.to_string());
+        session
+    }
+
+    fn assert_no_git_fields(view: &SessionView) {
+        assert_eq!(view.project_root, None);
+        assert_eq!(view.worktree_path, None);
+        assert_eq!(view.worktree_branch, None);
+    }
+
+    fn assert_gated_git_fields(view: &SessionView, cwd: &str) {
+        let (project_root, worktree_path, worktree_branch) = gated_context(cwd);
+        assert_eq!(view.project_root, project_root);
+        assert_eq!(view.worktree_path, worktree_path);
+        assert_eq!(view.worktree_branch, worktree_branch);
+    }
+
+    #[test]
+    fn register_publishes_at_once_and_one_update_when_the_lookup_lands() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+
+        register_session_in(&mut actor, session_in("fresh", "/a"));
+
+        gate.expect_call("/a");
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Registered fresh"]);
+        assert_no_git_fields(&session_view(&actor, "fresh").unwrap());
+
+        gate.land_one(&mut actor, "/a");
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated fresh"]);
+        assert_gated_git_fields(&views[0], "/a");
+        assert_view_is_current(&actor, &views[0]);
+    }
+
+    #[test]
+    fn a_preset_project_root_requests_no_lookup() {
+        let (_tx, mut actor, _events, gate) = create_gated_actor();
+
+        let mut preset = session_in("preset", "/a");
+        preset.project_root = Some("/preset".to_string());
+        register_session_in(&mut actor, preset);
+
+        gate.assert_no_more_calls();
+        assert!(!actor.git_lookups.has_in_flight());
+    }
+
+    #[test]
+    fn a_session_without_a_cwd_requests_no_lookup() {
+        let (_tx, mut actor, _events, gate) = create_gated_actor();
+
+        register_session_in(&mut actor, create_test_session("no-cwd"));
+
+        gate.assert_no_more_calls();
+        assert!(!actor.git_lookups.has_in_flight());
+    }
+
+    #[test]
+    fn a_status_line_cwd_change_keeps_the_old_fields_until_the_result_lands() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+        register_session_in(&mut actor, session_in("mover", "/a"));
+        gate.expect_call("/a");
+        gate.land_one(&mut actor, "/a");
+        drain_events(&mut event_rx);
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "mover",
+                "cwd": "/b",
+                "model": {"id": "claude-sonnet-4-20250514"}
+            }),
+        );
+
+        gate.expect_call("/b");
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated mover"]);
+        assert_eq!(views[0].working_directory.as_deref(), Some("/b"));
+        assert_gated_git_fields(&views[0], "/a");
+
+        gate.land_one(&mut actor, "/b");
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated mover"]);
+        assert_gated_git_fields(&views[0], "/b");
+    }
+
+    #[test]
+    fn a_status_line_keeping_the_cwd_and_root_requests_no_lookup() {
+        let (_tx, mut actor, _events, gate) = create_gated_actor();
+        register_session_in(&mut actor, session_in("still", "/a"));
+        gate.expect_call("/a");
+        gate.land_one(&mut actor, "/a");
+
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "still",
+                "cwd": "/a",
+                "model": {"id": "claude-sonnet-4-20250514"}
+            }),
+        );
+
+        gate.assert_no_more_calls();
+    }
+
+    #[test]
+    fn a_refresh_with_no_change_publishes_nothing() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+        register_session_in(&mut actor, session_in("same", "/a"));
+        gate.expect_call("/a");
+        gate.land_one(&mut actor, "/a");
+        drain_events(&mut event_rx);
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+        gate.expect_call("/a");
+        gate.land_one(&mut actor, "/a");
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+    }
+
+    #[test]
+    fn a_refresh_requests_one_lookup_per_distinct_cwd() {
+        let (_tx, mut actor, _events, gate) = create_gated_actor();
+        register_session_in(&mut actor, session_in("one", "/a"));
+        register_session_in(&mut actor, session_in("two", "/a"));
+        gate.expect_call("/a");
+        gate.assert_no_more_calls();
+        gate.land_one(&mut actor, "/a");
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+
+        gate.expect_call("/a");
+        gate.assert_no_more_calls();
+    }
+
+    #[test]
+    fn a_result_updates_every_session_in_its_cwd() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+        for id in ["s0", "s1", "s2"] {
+            register_session_in(&mut actor, session_in(id, "/a"));
+        }
+        register_session_in(&mut actor, session_in("elsewhere", "/b"));
+        gate.expect_calls_in_any_order(&["/a", "/b"]);
+        drain_events(&mut event_rx);
+
+        // Both lookups are blocked on one gate, so they may land in either
+        // order; apply each by the cwd it reports.
+        gate.release.send(()).unwrap();
+        gate.release.send(()).unwrap();
+        actor.finish_git_lookups();
+
+        for id in ["s0", "s1", "s2"] {
+            assert_gated_git_fields(&session_view(&actor, id).unwrap(), "/a");
+        }
+        assert_gated_git_fields(&session_view(&actor, "elsewhere").unwrap(), "/b");
+        let mut expected: Vec<String> = actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| format!("Updated {}", session.id))
+            .collect();
+        expected.sort();
+        let (mut events, _) = drain_events(&mut event_rx);
+        events.sort();
+        assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn a_result_is_published_in_map_order_within_a_cwd() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+        for id in ["s0", "s1", "s2", "s3"] {
+            register_session_in(&mut actor, session_in(id, "/a"));
+        }
+        gate.expect_call("/a");
+        drain_events(&mut event_rx);
+
+        gate.land_one(&mut actor, "/a");
+
+        let expected: Vec<String> = actor
+            .sessions_by_pid
+            .values()
+            .map(|(session, _)| format!("Updated {}", session.id))
+            .collect();
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn a_result_reaches_a_child_that_copied_a_parent_still_waiting() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+        let (parent_tx, mut parent_rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Register {
+            session: Box::new(session_in("lead", "/a")),
+            respond_to: parent_tx,
+        });
+        parent_rx.try_recv().unwrap().unwrap();
+        gate.expect_call("/a");
+
+        start_child(&mut actor, &SessionId::new("lead"), "agent-1");
+        assert_no_git_fields(&session_view(&actor, "agent-1").unwrap());
+        gate.assert_no_more_calls();
+        drain_events(&mut event_rx);
+
+        gate.land_one(&mut actor, "/a");
+
+        assert_gated_git_fields(&session_view(&actor, "lead").unwrap(), "/a");
+        assert_gated_git_fields(&session_view(&actor, "agent-1").unwrap(), "/a");
+        let (mut events, _) = drain_events(&mut event_rx);
+        events.sort();
+        assert_eq!(events, ["Updated agent-1", "Updated lead"]);
+    }
+
+    #[test]
+    fn a_stale_result_is_ignored_and_frees_its_slot() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+        register_session_in(&mut actor, session_in("mover", "/a"));
+        gate.expect_call("/a");
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "mover",
+                "cwd": "/b",
+                "model": {"id": "claude-sonnet-4-20250514"}
+            }),
+        );
+        gate.expect_call("/b");
+        drain_events(&mut event_rx);
+
+        actor.apply_git_result("/a".to_string(), Some(gated_context("/a")));
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert_no_git_fields(&session_view(&actor, "mover").unwrap());
+        // "/a"'s slot is free again, so a later session there gets a lookup.
+        register_session_in(&mut actor, session_in("back", "/a"));
+        gate.expect_call("/a");
+    }
+
+    #[test]
+    fn rediscovery_requests_a_lookup_for_the_new_cwd() {
+        let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
+        let pid = std::process::id();
+        let id = SessionId::pending_from_pid(pid);
+        discover(
+            &mut actor,
+            id.clone(),
+            pid,
+            std::path::Path::new("/a"),
+            None,
+        );
+        gate.expect_call("/a");
+        gate.land_one(&mut actor, "/a");
+        drain_events(&mut event_rx);
+
+        discover(
+            &mut actor,
+            SessionId::new("real"),
+            pid,
+            std::path::Path::new("/b"),
+            None,
+        );
+
+        gate.expect_call("/b");
+        let view = session_view(&actor, "real").unwrap();
+        assert_eq!(view.working_directory.as_deref(), Some("/b"));
+        assert_gated_git_fields(&view, "/a");
+        drain_events(&mut event_rx);
+
+        gate.land_one(&mut actor, "/b");
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated real"]);
+        assert_gated_git_fields(&views[0], "/b");
+    }
+
+    #[test]
+    fn a_full_registry_requests_no_lookup_for_a_rejected_session() {
+        let (_tx, mut actor, _events, gate) = create_gated_actor();
+        for i in 0..MAX_SESSIONS {
+            register_session_in(&mut actor, create_test_session(&format!("s{i}")));
+        }
+
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::Register {
+            session: Box::new(session_in("over", "/a")),
+            respond_to: tx,
+        });
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Err(RegistryError::RegistryFull { .. })
+        ));
+        gate.assert_no_more_calls();
+    }
+
+    #[tokio::test]
+    async fn the_running_actor_serves_commands_while_a_lookup_hangs_then_applies_it() {
+        let (cmd_tx, actor, mut event_rx, gate) = create_gated_actor();
+        let running = tokio::spawn(actor.run());
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(RegistryCommand::Register {
+                session: Box::new(session_in("hung", "/a")),
+                respond_to: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(RegistryCommand::GetSession {
+                session_id: SessionId::new("hung"),
+                respond_to: tx,
+            })
+            .await
+            .unwrap();
+        let view = tokio::time::timeout(GIT_WAIT, rx)
+            .await
+            .expect("the actor answers while the lookup hangs")
+            .unwrap()
+            .unwrap();
+        assert_no_git_fields(&view);
+
+        gate.release.send(()).unwrap();
+        let updated = tokio::time::timeout(GIT_WAIT, async {
+            loop {
+                if let SessionEvent::Updated { session } = event_rx.recv().await.unwrap() {
+                    return session;
+                }
+            }
+        })
+        .await
+        .expect("the actor applies the result");
+        assert_gated_git_fields(&updated, "/a");
+
+        drop(cmd_tx);
+        tokio::time::timeout(GIT_WAIT, running)
+            .await
+            .expect("the actor stops")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_returns_when_the_senders_drop_while_a_lookup_hangs() {
+        let (cmd_tx, actor, _events, gate) = create_gated_actor();
+        let running = tokio::spawn(actor.run());
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(RegistryCommand::Register {
+                session: Box::new(session_in("hung", "/a")),
+                respond_to: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+        gate.expect_call("/a");
+
+        drop(cmd_tx);
+
+        tokio::time::timeout(GIT_WAIT, running)
+            .await
+            .expect("run() must not wait for the hung lookup")
+            .unwrap();
+        // `gate` still holds the lookup blocked here.
+        drop(gate);
+    }
+
+    /// An actor whose git lookups panic on the given calls, counted from 0, and
+    /// otherwise answer [`gated_context`] at once.
+    fn create_actor_with_panicking_lookups(
+        panic_on: &'static [usize],
+    ) -> (RegistryActor, broadcast::Receiver<SessionEvent>) {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (_, cmd_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let actor = RegistryActor::with_git_resolver(cmd_rx, event_tx, move |cwd: &str| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(!panic_on.contains(&call), "lookup {call} fails");
+            gated_context(cwd)
+        });
+        (actor, event_rx)
+    }
+
+    #[test]
+    fn a_panicking_lookup_frees_its_slot_and_the_next_refresh_fills_the_fields() {
+        let (mut actor, mut event_rx) = create_actor_with_panicking_lookups(&[0]);
+        register_session_in(&mut actor, session_in("unlucky", "/a"));
+        actor.finish_git_lookups();
+        assert_no_git_fields(&session_view(&actor, "unlucky").unwrap());
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Registered unlucky"]);
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+        actor.finish_git_lookups();
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated unlucky"]);
+        assert_gated_git_fields(&views[0], "/a");
+    }
+
+    #[test]
+    fn a_panicking_lookup_leaves_good_fields_alone() {
+        let (mut actor, mut event_rx) = create_actor_with_panicking_lookups(&[1]);
+        register_session_in(&mut actor, session_in("lucky", "/a"));
+        actor.finish_git_lookups();
+        drain_events(&mut event_rx);
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+        actor.finish_git_lookups();
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert_gated_git_fields(&session_view(&actor, "lucky").unwrap(), "/a");
     }
 }

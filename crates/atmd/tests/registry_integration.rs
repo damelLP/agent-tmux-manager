@@ -9,7 +9,7 @@
 use atm_core::{AgentType, LifecycleEvent, Model, SessionDomain, SessionId, Tool};
 use atmd::registry::{
     spawn_registry, spawn_registry_with_cancel, supervise_actor, ActorStopped, RegistryError,
-    RemovalReason, SessionEvent, MAX_SESSIONS,
+    RegistryHandle, RemovalReason, SessionEvent, MAX_SESSIONS,
 };
 use atmd::server::parse_status_line;
 use std::time::Duration;
@@ -1012,9 +1012,36 @@ async fn test_project_resolution_on_discovery() {
 // CWD Change Detection Tests
 // ============================================================================
 
+/// The refresh task ticks about 1 ms after it spawns. Waits that out, so a test
+/// proves its own code path requested a lookup, not that tick.
+async fn pass_first_refresh_tick() {
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Git context resolves off the actor, so a session's branch fills in shortly
+/// after a command. Returns the session's view once its branch is `branch`, or
+/// after a timeout, so the caller's assertions report what it has instead. The
+/// timeout stays well under the 5 s refresh interval, so a later refresh tick
+/// can't stand in for the code path a test names; see `pass_first_refresh_tick`.
+async fn view_with_branch(
+    handle: &RegistryHandle,
+    id: &str,
+    branch: &str,
+) -> Option<atm_core::SessionView> {
+    for _ in 0..400 {
+        let view = handle.get_session(SessionId::new(id)).await?;
+        if view.worktree_branch.as_deref() == Some(branch) {
+            return Some(view);
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    handle.get_session(SessionId::new(id)).await
+}
+
 #[tokio::test]
 async fn test_status_line_cwd_change_updates_git_info() {
     let handle = spawn_registry();
+    pass_first_refresh_tick().await;
 
     // Create two temp repos to simulate a worktree switch
     let dir = tempfile::tempdir().unwrap();
@@ -1039,8 +1066,7 @@ async fn test_status_line_cwd_change_updates_git_info() {
         .await
         .expect("should register");
 
-    let view = handle
-        .get_session(SessionId::new("cwd-change-test"))
+    let view = view_with_branch(&handle, "cwd-change-test", "main")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("main"));
@@ -1068,8 +1094,7 @@ async fn test_status_line_cwd_change_updates_git_info() {
         .expect("status update should succeed");
 
     // Verify git info was re-resolved to repo_b
-    let view = handle
-        .get_session(SessionId::new("cwd-change-test"))
+    let view = view_with_branch(&handle, "cwd-change-test", "feature-x")
         .await
         .unwrap();
     assert_eq!(
@@ -1139,8 +1164,7 @@ async fn test_status_line_same_cwd_does_not_re_resolve() {
         .unwrap();
 
     // Session should still have correct info
-    let view = handle
-        .get_session(SessionId::new("same-cwd-test"))
+    let view = view_with_branch(&handle, "same-cwd-test", "main")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("main"));
@@ -1236,6 +1260,7 @@ async fn test_rescan_preserves_metadata_for_existing_pid() {
 #[tokio::test]
 async fn test_rescan_refreshes_git_info() {
     let handle = spawn_registry();
+    pass_first_refresh_tick().await;
 
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("rescan-git-repo");
@@ -1256,8 +1281,7 @@ async fn test_rescan_refreshes_git_info() {
         .await
         .unwrap();
 
-    let view = handle
-        .get_session(SessionId::new("rescan-git-test"))
+    let view = view_with_branch(&handle, "rescan-git-test", "old-branch")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("old-branch"));
@@ -1277,8 +1301,7 @@ async fn test_rescan_refreshes_git_info() {
         .await
         .unwrap();
 
-    let view = handle
-        .get_session(SessionId::new("rescan-git-test-2"))
+    let view = view_with_branch(&handle, "rescan-git-test-2", "new-branch")
         .await
         .unwrap();
     assert_eq!(

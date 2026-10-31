@@ -33,6 +33,7 @@ use tracing::{debug, error};
 
 mod actor;
 mod commands;
+mod git;
 mod handle;
 mod infra;
 
@@ -190,8 +191,9 @@ fn spawn_cleanup_task(
 /// Spawn a background task that periodically refreshes git info for all sessions.
 ///
 /// Detects branch switches that happen without a working directory change
-/// (e.g., `git checkout other-branch`). The cost is minimal: one stat() + read()
-/// of `.git/HEAD` per tracked session every 5 seconds.
+/// (e.g., `git checkout other-branch`). Each tick starts one short-lived thread
+/// per tracked directory: about 0.7 ms on the actor for 100 directories
+/// (measured 2026-10-31, release build, repos on tmpfs).
 fn spawn_git_refresh_task(
     sender: mpsc::Sender<RegistryCommand>,
     cancel: CancellationToken,

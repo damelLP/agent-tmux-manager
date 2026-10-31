@@ -1,6 +1,6 @@
 //! End-to-end harness exercising real binaries against a real tmux server.
 //!
-//! Five scenarios are covered:
+//! Six scenarios are covered:
 //!
 //! 1. **Protocol-level e2e**: spawn `atmd` as a child, hand-roll a client over
 //!    a Unix socket, register a session via `HookEvent`, observe via
@@ -52,6 +52,12 @@
 //!    config, create types exactly `claude`, then `Enter` on its own; a
 //!    logging `tmux` on atm's PATH swallows that `Enter`, so nothing runs.
 //!
+//! 6. **The TUI's capture preview**: the real `atm` runs in a pane and
+//!    previews panes that each print their own marker. Its daemon is a
+//!    stand-in, so a key, a session update and a full session list each fire
+//!    on their own: a real atmd's events come with others, and any key press
+//!    also syncs the capture target, which would hide a missing sync.
+//!
 //! The test skips cleanly (printed message, returns Ok) when `tmux` is
 //! absent from PATH, when the binaries weren't built, or — for scenario
 //! 4 only — when `python3` is unavailable.
@@ -66,12 +72,14 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use atm_core::{SessionId, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage, ProtocolVersion};
 use atm_tmux::{PaneDirection, RealTmuxClient, TmuxClient};
 use serde_json::{json, Value};
@@ -413,7 +421,7 @@ impl Client {
     }
 }
 
-/// Shared fixture for all 5 scenarios — daemon, primary tmux server,
+/// Shared fixture for all 6 scenarios — daemon, primary tmux server,
 /// shim, binary paths. Scenarios borrow `&E2eEnv` immutably; everything
 /// inside is RAII-cleaned when the fixture drops at end-of-test.
 struct E2eEnv {
@@ -2006,6 +2014,270 @@ fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
         .expect("chmod tmux wrapper");
 }
 
+const PREVIEW_MARKERS: [&str; 3] = ["preview-marker-a", "preview-marker-b", "preview-marker-c"];
+
+/// The capture task polls once a second, so this allows several polls.
+const PREVIEW_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs `tmux -L <label> <args>` and returns stdout.
+fn tmux_stdout(socket_label: &str, args: &[&str]) -> String {
+    let stdout = run_tmux_or_panic(
+        Command::new("tmux").args(["-L", socket_label]).args(args),
+        args.first().copied().unwrap_or("tmux"),
+    );
+    String::from_utf8_lossy(&stdout).trim_end().to_string()
+}
+
+/// A stand-in daemon on `socket`. It answers `connect` with Connected and
+/// `subscribe` with `sessions`, then hands over the subscriber's stream so
+/// the scenario sends each later event itself.
+fn fake_tui_daemon(socket: &Path, sessions: Vec<SessionView>) -> mpsc::Receiver<UnixStream> {
+    let listener = UnixListener::bind(socket).expect("bind");
+    let connected =
+        serde_json::to_string(&DaemonMessage::connected("tui".to_string())).expect("serialize");
+    let list = serde_json::to_string(&DaemonMessage::session_list(sessions)).expect("serialize");
+    let (subscriber_tx, subscriber_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept");
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            // `atm` first checks that something listens, then hangs up
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            (&stream)
+                .write_all(format!("{connected}\n").as_bytes())
+                .expect("reply Connected");
+            // Read Subscribe
+            line.clear();
+            let _ = reader.read_line(&mut line);
+            (&stream)
+                .write_all(format!("{list}\n").as_bytes())
+                .expect("reply SessionList");
+            let _ = subscriber_tx.send(stream);
+            return;
+        }
+    });
+    subscriber_rx
+}
+
+fn preview_session(id: &str, started_at: &str, pane: Option<&str>) -> SessionView {
+    SessionView {
+        id: SessionId::new(id),
+        id_short: id.to_string(),
+        tmux_pane: pane.map(str::to_string),
+        started_at: started_at.to_string(),
+        project_root: Some("/rig".to_string()),
+        working_directory: Some("/rig".to_string()),
+        ..SessionView::default()
+    }
+}
+
+/// Sessions sort newest first, so `session-a`'s row comes before `session-b`'s.
+fn preview_session_a(pane: Option<&str>) -> SessionView {
+    preview_session("session-a", "2026-01-01T00:00:02Z", pane)
+}
+
+fn preview_session_b(pane: Option<&str>) -> SessionView {
+    preview_session("session-b", "2026-01-01T00:00:01Z", pane)
+}
+
+/// The real TUI in a pane, and the stream that feeds it daemon events.
+struct PreviewRig {
+    socket_label: String,
+    tui_pane: String,
+    daemon: UnixStream,
+}
+
+impl Drop for PreviewRig {
+    /// The TUI answers a closed daemon stream by starting a real atmd, which
+    /// would outlive the test, so it has to die before `daemon` closes. Its
+    /// death closes the far end, so EOF here means it's gone, zombie or not.
+    fn drop(&mut self) {
+        let tmux = |args: &[&str]| {
+            let _ = Command::new("tmux")
+                .args(["-L", self.socket_label.as_str()])
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        };
+        tmux(&["kill-pane", "-t", self.tui_pane.as_str()]);
+        let _ = self.daemon.set_read_timeout(Some(PREVIEW_STEP_TIMEOUT));
+        let mut buf = [0u8; 1024];
+        loop {
+            match self.daemon.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("the TUI outlived its pane: {e}");
+                    break;
+                }
+            }
+        }
+        tmux(&["kill-session", "-t", "=preview-agents:"]);
+    }
+}
+
+impl PreviewRig {
+    fn screen(&self) -> String {
+        tmux_stdout(
+            &self.socket_label,
+            &["capture-pane", "-p", "-t", self.tui_pane.as_str()],
+        )
+    }
+
+    fn press(&self, key: &str) {
+        tmux_stdout(
+            &self.socket_label,
+            &["send-keys", "-t", self.tui_pane.as_str(), key],
+        );
+    }
+
+    fn send(&mut self, message: &DaemonMessage) {
+        let line = serde_json::to_string(message).expect("serialize");
+        self.daemon
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write to the TUI");
+    }
+
+    /// Waits until the screen satisfies `done`, panicking with the screen at
+    /// the deadline.
+    fn wait_until(&self, step: &str, done: impl Fn(&str) -> bool) {
+        let start = Instant::now();
+        loop {
+            let screen = self.screen();
+            if done(&screen) {
+                return;
+            }
+            assert!(
+                start.elapsed() < PREVIEW_STEP_TIMEOUT,
+                "{step}: timed out, screen:\n{screen}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Waits until the preview shows `marker` and no other pane's marker.
+    fn wait_for_preview(&self, step: &str, marker: &str) {
+        self.wait_until(step, |screen| {
+            PREVIEW_MARKERS
+                .iter()
+                .all(|m| screen.contains(m) == (*m == marker))
+        });
+    }
+}
+
+/// Scenario 6 — the capture preview follows the selected session's pane.
+async fn scenario_tui_capture_preview(env: &E2eEnv) {
+    let label = env.tmux_server.label();
+
+    // One pane per marker, in a session of their own.
+    let mut panes = Vec::new();
+    for (i, marker) in PREVIEW_MARKERS.iter().enumerate() {
+        let print_and_stay = format!("echo {marker}; exec sleep 600");
+        let mut args: Vec<&str> = if i == 0 {
+            vec!["new-session", "-d", "-s", "preview-agents"]
+        } else {
+            vec!["new-window", "-d", "-t", "=preview-agents:"]
+        };
+        args.extend(["-P", "-F", "#{pane_id}", "sh", "-c", &print_and_stay]);
+        panes.push(tmux_stdout(label, &args));
+    }
+    let [pane_a, pane_b, pane_c] = [&panes[0], &panes[1], &panes[2]].map(String::as_str);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("atmd.sock");
+    let subscriber = fake_tui_daemon(
+        &socket,
+        vec![
+            preview_session_a(Some(pane_a)),
+            preview_session_b(Some(pane_b)),
+        ],
+    );
+
+    // A window as big as the session asks for, so the preview has room.
+    let tui_pane = tmux_stdout(
+        label,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "preview-tui",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "-e",
+            &format!("ATM_SOCKET={}", socket.display()),
+            "-e",
+            &format!("ATM_TMUX_SOCKET={label}"),
+            "-e",
+            &format!("XDG_STATE_HOME={}", dir.path().join("state").display()),
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "env",
+            &env.atm_path.display().to_string(),
+        ],
+    );
+    let daemon = subscriber
+        .recv_timeout(PREVIEW_STEP_TIMEOUT)
+        .expect("the TUI subscribes");
+    let mut rig = PreviewRig {
+        socket_label: label.to_string(),
+        tui_pane,
+        daemon,
+    };
+    rig.wait_until("the list arrives", |screen| screen.contains("session-a"));
+
+    // A key: selecting a row targets its pane, and moving on retargets.
+    rig.press("j");
+    rig.wait_for_preview("key to session-a", PREVIEW_MARKERS[0]);
+    rig.press("j");
+    rig.wait_for_preview("key to session-b", PREVIEW_MARKERS[1]);
+
+    // An update that keeps the selected pane leaves the preview alone: it
+    // must not blank until the next capture, which a poll would catch.
+    let start = Instant::now();
+    let mut sent = Duration::ZERO;
+    while start.elapsed() < Duration::from_millis(1500) {
+        if start.elapsed() >= sent {
+            rig.send(&DaemonMessage::session_updated(preview_session_b(Some(
+                pane_b,
+            ))));
+            sent += Duration::from_millis(150);
+        }
+        let screen = rig.screen();
+        assert!(
+            screen.contains(PREVIEW_MARKERS[1]),
+            "same-pane update blanked the preview, screen:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A session update, with no key: the selected session moved pane.
+    rig.send(&DaemonMessage::session_updated(preview_session_b(Some(
+        pane_c,
+    ))));
+    rig.wait_for_preview("update to pane c", PREVIEW_MARKERS[2]);
+
+    // A full list, with no key: the same again.
+    rig.send(&DaemonMessage::session_list(vec![
+        preview_session_a(Some(pane_a)),
+        preview_session_b(Some(pane_b)),
+    ]));
+    rig.wait_for_preview("list back to pane b", PREVIEW_MARKERS[1]);
+
+    // No pane to capture, so nothing would ever replace the old output: only
+    // clearing it empties the preview.
+    rig.send(&DaemonMessage::session_updated(preview_session_b(None)));
+    rig.wait_until("update to no pane", |screen| {
+        PREVIEW_MARKERS.iter().all(|m| !screen.contains(m)) && !screen.contains(" Terminal ")
+    });
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn atm_atmd_tmux_end_to_end() {
     let Some(env) = E2eEnv::try_setup().await else {
@@ -2034,6 +2306,7 @@ async fn atm_atmd_tmux_end_to_end() {
     scenario_workspace_create_rejects_unknown_harness(&env).await;
     scenario_workspace_create_sends_args_ending_in_semicolon(&env).await;
     scenario_workspace_create_sends_default_keys(&env).await;
+    scenario_tui_capture_preview(&env).await;
 }
 
 #[derive(Debug)]

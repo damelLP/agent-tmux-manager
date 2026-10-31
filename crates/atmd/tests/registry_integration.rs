@@ -1012,15 +1012,23 @@ async fn test_project_resolution_on_discovery() {
 // CWD Change Detection Tests
 // ============================================================================
 
+/// The refresh task ticks about 1 ms after it spawns. Waits that out, so a test
+/// proves its own code path requested a lookup, not that tick.
+async fn pass_first_refresh_tick() {
+    sleep(Duration::from_millis(50)).await;
+}
+
 /// Git context resolves off the actor, so a session's branch fills in shortly
 /// after a command. Returns the session's view once its branch is `branch`, or
-/// after a timeout, so the caller's assertions report what it has instead.
+/// after a timeout, so the caller's assertions report what it has instead. The
+/// timeout stays well under the 5 s refresh interval, so a later refresh tick
+/// can't stand in for the code path a test names; see `pass_first_refresh_tick`.
 async fn view_with_branch(
     handle: &RegistryHandle,
     id: &str,
     branch: &str,
 ) -> Option<atm_core::SessionView> {
-    for _ in 0..1000 {
+    for _ in 0..400 {
         let view = handle.get_session(SessionId::new(id)).await?;
         if view.worktree_branch.as_deref() == Some(branch) {
             return Some(view);
@@ -1033,6 +1041,7 @@ async fn view_with_branch(
 #[tokio::test]
 async fn test_status_line_cwd_change_updates_git_info() {
     let handle = spawn_registry();
+    pass_first_refresh_tick().await;
 
     // Create two temp repos to simulate a worktree switch
     let dir = tempfile::tempdir().unwrap();
@@ -1251,6 +1260,7 @@ async fn test_rescan_preserves_metadata_for_existing_pid() {
 #[tokio::test]
 async fn test_rescan_refreshes_git_info() {
     let handle = spawn_registry();
+    pass_first_refresh_tick().await;
 
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("rescan-git-repo");

@@ -10,7 +10,7 @@
 //! - All fallible operations use `?`, pattern matching, or `unwrap_or`
 //! - Channel send failures are logged but don't panic
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -745,9 +745,9 @@ impl RegistryActor {
                 "Creating session from lifecycle event"
             );
             // Read cwd from /proc/{pid}/cwd so a session created
-            // via a vendor adapter event lands grouped under the
-            // right project / branch from frame one. Without this,
-            // lifecycle-event-created sessions fall into the
+            // via a vendor adapter event gets grouped under the
+            // right project / branch once its git lookup lands. Without
+            // this, lifecycle-event-created sessions stay in the
             // "Other" tree bucket because working_directory is None.
             let proc_cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok();
             let session = build_session_from_pid(
@@ -1147,10 +1147,13 @@ impl RegistryActor {
     /// (e.g., `git checkout other-branch` in the same directory).
     fn handle_refresh_git_info(&mut self) {
         let now = Instant::now();
-        for (session, _) in self.sessions_by_pid.values() {
-            if let Some(cwd) = &session.working_directory {
-                self.git_lookups.request(cwd, now);
-            }
+        let cwds: HashSet<&str> = self
+            .sessions_by_pid
+            .values()
+            .filter_map(|(session, _)| session.working_directory.as_deref())
+            .collect();
+        for cwd in cwds {
+            self.git_lookups.request(cwd, now);
         }
 
         for cwd in self.git_lookups.newly_stuck(now) {
@@ -5086,7 +5089,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_updates_every_session_in_the_cwd_in_loop_order() {
+    fn a_result_updates_every_session_in_its_cwd() {
         let (_tx, mut actor, mut event_rx, gate) = create_gated_actor();
         for id in ["s0", "s1", "s2"] {
             register_session_in(&mut actor, session_in(id, "/a"));

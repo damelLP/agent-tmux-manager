@@ -100,12 +100,12 @@ fn setup_installs_the_pi_package_exactly_as_its_source() {
                 "{INSTALLED}/{name} differs from {SOURCE}/{name}, which wins. \
                  Compare with `diff {SOURCE}/{name} {MIRROR}/{name}`, then sync \
                  with `cp {SOURCE}/{name} {MIRROR}/{name}`; if they already \
-                 match, crates/atm/src/setup.rs installs the wrong bytes"
+                 match, crates/atm/src/setup/pi.rs installs the wrong bytes"
             )),
             None => drift.push(format!(
                 "{SOURCE}/{name} is not installed; copy it with \
                  `cp {SOURCE}/{name} {MIRROR}/{name}` and embed it in \
-                 crates/atm/src/setup.rs"
+                 crates/atm/src/setup/pi.rs"
             )),
         }
     }
@@ -113,7 +113,7 @@ fn setup_installs_the_pi_package_exactly_as_its_source() {
         let name = file.display();
         drift.push(format!(
             "{INSTALLED}/{name} has no source; add it as {SOURCE}/{name} \
-             or stop installing it in crates/atm/src/setup.rs"
+             or stop installing it in crates/atm/src/setup/pi.rs"
         ));
     }
     assert!(

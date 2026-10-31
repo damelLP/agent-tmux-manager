@@ -374,6 +374,75 @@ fn remove_hook_command_marker(hooks_array: &mut Vec<Value>, marker: &str) -> usi
     removed
 }
 
+/// Setup's hook loop: for each of `hook_names`, adds `new_entry`'s entry to
+/// that event's array in `settings`' `hooks` object unless a command there
+/// already runs `marker`, printing the outcome. `not_object` is the error
+/// for a `hooks` that isn't an object. Returns how many entries were added.
+fn add_hook_entries(
+    settings: &mut Map<String, Value>,
+    hook_names: impl Iterator<Item = &'static str>,
+    marker: &str,
+    not_object: &'static str,
+    new_entry: impl Fn(&str) -> Value,
+) -> Result<usize> {
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(SetupError::Shape(not_object))?;
+
+    let mut added = 0;
+
+    for hook_type in hook_names {
+        let hooks_array = hooks
+            .entry(hook_type)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or(SetupError::Shape("hook type is not an array"))?;
+
+        if has_hook_command_marker(hooks_array, marker) {
+            println!("    {hook_type} - already configured");
+        } else {
+            hooks_array.push(new_entry(hook_type));
+            added += 1;
+            println!("    {hook_type} - added");
+        }
+    }
+
+    Ok(added)
+}
+
+/// Uninstall's hook loop: for each of `hook_names`, removes the commands
+/// that run `marker` from that event's array in `settings`' `hooks` object,
+/// printing the events that lost one, and drops arrays left empty. Returns
+/// how many commands were removed; the caller writes `settings` back.
+#[must_use]
+fn remove_hook_entries(
+    settings: &mut Map<String, Value>,
+    hook_names: impl Iterator<Item = &'static str>,
+    marker: &str,
+) -> usize {
+    let mut removed = 0;
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for hook_type in hook_names {
+            if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
+                let count = remove_hook_command_marker(hooks_array, marker);
+
+                if count > 0 {
+                    removed += count;
+                    println!("  {hook_type} - removed");
+                }
+
+                // Remove empty arrays
+                if hooks_array.is_empty() {
+                    hooks.remove(hook_type);
+                }
+            }
+        }
+    }
+    removed
+}
+
 /// Writes `content` to `path` (creating parent directories as needed)
 /// and marks it executable.
 fn install_executable_script(path: &Path, content: &str) -> Result<()> {
@@ -740,30 +809,13 @@ fn setup_claude_code() -> Result<()> {
 
     let mut settings = read_settings()?;
 
-    // Ensure hooks object exists
-    let hooks = settings
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or(SetupError::Shape("hooks is not an object"))?;
-
-    let mut added = 0;
-
-    for hook_type in ClaudeEventType::hook_names() {
-        let hooks_array = hooks
-            .entry(hook_type)
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .ok_or(SetupError::Shape("hook type is not an array"))?;
-
-        if has_hook_command_marker(hooks_array, "atm-hook") {
-            println!("    {hook_type} - already configured");
-        } else {
-            hooks_array.push(create_hook_entry(hook_type));
-            added += 1;
-            println!("    {hook_type} - added");
-        }
-    }
+    let added = add_hook_entries(
+        &mut settings,
+        ClaudeEventType::hook_names(),
+        "atm-hook",
+        "hooks is not an object",
+        create_hook_entry,
+    )?;
 
     // statusLine
     let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
@@ -805,31 +857,14 @@ fn setup_codex() -> Result<()> {
     println!("done");
 
     let mut settings = read_codex_hooks()?;
-    let hooks = settings
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or(SetupError::Shape(
-            "hooks is not an object in codex hooks.json",
-        ))?;
 
-    let mut added = 0;
-
-    for hook_type in CodexEventType::hook_names() {
-        let hooks_array = hooks
-            .entry(hook_type)
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .ok_or(SetupError::Shape("hook type is not an array"))?;
-
-        if has_hook_command_marker(hooks_array, "atm-codex-hook") {
-            println!("    {hook_type} - already configured");
-        } else {
-            hooks_array.push(create_codex_hook_entry());
-            added += 1;
-            println!("    {hook_type} - added");
-        }
-    }
+    let added = add_hook_entries(
+        &mut settings,
+        CodexEventType::hook_names(),
+        "atm-codex-hook",
+        "hooks is not an object in codex hooks.json",
+        |_| create_codex_hook_entry(),
+    )?;
 
     if added > 0 {
         write_codex_hooks(&settings)?;
@@ -851,30 +886,11 @@ pub fn uninstall() -> Result<()> {
     println!("Removing Claude Code hooks...");
     let mut settings = or_empty_if_not_object(read_settings())?;
 
-    let mut removed = 0;
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for hook_type in ClaudeEventType::hook_names() {
-            if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
-                let count = remove_hook_command_marker(hooks_array, "atm-hook");
+    let removed = remove_hook_entries(&mut settings, ClaudeEventType::hook_names(), "atm-hook");
 
-                if count > 0 {
-                    removed += count;
-                    println!("  {hook_type} - removed");
-                }
-
-                // Remove empty arrays
-                if hooks_array.is_empty() {
-                    hooks.remove(hook_type);
-                }
-            }
-        }
-
-        if removed > 0 {
-            write_settings(&settings)?;
-        }
-    }
-
-    if removed == 0 {
+    if removed > 0 {
+        write_settings(&settings)?;
+    } else {
         println!("  No hooks found");
     }
 
@@ -938,31 +954,15 @@ pub fn uninstall() -> Result<()> {
     if detect_codex() {
         println!("\nRemoving Codex hooks...");
         let mut codex_settings = or_empty_if_not_object(read_codex_hooks())?;
-        let mut codex_removed = 0;
-        if let Some(hooks) = codex_settings
-            .get_mut("hooks")
-            .and_then(|h| h.as_object_mut())
-        {
-            for hook_type in CodexEventType::hook_names() {
-                if let Some(hooks_array) = hooks.get_mut(hook_type).and_then(|h| h.as_array_mut()) {
-                    let count = remove_hook_command_marker(hooks_array, "atm-codex-hook");
+        let codex_removed = remove_hook_entries(
+            &mut codex_settings,
+            CodexEventType::hook_names(),
+            "atm-codex-hook",
+        );
 
-                    if count > 0 {
-                        codex_removed += count;
-                        println!("  {hook_type} - removed");
-                    }
-
-                    if hooks_array.is_empty() {
-                        hooks.remove(hook_type);
-                    }
-                }
-            }
-
-            if codex_removed > 0 {
-                write_codex_hooks(&codex_settings)?;
-            }
-        }
-        if codex_removed == 0 {
+        if codex_removed > 0 {
+            write_codex_hooks(&codex_settings)?;
+        } else {
             println!("  No hooks found");
         }
     }

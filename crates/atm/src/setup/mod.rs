@@ -289,7 +289,7 @@ mod error_tests {
     use std::io;
     use std::path::Path;
 
-    /// For each `op` string used in this file, Display must match the anyhow
+    /// For each `op` string used in `setup/`, Display must match the anyhow
     /// context string setup printed before SetupError existed (`serialize`
     /// is new: that site had no context).
     #[test]

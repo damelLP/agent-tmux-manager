@@ -382,7 +382,7 @@ async fn test_cleanup_fresh_sessions_not_removed() {
 }
 
 // Note: Testing dead-process cleanup requires sessions with real PIDs
-// that have terminated. The unit tests in actor.rs provide coverage
+// that have terminated. The unit tests in actor/tests.rs provide coverage
 // for the cleanup logic using synthetic PIDs.
 
 // ============================================================================

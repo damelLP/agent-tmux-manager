@@ -231,7 +231,7 @@ impl RegistryActor {
     }
 
     // ========================================================================
-    // Command Handlers
+    // Shared Helpers, Queries and Git Refresh
     // ========================================================================
 
     /// Publishes the current view of the session stored under `pid`.

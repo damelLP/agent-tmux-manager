@@ -24,7 +24,7 @@ use atm_core::{
 };
 
 use super::commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
-use super::git::{GitContext, GitLookups};
+use super::git::{GitContext, GitLookups, GitResult};
 use super::infra::SessionInfrastructure;
 use crate::discovery::read_parent_session_id;
 
@@ -89,7 +89,7 @@ pub struct RegistryActor {
     git_lookups: GitLookups,
 
     /// Where finished git-context lookups report back.
-    git_results: mpsc::UnboundedReceiver<(String, GitContext)>,
+    git_results: mpsc::UnboundedReceiver<GitResult>,
 }
 
 impl RegistryActor {
@@ -1162,10 +1162,14 @@ impl RegistryActor {
     }
 
     /// Applies a finished git-context lookup to every session in `cwd`,
-    /// children included. A session that has left `cwd` keeps its fields.
-    fn apply_git_result(&mut self, cwd: String, context: GitContext) {
+    /// children included. A session that has left `cwd` keeps its fields, and
+    /// so does every session when the lookup panicked.
+    fn apply_git_result(&mut self, cwd: String, context: Option<GitContext>) {
         self.git_lookups.finished(&cwd);
-        let (new_project_root, new_wt_path, new_wt_branch) = context;
+        let Some((new_project_root, new_wt_path, new_wt_branch)) = context else {
+            warn!(cwd = %cwd, "Git lookup panicked; the next refresh retries");
+            return;
+        };
         let mut updated_pids = Vec::new();
 
         for (pid, (session, _)) in self.sessions_by_pid.iter_mut() {
@@ -5181,7 +5185,7 @@ mod tests {
         gate.expect_call("/b");
         drain_events(&mut event_rx);
 
-        actor.apply_git_result("/a".to_string(), gated_context("/a"));
+        actor.apply_git_result("/a".to_string(), Some(gated_context("/a")));
 
         let (events, _) = drain_events(&mut event_rx);
         assert!(events.is_empty(), "unexpected events: {events:?}");
@@ -5319,5 +5323,53 @@ mod tests {
             .unwrap();
         // `gate` still holds the lookup blocked here.
         drop(gate);
+    }
+
+    /// An actor whose git lookups panic on the given calls, counted from 0, and
+    /// otherwise answer [`gated_context`] at once.
+    fn create_actor_with_panicking_lookups(
+        panic_on: &'static [usize],
+    ) -> (RegistryActor, broadcast::Receiver<SessionEvent>) {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (_, cmd_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let actor = RegistryActor::with_git_resolver(cmd_rx, event_tx, move |cwd: &str| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(!panic_on.contains(&call), "lookup {call} fails");
+            gated_context(cwd)
+        });
+        (actor, event_rx)
+    }
+
+    #[test]
+    fn a_panicking_lookup_frees_its_slot_and_the_next_refresh_fills_the_fields() {
+        let (mut actor, mut event_rx) = create_actor_with_panicking_lookups(&[0]);
+        register_session_in(&mut actor, session_in("unlucky", "/a"));
+        actor.finish_git_lookups();
+        assert_no_git_fields(&session_view(&actor, "unlucky").unwrap());
+        let (events, _) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Registered unlucky"]);
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+        actor.finish_git_lookups();
+
+        let (events, views) = drain_events(&mut event_rx);
+        assert_eq!(events, ["Updated unlucky"]);
+        assert_gated_git_fields(&views[0], "/a");
+    }
+
+    #[test]
+    fn a_panicking_lookup_leaves_good_fields_alone() {
+        let (mut actor, mut event_rx) = create_actor_with_panicking_lookups(&[1]);
+        register_session_in(&mut actor, session_in("lucky", "/a"));
+        actor.finish_git_lookups();
+        drain_events(&mut event_rx);
+
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+        actor.finish_git_lookups();
+
+        let (events, _) = drain_events(&mut event_rx);
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert_gated_git_fields(&session_view(&actor, "lucky").unwrap(), "/a");
     }
 }

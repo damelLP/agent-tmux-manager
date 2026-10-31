@@ -7,6 +7,7 @@
 //! waits for a lookup; results reach it on one channel.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,9 @@ use tracing::warn;
 
 /// A directory's project root, worktree path and worktree branch.
 pub(super) type GitContext = (Option<String>, Option<String>, Option<String>);
+
+/// A finished lookup: its directory, and its context unless it panicked.
+pub(super) type GitResult = (String, Option<GitContext>);
 
 /// How long a lookup runs before it counts as stuck.
 const STUCK_AFTER: Duration = Duration::from_secs(5);
@@ -30,7 +34,7 @@ struct InFlight {
 /// filesystem costs one thread per directory.
 pub(super) struct GitLookups {
     resolve: Arc<dyn Fn(&str) -> GitContext + Send + Sync>,
-    results: mpsc::UnboundedSender<(String, GitContext)>,
+    results: mpsc::UnboundedSender<GitResult>,
     in_flight: HashMap<String, InFlight>,
 }
 
@@ -39,7 +43,7 @@ impl GitLookups {
     /// their results arrive on.
     pub(super) fn new(
         resolve: impl Fn(&str) -> GitContext + Send + Sync + 'static,
-    ) -> (Self, mpsc::UnboundedReceiver<(String, GitContext)>) {
+    ) -> (Self, mpsc::UnboundedReceiver<GitResult>) {
         let (results, receiver) = mpsc::unbounded_channel();
         let lookups = Self {
             resolve: Arc::new(resolve),
@@ -61,7 +65,10 @@ impl GitLookups {
         let spawned = std::thread::Builder::new()
             .name("atmd-git-lookup".to_string())
             .spawn(move || {
-                let context = resolve(&thread_cwd);
+                // A panic must still report back, or the slot leaks and this
+                // directory never gets another lookup. The production resolver
+                // keeps no state for a panic to leave broken.
+                let context = catch_unwind(AssertUnwindSafe(|| resolve(&thread_cwd))).ok();
                 // A send error means the actor is gone.
                 let _ = results.send((thread_cwd, context));
             });
@@ -108,6 +115,7 @@ impl GitLookups {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::mpsc as std_mpsc;
     use std::sync::Mutex;
 
@@ -120,10 +128,9 @@ mod tests {
 
     /// A resolver that reports each call, and blocks on [`HUNG`] until the
     /// returned release sender sends or drops.
-    #[allow(clippy::type_complexity)]
     fn lookups() -> (
         GitLookups,
-        mpsc::UnboundedReceiver<(String, GitContext)>,
+        mpsc::UnboundedReceiver<GitResult>,
         std_mpsc::Receiver<String>,
         std_mpsc::Sender<()>,
     ) {
@@ -140,9 +147,7 @@ mod tests {
         (lookups, results, calls, release)
     }
 
-    async fn next_result(
-        results: &mut mpsc::UnboundedReceiver<(String, GitContext)>,
-    ) -> (String, GitContext) {
+    async fn next_result(results: &mut mpsc::UnboundedReceiver<GitResult>) -> GitResult {
         tokio::time::timeout(WAIT, results.recv())
             .await
             .expect("a result within the timeout")
@@ -163,7 +168,7 @@ mod tests {
 
         let (cwd, context) = next_result(&mut results).await;
         assert_eq!(cwd, "/repo");
-        assert_eq!(context, context_of("/repo"));
+        assert_eq!(context, Some(context_of("/repo")));
     }
 
     #[tokio::test]
@@ -255,5 +260,29 @@ mod tests {
         lookups.request(HUNG, stuck);
         assert_eq!(calls.recv_timeout(WAIT).unwrap(), HUNG);
         assert_eq!(lookups.newly_stuck(stuck + STUCK_AFTER), [HUNG]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_lookup_reports_no_context_and_the_next_request_runs_again() {
+        let calls = AtomicUsize::new(0);
+        let (mut lookups, mut results) = GitLookups::new(move |cwd: &str| {
+            if calls.fetch_add(1, SeqCst) == 0 {
+                panic!("first lookup fails");
+            }
+            context_of(cwd)
+        });
+        let now = Instant::now();
+
+        lookups.request("/repo", now);
+        let (cwd, context) = next_result(&mut results).await;
+        assert_eq!(cwd, "/repo");
+        assert_eq!(context, None);
+        lookups.finished(&cwd);
+        assert!(lookups.newly_stuck(now + STUCK_AFTER).is_empty());
+
+        lookups.request("/repo", now);
+        let (cwd, context) = next_result(&mut results).await;
+        assert_eq!(cwd, "/repo");
+        assert_eq!(context, Some(context_of("/repo")));
     }
 }

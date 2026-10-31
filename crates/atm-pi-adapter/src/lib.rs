@@ -173,7 +173,7 @@
 //!   on one file; `/resume` of an open session is unverified. Both
 //!   processes send the same `session_id`. atmd keeps a row per pid
 //!   (`atm list` showed both), but removing either pid un-indexes the id
-//!   (`handle_remove_by_pid`, atmd `registry/actor.rs:996`), and the TUI
+//!   (`handle_remove_by_pid`, atmd `registry/actor/remove.rs`), and the TUI
 //!   keys rows by `SessionId` (atm-tui `app.rs:55`), so the two collapse
 //!   into one. Claude has the same case with `claude --resume`. Queued as
 //!   "one session id held by two pids". Older pi-atm sent no

@@ -3,6 +3,9 @@
 //! file's bytes. The event lists are written out, so adding an event to an
 //! adapter means adding it here too.
 //!
+//! These pin today's behaviour, quirks included, so the loops can be
+//! refactored safely. A deliberate behaviour fix updates them.
+//!
 //! Every run gets its own HOME and XDG dirs in a temp dir, so nothing
 //! reaches the real harness configs, a daemon or tmux.
 #![cfg(target_os = "linux")]
@@ -21,6 +24,12 @@ struct Harness {
     script: &'static str,
     other_script: &'static str,
     events: &'static [&'static str],
+    /// The events whose entry carries `"matcher": "*"`.
+    matcher_events: &'static [&'static str],
+    /// The `timeout` on each command, if the harness's entries set one.
+    timeout: Option<u64>,
+    /// Whether setup also installs a statusLine.
+    has_status_line: bool,
     not_object: &'static str,
     /// Setup's "Detected coding agents" lines with only this harness present.
     detected: &'static str,
@@ -55,6 +64,14 @@ const CLAUDE: Harness = Harness {
         "TaskCreated",
         "TaskCompleted",
     ],
+    matcher_events: &[
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PermissionRequest",
+    ],
+    timeout: None,
+    has_status_line: true,
     not_object: "hooks is not an object",
     detected: "  ✓ Claude Code  (~/.claude/)\n  \
                ✗ pi           (~/.pi/agent/ not present)\n  \
@@ -82,6 +99,9 @@ const CODEX: Harness = Harness {
         "PreCompact",
         "PostCompact",
     ],
+    matcher_events: &[],
+    timeout: Some(5),
+    has_status_line: false,
     not_object: "hooks is not an object in codex hooks.json",
     detected: "  ✗ Claude Code  (~/.claude/ not present)\n  \
                ✗ pi           (~/.pi/agent/ not present)\n  \
@@ -113,17 +133,15 @@ impl Harness {
 
     /// The entry setup writes for `event`.
     fn entry(&self, home: &Path, event: &str) -> Value {
-        let command = self.script_path(home);
-        if self.script == CODEX.script {
-            return json!({"hooks": [{"type": "command", "command": command, "timeout": 5}]});
+        let mut command = json!({"type": "command", "command": self.script_path(home)});
+        if let Some(timeout) = self.timeout {
+            command["timeout"] = json!(timeout);
         }
-        let hooks = json!([{"type": "command", "command": command}]);
-        match event {
-            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionRequest" => {
-                json!({"matcher": "*", "hooks": hooks})
-            }
-            _ => json!({"hooks": hooks}),
+        let mut entry = json!({"hooks": [command]});
+        if self.matcher_events.contains(&event) {
+            entry["matcher"] = json!("*");
         }
+        entry
     }
 
     /// The whole file setup writes into an empty home.
@@ -134,7 +152,7 @@ impl Harness {
             .map(|event| ((*event).to_string(), json!([self.entry(home, event)])))
             .collect();
         let mut settings = json!({"hooks": hooks});
-        if self.script == CLAUDE.script {
+        if self.has_status_line {
             settings["statusLine"] = json!({"type": "command", "command": self.script_path(home)});
         }
         settings
@@ -178,17 +196,16 @@ impl Harness {
     ) -> String {
         let claude = script_path(home, CLAUDE.script);
         let codex = script_path(home, CODEX.script);
-        let (claude_lines, claude_script, codex_section, codex_script) =
-            if self.script == CLAUDE.script {
-                (hook_lines, script_outcome, String::new(), "not found")
-            } else {
-                (
-                    "  No hooks found\n",
-                    "not found",
-                    format!("\nRemoving Codex hooks...\n{hook_lines}"),
-                    script_outcome,
-                )
-            };
+        let (claude_lines, claude_script, codex_section, codex_script) = if self.has_status_line {
+            (hook_lines, script_outcome, String::new(), "not found")
+        } else {
+            (
+                "  No hooks found\n",
+                "not found",
+                format!("\nRemoving Codex hooks...\n{hook_lines}"),
+                script_outcome,
+            )
+        };
         format!(
             "Uninstalling ATM...\n\nRemoving Claude Code hooks...\n{claude_lines}\n{status_line}\n\n\
              Removing hook script {claude}... {claude_script}\n{codex_section}\n\

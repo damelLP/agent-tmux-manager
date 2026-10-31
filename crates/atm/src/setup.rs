@@ -414,8 +414,9 @@ fn add_hook_entries(
 
 /// Uninstall's hook loop: for each of `hook_names`, removes the commands
 /// that run `marker` from that event's array in `settings`' `hooks` object,
-/// printing the events that lost one, and drops arrays left empty. Returns
-/// how many commands were removed; the caller writes `settings` back.
+/// printing the events that lost one, and drops the array if it's empty,
+/// even if it already was. So `settings` can change when this returns 0.
+/// Returns how many commands were removed; writing is up to the caller.
 #[must_use]
 fn remove_hook_entries(
     settings: &mut Map<String, Value>,

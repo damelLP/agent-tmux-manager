@@ -54,9 +54,11 @@
 //!
 //! 6. **The TUI's capture preview**: the real `atm` runs in a pane and
 //!    previews panes that each print their own marker. Its daemon is a
-//!    stand-in, so a key, a session update and a full session list each fire
-//!    on their own: a real atmd's events come with others, and any key press
-//!    also syncs the capture target, which would hide a missing sync.
+//!    stand-in, so a key, a session update, a full session list and a removal
+//!    each fire on their own: a real atmd's events come with others, and any
+//!    key press also syncs the capture target, which would hide a missing
+//!    sync. A second TUI runs under `--tmux-session`, whose filter hides the
+//!    selected session once its pane leaves that tmux session.
 //!
 //! The test skips cleanly (printed message, returns Ok) when `tmux` is
 //! absent from PATH, when the binaries weren't built, or — for scenario
@@ -2083,6 +2085,10 @@ fn preview_session_b(pane: Option<&str>) -> SessionView {
     preview_session("session-b", "2026-01-01T00:00:01Z", pane)
 }
 
+fn preview_session_c(pane: Option<&str>) -> SessionView {
+    preview_session("session-c", "2026-01-01T00:00:00Z", pane)
+}
+
 /// The real TUI in a pane, and the stream that feeds it daemon events, once
 /// it has subscribed.
 struct PreviewRig {
@@ -2122,6 +2128,7 @@ impl Drop for PreviewRig {
             }
         }
         tmux(&["kill-session", "-t", "=preview-agents:"]);
+        tmux(&["kill-session", "-t", "=preview-hold:"]);
     }
 }
 
@@ -2174,13 +2181,17 @@ impl PreviewRig {
                 .all(|m| screen.contains(m) == (*m == marker))
         });
     }
+
+    /// Waits until the preview is gone, with no pane's marker left on screen.
+    fn wait_for_no_preview(&self, step: &str) {
+        self.wait_until(step, |screen| {
+            PREVIEW_MARKERS.iter().all(|m| !screen.contains(m)) && !screen.contains(" Terminal ")
+        });
+    }
 }
 
-/// Scenario 6 — the capture preview follows the selected session's pane.
-async fn scenario_tui_capture_preview(env: &E2eEnv) {
-    let label = env.tmux_server.label();
-
-    // One pane per marker, in a session of their own.
+/// One pane per marker, in a session of their own, in `PREVIEW_MARKERS` order.
+fn start_preview_panes(label: &str) -> Vec<String> {
     let mut panes = Vec::new();
     for (i, marker) in PREVIEW_MARKERS.iter().enumerate() {
         let print_and_stay = format!("echo {marker}; exec sleep 600");
@@ -2192,43 +2203,50 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
         args.extend(["-P", "-F", "#{pane_id}", "sh", "-c", &print_and_stay]);
         panes.push(tmux_stdout(label, &args));
     }
-    let [pane_a, pane_b, pane_c] = [&panes[0], &panes[1], &panes[2]].map(String::as_str);
+    panes
+}
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket = dir.path().join("atmd.sock");
-    let subscriber = fake_tui_daemon(
-        &socket,
-        vec![
-            preview_session_a(Some(pane_a)),
-            preview_session_b(Some(pane_b)),
-        ],
-    );
+/// Starts the real TUI with `atm_args` against a stand-in daemon that lists
+/// `sessions`, and waits until the list is on screen. `dir` holds the socket
+/// and the TUI's state, so it has to outlive the returned rig.
+fn start_preview_tui(
+    env: &E2eEnv,
+    dir: &Path,
+    sessions: Vec<SessionView>,
+    atm_args: &[&str],
+) -> PreviewRig {
+    let label = env.tmux_server.label();
+    let socket = dir.join("atmd.sock");
+    let subscriber = fake_tui_daemon(&socket, sessions);
 
     // A window as big as the session asks for, so the preview has room.
-    let tui_pane = tmux_stdout(
-        label,
-        &[
-            "new-session",
-            "-d",
-            "-s",
-            "preview-tui",
-            "-x",
-            "120",
-            "-y",
-            "40",
-            "-e",
-            &format!("ATM_SOCKET={}", socket.display()),
-            "-e",
-            &format!("ATM_TMUX_SOCKET={label}"),
-            "-e",
-            &format!("XDG_STATE_HOME={}", dir.path().join("state").display()),
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "env",
-            &env.atm_path.display().to_string(),
-        ],
-    );
+    let socket_env = format!("ATM_SOCKET={}", socket.display());
+    let tmux_env = format!("ATM_TMUX_SOCKET={label}");
+    let state_env = format!("XDG_STATE_HOME={}", dir.join("state").display());
+    let atm_path = env.atm_path.display().to_string();
+    let mut args = vec![
+        "new-session",
+        "-d",
+        "-s",
+        "preview-tui",
+        "-x",
+        "120",
+        "-y",
+        "40",
+        "-e",
+        &socket_env,
+        "-e",
+        &tmux_env,
+        "-e",
+        &state_env,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "env",
+        &atm_path,
+    ];
+    args.extend_from_slice(atm_args);
+    let tui_pane = tmux_stdout(label, &args);
     let mut rig = PreviewRig {
         socket_label: label.to_string(),
         tui_pane,
@@ -2239,6 +2257,25 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
         .unwrap_or_else(|e| panic!("the TUI didn't subscribe: {e}, screen:\n{}", rig.screen()));
     rig.daemon = Some(daemon);
     rig.wait_until("the list arrives", |screen| screen.contains("session-a"));
+    rig
+}
+
+/// Scenario 6 — the capture preview follows the selected session's pane.
+async fn scenario_tui_capture_preview(env: &E2eEnv) {
+    let label = env.tmux_server.label();
+    let panes = start_preview_panes(label);
+    let [pane_a, pane_b, pane_c] = [&panes[0], &panes[1], &panes[2]].map(String::as_str);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut rig = start_preview_tui(
+        env,
+        dir.path(),
+        vec![
+            preview_session_a(Some(pane_a)),
+            preview_session_b(Some(pane_b)),
+        ],
+        &[],
+    );
 
     // A key: selecting a row targets its pane, and moving on retargets.
     rig.press("j");
@@ -2284,6 +2321,80 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
     rig.wait_until("update to no pane", |screen| {
         PREVIEW_MARKERS.iter().all(|m| !screen.contains(m)) && !screen.contains(" Terminal ")
     });
+
+    // Removals, with no key. The cursor holds its row index, so `session-b`,
+    // the second agent, is selected again after each full list.
+    let all_three = || {
+        DaemonMessage::session_list(vec![
+            preview_session_a(Some(pane_a)),
+            preview_session_b(Some(pane_b)),
+            preview_session_c(Some(pane_c)),
+        ])
+    };
+    rig.send(&all_three());
+    rig.wait_for_preview("list of three", PREVIEW_MARKERS[1]);
+
+    // The selected session goes, and the next one takes its row.
+    rig.send(&DaemonMessage::session_removed(SessionId::new("session-b")));
+    rig.wait_for_preview("remove selected session-b", PREVIEW_MARKERS[2]);
+
+    // A session above the selection goes, so the cursor lands on another row.
+    rig.send(&all_three());
+    rig.wait_for_preview("list of three again", PREVIEW_MARKERS[1]);
+    rig.send(&DaemonMessage::session_removed(SessionId::new("session-a")));
+    rig.wait_for_preview("remove session-a above the cursor", PREVIEW_MARKERS[2]);
+
+    // The selected session was the last row, so the cursor clamps up.
+    rig.send(&DaemonMessage::session_removed(SessionId::new("session-c")));
+    rig.wait_for_preview("remove last-row session-c", PREVIEW_MARKERS[1]);
+
+    // Nothing left to select, so nothing would ever replace the old output.
+    rig.send(&DaemonMessage::session_removed(SessionId::new("session-b")));
+    rig.wait_for_no_preview("remove the only session");
+}
+
+/// Scenario 6, under `--tmux-session`: the preview follows the selection when
+/// the filter hides the selected session. The TUI's own filter task sends
+/// `FilterUpdate`, so a pane has to really leave the tmux session.
+async fn scenario_tui_capture_preview_filter(env: &E2eEnv) {
+    let label = env.tmux_server.label();
+    let panes = start_preview_panes(label);
+    let [pane_a, pane_b, pane_c] = [&panes[0], &panes[1], &panes[2]].map(String::as_str);
+    tmux_stdout(
+        label,
+        &["new-session", "-d", "-s", "preview-hold", "sleep", "600"],
+    );
+    let hide = |pane: &str| {
+        tmux_stdout(
+            label,
+            &["break-pane", "-d", "-s", pane, "-t", "=preview-hold:"],
+        );
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rig = start_preview_tui(
+        env,
+        dir.path(),
+        vec![
+            preview_session_a(Some(pane_a)),
+            preview_session_b(Some(pane_b)),
+            preview_session_c(Some(pane_c)),
+        ],
+        &["--tmux-session", "preview-agents"],
+    );
+    rig.press("j");
+    rig.wait_for_preview("filter: key to session-a", PREVIEW_MARKERS[0]);
+    rig.press("j");
+    rig.wait_for_preview("filter: key to session-b", PREVIEW_MARKERS[1]);
+
+    // The selected session is hidden, and the next one takes its row.
+    hide(pane_b);
+    rig.wait_for_preview("filter hides selected session-b", PREVIEW_MARKERS[2]);
+
+    // Every session is hidden, so there is nothing to select.
+    hide(pane_a);
+    hide(pane_c);
+    rig.wait_for_no_preview("filter hides every session");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2315,6 +2426,7 @@ async fn atm_atmd_tmux_end_to_end() {
     scenario_workspace_create_sends_args_ending_in_semicolon(&env).await;
     scenario_workspace_create_sends_default_keys(&env).await;
     scenario_tui_capture_preview(&env).await;
+    scenario_tui_capture_preview_filter(&env).await;
 }
 
 #[derive(Debug)]

@@ -2083,17 +2083,20 @@ fn preview_session_b(pane: Option<&str>) -> SessionView {
     preview_session("session-b", "2026-01-01T00:00:01Z", pane)
 }
 
-/// The real TUI in a pane, and the stream that feeds it daemon events.
+/// The real TUI in a pane, and the stream that feeds it daemon events, once
+/// it has subscribed.
 struct PreviewRig {
     socket_label: String,
     tui_pane: String,
-    daemon: UnixStream,
+    daemon: Option<UnixStream>,
 }
 
 impl Drop for PreviewRig {
-    /// The TUI answers a closed daemon stream by starting a real atmd, which
-    /// would outlive the test, so it has to die before `daemon` closes. Its
-    /// death closes the far end, so EOF here means it's gone, zombie or not.
+    /// The TUI answers a closed daemon stream or a missing socket by starting
+    /// a real atmd, which would outlive the test, so it has to die before
+    /// `daemon` closes and the socket's temp dir goes. Its death closes the far
+    /// end, so EOF here means it's gone, zombie or not. A TUI that never
+    /// subscribed gets only the pane's hangup.
     fn drop(&mut self) {
         let tmux = |args: &[&str]| {
             let _ = Command::new("tmux")
@@ -2104,15 +2107,17 @@ impl Drop for PreviewRig {
                 .status();
         };
         tmux(&["kill-pane", "-t", self.tui_pane.as_str()]);
-        let _ = self.daemon.set_read_timeout(Some(PREVIEW_STEP_TIMEOUT));
-        let mut buf = [0u8; 1024];
-        loop {
-            match self.daemon.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("the TUI outlived its pane: {e}");
-                    break;
+        if let Some(daemon) = &mut self.daemon {
+            let _ = daemon.set_read_timeout(Some(PREVIEW_STEP_TIMEOUT));
+            let mut buf = [0u8; 1024];
+            loop {
+                match daemon.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("the TUI outlived its pane: {e}");
+                        break;
+                    }
                 }
             }
         }
@@ -2138,6 +2143,8 @@ impl PreviewRig {
     fn send(&mut self, message: &DaemonMessage) {
         let line = serde_json::to_string(message).expect("serialize");
         self.daemon
+            .as_mut()
+            .expect("the TUI subscribed")
             .write_all(format!("{line}\n").as_bytes())
             .expect("write to the TUI");
     }
@@ -2222,14 +2229,15 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
             &env.atm_path.display().to_string(),
         ],
     );
-    let daemon = subscriber
-        .recv_timeout(PREVIEW_STEP_TIMEOUT)
-        .expect("the TUI subscribes");
     let mut rig = PreviewRig {
         socket_label: label.to_string(),
         tui_pane,
-        daemon,
+        daemon: None,
     };
+    let daemon = subscriber
+        .recv_timeout(PREVIEW_STEP_TIMEOUT)
+        .unwrap_or_else(|e| panic!("the TUI didn't subscribe: {e}, screen:\n{}", rig.screen()));
+    rig.daemon = Some(daemon);
     rig.wait_until("the list arrives", |screen| screen.contains("session-a"));
 
     // A key: selecting a row targets its pane, and moving on retargets.

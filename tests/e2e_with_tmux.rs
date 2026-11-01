@@ -2369,9 +2369,9 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
     rig.send(&DaemonMessage::session_removed(SessionId::new("session-b")));
     rig.wait_for_no_preview("remove the only session");
 
-    // The old output has to be dropped too. With its pane gone, no capture
-    // would replace it, so it would show again when the session comes back.
-    // The emptied tree reset the cursor to the header, hence the key.
+    // A sync with nothing selected still drops the old output. With its pane
+    // gone, no capture would replace it if it showed again. The emptied tree
+    // left the cursor on the header, hence the key.
     tmux_stdout(label, &["kill-pane", "-t", pane_b]);
     rig.send(&DaemonMessage::session_updated(preview_session_b(Some(
         pane_b,

@@ -2364,9 +2364,25 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
     rig.send(&DaemonMessage::session_removed(SessionId::new("session-c")));
     rig.wait_for_preview("remove last-row session-c", PREVIEW_MARKERS[1]);
 
-    // Nothing left to select, so nothing would ever replace the old output.
+    // Nothing left to select. The panel draws no output then, stale or not, so
+    // this covers only the cleared layout.
     rig.send(&DaemonMessage::session_removed(SessionId::new("session-b")));
     rig.wait_for_no_preview("remove the only session");
+
+    // The old output has to be dropped too. With its pane gone, no capture
+    // would replace it, so it would show again when the session comes back.
+    // The emptied tree reset the cursor to the header, hence the key.
+    tmux_stdout(label, &["kill-pane", "-t", pane_b]);
+    rig.send(&DaemonMessage::session_updated(preview_session_b(Some(
+        pane_b,
+    ))));
+    rig.wait_until("session-b comes back", |screen| {
+        screen.contains("session-b")
+    });
+    rig.press("j");
+    rig.wait_until("the removed session's output stays gone", |screen| {
+        screen.contains("ID: session-b") && PREVIEW_MARKERS.iter().all(|m| !screen.contains(m))
+    });
 }
 
 /// Scenario 6, under `--tmux-session`: the preview follows the selection when
@@ -2407,7 +2423,10 @@ async fn scenario_tui_capture_preview_filter(env: &E2eEnv) {
     hide(pane_b);
     rig.wait_for_preview("filter hides selected session-b", PREVIEW_MARKERS[2]);
 
-    // Every session is hidden, so there is nothing to select.
+    // Every session is hidden, so there is nothing to select. The panel draws
+    // no output then, so this covers only the cleared layout. Unlike a removal,
+    // it can't check the output was dropped: a hidden session only comes back
+    // with its pane alive, so a capture would replace the output anyway.
     hide(pane_a);
     hide(pane_c);
     rig.wait_for_no_preview("filter hides every session");

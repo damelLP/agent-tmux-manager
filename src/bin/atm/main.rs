@@ -432,6 +432,8 @@ async fn run_event_loop(
         app.tick();
         app.now = chrono::Utc::now();
         beads_dir_tx.send_replace(app.selected_beads_dir().map(str::to_owned));
+        // Every frame, so any event that moves the selection moves the preview
+        sync_capture_target(app, capture_pane_tx);
 
         // Render the UI and capture viewport height for half-page navigation
         terminal.draw(|frame| {
@@ -679,10 +681,6 @@ async fn run_event_loop(
                             }
                         }
                     }
-
-                    // After any key (actions, search edits, filter clear),
-                    // check if selected pane changed
-                    sync_capture_target(app, capture_pane_tx);
                 }
                 Event::CaptureUpdate { pane_id, lines } => {
                     app.update_capture(&pane_id, lines);
@@ -696,14 +694,10 @@ async fn run_event_loop(
                 Event::SessionUpdate(sessions) => {
                     debug!(count = sessions.len(), "Received session update");
                     app.update_sessions(sessions);
-                    // Sessions may have changed — update capture target
-                    sync_capture_target(app, capture_pane_tx);
                 }
                 Event::SessionListReplace(sessions) => {
                     debug!(count = sessions.len(), "Received full session list");
                     app.replace_sessions(sessions);
-                    // Sessions replaced — update capture target
-                    sync_capture_target(app, capture_pane_tx);
                 }
                 Event::SessionRemoved(session_id) => {
                     debug!(session_id = %session_id, "Session removed");

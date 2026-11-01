@@ -394,6 +394,20 @@ fn spawn_beads_task(
 // Main Event Loop
 // ============================================================================
 
+/// Points the capture task at the selected session's pane when that pane
+/// changed, dropping the old pane's output.
+fn sync_capture_target(
+    app: &mut App,
+    capture_pane_tx: &tokio::sync::watch::Sender<Option<String>>,
+) {
+    let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
+    if app.capture_pane_id != new_pane {
+        app.capture_pane_id.clone_from(&new_pane);
+        app.captured_output.clear();
+        let _ = capture_pane_tx.send(new_pane);
+    }
+}
+
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -668,12 +682,7 @@ async fn run_event_loop(
 
                     // After any key (actions, search edits, filter clear),
                     // check if selected pane changed
-                    let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
-                    if app.capture_pane_id != new_pane {
-                        app.capture_pane_id.clone_from(&new_pane);
-                        app.captured_output.clear();
-                        let _ = capture_pane_tx.send(new_pane);
-                    }
+                    sync_capture_target(app, capture_pane_tx);
                 }
                 Event::CaptureUpdate { pane_id, lines } => {
                     app.update_capture(&pane_id, lines);
@@ -688,23 +697,13 @@ async fn run_event_loop(
                     debug!(count = sessions.len(), "Received session update");
                     app.update_sessions(sessions);
                     // Sessions may have changed — update capture target
-                    let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
-                    if app.capture_pane_id != new_pane {
-                        app.capture_pane_id.clone_from(&new_pane);
-                        app.captured_output.clear();
-                        let _ = capture_pane_tx.send(new_pane);
-                    }
+                    sync_capture_target(app, capture_pane_tx);
                 }
                 Event::SessionListReplace(sessions) => {
                     debug!(count = sessions.len(), "Received full session list");
                     app.replace_sessions(sessions);
                     // Sessions replaced — update capture target
-                    let new_pane = app.selected_session().and_then(|s| s.tmux_pane.clone());
-                    if app.capture_pane_id != new_pane {
-                        app.capture_pane_id.clone_from(&new_pane);
-                        app.captured_output.clear();
-                        let _ = capture_pane_tx.send(new_pane);
-                    }
+                    sync_capture_target(app, capture_pane_tx);
                 }
                 Event::SessionRemoved(session_id) => {
                     debug!(session_id = %session_id, "Session removed");

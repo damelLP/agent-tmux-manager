@@ -327,12 +327,12 @@ fn spawn_keyboard_task(
 
 /// Spawns a task that periodically captures the selected agent's tmux pane output.
 fn spawn_capture_task(
+    client: impl TmuxClient + 'static,
     event_tx: mpsc::UnboundedSender<Event>,
     cancel_token: CancellationToken,
     capture_pane_rx: tokio::sync::watch::Receiver<Option<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let client = RealTmuxClient::new();
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
@@ -1888,7 +1888,12 @@ async fn main() -> Result<()> {
 
     // Create watch channel for selected pane ID and spawn capture polling task
     let (capture_pane_tx, capture_pane_rx) = tokio::sync::watch::channel(None::<String>);
-    let capture_handle = spawn_capture_task(event_tx, cancel_token.clone(), capture_pane_rx);
+    let capture_handle = spawn_capture_task(
+        RealTmuxClient::new(),
+        event_tx,
+        cancel_token.clone(),
+        capture_pane_rx,
+    );
 
     let result = run_event_loop(
         &mut terminal,
@@ -2483,5 +2488,97 @@ mod send_tests {
             needs_input(row("else-dddd", Some("%9"), None)),
         ];
         assert_eq!(reason(&other_pane, "lead"), None);
+    }
+}
+
+#[cfg(test)]
+mod capture_task_tests {
+    use super::{spawn_capture_task, Event};
+    use atm_tmux::MockTmuxClient;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    struct Rig {
+        events: mpsc::UnboundedReceiver<Event>,
+        target: watch::Sender<Option<String>>,
+        cancel: CancellationToken,
+        handle: JoinHandle<()>,
+    }
+
+    fn rig(start: Option<&str>) -> Rig {
+        let client = MockTmuxClient::new();
+        client.set_pane_content("%1", vec!["one".to_string()]);
+        client.set_pane_content("%2", vec!["two".to_string()]);
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (target, target_rx) = watch::channel(start.map(str::to_string));
+        let cancel = CancellationToken::new();
+        let handle = spawn_capture_task(client, event_tx, cancel.clone(), target_rx);
+        Rig {
+            events,
+            target,
+            cancel,
+            handle,
+        }
+    }
+
+    /// The next capture within `within`, by pane id and first line. The clock
+    /// is paused and the mock has no real I/O, so time moves only when
+    /// every task is idle: this deadline and the 1 s tick can't race.
+    async fn next_capture(rig: &mut Rig, within: Duration) -> Option<(String, String)> {
+        match timeout(within, rig.events.recv()).await {
+            Ok(Some(Event::CaptureUpdate { pane_id, lines })) => Some((pane_id, lines.join("\n"))),
+            Ok(_) => panic!("expected a capture"),
+            Err(_) => None,
+        }
+    }
+
+    fn capture(pane: &str, text: &str) -> Option<(String, String)> {
+        Some((pane.to_string(), text.to_string()))
+    }
+
+    const WELL_BEFORE_THE_TICK: Duration = Duration::from_millis(500);
+    const PAST_THE_TICK: Duration = Duration::from_millis(1100);
+
+    #[tokio::test(start_paused = true)]
+    async fn the_target_keeps_refreshing_on_the_tick() {
+        let mut rig = rig(Some("%1"));
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+
+        assert_eq!(next_capture(&mut rig, WELL_BEFORE_THE_TICK).await, None);
+        assert_eq!(
+            next_capture(&mut rig, PAST_THE_TICK).await,
+            capture("%1", "one")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_the_target_captures_nothing() {
+        let mut rig = rig(Some("%1"));
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+
+        rig.target.send_replace(None);
+
+        assert_eq!(next_capture(&mut rig, PAST_THE_TICK).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_after_cancel_ends_the_task_without_capturing() {
+        let mut rig = rig(None);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        rig.cancel.cancel();
+        rig.target.send_replace(Some("%1".to_string()));
+
+        assert!(timeout(PAST_THE_TICK, &mut rig.handle).await.is_ok());
+        assert!(rig.events.try_recv().is_err());
     }
 }

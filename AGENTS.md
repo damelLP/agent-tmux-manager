@@ -70,7 +70,8 @@ hooks, tmux). Their real behaviour beats docs, and docs beat assumptions.
   (`thiserror`) from libraries; `anyhow` only in binaries.
 - **Keep new logic pure.** Parsing, state transitions and mapping take plain
   inputs (time, IDs passed in) and do no I/O, so they test without tmux or a
-  daemon. Side effects belong in `atmd`, `atm-tmux`, and the binaries.
+  daemon. Side effects belong in `atmd`, `atm-tmux`, the binaries, and
+  `atm-tui`, the TUI's I/O boundary (`daemon.rs`, `setup/`, `beads/`).
 - Use newtypes for IDs (`SessionId(String)`, not `String`), `#[must_use]`
   where ignoring a return is a bug, and derive `Debug`/`Clone`/`Default`
   liberally.
@@ -121,7 +122,8 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
     Each moves out in its own approved refactor, never inside an unrelated
     change.
 - Adapters never depend on each other.
-- One definition per concept, in `atm-core`. Never create a field-for-field
+- One definition per concept. A concept crates share lives in `atm-core`; a
+  type only one crate uses lives in that crate. Never create a field-for-field
   copy of an existing type; an adapter's raw payload type exists only because
   the vendor's shape differs.
 
@@ -153,9 +155,9 @@ covers the steps below. Codex (#30) touched 23 files:
    authoritative, `crates/atm/assets/pi-atm` is its install mirror, and
    `tests/setup_pi_package.rs` guards them.
 6. `atm` (crate `atm-tui`): the adapter dependency in `crates/atm/Cargo.toml`
-   (`setup.rs` reads the adapter's hook event list), and install and
-   uninstall in `setup.rs`. A badge colour in `ui/session_list.rs` is
-   optional; unknown harnesses get grey.
+   (`setup/` reads the adapter's hook event list), install in a new
+   `setup/<vendor>.rs`, and dispatch and uninstall in `setup/mod.rs`. A badge
+   colour in `ui/session_list.rs` is optional; unknown harnesses get grey.
 7. The root `Cargo.toml` (`[workspace.dependencies]` and members) and
    `.github/workflows/release.yml` (§2): the adapter publishes before
    `atmd` and `atm-tui`.
@@ -172,9 +174,10 @@ covers the steps below. Codex (#30) touched 23 files:
     waits for every `spawn_blocking` task when it drops, so a hung one stops
     the process from ever exiting. Spawn it with `std::thread::Builder`, so
     a failed spawn is an error rather than a panic. Report back through a
-    `oneshot` with a timeout, and keep at most one call in flight per
-    resource: keep the pending receiver instead of spawning again, or hung
-    calls pile up threads. #84 introduces the pattern. Older
+    `oneshot` with a timeout, keeping the pending receiver instead of spawning
+    again (#84), or through one results channel the owner selects on, so it
+    never waits and logs a call that runs too long (#131). Either way, keep at
+    most one call in flight per resource, or hung calls pile up threads. Older
     `spawn_blocking` reads of hook-supplied paths predate this rule.
 - Every external operation (tmux, socket, subprocess) has a timeout.
 - Handle channel closure (`None`/`Err`) as a normal shutdown path.
@@ -267,9 +270,8 @@ them with `/hooks`.
 - Hand noisy exploration to subagents and keep only their conclusions.
 - Parallel agents: one task per agent, each in its own git worktree under
   `.worktrees/`.
-- Keep new files small and single-purpose. Some existing files (e.g.
-  `registry/actor.rs`, `src/bin/atm/main.rs`) are large; don't split them as
-  part of a feature — that's a separate refactor (principle 2).
+- Keep new files small and single-purpose. Don't split a large existing file
+  as part of a feature — that's a separate refactor (principle 2).
 
 ## 5. Pointers
 

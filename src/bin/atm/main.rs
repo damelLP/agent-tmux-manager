@@ -325,22 +325,31 @@ fn spawn_keyboard_task(
 // Capture Polling Task
 // ============================================================================
 
-/// Spawns a task that periodically captures the selected agent's tmux pane output.
+/// Spawns a task that captures the selected agent's tmux pane output every
+/// second, and at once when the selected pane changes.
 fn spawn_capture_task(
     client: impl TmuxClient + 'static,
     event_tx: mpsc::UnboundedSender<Event>,
     cancel_token: CancellationToken,
-    capture_pane_rx: tokio::sync::watch::Receiver<Option<String>>,
+    mut capture_pane_rx: tokio::sync::watch::Receiver<Option<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                changed = capture_pane_rx.changed() => {
+                    // A closed channel stays ready forever, so stop on it
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
             if cancel_token.is_cancelled() {
                 break;
             }
 
-            let pane_id = capture_pane_rx.borrow().clone();
+            let pane_id = capture_pane_rx.borrow_and_update().clone();
             if let Some(ref pane) = pane_id {
                 if let Ok(lines) = client.capture_pane(pane).await {
                     if event_tx
@@ -2543,6 +2552,37 @@ mod capture_task_tests {
     const PAST_THE_TICK: Duration = Duration::from_millis(1100);
 
     #[tokio::test(start_paused = true)]
+    async fn a_new_target_is_captured_without_waiting_for_the_tick() {
+        let mut rig = rig(Some("%1"));
+        // The interval's first tick is immediate; this consumes it.
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+
+        rig.target.send_replace(Some("%2".to_string()));
+
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%2", "two")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_selection_is_captured_without_waiting_for_the_tick() {
+        let mut rig = rig(None);
+        // Past the immediate first tick, which has nothing to capture.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        rig.target.send_replace(Some("%1".to_string()));
+
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_target_keeps_refreshing_on_the_tick() {
         let mut rig = rig(Some("%1"));
         assert_eq!(
@@ -2580,5 +2620,17 @@ mod capture_task_tests {
 
         assert!(timeout(PAST_THE_TICK, &mut rig.handle).await.is_ok());
         assert!(rig.events.try_recv().is_err());
+    }
+
+    /// Real time, not paused: a task that spins on the closed channel keeps
+    /// the runtime busy, and a paused clock would never reach this deadline.
+    #[tokio::test]
+    async fn a_dropped_sender_ends_the_task() {
+        let rig = rig(None);
+
+        drop(rig.target);
+
+        let ended = timeout(Duration::from_secs(5), rig.handle).await;
+        assert!(ended.is_ok(), "the task must end, not spin or keep polling");
     }
 }

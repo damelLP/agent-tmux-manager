@@ -141,3 +141,4 @@ atmd = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+async-trait = { workspace = true }

@@ -104,6 +104,7 @@ name = "atm"
 version = "0.2.7"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atm-core",
  "atm-protocol",
  "atm-tmux",

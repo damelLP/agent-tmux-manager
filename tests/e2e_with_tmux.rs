@@ -55,10 +55,10 @@
 //! 6. **The TUI's capture preview**: the real `atm` runs in a pane and
 //!    previews panes that each print their own marker. Its daemon is a
 //!    stand-in, so a key, a session update, a full session list and a removal
-//!    each fire on their own: a real atmd's events come with others, and any
-//!    key press also syncs the capture target, which would hide a missing
-//!    sync. A second TUI runs under `--tmux-session`, whose filter hides the
-//!    selected session once its pane leaves that tmux session.
+//!    each fire on their own: a real atmd's events come with others, which
+//!    could hide one that leaves the preview behind. A second TUI runs under
+//!    `--tmux-session`, whose filter hides the selected session once its pane
+//!    leaves that tmux session.
 //!
 //! The test skips cleanly (printed message, returns Ok) when `tmux` is
 //! absent from PATH, when the binaries weren't built, or — for scenario
@@ -2338,9 +2338,25 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
     rig.send(&DaemonMessage::session_removed(SessionId::new("session-b")));
     rig.wait_for_preview("remove selected session-b", PREVIEW_MARKERS[2]);
 
-    // A session above the selection goes, so the cursor lands on another row.
+    // atmd's id upgrade: a removal, then an update for the same pane. The
+    // preview may blank between them, but it has to end up back on that pane.
     rig.send(&all_three());
     rig.wait_for_preview("list of three again", PREVIEW_MARKERS[1]);
+    rig.send(&DaemonMessage::session_removed(SessionId::new("session-b")));
+    rig.send(&DaemonMessage::session_updated(preview_session(
+        "session-b-real",
+        "2026-01-01T00:00:01Z",
+        Some(pane_b),
+    )));
+    rig.wait_until("id upgrade arrives", |screen| {
+        screen.contains("ID: session-b-real")
+    });
+    rig.wait_for_preview("id upgrade of session-b", PREVIEW_MARKERS[1]);
+
+    // A session above the selection goes. The cursor keeps its row index, so
+    // it lands on another session. This records today's positional cursor, not
+    // a goal: a cursor that followed its session would stay on `session-b`.
+    rig.send(&all_three());
     rig.send(&DaemonMessage::session_removed(SessionId::new("session-a")));
     rig.wait_for_preview("remove session-a above the cursor", PREVIEW_MARKERS[2]);
 

@@ -20,8 +20,10 @@ case $name in
         ;;
 esac
 
-dir=$(pwd -P)
-while :; do
+# A deleted cwd makes `pwd -P` fail; then only the config dir is searched.
+start=$(pwd -P 2>/dev/null) || start=
+dir=$start
+while [ -n "$dir" ]; do
     if [ -f "$dir/.atm/profiles/$name.md" ]; then
         echo "$dir/.atm/profiles/$name.md" >&2
         exec cat "$dir/.atm/profiles/$name.md"
@@ -40,5 +42,5 @@ if [ -f "$config/profiles/$name.md" ]; then
     exec cat "$config/profiles/$name.md"
 fi
 
-echo "atm-profile: no profile '$name' in .atm/profiles/ (walking up from $(pwd -P)) or $config/profiles/" >&2
+echo "atm-profile: no profile '$name' in .atm/profiles/ (walking up from ${start:-a deleted directory}) or $config/profiles/" >&2
 exit 1

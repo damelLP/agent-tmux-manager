@@ -13,11 +13,18 @@
 #   ATTENTION      0  a dialog in the pane waits for an answer
 #   GONE           2  no session has had this pane for 3 polls in a row
 #   TIMEOUT        3  still working after timeout-s (default 1800)
-#   NEVER_STARTED  4  not seen working within start-timeout-s (default 120)
+#   NEVER_STARTED  4  not seen working within start-timeout-s (default 120),
+#                     or within timeout-s if that is shorter
 #
 # A start-timeout-s of 0 means the turn has already started: the first poll
 # that sees the session not working returns IDLE. Use it to wait again after
 # TIMEOUT.
+#
+# A dialog already open at the first poll counts as a turn in progress, not
+# as ATTENTION: Claude Code sends no hook when a dialog is approved, so after
+# `atm reply -y` the row reads attention_needed until the approved tool ends.
+# Only a dialog that opens after the first poll returns ATTENTION. Don't wait
+# on a dialog nobody has answered.
 #
 # Why "working, then not working" and not just "idle": straight after a send
 # the row still reads idle, and metadata events move last_activity while the
@@ -55,22 +62,43 @@ filter='
     elif any($leads[]; .status == "working") then "working"
     else "idle" end'
 
-limit=()
-command -v timeout >/dev/null && limit=(timeout 15)
+# One `atm list`, bounded where coreutils' timeout exists. (No array: an empty
+# "${a[@]}" is an unbound-variable error under set -u in bash before 4.4.)
+list_sessions() {
+    if command -v timeout >/dev/null; then
+        timeout 15 atm list -f json
+    else
+        atm list -f json
+    fi
+}
 
 start=$(date +%s)
 started=0
 [ "$start_timeout_s" -eq 0 ] && started=1
 missing=0
 warned=0
+first=1
+answered_dialog=0
 
 while :; do
     elapsed=$(( $(date +%s) - start ))
-    if json=$("${limit[@]}" atm list -f json 2>/dev/null) &&
+    if json=$(list_sessions 2>/dev/null) &&
         state=$(printf '%s' "$json" | jq -r --arg p "$pane" "$filter" 2>/dev/null); then
         :
     else
         state=error
+    fi
+
+    # The dialog seen at the first poll reads as working until the row
+    # leaves attention_needed once; any dialog after that is ATTENTION.
+    if [ "$state" != error ]; then
+        if [ "$first" -eq 1 ]; then
+            first=0
+            [ "$state" = attention ] && answered_dialog=1
+        elif [ "$state" != attention ]; then
+            answered_dialog=0
+        fi
+        [ "$state" = attention ] && [ "$answered_dialog" -eq 1 ] && state=working
     fi
 
     case $state in
@@ -85,6 +113,7 @@ while :; do
             if [ "$missing" -ge 3 ]; then echo GONE; exit 2; fi
             ;;
         *)
+            missing=0
             if [ "$warned" -eq 0 ]; then
                 echo "atm-wait: atm list failed; retrying" >&2
                 warned=1
@@ -95,6 +124,9 @@ while :; do
     if [ "$started" -eq 0 ] && [ "$elapsed" -ge "$start_timeout_s" ]; then
         echo NEVER_STARTED; exit 4
     fi
-    if [ "$elapsed" -ge "$timeout_s" ]; then echo TIMEOUT; exit 3; fi
+    if [ "$elapsed" -ge "$timeout_s" ]; then
+        if [ "$started" -eq 0 ]; then echo NEVER_STARTED; exit 4; fi
+        echo TIMEOUT; exit 3
+    fi
     if [ "$elapsed" -lt 60 ]; then sleep 1; else sleep 3; fi
 done

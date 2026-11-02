@@ -14,7 +14,10 @@ but its session id doesn't:
 - Claude Code gives the same process a new session id on `/clear`.
 - A short id prefix can match two sessions (`Ambiguous target`).
 
-Take the pane from the `tmux_pane` field of `atm list -f json`.
+Take the pane from the `tmux_pane` field of `atm list -f json`. Pane ids are
+per tmux server: atm acts on the server it talks to (the default one, or
+`ATM_TMUX_SOCKET`), and a session in another server (`atm workspace create
+--isolate`) can show the same `%N` in `atm list`.
 
 ## `atm list -f json`
 
@@ -49,6 +52,10 @@ screen that a send would collide with.
 
 Pastes the text into the pane, then presses Enter, as if the user typed it.
 `/clear` runs as a command, and `!cmd` runs a shell command.
+
+Quote the text with single quotes (`atm send %N '...'`, an apostrophe as
+`'\''`). In double quotes your own shell expands `$atm:implement` to
+`:implement` and runs anything in backticks before atm sees it.
 
 It refuses, with a reason:
 
@@ -85,12 +92,22 @@ It refuses nothing: the keys go to whatever is on screen. Peek with
 `--prompt` first, and reply only when you know what you're approving.
 Otherwise ask the user.
 
+Claude Code sends no hook when a dialog is answered. After `-y` the row reads
+`attention_needed` until the approved tool ends. After `-n` it reads that way
+until the next prompt, and `atm send` refuses the session, so the next
+instruction has to be typed in the pane (#127 plans `atm reply --no
+--message`).
+
 ## `atm interrupt <pane>`
 
 Presses Ctrl+C in the pane, which stops the current turn. Never interrupt an
 idle implementer, and never twice in a row: at an empty prompt, Claude Code
 asks for a second Ctrl+C and then exits. On a subagent's row it hits the
 lead's pane (#146).
+
+Claude Code sends no hook for an interrupt, so its row keeps reading
+`working` until the next prompt, and `atm-wait` never sees the turn end. Peek
+instead: an idle input box means it stopped.
 
 ## `atm kill <pane>`
 
@@ -123,7 +140,7 @@ left|right|above|below` (default below), `-s 30%` (default 50%), `-m <model>`.
 ## Scripts in this plugin
 
 They are the steps the skills run, not atm commands. Paths are relative to
-this file.
+this file. Run them by absolute path from your own working directory.
 
 - **`../scripts/atm-wait <pane> [timeout] [start-timeout]`** waits for an
   implementer's turn to end by polling `atm list -f json`. atmd already

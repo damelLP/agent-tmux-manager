@@ -18,7 +18,12 @@ Your arguments: Claude Code puts them here: $ARGUMENTS
 message that invoked this skill.)
 
 Paths below such as `../../scripts/atm-wait` are relative to this skill's
-folder. Run the scripts with `bash <path>`.
+folder. Run the scripts by their absolute path, with `bash`, from your own
+working directory: `atm-profile` searches from the current directory.
+
+**Quote what you send with single quotes:** `atm send %N '...'`. In double
+quotes your shell expands `$atm:implement` to `:implement` and runs anything
+in backticks. Write an apostrophe as `'\''`.
 
 ## 0. Before the first task
 
@@ -47,7 +52,7 @@ Look up the implementer's `harness` in `atm list -f json`.
 | `claude` | `/clear` | `/atm:implement` | up to 800 characters and 3 lines, or the skill doesn't load |
 | `pi` | `/new` (aborts a busy turn) | `/skill:implement` | any length |
 | `codex` | `/new` | `$atm:implement` | any length |
-| anything else, or no atm skills installed there | ask the user | none: start the brief with "Read `<this plugin>/skills/implement/SKILL.md` and follow it" and send the brief's path alone | any length |
+| anything else, or no atm skills installed there | ask the user | none: start the brief with "Read `<this plugin>/skills/implement/SKILL.md` and follow it", name the profile's file in it, and send `Your task is in <brief path>. Read it and follow it.` | any length |
 
 How you wait depends on your own harness:
 
@@ -65,20 +70,24 @@ constraints, when it's done, and how to report. Add what the profile says each
 brief needs.
 
 Write each brief to a file the implementer can read. By default:
-`/tmp/atm-briefs/<implementer>-<n>.md`. A profile may name a git-excluded
-folder in the project instead. One task per implementer at a time.
+`/tmp/atm-briefs/<project>/<implementer>-<n>.md`, with `n` counting on across
+handovers, so no brief is overwritten while an implementer may still read it.
+A profile may name a git-excluded folder in the project instead. One task per
+implementer at a time.
 
 ## 2. Send a task
 
 1. **Idle first.** The implementer's row must read `idle`. If it's busy, wait
-   (step 3) or pick another implementer.
+   (step 3) or pick another implementer. Claude Code sends no hook for an
+   interrupt, so after `atm interrupt` its row reads `working` until the next
+   prompt: there, trust a peek that shows an idle input box.
 2. **Peek.** `atm peek %N -n 15`: no dialog, and no turn running.
 3. **Clear.** `atm send %N <clear command>`.
 4. **Peek until the screen is fresh:** the last task's output is gone and the
    input box is empty. Don't send before that: two sends milliseconds apart
    can reach the harness as one plain-text message, and nothing is cleared.
-5. **Send the skill call** on one line:
-   `atm send %N "<invoke> [--profile <name>] /tmp/atm-briefs/<implementer>-<n>.md"`.
+5. **Send the skill call** on one line, in single quotes:
+   `atm send %N '<invoke> [--profile <name>] /tmp/atm-briefs/<project>/<implementer>-<n>.md'`.
 
 ## 3. Wait
 
@@ -95,12 +104,13 @@ prints one word:
 
 ## 4. Read and answer
 
-`atm peek %N -n 60`. The implementer's last line starts with one of:
+`atm peek %N -n 60` (it shows only the visible screen, so a small pane shows
+fewer lines). The implementer's last line starts with one of:
 
 - **`QUESTION:`** Answer it when the answer is inside what you and the user
-  agreed; otherwise ask the user. Send the answer with `atm send %N "<answer>"`
+  agreed; otherwise ask the user. Send the answer with `atm send %N '<answer>'`
   and wait again. An answer may be any length: only a skill call has to be
-  short.
+  short. For a long one, write a file and send its path in a sentence.
 - **`BLOCKED:`** Unblock it if that's clearly yours to do; otherwise tell the
   user.
 - **`DONE:`** Review the result as the profile says. Then the implementer is
@@ -108,8 +118,11 @@ prints one word:
 
 If there's a dialog instead, run `atm peek %N --prompt`. Answer it with
 `atm reply` only when you know what you're approving and it's inside the agreed
-task; otherwise ask the user. If there's neither a dialog nor one of those
-lines, wait again or ask the user.
+task; otherwise ask the user. After `atm reply -y`, wait again: `atm-wait`
+counts the dialog it starts on as answered. After `atm reply -n`, Claude's row
+reads as needing input until the next prompt, and `atm send` refuses it: ask
+the user to type the next instruction in that pane (until #127). If there's
+neither a dialog nor one of those lines, wait again or ask the user.
 
 ## 5. Hand over at 40% context
 

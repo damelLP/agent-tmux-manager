@@ -1,0 +1,131 @@
+# atm command reference for coordinators
+
+The commands a coordinator uses to drive implementers, with what each one
+refuses and what to do instead. It follows atm's code after #119 and #145
+(`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run `atm <command> --help`
+for the full flags.
+
+## Targets: use the pane
+
+Every command below takes a session id prefix or a tmux pane id (`%12`).
+**Use the pane id.** A pane stays the same for an implementer's whole life,
+but its session id doesn't:
+
+- Claude Code gives the same process a new session id on `/clear`.
+- A short id prefix can match two sessions (`Ambiguous target`).
+
+Take the pane from the `tmux_pane` field of `atm list -f json`.
+
+## `atm list -f json`
+
+Prints a JSON array, one object per session atmd knows. Fields a coordinator
+reads:
+
+| Field | Meaning |
+|---|---|
+| `tmux_pane` | `"%12"`, or `null` outside tmux |
+| `harness` | `"claude"`, `"pi"`, `"codex"`, ... |
+| `status` | `"idle"`, `"working"` or `"attention_needed"` (a dialog waits for an answer) |
+| `parent_session_id` | set on a subagent. An in-process subagent (Claude's background agents) has its lead's pane |
+| `id`, `id_short` | the session id; changes on Claude's `/clear` |
+| `last_activity` | an RFC 3339 time. Metadata events move it while the session is idle, so it doesn't prove a turn ran |
+| `context_percentage`, `worktree_branch`, `working_directory`, `first_prompt` | for your notes and handover |
+
+Filters: `--status working|idle|attention`, `--project <part of the project
+root>`. A session appears after its harness's first event to atmd. `atm list`
+starts atmd if none is running.
+
+## `atm peek <pane> [-n N] [--prompt]`
+
+Prints the visible screen of the pane (not its scrollback). `-n 60` keeps the
+last 60 lines, enough for an implementer's closing report. `--prompt` cuts out
+a Claude Code dialog (the question and its numbered options); when it finds
+none it prints the last 15 lines.
+
+Read before every write: a peek shows a dialog, a typed draft or a busy
+screen that a send would collide with.
+
+## `atm send <pane> <text>`
+
+Pastes the text into the pane, then presses Enter, as if the user typed it.
+`/clear` runs as a command, and `!cmd` runs a shell command.
+
+It refuses, with a reason:
+
+| Refusal | Do instead |
+|---|---|
+| "the session is waiting on a dialog that Enter would answer" | `atm peek <pane> --prompt`, then `atm reply`. The status can outlast a dialog dismissed with Esc: if the screen shows no dialog, ask the user |
+| "the session is a subagent in its lead's pane" | Target the lead's pane (`%N`), and only if you mean to talk to the lead |
+| "the pane is in copy mode" | Ask the user to leave copy mode (`q`) in that pane |
+| "the program didn't ask for bracketed paste, so each line would submit alone" | Send one line. Claude, pi and Codex all ask for it, so this means something else runs in the pane |
+
+What it doesn't protect against:
+
+- **A draft in the input box merges with the text.** Peek first; an
+  implementer's input box belongs to the loop.
+- **A busy session.** Claude queues the text until its turn ends, pi queues it
+  as steering, and Codex steers it into the running turn at once (#116). pi's
+  `/new` while busy aborts the turn. Clear an implementer only when it's idle.
+- **A send right after `/clear`.** Two sends a few milliseconds apart reached
+  Claude Code 2.1.316 as one plain-text message (`/clear/atm:implement ...`)
+  and nothing was cleared. Peek until the screen is fresh before the next send.
+- **Claude Code's paste limit.** Claude collapses a paste of more than 800
+  characters or more than 3 lines into `[Pasted text #N]` and then sends it to
+  the model as plain text: a slash command in it doesn't run, so the skill
+  doesn't load. Keep a skill call to one short line and put the brief in a
+  file. pi and Codex have no such limit.
+
+## `atm reply <pane> [-y | -n | -o N]`
+
+Answers a dialog by pressing keys: `-y` presses Enter on the highlighted
+option, `-n` presses Escape, `-o N` moves Claude's `❯` cursor to option N and
+presses Enter. With no flag it presses Enter.
+
+It refuses nothing: the keys go to whatever is on screen. Peek with
+`--prompt` first, and reply only when you know what you're approving.
+Otherwise ask the user.
+
+## `atm interrupt <pane>`
+
+Presses Ctrl+C in the pane, which stops the current turn. Never interrupt an
+idle implementer, and never twice in a row: at an empty prompt, Claude Code
+asks for a second Ctrl+C and then exits. On a subagent's row it hits the
+lead's pane (#146).
+
+## `atm kill <pane>`
+
+Kills the pane and the harness in it. Work on disk stays. On a subagent's row
+it kills the lead's pane (#146). Kill an implementer only when the user asks
+or the loop is over.
+
+## `atm spawn -H <harness> -w <dir> -t "$TMUX_PANE"`
+
+Splits a pane and starts the harness in it, in `<dir>`. Options: `-d
+left|right|above|below` (default below), `-s 30%` (default 50%), `-m <model>`.
+
+- **Always pass `-t "$TMUX_PANE"`.** Without it, atm splits the first active
+  pane it finds in any tmux session, which is usually not yours (#130 gap 1).
+- **It prints nothing.** To find the new pane, list the panes in
+  `atm list -f json` before you spawn and again after, until a new
+  `tmux_pane` appears (until #121). Claude Code and pi report at startup;
+  Codex 0.163.0 may not until its first prompt.
+- Spawn only when the user asks or agrees.
+
+## Not in atm yet
+
+| Planned | Today |
+|---|---|
+| `atm name` and targets by name (#118) | keep a name-to-pane table in your notes and handover |
+| `atm role` and the TUI's `C`/`I` tag (#148) | nothing; skip the step |
+| `atm profile show <name>` (#147) | `scripts/atm-profile <name>` |
+| `atm spawn` printing the new pane (#121) | diff `atm list` before and after |
+
+## Scripts in this plugin
+
+They are the steps the skills run, not atm commands. Paths are relative to
+this file.
+
+- **`../scripts/atm-wait <pane> [timeout] [start-timeout]`** waits for an
+  implementer's turn to end by polling `atm list -f json`. atmd already
+  tracks idle, so there is no `atm wait` (#122 was closed).
+- **`../scripts/atm-profile <name>`** prints a profile (#147's lookup).

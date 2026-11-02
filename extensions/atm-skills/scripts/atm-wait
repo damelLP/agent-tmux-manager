@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# atm-wait: the poll the atm coordinate skill runs after it sends a task.
+#
+# It is not an atm command. atmd already tracks whether a session is idle,
+# so `atm wait` (#122) was closed; this script only reads `atm list -f json`.
+#
+# Usage: atm-wait <pane> [timeout-s] [start-timeout-s]
+#
+# Waits for the session in <pane> (e.g. %12) to start a turn and finish it,
+# then prints one word and exits:
+#
+#   IDLE           0  the session went working, then stopped working
+#   ATTENTION      0  a dialog in the pane waits for an answer
+#   GONE           2  no session has had this pane for 3 polls in a row
+#   TIMEOUT        3  still working after timeout-s (default 1800)
+#   NEVER_STARTED  4  not seen working within start-timeout-s (default 120)
+#
+# A start-timeout-s of 0 means the turn has already started: the first poll
+# that sees the session not working returns IDLE. Use it to wait again after
+# TIMEOUT.
+#
+# Why "working, then not working" and not just "idle": straight after a send
+# the row still reads idle, and metadata events move last_activity while the
+# session is idle, so neither proves the turn ran. Polls every 1 s for the
+# first 60 s, so a short answer turn isn't missed, then every 3 s.
+#
+# Subagents that share the pane (Claude's background agents) count for
+# ATTENTION, since their dialogs show in the lead's pane, but not for
+# working: the wait is for the lead's turn.
+
+set -u
+
+usage() {
+    echo "usage: atm-wait <pane> [timeout-s] [start-timeout-s]" >&2
+    exit 64
+}
+
+pane=${1:-}
+timeout_s=${2:-1800}
+start_timeout_s=${3:-120}
+case $pane in %[0-9]*) ;; *) usage ;; esac
+case $timeout_s$start_timeout_s in *[!0-9]*) usage ;; esac
+for tool in atm jq; do
+    command -v "$tool" >/dev/null || { echo "atm-wait: $tool not found on PATH" >&2; exit 64; }
+done
+
+# One state for the pane: none, attention, working or idle.
+filter='
+  [.[] | select(.tmux_pane == $p)] as $rows
+  | [$rows[].id] as $ids
+  | [$rows[] | select((.parent_session_id // null) as $parent
+      | $parent == null or (any($ids[]; . == $parent) | not))] as $leads
+  | if ($rows | length) == 0 then "none"
+    elif any($rows[]; .status == "attention_needed") then "attention"
+    elif any($leads[]; .status == "working") then "working"
+    else "idle" end'
+
+limit=()
+command -v timeout >/dev/null && limit=(timeout 15)
+
+start=$(date +%s)
+started=0
+[ "$start_timeout_s" -eq 0 ] && started=1
+missing=0
+warned=0
+
+while :; do
+    elapsed=$(( $(date +%s) - start ))
+    if json=$("${limit[@]}" atm list -f json 2>/dev/null) &&
+        state=$(printf '%s' "$json" | jq -r --arg p "$pane" "$filter" 2>/dev/null); then
+        :
+    else
+        state=error
+    fi
+
+    case $state in
+        attention) echo ATTENTION; exit 0 ;;
+        working) started=1; missing=0 ;;
+        idle)
+            missing=0
+            if [ "$started" -eq 1 ]; then echo IDLE; exit 0; fi
+            ;;
+        none)
+            missing=$((missing + 1))
+            if [ "$missing" -ge 3 ]; then echo GONE; exit 2; fi
+            ;;
+        *)
+            if [ "$warned" -eq 0 ]; then
+                echo "atm-wait: atm list failed; retrying" >&2
+                warned=1
+            fi
+            ;;
+    esac
+
+    if [ "$started" -eq 0 ] && [ "$elapsed" -ge "$start_timeout_s" ]; then
+        echo NEVER_STARTED; exit 4
+    fi
+    if [ "$elapsed" -ge "$timeout_s" ]; then echo TIMEOUT; exit 3; fi
+    if [ "$elapsed" -lt 60 ]; then sleep 1; else sleep 3; fi
+done

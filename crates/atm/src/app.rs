@@ -2002,4 +2002,23 @@ mod tests {
         dispatch(&mut app, action);
         assert_eq!(app.tree_rows.len(), rows_before);
     }
+
+    /// A capture still in flight when the target moved must not land under
+    /// the new selection.
+    #[test]
+    fn update_capture_drops_output_for_a_pane_no_longer_tracked() {
+        let mut app = App::new();
+        app.capture_pane_id = Some("%2".to_string());
+
+        app.update_capture("%1", vec!["old pane".to_string()]);
+        assert!(app.captured_output.is_empty());
+
+        app.update_capture("%2", vec!["new pane".to_string()]);
+        assert_eq!(app.captured_output, vec!["new pane".to_string()]);
+
+        app.capture_pane_id = None;
+        app.captured_output.clear();
+        app.update_capture("%2", vec!["no selection".to_string()]);
+        assert!(app.captured_output.is_empty());
+    }
 }

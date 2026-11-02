@@ -325,22 +325,31 @@ fn spawn_keyboard_task(
 // Capture Polling Task
 // ============================================================================
 
-/// Spawns a task that periodically captures the selected agent's tmux pane output.
+/// Spawns a task that captures the selected agent's tmux pane output every
+/// second, and at once when the selected pane changes.
 fn spawn_capture_task(
+    client: impl TmuxClient + 'static,
     event_tx: mpsc::UnboundedSender<Event>,
     cancel_token: CancellationToken,
-    capture_pane_rx: tokio::sync::watch::Receiver<Option<String>>,
+    mut capture_pane_rx: tokio::sync::watch::Receiver<Option<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let client = RealTmuxClient::new();
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                changed = capture_pane_rx.changed() => {
+                    // A closed channel stays ready forever, so stop on it
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
             if cancel_token.is_cancelled() {
                 break;
             }
 
-            let pane_id = capture_pane_rx.borrow().clone();
+            let pane_id = capture_pane_rx.borrow_and_update().clone();
             if let Some(ref pane) = pane_id {
                 if let Ok(lines) = client.capture_pane(pane).await {
                     if event_tx
@@ -1888,7 +1897,12 @@ async fn main() -> Result<()> {
 
     // Create watch channel for selected pane ID and spawn capture polling task
     let (capture_pane_tx, capture_pane_rx) = tokio::sync::watch::channel(None::<String>);
-    let capture_handle = spawn_capture_task(event_tx, cancel_token.clone(), capture_pane_rx);
+    let capture_handle = spawn_capture_task(
+        RealTmuxClient::new(),
+        event_tx,
+        cancel_token.clone(),
+        capture_pane_rx,
+    );
 
     let result = run_event_loop(
         &mut terminal,
@@ -2483,5 +2497,283 @@ mod send_tests {
             needs_input(row("else-dddd", Some("%9"), None)),
         ];
         assert_eq!(reason(&other_pane, "lead"), None);
+    }
+}
+
+#[cfg(test)]
+mod capture_task_tests {
+    use super::{spawn_capture_task, Event};
+    use async_trait::async_trait;
+    use atm_tmux::{MockTmuxClient, PaneDirection, PaneInfo, TmuxClient, TmuxError};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, watch, Semaphore};
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    struct Rig {
+        client: MockTmuxClient,
+        events: mpsc::UnboundedReceiver<Event>,
+        target: watch::Sender<Option<String>>,
+        cancel: CancellationToken,
+        handle: JoinHandle<()>,
+    }
+
+    fn rig(start: Option<&str>) -> Rig {
+        let client = MockTmuxClient::new();
+        client.set_pane_content("%1", vec!["one".to_string()]);
+        client.set_pane_content("%2", vec!["two".to_string()]);
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (target, target_rx) = watch::channel(start.map(str::to_string));
+        let cancel = CancellationToken::new();
+        let handle = spawn_capture_task(client.clone(), event_tx, cancel.clone(), target_rx);
+        Rig {
+            client,
+            events,
+            target,
+            cancel,
+            handle,
+        }
+    }
+
+    /// The next capture within `within`, by pane id and first line. The clock
+    /// is paused and the mock has no real I/O, so time moves only when
+    /// every task is idle: this deadline and the 1 s tick can't race.
+    async fn next_capture(rig: &mut Rig, within: Duration) -> Option<(String, String)> {
+        match timeout(within, rig.events.recv()).await {
+            Ok(Some(Event::CaptureUpdate { pane_id, lines })) => Some((pane_id, lines.join("\n"))),
+            Ok(_) => panic!("expected a capture"),
+            Err(_) => None,
+        }
+    }
+
+    fn capture(pane: &str, text: &str) -> Option<(String, String)> {
+        Some((pane.to_string(), text.to_string()))
+    }
+
+    const WELL_BEFORE_THE_TICK: Duration = Duration::from_millis(500);
+    const PAST_THE_TICK: Duration = Duration::from_millis(1100);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_target_is_captured_without_waiting_for_the_tick() {
+        let mut rig = rig(Some("%1"));
+        // The interval's first tick is immediate; this consumes it.
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+
+        rig.target.send_replace(Some("%2".to_string()));
+
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%2", "two")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_selection_is_captured_without_waiting_for_the_tick() {
+        let mut rig = rig(None);
+        // Past the immediate first tick, which has nothing to capture.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        rig.target.send_replace(Some("%1".to_string()));
+
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_target_keeps_refreshing_on_the_tick() {
+        let mut rig = rig(Some("%1"));
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+
+        assert_eq!(next_capture(&mut rig, WELL_BEFORE_THE_TICK).await, None);
+        assert_eq!(
+            next_capture(&mut rig, PAST_THE_TICK).await,
+            capture("%1", "one")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_the_target_captures_nothing() {
+        let mut rig = rig(Some("%1"));
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+
+        rig.target.send_replace(None);
+
+        assert_eq!(next_capture(&mut rig, PAST_THE_TICK).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_after_cancel_ends_the_task_without_capturing() {
+        let mut rig = rig(None);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        rig.cancel.cancel();
+        rig.target.send_replace(Some("%1".to_string()));
+
+        // Ok(Ok(())): a panicking task would also finish the handle.
+        assert!(matches!(
+            timeout(PAST_THE_TICK, &mut rig.handle).await,
+            Ok(Ok(()))
+        ));
+        assert!(rig.events.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_retarget_capture_retries_on_the_tick() {
+        let mut rig = rig(Some("%1"));
+        assert_eq!(
+            next_capture(&mut rig, WELL_BEFORE_THE_TICK).await,
+            capture("%1", "one")
+        );
+
+        rig.client.set_next_error(TmuxError::CommandFailed {
+            command: "capture-pane".to_string(),
+            stderr: "can't find pane".to_string(),
+        });
+        rig.target.send_replace(Some("%2".to_string()));
+
+        assert_eq!(next_capture(&mut rig, WELL_BEFORE_THE_TICK).await, None);
+        assert_eq!(
+            next_capture(&mut rig, PAST_THE_TICK).await,
+            capture("%2", "two")
+        );
+    }
+
+    /// Holds each capture until the test releases it, so a target can change
+    /// while one is in flight. `MockTmuxClient` answers without ever yielding.
+    struct GatedClient {
+        started: mpsc::UnboundedSender<String>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl TmuxClient for GatedClient {
+        async fn capture_pane(&self, pane: &str) -> Result<Vec<String>, TmuxError> {
+            let _ = self.started.send(pane.to_string());
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+            Ok(vec![pane.to_string()])
+        }
+
+        async fn raw_command(&self, _: &str, _: &[&str]) -> Result<String, TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn split_window(
+            &self,
+            _: &str,
+            _: &str,
+            _: PaneDirection,
+            _: Option<&str>,
+        ) -> Result<String, TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn get_pane_cwd(&self, _: &str) -> Result<Option<String>, TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn new_window(&self, _: &str, _: Option<&str>) -> Result<String, TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn kill_pane(&self, _: &str) -> Result<(), TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn resize_pane(
+            &self,
+            _: &str,
+            _: Option<u16>,
+            _: Option<u16>,
+        ) -> Result<(), TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn send_keys(&self, _: &str, _: &str) -> Result<(), TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn paste_text(&self, _: &str, _: &str) -> Result<(), TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn display_popup(&self, _: &str, _: &str, _: &str) -> Result<(), TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn select_pane(&self, _: &str) -> Result<(), TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+
+        async fn new_session(&self, _: &str) -> Result<String, TmuxError> {
+            unreachable!("the capture task only captures")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_target_changed_during_a_capture_is_captured_right_after_it() {
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let client = GatedClient {
+            started: started_tx,
+            release: Arc::clone(&release),
+        };
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let (target, target_rx) = watch::channel(Some("%1".to_string()));
+        let _handle = spawn_capture_task(client, event_tx, CancellationToken::new(), target_rx);
+        // Every wait has a deadline: with the clock paused, a task that stopped
+        // capturing would otherwise hang this test rather than fail it.
+        assert_eq!(
+            timeout(WELL_BEFORE_THE_TICK, started.recv()).await,
+            Ok(Some("%1".to_string()))
+        );
+
+        // The capture of %1 is in flight when the target moves.
+        target.send_replace(Some("%2".to_string()));
+        release.add_permits(1);
+
+        // %1's result still arrives; `App::update_capture` is what drops it.
+        assert!(matches!(
+            timeout(WELL_BEFORE_THE_TICK, events.recv()).await,
+            Ok(Some(Event::CaptureUpdate { pane_id, .. })) if pane_id == "%1"
+        ));
+        // The clock can't reach the 1 s tick before this 500 ms deadline.
+        assert_eq!(
+            timeout(WELL_BEFORE_THE_TICK, started.recv()).await,
+            Ok(Some("%2".to_string()))
+        );
+    }
+
+    /// Real time, not paused: a task that spins on the closed channel keeps
+    /// the runtime busy, and a paused clock would never reach this deadline.
+    #[tokio::test]
+    async fn a_dropped_sender_ends_the_task() {
+        let rig = rig(None);
+
+        drop(rig.target);
+
+        let ended = timeout(Duration::from_secs(5), rig.handle).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the task must end cleanly, not spin, keep polling or panic"
+        );
     }
 }

@@ -49,6 +49,23 @@ The plugin lives in this folder. The repository root holds a marketplace
 - **Codex** copies the plugin into `$CODEX_HOME/plugins/cache/`. Run
   `codex plugin add atm@agent-tmux-manager` again after pulling changes.
 
+### A Codex coordinator needs its sandbox opened
+
+A coordinator runs `atm` from its shell tool. In Codex 0.163.0's default
+`workspace-write` sandbox, `atm list` fails with "Failed to connect to daemon
+... Operation not permitted": the sandbox blocks the connection to atmd's unix
+socket. With network access allowed, `atm list`, `peek` and `send` all worked:
+
+```toml
+# ~/.codex/config.toml, or -c sandbox_workspace_write.network_access=true
+[sandbox_workspace_write]
+network_access = true
+```
+
+That also lets the coordinator's other commands reach the network. Approving
+each `atm` call to run outside the sandbox is the narrower option. An
+implementer never runs `atm`, so it needs neither.
+
 ## Profiles
 
 `--profile <name>` adds a reusable brief to either skill: a Markdown file

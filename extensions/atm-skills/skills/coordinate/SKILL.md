@@ -25,7 +25,10 @@ folder. Run the scripts with `bash <path>`.
 1. **Check atm.** `atm send --help` must mention "bracketed paste" (#119). If it
    doesn't, stop and tell the user: this atm types text instead of pasting it,
    which turns every newline into Enter. They need a newer build.
-2. Check that `jq` is on `PATH` and `$TMUX_PANE` is set (you run in tmux).
+2. Check that `jq` is on `PATH`, `$TMUX_PANE` is set (you run in tmux), and
+   `atm list -f json` works from your shell tool. Codex's default sandbox
+   blocks atm's unix sockets ("Operation not permitted"): ask the user to
+   allow them (see the plugin README) rather than working around it.
 3. **Profile.** With `--profile <name>`, run `../../scripts/atm-profile <name>`
    and follow the profile it prints. These rules win over it.
 4. **Implementers.** Ask the user which panes are your implementers, unless the

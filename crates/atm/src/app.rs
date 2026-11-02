@@ -1953,7 +1953,7 @@ mod tests {
 
     #[test]
     fn test_z_chord_wires_through_end_to_end() {
-        // Mirrors the dispatch in src/bin/atm/main.rs.
+        // Mirrors the dispatch in src/bin/atm/tui.rs.
         use crate::keybinding::{InputHandler, UiAction};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

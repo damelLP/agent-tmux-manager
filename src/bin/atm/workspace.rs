@@ -1,11 +1,11 @@
 use anyhow::{bail, Context, Result};
 use atm_tmux::{RealTmuxClient, TmuxClient, TmuxError};
 
-#[cfg(test)]
-use super::TEST_ENV_LOCK;
-use super::{
+use super::spawn::{
     build_spawn_command_for_harness, resolve_spawn_harness, shell_quote, tmux_shell_prefix,
 };
+#[cfg(test)]
+use super::TEST_ENV_LOCK;
 
 /// `run-shell`'s argument to run the script at `path` with `args`: each one
 /// `sh -c` word, with `#` doubled because run-shell format-expands its

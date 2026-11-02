@@ -2739,7 +2739,12 @@ mod capture_task_tests {
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let (target, target_rx) = watch::channel(Some("%1".to_string()));
         let _handle = spawn_capture_task(client, event_tx, CancellationToken::new(), target_rx);
-        assert_eq!(started.recv().await.as_deref(), Some("%1"));
+        // Every wait has a deadline: with the clock paused, a task that stopped
+        // capturing would otherwise hang this test rather than fail it.
+        assert_eq!(
+            timeout(WELL_BEFORE_THE_TICK, started.recv()).await,
+            Ok(Some("%1".to_string()))
+        );
 
         // The capture of %1 is in flight when the target moves.
         target.send_replace(Some("%2".to_string()));
@@ -2747,8 +2752,8 @@ mod capture_task_tests {
 
         // %1's result still arrives; `App::update_capture` is what drops it.
         assert!(matches!(
-            events.recv().await,
-            Some(Event::CaptureUpdate { pane_id, .. }) if pane_id == "%1"
+            timeout(WELL_BEFORE_THE_TICK, events.recv()).await,
+            Ok(Some(Event::CaptureUpdate { pane_id, .. })) if pane_id == "%1"
         ));
         // The clock can't reach the 1 s tick before this 500 ms deadline.
         assert_eq!(

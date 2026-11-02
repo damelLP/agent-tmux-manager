@@ -1,0 +1,15 @@
+{
+  "name": "agent-tmux-manager",
+  "description": "atm's own plugins: skills for coordinating coding agents through atm",
+  "owner": {
+    "name": "damelLP",
+    "url": "https://github.com/damelLP"
+  },
+  "plugins": [
+    {
+      "name": "atm",
+      "source": "./extensions/atm-skills",
+      "description": "Coordinate and implement skills: drive coding agents in tmux through the atm CLI"
+    }
+  ]
+}

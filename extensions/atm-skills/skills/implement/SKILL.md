@@ -34,8 +34,9 @@ The brief wins over the profile. These rules win over both.
 - **Plan first when asked.** If the brief asks for a plan or survey first, end
   the turn with it (`DONE: plan <path>`) and wait for the coordinator's OK.
 - **Ask in text.** Put questions at the end of your turn (`QUESTION:`). Never
-  open a question dialog (AskUserQuestion, request_user_input or similar): it
-  holds your pane until someone answers it.
+  open a question dialog (AskUserQuestion, request_user_input or similar) or
+  enter plan mode, whose approval is a dialog too: it holds your pane until
+  someone answers it. Write a plan to a file instead.
 - **Don't drive other panes.** No `atm send`, `reply`, `interrupt`, `kill` or
   `spawn`, and no `tmux send-keys`.
 - **Don't clear yourself** (`/clear`, `/new`): the coordinator clears you

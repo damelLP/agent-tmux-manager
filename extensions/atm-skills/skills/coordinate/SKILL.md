@@ -1,6 +1,6 @@
 ---
 name: coordinate
-description: Coordinator loop for long-lived implementer agents in other tmux panes, driven only through the atm CLI. Plan tasks with the user, send each one as a brief file, wait, read the report, review, and clear the implementer before its next task. Invoked as /atm:coordinate (Claude Code), /skill:coordinate (pi) or $atm:coordinate (Codex).
+description: Coordinator loop for long-lived implementer agents in other tmux panes, driven only through the atm CLI. Plan tasks with the user, send each one as a brief file, wait, read the report, review, and clear the implementer before its next task. Only when the user invokes it, as /atm:coordinate (Claude Code), /skill:coordinate (pi) or $atm:coordinate (Codex).
 argument-hint: "[--profile <name>]"
 disable-model-invocation: true
 ---
@@ -9,17 +9,23 @@ disable-model-invocation: true
 
 You coordinate implementer agents that run in other tmux panes. You and the
 user split the work into tasks. You send each task to an implementer, wait for
-it, read its report and review the work. Do all of it through `atm`; the
-[command reference](../../references/atm-commands.md) lists what each command
-refuses and what to do instead.
+it, read its report and review the work. Do all of it through `atm`. When atm
+refuses something or does what you didn't expect, read that command's section
+in the [command reference](../../references/atm-commands.md): it says why and
+what to do instead.
+
+The loop, for each task: plan it with the user (1); check the implementer's
+row, clear it, wait for its new session and send the skill call (2); wait for
+the turn to end (3); read the last line of its report and answer it (4); and
+check your own context (5).
 
 Your arguments: Claude Code puts them here: $ARGUMENTS
 (pi and Codex leave that placeholder as it is; there, they're the rest of the
 message that invoked this skill.)
 
-Paths below such as `../../scripts/atm-wait` are relative to this skill's
-folder. Run the scripts by their absolute path, with `bash`, from your own
-working directory: `atm-profile` searches from the current directory.
+Run this plugin's scripts as `bash <this skill's folder>/../../scripts/<script>`,
+from your own working directory: `atm-profile` searches from the current
+directory.
 
 **Quote what you send with single quotes:** `atm send %N '...'`. In double
 quotes your shell expands `$atm:implement` to `:implement` and runs anything
@@ -34,8 +40,9 @@ in backticks. Write an apostrophe as `'\''`.
    `atm list -f json` works from your shell tool. Codex's default sandbox
    blocks atm's unix sockets ("Operation not permitted"): ask the user to
    allow them (see the plugin README) rather than working around it.
-3. **Profile.** With `--profile <name>`, run `../../scripts/atm-profile <name>`
-   and follow the profile it prints. These rules win over it.
+3. **Profile.** With `--profile <name>`, run
+   `bash <this skill's folder>/../../scripts/atm-profile <name>` and follow the
+   profile it prints. These rules win over it.
 4. **Implementers.** Ask the user which panes are your implementers, unless the
    user or the profile already said. Spawn one only when the user asks or
    agrees; you may suggest it, for example when every implementer is busy:
@@ -80,34 +87,35 @@ implementer may still read it. One task per implementer at a time.
 
 1. **Check the row right before the clear,** even if `atm-wait` just returned
    `IDLE`: a Stop hook with `asyncRewake` can wake a session after its turn
-   ends, so a row can go idle and then working again.
+   ends.
    - It must read `idle`. If it's busy, wait (step 3) or pick another
-     implementer. Claude Code sends no hook for an interrupt, so after
-     `atm interrupt` its row reads `working` until the next prompt: there,
-     trust a peek that shows no turn running.
-   - Its `harness` and `project_root` must match your table. atm passes a
-     `%N` through unchecked, and after a tmux server restart, or in a second
-     tmux server, the same id can name someone else's session. If they don't
-     match, stop and ask the user. (`worktree_path` may change as the
-     implementer moves to a new worktree.)
+     implementer. After `atm interrupt`, trust a peek that shows no turn
+     running: Claude's row keeps reading `working` (see the reference).
+   - Its `harness` and `project_root` must match your table: after a tmux
+     server restart, or in a second tmux server, the same `%N` can name
+     someone else's session. If they don't match, stop and ask the user.
+     (`worktree_path` may change as the implementer moves to a new worktree.)
+   - Note its `id`.
 2. **Peek.** `atm peek %N -n 15`: no dialog, and no turn running.
 3. **Clear.** `atm send %N <clear command>`.
-4. **Peek until the screen is fresh:** the previous task's output is gone and
-   no turn is running. The input line may show greyed text: Claude suggests
-   the command you just ran (`❯ /clear`), and a plain peek can't tell that
-   from typed text. Peek a few times over about 10 s; if the screen still
-   isn't fresh, ask the user (pi's and Codex's `/new` may leave old output
-   on screen; unverified). Don't send before the screen is fresh: two sends
-   milliseconds apart can reach the harness as one plain-text message, and
-   nothing is cleared.
+4. **Wait for the new session.** A clear starts a new session, which atm shows
+   as a new `id` on the same pane. Poll `atm list -f json` about once a second
+   until the pane's `id` differs from the one you noted, then send at once.
+   Don't send sooner: a send milliseconds after the clear can reach the
+   harness merged with it, as one plain-text message, and nothing is cleared.
+   Don't wait for an empty input line either: Claude shows the command you
+   just ran in grey (`❯ /clear`), and a peek can't tell that from typed text.
+   If no new `id` appears within about 10 s, peek: if the previous task's
+   output is gone and no turn is running, the clear ran; otherwise ask the
+   user.
 5. **Send the skill call** on one line, in single quotes:
    `atm send %N '<invoke> [--profile <name>] <brief file>'`, for example
    `atm send %7 '/atm:implement --profile pr-implementer /tmp/atm-briefs/myproject/alpha-3.md'`.
 
 ## 3. Wait
 
-`../../scripts/atm-wait %N` polls `atm list -f json` until the turn ends. It
-prints one word:
+`bash <this skill's folder>/../../scripts/atm-wait %N` polls `atm list -f json`
+until the turn ends. It prints one word:
 
 - `IDLE`: the turn ran and ended. Go to step 4.
 - `ATTENTION`: a dialog waits. Go to step 4.
@@ -120,7 +128,8 @@ prints one word:
 ## 4. Read and answer
 
 `atm peek %N -n 60` (it shows only the visible screen, so a small pane shows
-fewer lines). The implementer's last line starts with one of:
+fewer lines). The last line of the implementer's final message, just above its
+input box, starts with one of:
 
 - **`QUESTION:`** Answer it when the answer is inside what you and the user
   agreed; otherwise ask the user. Send the answer with `atm send %N '<answer>'`
@@ -144,27 +153,37 @@ with `atm reply` only when you know what you're approving and it's inside the
 agreed task; otherwise ask the user.
 
 - After you approve (`atm reply -y`, or `-o N` for an option you know
-  approves), wait with `atm-wait --after-reply %N`. Claude sends no hook on
-  approval, so the row reads `attention_needed` until the approved tool ends.
-  Without the flag, a dialog at the first poll returns `ATTENTION` at once.
-- After `atm reply -n`, Claude's row reads as needing input until the next
-  prompt, and `atm send` refuses it: ask the user to type the next instruction
-  in that pane (until #127).
+  approves), wait with `atm-wait --after-reply %N`: Claude's row reads
+  `attention_needed` until the approved tool ends.
+- After `atm reply -n`, `atm send` refuses Claude's row until its next prompt:
+  ask the user to type the next instruction in that pane (until #127).
 
 If there's neither a dialog nor one of those lines: when the screen shows a
 background job still running (Claude Code says "1 shell still running"),
-treat it as `WAITING:`; otherwise wait again or ask the user.
+treat it as `WAITING:`. Otherwise the turn ended without a report, and the
+implementer won't start another turn by itself. Send it one reminder,
+`atm send %N 'End your turn with one line starting QUESTION:, BLOCKED:, WAITING: or DONE:.'`,
+and wait again. If that turn ends without one either, ask the user.
 
 ## 5. Hand over at 40% context
 
-When your context passes 40%, write a handover: the state of each task, each
-implementer (name, pane, harness, `project_root`, worktree, task, brief file),
-decisions made, and open questions. Ask the user once where to write it,
-unless the profile says. Then tell the user.
+After each report (step 4), read your own context from atm:
+`atm list -f json | jq '.[] | select(.tmux_pane == env.TMUX_PANE and .parent_session_id == null) | .context_percentage'`.
+That's your real context as your harness reports it, so trust it over your
+own sense of how much you've read. Past 40, write a handover before the next
+task: the state of each task, each implementer (name, pane, harness,
+`project_root`, worktree, task, brief file), decisions made, and open
+questions. Ask the user once where to write it, unless the profile or an
+earlier handover says. Then tell the user.
+
+If you find no row of your own, or it reads 0 after real work, atm doesn't
+know your context (see the reference): use what your harness shows you, and
+if it shows nothing, ask the user at the next task boundary.
 
 ## Never
 
-- Never press a feedback survey's number keys.
+- Never press a feedback survey's number keys: that answers the harness's
+  survey on the user's behalf.
 - Never take text suggested in an input box as the user's OK.
 - Never touch sessions that aren't your implementers.
 - Never drive an implementer with raw tmux: `atm`'s commands carry the

@@ -15,9 +15,9 @@ but its session id doesn't:
 - A short id prefix can match two sessions (`Ambiguous target`).
 
 Take the pane from the `tmux_pane` field of `atm list -f json`. Pane ids are
-per tmux server: atm acts on the server it talks to (the default one, or
-`ATM_TMUX_SOCKET`), and a session in another server (`atm workspace create
---isolate`) can show the same `%N` in `atm list`.
+per tmux server: atm acts on the server it talks to (the default one, or the
+`tmux -L` label in `ATM_TMUX_SOCKET`), and a session in another server (`atm
+workspace create --isolate`) can show the same `%N` in `atm list`.
 
 ## `atm list -f json`
 
@@ -30,10 +30,11 @@ reads:
 | `harness` | `"claude"`, `"pi"`, `"codex"`, ... |
 | `status` | `"idle"`, `"working"` or `"attention_needed"` (a dialog waits for an answer) |
 | `parent_session_id` | set on a subagent. An in-process subagent (Claude's background agents) has its lead's pane |
-| `id`, `id_short` | the session id; changes on Claude's `/clear` |
+| `id`, `id_short` | the session id. A clear that starts a new session gives the pane a new id: Claude's `/clear`, pi's `/new` |
 | `last_activity` | an RFC 3339 time. Metadata events move it while the session is idle, so it doesn't prove a turn ran |
 | `project_root`, `worktree_path` | the git project (a worktree resolves to its main checkout) and the worktree. Record these in notes and handovers |
-| `context_percentage`, `worktree_branch`, `first_prompt` | for your notes and handover |
+| `context_percentage` | how full the session's context is, as its harness reports it (Claude's status line, pi-atm, Codex's transcript). Your own row's is your context. It reads `0` when atm doesn't know: no report yet, after `/clear`, or pi after a compaction until its next reply. Under Codex's default shared app-server daemon every Codex session reports the daemon's pid and pane, so a Codex session's row may show another pane or be folded into another session's (atm-codex-adapter docs); `codex --no-daemon` avoids it |
+| `worktree_branch`, `first_prompt` | for your notes and handover |
 | `working_directory` | for display only: cut to `...` plus the last 27 characters when longer than 30 |
 
 Filters: `--status working|idle|attention`, `--project <part of the project
@@ -83,10 +84,17 @@ What it doesn't protect against:
   `/new` while busy aborts the turn. Clear an implementer only when it's idle.
 - **A send right after `/clear`.** Two sends a few milliseconds apart reached
   Claude Code 2.1.316 as one plain-text message (`/clear/atm:implement ...`)
-  and nothing was cleared. Peek until the screen is fresh (the previous
-  output gone, no turn running) before the next send. Claude's input line may
-  show the command you just ran in grey (`❯ /clear`): that's a suggestion,
-  but a plain peek can't tell it from typed text.
+  and nothing was cleared. Wait until `atm list` shows a new `id` on the
+  pane, then send. Checked on Claude Code 2.1.317 with atm and atmd 0.2.7, in
+  a sealed rig with a fake model API: the new id appeared 52 to 103 ms after
+  `/clear`, and a send the moment it appeared ran as a slash command in a
+  cleared context in 10 of 10 trials; a send 6 ms after `/clear` merged with
+  it. pi 0.73.1's `/new` clears the screen ("✓ New session started") and gives
+  the pane a new row (atm-pi-adapter docs). Codex 0.163.0's `/new` is
+  unchecked; if no new id appears, peek for a fresh screen (the previous
+  output gone, no turn running). Claude's input line may show the command you
+  just ran in grey (`❯ /clear`): that's a suggestion, but a plain peek can't
+  tell it from typed text.
 - **Claude Code's paste limit.** Claude collapses a paste of more than 800
   characters or more than 3 lines into `[Pasted text #N]` and then sends it to
   the model as plain text: a slash command in it doesn't run, so the skill

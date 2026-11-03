@@ -13,7 +13,7 @@ any harness atm supports:
 Everything goes through atm (`atm list`, `peek`, `send`, `reply`, `spawn`),
 so the loop is the same whichever harness runs on either side. The commands,
 their refusals and what to do instead are in
-[`references/atm-commands.md`](references/atm-commands.md).
+[`shared/references/atm-commands.md`](shared/references/atm-commands.md).
 
 This is v0 (#123): it works with today's CLI. `atm role` (#148), names
 (#118), `atm profile show` (#147) and spawn output (#121) will replace the
@@ -72,4 +72,4 @@ implementer never runs `atm`, so it needs neither.
 `<name>.md` in `.atm/profiles/` (the first one found walking up from the
 current directory) or in atm's config dir (`~/.config/atm/profiles/` on
 Linux). The project's file wins; they aren't merged. This repository's
-profiles are in [`/.atm/profiles/`](../../.atm/profiles/).
+profiles are in [`/.atm/profiles/`](../../../../.atm/profiles/).

@@ -4,13 +4,13 @@
 #   `atm list -f json` output, one line per poll;
 # - atm-profile's lookup in a scratch directory tree.
 #
-# Run: bash extensions/atm-skills/tests/scripts.sh
+# Run: bash crates/atm/assets/atm-skills/tests/scripts.sh
 # `cargo test` runs it through tests/atm_skills_scripts.rs.
 
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd -P)
-scripts=$here/../scripts
+scripts=$here/../shared/scripts
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/results"

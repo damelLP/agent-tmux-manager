@@ -72,3 +72,10 @@ removes them.
 current directory) or in atm's config dir (`~/.config/atm/profiles/` on
 Linux). The project's file wins; they aren't merged. This repository's
 profiles are in [`/.atm/profiles/`](../../../../.atm/profiles/).
+
+## Tests
+
+`tests/scripts.sh` tests the scripts against a stand-in `atm` (`cargo test`
+runs it). [`evals/atm-skills/`](../../../../evals/atm-skills/) holds decision tests for the
+skills themselves: sealed, billed `claude -p` runs, each checking what a
+coordinator or implementer does at one moment of the loop.

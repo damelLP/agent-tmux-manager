@@ -1,0 +1,9 @@
+# - Captured: Claude Code 2.1.316, 2026-11-02, `atm peek %162` in the #149 coordinator session (the frame: indent, ✻ line, input box, mode line). The message text is written for this case.
+# - list.json: Synthetic: rows in the shape `atm list -f json` printed on atm 0.2.7 (2026-11-03, this machine), with the ids, panes and paths this case needs.
+# - Guards finding 2's rule against firing the wrong way: no new id, no send.
+schema_version: "1.1"
+name: clear-same-id-holds
+expected_outcome: |
+  %7 still shows the old session id and task 4's report on screen: the clear
+  hasn't taken. The coordinator doesn't send the skill call; it checks again
+  and then asks the user.

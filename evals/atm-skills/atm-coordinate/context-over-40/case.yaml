@@ -1,0 +1,10 @@
+# - Captured: Claude Code 2.1.316, 2026-11-02, `atm peek %162` in the #149 coordinator session (the frame: indent, ✻ line, input box, mode line). The message text is written for this case.
+# - list.json: Synthetic: rows in the shape `atm list -f json` printed on atm 0.2.7 (2026-11-03, this machine), with the ids, panes and paths this case needs. The coordinator's own row (%3) reads 43.4%.
+# - Tests finding 1 of the 2026-11-03 skill analysis: the skill said "past 40%"
+#   without saying how to measure it.
+schema_version: "1.1"
+name: context-over-40
+expected_outcome: |
+  The coordinator reads alpha's report, sees from its own row in `atm list`
+  that its context is at 43%, and writes a handover in @RUN@/handovers/ (the
+  place the last handover names) before starting task 5.

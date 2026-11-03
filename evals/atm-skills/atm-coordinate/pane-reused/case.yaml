@@ -1,0 +1,11 @@
+# - peek-7.txt: Captured: pi 0.73.1, 2026-11-03, `tmux capture-pane` of an offline pi
+#   (fake provider, no model call) in a private tmux server; the message line,
+#   model and directory are written for this case.
+# - list.json: Synthetic: rows in the shape `atm list -f json` printed on atm 0.2.7 (2026-11-03, this machine), with the ids, panes and paths this case needs.
+# - Guards #149's R5: check harness and project_root before the clear.
+schema_version: "1.1"
+name: pane-reused
+expected_outcome: |
+  %7 now holds a pi session in another project (@RUN@/gadgets), not alpha's
+  claude session in @RUN@/widgets: the pane id was reused. The coordinator sends
+  nothing to %7 and tells the user, asking where alpha is.

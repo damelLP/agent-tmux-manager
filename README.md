@@ -72,6 +72,44 @@ atm workspace attach               # inject sidebar into current session
 atm layout pair                    # two agents + ATM sidebar
 ```
 
+## Notifications
+
+`atmd` can run a command of yours whenever a session starts needing input: a permission dialog, an MCP input dialog, or an agent asking you something, in any supported harness. Add a `[notify]` section to `config.toml`. `atm setup` writes this example commented out, but it never rewrites an existing file, so add the section by hand if you already have one:
+
+```toml
+[notify]
+command = ["notify-send", "atm", "--"]
+```
+
+`atmd` appends one message as the last argument, such as `agent-tmux-manager/main %5: claude needs input (Bash: cargo test)` (project and branch, pane, harness, and what it asks; a subagent's row says `claude subagent`), and runs the command directly. No shell parses the message. Keep the `--` for a command that takes options, so a message that starts with `-` isn't read as one.
+
+- It runs once each time a session changes into needing input. Nothing runs while a session stays there, when a turn ends, or for Claude's "waiting for your input" reminder (`idle_prompt`), and the sessions `atmd` finds at startup never set it off. A subagent's dialog sends one message, for the subagent, even though Claude marks its lead as waiting too.
+- `atmd` reads `[notify]` when it starts. Run `atmd stop` to apply a change: an open TUI starts it again, or the next `atm` does.
+- The command runs in `atmd`'s environment, which comes from whoever started `atmd` (usually a TUI). Use absolute paths: with no shell, `~` and `$VAR` aren't expanded.
+- Stdin and stdout are closed. After 30 seconds `atmd` kills the command (but not processes it started). A failure is logged, with the command's stderr, to the daemon log.
+
+[ntfy](https://ntfy.sh), through curl. `--data-raw` sends the message as it is; `-d` would read a file for a message that starts with `@`:
+
+```toml
+[notify]
+command = ["curl", "-fsS", "https://ntfy.sh/<your-topic>", "--data-raw"]
+```
+
+A Slack incoming webhook, through a small script that JSON-escapes the message:
+
+```sh
+#!/bin/sh
+# Posts $1 to the Slack incoming webhook whose URL is in the file below.
+url=$(cat "$HOME/.config/atm/slack-webhook-url") || exit 1
+jq -n --arg text "$1" '{text: $text}' |
+  curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$url"
+```
+
+```toml
+[notify]
+command = ["/home/you/bin/atm-slack"]
+```
+
 ## How it works
 
 ```

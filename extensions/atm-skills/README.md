@@ -7,8 +7,8 @@ any harness atm supports:
   one to a long-lived implementer, wait for it, read its report, review, and
   clear the implementer before its next task.
 - **`implement`**: the implementer's rules. One task, in its own worktree,
-  and every turn ends with a `QUESTION:`, `BLOCKED:` or `DONE:` line the
-  coordinator can read.
+  and every turn ends with a `QUESTION:`, `BLOCKED:`, `WAITING:` or `DONE:`
+  line the coordinator can read.
 
 Everything goes through atm (`atm list`, `peek`, `send`, `reply`, `spawn`),
 so the loop is the same whichever harness runs on either side. The commands,

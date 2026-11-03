@@ -128,6 +128,10 @@ fewer lines). The implementer's last line starts with one of:
   short. For a long one, write a file and send its path in a sentence.
 - **`BLOCKED:`** Unblock it if that's clearly yours to do; otherwise tell the
   user.
+- **`WAITING:`** The implementer ended its turn while a job of its own (CI, a
+  long test) still runs in the background; it reports in the next turn. Wait
+  again with a long start timeout, for example `atm-wait %N 3600 1800`: the
+  default 120 s would end `NEVER_STARTED` before a longer job finishes.
 - **`DONE: plan <path>`** The implementer stopped for your OK. Read the plan,
   then send your OK or your changes with `atm send` and wait again. Don't
   clear it: the task isn't done.
@@ -147,8 +151,9 @@ agreed task; otherwise ask the user.
   prompt, and `atm send` refuses it: ask the user to type the next instruction
   in that pane (until #127).
 
-If there's neither a dialog nor one of those lines, wait again or ask the
-user.
+If there's neither a dialog nor one of those lines: when the screen shows a
+background job still running (Claude Code says "1 shell still running"),
+treat it as `WAITING:`; otherwise wait again or ask the user.
 
 ## 5. Hand over at 40% context
 

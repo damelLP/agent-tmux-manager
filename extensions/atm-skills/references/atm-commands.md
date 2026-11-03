@@ -43,7 +43,9 @@ starts atmd if none is running.
 ## `atm peek <pane> [-n N] [--prompt]`
 
 Prints the visible screen of the pane (not its scrollback). `-n 60` keeps the
-last 60 lines, but a small pane shows fewer.
+last 60 lines, but a small pane shows fewer. An implementer's report ends with
+a line starting `QUESTION:`, `BLOCKED:`, `WAITING:` (a background job of its
+own still runs; it reports in its next turn) or `DONE:`.
 
 `--prompt` tries to cut out a Claude Code dialog (the question and its
 numbered options). It's best-effort: with no dialog it may print a single

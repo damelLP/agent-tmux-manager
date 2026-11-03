@@ -54,5 +54,10 @@ The last line starts with exactly one of:
 
 - `QUESTION: <the decision you need>`, then wait for the answer.
 - `BLOCKED: <what stops you, and what would unblock it>`
+- `WAITING: <what you wait for, and roughly how long>`, when you end a turn
+  while a job of yours still runs in the background (CI, a long test). Report
+  with one of the other markers in the turn that follows. Prefer waiting in
+  the foreground when your shell tool allows it (`gh pr checks <n> --watch`),
+  so the turn ends with the result.
 - `DONE: <the result>`. For code: the PR, its head sha, the tests you ran, and
   what you couldn't verify.

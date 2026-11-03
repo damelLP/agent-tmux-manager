@@ -81,7 +81,7 @@ atm layout pair                    # two agents + ATM sidebar
 command = ["notify-send", "atm", "--"]
 ```
 
-`atmd` appends one message as the last argument, such as `agent-tmux-manager/main %5: claude needs input (Bash: cargo test)` (project and branch, pane, harness, and what it asks; a subagent's row says `claude subagent`), and runs the command directly. No shell parses the message. Keep the `--` for a command that takes options, so a message that starts with `-` isn't read as one.
+`atmd` appends one message as the last argument, such as `agent-tmux-manager/main %5: claude needs input (Bash: cargo test)` (project and branch, pane, harness, and what it asks; a subagent's row says `claude subagent`), and runs the command directly. No shell parses the message. Keep the `--` for a command that takes options, so a message that starts with `-` isn't read as one. The message names the tool and a short summary of its input, such as the start of a shell command, so a script that sends it off your machine (Slack, ntfy) can trim it first.
 
 - It runs once each time a session changes into needing input. Nothing runs while a session stays there, when a turn ends, or for Claude's "waiting for your input" reminder (`idle_prompt`), and the sessions `atmd` finds at startup never set it off. A subagent's dialog sends one message, for the subagent, even though Claude marks its lead as waiting too.
 - `atmd` reads `[notify]` when it starts. Run `atmd stop` to apply a change: an open TUI starts it again, or the next `atm` does.

@@ -19,9 +19,11 @@
 //! `PermissionRequest` carries the subagent's `agent_id`, and the
 //! `Notification` about 6 s later, sent only if the dialog is still open,
 //! carries none, so it lands on the lead's row. A lead with a subagent
-//! already needing input therefore stays quiet.
+//! already needing input therefore stays quiet, once per subagent stretch:
+//! a subagent stopped mid-dialog keeps needing input (#129) and must not
+//! mute the lead's later dialogs.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -124,7 +126,9 @@ pub fn notification_message(view: &SessionView) -> String {
 /// Remembers which sessions need input, to notify only on the change.
 #[derive(Debug, Default)]
 pub struct AttentionTracker {
-    in_attention: HashSet<SessionId>,
+    /// Each session that needs input, and whether it has already muted its
+    /// lead's ping during this stretch.
+    in_attention: HashMap<SessionId, bool>,
 }
 
 impl AttentionTracker {
@@ -132,8 +136,9 @@ impl AttentionTracker {
     ///
     /// `Registered` carries no status, so it only resets the session to
     /// "not needing input"; the next `Updated` decides. A session whose
-    /// subagent already needs input stays quiet: Claude reports a
-    /// subagent's dialog on the lead's row too.
+    /// subagent already needs input stays quiet, because Claude reports a
+    /// subagent's dialog on the lead's row too, but each subagent mutes it
+    /// only once per stretch: a stopped one can keep needing input (#129).
     pub fn observe(&mut self, event: &SessionEvent) -> Option<String> {
         match event {
             SessionEvent::Registered { session_id, .. }
@@ -142,10 +147,19 @@ impl AttentionTracker {
                 None
             }
             SessionEvent::Updated { session } if session.status.needs_attention() => {
-                let child_waiting = (session.child_session_ids.iter())
-                    .any(|child| self.in_attention.contains(child));
-                let changed = self.in_attention.insert(session.id.clone());
-                (changed && !child_waiting).then(|| notification_message(session))
+                if self.in_attention.contains_key(&session.id) {
+                    return None;
+                }
+                self.in_attention.insert(session.id.clone(), false);
+                let muting_child = (session.child_session_ids.iter())
+                    .find(|child| self.in_attention.get(*child) == Some(&false));
+                match muting_child.and_then(|child| self.in_attention.get_mut(child)) {
+                    Some(muted) => {
+                        *muted = true;
+                        None
+                    }
+                    None => Some(notification_message(session)),
+                }
             }
             SessionEvent::Updated { session } => {
                 self.in_attention.remove(&session.id);
@@ -433,6 +447,55 @@ mod tests {
                 updated("lead", AttentionNeeded),
             ]),
             [false, true, false, false, false, false, true]
+        );
+    }
+
+    /// #129, captured with Claude Code 2.1.312 on 2026-10-29: a background
+    /// agent stopped during its dialog sends no `SubagentStop`, so its row
+    /// keeps needing input. It mutes the lead's ping for its own dialog,
+    /// but not the lead's later dialogs.
+    #[test]
+    fn a_stale_subagent_mutes_its_lead_only_once() {
+        let mut lead = view("lead", Working);
+        lead.child_session_ids = vec![SessionId::new("sub")];
+        let mut sub = view("sub", AttentionNeeded);
+        sub.parent_session_id = Some(SessionId::new("lead"));
+        let lead_now = |status| SessionEvent::Updated {
+            session: Box::new(SessionView {
+                status,
+                ..lead.clone()
+            }),
+        };
+        let sub_now = |status| SessionEvent::Updated {
+            session: Box::new(SessionView {
+                status,
+                ..sub.clone()
+            }),
+        };
+        assert_eq!(
+            fired(&[
+                sub_now(AttentionNeeded),
+                lead_now(AttentionNeeded),
+                // The subagent is stopped; its row stays in needs input.
+                lead_now(Working),
+                lead_now(Idle),
+                lead_now(AttentionNeeded),
+                lead_now(Working),
+                lead_now(AttentionNeeded),
+            ]),
+            [true, false, false, false, true, false, true]
+        );
+        // Its next dialog, after leaving needs input, mutes the lead again.
+        assert_eq!(
+            fired(&[
+                sub_now(AttentionNeeded),
+                lead_now(AttentionNeeded),
+                lead_now(Working),
+                sub_now(Working),
+                sub_now(AttentionNeeded),
+                lead_now(AttentionNeeded),
+            ]),
+            [true, false, false, false, true, false]
         );
     }
 

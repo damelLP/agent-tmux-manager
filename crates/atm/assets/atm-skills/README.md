@@ -3,10 +3,10 @@
 Two skills that let one agent coordinate others through the `atm` CLI, for
 any harness atm supports:
 
-- **`coordinate`**: the coordinator loop. Plan tasks with the user, send each
-  one to a long-lived implementer, wait for it, read its report, review, and
-  clear the implementer before its next task.
-- **`implement`**: the implementer's rules. One task, in its own worktree,
+- **`atm-coordinate`**: the coordinator loop. Plan tasks with the user, send
+  each one to a long-lived implementer, wait for it, read its report, review,
+  and clear the implementer before its next task.
+- **`atm-implement`**: the implementer's rules. One task, in its own worktree,
   and every turn ends with a `QUESTION:`, `BLOCKED:`, `WAITING:` or `DONE:`
   line the coordinator can read.
 
@@ -23,48 +23,47 @@ workarounds noted in the skills.
 
 - **`atm` built after #119.** Its `atm send` pastes text and refuses unsafe
   sends. Older builds type text with `send-keys`, which turns each newline into
-  Enter. Check: `atm send --help` mentions "bracketed paste". The coordinate
-  skill checks this first and stops if it's missing.
-- `atm setup` run for each harness you use, so the sessions show in `atm list`.
+  Enter. Check: `atm send --help` mentions "bracketed paste". The
+  `atm-coordinate` skill checks this first and stops if it's missing.
+- `atm setup` run for each harness you use: it installs atm's hooks, so the
+  sessions show in `atm list`, and these skills.
 - `tmux`, and `jq` on `PATH` for the coordinator.
+- A Codex coordinator needs its sandbox opened for atm's socket: see the
+  [command reference](shared/references/atm-commands.md#a-codex-coordinator-needs-its-sandbox-opened).
 
 ## Install
 
-The plugin lives in this folder. The repository root holds a marketplace
-(`.claude-plugin/marketplace.json`) that points at it. Replace
-`<repo>` with your checkout of agent-tmux-manager.
+`atm setup` installs both skills for each harness it finds, as plain skill
+folders: no plugin, no marketplace and no settings entry. The files are built
+into the `atm` binary, so `cargo install` and then `atm setup` is all it takes.
+Run `atm setup` again after updating atm to update the skills. `atm uninstall`
+removes them.
 
-| Harness | Install | Invoke |
+| Harness | Installed in | Invoke |
 |---|---|---|
-| Claude Code | `claude plugin marketplace add <repo>`<br>`claude plugin install atm@agent-tmux-manager` | `/atm:coordinate`, `/atm:implement` |
-| pi | add `"skills": ["<repo>/extensions/atm-skills/skills"]` to `~/.pi/agent/settings.json`, or start pi with `--skill <repo>/extensions/atm-skills/skills` | `/skill:coordinate`, `/skill:implement` |
-| Codex CLI | `codex plugin marketplace add <repo>`<br>`codex plugin add atm@agent-tmux-manager` | `$atm:coordinate`, `$atm:implement` |
+| Claude Code | `~/.claude/skills/atm-coordinate/`, `~/.claude/skills/atm-implement/` | `/atm-coordinate`, `/atm-implement` |
+| pi | `~/.pi/agent/skills/atm-coordinate/`, `.../atm-implement/` | `/skill:atm-coordinate`, `/skill:atm-implement` |
+| Codex CLI | `~/.codex/skills/atm-coordinate/`, `.../atm-implement/` | `$atm-coordinate`, `$atm-implement` |
 
-- **Claude Code** installs at user scope by default, so every session sees the
-  skills, including implementers that `atm spawn` starts in other directories.
-  A local marketplace is read from the folder itself, so edits to the skills
-  apply to new sessions without reinstalling.
-- **pi**: `atm spawn -H pi` doesn't pass `--skill`, so use the settings entry
-  for spawned implementers.
-- **Codex** copies the plugin into `$CODEX_HOME/plugins/cache/`. Run
-  `codex plugin add atm@agent-tmux-manager` again after pulling changes.
+- Each installed skill folder holds its `SKILL.md` and a copy of everything in
+  `shared/`: the command reference, the scripts, and `agents/openai.yaml`.
+  That file keeps Codex from invoking the skills on its own, since Codex
+  ignores `disable-model-invocation`. Claude Code and pi ignore it.
+- Claude Code and Codex list a newly installed skill in sessions that are
+  already running. Restart pi sessions.
+- The folders are the harnesses' defaults. With `CLAUDE_CONFIG_DIR` or
+  `CODEX_HOME` pointing elsewhere, that harness doesn't read them, as with
+  atm's hooks.
+- `atm setup` replaces atm's two folders whole, so edits there, or a symlink
+  in their place, are lost on its next run. To try a change to the skills,
+  edit them here, rebuild atm and run `atm setup` again.
 
-### A Codex coordinator needs its sandbox opened
+## Layout
 
-A coordinator runs `atm` from its shell tool. In Codex 0.163.0's default
-`workspace-write` sandbox, `atm list` fails with "Failed to connect to daemon
-... Operation not permitted": the sandbox blocks the connection to atmd's unix
-socket. With network access allowed, `atm list`, `peek` and `send` all worked:
-
-```toml
-# ~/.codex/config.toml, or -c sandbox_workspace_write.network_access=true
-[sandbox_workspace_write]
-network_access = true
-```
-
-That also lets the coordinator's other commands reach the network. Approving
-each `atm` call to run outside the sandbox is the narrower option. An
-implementer never runs `atm`, so it needs neither.
+- `atm-coordinate/SKILL.md`, `atm-implement/SKILL.md`: the skills.
+- `shared/`: copied into every installed skill folder at the same paths.
+- `tests/scripts.sh`: tests for the scripts, which `cargo test` runs. It and
+  this README aren't installed.
 
 ## Profiles
 

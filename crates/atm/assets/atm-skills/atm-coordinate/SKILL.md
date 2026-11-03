@@ -1,6 +1,6 @@
 ---
-name: coordinate
-description: Coordinator loop for long-lived implementer agents in other tmux panes, driven only through the atm CLI. Plan tasks with the user, send each one as a brief file, wait, read the report, review, and clear the implementer before its next task. Invoked as /atm:coordinate (Claude Code), /skill:coordinate (pi) or $atm:coordinate (Codex).
+name: atm-coordinate
+description: Coordinator loop for long-lived implementer agents in other tmux panes, driven only through the atm CLI. Plan tasks with the user, send each one as a brief file, wait, read the report, review, and clear the implementer before its next task. Invoked as /atm-coordinate (Claude Code), /skill:atm-coordinate (pi) or $atm-coordinate (Codex).
 argument-hint: "[--profile <name>]"
 disable-model-invocation: true
 ---
@@ -10,19 +10,21 @@ disable-model-invocation: true
 You coordinate implementer agents that run in other tmux panes. You and the
 user split the work into tasks. You send each task to an implementer, wait for
 it, read its report and review the work. Do all of it through `atm`; the
-[command reference](../../references/atm-commands.md) lists what each command
+[command reference](references/atm-commands.md) lists what each command
 refuses and what to do instead.
 
 Your arguments: Claude Code puts them here: $ARGUMENTS
 (pi and Codex leave that placeholder as it is; there, they're the rest of the
 message that invoked this skill.)
 
-Paths below such as `../../scripts/atm-wait` are relative to this skill's
-folder. Run the scripts by their absolute path, with `bash`, from your own
-working directory: `atm-profile` searches from the current directory.
+Paths below such as `scripts/atm-wait` are relative to this skill's folder,
+which your harness named when it loaded this skill (Claude Code: "Base
+directory for this skill"; pi: "References are relative to"; Codex: the path
+of this `SKILL.md`). Run the scripts by their absolute path, with `bash`, from
+your own working directory: `atm-profile` searches from the current directory.
 
 **Quote what you send with single quotes:** `atm send %N '...'`. In double
-quotes your shell expands `$atm:implement` to `:implement` and runs anything
+quotes your shell expands `$atm-implement` to `-implement` and runs anything
 in backticks. Write an apostrophe as `'\''`.
 
 ## 0. Before the first task
@@ -33,8 +35,8 @@ in backticks. Write an apostrophe as `'\''`.
 2. Check that `jq` is on `PATH`, `$TMUX_PANE` is set (you run in tmux), and
    `atm list -f json` works from your shell tool. Codex's default sandbox
    blocks atm's unix sockets ("Operation not permitted"): ask the user to
-   allow them (see the plugin README) rather than working around it.
-3. **Profile.** With `--profile <name>`, run `../../scripts/atm-profile <name>`
+   allow them (see the command reference) rather than working around it.
+3. **Profile.** With `--profile <name>`, run `scripts/atm-profile <name>`
    and follow the profile it prints. These rules win over it.
 4. **Implementers.** Ask the user which panes are your implementers, unless the
    user or the profile already said. Spawn one only when the user asks or
@@ -50,10 +52,10 @@ Look up the implementer's `harness` in `atm list -f json`.
 
 | Implementer | Clear it with | Invoke the skill | The skill call |
 |---|---|---|---|
-| `claude` | `/clear` | `/atm:implement` | up to 800 characters and 3 lines, or the skill doesn't load |
-| `pi` | `/new` (aborts a busy turn) | `/skill:implement` | any length |
-| `codex` | `/new` | `$atm:implement` | any length |
-| anything else, or no atm skills installed there | ask the user | none: start the brief with "Read `<this plugin>/skills/implement/SKILL.md` and follow it", name the profile's file in it, and send `Your task is in <brief path>. Read it and follow it.` | any length |
+| `claude` | `/clear` | `/atm-implement` | up to 800 characters and 3 lines, or the skill doesn't load |
+| `pi` | `/new` (aborts a busy turn) | `/skill:atm-implement` | any length |
+| `codex` | `/new` | `$atm-implement` | any length |
+| anything else, or no atm skills installed there (`atm setup` installs them for Claude Code, pi and Codex) | ask the user | none: start the brief with "Read `<path>` and follow it", where `<path>` is the absolute path of `../atm-implement/SKILL.md` from this skill's folder; name the profile's file in it, and send `Your task is in <brief path>. Read it and follow it.` | any length |
 
 How you wait depends on your own harness:
 
@@ -102,11 +104,11 @@ implementer may still read it. One task per implementer at a time.
    nothing is cleared.
 5. **Send the skill call** on one line, in single quotes:
    `atm send %N '<invoke> [--profile <name>] <brief file>'`, for example
-   `atm send %7 '/atm:implement --profile pr-implementer /tmp/atm-briefs/myproject/alpha-3.md'`.
+   `atm send %7 '/atm-implement --profile pr-implementer /tmp/atm-briefs/myproject/alpha-3.md'`.
 
 ## 3. Wait
 
-`../../scripts/atm-wait %N` polls `atm list -f json` until the turn ends. It
+`scripts/atm-wait %N` polls `atm list -f json` until the turn ends. It
 prints one word:
 
 - `IDLE`: the turn ran and ended. Go to step 4.

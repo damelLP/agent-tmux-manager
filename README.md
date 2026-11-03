@@ -127,7 +127,7 @@ Inside the container the hook needs `jq` and either `socat` or `nc`, and the hoo
 
 ## Coordinating agents (experimental)
 
-The `atm` plugin in [`crates/atm/assets/atm-skills`](crates/atm/assets/atm-skills/) has two skills: `coordinate` lets one agent drive long-lived implementer agents through `atm list`, `peek`, `send` and `reply`, and `implement` gives each implementer its rules. They work across Claude Code, pi and Codex. Install and usage are in its [README](crates/atm/assets/atm-skills/README.md).
+`atm setup` installs two skills for Claude Code, pi and Codex: `atm-coordinate` lets one agent drive long-lived implementer agents through `atm list`, `peek`, `send` and `reply`, and `atm-implement` gives each implementer its rules. Invoke them as `/atm-coordinate` (Claude Code), `/skill:atm-coordinate` (pi) or `$atm-coordinate` (Codex). Their source, install layout and usage are in [`crates/atm/assets/atm-skills`](crates/atm/assets/atm-skills/README.md).
 
 ## Documentation
 

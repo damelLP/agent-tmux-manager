@@ -1,0 +1,5 @@
+# Codex reads this; Claude Code and pi ignore it. Codex ignores the
+# SKILL.md disable-model-invocation key, and this keeps the skill out of the
+# model's list while $atm-coordinate / $atm-implement still invoke it.
+policy:
+  allow_implicit_invocation: false

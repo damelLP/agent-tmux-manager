@@ -1,6 +1,6 @@
 ---
-name: implement
-description: Implementer rules for one task that an atm coordinator sends with atm send. The coordinator invokes it as /atm:implement (Claude Code), /skill:implement (pi) or $atm:implement (Codex); don't invoke it yourself.
+name: atm-implement
+description: Implementer rules for one task that an atm coordinator sends with atm send. The coordinator invokes it as /atm-implement (Claude Code), /skill:atm-implement (pi) or $atm-implement (Codex); don't invoke it yourself.
 argument-hint: "[--profile <name>] <brief file | task>"
 disable-model-invocation: true
 ---
@@ -18,7 +18,7 @@ pi and Codex leave that placeholder as it is; there, your arguments are the
 rest of the message that invoked this skill.
 
 - **`--profile <name>`**: from your working directory, run
-  `bash <this skill's folder>/../../scripts/atm-profile <name>` (it searches
+  `bash <this skill's folder>/scripts/atm-profile <name>` (it searches
   from the current directory, so don't `cd` into the skill's folder) and
   follow the profile it prints. If it fails, end the turn with
   `BLOCKED: profile <name> not found`.

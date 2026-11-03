@@ -61,8 +61,8 @@ Pastes the text into the pane, then presses Enter, as if the user typed it.
 `/clear` runs as a command, and `!cmd` runs a shell command.
 
 Quote the text with single quotes (`atm send %N '...'`, an apostrophe as
-`'\''`). In double quotes your own shell expands `$atm:implement` to
-`:implement` and runs anything in backticks before atm sees it.
+`'\''`). In double quotes your own shell expands `$atm-implement` to
+`-implement` and runs anything in backticks before atm sees it.
 
 It refuses, with a reason:
 
@@ -82,7 +82,7 @@ What it doesn't protect against:
   as steering, and Codex steers it into the running turn at once (#116). pi's
   `/new` while busy aborts the turn. Clear an implementer only when it's idle.
 - **A send right after `/clear`.** Two sends a few milliseconds apart reached
-  Claude Code 2.1.316 as one plain-text message (`/clear/atm:implement ...`)
+  Claude Code 2.1.316 as one plain-text message (`/clear/atm-implement ...`)
   and nothing was cleared. Peek until the screen is fresh (the previous
   output gone, no turn running) before the next send. Claude's input line may
   show the command you just ran in grey (`❯ /clear`): that's a suggestion,
@@ -143,6 +143,23 @@ left|right|above|below` (default below), `-s 30%` (default 50%), `-m <model>`.
   the new pane's id.
 - Spawn only when the user asks or agrees.
 
+## A Codex coordinator needs its sandbox opened
+
+A coordinator runs `atm` from its shell tool. In Codex 0.163.0's default
+`workspace-write` sandbox, `atm list` fails with "Failed to connect to daemon
+... Operation not permitted": the sandbox blocks the connection to atmd's unix
+socket. With network access allowed, `atm list`, `peek` and `send` all worked:
+
+```toml
+# ~/.codex/config.toml, or -c sandbox_workspace_write.network_access=true
+[sandbox_workspace_write]
+network_access = true
+```
+
+That also lets the coordinator's other commands reach the network. Approving
+each `atm` call to run outside the sandbox is the narrower option. An
+implementer never runs `atm`, so it needs neither.
+
 ## Not in atm yet
 
 | Planned | Today |
@@ -152,10 +169,11 @@ left|right|above|below` (default below), `-s 30%` (default 50%), `-m <model>`.
 | `atm profile show <name>` (#147) | `scripts/atm-profile <name>` |
 | `atm spawn` printing the new pane (#121) | diff `atm list` before and after |
 
-## Scripts in this plugin
+## Scripts in this skill
 
-They are the steps the skills run, not atm commands. Paths are relative to
-this file. Run them by absolute path from your own working directory.
+They are the steps the skills run, not atm commands. `atm setup` installs
+them in each skill's `scripts/` folder. Paths are relative to this file. Run
+them by absolute path from your own working directory.
 
 - **`../scripts/atm-wait [--after-reply] <pane> [timeout] [start-timeout]`**
   waits for an implementer's turn to end by polling `atm list -f json`. atmd

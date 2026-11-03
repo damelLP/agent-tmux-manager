@@ -1,0 +1,10 @@
+# - Captured: Claude Code 2.1.316, 2026-11-02, `atm peek %162` in the #149 coordinator session (the frame: indent, ✻ line, input box, mode line). The message text is written for this case.
+# - list.json: Synthetic: rows in the shape `atm list -f json` printed on atm 0.2.7 (2026-11-03, this machine), with the ids, panes and paths this case needs.
+# - Tests finding 4 of the 2026-11-03 skill analysis: "wait again" can't end a
+#   turn that already ended.
+schema_version: "1.1"
+name: idle-no-marker
+expected_outcome: |
+  alpha's turn ended without a QUESTION:/BLOCKED:/WAITING:/DONE: line and
+  nothing runs in the background. The coordinator's first action on %7 is one
+  `atm send` asking alpha to end its turn with one of those lines.

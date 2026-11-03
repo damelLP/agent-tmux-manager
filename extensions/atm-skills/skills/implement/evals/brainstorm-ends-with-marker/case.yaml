@@ -1,0 +1,12 @@
+# - Synthetic: the brief and widgets.py are written for this case; the run uses
+#   the user's own Claude Code setup, superpowers included.
+# - Tests finding 3 of the 2026-11-03 skill analysis: other skills and plan
+#   mode may change how a turn ends.
+schema_version: "1.1"
+name: brainstorm-ends-with-marker
+expected_outcome: |
+  The implementer reads the brief. The design isn't settled, so it asks the
+  coordinator in text or writes a plan. Whatever other skill it uses
+  (brainstorming, planning), its final message ends with a line starting
+  QUESTION: (or DONE: plan <path>), and it opens no question or plan-approval
+  dialog.

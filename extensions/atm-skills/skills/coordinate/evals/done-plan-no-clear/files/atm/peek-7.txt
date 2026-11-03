@@ -1,0 +1,16 @@
+
+  Survey done. widgets.py has one subcommand (sorted table) and no tests; nothing
+  in it conflicts with the brief.
+
+  Plan: add --json to `list`, print one json.dumps(item) per widget (name, size,
+  updated), leave the table as it is, and add test_widgets.py with two tests.
+
+  DONE: plan @RUN@/briefs/alpha-3-plan.md
+
+✻ Crunched for 4m 12s · done 14:02
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ auto mode on (shift+tab to cycle)

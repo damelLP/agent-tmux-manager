@@ -4,7 +4,7 @@
 # It is not an atm command. atmd already tracks whether a session is idle,
 # so `atm wait` (#122) was closed; this script only reads `atm list -f json`.
 #
-# Usage: atm-wait <pane> [timeout-s] [start-timeout-s]
+# Usage: atm-wait [--after-reply] <pane> [timeout-s] [start-timeout-s]
 #
 # Waits for the session in <pane> (e.g. %12) to start a turn and finish it,
 # then prints one word and exits:
@@ -20,11 +20,13 @@
 # that sees the session not working returns IDLE. Use it to wait again after
 # TIMEOUT.
 #
-# A dialog already open at the first poll counts as a turn in progress, not
-# as ATTENTION: Claude Code sends no hook when a dialog is approved, so after
-# `atm reply -y` the row reads attention_needed until the approved tool ends.
-# Only a dialog that opens after the first poll returns ATTENTION. Don't wait
-# on a dialog nobody has answered.
+# A dialog already open at the first poll returns ATTENTION at once: nobody
+# may have answered it yet. --after-reply is for waiting right after you
+# approved a dialog (`atm reply -y`, or an option you know approves). Claude
+# Code sends no hook on approval, so the row reads attention_needed until the
+# approved tool ends; with --after-reply a dialog at the first poll counts as
+# a turn in progress until the row leaves attention_needed once. A dialog
+# after that returns ATTENTION in both modes.
 #
 # Why "working, then not working" and not just "idle": straight after a send
 # the row still reads idle, and metadata events move last_activity while the
@@ -38,10 +40,15 @@
 set -u
 
 usage() {
-    echo "usage: atm-wait <pane> [timeout-s] [start-timeout-s]" >&2
+    echo "usage: atm-wait [--after-reply] <pane> [timeout-s] [start-timeout-s]" >&2
     exit 64
 }
 
+after_reply=0
+if [ "${1:-}" = --after-reply ]; then
+    after_reply=1
+    shift
+fi
 pane=${1:-}
 timeout_s=${2:-1800}
 start_timeout_s=${3:-120}
@@ -62,11 +69,14 @@ filter='
     elif any($leads[]; .status == "working") then "working"
     else "idle" end'
 
-# One `atm list`, bounded where coreutils' timeout exists. (No array: an empty
-# "${a[@]}" is an unbound-variable error under set -u in bash before 4.4.)
+# One `atm list`, bounded by coreutils' timeout (gtimeout on macOS with
+# coreutils), else unbounded: atm bounds its own socket calls. No array: an
+# empty "${a[@]}" is an unbound-variable error under set -u in bash < 4.4.
 list_sessions() {
     if command -v timeout >/dev/null; then
         timeout 15 atm list -f json
+    elif command -v gtimeout >/dev/null; then
+        gtimeout 15 atm list -f json
     else
         atm list -f json
     fi
@@ -89,12 +99,12 @@ while :; do
         state=error
     fi
 
-    # The dialog seen at the first poll reads as working until the row
-    # leaves attention_needed once; any dialog after that is ATTENTION.
+    # With --after-reply, the dialog seen at the first poll reads as working
+    # until the row leaves attention_needed once; any later dialog is ATTENTION.
     if [ "$state" != error ]; then
         if [ "$first" -eq 1 ]; then
             first=0
-            [ "$state" = attention ] && answered_dialog=1
+            [ "$state" = attention ] && [ "$after_reply" -eq 1 ] && answered_dialog=1
         elif [ "$state" != attention ]; then
             answered_dialog=0
         fi

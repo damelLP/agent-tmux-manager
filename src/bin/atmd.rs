@@ -31,11 +31,12 @@ use std::process;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use atmd::discovery::DiscoveryService;
 use atmd::monitor::spawn_monitor_task;
+use atmd::notify::{parse_notify_command, spawn_notifier};
 use atmd::registry::{spawn_registry_with_cancel, supervise_actor};
 use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
 
@@ -349,6 +350,12 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     let (registry, registry_tasks) = spawn_registry_with_cancel(registry_cancel.clone());
     info!("Session registry started");
 
+    // Subscribed before discovery, so the notifier sees every session.
+    let _notify_handle = notify_command().await.map(|command| {
+        info!(command = ?command, "Running [notify] when a session needs input");
+        spawn_notifier(registry.subscribe(), command, cancel_token.clone())
+    });
+
     let discovery = DiscoveryService::new(registry.clone());
     let discovery_result = discovery.discover().await;
     if discovery_result.discovered > 0 {
@@ -391,6 +398,25 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
 
     info!("ATM daemon stopped");
     Ok(())
+}
+
+/// The `[notify]` command in atm's `config.toml`, read once at start. A
+/// missing file or section turns notifications off, and so, with a
+/// warning, does a config that can't be read or parsed.
+async fn notify_command() -> Option<Vec<String>> {
+    let path = atm_tui::setup::atm_config_path()?;
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "Cannot read config; notifications are off");
+            return None;
+        }
+    };
+    parse_notify_command(&text).unwrap_or_else(|e| {
+        warn!(path = %path.display(), error = %e, "Invalid config; notifications are off");
+        None
+    })
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {

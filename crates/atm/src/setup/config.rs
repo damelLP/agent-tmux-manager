@@ -76,6 +76,13 @@ default = "claude"
 # binary = "custom-agent"
 # default_args = ["--profile", "atm"]
 # model_flag = "--model-id"
+
+# Run a command when a session starts needing input (a permission or
+# input dialog). atmd appends a message as one last argument and runs the
+# command without a shell, in atmd's environment; the "--" stops a message
+# that starts with "-" being read as an option. Restart atmd to apply.
+# [notify]
+# command = ["notify-send", "atm", "--"]
 "#
 }
 

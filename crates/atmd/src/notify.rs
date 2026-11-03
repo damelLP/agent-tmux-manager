@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use atm_core::{SessionId, SessionView};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::task::JoinHandle;
@@ -40,9 +41,15 @@ use crate::registry::SessionEvent;
 /// How long a notify command may run before atmd kills it.
 pub const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A notify command that failed.
+/// How much of a failed command's stderr atmd keeps for its log.
+pub const STDERR_LIMIT: usize = 4096;
+
+/// A `[notify]` config or command that failed.
 #[derive(Debug, thiserror::Error)]
 pub enum NotifyError {
+    /// atm's `config.toml` is not valid, or its `[notify]` is not.
+    #[error("invalid config: {0}")]
+    Config(#[from] toml::de::Error),
     /// The command could not start, e.g. it was not found.
     #[error("failed to start {program:?}: {source}")]
     Start {
@@ -74,8 +81,10 @@ struct ConfigFile {
     notify: NotifyConfig,
 }
 
-/// `[notify]` in atm's `config.toml`.
+/// `[notify]` in atm's `config.toml`. An unknown key is an error, so a
+/// typo doesn't turn notifications off silently.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotifyConfig {
     /// The program and its arguments. atmd appends the message as one
     /// last argument and runs it without a shell.
@@ -85,7 +94,7 @@ struct NotifyConfig {
 
 /// The `[notify]` command in the text of atm's `config.toml`. `None`, so
 /// notifications are off, when there is no section or `command` is empty.
-pub fn parse_notify_command(text: &str) -> Result<Option<Vec<String>>, toml::de::Error> {
+pub fn parse_notify_command(text: &str) -> Result<Option<Vec<String>>, NotifyError> {
     let file: ConfigFile = toml::from_str(text)?;
     Ok(Some(file.notify.command).filter(|command| !command.is_empty()))
 }
@@ -104,7 +113,7 @@ pub fn notification_message(view: &SessionView) -> String {
         .or(view.working_directory.as_ref());
     let project = dir
         .and_then(|dir| dir.rsplit('/').find(|part| !part.is_empty()))
-        .unwrap_or("?");
+        .unwrap_or("-");
     let label = match &view.worktree_branch {
         Some(branch) => format!("{project}/{branch}"),
         None => project.to_string(),
@@ -176,7 +185,7 @@ pub async fn run_notify(argv: &[String], timeout: Duration) -> Result<(), Notify
     // An empty argv fails to start, like a program that isn't there.
     let program = argv.first().cloned().unwrap_or_default();
     let args = argv.get(1..).unwrap_or_default();
-    let child = Command::new(&program)
+    let mut child = Command::new(&program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -187,21 +196,34 @@ pub async fn run_notify(argv: &[String], timeout: Duration) -> Result<(), Notify
             program: program.clone(),
             source,
         })?;
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(output) => output.map_err(|source| NotifyError::Wait {
+    let mut stderr = Vec::new();
+    let pipe = child.stderr.take();
+    let run = async {
+        if let Some(pipe) = pipe {
+            // Past the limit the pipe closes, so a chatty command gets
+            // EPIPE instead of growing atmd's memory.
+            pipe.take(STDERR_LIMIT as u64)
+                .read_to_end(&mut stderr)
+                .await?;
+        }
+        child.wait().await
+    };
+    let status = match tokio::time::timeout(timeout, run).await {
+        Ok(status) => status.map_err(|source| NotifyError::Wait {
             program: program.clone(),
             source,
         })?,
-        // Dropping the future dropped the child, and `kill_on_drop` killed it.
+        // Dropping `run` let go of the child; `kill_on_drop` kills it when
+        // this function returns.
         Err(_) => return Err(NotifyError::Timeout { program, timeout }),
     };
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
     Err(NotifyError::Failed {
         program,
-        status: output.status,
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        status,
+        stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
     })
 }
 
@@ -280,6 +302,8 @@ mod tests {
             "[notify]\ncommand = 'notify-send atm'\n",
             "[notify]\ncommand = [1]\n",
             "[notify\n",
+            // A typo inside [notify] is an error, not notifications off.
+            "[notify]\ncmd = ['notify-send', 'atm', '--']\n",
         ] {
             assert!(parse_notify_command(text).is_err(), "{text:?}");
         }
@@ -538,6 +562,12 @@ mod tests {
             notification_message(&bare),
             "demo 9b8c7d6e: claude needs input"
         );
+
+        // Nothing at all: `-`, as `atm list` shows a missing project.
+        assert_eq!(
+            notification_message(&view("9b8c7d6e5f", AttentionNeeded)),
+            "- 9b8c7d6e: claude needs input"
+        );
     }
 
     #[tokio::test]
@@ -549,6 +579,29 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("exit status: 3"), "{message}");
         assert!(message.contains("webhook said no"), "{message}");
+    }
+
+    /// A chatty command can't grow atmd's memory or its log line: atmd
+    /// keeps at most `STDERR_LIMIT` bytes of its stderr.
+    #[tokio::test]
+    async fn run_notify_keeps_only_the_start_of_a_long_stderr() {
+        let argv = [
+            "sh",
+            "-c",
+            "head -c 1000000 /dev/zero | tr '\\0' x >&2; exit 1",
+        ]
+        .map(String::from);
+        let err = run_notify(&argv, Duration::from_secs(10))
+            .await
+            .expect_err("a chatty failure is still a failure");
+        let NotifyError::Failed { stderr, .. } = &err else {
+            panic!("expected Failed, got {err}");
+        };
+        assert!(
+            !stderr.is_empty() && stderr.len() <= STDERR_LIMIT,
+            "{}",
+            stderr.len()
+        );
     }
 
     #[tokio::test]

@@ -20,6 +20,10 @@
 //!   approval of non-managed hooks — `setup_codex` prints the `/hooks`
 //!   instruction for this. codex-cli 0.163.0 also asks at startup
 //!   ("Hooks need review"), and `/hooks` still exists.
+//! - **The atm skills** (`atm-coordinate`, `atm-implement`): plain skill
+//!   folders in each detected harness's skills folder (`~/.claude/skills/`,
+//!   `~/.pi/agent/skills/`, `~/.codex/skills/`), with no settings entry.
+//!   Setup replaces them whole each run; see `skills.rs`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,19 +38,22 @@ mod config;
 mod hooks;
 mod json;
 mod pi;
+mod skills;
 
 use claude::{
-    detect_claude_code, hook_script_path, read_settings, setup_claude_code,
+    claude_skills_dir, detect_claude_code, hook_script_path, read_settings, setup_claude_code,
     status_line_backup_path, uninstall_status_line, write_settings,
 };
 use codex::{
-    codex_hook_script_path, detect_codex, read_codex_hooks, setup_codex, write_codex_hooks,
+    codex_hook_script_path, codex_skills_dir, detect_codex, read_codex_hooks, setup_codex,
+    write_codex_hooks,
 };
 use config::install_tmux_bindings;
 pub use config::{atm_config_path, ensure_default_atm_config};
 use hooks::{remove_hook_entries, remove_script_file};
 use json::{or_empty_if_not_object, read_json_file_or_empty};
-use pi::{detect_pi, setup_pi, uninstall_pi_extension};
+use pi::{detect_pi, pi_skills_dir, setup_pi, uninstall_pi_extension};
+use skills::uninstall_atm_skills;
 
 /// Errors from installing or removing ATM's harness integrations.
 #[derive(Debug, Error)]
@@ -275,6 +282,18 @@ pub fn uninstall() -> Result<()> {
         println!("done");
     } else {
         println!("not found");
+    }
+
+    // Step 6: Remove the atm skills from each detected harness's skills
+    // folder. Without the harness's own directory there is no skills folder.
+    for (detected, skills_dir) in [
+        (detect_claude_code(), claude_skills_dir()),
+        (detect_pi(), pi_skills_dir()),
+        (detect_codex(), codex_skills_dir()),
+    ] {
+        if detected {
+            uninstall_atm_skills(skills_dir)?;
+        }
     }
 
     println!("\nATM uninstalled successfully!");

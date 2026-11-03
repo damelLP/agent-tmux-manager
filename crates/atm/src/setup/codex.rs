@@ -7,6 +7,7 @@ use serde_json::{json, Map, Value};
 
 use super::hooks::{add_hook_entries, install_executable_script};
 use super::json::{read_json_file_or_empty, write_json_file_pretty};
+use super::skills::setup_atm_skills;
 use super::{Result, SetupError};
 
 /// The atm-codex-hook bash script content (Codex CLI), embedded at compile time.
@@ -15,6 +16,14 @@ const ATM_CODEX_HOOK_SCRIPT: &str = include_str!("../../scripts/atm-codex-hook")
 /// Returns the path to Codex's hooks.json
 fn codex_hooks_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
+}
+
+/// Where Codex loads user skills from, with no settings entry (as
+/// `$CODEX_HOME/skills`; Codex writes its own into `.system/` there).
+/// codex-cli 0.163.0 also reads `~/.agents/skills/`, which Claude Code
+/// doesn't.
+pub(super) fn codex_skills_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex").join("skills"))
 }
 
 /// Returns the path to the atm-codex-hook script
@@ -94,7 +103,7 @@ pub(super) fn setup_codex() -> Result<()> {
     } else {
         println!("  Codex already configured.");
     }
-    Ok(())
+    setup_atm_skills(codex_skills_dir())
 }
 
 #[cfg(test)]

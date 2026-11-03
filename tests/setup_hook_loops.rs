@@ -38,6 +38,8 @@ struct Harness {
     written: &'static str,
     /// What setup prints after the event lines when nothing changed.
     unchanged: &'static str,
+    /// Where setup installs the atm skills, relative to HOME.
+    skills: &'static str,
 }
 
 const CLAUDE: Harness = Harness {
@@ -79,6 +81,7 @@ const CLAUDE: Harness = Harness {
     title: "Claude Code",
     written: "    statusLine - added\n  Claude Code configuration written.\n",
     unchanged: "    statusLine - already configured\n  Claude Code already configured.\n",
+    skills: ".claude/skills",
 };
 
 const CODEX: Harness = Harness {
@@ -112,6 +115,7 @@ const CODEX: Harness = Harness {
               it did not create. Launch codex and run: /hooks\n  \
               then approve the atm-codex-hook entries when prompted.\n",
     unchanged: "  Codex already configured.\n",
+    skills: ".codex/skills",
 };
 
 impl Harness {
@@ -174,10 +178,12 @@ impl Harness {
     fn setup_stdout(&self, home: &Path, event_lines: &str, tail: &str, config: &str) -> String {
         let config_dir = home.join(".config/atm");
         format!(
-            "{}{event_lines}{tail}\nInstalled tmux bindings: {bindings}\n\
+            "{}{event_lines}{tail}  Installing atm skills to {skills}... done\n\
+             \nInstalled tmux bindings: {bindings}\n\
              Add to your .tmux.conf: source-file {bindings}\n\n\
              Writing atm config to {config_path}... {config}\n\nNext step:\n  Run: atm\n",
             self.setup_stdout_start(home),
+            skills = home.join(self.skills).display(),
             bindings = config_dir.join("tmux-bindings.conf").display(),
             config_path = config_dir.join("config.toml").display(),
         )
@@ -186,7 +192,8 @@ impl Harness {
     /// Uninstall's whole stdout, with `hook_lines` as the output of this
     /// harness's hook loop, in a home where this is the only harness.
     /// `status_line` is the line about ATM's statusLine, printed for any home.
-    /// `script_outcome` is printed for this harness's hook script.
+    /// `script_outcome` is printed for this harness's hook script, and for
+    /// its atm skills, which setup installs with it.
     fn uninstall_stdout(
         &self,
         home: &Path,
@@ -210,7 +217,9 @@ impl Harness {
             "Uninstalling ATM...\n\nRemoving Claude Code hooks...\n{claude_lines}\n{status_line}\n\n\
              Removing hook script {claude}... {claude_script}\n{codex_section}\n\
              Removing codex hook script {codex}... {codex_script}\n\n\
-             ATM uninstalled successfully!\n"
+             Removing atm skills from {skills}... {script_outcome}\n\n\
+             ATM uninstalled successfully!\n",
+            skills = home.join(self.skills).display(),
         )
     }
 }

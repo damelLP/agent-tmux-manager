@@ -576,8 +576,6 @@ mod tests {
         assert!(!target.exists(), "created the symlink's target");
     }
 
-    /// A blocking read-only open of a FIFO waits for a writer, which would
-    /// hang `atmd start` before it ever reaches LOCK_NB.
     /// A FIFO (or a stuck mount) at config.toml can't hang atmd's start:
     /// the read gives up after its timeout.
     #[tokio::test]
@@ -610,6 +608,8 @@ mod tests {
         );
     }
 
+    /// A blocking read-only open of a FIFO waits for a writer, which would
+    /// hang `atmd start` before it ever reaches LOCK_NB.
     #[test]
     fn test_daemon_lock_refuses_a_fifo_without_blocking() {
         let dir = tempfile::tempdir().expect("tempdir");

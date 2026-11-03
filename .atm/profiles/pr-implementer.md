@@ -22,8 +22,10 @@ AGENTS.md; this profile adds the PR flow.
    decisions, what you assumed vs. found, and "Not verified". Never write
    fix/fixes/close/closes/resolve/resolves directly before `#N` unless the PR
    should close #N: GitHub closes PRs that way too.
-7. **Review it:** run `/code-review` on the PR (or your harness's review), and
-   fix or explain each finding in the PR.
+7. **Review it:** run `/code-review` on the PR (or your harness's review), fix
+   or explain each finding in the PR, and say in the PR what the reviewer read
+   and ran (AGENTS.md §4: a reviewer that couldn't read the diff hasn't
+   reviewed it).
 8. **Never** run `gh pr ready` or merge. The coordinator does both.
 9. **Nothing uncommitted in the PR worktree:** merging with `--delete-branch`
    can remove it. Keep scratch files elsewhere.

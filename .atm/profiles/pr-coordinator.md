@@ -7,7 +7,9 @@ Brief them with `--profile pr-implementer`. Follow AGENTS.md.
 
 1. **Brief:** the goal, the agreed design, constraints, the branch and
    worktree name, and what `DONE:` must carry. Start the brief with "Survey
-   first".
+   first". Put the user's own rules in each brief, such as which gh account
+   or token PR commands use: implementers in other harnesses can't see your
+   memory.
 2. **Survey, then your OK.** Read the implementer's plan. Answer design
    questions you and the user already settled; take anything new to the user.
    Then send your OK.
@@ -39,7 +41,7 @@ Brief them with `--profile pr-implementer`. Follow AGENTS.md.
 
 - Never write fix/fixes/close/closes/resolve/resolves directly before `#N` in
   PR prose unless the PR should close #N.
-- What needs the user: changes AGENTS.md principle 2 lists (public types in
-  atm-core or atm-protocol, the wire format, moves and renames), user-visible
-  behaviour choices, paid model calls, and ticking boxes in or closing issues.
+- What needs the user: anything AGENTS.md principle 2 ("If it doesn't fit,
+  stop and ask") lists, user-visible behaviour choices, paid model calls, and
+  ticking boxes in or closing issues.
 - One issue at a time until it's done.

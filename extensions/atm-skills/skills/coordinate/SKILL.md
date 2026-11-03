@@ -40,8 +40,9 @@ in backticks. Write an apostrophe as `'\''`.
    user or the profile already said. Spawn one only when the user asks or
    agrees; you may suggest it, for example when every implementer is busy:
    `atm spawn -H <harness> -w <dir> -t "$TMUX_PANE"`, then find its pane (see
-   the reference). Keep a table: name, pane (`%N`), harness, worktree, task,
-   brief file.
+   the reference). Keep a table: name, pane (`%N`), harness, `project_root`,
+   worktree, task, brief file. (`working_directory` in `atm list` is cut to
+   30 characters, so record `project_root` and `worktree_path`.)
 
 ## Per harness
 
@@ -69,25 +70,39 @@ the implementer starts it from a cleared context: the goal, the agreed design,
 constraints, when it's done, and how to report. Add what the profile says each
 brief needs.
 
-Write each brief to a file the implementer can read. By default:
-`/tmp/atm-briefs/<project>/<implementer>-<n>.md`, with `n` counting on across
-handovers, so no brief is overwritten while an implementer may still read it.
-A profile may name a git-excluded folder in the project instead. One task per
-implementer at a time.
+Write each brief to any file the implementer can read and git doesn't track,
+for example `/tmp/atm-briefs/<project>/<implementer>-<n>.md`, or a git-excluded
+folder in the project such as `docs/`. A folder per project, and numbers that
+count on across handovers, keep a brief from being overwritten while an
+implementer may still read it. One task per implementer at a time.
 
 ## 2. Send a task
 
-1. **Idle first.** The implementer's row must read `idle`. If it's busy, wait
-   (step 3) or pick another implementer. Claude Code sends no hook for an
-   interrupt, so after `atm interrupt` its row reads `working` until the next
-   prompt: there, trust a peek that shows an idle input box.
+1. **Check the row right before the clear,** even if `atm-wait` just returned
+   `IDLE`: a Stop hook with `asyncRewake` can wake a session after its turn
+   ends, so a row can go idle and then working again.
+   - It must read `idle`. If it's busy, wait (step 3) or pick another
+     implementer. Claude Code sends no hook for an interrupt, so after
+     `atm interrupt` its row reads `working` until the next prompt: there,
+     trust a peek that shows no turn running.
+   - Its `harness` and `project_root` must match your table. atm passes a
+     `%N` through unchecked, and after a tmux server restart, or in a second
+     tmux server, the same id can name someone else's session. If they don't
+     match, stop and ask the user. (`worktree_path` may change as the
+     implementer moves to a new worktree.)
 2. **Peek.** `atm peek %N -n 15`: no dialog, and no turn running.
 3. **Clear.** `atm send %N <clear command>`.
-4. **Peek until the screen is fresh:** the last task's output is gone and the
-   input box is empty. Don't send before that: two sends milliseconds apart
-   can reach the harness as one plain-text message, and nothing is cleared.
+4. **Peek until the screen is fresh:** the previous task's output is gone and
+   no turn is running. The input line may show greyed text: Claude suggests
+   the command you just ran (`❯ /clear`), and a plain peek can't tell that
+   from typed text. Peek a few times over about 10 s; if the screen still
+   isn't fresh, ask the user (pi's and Codex's `/new` may leave old output
+   on screen; unverified). Don't send before the screen is fresh: two sends
+   milliseconds apart can reach the harness as one plain-text message, and
+   nothing is cleared.
 5. **Send the skill call** on one line, in single quotes:
-   `atm send %N '<invoke> [--profile <name>] /tmp/atm-briefs/<project>/<implementer>-<n>.md'`.
+   `atm send %N '<invoke> [--profile <name>] <brief file>'`, for example
+   `atm send %7 '/atm:implement --profile pr-implementer /tmp/atm-briefs/myproject/alpha-3.md'`.
 
 ## 3. Wait
 
@@ -113,23 +128,34 @@ fewer lines). The implementer's last line starts with one of:
   short. For a long one, write a file and send its path in a sentence.
 - **`BLOCKED:`** Unblock it if that's clearly yours to do; otherwise tell the
   user.
-- **`DONE:`** Review the result as the profile says. Then the implementer is
-  free for its next task (step 2).
+- **`DONE: plan <path>`** The implementer stopped for your OK. Read the plan,
+  then send your OK or your changes with `atm send` and wait again. Don't
+  clear it: the task isn't done.
+- **`DONE:`** with a result: review it as the profile says. Only now is the
+  implementer free for its next task (step 2).
 
-If there's a dialog instead, run `atm peek %N --prompt`. Answer it with
-`atm reply` only when you know what you're approving and it's inside the agreed
-task; otherwise ask the user. After `atm reply -y`, wait again: `atm-wait`
-counts the dialog it starts on as answered. After `atm reply -n`, Claude's row
-reads as needing input until the next prompt, and `atm send` refuses it: ask
-the user to type the next instruction in that pane (until #127). If there's
-neither a dialog nor one of those lines, wait again or ask the user.
+If there's a dialog instead, run `atm peek %N --prompt`. It extracts a dialog
+on a best-effort basis, so confirm with a plain `atm peek %N -n 40`. Answer it
+with `atm reply` only when you know what you're approving and it's inside the
+agreed task; otherwise ask the user.
+
+- After you approve (`atm reply -y`, or `-o N` for an option you know
+  approves), wait with `atm-wait --after-reply %N`. Claude sends no hook on
+  approval, so the row reads `attention_needed` until the approved tool ends.
+  Without the flag, a dialog at the first poll returns `ATTENTION` at once.
+- After `atm reply -n`, Claude's row reads as needing input until the next
+  prompt, and `atm send` refuses it: ask the user to type the next instruction
+  in that pane (until #127).
+
+If there's neither a dialog nor one of those lines, wait again or ask the
+user.
 
 ## 5. Hand over at 40% context
 
 When your context passes 40%, write a handover: the state of each task, each
-implementer (name, pane, harness, worktree, task, brief file), decisions made,
-and open questions. Ask the user once where to write it, unless the profile
-says. Then tell the user.
+implementer (name, pane, harness, `project_root`, worktree, task, brief file),
+decisions made, and open questions. Ask the user once where to write it,
+unless the profile says. Then tell the user.
 
 ## Never
 
@@ -140,5 +166,5 @@ says. Then tell the user.
   refusals.
 - Kill implementers (`atm kill %N`) only when the user asks or the loop is over.
 
-A draft typed into an implementer's input box merges with your next send; atm
-can't see it. That's a known limit: implementer panes belong to the loop.
+The user may type into an implementer's pane, for example to answer it
+directly. A draft left there merges with your next send, and atm can't see it.

@@ -32,7 +32,9 @@ reads:
 | `parent_session_id` | set on a subagent. An in-process subagent (Claude's background agents) has its lead's pane |
 | `id`, `id_short` | the session id; changes on Claude's `/clear` |
 | `last_activity` | an RFC 3339 time. Metadata events move it while the session is idle, so it doesn't prove a turn ran |
-| `context_percentage`, `worktree_branch`, `working_directory`, `first_prompt` | for your notes and handover |
+| `project_root`, `worktree_path` | the git project (a worktree resolves to its main checkout) and the worktree. Record these in notes and handovers |
+| `context_percentage`, `worktree_branch`, `first_prompt` | for your notes and handover |
+| `working_directory` | for display only: cut to `...` plus the last 27 characters when longer than 30 |
 
 Filters: `--status working|idle|attention`, `--project <part of the project
 root>`. A session appears after its harness's first event to atmd. `atm list`
@@ -41,9 +43,12 @@ starts atmd if none is running.
 ## `atm peek <pane> [-n N] [--prompt]`
 
 Prints the visible screen of the pane (not its scrollback). `-n 60` keeps the
-last 60 lines, enough for an implementer's closing report. `--prompt` cuts out
-a Claude Code dialog (the question and its numbered options); when it finds
-none it prints the last 15 lines.
+last 60 lines, but a small pane shows fewer.
+
+`--prompt` tries to cut out a Claude Code dialog (the question and its
+numbered options). It's best-effort: with no dialog it may print a single
+line, and a report that ends in a numbered list can come back as the
+"prompt". Confirm with a plain `atm peek <pane> -n 40`.
 
 Read before every write: a peek shows a dialog, a typed draft or a busy
 screen that a send would collide with.
@@ -68,14 +73,18 @@ It refuses, with a reason:
 
 What it doesn't protect against:
 
-- **A draft in the input box merges with the text.** Peek first; an
-  implementer's input box belongs to the loop.
+- **A draft in the input box merges with the text.** The user may type into
+  an implementer's pane, for example to answer it directly; a draft left
+  there merges with your next send, and atm can't see it.
 - **A busy session.** Claude queues the text until its turn ends, pi queues it
   as steering, and Codex steers it into the running turn at once (#116). pi's
   `/new` while busy aborts the turn. Clear an implementer only when it's idle.
 - **A send right after `/clear`.** Two sends a few milliseconds apart reached
   Claude Code 2.1.316 as one plain-text message (`/clear/atm:implement ...`)
-  and nothing was cleared. Peek until the screen is fresh before the next send.
+  and nothing was cleared. Peek until the screen is fresh (the previous
+  output gone, no turn running) before the next send. Claude's input line may
+  show the command you just ran in grey (`❯ /clear`): that's a suggestion,
+  but a plain peek can't tell it from typed text.
 - **Claude Code's paste limit.** Claude collapses a paste of more than 800
   characters or more than 3 lines into `[Pasted text #N]` and then sends it to
   the model as plain text: a slash command in it doesn't run, so the skill
@@ -93,7 +102,8 @@ It refuses nothing: the keys go to whatever is on screen. Peek with
 Otherwise ask the user.
 
 Claude Code sends no hook when a dialog is answered. After `-y` the row reads
-`attention_needed` until the approved tool ends. After `-n` it reads that way
+`attention_needed` until the approved tool ends, so wait with
+`atm-wait --after-reply`. After `-n` it reads that way
 until the next prompt, and `atm send` refuses the session, so the next
 instruction has to be typed in the pane (#127 plans `atm reply --no
 --message`).
@@ -123,9 +133,12 @@ left|right|above|below` (default below), `-s 30%` (default 50%), `-m <model>`.
 - **Always pass `-t "$TMUX_PANE"`.** Without it, atm splits the first active
   pane it finds in any tmux session, which is usually not yours (#130 gap 1).
 - **It prints nothing.** To find the new pane, list the panes in
-  `atm list -f json` before you spawn and again after, until a new
-  `tmux_pane` appears (until #121). Claude Code and pi report at startup;
-  Codex 0.163.0 may not until its first prompt.
+  `atm list -f json` before you spawn, then list again every few seconds for
+  up to about 60 s until a new `tmux_pane` appears (until #121). Claude Code
+  and pi report at startup. Codex 0.163.0 may not report before its first
+  prompt, and `atm list` doesn't make atmd look for new sessions (it does
+  that at startup or when a TUI asks). If nothing appears, ask the user for
+  the new pane's id.
 - Spawn only when the user asks or agrees.
 
 ## Not in atm yet
@@ -142,7 +155,9 @@ left|right|above|below` (default below), `-s 30%` (default 50%), `-m <model>`.
 They are the steps the skills run, not atm commands. Paths are relative to
 this file. Run them by absolute path from your own working directory.
 
-- **`../scripts/atm-wait <pane> [timeout] [start-timeout]`** waits for an
-  implementer's turn to end by polling `atm list -f json`. atmd already
-  tracks idle, so there is no `atm wait` (#122 was closed).
+- **`../scripts/atm-wait [--after-reply] <pane> [timeout] [start-timeout]`**
+  waits for an implementer's turn to end by polling `atm list -f json`. atmd
+  already tracks idle, so there is no `atm wait` (#122 was closed). A dialog
+  at its first poll returns `ATTENTION`; `--after-reply` counts it as
+  answered, for waiting right after you approved one.
 - **`../scripts/atm-profile <name>`** prints a profile (#147's lookup).

@@ -31,30 +31,26 @@ const SKILLS: [(&str, &str); 2] = [
     ),
 ];
 
-/// `assets/atm-skills/shared/`: each file's path inside a skill folder, its
-/// content, and whether it's an executable script.
-const SHARED: [(&str, &str, bool); 4] = [
+/// `assets/atm-skills/shared/`: each file's path inside a skill folder and
+/// its content. Files under `scripts/` are installed executable.
+const SHARED: [(&str, &str); 4] = [
     (
         "references/atm-commands.md",
         include_str!("../../assets/atm-skills/shared/references/atm-commands.md"),
-        false,
     ),
     (
         "scripts/atm-wait",
         include_str!("../../assets/atm-skills/shared/scripts/atm-wait"),
-        true,
     ),
     (
         "scripts/atm-profile",
         include_str!("../../assets/atm-skills/shared/scripts/atm-profile"),
-        true,
     ),
     (
         // Codex ignores `disable-model-invocation`; this keeps the skill
         // out of its model's list. Claude Code and pi ignore the file.
         "agents/openai.yaml",
         include_str!("../../assets/atm-skills/shared/agents/openai.yaml"),
-        false,
     ),
 ];
 
@@ -62,11 +58,15 @@ const SHARED: [(&str, &str, bool); 4] = [
 /// file or symlink in its place (a symlink's target is left alone).
 /// Returns whether anything was there.
 fn remove_entry(path: &Path) -> Result<bool> {
-    let removed = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(e) => Err(e),
+        Err(e) => return Err(io_err("read", path)(e)),
+    };
+    let removed = if meta.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
     };
     removed.map_err(io_err("remove", path))?;
     Ok(true)
@@ -79,9 +79,9 @@ fn install_atm_skills(skills_dir: &Path) -> Result<()> {
         let dir = skills_dir.join(name);
         remove_entry(&dir)?;
         write_file(&dir.join("SKILL.md"), skill_md)?;
-        for (path, content, executable) in SHARED {
+        for (path, content) in SHARED {
             let file = dir.join(path);
-            if executable {
+            if path.starts_with("scripts/") {
                 install_executable_script(&file, content)?;
             } else {
                 write_file(&file, content)?;
@@ -92,24 +92,36 @@ fn install_atm_skills(skills_dir: &Path) -> Result<()> {
 }
 
 /// Setup's step for one harness: installs the atm skills into its skills
-/// folder, `skills_dir`.
+/// folder, `skills_dir`. The harness's hooks are in place by then, so a
+/// failure here (a read-only skills folder, say) is reported and setup
+/// goes on.
 pub(super) fn setup_atm_skills(skills_dir: Option<PathBuf>) -> Result<()> {
     let dir = skills_dir.ok_or(SetupError::HomeDirUnknown)?;
     print!("  Installing atm skills to {}... ", dir.display());
-    install_atm_skills(&dir)?;
-    println!("done");
+    match install_atm_skills(&dir) {
+        Ok(()) => println!("done"),
+        Err(e) => println!("failed: {e}"),
+    }
     Ok(())
 }
 
 /// Uninstall's step for one harness: removes atm's skill folders from
-/// `skills_dir`, leaving the folder and every other skill in it.
+/// `skills_dir`, leaving the folder and every other skill in it. A folder
+/// it can't remove is reported, and uninstall goes on.
 pub(super) fn uninstall_atm_skills(skills_dir: Option<PathBuf>) -> Result<()> {
     let dir = skills_dir.ok_or(SetupError::HomeDirUnknown)?;
     print!("\nRemoving atm skills from {}... ", dir.display());
     let mut removed = false;
+    let mut failed = None;
     for (name, _) in SKILLS {
-        removed |= remove_entry(&dir.join(name))?;
+        match remove_entry(&dir.join(name)) {
+            Ok(was_there) => removed |= was_there,
+            Err(e) => failed = failed.or(Some(e)),
+        }
     }
-    println!("{}", if removed { "done" } else { "not found" });
+    match failed {
+        Some(e) => println!("failed: {e}"),
+        None => println!("{}", if removed { "done" } else { "not found" }),
+    }
     Ok(())
 }

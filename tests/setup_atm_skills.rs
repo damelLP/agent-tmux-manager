@@ -293,3 +293,56 @@ fn setup_writes_no_settings_for_the_skills() {
     assert!(pi.get("skills").is_none(), "pi settings.json: {pi}");
     assert!(!home.join(".codex/config.toml").exists());
 }
+
+/// The skills are an addition to each harness's hooks: a skills folder setup
+/// can't write (here a file in its place, as a read-only or foreign
+/// `~/.claude/skills` would be) is reported, and setup goes on to the other
+/// harnesses, the tmux bindings and atm's config.
+#[test]
+fn a_failed_skills_install_is_reported_and_setup_goes_on() {
+    let home = all_harnesses();
+    let home = home.path();
+    fs::write(home.join(".claude/skills"), "not a folder").unwrap();
+
+    let stdout = run_atm_ok(home, "setup");
+
+    let line = format!(
+        "  Installing atm skills to {}... failed: ",
+        home.join(".claude/skills").display()
+    );
+    assert!(stdout.contains(&line), "no {line:?} in:\n{stdout}");
+    assert!(home.join(".claude/settings.json").exists(), "{stdout}");
+    assert_installed(&home.join(".pi/agent/skills"));
+    assert_installed(&home.join(".codex/skills"));
+    assert!(home.join(".config/atm/config.toml").exists(), "{stdout}");
+}
+
+/// Uninstall reports a skills folder it can't clear and goes on to the
+/// other harnesses.
+#[test]
+fn a_failed_skills_removal_is_reported_and_uninstall_goes_on() {
+    let home = all_harnesses();
+    let home = home.path();
+    run_atm_ok(home, "setup");
+    let claude_skills = home.join(".claude/skills");
+    fs::remove_dir_all(&claude_skills).unwrap();
+    fs::write(&claude_skills, "not a folder").unwrap();
+
+    let stdout = run_atm_ok(home, "uninstall");
+
+    let line = format!(
+        "Removing atm skills from {}... failed: ",
+        claude_skills.display()
+    );
+    assert!(stdout.contains(&line), "no {line:?} in:\n{stdout}");
+    for skills in [".pi/agent/skills", ".codex/skills"] {
+        assert!(
+            names_in(&home.join(skills)).is_empty(),
+            "{skills}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.ends_with("ATM uninstalled successfully!\n"),
+        "{stdout}"
+    );
+}

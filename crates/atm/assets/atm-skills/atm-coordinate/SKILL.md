@@ -71,7 +71,7 @@ How you wait depends on your own harness:
 - **pi, Codex and others:** run it in the foreground with a timeout your shell
   tool allows, such as `atm-wait %12 300`. After `TIMEOUT`, run
   `atm-wait %12 300 0` to keep waiting for the same turn, with `--after-reply`
-  if the first wait had it.
+  only if a peek shows the tool you approved still running, not a new dialog.
 
 ## 1. Plan with the user
 
@@ -81,8 +81,8 @@ constraints, when it's done, and how to report. Add what the profile says each
 brief needs.
 
 Write each brief to any file the implementer can read and git doesn't track,
-for example `/tmp/atm-briefs/<project>/<implementer>-<n>.md`, or a git-excluded
-folder in the project such as `docs/plans/`. A folder per project, and numbers that
+for example `/tmp/atm-briefs/<project>/<implementer>-<n>.md`, or a folder
+the project's `.gitignore` excludes (in atm's own repo, `docs/plans/`). A folder per project, and numbers that
 count on across handovers, keep a brief from being overwritten while an
 implementer may still read it. One task per implementer at a time.
 
@@ -128,7 +128,8 @@ until the turn ends. It prints one word:
 - `NEVER_STARTED`: the row never went working. Peek: the send may have failed,
   or the turn was shorter than a poll.
 - `TIMEOUT`: still working. Peek to see whether it's stuck, then wait again
-  with a start timeout of 0, and `--after-reply` if the first wait had it.
+  with a start timeout of 0, and `--after-reply` only if the peek shows the
+  tool you approved still running, not a new dialog.
 
 ## 4. Read and answer
 

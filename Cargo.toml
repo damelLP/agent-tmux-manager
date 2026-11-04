@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Real-time management dashboard for coding agents across tmux sessions"
 readme = "README.md"
+# The atm skills' decision tests: billed `claude -p` runs for development,
+# not part of the crate.
+exclude = ["/evals/"]
 
 [workspace]
 resolver = "2"

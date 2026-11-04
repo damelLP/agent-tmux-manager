@@ -72,23 +72,80 @@ fn remove_entry(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Writes the atm skills into `skills_dir`. Each skill's folder is
-/// replaced whole, so files an older atm installed go too.
-fn install_atm_skills(skills_dir: &Path) -> Result<()> {
-    for (name, skill_md) in SKILLS {
-        let dir = skills_dir.join(name);
-        remove_entry(&dir)?;
-        write_file(&dir.join("SKILL.md"), skill_md)?;
-        for (path, content) in SHARED {
-            let file = dir.join(path);
-            if path.starts_with("scripts/") {
-                install_executable_script(&file, content)?;
-            } else {
-                write_file(&file, content)?;
-            }
+/// The folder, inside the skills folder, where setup builds each skill
+/// before swapping it in. Inside, so the swap's renames never cross
+/// filesystems. Claude Code 2.1.318 loads a skill from a dot-folder directly
+/// in its skills folder, but none of it, pi 0.73.1 and codex-cli 0.163.0
+/// loads one nested in here (checked 2026-11-04).
+const STAGING: &str = ".atm-staging";
+
+/// Writes one skill's files into `dir`.
+fn write_skill(dir: &Path, skill_md: &str) -> Result<()> {
+    write_file(&dir.join("SKILL.md"), skill_md)?;
+    for (path, content) in SHARED {
+        let file = dir.join(path);
+        if path.starts_with("scripts/") {
+            install_executable_script(&file, content)?;
+        } else {
+            write_file(&file, content)?;
         }
     }
     Ok(())
+}
+
+/// Installs one skill, replacing its folder whole, so files an older atm
+/// installed go too. The new copy is written in the staging folder and swapped
+/// in with two renames, so a failure leaves the old copy or the new one whole,
+/// never a mix. An old copy that can't be removed stays in the staging folder,
+/// where no harness loads it, and is reported.
+fn install_skill(skills_dir: &Path, name: &str, skill_md: &str) -> Result<()> {
+    let dir = skills_dir.join(name);
+    let staging = skills_dir.join(STAGING);
+    let new = staging.join(name);
+    let old = staging.join(format!("{name}.old"));
+    remove_entry(&new)?;
+    remove_entry(&old)?;
+    if let Err(e) = write_skill(&new, skill_md) {
+        let _ = remove_entry(&new);
+        return Err(e);
+    }
+    match fs::rename(&dir, &old) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = remove_entry(&new);
+            return Err(io_err("rename", &dir)(e));
+        }
+    }
+    if let Err(e) = fs::rename(&new, &dir) {
+        let _ = fs::rename(&old, &dir);
+        let _ = remove_entry(&new);
+        return Err(io_err("rename", &new)(e));
+    }
+    remove_entry(&old).map(drop)
+}
+
+/// Writes the atm skills into `skills_dir`, trying each one even when
+/// another fails, and returns the first error.
+fn install_atm_skills(skills_dir: &Path) -> Result<()> {
+    let mut failed = None;
+    for (name, skill_md) in SKILLS {
+        if let Err(e) = install_skill(skills_dir, name, skill_md) {
+            failed = failed.or(Some(e));
+        }
+    }
+    // Empty unless an old copy couldn't be removed; then it stays.
+    let _ = fs::remove_dir(skills_dir.join(STAGING));
+    failed.map_or(Ok(()), Err)
+}
+
+/// `e` and the error under it, if any: "Failed to remove <path>:
+/// Permission denied (os error 13)".
+fn with_cause(e: &SetupError) -> String {
+    match std::error::Error::source(e) {
+        Some(cause) => format!("{e}: {cause}"),
+        None => e.to_string(),
+    }
 }
 
 /// Setup's step for one harness: installs the atm skills into its skills
@@ -100,27 +157,27 @@ pub(super) fn setup_atm_skills(skills_dir: Option<PathBuf>) -> Result<()> {
     print!("  Installing atm skills to {}... ", dir.display());
     match install_atm_skills(&dir) {
         Ok(()) => println!("done"),
-        Err(e) => println!("failed: {e}"),
+        Err(e) => println!("failed: {}", with_cause(&e)),
     }
     Ok(())
 }
 
-/// Uninstall's step for one harness: removes atm's skill folders from
-/// `skills_dir`, leaving the folder and every other skill in it. A folder
-/// it can't remove is reported, and uninstall goes on.
+/// Uninstall's step for one harness: removes atm's skill folders and its
+/// staging folder from `skills_dir`, leaving the folder and every other
+/// skill in it. A folder it can't remove is reported, and uninstall goes on.
 pub(super) fn uninstall_atm_skills(skills_dir: Option<PathBuf>) -> Result<()> {
     let dir = skills_dir.ok_or(SetupError::HomeDirUnknown)?;
     print!("\nRemoving atm skills from {}... ", dir.display());
     let mut removed = false;
     let mut failed = None;
-    for (name, _) in SKILLS {
+    for name in SKILLS.map(|(name, _)| name).into_iter().chain([STAGING]) {
         match remove_entry(&dir.join(name)) {
             Ok(was_there) => removed |= was_there,
             Err(e) => failed = failed.or(Some(e)),
         }
     }
     match failed {
-        Some(e) => println!("failed: {e}"),
+        Some(e) => println!("failed: {}", with_cause(&e)),
         None => println!("{}", if removed { "done" } else { "not found" }),
     }
     Ok(())

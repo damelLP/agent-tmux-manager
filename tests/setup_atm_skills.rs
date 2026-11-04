@@ -310,7 +310,7 @@ fn a_failed_skills_install_is_reported_and_setup_goes_on() {
         "  Installing atm skills to {}... failed: ",
         home.join(".claude/skills").display()
     );
-    assert!(stdout.contains(&line), "no {line:?} in:\n{stdout}");
+    assert_failed_with_cause(&stdout, &line);
     assert!(home.join(".claude/settings.json").exists(), "{stdout}");
     assert_installed(&home.join(".pi/agent/skills"));
     assert_installed(&home.join(".codex/skills"));
@@ -334,7 +334,7 @@ fn a_failed_skills_removal_is_reported_and_uninstall_goes_on() {
         "Removing atm skills from {}... failed: ",
         claude_skills.display()
     );
-    assert!(stdout.contains(&line), "no {line:?} in:\n{stdout}");
+    assert_failed_with_cause(&stdout, &line);
     for skills in [".pi/agent/skills", ".codex/skills"] {
         assert!(
             names_in(&home.join(skills)).is_empty(),
@@ -345,4 +345,76 @@ fn a_failed_skills_removal_is_reported_and_uninstall_goes_on() {
         stdout.ends_with("ATM uninstalled successfully!\n"),
         "{stdout}"
     );
+}
+
+/// Asserts `stdout` has a line starting with `start` (a skills step's
+/// "... failed: ") that also names the OS error under it, such as "Not a
+/// directory (os error 20)", not just the path.
+fn assert_failed_with_cause(stdout: &str, start: &str) {
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with(start))
+        .unwrap_or_else(|| panic!("no {start:?} in:\n{stdout}"));
+    assert!(line.contains("(os error "), "no cause in {line:?}");
+}
+
+/// Gives every folder under `dir` its write permission back, so a test that
+/// locked one can clean up.
+fn unlock(dir: &Path) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            unlock(&path);
+        }
+    }
+}
+
+/// A failed install leaves each skill whole: setup builds a skill beside the
+/// installed one and swaps it in only once it's complete, and tries every
+/// skill. Here the older atm-coordinate has a folder setup can't empty (as a
+/// read-only `references/` from an older install would be), and an older
+/// atm-implement is due for replacement. As root, permissions don't stop the
+/// removal, so the install simply succeeds.
+#[test]
+fn a_failed_install_leaves_each_skill_whole() {
+    let home = home_with(&[".claude"]);
+    let home = home.path();
+    run_atm_ok(home, "setup");
+    let skills = home.join(".claude/skills");
+    let coordinate = skills.join("atm-coordinate");
+    fs::write(coordinate.join("SKILL.md"), "old atm-coordinate").unwrap();
+    fs::write(skills.join("atm-implement/SKILL.md"), "old atm-implement").unwrap();
+    let old_coordinate = files_under(&coordinate);
+    fs::set_permissions(
+        coordinate.join("references"),
+        fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+
+    let stdout = run_atm_ok(home, "setup");
+    unlock(home);
+
+    let installed = files_under(&coordinate);
+    assert!(
+        installed == expected_skill("atm-coordinate") || installed == old_coordinate,
+        "atm-coordinate is neither the old copy nor the new one: {:?}\n{stdout}",
+        installed.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        files_under(&skills.join("atm-implement")),
+        expected_skill("atm-implement"),
+        "{stdout}"
+    );
+    let staging = skills.join(".atm-staging");
+    for name in ["atm-coordinate", "atm-implement"] {
+        assert!(
+            !staging.join(name).exists(),
+            "a new {name} was left: {stdout}"
+        );
+    }
+
+    // Uninstall clears the staging folder with the skills.
+    run_atm_ok(home, "uninstall");
+    assert!(names_in(&skills).is_empty(), "{:?}", names_in(&skills));
 }

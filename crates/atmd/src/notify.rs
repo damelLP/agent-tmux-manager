@@ -11,7 +11,10 @@
 //!
 //! With `delay_secs`, a notification waits that long and goes out only if
 //! the same stretch of needing input is still open, so a dialog answered
-//! in time sends nothing.
+//! in time sends nothing. Claude Code 2.1.317 sends no hook when a dialog
+//! is approved (seen 2026-11-04, sealed real TUI): the row reads needs
+//! input until the tool's `PostToolUse`, so a tool that outlasts the delay
+//! still notifies. The fix belongs where the event is mapped, not here.
 //!
 //! Claude Code 2.1.310 sends `PermissionRequest` and then `Notification`
 //! (`permission_prompt`) for one dialog, both needs input, so one dialog

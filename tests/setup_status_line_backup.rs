@@ -167,6 +167,12 @@ fn a_corrupt_backup_lets_uninstall_finish_and_stays_in_place() {
         ".local/bin/atm-hook",
         ".local/bin/atm-codex-hook",
         ".pi/agent/packages/pi-atm",
+        ".claude/skills/atm-coordinate",
+        ".claude/skills/atm-implement",
+        ".pi/agent/skills/atm-coordinate",
+        ".pi/agent/skills/atm-implement",
+        ".codex/skills/atm-coordinate",
+        ".codex/skills/atm-implement",
     ] {
         assert!(!home.join(artifact).exists(), "{artifact} left: {stdout}");
     }

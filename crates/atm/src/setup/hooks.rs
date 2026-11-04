@@ -164,14 +164,19 @@ pub(super) fn remove_hook_entries(
     removed
 }
 
-/// Writes `content` to `path` (creating parent directories as needed)
-/// and marks it executable.
-pub(super) fn install_executable_script(path: &Path, content: &str) -> Result<()> {
+/// Writes `content` to `path`, creating parent directories as needed.
+pub(super) fn write_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_err("create", parent))?;
     }
 
-    fs::write(path, content).map_err(io_err("write", path))?;
+    fs::write(path, content).map_err(io_err("write", path))
+}
+
+/// Writes `content` to `path` (creating parent directories as needed)
+/// and marks it executable.
+pub(super) fn install_executable_script(path: &Path, content: &str) -> Result<()> {
+    write_file(path, content)?;
 
     #[cfg(unix)]
     {

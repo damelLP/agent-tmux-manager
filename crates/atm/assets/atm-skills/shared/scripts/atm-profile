@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# atm-profile: the profile lookup the atm skills run until
+# `atm profile show <name>` (#147) exists. Not an atm command.
+#
+# Usage: atm-profile <name>
+#
+# Prints the profile on stdout and the file it came from on stderr. Looks for
+# .atm/profiles/<name>.md in the current directory and each parent, then in
+# atm's config dir: ${XDG_CONFIG_HOME:-~/.config}/atm/profiles/<name>.md
+# (~/Library/Application Support/atm/profiles/ on macOS). The first file found
+# wins; profiles aren't merged. Exits 1 when there is none.
+
+set -u
+
+name=${1:-}
+case $name in
+    "" | .* | *[!A-Za-z0-9._-]*)
+        echo "usage: atm-profile <name>  (letters, digits, '.', '_', '-')" >&2
+        exit 64
+        ;;
+esac
+
+# A deleted cwd makes `pwd -P` fail; then only the config dir is searched.
+start=$(pwd -P 2>/dev/null) || start=
+dir=$start
+while [ -n "$dir" ]; do
+    if [ -f "$dir/.atm/profiles/$name.md" ]; then
+        echo "$dir/.atm/profiles/$name.md" >&2
+        exec cat "$dir/.atm/profiles/$name.md"
+    fi
+    [ "$dir" = / ] && break
+    dir=$(dirname "$dir")
+done
+
+if [ "$(uname -s)" = Darwin ]; then
+    config="$HOME/Library/Application Support/atm"
+else
+    config="${XDG_CONFIG_HOME:-$HOME/.config}/atm"
+fi
+if [ -f "$config/profiles/$name.md" ]; then
+    echo "$config/profiles/$name.md" >&2
+    exec cat "$config/profiles/$name.md"
+fi
+
+echo "atm-profile: no profile '$name' in .atm/profiles/ (walking up from ${start:-a deleted directory}) or $config/profiles/" >&2
+exit 1

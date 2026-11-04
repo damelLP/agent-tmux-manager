@@ -125,6 +125,10 @@ devcontainer exec --workspace-folder . --remote-env TMUX_PANE="$TMUX_PANE" -- cl
 
 Inside the container the hook needs `jq` and either `socat` or `nc`, and the hook script must exist at the path recorded in Claude Code's settings (`~/.local/bin/atm-hook` by default). If the container home differs from the host home, run `atm setup` inside the container once. Set `ATM_DEBUG=1` in the container to log hook activity to `/tmp/atm-hook.log` when sessions do not appear.
 
+## Coordinating agents (experimental)
+
+`atm setup` installs two skills for Claude Code, pi and Codex: `atm-coordinate` lets one agent drive long-lived implementer agents through `atm list`, `peek`, `send` and `reply`, and `atm-implement` gives each implementer its rules. Invoke them as `/atm-coordinate` (Claude Code), `/skill:atm-coordinate` (pi) or `$atm-coordinate` (Codex). Their source, install layout and usage are in [`crates/atm/assets/atm-skills`](crates/atm/assets/atm-skills/README.md).
+
 ## Documentation
 
 See the **[Wiki](https://github.com/damelLP/agent-tmux-manager/wiki)** for the full user guide, tmux integration, architecture, and troubleshooting.

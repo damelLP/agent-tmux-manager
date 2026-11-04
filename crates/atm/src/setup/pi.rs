@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde_json::{json, Map, Value};
 
 use super::json::{or_empty_if_not_object, read_json_file_or_empty, write_json_file_pretty};
+use super::skills::setup_atm_skills;
 use super::{io_err, Result, SetupError};
 
 /// The pi-atm TypeScript extension content, embedded at compile time.
@@ -38,6 +39,12 @@ pub(super) fn detect_pi() -> bool {
 /// `~/.pi/agent/packages/<name>/`.
 fn pi_atm_package_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".pi/agent/packages/pi-atm"))
+}
+
+/// Where pi loads user skills from, with no settings entry. pi 0.73.1 also
+/// reads `~/.agents/skills/`, which Claude Code doesn't.
+pub(super) fn pi_skills_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".pi/agent/skills"))
 }
 
 /// Path to pi's settings file.
@@ -136,5 +143,5 @@ pub(super) fn setup_pi() -> Result<()> {
         println!("    settings.json - already references 'packages/pi-atm'");
     }
     println!("  pi configuration written.");
-    Ok(())
+    setup_atm_skills(pi_skills_dir())
 }

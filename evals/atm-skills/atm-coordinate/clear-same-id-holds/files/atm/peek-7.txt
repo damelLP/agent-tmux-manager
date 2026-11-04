@@ -1,0 +1,14 @@
+
+  Wrote the release notes: Added (--json), Changed (sorted list), Fixed (README
+  usage). Each entry matches tasks 1-3.
+
+  DONE: wrote @RUN@/widgets/NOTES-1.4.md (3 sections, 11 lines); checked it against
+  the briefs for tasks 1-3, nothing else to verify.
+
+✻ Crunched for 4m 12s · done 14:02
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -1,0 +1,14 @@
+
+  I've written the release notes to @RUN@/widgets/NOTES-1.4.md and checked
+  the entries against tasks 1-3.
+
+  All three sections are in. Let me know if you'd like a different tone for the
+  Changed section.
+
+✻ Brewed for 2m 03s · done 14:01
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ auto mode on (shift+tab to cycle)

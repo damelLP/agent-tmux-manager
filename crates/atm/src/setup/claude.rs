@@ -8,6 +8,7 @@ use serde_json::{json, Map, Value};
 use super::atm_config_path;
 use super::hooks::{add_hook_entries, install_executable_script, is_marker_command};
 use super::json::{read_json_file_or_empty, write_json_file_pretty};
+use super::skills::setup_atm_skills;
 use super::{Result, SetupError};
 
 /// The atm-hook bash script content (Claude Code), embedded at compile time.
@@ -16,6 +17,11 @@ const ATM_HOOK_SCRIPT: &str = include_str!("../../scripts/atm-hook");
 /// Returns the path to Claude Code settings.json
 fn claude_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
+}
+
+/// Where Claude Code loads user skills from, with no settings entry.
+pub(super) fn claude_skills_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join("skills"))
 }
 
 /// Returns the path to the atm-hook script
@@ -181,7 +187,7 @@ pub(super) fn setup_claude_code() -> Result<()> {
     } else {
         println!("  Claude Code already configured.");
     }
-    Ok(())
+    setup_atm_skills(claude_skills_dir())
 }
 
 #[cfg(test)]

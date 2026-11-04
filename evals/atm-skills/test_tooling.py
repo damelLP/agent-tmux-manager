@@ -58,6 +58,30 @@ class GradeOnlyFinishedRuns(unittest.TestCase):
         self.assertEqual(g["summary"]["passed"], 1, g["expectations"])
 
 
+class HandoverNeedsItsContent(unittest.TestCase):
+    """context-over-40's grader asks for a handover naming alpha's pane,
+    harness, project_root and task state, not just a new file."""
+
+    def handover_expectation(self, content):
+        with tempfile.TemporaryDirectory() as out:
+            write_run(out, 0, FINISHED)
+            created = os.path.join(out, "outputs", "created", "handovers")
+            os.makedirs(created)
+            with open(os.path.join(created, "handover-2.md"), "w") as f:
+                f.write(content)
+            g = grade.main(CONTEXT, out)
+        return next(e for e in g["expectations"] if "handover file" in e["text"])
+
+    def test_an_empty_handover_fails(self):
+        self.assertFalse(self.handover_expectation("")["passed"])
+
+    def test_a_handover_like_the_last_one_passes(self):
+        # The case's own handover, as a coordinator wrote it before.
+        with open(os.path.join(CONTEXT, "files", "work", "handovers", "handover-1.md")) as f:
+            e = self.handover_expectation(f.read())
+        self.assertTrue(e["passed"], e["evidence"])
+
+
 class RunStartsFresh(unittest.TestCase):
     """run.sh twice into one out dir, with a stand-in `claude` (HOME points
     at a temp home): files the first run created must not stay for the

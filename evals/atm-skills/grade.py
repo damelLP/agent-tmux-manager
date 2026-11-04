@@ -50,7 +50,7 @@ class Run:
         result = next((e for e in self.events if e.get("type") == "result"), {})
         self.final = result.get("result") or (self.texts[-1] if self.texts else "")
         self.created = []
-        created_dir = os.path.join(out, "outputs", "created")
+        self.created_dir = created_dir = os.path.join(out, "outputs", "created")
         for root, _, files in os.walk(created_dir):
             for name in files:
                 self.created.append(os.path.relpath(os.path.join(root, name), created_dir))
@@ -112,7 +112,20 @@ def reads_own_context(r):
 
 def writes_handover(r):
     new = [p for p in r.created if p.startswith("handovers/") and p != "handovers/handover-1.md"]
-    return bool(new), f"files created: {r.created or 'none'}"
+    if not new:
+        return False, f"files created: {r.created or 'none'}"
+    # The grader asks for alpha's pane, harness, project_root and task state;
+    # run.sh writes the run's directory as @RUN@ in created files.
+    needed = {"pane": "%7", "harness": "claude", "project_root": "@RUN@/widgets"}
+    for path in new:
+        with open(os.path.join(r.created_dir, path)) as f:
+            text = f.read()
+        missing = [k for k, v in needed.items() if v not in text]
+        if not re.search(r"\btask", text, re.I):
+            missing.append("task state")
+        if not missing:
+            return True, f"{path} names alpha's pane, harness, project_root and tasks"
+    return False, f"new handovers {new}; the last one lacks {', '.join(missing)}"
 
 
 def sends_skill_call(r):

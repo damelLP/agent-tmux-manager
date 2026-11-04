@@ -58,15 +58,9 @@ pub enum NotifyError {
     /// atm's `config.toml` is not valid, or its `[notify]` is not.
     #[error("invalid config: {0}")]
     Config(#[from] toml::de::Error),
-    /// The command could not start, e.g. it was not found.
-    #[error("failed to start {program:?}: {source}")]
-    Start {
-        program: String,
-        source: std::io::Error,
-    },
-    /// Waiting for the command failed.
-    #[error("failed to wait for {program:?}: {source}")]
-    Wait {
+    /// The command could not start (e.g. it was not found) or be waited on.
+    #[error("{program:?}: {source}")]
+    Io {
         program: String,
         source: std::io::Error,
     },
@@ -116,32 +110,25 @@ pub fn notify_argv(command: &[String], message: &str) -> Vec<String> {
     [command, &[message.to_string()]].concat()
 }
 
-/// Says which agent needs input and why: its project label (as in
-/// `atm list`), its pane or short id, its harness, and the activity.
+/// Says which agent needs input and why: its project dir (and branch),
+/// its pane or short id, its harness, and the activity.
 pub fn notification_message(view: &SessionView) -> String {
     let dir = view
         .project_root
         .as_ref()
         .or(view.working_directory.as_ref());
-    let project = dir
-        .and_then(|dir| dir.rsplit('/').find(|part| !part.is_empty()))
-        .unwrap_or("-");
-    let label = match &view.worktree_branch {
-        Some(branch) => format!("{project}/{branch}"),
-        None => project.to_string(),
-    };
-    let target = view.tmux_pane.as_deref().unwrap_or(&view.id_short);
-    let who = if view.parent_session_id.is_some() {
-        format!("{} subagent", view.harness)
-    } else {
-        view.harness.clone()
-    };
-    let why = view
-        .activity_detail
-        .as_ref()
-        .map(|detail| format!(" ({detail})"))
-        .unwrap_or_default();
-    format!("{label} {target}: {who} needs input{why}")
+    let project = dir.and_then(|d| d.rsplit('/').find(|p| !p.is_empty()));
+    let branch = view.worktree_branch.as_ref().map(|b| format!("/{b}"));
+    let target = view.tmux_pane.as_ref().unwrap_or(&view.id_short);
+    let subagent = view.parent_session_id.as_ref().map_or("", |_| " subagent");
+    let why = view.activity_detail.as_ref().map(|d| format!(" ({d})"));
+    format!(
+        "{}{} {target}: {}{subagent} needs input{}",
+        project.unwrap_or("-"),
+        branch.unwrap_or_default(),
+        view.harness,
+        why.unwrap_or_default()
+    )
 }
 
 /// A notification for a session that started needing input.
@@ -231,6 +218,10 @@ pub async fn run_notify(argv: &[String], timeout: Duration) -> Result<(), Notify
     // An empty argv fails to start, like a program that isn't there.
     let program = argv.first().cloned().unwrap_or_default();
     let args = argv.get(1..).unwrap_or_default();
+    let io = |source| NotifyError::Io {
+        program: program.clone(),
+        source,
+    };
     let mut child = Command::new(&program)
         .args(args)
         .stdin(Stdio::null())
@@ -238,10 +229,7 @@ pub async fn run_notify(argv: &[String], timeout: Duration) -> Result<(), Notify
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|source| NotifyError::Start {
-            program: program.clone(),
-            source,
-        })?;
+        .map_err(io)?;
     let mut stderr = Vec::new();
     let pipe = child.stderr.take();
     let run = async {
@@ -255,10 +243,7 @@ pub async fn run_notify(argv: &[String], timeout: Duration) -> Result<(), Notify
         child.wait().await
     };
     let status = match tokio::time::timeout(timeout, run).await {
-        Ok(status) => status.map_err(|source| NotifyError::Wait {
-            program: program.clone(),
-            source,
-        })?,
+        Ok(status) => status.map_err(io)?,
         // Dropping `run` let go of the child; `kill_on_drop` kills it when
         // this function returns.
         Err(_) => return Err(NotifyError::Timeout { program, timeout }),
@@ -310,9 +295,7 @@ pub fn spawn_notifier(
                         }
                         None => {}
                     },
-                    Err(RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "Notifier fell behind and missed session events");
-                    }
+                    Err(RecvError::Lagged(skipped)) => warn!(skipped, "Notifier missed events"),
                     Err(RecvError::Closed) => break,
                 },
             }
@@ -325,8 +308,8 @@ fn spawn_run(command: &[String], message: String) {
     let argv = notify_argv(command, &message);
     tokio::spawn(async move {
         match run_notify(&argv, NOTIFY_TIMEOUT).await {
-            Ok(()) => info!(message = %message, "Notify command ran"),
-            Err(e) => warn!(error = %e, message = %message, "Notify command failed"),
+            Ok(()) => info!(notification = %message, "Notify command ran"),
+            Err(e) => warn!(error = %e, notification = %message, "Notify command failed"),
         }
     });
 }
@@ -799,7 +782,7 @@ mod tests {
         let err = run_notify(&argv, Duration::from_secs(5))
             .await
             .expect_err("a missing program cannot start");
-        assert!(matches!(err, NotifyError::Start { .. }), "{err}");
+        assert!(matches!(err, NotifyError::Io { .. }), "{err}");
         assert!(err.to_string().contains("atm-notifier"), "{err}");
     }
 

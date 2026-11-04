@@ -50,6 +50,11 @@ behave the way the skills say is checked with real harnesses (see the PR).
 `grade.py <case> <out-dir>` checks each grader file against the stand-in's log,
 the transcript and the files the run created, and writes `grading.json` in
 skill-creator's format.
+A run whose `run.sh` failed or whose model never finished fails every
+grader ("not graded: …"): in a case where doing nothing is right, it would
+otherwise pass. `run.sh` clears the files it owns in a reused out dir first.
+`test_tooling.py` checks both with no model call:
+`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s evals/atm-skills -p 'test_*.py'`.
 
 `run-all.sh <iteration-dir> <config> <skills-dir> [runs] [jobs] [model] [case...]`
 runs and grades every case (or the ones named) `runs` times, in the workspace

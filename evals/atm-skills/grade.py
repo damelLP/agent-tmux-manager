@@ -161,14 +161,37 @@ def no_dialog(r):
     return not used, f"dialog tools called: {used or 'none'}"
 
 
+def unfinished(out, r):
+    """Why the run can't be graded, or None. A run whose runner failed or
+    whose model never finished made no decision, and in a case where doing
+    nothing is right it would otherwise pass."""
+    try:
+        with open(os.path.join(out, "timing.json")) as f:
+            code = json.load(f).get("exit_code")
+    except (OSError, ValueError):
+        return "run.sh wrote no timing.json"
+    if code != 0:
+        return f"run.sh exited {code}"
+    result = next((e for e in r.events if e.get("type") == "result"), None)
+    if result is None:
+        return "the transcript has no result: the model run didn't finish"
+    if result.get("is_error") or result.get("subtype") != "success":
+        return f"the model run ended with {result.get('subtype')}"
+    return None
+
+
 def main(case_dir, out):
     r = Run(out)
+    problem = unfinished(out, r)
     expectations = []
     gdir = os.path.join(case_dir, "graders")
     for name in sorted(os.listdir(gdir)):
         with open(os.path.join(gdir, name)) as f:
             text = f.read().split("---", 2)[-1].strip()
         fn = globals().get(re.sub(r"^\d+-", "", name[:-3]).replace("-", "_"))
+        if problem:
+            expectations.append({"text": text, "passed": False, "evidence": f"not graded: {problem}"})
+            continue
         if fn is None:
             expectations.append({"text": text, "passed": False, "evidence": "no check in grade.py: read it by hand"})
             continue

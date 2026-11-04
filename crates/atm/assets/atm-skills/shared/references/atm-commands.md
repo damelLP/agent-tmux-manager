@@ -185,7 +185,10 @@ them by absolute path from your own working directory.
 
 - **`../scripts/atm-wait [--after-reply] <pane> [timeout] [start-timeout]`**
   waits for an implementer's turn to end by polling `atm list -f json`. atmd
-  already tracks idle, so there is no `atm wait` (#122 was closed). A dialog
+  already tracks idle, so there is no `atm wait` (#122 was closed). Run it in
+  the same command as the send that starts the turn
+  (`atm send %N '...' && bash <path>/atm-wait %N`), so a short turn can't end
+  between the two. A dialog
   at its first poll returns `ATTENTION`; `--after-reply` counts it as
   answered, for waiting right after you approved one.
 - **`../scripts/atm-profile <name>`** prints a profile (#147's lookup).

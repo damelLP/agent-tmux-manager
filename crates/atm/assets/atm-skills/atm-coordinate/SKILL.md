@@ -62,13 +62,16 @@ Look up the implementer's `harness` in `atm list -f json`.
 | `codex` | `/new` | `$atm-implement` | any length |
 | anything else, or no atm skills installed there (`atm setup` installs them for Claude Code, pi and Codex) | ask the user | none: start the brief with "Read `<path>` and follow it", where `<path>` is the absolute path of `../atm-implement/SKILL.md` from this skill's folder; name the profile's file in it, and send `Your task is in <brief path>. Read it and follow it.` | any length |
 
+Send and wait in one shell command, so a short turn can't end between the
+two: `atm send %N '...' && bash <this skill's folder>/scripts/atm-wait %N`.
 How you wait depends on your own harness:
 
-- **Claude Code:** run `atm-wait` as a background command; you're told when it
+- **Claude Code:** run that command in the background; you're told when it
   ends.
 - **pi, Codex and others:** run it in the foreground with a timeout your shell
   tool allows, such as `atm-wait %12 300`. After `TIMEOUT`, run
-  `atm-wait %12 300 0` to keep waiting for the same turn.
+  `atm-wait %12 300 0` to keep waiting for the same turn, with `--after-reply`
+  if the first wait had it.
 
 ## 1. Plan with the user
 
@@ -79,7 +82,7 @@ brief needs.
 
 Write each brief to any file the implementer can read and git doesn't track,
 for example `/tmp/atm-briefs/<project>/<implementer>-<n>.md`, or a git-excluded
-folder in the project such as `docs/`. A folder per project, and numbers that
+folder in the project such as `docs/plans/`. A folder per project, and numbers that
 count on across handovers, keep a brief from being overwritten while an
 implementer may still read it. One task per implementer at a time.
 
@@ -108,9 +111,11 @@ implementer may still read it. One task per implementer at a time.
    If no new `id` appears within about 10 s, peek: if the previous task's
    output is gone and no turn is running, the clear ran; otherwise ask the
    user.
-5. **Send the skill call** on one line, in single quotes:
-   `atm send %N '<invoke> [--profile <name>] <brief file>'`, for example
-   `atm send %7 '/atm-implement --profile pr-implementer /tmp/atm-briefs/myproject/alpha-3.md'`.
+5. **Send the skill call** on one line, in single quotes, and wait (step 3)
+   in the same command:
+   `atm send %N '<invoke> [--profile <name>] <brief file>' && bash <this skill's folder>/scripts/atm-wait %N`,
+   for example
+   `atm send %7 '/atm-implement --profile pr-implementer /tmp/atm-briefs/myproject/alpha-3.md' && bash <this skill's folder>/scripts/atm-wait %7`.
 
 ## 3. Wait
 
@@ -123,7 +128,7 @@ until the turn ends. It prints one word:
 - `NEVER_STARTED`: the row never went working. Peek: the send may have failed,
   or the turn was shorter than a poll.
 - `TIMEOUT`: still working. Peek to see whether it's stuck, then wait again
-  with a start timeout of 0.
+  with a start timeout of 0, and `--after-reply` if the first wait had it.
 
 ## 4. Read and answer
 
@@ -132,8 +137,9 @@ fewer lines). The last line of the implementer's final message, just above its
 input box, starts with one of:
 
 - **`QUESTION:`** Answer it when the answer is inside what you and the user
-  agreed; otherwise ask the user. Send the answer with `atm send %N '<answer>'`
-  and wait again. An answer may be any length: only a skill call has to be
+  agreed; otherwise ask the user. Send the answer and wait again in one
+  command, `atm send %N '<answer>' && bash <this skill's folder>/scripts/atm-wait %N`.
+  An answer may be any length: only a skill call has to be
   short. For a long one, write a file and send its path in a sentence.
 - **`BLOCKED:`** Unblock it if that's clearly yours to do; otherwise tell the
   user.
@@ -142,7 +148,8 @@ input box, starts with one of:
   again with a long start timeout, for example `atm-wait %N 3600 1800`: the
   default 120 s would end `NEVER_STARTED` before a longer job finishes.
 - **`DONE: plan <path>`** The implementer stopped for your OK. Read the plan,
-  then send your OK or your changes with `atm send` and wait again. Don't
+  then send your OK or your changes and wait again, in one command as for an
+  answer. Don't
   clear it: the task isn't done.
 - **`DONE:`** with a result: review it as the profile says. Only now is the
   implementer free for its next task (step 2).
@@ -161,9 +168,10 @@ agreed task; otherwise ask the user.
 If there's neither a dialog nor one of those lines: when the screen shows a
 background job still running (Claude Code says "1 shell still running"),
 treat it as `WAITING:`. Otherwise the turn ended without a report, and the
-implementer won't start another turn by itself. Send it one reminder,
-`atm send %N 'End your turn with one line starting QUESTION:, BLOCKED:, WAITING: or DONE:.'`,
-and wait again. If that turn ends without one either, ask the user.
+implementer won't start another turn by itself. Send it one reminder and
+wait again, in one command:
+`atm send %N 'End your turn with one line starting QUESTION:, BLOCKED:, WAITING: or DONE:.' && bash <this skill's folder>/scripts/atm-wait %N`.
+If that turn ends without one either, ask the user.
 
 ## 5. Hand over at 40% context
 

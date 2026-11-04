@@ -36,7 +36,7 @@ use tracing_subscriber::EnvFilter;
 
 use atmd::discovery::DiscoveryService;
 use atmd::monitor::spawn_monitor_task;
-use atmd::notify::{parse_notify_command, spawn_notifier};
+use atmd::notify::{parse_notify_command, spawn_notifier, NotifyConfig};
 use atmd::registry::{spawn_registry_with_cancel, supervise_actor};
 use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
 
@@ -351,11 +351,21 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     info!("Session registry started");
 
     // Subscribed before discovery, so the notifier sees every session.
-    let _notify_handle = notify_command().await.map(|command| {
+    let _notify_handle = notify_config().await.map(|config| {
         // Only the program: the arguments may hold a webhook URL or topic.
-        let program = command.first().cloned().unwrap_or_default();
-        info!(program, "Running [notify] when a session needs input");
-        spawn_notifier(registry.subscribe(), command, cancel_token.clone())
+        let program = config.command.first().cloned().unwrap_or_default();
+        let delay_secs = config.delay_secs;
+        info!(
+            program,
+            delay_secs, "Running [notify] when a session needs input"
+        );
+        let delay = std::time::Duration::from_secs(delay_secs);
+        spawn_notifier(
+            registry.subscribe(),
+            config.command,
+            delay,
+            cancel_token.clone(),
+        )
     });
 
     let discovery = DiscoveryService::new(registry.clone());
@@ -402,10 +412,10 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// The `[notify]` command in atm's `config.toml`, read once at start. A
+/// The `[notify]` section of atm's `config.toml`, read once at start. A
 /// missing file or section turns notifications off, and so, with a
 /// warning, does a config that can't be read or parsed.
-async fn notify_command() -> Option<Vec<String>> {
+async fn notify_config() -> Option<NotifyConfig> {
     let path = atm_tui::setup::atm_config_path()?;
     let text = match read_config(path.clone(), CONFIG_READ_TIMEOUT).await {
         Ok(text) => text?,

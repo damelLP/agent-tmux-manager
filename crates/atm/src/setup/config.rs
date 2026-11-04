@@ -80,9 +80,12 @@ default = "claude"
 # Run a command when a session starts needing input (a permission or
 # input dialog). atmd appends a message as one last argument and runs the
 # command without a shell, in atmd's environment; the "--" stops a message
-# that starts with "-" being read as an option. Restart atmd to apply.
+# that starts with "-" being read as an option. With delay_secs = N, a
+# dialog answered within N seconds sends nothing (0, the default, sends at
+# once; about 10 means "away from the desk"). Restart atmd to apply.
 # [notify]
 # command = ["notify-send", "atm", "--"]
+# delay_secs = 0
 "#
 }
 

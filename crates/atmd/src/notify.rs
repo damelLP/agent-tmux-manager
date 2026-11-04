@@ -9,6 +9,10 @@
 //! as one last argument, no shell, atmd's environment, closed stdin and
 //! stdout, and [`NOTIFY_TIMEOUT`].
 //!
+//! With `delay_secs`, a notification waits that long and goes out only if
+//! the same stretch of needing input is still open, so a dialog answered
+//! in time sends nothing.
+//!
 //! Claude Code 2.1.310 sends `PermissionRequest` and then `Notification`
 //! (`permission_prompt`) for one dialog, both needs input, so one dialog
 //! notifies once; `idle_prompt` maps to idle and never notifies (the
@@ -32,6 +36,7 @@ use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -85,18 +90,22 @@ struct ConfigFile {
 /// typo doesn't turn notifications off silently.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NotifyConfig {
+pub struct NotifyConfig {
     /// The program and its arguments. atmd appends the message as one
     /// last argument and runs it without a shell.
     #[serde(default)]
-    command: Vec<String>,
+    pub command: Vec<String>,
+    /// Seconds to wait first: a session that stops needing input by then
+    /// sends nothing. 0, the default, notifies at once.
+    #[serde(default)]
+    pub delay_secs: u64,
 }
 
-/// The `[notify]` command in the text of atm's `config.toml`. `None`, so
+/// The `[notify]` section in the text of atm's `config.toml`. `None`, so
 /// notifications are off, when there is no section or `command` is empty.
-pub fn parse_notify_command(text: &str) -> Result<Option<Vec<String>>, NotifyError> {
+pub fn parse_notify_command(text: &str) -> Result<Option<NotifyConfig>, NotifyError> {
     let file: ConfigFile = toml::from_str(text)?;
-    Ok(Some(file.notify.command).filter(|command| !command.is_empty()))
+    Ok(Some(file.notify).filter(|notify| !notify.command.is_empty()))
 }
 
 /// The configured command followed by `message` as its last argument.
@@ -132,12 +141,30 @@ pub fn notification_message(view: &SessionView) -> String {
     format!("{label} {target}: {who} needs input{why}")
 }
 
+/// A notification for a session that started needing input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// The session that needs input.
+    pub session_id: SessionId,
+    /// Which stretch of needing input it is, for [`AttentionTracker::is_open`].
+    pub stretch: u64,
+    /// The message, built when the stretch began.
+    pub message: String,
+}
+
+/// One unbroken stretch of a session needing input.
+#[derive(Debug, Clone, Copy)]
+struct Stretch {
+    id: u64,
+    /// Whether this session has already muted its lead's ping.
+    muted_lead: bool,
+}
+
 /// Remembers which sessions need input, to notify only on the change.
 #[derive(Debug, Default)]
 pub struct AttentionTracker {
-    /// Each session that needs input, and whether it has already muted its
-    /// lead's ping during this stretch.
-    in_attention: HashMap<SessionId, bool>,
+    in_attention: HashMap<SessionId, Stretch>,
+    last_stretch: u64,
 }
 
 impl AttentionTracker {
@@ -148,7 +175,7 @@ impl AttentionTracker {
     /// subagent already needs input stays quiet, because Claude reports a
     /// subagent's dialog on the lead's row too, but each subagent mutes it
     /// only once per stretch: a stopped one can keep needing input (#129).
-    pub fn observe(&mut self, event: &SessionEvent) -> Option<String> {
+    pub fn observe(&mut self, event: &SessionEvent) -> Option<Pending> {
         match event {
             SessionEvent::Registered { session_id, .. }
             | SessionEvent::Removed { session_id, .. } => {
@@ -159,15 +186,24 @@ impl AttentionTracker {
                 if self.in_attention.contains_key(&session.id) {
                     return None;
                 }
-                self.in_attention.insert(session.id.clone(), false);
+                self.last_stretch = self.last_stretch.wrapping_add(1);
+                let stretch = Stretch {
+                    id: self.last_stretch,
+                    muted_lead: false,
+                };
+                self.in_attention.insert(session.id.clone(), stretch);
                 let muting_child = (session.child_session_ids.iter())
-                    .find(|child| self.in_attention.get(*child) == Some(&false));
+                    .find(|child| self.in_attention.get(*child).is_some_and(|s| !s.muted_lead));
                 match muting_child.and_then(|child| self.in_attention.get_mut(child)) {
-                    Some(muted) => {
-                        *muted = true;
+                    Some(child) => {
+                        child.muted_lead = true;
                         None
                     }
-                    None => Some(notification_message(session)),
+                    None => Some(Pending {
+                        session_id: session.id.clone(),
+                        stretch: stretch.id,
+                        message: notification_message(session),
+                    }),
                 }
             }
             SessionEvent::Updated { session } => {
@@ -175,6 +211,13 @@ impl AttentionTracker {
                 None
             }
         }
+    }
+
+    /// Whether `session_id` still needs input in the same `stretch`.
+    pub fn is_open(&self, session_id: &SessionId, stretch: u64) -> bool {
+        self.in_attention
+            .get(session_id)
+            .is_some_and(|open| open.id == stretch)
     }
 }
 
@@ -230,39 +273,59 @@ pub async fn run_notify(argv: &[String], timeout: Duration) -> Result<(), Notify
 /// Runs `command` with a message each time a session starts needing
 /// input, until `cancel` fires or the registry closes. Each command runs in
 /// its own task, so a slow one never holds up the next event.
+///
+/// With a non-zero `delay`, each notification waits in its own timer task,
+/// which then reports back here; it runs only if the session still needs
+/// input in the same stretch. Only this loop touches the tracker.
 pub fn spawn_notifier(
     mut events: broadcast::Receiver<SessionEvent>,
     command: Vec<String>,
+    delay: Duration,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tracker = AttentionTracker::default();
+        let (due_tx, mut due) = mpsc::unbounded_channel::<Pending>();
         loop {
-            let event = tokio::select! {
+            tokio::select! {
                 () = cancel.cancelled() => break,
-                event = events.recv() => event,
-            };
-            match event {
-                Ok(event) => {
-                    if let Some(message) = tracker.observe(&event) {
-                        let argv = notify_argv(&command, &message);
-                        tokio::spawn(async move {
-                            match run_notify(&argv, NOTIFY_TIMEOUT).await {
-                                Ok(()) => info!(message = %message, "Notify command ran"),
-                                Err(e) => {
-                                    warn!(error = %e, message = %message, "Notify command failed")
-                                }
-                            }
-                        });
+                Some(pending) = due.recv() => {
+                    if tracker.is_open(&pending.session_id, pending.stretch) {
+                        spawn_run(&command, pending.message);
                     }
                 }
-                Err(RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "Notifier fell behind and missed session events");
-                }
-                Err(RecvError::Closed) => break,
+                event = events.recv() => match event {
+                    Ok(event) => match tracker.observe(&event) {
+                        Some(pending) if delay.is_zero() => spawn_run(&command, pending.message),
+                        Some(pending) => {
+                            let due_tx = due_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                // A send error means the notifier has stopped.
+                                let _ = due_tx.send(pending);
+                            });
+                        }
+                        None => {}
+                    },
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "Notifier fell behind and missed session events");
+                    }
+                    Err(RecvError::Closed) => break,
+                },
             }
         }
     })
+}
+
+/// Runs `command` with `message` in its own task and logs the outcome.
+fn spawn_run(command: &[String], message: String) {
+    let argv = notify_argv(command, &message);
+    tokio::spawn(async move {
+        match run_notify(&argv, NOTIFY_TIMEOUT).await {
+            Ok(()) => info!(message = %message, "Notify command ran"),
+            Err(e) => warn!(error = %e, message = %message, "Notify command failed"),
+        }
+    });
 }
 
 #[cfg(test)]
@@ -279,9 +342,28 @@ mod tests {
         let text =
             "[harness]\ndefault = 'pi'\n\n[notify]\ncommand = ['notify-send', 'atm', '--']\n";
         assert_eq!(
-            parse_notify_command(text).unwrap(),
+            parse_notify_command(text)
+                .unwrap()
+                .map(|config| config.command),
             Some(vec!["notify-send".into(), "atm".into(), "--".into()])
         );
+    }
+
+    #[test]
+    fn delay_secs_defaults_to_zero() {
+        let delay = |text: &str| parse_notify_command(text).unwrap().map(|c| c.delay_secs);
+        assert_eq!(delay("[notify]\ncommand = ['n']\n"), Some(0));
+        assert_eq!(
+            delay("[notify]\ncommand = ['n']\ndelay_secs = 10\n"),
+            Some(10)
+        );
+        for text in [
+            "[notify]\ncommand = ['n']\ndelay_secs = -1\n",
+            "[notify]\ncommand = ['n']\ndelay_secs = '10'\n",
+            "[notify]\ncommand = ['n']\ndelay = 10\n",
+        ] {
+            assert!(parse_notify_command(text).is_err(), "{text:?}");
+        }
     }
 
     #[test]
@@ -292,7 +374,7 @@ mod tests {
             "[notify]\n",
             "[notify]\ncommand = []\n",
         ] {
-            assert_eq!(parse_notify_command(text).unwrap(), None, "{text:?}");
+            assert!(parse_notify_command(text).unwrap().is_none(), "{text:?}");
         }
     }
 
@@ -521,6 +603,110 @@ mod tests {
             ]),
             [true, false, false, false, true, false]
         );
+    }
+
+    /// With a delay, a pending notification goes out only if its stretch
+    /// of needing input is still open when the delay ends.
+    #[test]
+    fn a_stretch_stays_open_until_the_session_leaves_needs_input() {
+        let mut tracker = AttentionTracker::default();
+        let first = tracker
+            .observe(&updated("a", AttentionNeeded))
+            .expect("entering needs input notifies");
+        assert_eq!(first.session_id, SessionId::new("a"));
+        assert!(first.message.contains("needs input"), "{}", first.message);
+        assert!(tracker.is_open(&first.session_id, first.stretch));
+
+        // Staying there keeps the same stretch.
+        assert!(tracker.observe(&updated("a", AttentionNeeded)).is_none());
+        assert!(tracker.is_open(&first.session_id, first.stretch));
+
+        // Leaving ends it, and coming back starts a new one.
+        tracker.observe(&updated("a", Working));
+        assert!(!tracker.is_open(&first.session_id, first.stretch));
+        let second = tracker
+            .observe(&updated("a", AttentionNeeded))
+            .expect("a new dialog notifies");
+        assert_ne!(second.stretch, first.stretch);
+        assert!(!tracker.is_open(&first.session_id, first.stretch));
+        assert!(tracker.is_open(&second.session_id, second.stretch));
+
+        // Removed and Registered end it too.
+        tracker.observe(&removed("a"));
+        assert!(!tracker.is_open(&second.session_id, second.stretch));
+        let third = tracker.observe(&updated("a", AttentionNeeded)).unwrap();
+        tracker.observe(&registered("a"));
+        assert!(!tracker.is_open(&third.session_id, third.stretch));
+
+        // Another session's stretch is its own.
+        let other = tracker.observe(&updated("b", AttentionNeeded)).unwrap();
+        assert!(!tracker.is_open(&SessionId::new("a"), other.stretch));
+    }
+
+    /// The notifier loop with a 400 ms delay, in real time: three sessions
+    /// whose calls a stand-in records, one file per call.
+    #[tokio::test]
+    async fn the_delay_skips_a_dialog_answered_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record");
+        std::fs::write(
+            &record,
+            format!(
+                "#!/bin/sh\nf=$(mktemp '{}/call.XXXXXX') && printf '%s' \"$1\" > \"$f\"\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let calls = |id: &str| {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path()).ok())
+                .filter(|text| text.contains(&format!(" {id}: ")))
+                .count()
+        };
+        let delay = Duration::from_millis(400);
+        let (events, receiver) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let command = vec![record.display().to_string()];
+        let notifier = spawn_notifier(receiver, command, delay, cancel.clone());
+        let send = |event| {
+            events.send(event).unwrap();
+        };
+        let pause = |ms| tokio::time::sleep(Duration::from_millis(ms));
+
+        // `answered` is answered at 50 ms; `open` is left open; `again` is
+        // answered at 50 ms and reopened at 250 ms, before its first timer
+        // ends, so only the second stretch may notify, 400 ms after 250.
+        send(updated("answered", AttentionNeeded));
+        send(updated("open", AttentionNeeded));
+        send(updated("again", AttentionNeeded));
+        pause(50).await;
+        send(updated("answered", Working));
+        send(updated("again", Working));
+        pause(200).await;
+        send(updated("again", AttentionNeeded));
+        let reopened = Instant::now();
+        assert_eq!(calls("open"), 0, "notified before the delay");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while calls("again") == 0 && Instant::now() < deadline {
+            pause(10).await;
+        }
+        assert_eq!(calls("again"), 1);
+        assert!(
+            reopened.elapsed() >= delay - Duration::from_millis(20),
+            "again notified {:?} after reopening",
+            reopened.elapsed()
+        );
+        pause(600).await;
+        assert_eq!(
+            (calls("answered"), calls("open"), calls("again")),
+            (0, 1, 1)
+        );
+        cancel.cancel();
+        notifier.await.unwrap();
     }
 
     #[test]

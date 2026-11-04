@@ -264,13 +264,16 @@ fn default_config_example_parses_once_uncommented() {
     let path = dir.path().join("config.toml");
     assert!(atm_tui::setup::ensure_default_atm_config(&path).unwrap());
     let text = fs::read_to_string(&path).unwrap();
-    assert_eq!(atmd::notify::parse_notify_command(&text).unwrap(), None);
+    assert!(atmd::notify::parse_notify_command(&text).unwrap().is_none());
 
     let example = "# [notify]\n# command = ";
     assert_eq!(text.matches(example).count(), 1, "{text}");
-    let uncommented = text.replace(example, "[notify]\ncommand = ");
-    assert_eq!(
-        atmd::notify::parse_notify_command(&uncommented).unwrap(),
-        Some(vec!["notify-send".into(), "atm".into(), "--".into()])
-    );
+    let uncommented = text
+        .replace(example, "[notify]\ncommand = ")
+        .replace("# delay_secs = ", "delay_secs = ");
+    let config = atmd::notify::parse_notify_command(&uncommented)
+        .unwrap()
+        .expect("the example configures a command");
+    assert_eq!(config.command, ["notify-send", "atm", "--"]);
+    assert_eq!(config.delay_secs, 0, "the example keeps the default");
 }

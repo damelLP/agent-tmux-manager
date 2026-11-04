@@ -26,7 +26,9 @@
 # Code sends no hook on approval, so the row reads attention_needed until the
 # approved tool ends; with --after-reply a dialog at the first poll counts as
 # a turn in progress until the row leaves attention_needed once. A dialog
-# after that returns ATTENTION in both modes.
+# after that returns ATTENTION in both modes. The reply has already started
+# the turn, so with --after-reply an idle first poll returns IDLE: the
+# approved turn ended before the wait began.
 #
 # Why "working, then not working" and not just "idle": straight after a send
 # the row still reads idle, and metadata events move last_activity while the
@@ -85,6 +87,7 @@ list_sessions() {
 start=$(date +%s)
 started=0
 [ "$start_timeout_s" -eq 0 ] && started=1
+[ "$after_reply" -eq 1 ] && started=1
 missing=0
 warned=0
 first=1

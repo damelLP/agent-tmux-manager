@@ -69,6 +69,7 @@ wait_case dialog_at_first_poll ATTENTION 0 "[$dialog]" -- %5 6
 wait_case after_reply_turn_ends IDLE 0 "[$dialog]" "[$dialog]" "[$busy]" "[$idle]" -- --after-reply %5
 wait_case after_reply_new_dialog ATTENTION 0 "[$dialog]" "[$busy]" "[$dialog]" -- --after-reply %5
 wait_case after_reply_dialog_stays TIMEOUT 3 "[$dialog]" -- --after-reply %5 3
+wait_case after_reply_turn_already_ended IDLE 0 "[$idle]" -- --after-reply %5 30 3
 wait_case subagent_dialog ATTENTION 0 "[$idle,$(row kid %5 attention_needed lead)]" -- %5 6
 wait_case subagent_working_lead_idle NEVER_STARTED 4 "[$idle,$(row kid %5 working lead)]" -- %5 30 3
 wait_case teammate_own_pane IDLE 0 \

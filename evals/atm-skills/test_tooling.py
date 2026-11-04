@@ -17,6 +17,7 @@ sys.path.insert(0, HERE)
 import grade  # noqa: E402
 
 HOLDS = os.path.join(HERE, "atm-coordinate", "clear-same-id-holds")
+PLAN = os.path.join(HERE, "atm-coordinate", "done-plan-no-clear")
 CONTEXT = os.path.join(HERE, "atm-coordinate", "context-over-40")
 FINISHED = {"type": "result", "subtype": "success", "is_error": False, "result": "Holding."}
 
@@ -56,6 +57,49 @@ class GradeOnlyFinishedRuns(unittest.TestCase):
     def test_a_finished_run_is_graded(self):
         g = self.grade(0, FINISHED)
         self.assertEqual(g["summary"]["passed"], 1, g["expectations"])
+
+
+class PlanReadNeedsItsContent(unittest.TestCase):
+    """done-plan-no-clear's reads-plan-first: the plan's content must be read
+    before the send to %7; a mention of its name (`ls -l`) isn't a read."""
+
+    def reads_plan_first(self, reads, read_failed=False):
+        events = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", **reads}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": read_failed}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t2", "name": "Bash",
+                 "input": {"command": "atm send %7 'OK, go ahead.'"}}]}},
+            FINISHED,
+        ]
+        with tempfile.TemporaryDirectory() as out:
+            write_run(out, 0, None)
+            with open(os.path.join(out, "transcript.jsonl"), "w") as f:
+                f.write("".join(json.dumps(e) + "\n" for e in events))
+            with open(os.path.join(out, "outputs", "atm.log"), "w") as f:
+                f.write(json.dumps({"argv": ["send", "%7", "OK, go ahead."], "pane": "%7"}) + "\n")
+            g = grade.main(PLAN, out)
+        return next(e for e in g["expectations"] if "read before" in e["text"])
+
+    def bash(self, command):
+        return {"name": "Bash", "input": {"command": command}}
+
+    def test_a_listing_is_not_a_read(self):
+        self.assertFalse(self.reads_plan_first(self.bash("ls -l @RUN@/briefs/alpha-3-plan.md"))["passed"])
+
+    def test_a_read_that_failed_is_not_a_read(self):
+        read = {"name": "Read", "input": {"file_path": "@RUN@/briefs/alpha-3-plan.md"}}
+        self.assertFalse(self.reads_plan_first(read, read_failed=True)["passed"])
+
+    def test_cat_and_read_are_reads(self):
+        for reads in (
+            self.bash("echo '== plan'; cat @RUN@/briefs/alpha-3-plan.md; echo"),
+            {"name": "Read", "input": {"file_path": "@RUN@/briefs/alpha-3-plan.md"}},
+        ):
+            e = self.reads_plan_first(reads)
+            self.assertTrue(e["passed"], (reads, e["evidence"]))
 
 
 class HandoverNeedsItsContent(unittest.TestCase):
@@ -121,6 +165,21 @@ class RunStartsFresh(unittest.TestCase):
             os.remove(flag)
             run()
             self.assertFalse(os.path.exists(created), "the first run's handover stayed in outputs/")
+
+            # A rerun that stops early (here, no skills) leaves nothing of
+            # the earlier run for grade.py to grade. In clear-same-id-holds a
+            # finished run that sent nothing passes, so stale files would.
+            def holds(skills):
+                return subprocess.run(
+                    ["bash", os.path.join(HERE, "run.sh"), HOLDS, skills, out],
+                    env=env, capture_output=True, timeout=60,
+                )
+
+            self.assertEqual(holds(os.path.join(tmp, "skills")).returncode, 0)
+            self.assertEqual(grade.main(HOLDS, out)["summary"]["passed"], 1)
+            self.assertEqual(holds(os.path.join(tmp, "missing")).returncode, 64)
+            g = grade.main(HOLDS, out)
+            self.assertEqual(g["summary"]["passed"], 0, g["expectations"])
 
 
 if __name__ == "__main__":

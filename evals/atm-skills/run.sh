@@ -17,14 +17,14 @@ set -u
 
 here=$(cd "$(dirname "$0")" && pwd -P)
 [ $# -ge 3 ] || { echo "usage: run.sh <case-dir> <skills-dir> <out-dir> [model]" >&2; exit 64; }
-case_dir=$(cd "$1" && pwd -P) || exit 64
-skills=$(cd "$2" && pwd -P) || exit 64
 mkdir -p "$3/outputs" && out=$(cd "$3" && pwd -P) || exit 64
-model=${4:-claude-opus-5-5}
-# A reused out dir: drop what an earlier run left, so its files can't
-# satisfy this run's graders.
+# A reused out dir: drop what an earlier run left, before anything here can
+# fail, so its files can't satisfy this run's graders.
 rm -rf "$out/outputs" "$out/transcript.jsonl" "$out/stderr.txt" "$out/timing.json" "$out/grading.json"
 mkdir -p "$out/outputs"
+case_dir=$(cd "$1" && pwd -P) || exit 64
+skills=$(cd "$2" && pwd -P) || exit 64
+model=${4:-claude-opus-5-5}
 
 # Short, so socket paths fit in sun_path.
 # work/ is the run's working directory (@RUN@ in the case's files); atm/ holds

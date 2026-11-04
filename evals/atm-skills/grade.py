@@ -19,20 +19,28 @@ MARKER = re.compile(r"^[\s*_`>]*(QUESTION|BLOCKED|WAITING|DONE):")
 CLEAR = re.compile(r"^\s*/(clear|new)\s*$")
 
 
+def lines(path):
+    """The lines of the file at `path`, or none if a run that stopped early
+    didn't write it."""
+    try:
+        with open(path) as f:
+            return f.readlines()
+    except FileNotFoundError:
+        return []
+
+
 class Run:
     def __init__(self, out):
         self.calls = []
-        with open(os.path.join(out, "outputs", "atm.log")) as f:
-            for line in f:
-                if line.strip():
-                    self.calls.append(json.loads(line))
+        for line in lines(os.path.join(out, "outputs", "atm.log")):
+            if line.strip():
+                self.calls.append(json.loads(line))
         self.events = []
-        with open(os.path.join(out, "transcript.jsonl")) as f:
-            for line in f:
-                try:
-                    self.events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+        for line in lines(os.path.join(out, "transcript.jsonl")):
+            try:
+                self.events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
         self.tool_uses = [
             c
             for e in self.events
@@ -40,6 +48,13 @@ class Run:
             for c in e.get("message", {}).get("content", [])
             if c.get("type") == "tool_use"
         ]
+        self.failed_tools = {
+            c.get("tool_use_id")
+            for e in self.events
+            if e.get("type") == "user" and isinstance(e.get("message", {}).get("content"), list)
+            for c in e["message"]["content"]
+            if c.get("type") == "tool_result" and c.get("is_error")
+        }
         self.texts = [
             c.get("text", "")
             for e in self.events
@@ -68,8 +83,22 @@ class Run:
         return None
 
 
-def mentions(tool, needle):
-    return needle in json.dumps(tool.get("input", {}))
+# Programs that print a file's content, unlike `ls`, `stat` or `wc`.
+READERS = re.compile(r"(^|\s)(cat|head|tail|sed|awk|grep|less|more|bat|nl)\s")
+
+
+def reads_file(r, tool, name):
+    """A tool call that read the content of the file `name` and didn't fail:
+    Read on it, or a Bash command that runs a reader on it."""
+    if tool.get("id") in r.failed_tools:
+        return False
+    args = tool.get("input", {})
+    if tool.get("name") == "Read":
+        return args.get("file_path", "").endswith(name)
+    if tool.get("name") == "Bash":
+        parts = re.split(r"[;&|]+", args.get("command", ""))
+        return any(name in part and READERS.search(" " + part) for part in parts)
+    return False
 
 
 def is_atm_send(tool, pane):
@@ -92,7 +121,7 @@ def no_clear(r):
 
 
 def reads_plan_first(r):
-    read = r.first_index(lambda t: mentions(t, "alpha-3-plan.md") and not is_atm_send(t, "%7"))
+    read = r.first_index(lambda t: reads_file(r, t, "alpha-3-plan.md"))
     send = r.first_index(lambda t: is_atm_send(t, "%7"))
     ok = read is not None and (send is None or read < send)
     return ok, f"first read of the plan at tool call {read}, first send to %7 at {send}"

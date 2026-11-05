@@ -1,8 +1,8 @@
 # atm command reference for coordinators
 
 The commands a coordinator uses to drive implementers, with what each one
-refuses and what to do instead. It follows atm's code after #119 and #145
-(`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run `atm <command> --help`
+refuses and what to do instead. It follows atm's code after #119, #145 and
+#154 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run `atm <command> --help`
 for the full flags.
 
 ## Targets: use the pane

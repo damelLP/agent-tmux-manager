@@ -143,9 +143,11 @@ in `<dir>`. Options: `-d left|right|above|below` (default below), `-s 30%`
 
 - **It prints the new pane's id** (`%13`) as soon as the pane exists:
   `pane=$(atm spawn -H pi -w <dir>)`. `-f json` prints
-  `{"cwd":"<dir>","harness":"pi","pane":"%13"}`. A failure after the
-  id is printed means the pane exists but the harness may not have
-  started: `atm peek` it, and `atm kill` it if you don't need it.
+  `{"cwd":"<dir>","harness":"pi","pane":"%13"}`: `cwd` is `-w` as you gave
+  it (pass an absolute path to record it), else the split pane's
+  directory, or `null` when atm can't tell. A failure after the id is
+  printed means the pane exists but the harness may not have started:
+  `atm peek` it, and `atm kill` it if you don't need it.
 - **The pane has no row in `atm list` until its harness reports.** Claude
   Code and pi report at startup. Codex 0.163.0 reports at its first prompt,
   so its row appears only after your first send. `atm send %N` works

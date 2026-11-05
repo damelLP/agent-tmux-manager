@@ -36,6 +36,7 @@
 
 pub mod discovery;
 pub mod monitor;
+pub mod notify;
 pub mod project;
 pub mod registry;
 pub mod server;

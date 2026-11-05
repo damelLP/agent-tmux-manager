@@ -191,9 +191,10 @@
 //! `SubagentStart` and `SubagentStop` can reach the lead while it waits on
 //! a permission dialog. The lead sends no hook of its own while its
 //! dialog waits; a background agent's own hooks carry its `agent_id` and
-//! go to its row. So child events leave the lead's status alone: until
-//! 2026-10-25 they set it working, and the row lost its needs input until
-//! the user answered. Sealed TUI runs on Claude Code 2.1.310 in manual
+//! go to its row. So a child's own hook events leave the lead's status
+//! alone (a subagent's dialog is the exception, below): until 2026-10-25
+//! they set it working, and the row lost its needs input until the user
+//! answered. Sealed TUI runs on Claude Code 2.1.310 in manual
 //! mode, with `atm list` polled every 200 ms:
 //!
 //! - A background agent that finished 15 s into the dialog sent its
@@ -215,6 +216,23 @@
 //!   still read needs input 12 s later. A natural `SubagentStop` at
 //!   an idle lead was followed by that `UserPromptSubmit` 53 ms later, so
 //!   no captured case needed a child event to mark the lead working.
+//!
+//! Seen with Claude Code 2.1.317, 2026-11-03 to 11-05, sealed TUI runs
+//! with a fake Messages API and `atm setup`'s hooks (#150, not kept as
+//! fixtures):
+//!
+//! - `Agent` calls run in the background by default.
+//! - A subagent's permission dialog sends `PermissionRequest` with its
+//!   `agent_id` (its row needs input). If the dialog is still open about
+//!   6 s later, Claude sends `Notification` (`permission_prompt`) with no
+//!   `agent_id`, so the lead's row needs input too. Answering the dialog
+//!   doesn't clear the lead's row; its next own event does.
+//! - Approving a dialog sends no hook: the row reads needs input until the
+//!   tool's `PostToolUse`. (`sleep` alone ran without a dialog.)
+//! - Two dialogs pending at once are queued ("1 of 2", "2 of 2"); the
+//!   second's `PermissionRequest` arrives when it is raised, not shown.
+//! - The stopped-agent case above (ctrl+x ctrl+k twice) still leaves its
+//!   row reading needs input.
 //!
 //! ## Typing into the TUI (captured 2026-10-29)
 //!

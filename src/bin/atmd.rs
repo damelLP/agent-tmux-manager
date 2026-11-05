@@ -31,11 +31,12 @@ use std::process;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use atmd::discovery::DiscoveryService;
 use atmd::monitor::spawn_monitor_task;
+use atmd::notify::{parse_notify_command, spawn_notifier, NotifyConfig};
 use atmd::registry::{spawn_registry_with_cancel, supervise_actor};
 use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
 
@@ -349,6 +350,24 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     let (registry, registry_tasks) = spawn_registry_with_cancel(registry_cancel.clone());
     info!("Session registry started");
 
+    // Subscribed before discovery, so the notifier sees every session.
+    let _notify_handle = notify_config().await.map(|config| {
+        // Only the program: the arguments may hold a webhook URL or topic.
+        let program = config.command.first().cloned().unwrap_or_default();
+        let delay_secs = config.delay_secs;
+        info!(
+            program,
+            delay_secs, "Running [notify] when a session needs input"
+        );
+        let delay = std::time::Duration::from_secs(delay_secs);
+        spawn_notifier(
+            registry.subscribe(),
+            config.command,
+            delay,
+            cancel_token.clone(),
+        )
+    });
+
     let discovery = DiscoveryService::new(registry.clone());
     let discovery_result = discovery.discover().await;
     if discovery_result.discovered > 0 {
@@ -391,6 +410,48 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
 
     info!("ATM daemon stopped");
     Ok(())
+}
+
+/// The `[notify]` section of atm's `config.toml`, read once at start. A
+/// missing file or section turns notifications off, and so, with a
+/// warning, does a config that can't be read or parsed.
+async fn notify_config() -> Option<NotifyConfig> {
+    let path = atm_tui::setup::atm_config_path()?;
+    let text = match read_config(path.clone(), CONFIG_READ_TIMEOUT).await {
+        Ok(text) => text?,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "Cannot read config; notifications are off");
+            return None;
+        }
+    };
+    parse_notify_command(&text).unwrap_or_else(|e| {
+        warn!(path = %path.display(), error = %e, "Invalid config; notifications are off");
+        None
+    })
+}
+
+/// How long atmd waits for `config.toml` before it starts without it.
+const CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Reads `path`, or `None` if it doesn't exist. The read runs on a
+/// detached thread, so a FIFO or a stuck mount there can hang neither
+/// atmd's start nor, as a `spawn_blocking` read would, its exit.
+async fn read_config(path: PathBuf, timeout: std::time::Duration) -> Result<Option<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("atmd-config-read".to_string())
+        .spawn(move || {
+            let _ = tx.send(match fs::read_to_string(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                result => result.map(Some),
+            });
+        })
+        .context("Failed to start the config read")?;
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(result)) => Ok(result?),
+        Ok(Err(_)) => bail!("the config read ended without a result"),
+        Err(_) => bail!("the config read timed out after {timeout:?}"),
+    }
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
@@ -523,6 +584,38 @@ mod tests {
 
         assert!(lock_daemon(&socket).is_err(), "followed a symlinked lock");
         assert!(!target.exists(), "created the symlink's target");
+    }
+
+    /// A FIFO (or a stuck mount) at config.toml can't hang atmd's start:
+    /// the read gives up after its timeout.
+    #[tokio::test]
+    async fn test_config_read_gives_up_on_a_fifo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let fifo = std::ffi::CString::new(path.to_str().expect("utf-8")).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let started = std::time::Instant::now();
+        let result = read_config(path, std::time::Duration::from_millis(200)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let err = result.expect_err("read a FIFO with no writer");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn test_config_read_reports_a_missing_file_as_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("config.toml");
+        let five = std::time::Duration::from_secs(5);
+        assert_eq!(
+            read_config(missing.clone(), five).await.expect("read"),
+            None
+        );
+        fs::write(&missing, "[notify]\n").expect("write");
+        assert_eq!(
+            read_config(missing, five).await.expect("read").as_deref(),
+            Some("[notify]\n")
+        );
     }
 
     /// A blocking read-only open of a FIFO waits for a writer, which would

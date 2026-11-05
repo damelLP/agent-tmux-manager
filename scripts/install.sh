@@ -51,7 +51,7 @@ detect_platform() {
 # Get latest release version
 get_latest_version() {
     curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' \
+        | grep -o '"tag_name": *"[^"]*"' \
         | cut -d'"' -f4
 }
 

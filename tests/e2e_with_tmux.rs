@@ -928,6 +928,12 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
         .env("ATM_SOCKET", &env.daemon.socket_path)
         // ensure_daemon_running reads PID file under XDG_STATE_HOME.
         .env("XDG_STATE_HOME", &env.daemon.state_dir)
+        // The developer's own config (a default harness) and spawn
+        // overrides (ARGS before the prompt) would change the shim's argv.
+        .env("XDG_CONFIG_HOME", env.daemon.state_dir.join("config"))
+        .env_remove("ATM_SPAWN_ARGS")
+        .env_remove("ATM_SPAWN_CLAUDE_BIN")
+        .env_remove("ATM_SPAWN_CLAUDE_ARGS")
         .output()
         .expect("run atm spawn");
 

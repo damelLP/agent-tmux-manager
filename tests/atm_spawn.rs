@@ -380,3 +380,19 @@ fn spawn_refuses_control_characters_in_the_prompt_before_splitting() {
     }
     assert_nothing_split(dir.path());
 }
+
+/// Spawn types the command before the pane's shell is up, through the tty's
+/// 4 KB line buffer (a 4,093-byte command was cut on tmux 3.8 + bash 5.3), so
+/// a long prompt is refused before anything is split.
+#[test]
+fn spawn_refuses_a_prompt_too_long_to_type_before_splitting() {
+    let dir = rig();
+    let out = spawn(dir.path(), Some("%7"), &["--prompt", &"x".repeat(3000)]);
+    assert_eq!(out.status.code(), Some(1), "atm spawn: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("too long") && stderr.contains("file"),
+        "{stderr}"
+    );
+    assert_nothing_split(dir.path());
+}

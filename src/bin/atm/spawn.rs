@@ -272,21 +272,32 @@ pub(super) fn build_spawn_command_for_harness(
     cmd
 }
 
+/// The most bytes `--prompt` may take once quoted. Spawn types the command
+/// before the pane's shell is up, so it passes through the tty's line buffer,
+/// which holds 4095 bytes: on tmux 3.8 and bash 5.3 a 4,033-byte command ran
+/// and a 4,093-byte one was cut, leaving bash waiting for its closing quote.
+/// Half of that leaves room for the `cd`, the binary and its arguments.
+const MAX_PROMPT_WORDS: usize = 2048;
+
 /// The words that hand `prompt` to `harness` at the end of its command, or
 /// why it can't take one.
 fn prompt_words(harness: &SpawnHarnessDefinition, prompt: &str) -> Result<String> {
+    let words = match harness.prompt_mode {
+        PromptMode::Positional => shell_quote(prompt),
+        PromptMode::Flag(flag) => format!("{flag} {}", shell_quote(prompt)),
+        PromptMode::KeystrokeInjection | PromptMode::Unsupported => {
+            bail!("harness '{}' can't take --prompt yet", harness.id)
+        }
+    };
     // The command is typed into an interactive shell, where a newline would
     // run it early and a tab would complete.
     if prompt.chars().any(char::is_control) {
         bail!("--prompt can't hold control characters (a newline, a tab, ...): put a long brief in a file and name the file in the prompt");
     }
-    match harness.prompt_mode {
-        PromptMode::Positional => Ok(shell_quote(prompt)),
-        PromptMode::Flag(flag) => Ok(format!("{flag} {}", shell_quote(prompt))),
-        PromptMode::KeystrokeInjection | PromptMode::Unsupported => {
-            bail!("harness '{}' can't take --prompt yet", harness.id)
-        }
+    if words.len() > MAX_PROMPT_WORDS {
+        bail!("--prompt is too long to type into a shell ({} bytes quoted, at most {MAX_PROMPT_WORDS}): put a long brief in a file and name the file in the prompt", words.len());
     }
+    Ok(words)
 }
 
 #[allow(clippy::too_many_arguments)] // one per `atm spawn` flag
@@ -812,11 +823,15 @@ mod spawn_command_tests {
             words(PromptMode::Flag("--prompt"), "a b"),
             Ok("--prompt 'a b'".to_string())
         );
+        // A harness that can't take a prompt says so first, whatever the
+        // text: a file wouldn't help it.
         for mode in [PromptMode::KeystrokeInjection, PromptMode::Unsupported] {
-            assert_eq!(
-                words(mode, "hi"),
-                Err("harness 'probe' can't take --prompt yet".to_string())
-            );
+            for prompt in ["hi", "a\nb", &"x".repeat(5000)] {
+                assert_eq!(
+                    words(mode, prompt),
+                    Err("harness 'probe' can't take --prompt yet".to_string())
+                );
+            }
         }
         for mode in [PromptMode::Positional, PromptMode::Flag("-p")] {
             let refused = words(mode, "a\nb").unwrap_err();
@@ -826,6 +841,18 @@ mod spawn_command_tests {
         assert_eq!(
             words(PromptMode::Positional, "é ✓ \u{2028}"),
             Ok("'é ✓ \u{2028}'".to_string())
+        );
+        // The limit counts the quoted words: 2046 plain bytes and their two
+        // quotes fit; a quote that grows to four bytes tips it over.
+        let at_limit = "x".repeat(2046);
+        assert_eq!(
+            words(PromptMode::Positional, &at_limit),
+            Ok(format!("'{at_limit}'"))
+        );
+        let refused = words(PromptMode::Positional, &format!("{}'", "x".repeat(2043))).unwrap_err();
+        assert!(
+            refused.contains("too long") && refused.contains("2049 bytes"),
+            "{refused}"
         );
     }
 }

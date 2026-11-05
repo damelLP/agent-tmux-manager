@@ -214,12 +214,14 @@ pub async fn run_notify(argv: &[String], timeout: Duration) -> Result<(), Notify
     let mut stderr = Vec::new();
     let pipe = child.stderr.take();
     let run = async {
-        if let Some(pipe) = pipe {
-            // Past the limit the pipe closes, so a chatty command gets
-            // EPIPE instead of growing atmd's memory.
-            pipe.take(STDERR_LIMIT as u64)
+        if let Some(mut pipe) = pipe {
+            // Keep the start and drop the rest: memory stays bounded, and
+            // the pipe stays open, so a chatty command isn't killed by SIGPIPE.
+            (&mut pipe)
+                .take(STDERR_LIMIT as u64)
                 .read_to_end(&mut stderr)
                 .await?;
+            tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await?;
         }
         child.wait().await
     };
@@ -696,6 +698,18 @@ mod tests {
             "{}",
             stderr.len()
         );
+    }
+
+    /// A command that keeps writing to stderr past the limit still runs to
+    /// the end: atmd drops the rest instead of closing the pipe, which
+    /// killed such a command with SIGPIPE before it could send anything.
+    #[tokio::test]
+    async fn run_notify_lets_a_chatty_command_finish() {
+        let script = "printf '%5000s' x >&2; sleep 0.3; echo more >&2; exit 0";
+        let argv = ["sh", "-c", script].map(String::from);
+        run_notify(&argv, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[tokio::test]

@@ -31,7 +31,8 @@
 //!    injection sidesteps that entirely.) The shim connects to atmd
 //!    over its socket, sends a `UserPromptSubmit` hook event carrying
 //!    `$TMUX_PANE`, and sleeps to keep the pane alive (atmd's
-//!    stale-session reaper runs every 2s). The test then polls
+//!    stale-session reaper runs every 2s). `atm spawn` must print the
+//!    pane it created. The test then polls
 //!    `atm list --format json` until a session whose `tmux_pane` matches
 //!    the pane atm spawn created shows up. This validates the entire
 //!    spawn → tmux split → hook event → registry update loop.
@@ -939,6 +940,12 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
         new_panes.iter().map(|p| &p.pane_id).collect::<Vec<_>>()
     );
     let spawned_pane = new_panes[0].pane_id.clone();
+    // A caller learns the new pane from atm spawn's stdout (#121).
+    assert_eq!(
+        String::from_utf8_lossy(&spawn_output.stdout),
+        format!("{spawned_pane}\n"),
+        "atm spawn should print the pane it created"
+    );
 
     // Poll `atm list --format json` until our fixture-minted session
     // shows up. We require BOTH the `id` prefix (rules out user-process

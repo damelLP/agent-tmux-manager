@@ -53,10 +53,10 @@ in backticks. Write an apostrophe as `'\''`.
    quotes, and wait (step 3) in the same command:
    `pane=$(atm spawn -H <harness> -w <dir> --prompt '<invoke> [--profile <name>] <brief file>') && bash <this skill's folder>/scripts/atm-wait "$pane"`.
    Only `claude`, `pi` and `codex` take `--prompt`, and a `codex` one needs
-   `ATM_SPAWN_CODEX_ARGS=--no-daemon` in front of `atm spawn`; for others,
-   spawn, wait for the input box, then send. If `atm-wait` prints `GONE`
-   within seconds, peek: a startup dialog (trust this folder?) holds the
-   prompt until the user answers it. If you are Codex, run as
+   `--no-daemon` (see the reference); for others, spawn, wait for the input
+   box, then send. If `atm-wait` prints `GONE` within seconds, peek: a
+   startup dialog (trust this folder?) holds the prompt until the user
+   answers it; a harness still starting needs another `atm-wait`. If you are Codex, run as
    `codex --no-daemon` or pass `-t <your pane>`: under Codex's shared daemon
    `$TMUX_PANE` names another pane. Keep a table: name, pane (`%N`), harness, `project_root`,
    worktree, task, brief file. (`working_directory` in `atm list` is cut to

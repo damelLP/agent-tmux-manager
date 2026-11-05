@@ -584,7 +584,9 @@ mod tests {
         let delay = Duration::from_millis(400);
         let (events, receiver) = broadcast::channel(16);
         let cancel = CancellationToken::new();
-        let command = vec![record.display().to_string()];
+        // Through `sh`, which only reads the script: executing a file this
+        // process just wrote can fail with ETXTBSY while a sibling test forks.
+        let command = vec!["sh".to_string(), record.display().to_string()];
         let notifier = spawn_notifier(receiver, command, delay, cancel.clone());
         let send = |event| {
             events.send(event).unwrap();
@@ -644,14 +646,16 @@ mod tests {
             .unwrap();
         let calls = || std::fs::read_dir(dir.path()).unwrap().count() - 1;
         let wait_for = |n: usize| async move {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while calls() < n && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
         let (events, receiver) = broadcast::channel(4);
         let cancel = CancellationToken::new();
-        let command = vec![record.display().to_string()];
+        // Through `sh`, which only reads the script: executing a file this
+        // process just wrote can fail with ETXTBSY while a sibling test forks.
+        let command = vec!["sh".to_string(), record.display().to_string()];
         let notifier = spawn_notifier(receiver, command, Duration::ZERO, cancel.clone());
 
         events.send(updated("a", AttentionNeeded)).unwrap();

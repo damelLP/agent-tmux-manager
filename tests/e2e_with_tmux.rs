@@ -32,7 +32,8 @@
 //!    over its socket, sends a `UserPromptSubmit` hook event carrying
 //!    `$TMUX_PANE`, and sleeps to keep the pane alive (atmd's
 //!    stale-session reaper runs every 2s). `atm spawn` must print the
-//!    pane it created. The test then polls
+//!    pane it created, and its `--prompt` must reach the shim as its one
+//!    argument (the shim sends its argv as the prompt). The test then polls
 //!    `atm list --format json` until a session whose `tmux_pane` matches
 //!    the pane atm spawn created shows up. This validates the entire
 //!    spawn → tmux split → hook event → registry update loop. A second
@@ -153,7 +154,9 @@ fn python3_on_path() -> Option<PathBuf> {
 /// The shim impersonates Claude Code's startup just enough to register a
 /// session with atmd and stay alive: connect to `$ATM_SOCKET`, send
 /// `Connect`, then send a `UserPromptSubmit` `HookEvent` carrying our PID
-/// and `$TMUX_PANE`, then sleep. Any error is logged to stderr and the
+/// and `$TMUX_PANE`, then sleep. Started with arguments, it sends them as
+/// the prompt, a JSON array, which atm shows as the session's
+/// `first_prompt`. Any error is logged to stderr and the
 /// shim exits non-zero so tmux's pane keeps the error visible for
 /// debugging.
 ///
@@ -206,7 +209,9 @@ try:
             "hook_event_name": "UserPromptSubmit",
             "pid": os.getpid(),
             "tmux_pane": pane,
-            "prompt": "fixture probe",
+            # The arguments it was started with, so a test can check the
+            # command `atm spawn --prompt` typed reached it as one word.
+            "prompt": json.dumps(sys.argv[1:]) if len(sys.argv) > 1 else "fixture probe",
         }},
     }})
 
@@ -883,9 +888,14 @@ async fn scenario_paste_text_and_atm_send(env: &E2eEnv) {
     }
 }
 
+/// The `--prompt` scenario 4 spawns the shim with: shell quotes and
+/// specials that must reach it as one argument.
+const SPAWN_PROMPT: &str = r#"/atm-implement --profile p it's "$HOME" & `id`; done;"#;
+
 /// Scenario 4 — `atm spawn` end-to-end. Splits a pane in our isolated
-/// server, the pane runs our Python shim, the shim phones home to atmd,
-/// we verify the registered session has the expected `tmux_pane`.
+/// server, the pane runs our Python shim with `--prompt`, the shim phones
+/// home to atmd, we verify the registered session has the expected
+/// `tmux_pane` and the prompt as the shim's one argument.
 async fn scenario_atm_spawn(env: &E2eEnv) {
     let panes_pre_spawn = env.tmux.list_panes().await.expect("list panes (pre-spawn)");
     let probe_pane_pre_spawn = panes_pre_spawn
@@ -904,6 +914,8 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
             "below",
             "--size",
             "20%",
+            "--prompt",
+            SPAWN_PROMPT,
         ])
         // is_in_tmux() just checks for the env var; any value passes.
         .env("TMUX", "atm-e2e-fixture-no-real-tmux-here")
@@ -1027,6 +1039,14 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
         registered_pane, spawned_pane,
         "fixture session's tmux_pane should match the pane atm spawn created"
     );
+    // The shim got the prompt as its one argument, through the pane's
+    // shell, quotes and all.
+    let argv: Value = session
+        .get("first_prompt")
+        .and_then(Value::as_str)
+        .map(|p| serde_json::from_str(p).expect("the shim's argv as JSON"))
+        .expect("fixture session should carry first_prompt");
+    assert_eq!(argv, serde_json::json!([SPAWN_PROMPT]));
 
     scenario_atm_spawn_defaults_to_tmux_pane(env, &probe_pane_pre_spawn).await;
 }

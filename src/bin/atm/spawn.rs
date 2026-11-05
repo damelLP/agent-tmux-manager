@@ -10,6 +10,7 @@ use tracing::warn;
 
 use atm_core::{
     builtin_harnesses, default_harness_definition, find_harness_definition, HarnessDefinition,
+    PromptMode,
 };
 use atm_tmux::{RealTmuxClient, TmuxClient};
 use atm_tui::setup;
@@ -81,6 +82,7 @@ pub(super) struct SpawnHarnessDefinition {
     binary: String,
     default_args: Vec<String>,
     model_flag: Option<String>,
+    prompt_mode: PromptMode,
 }
 
 impl SpawnHarnessDefinition {
@@ -94,6 +96,7 @@ impl SpawnHarnessDefinition {
                 .map(|arg| (*arg).to_string())
                 .collect(),
             model_flag: definition.model_flag.map(str::to_string),
+            prompt_mode: definition.prompt_mode,
         }
     }
 
@@ -108,6 +111,7 @@ impl SpawnHarnessDefinition {
             binary: binary.to_string(),
             default_args: config.default_args.clone().unwrap_or_default(),
             model_flag: config.model_flag.as_deref().and_then(non_empty_str),
+            prompt_mode: PromptMode::Unsupported,
         })
     }
 
@@ -268,6 +272,24 @@ pub(super) fn build_spawn_command_for_harness(
     cmd
 }
 
+/// The words that hand `prompt` to `harness` at the end of its command, or
+/// why it can't take one.
+fn prompt_words(harness: &SpawnHarnessDefinition, prompt: &str) -> Result<String> {
+    // The command is typed into an interactive shell, where a newline would
+    // run it early and a tab would complete.
+    if prompt.chars().any(char::is_control) {
+        bail!("--prompt can't hold control characters (a newline, a tab, ...): put a long brief in a file and name the file in the prompt");
+    }
+    match harness.prompt_mode {
+        PromptMode::Positional => Ok(shell_quote(prompt)),
+        PromptMode::Flag(flag) => Ok(format!("{flag} {}", shell_quote(prompt))),
+        PromptMode::KeystrokeInjection | PromptMode::Unsupported => {
+            bail!("harness '{}' can't take --prompt yet", harness.id)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // one per `atm spawn` flag
 pub(super) async fn cmd_spawn(
     harness_id: Option<String>,
     model: Option<String>,
@@ -276,11 +298,15 @@ pub(super) async fn cmd_spawn(
     size: String,
     target_pane: Option<String>,
     format: SpawnFormat,
+    prompt: Option<String>,
 ) -> Result<()> {
     let harness = resolve_spawn_harness(harness_id.as_deref())?;
     if model.is_some() && harness.model_flag.is_none() {
         bail!("harness '{}' does not support --model yet", harness.id);
     }
+    let prompt = prompt
+        .map(|text| prompt_words(&harness, &text))
+        .transpose()?;
 
     if !tmux::is_in_tmux() {
         bail!("atm spawn requires running inside tmux");
@@ -326,7 +352,12 @@ pub(super) async fn cmd_spawn(
             })
     };
 
-    let agent_cmd = build_spawn_command_for_harness(&harness, cwd.as_deref(), model.as_deref());
+    let mut agent_cmd = build_spawn_command_for_harness(&harness, cwd.as_deref(), model.as_deref());
+    // Last, after ATM_SPAWN_*_ARGS and --model.
+    if let Some(words) = prompt {
+        agent_cmd.push(' ');
+        agent_cmd.push_str(&words);
+    }
 
     let pane_dir: atm_tmux::PaneDirection = direction.into();
     // Split without a command so the pane gets an interactive shell (which has
@@ -530,7 +561,7 @@ mod shell_quote_tests {
 #[cfg(test)]
 mod spawn_command_tests {
     use super::{
-        build_spawn_command, build_spawn_command_for_harness, resolve_spawn_harness,
+        build_spawn_command, build_spawn_command_for_harness, prompt_words, resolve_spawn_harness,
         SpawnHarnessDefinition,
     };
     use std::fs;
@@ -745,6 +776,7 @@ mod spawn_command_tests {
             binary: "claude".to_string(),
             default_args: vec!["--profile".to_string(), "a b".to_string()],
             model_flag: Some("--model".to_string()),
+            prompt_mode: atm_core::PromptMode::Unsupported,
         };
         assert_eq!(
             build_spawn_command_for_harness(&plain_word_harness, Some("/work dir"), Some("opus")),
@@ -755,5 +787,45 @@ mod spawn_command_tests {
         // assert_eq!s above panicked.
         let _ = config_home;
         let _ = config_dir;
+    }
+
+    /// `--prompt` per prompt mode: one shell word, after a flag for `Flag`
+    /// (no built-in uses one yet), refused for the modes spawn can't do,
+    /// and refused with a control character whatever the mode.
+    #[test]
+    fn prompt_words_follow_the_prompt_mode() {
+        use atm_core::PromptMode;
+        let harness = |prompt_mode| SpawnHarnessDefinition {
+            id: "probe".to_string(),
+            binary: "probe".to_string(),
+            default_args: Vec::new(),
+            model_flag: None,
+            prompt_mode,
+        };
+        let words =
+            |mode, prompt: &str| prompt_words(&harness(mode), prompt).map_err(|e| e.to_string());
+        assert_eq!(
+            words(PromptMode::Positional, "it's $x"),
+            Ok("'it'\\''s $x'".to_string())
+        );
+        assert_eq!(
+            words(PromptMode::Flag("--prompt"), "a b"),
+            Ok("--prompt 'a b'".to_string())
+        );
+        for mode in [PromptMode::KeystrokeInjection, PromptMode::Unsupported] {
+            assert_eq!(
+                words(mode, "hi"),
+                Err("harness 'probe' can't take --prompt yet".to_string())
+            );
+        }
+        for mode in [PromptMode::Positional, PromptMode::Flag("-p")] {
+            let refused = words(mode, "a\nb").unwrap_err();
+            assert!(refused.contains("control characters"), "{refused}");
+        }
+        // Not control characters: they pass as they are.
+        assert_eq!(
+            words(PromptMode::Positional, "é ✓ \u{2028}"),
+            Ok("'é ✓ \u{2028}'".to_string())
+        );
     }
 }

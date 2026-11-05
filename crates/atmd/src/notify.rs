@@ -56,8 +56,9 @@ pub const STDERR_LIMIT: usize = 4096;
 /// A `[notify]` config or command that failed.
 #[derive(Debug, thiserror::Error)]
 pub enum NotifyError {
-    /// atm's `config.toml` is not valid, or its `[notify]` is not.
-    #[error("invalid config: {0}")]
+    /// atm's `config.toml` is not valid, or its `[notify]` is not. Shown
+    /// without toml's quote of the line, which can hold a webhook URL.
+    #[error("invalid config: {}", .0.message())]
     Config(#[from] toml::de::Error),
     /// The command could not start (e.g. it was not found) or be waited on.
     #[error("{program:?}: {source}")]
@@ -363,6 +364,27 @@ mod tests {
         ] {
             assert!(parse_notify_command(text).is_err(), "{text:?}");
         }
+    }
+
+    /// atmd logs a config error, so it must not quote the offending line:
+    /// that line can hold a webhook URL or an ntfy topic.
+    #[test]
+    fn a_config_error_does_not_quote_the_line() {
+        let url = "https://hooks.example.invalid/services/T0/B0/SECRET";
+        for text in [
+            format!("[notify]\ncmd = ['curl', '{url}']\n"),
+            format!("[notify]\ncommand = ['curl', '{url}'\n"),
+        ] {
+            let err = parse_notify_command(&text).expect_err("invalid");
+            let shown = err.to_string();
+            assert!(!shown.contains("SECRET"), "{shown}");
+            assert!(shown.starts_with("invalid config: "), "{shown}");
+        }
+        let typo = format!("[notify]\ncmd = ['curl', '{url}']\n");
+        let shown = parse_notify_command(&typo)
+            .expect_err("invalid")
+            .to_string();
+        assert!(shown.contains("unknown field `cmd`"), "{shown}");
     }
 
     #[test]

@@ -1994,8 +1994,10 @@ async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
 }
 
 /// Writes a `tmux` into `dir` that appends its argv to `log`, one `[arg]` per
-/// argument, then execs the real tmux. A lone `-u -L <label> send-keys -t
-/// <pane> Enter` is logged with ` swallowed` and not forwarded.
+/// argument, then execs the real tmux. A lone `send-keys -t <pane> Enter`
+/// is logged with ` swallowed` and not forwarded, whatever global flags
+/// come before it (`-u -L <label>`), so a change to those flags can't let
+/// the Enter reach the pane and start a harness.
 fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
     let real = tmux_on_path().expect("tmux on PATH (checked at setup)");
     let (real, log) = (real.display().to_string(), log.display().to_string());
@@ -2005,8 +2007,9 @@ fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
         "wrapper paths must not contain a single quote: {real} {log}"
     );
     let body = format!(
-        "#!/bin/sh\nline=\nfor arg in \"$@\"; do line=\"$line [$arg]\"; done\n\
-         if [ \"$#\" -eq 7 ] && [ \"$4\" = send-keys ] && [ \"$7\" = Enter ]; then\n\
+        "#!/bin/sh\nline=\na=\nb=\nc=\nd=\n\
+         for arg in \"$@\"; do line=\"$line [$arg]\"; a=$b; b=$c; c=$d; d=$arg; done\n\
+         if [ \"$a\" = send-keys ] && [ \"$b\" = -t ] && [ \"$d\" = Enter ]; then\n\
          \x20 printf '%s swallowed\\n' \"${{line# }}\" >> '{log}'\n\x20 exit 0\nfi\n\
          printf '%s\\n' \"${{line# }}\" >> '{log}'\nexec '{real}' \"$@\"\n"
     );

@@ -85,8 +85,8 @@ What it doesn't protect against:
 - **A send right after `/clear`.** Two sends a few milliseconds apart reached
   Claude Code 2.1.316 as one plain-text message (`/clear/atm-implement ...`)
   and nothing was cleared. Wait until `atm list` shows a new `id` on the
-  pane, then send. Checked on Claude Code 2.1.317 with atm and atmd 0.2.7, in
-  a sealed rig with a fake model API: the new id appeared 52 to 103 ms after
+  pane, then send. Checked on Claude Code 2.1.317 with a pre-release 0.3.0
+  build of atm and atmd (60baabd), in a sealed rig with a fake model API: the new id appeared 52 to 103 ms after
   `/clear`, and a send the moment it appeared ran as a slash command in a
   cleared context in 10 of 10 trials; a send 6 ms after `/clear` merged with
   it. pi 0.73.1's `/new` clears the screen ("✓ New session started") and gives
@@ -154,20 +154,22 @@ in `<dir>`. Options: `-d left|right|above|below` (default below), `-s 30%`
   0.163.0), in single quotes as for `atm send`:
   `pane=$(atm spawn -H pi -w <dir> --prompt '<skill call>')`. Then wait on
   the pane as after a send.
-  - Other harnesses refuse it ("can't take --prompt yet"), and so does text
-    with a newline, a tab or another control character, or over about 2 KB:
-    put a long brief in a file and name the file.
-  - The harness reads it like any argument: a one-word prompt that names one
-    of its subcommands runs that instead (`update`, in all three). A skill
-    call never does.
+  - Other harnesses refuse it ("can't take --prompt yet"). atm also refuses
+    text with a newline, a tab or another control character, and a command
+    line that would pass 4000 bytes with the `cd` and the harness's
+    arguments: put a long brief in a file and name the file.
+  - It refuses a one-word prompt and one that starts with `-`: the harness
+    would read it as a subcommand (`update`, in all three) or an option. A
+    skill call with its brief file always passes.
   - **A startup dialog holds the prompt**: Claude Code's and Codex's "trust
     this folder?", and Codex's "Hooks need review" after `atm setup` changes
     its hooks. The harness reports nothing until someone answers it, so the
     pane has no row and `atm-wait` prints `GONE` within seconds. So does a
     harness that is still starting (a slow shell, a cold start): `atm-wait`
     gives up after about 2 s without a row. Peek. If the screen shows a
-    dialog, ask the user to answer it (the prompt is sent after it), and
-    don't answer it yourself; otherwise run `atm-wait` again.
+    dialog, ask the user to answer it, and don't answer it yourself; the
+    prompt is sent once they have, so run `atm-wait` again then. Otherwise
+    run it again at once.
 - **The pane has no row in `atm list` until its harness reports.** Claude
   Code and pi report at startup. Codex 0.163.0 reports at its first prompt,
   so its row appears only after your first send or its `--prompt`.

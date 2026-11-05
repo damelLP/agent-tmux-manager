@@ -56,7 +56,8 @@ in backticks. Write an apostrophe as `'\''`.
    `--no-daemon` (see the reference); for others, spawn, wait for the input
    box, then send. If `atm-wait` prints `GONE` within seconds, peek: a
    startup dialog (trust this folder?) holds the prompt until the user
-   answers it; a harness still starting needs another `atm-wait`. If you are Codex, run as
+   answers it, so run `atm-wait` again once they have; a harness still
+   starting needs another `atm-wait` at once. If you are Codex, run as
    `codex --no-daemon` or pass `-t <your pane>`: under Codex's shared daemon
    `$TMUX_PANE` names another pane. Keep a table: name, pane (`%N`), harness, `project_root`,
    worktree, task, brief file. (`working_directory` in `atm list` is cut to

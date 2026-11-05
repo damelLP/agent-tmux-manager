@@ -189,7 +189,9 @@ def do_write(rows, cmd, pane, args):
         print(f"Interrupted {pane}")
     elif cmd == "kill":
         print(f"Killed {pane}")
-    # spawn prints nothing, as atm 0.2.7 does.
+    elif cmd == "spawn":
+        # spawn prints the new pane's id (#121); no case's list has it yet.
+        print("%99")
     return 0
 
 

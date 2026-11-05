@@ -49,8 +49,9 @@ pub const STDERR_LIMIT: usize = 4096;
 #[derive(Debug, thiserror::Error)]
 pub enum NotifyError {
     /// atm's `config.toml` is not valid, or its `[notify]` is not. Shown
-    /// without toml's quote of the line, which can hold a webhook URL.
-    #[error("invalid config: {}", .0.message())]
+    /// without toml's quote of the line or serde's quote of a value, which
+    /// can hold a webhook URL.
+    #[error("invalid config: {}", hide_values(.0.message()))]
     Config(#[from] toml::de::Error),
     /// The command could not start (e.g. it was not found) or be waited on.
     #[error("{program:?}: {source}")]
@@ -68,6 +69,17 @@ pub enum NotifyError {
         status: std::process::ExitStatus,
         stderr: String,
     },
+}
+
+/// `message` with everything between its first and last `"` cut out. serde
+/// quotes a string of the wrong type in full (`invalid type: string "..",
+/// expected a sequence`) and escapes each `"` inside, so its value always
+/// lies between the two.
+fn hide_values(message: &str) -> String {
+    match (message.split_once('"'), message.rsplit_once('"')) {
+        (Some((head, _)), Some((_, tail))) => format!("{head}\"…\"{tail}"),
+        _ => message.to_string(),
+    }
 }
 
 /// The parts of atm's `config.toml` that atmd reads.
@@ -322,7 +334,7 @@ mod tests {
             )))
         };
         let invalid = || -> Parsed { Err("invalid config: ") };
-        let cases: [(&str, Parsed); 16] = [
+        let cases: [(&str, Parsed); 19] = [
             (
                 "[harness]\ndefault = 'pi'\n\n[notify]\ncommand = ['notify-send', 'atm', '--']\n",
                 on(&["notify-send", "atm", "--"], 0),
@@ -343,13 +355,23 @@ mod tests {
             ("[notify]\ncommand = ['n']\ndelay = 10\n", invalid()),
             ("[notify]\ncmd = ['notify-send', 'atm', '--']\n", invalid()),
             // atmd logs a config error, so it must not quote the offending
-            // line: that line can hold a webhook URL or an ntfy topic.
+            // line or a value from it: either can hold a webhook URL or an
+            // ntfy topic.
             (
                 "[notify]\ncmd = ['curl', 'https://hooks.example.invalid/services/T0/B0/SECRET']\n",
                 Err("unknown field `cmd`"),
             ),
             (
                 "[notify]\ncommand = ['curl', 'https://hooks.example.invalid/services/T0/B0/SECRET'\n",
+                invalid(),
+            ),
+            (
+                "[notify]\ncommand = 'curl https://hooks.example.invalid/services/T0/B0/SECRET'\n",
+                Err("invalid type: string \"…\", expected a sequence"),
+            ),
+            ("notify = 'https://ntfy.sh/SECRET'\n", invalid()),
+            (
+                "[notify]\ncommand = ['n']\ndelay_secs = 'a \"quoted\" SECRET'\n",
                 invalid(),
             ),
         ];

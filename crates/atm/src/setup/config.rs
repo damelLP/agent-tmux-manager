@@ -18,14 +18,15 @@ pub(super) fn install_tmux_bindings() -> Result<()> {
     let content = r#"# ATM — Agent Tmux Manager bindings
 # Source this in your .tmux.conf: source-file ~/.config/atm/tmux-bindings.conf
 
-# Spawn a new agent (default: below current pane)
-bind C-n run-shell "atm spawn --target-pane #{pane_id}"
+# Spawn a new agent (default: below current pane). atm spawn prints the new
+# pane's id, which tmux would show over the pane, so it goes to /dev/null.
+bind C-n run-shell "atm spawn --target-pane #{pane_id} > /dev/null"
 
 # Directional agent spawn (vim-style: h=left, j=below, k=above, l=right)
-bind C-h run-shell "atm spawn --direction left --target-pane #{pane_id}"
-bind C-j run-shell "atm spawn --direction below --target-pane #{pane_id}"
-bind C-k run-shell "atm spawn --direction above --target-pane #{pane_id}"
-bind C-l run-shell "atm spawn --direction right --target-pane #{pane_id}"
+bind C-h run-shell "atm spawn --direction left --target-pane #{pane_id} > /dev/null"
+bind C-j run-shell "atm spawn --direction below --target-pane #{pane_id} > /dev/null"
+bind C-k run-shell "atm spawn --direction above --target-pane #{pane_id} > /dev/null"
+bind C-l run-shell "atm spawn --direction right --target-pane #{pane_id} > /dev/null"
 
 # Toggle ATM sidebar panel
 bind C-a run-shell "atm toggle-panel"

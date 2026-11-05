@@ -438,3 +438,30 @@ fn spawn_refuses_a_prompt_line_too_long_to_type_before_splitting() {
     assert!(out.status.success(), "atm spawn: {out:?}");
     assert_eq!(typed_command(dir.path()).len(), 5015);
 }
+
+/// A one-word prompt may name one of the harness's subcommands (`claude
+/// update` updates Claude Code) and a leading '-' reads as an option, so
+/// both are refused before anything is split (the user's decision,
+/// 2026-11-05). clap already refuses `--prompt -x`; the `=` form gets here.
+#[test]
+fn spawn_refuses_a_one_word_or_dash_prompt_before_splitting() {
+    let dir = rig();
+    for arg in ["--prompt=update", "--prompt=-x", "--prompt=-p hello"] {
+        let out = spawn(dir.path(), Some("%7"), &["-H", "codex", arg]);
+        assert_eq!(out.status.code(), Some(1), "{arg}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("more than one word"), "{arg}: {stderr}");
+    }
+    assert_nothing_split(dir.path());
+
+    let out = spawn(
+        dir.path(),
+        Some("%7"),
+        &["-H", "codex", "--prompt", "$atm-implement /tmp/b.md"],
+    );
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(
+        typed_command(dir.path()),
+        "cd '/from/pane' && codex '$atm-implement /tmp/b.md'"
+    );
+}

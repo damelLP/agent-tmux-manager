@@ -294,6 +294,11 @@ fn prompt_words(harness: &SpawnHarnessDefinition, prompt: &str) -> Result<String
     if prompt.chars().any(char::is_control) {
         bail!("--prompt can't hold control characters (a newline, a tab, ...): put a long brief in a file and name the file in the prompt");
     }
+    // The harness parses the prompt like any argument. An empty one is like
+    // none, so it passes.
+    if prompt.starts_with('-') || (!prompt.is_empty() && !prompt.chars().any(char::is_whitespace)) {
+        bail!("--prompt must be more than one word and not start with '-': a one-word prompt may name one of the harness's subcommands (e.g. update), and a leading '-' reads as an option");
+    }
     Ok(words)
 }
 
@@ -803,7 +808,8 @@ mod spawn_command_tests {
 
     /// `--prompt` per prompt mode: one shell word, after a flag for `Flag`
     /// (no built-in uses one yet), refused for the modes spawn can't do,
-    /// and refused with a control character whatever the mode.
+    /// and refused with a control character, as one word or with a leading
+    /// '-' whatever the mode.
     #[test]
     fn prompt_words_follow_the_prompt_mode() {
         use atm_core::PromptMode;
@@ -827,7 +833,7 @@ mod spawn_command_tests {
         // A harness that can't take a prompt says so first, whatever the
         // text: a file wouldn't help it.
         for mode in [PromptMode::KeystrokeInjection, PromptMode::Unsupported] {
-            for prompt in ["hi", "a\nb", &"x".repeat(5000)] {
+            for prompt in ["hi there", "a\nb", "update", "-x"] {
                 assert_eq!(
                     words(mode, prompt),
                     Err("harness 'probe' can't take --prompt yet".to_string())
@@ -842,6 +848,27 @@ mod spawn_command_tests {
         assert_eq!(
             words(PromptMode::Positional, "é ✓ \u{2028}"),
             Ok("'é ✓ \u{2028}'".to_string())
+        );
+        // One word may name a subcommand (`claude update` updates Claude
+        // Code), and a leading '-' reads as an option: both refused, under
+        // every mode that takes a prompt. An empty prompt is like none.
+        for mode in [PromptMode::Positional, PromptMode::Flag("-p")] {
+            for prompt in ["update", "-x", "-p hello", "--yolo", "é"] {
+                let refused = words(mode, prompt).unwrap_err();
+                assert!(
+                    refused.contains("more than one word"),
+                    "{prompt}: {refused}"
+                );
+            }
+        }
+        assert_eq!(words(PromptMode::Positional, ""), Ok("''".to_string()));
+        assert_eq!(
+            words(PromptMode::Positional, "/atm-implement /tmp/b.md"),
+            Ok("'/atm-implement /tmp/b.md'".to_string())
+        );
+        assert_eq!(
+            words(PromptMode::Positional, "a-b c"),
+            Ok("'a-b c'".to_string())
         );
     }
 }

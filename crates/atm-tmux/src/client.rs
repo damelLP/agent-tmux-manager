@@ -89,9 +89,14 @@ impl RealTmuxClient {
     }
 
     /// Builds a `Command` with the base `tmux` invocation.
+    /// `-u` makes tmux print output as UTF-8 whatever the caller's locale:
+    /// a client with neither `$TMUX` nor a UTF-8 `LC_ALL`/`LC_CTYPE`/`LANG`
+    /// gets each tab, and each column of each non-ASCII character, as `_`
+    /// (seen on tmux 3.8; 3.4's source has the same code; #138).
     /// Adds `-L <socket>` if a custom socket name is configured.
     fn tmux_cmd(&self) -> Command {
         let mut cmd = Command::new("tmux");
+        cmd.arg("-u");
         if let Some(ref socket) = self.socket_name {
             cmd.arg("-L").arg(socket);
         }

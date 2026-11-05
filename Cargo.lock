@@ -190,6 +190,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "serde",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",

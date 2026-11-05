@@ -218,13 +218,22 @@ fn test_commands_read_the_daemons_session_list() {
         let _ = std::fs::remove_file(&tmux_log);
         let out = atm(exe, dir.path(), &args);
         assert!(out.status.success(), "atm {args:?}: {out:?}");
-        let calls = std::fs::read_to_string(&tmux_log).expect("tmux was called");
-        let called: Vec<&str> = calls
+        let log = std::fs::read_to_string(&tmux_log).expect("tmux was called");
+        // Each call starts with `-u`, so tmux prints UTF-8 whatever the
+        // caller's locale (#138); the subcommand comes next.
+        let calls: Vec<&str> = log
             .lines()
+            .map(|call| {
+                call.strip_prefix("-u ")
+                    .unwrap_or_else(|| panic!("atm {args:?}: tmux called without -u: {call:?}"))
+            })
+            .collect();
+        let called: Vec<&str> = calls
+            .iter()
             .map(|call| call.split(' ').next().unwrap_or_default())
             .collect();
         assert_eq!(called, subcommands, "atm {args:?}: {calls:?}");
-        for call in calls.lines() {
+        for call in &calls {
             let words: Vec<&str> = call.split(' ').collect();
             let subcommand = words.first().copied().unwrap_or_default();
             if subcommand == "load-buffer" {

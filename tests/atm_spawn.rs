@@ -381,18 +381,60 @@ fn spawn_refuses_control_characters_in_the_prompt_before_splitting() {
     assert_nothing_split(dir.path());
 }
 
-/// Spawn types the command before the pane's shell is up, through the tty's
-/// 4 KB line buffer (a 4,093-byte command was cut on tmux 3.8 + bash 5.3), so
-/// a long prompt is refused before anything is split.
+/// Spawn types the whole command before the pane's shell is up, through the
+/// tty's line buffer (tmux 3.8, bash 5.3.20 or zsh 5.9.2 started late: a
+/// 4,095-byte line ran, 4,096 bytes were cut). With `--prompt`, a line over
+/// 4000 bytes is refused before anything is split, whichever part makes it
+/// long. Without `--prompt` the line is typed as before.
 #[test]
-fn spawn_refuses_a_prompt_too_long_to_type_before_splitting() {
+fn spawn_refuses_a_prompt_line_too_long_to_type_before_splitting() {
+    let prompt = "/atm-implement /tmp/b.md";
+    // `cd '<w>' && claude '<prompt>'` is the -w path plus 42 bytes.
+    let w = |len: usize| format!("/{}", "w".repeat(len - 1));
     let dir = rig();
-    let out = spawn(dir.path(), Some("%7"), &["--prompt", &"x".repeat(3000)]);
-    assert_eq!(out.status.code(), Some(1), "atm spawn: {out:?}");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("too long") && stderr.contains("file"),
-        "{stderr}"
+    let out = spawn(
+        dir.path(),
+        Some("%7"),
+        &["-w", &w(3958), "--prompt", prompt],
     );
-    assert_nothing_split(dir.path());
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(typed_command(dir.path()).len(), 4000);
+
+    let assert_refused = |dir: &Path, out: &Output, bytes: &str| {
+        assert_eq!(out.status.code(), Some(1), "atm spawn: {out:?}");
+        assert_eq!(stdout(out), "");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("{bytes} bytes")) && stderr.contains("file"),
+            "{stderr}"
+        );
+        assert_nothing_split(dir);
+    };
+    let dir = rig();
+    let out = spawn(
+        dir.path(),
+        Some("%7"),
+        &["-w", &w(3959), "--prompt", prompt],
+    );
+    assert_refused(dir.path(), &out, "4001");
+
+    // A prompt that fits by itself, after long harness arguments.
+    let dir = rig();
+    let out = spawn_command(
+        dir.path(),
+        Some("%7"),
+        &["--prompt", &format!("a {}", "b".repeat(2000))],
+    )
+    .env(
+        "ATM_SPAWN_CLAUDE_ARGS",
+        format!("--pad {}", "c".repeat(2100)),
+    )
+    .output()
+    .expect("run atm spawn");
+    assert_refused(dir.path(), &out, "4137");
+
+    let dir = rig();
+    let out = spawn(dir.path(), Some("%7"), &["-w", &w(5000)]);
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(typed_command(dir.path()).len(), 5015);
 }

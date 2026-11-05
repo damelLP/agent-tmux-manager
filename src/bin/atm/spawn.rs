@@ -272,12 +272,12 @@ pub(super) fn build_spawn_command_for_harness(
     cmd
 }
 
-/// The most bytes `--prompt` may take once quoted. Spawn types the command
-/// before the pane's shell is up, so it passes through the tty's line buffer,
-/// which holds 4095 bytes: on tmux 3.8 and bash 5.3 a 4,033-byte command ran
-/// and a 4,093-byte one was cut, leaving bash waiting for its closing quote.
-/// Half of that leaves room for the `cd`, the binary and its arguments.
-const MAX_PROMPT_WORDS: usize = 2048;
+/// The most bytes of command spawn types when it carries `--prompt`. Spawn
+/// types it before the pane's shell is up, so it passes through the tty's
+/// line buffer: on tmux 3.8 with bash 5.3.20 or zsh 5.9.2 started late, a
+/// 4,095-byte line ran and a 4,096-byte one was cut, leaving the shell
+/// waiting for its closing quote. 4000 keeps a margin.
+const MAX_TYPED_LINE: usize = 4000;
 
 /// The words that hand `prompt` to `harness` at the end of its command, or
 /// why it can't take one.
@@ -293,9 +293,6 @@ fn prompt_words(harness: &SpawnHarnessDefinition, prompt: &str) -> Result<String
     // run it early and a tab would complete.
     if prompt.chars().any(char::is_control) {
         bail!("--prompt can't hold control characters (a newline, a tab, ...): put a long brief in a file and name the file in the prompt");
-    }
-    if words.len() > MAX_PROMPT_WORDS {
-        bail!("--prompt is too long to type into a shell ({} bytes quoted, at most {MAX_PROMPT_WORDS}): put a long brief in a file and name the file in the prompt", words.len());
     }
     Ok(words)
 }
@@ -368,6 +365,10 @@ pub(super) async fn cmd_spawn(
     if let Some(words) = prompt {
         agent_cmd.push(' ');
         agent_cmd.push_str(&words);
+        // Only with a prompt: without one the command is as before.
+        if agent_cmd.len() > MAX_TYPED_LINE {
+            bail!("with --prompt, the command to type is {} bytes, more than the {MAX_TYPED_LINE} a starting shell reads as one line: put a long brief in a file and name the file in the prompt, or shorten -w or the harness's arguments", agent_cmd.len());
+        }
     }
 
     let pane_dir: atm_tmux::PaneDirection = direction.into();
@@ -841,18 +842,6 @@ mod spawn_command_tests {
         assert_eq!(
             words(PromptMode::Positional, "é ✓ \u{2028}"),
             Ok("'é ✓ \u{2028}'".to_string())
-        );
-        // The limit counts the quoted words: 2046 plain bytes and their two
-        // quotes fit; a quote that grows to four bytes tips it over.
-        let at_limit = "x".repeat(2046);
-        assert_eq!(
-            words(PromptMode::Positional, &at_limit),
-            Ok(format!("'{at_limit}'"))
-        );
-        let refused = words(PromptMode::Positional, &format!("{}'", "x".repeat(2043))).unwrap_err();
-        assert!(
-            refused.contains("too long") && refused.contains("2049 bytes"),
-            "{refused}"
         );
     }
 }

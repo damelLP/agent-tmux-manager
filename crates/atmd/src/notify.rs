@@ -278,7 +278,12 @@ pub fn spawn_notifier(
                         }
                         None => {}
                     },
-                    Err(RecvError::Lagged(skipped)) => warn!(skipped, "Notifier missed events"),
+                    Err(RecvError::Lagged(skipped)) => {
+                        // A dropped "left needs input" would mute that session's
+                        // next dialog; forget them all (at worst one extra ping).
+                        warn!(skipped, "Notifier missed events");
+                        tracker = AttentionTracker::default();
+                    }
                     Err(RecvError::Closed) => break,
                 },
             }
@@ -615,6 +620,52 @@ mod tests {
             (calls("answered"), calls("open"), calls("again")),
             (0, 1, 1)
         );
+        cancel.cancel();
+        notifier.await.unwrap();
+    }
+
+    /// A lagging broadcast can drop a session's "left needs input" event.
+    /// The notifier then forgets every session, so that session's next
+    /// dialog still notifies. A 4-slot channel and a burst sent without
+    /// yielding make the lag certain.
+    #[tokio::test]
+    async fn a_lagged_notifier_still_notifies_the_next_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record");
+        std::fs::write(
+            &record,
+            format!(
+                "#!/bin/sh\nf=$(mktemp '{}/call.XXXXXX') && printf '%s' \"$1\" > \"$f\"\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let calls = || std::fs::read_dir(dir.path()).unwrap().count() - 1;
+        let wait_for = |n: usize| async move {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while calls() < n && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let (events, receiver) = broadcast::channel(4);
+        let cancel = CancellationToken::new();
+        let command = vec![record.display().to_string()];
+        let notifier = spawn_notifier(receiver, command, Duration::ZERO, cancel.clone());
+
+        events.send(updated("a", AttentionNeeded)).unwrap();
+        wait_for(1).await;
+        assert_eq!(calls(), 1);
+        // The answer is among the events the burst pushes out.
+        events.send(updated("a", Working)).unwrap();
+        for i in 0..8 {
+            events.send(updated(&format!("b{i}"), Working)).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.send(updated("a", AttentionNeeded)).unwrap();
+        wait_for(2).await;
+        assert_eq!(calls(), 2, "the second dialog didn't notify");
         cancel.cancel();
         notifier.await.unwrap();
     }

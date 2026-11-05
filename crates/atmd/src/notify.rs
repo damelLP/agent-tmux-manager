@@ -11,25 +11,17 @@
 //!
 //! With `delay_secs`, a notification waits that long and goes out only if
 //! the same stretch of needing input is still open, so a dialog answered
-//! in time sends nothing. Claude Code 2.1.317 sends no hook when a dialog
-//! is approved (seen 2026-11-04, sealed real TUI): the row reads needs
-//! input until the tool's `PostToolUse`, so a tool that outlasts the delay
-//! still notifies. The fix belongs where the event is mapped, not here.
+//! in time sends nothing.
 //!
-//! Claude Code 2.1.310 sends `PermissionRequest` and then `Notification`
-//! (`permission_prompt`) for one dialog, both needs input, so one dialog
-//! notifies once; `idle_prompt` maps to idle and never notifies (the
-//! root `tests/atmd_notify.rs` replays that capture).
-//!
-//! A subagent's dialog turns two rows: seen with a real Claude Code
-//! 2.1.317 TUI (a fake Messages API, no model call), its
-//! `PermissionRequest` carries the subagent's `agent_id`, and the
-//! `Notification` about 6 s later, sent only if the dialog is still open,
-//! carries none, so it lands on the lead's row. Both rows notify. A
-//! row-level mute was tried and dropped: on 2026-11-04 it lost a lead's
-//! own dialog that came while its subagent was asking, and the lead's
-//! next dialog after a subagent stopped mid-dialog (#129). The fix for the
-//! double ping belongs where the `Notification` is mapped to a row.
+//! Every row notifies on its own, so what a dialog sends follows from the
+//! rows the harness's hooks mark as needing input, recorded in each
+//! adapter's crate docs. For Claude Code (atm-claude-adapter): one dialog
+//! notifies once, an approved dialog's row needs input until its tool
+//! ends, so a tool that outlasts the delay still notifies, and a
+//! subagent's dialog that stays open marks its lead's row too, so it
+//! notifies twice. Those fixes belong where the hooks are mapped. A
+//! row-level mute for the double ping was tried here and dropped: on
+//! 2026-11-04 it lost a lead's own dialogs (#129).
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -314,79 +306,67 @@ mod tests {
     use super::*;
     use crate::registry::RemovalReason;
 
-    #[test]
-    fn parses_the_notify_command() {
-        let text =
-            "[harness]\ndefault = 'pi'\n\n[notify]\ncommand = ['notify-send', 'atm', '--']\n";
-        assert_eq!(
-            parse_notify_command(text)
-                .unwrap()
-                .map(|config| config.command),
-            Some(vec!["notify-send".into(), "atm".into(), "--".into()])
-        );
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
     }
 
+    /// Each config text, and the command and delay it turns on, `None`
+    /// (notify off), or the text its error must contain.
     #[test]
-    fn delay_secs_defaults_to_zero() {
-        let delay = |text: &str| parse_notify_command(text).unwrap().map(|c| c.delay_secs);
-        assert_eq!(delay("[notify]\ncommand = ['n']\n"), Some(0));
-        assert_eq!(
-            delay("[notify]\ncommand = ['n']\ndelay_secs = 10\n"),
-            Some(10)
-        );
-        for text in [
-            "[notify]\ncommand = ['n']\ndelay_secs = -1\n",
-            "[notify]\ncommand = ['n']\ndelay_secs = '10'\n",
-            "[notify]\ncommand = ['n']\ndelay = 10\n",
-        ] {
-            assert!(parse_notify_command(text).is_err(), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn no_section_or_an_empty_command_turns_notify_off() {
-        for text in [
-            "",
-            "[harness]\ndefault = 'claude'\n",
-            "[notify]\n",
-            "[notify]\ncommand = []\n",
-        ] {
-            assert!(parse_notify_command(text).unwrap().is_none(), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn an_invalid_config_is_an_error() {
-        for text in [
-            "[notify]\ncommand = 'notify-send atm'\n",
-            "[notify]\ncommand = [1]\n",
-            "[notify\n",
+    fn parses_the_notify_config() {
+        type Parsed = Result<Option<(Vec<String>, u64)>, &'static str>;
+        let on = |command: &[&str], delay: u64| -> Parsed {
+            Ok(Some((
+                command.iter().map(|a| a.to_string()).collect(),
+                delay,
+            )))
+        };
+        let invalid = || -> Parsed { Err("invalid config: ") };
+        let cases: [(&str, Parsed); 16] = [
+            (
+                "[harness]\ndefault = 'pi'\n\n[notify]\ncommand = ['notify-send', 'atm', '--']\n",
+                on(&["notify-send", "atm", "--"], 0),
+            ),
+            ("[notify]\ncommand = ['n']\n", on(&["n"], 0)),
+            ("[notify]\ncommand = ['n']\ndelay_secs = 10\n", on(&["n"], 10)),
+            // No section or an empty command turns notify off.
+            ("", Ok(None)),
+            ("[harness]\ndefault = 'claude'\n", Ok(None)),
+            ("[notify]\n", Ok(None)),
+            ("[notify]\ncommand = []\n", Ok(None)),
+            ("[notify]\ncommand = 'notify-send atm'\n", invalid()),
+            ("[notify]\ncommand = [1]\n", invalid()),
+            ("[notify\n", invalid()),
+            ("[notify]\ncommand = ['n']\ndelay_secs = -1\n", invalid()),
+            ("[notify]\ncommand = ['n']\ndelay_secs = '10'\n", invalid()),
             // A typo inside [notify] is an error, not notifications off.
-            "[notify]\ncmd = ['notify-send', 'atm', '--']\n",
-        ] {
-            assert!(parse_notify_command(text).is_err(), "{text:?}");
+            ("[notify]\ncommand = ['n']\ndelay = 10\n", invalid()),
+            ("[notify]\ncmd = ['notify-send', 'atm', '--']\n", invalid()),
+            // atmd logs a config error, so it must not quote the offending
+            // line: that line can hold a webhook URL or an ntfy topic.
+            (
+                "[notify]\ncmd = ['curl', 'https://hooks.example.invalid/services/T0/B0/SECRET']\n",
+                Err("unknown field `cmd`"),
+            ),
+            (
+                "[notify]\ncommand = ['curl', 'https://hooks.example.invalid/services/T0/B0/SECRET'\n",
+                invalid(),
+            ),
+        ];
+        for (text, want) in cases {
+            let got = parse_notify_command(text)
+                .map(|config| config.map(|c| (c.command, c.delay_secs)))
+                .map_err(|e| e.to_string());
+            match (got, want) {
+                (Err(shown), Err(says)) => assert!(
+                    shown.starts_with("invalid config: ")
+                        && shown.contains(says)
+                        && !shown.contains("SECRET"),
+                    "{text:?}: {shown}"
+                ),
+                (got, want) => assert_eq!(got, want.map_err(String::from), "{text:?}"),
+            }
         }
-    }
-
-    /// atmd logs a config error, so it must not quote the offending line:
-    /// that line can hold a webhook URL or an ntfy topic.
-    #[test]
-    fn a_config_error_does_not_quote_the_line() {
-        let url = "https://hooks.example.invalid/services/T0/B0/SECRET";
-        for text in [
-            format!("[notify]\ncmd = ['curl', '{url}']\n"),
-            format!("[notify]\ncommand = ['curl', '{url}'\n"),
-        ] {
-            let err = parse_notify_command(&text).expect_err("invalid");
-            let shown = err.to_string();
-            assert!(!shown.contains("SECRET"), "{shown}");
-            assert!(shown.starts_with("invalid config: "), "{shown}");
-        }
-        let typo = format!("[notify]\ncmd = ['curl', '{url}']\n");
-        let shown = parse_notify_command(&typo)
-            .expect_err("invalid")
-            .to_string();
-        assert!(shown.contains("unknown field `cmd`"), "{shown}");
     }
 
     #[test]
@@ -417,10 +397,14 @@ mod tests {
         }
     }
 
-    fn updated(id: &str, status: SessionStatus) -> SessionEvent {
+    fn update(session: SessionView) -> SessionEvent {
         SessionEvent::Updated {
-            session: Box::new(view(id, status)),
+            session: Box::new(session),
         }
+    }
+
+    fn updated(id: &str, status: SessionStatus) -> SessionEvent {
+        update(view(id, status))
     }
 
     fn registered(id: &str) -> SessionEvent {
@@ -449,99 +433,77 @@ mod tests {
 
     use SessionStatus::{AttentionNeeded, Idle, Working};
 
+    fn needs(id: &str) -> SessionEvent {
+        updated(id, AttentionNeeded)
+    }
+
+    fn working(id: &str) -> SessionEvent {
+        updated(id, Working)
+    }
+
+    /// Event sequences, and whether the tracker fires on each event.
     #[test]
     fn fires_when_a_session_starts_needing_input() {
-        assert_eq!(
-            fired(&[
-                registered("a"),
-                updated("a", Idle),
-                updated("a", AttentionNeeded)
-            ]),
-            [false, false, true]
-        );
-        assert_eq!(
-            fired(&[updated("a", Working), updated("a", AttentionNeeded)]),
-            [false, true]
-        );
-    }
-
-    /// Claude sends `PermissionRequest` and then `Notification`
-    /// (`permission_prompt`) for one dialog, and both map to needs input.
-    #[test]
-    fn stays_quiet_while_a_session_keeps_needing_input() {
-        assert_eq!(
-            fired(&[
-                updated("a", Working),
-                updated("a", AttentionNeeded),
-                updated("a", AttentionNeeded),
-            ]),
-            [false, true, false]
-        );
-    }
-
-    #[test]
-    fn fires_again_for_the_next_dialog() {
-        assert_eq!(
-            fired(&[
-                updated("a", AttentionNeeded),
-                updated("a", Working),
-                updated("a", AttentionNeeded),
-            ]),
-            [true, false, true]
-        );
-    }
-
-    /// `Registered` carries no status, so it only resets the baseline.
-    /// Discovery's rows start idle, so startup sends nothing.
-    #[test]
-    fn registering_never_fires() {
-        assert_eq!(
-            fired(&[registered("a"), updated("a", Idle), registered("b")]),
-            [false, false, false]
-        );
-    }
-
-    #[test]
-    fn a_session_that_left_and_came_back_starts_fresh() {
-        assert_eq!(
-            fired(&[
-                updated("a", AttentionNeeded),
-                removed("a"),
-                registered("a"),
-                updated("a", AttentionNeeded),
-            ]),
-            [true, false, false, true]
-        );
-    }
-
-    /// Seen with a real Claude Code 2.1.317 TUI on 2026-11-04 (#150's
-    /// overlap run): a background subagent asks (its row needs input),
-    /// then the lead asks for itself 4 s later (its row needs input too).
-    /// Two dialogs, two notifications: no row mutes another, because a
-    /// mute can't tell the lead's own dialog from Claude marking the lead
-    /// for its subagent's dialog, and it lost the lead's ping here.
-    #[test]
-    fn a_lead_notifies_even_while_its_subagent_needs_input() {
+        // The last case, seen with a real Claude Code 2.1.317 TUI on
+        // 2026-11-04 (#150's overlap run): a background subagent asks (its
+        // row needs input), then the lead asks for itself 4 s later (its row
+        // needs input too). Two dialogs, two notifications: no row mutes
+        // another, because a mute can't tell the lead's own dialog from
+        // Claude marking the lead for its subagent's dialog, and it lost the
+        // lead's ping here.
         let mut lead = view("lead", Working);
         lead.child_session_ids = vec![SessionId::new("sub")];
         let mut sub = view("sub", AttentionNeeded);
         sub.parent_session_id = Some(SessionId::new("lead"));
-        let lead_now = |status| SessionEvent::Updated {
-            session: Box::new(SessionView {
+        let lead_now = |status| {
+            update(SessionView {
                 status,
                 ..lead.clone()
-            }),
+            })
         };
-        assert_eq!(
-            fired(&[
-                lead_now(Working),
-                SessionEvent::Updated {
-                    session: Box::new(sub.clone())
-                },
-                lead_now(AttentionNeeded),
-            ]),
-            [false, true, true]
-        );
+        let idle = |id| updated(id, Idle);
+        let cases: [(Vec<SessionEvent>, &[bool]); 8] = [
+            (
+                vec![registered("a"), idle("a"), needs("a")],
+                &[false, false, true],
+            ),
+            (vec![working("a"), needs("a")], &[false, true]),
+            // Quiet while it keeps needing input: Claude sends
+            // `PermissionRequest` and then `Notification` (`permission_prompt`)
+            // for one dialog, and both map to needs input.
+            (
+                vec![working("a"), needs("a"), needs("a")],
+                &[false, true, false],
+            ),
+            // Again for the next dialog.
+            (
+                vec![needs("a"), working("a"), needs("a")],
+                &[true, false, true],
+            ),
+            // `Registered` carries no status, so it only resets the
+            // baseline. Discovery's rows start idle, so startup sends nothing.
+            (
+                vec![registered("a"), idle("a"), registered("b")],
+                &[false, false, false],
+            ),
+            // A session that left and came back starts fresh.
+            (
+                vec![needs("a"), removed("a"), registered("a"), needs("a")],
+                &[true, false, false, true],
+            ),
+            // Sessions are tracked apart.
+            (
+                vec![needs("a"), needs("b"), needs("a")],
+                &[true, true, false],
+            ),
+            (
+                vec![lead_now(Working), update(sub), lead_now(AttentionNeeded)],
+                &[false, true, true],
+            ),
+        ];
+        for (events, want) in cases {
+            assert_eq!(fired(&events), want, "{events:?}");
+        }
     }
 
     /// With a delay, a pending notification goes out only if its stretch
@@ -550,22 +512,20 @@ mod tests {
     fn a_stretch_stays_open_until_the_session_leaves_needs_input() {
         let mut tracker = AttentionTracker::default();
         let first = tracker
-            .observe(&updated("a", AttentionNeeded))
+            .observe(&needs("a"))
             .expect("entering needs input notifies");
         assert_eq!(first.session_id, SessionId::new("a"));
         assert!(first.message.contains("needs input"), "{}", first.message);
         assert!(tracker.is_open(&first.session_id, first.stretch));
 
         // Staying there keeps the same stretch.
-        assert!(tracker.observe(&updated("a", AttentionNeeded)).is_none());
+        assert!(tracker.observe(&needs("a")).is_none());
         assert!(tracker.is_open(&first.session_id, first.stretch));
 
         // Leaving ends it, and coming back starts a new one.
-        tracker.observe(&updated("a", Working));
+        tracker.observe(&working("a"));
         assert!(!tracker.is_open(&first.session_id, first.stretch));
-        let second = tracker
-            .observe(&updated("a", AttentionNeeded))
-            .expect("a new dialog notifies");
+        let second = tracker.observe(&needs("a")).expect("a new dialog notifies");
         assert_ne!(second.stretch, first.stretch);
         assert!(!tracker.is_open(&first.session_id, first.stretch));
         assert!(tracker.is_open(&second.session_id, second.stretch));
@@ -573,129 +533,141 @@ mod tests {
         // Removed and Registered end it too.
         tracker.observe(&removed("a"));
         assert!(!tracker.is_open(&second.session_id, second.stretch));
-        let third = tracker.observe(&updated("a", AttentionNeeded)).unwrap();
+        let third = tracker.observe(&needs("a")).unwrap();
         tracker.observe(&registered("a"));
         assert!(!tracker.is_open(&third.session_id, third.stretch));
 
         // Another session's stretch is its own.
-        let other = tracker.observe(&updated("b", AttentionNeeded)).unwrap();
+        let other = tracker.observe(&needs("b")).unwrap();
         assert!(!tracker.is_open(&SessionId::new("a"), other.stretch));
     }
 
-    /// The notifier loop with a 400 ms delay, in real time: three sessions
-    /// whose calls a stand-in records, one file per call.
+    /// The notifier loop in real time. Its stand-in command, `sh -c`, so
+    /// no file is executed, writes each call's message to a file of its own.
+    struct Notifier {
+        calls: tempfile::TempDir,
+        events: broadcast::Sender<SessionEvent>,
+        cancel: CancellationToken,
+        task: JoinHandle<()>,
+    }
+
+    impl Notifier {
+        /// A notifier with `delay`, fed by a channel of `capacity` events.
+        fn start(delay: Duration, capacity: usize) -> Self {
+            let calls = tempfile::tempdir().unwrap();
+            let script = format!(
+                "f=$(mktemp '{}/call.XXXXXX') && printf '%s' \"$1\" > \"$f\"",
+                calls.path().display()
+            );
+            let command = vec!["sh".into(), "-c".into(), script, "sh".into()];
+            let (events, receiver) = broadcast::channel(capacity);
+            let cancel = CancellationToken::new();
+            let task = spawn_notifier(receiver, command, delay, cancel.clone());
+            Self {
+                calls,
+                events,
+                cancel,
+                task,
+            }
+        }
+
+        fn send(&self, event: SessionEvent) {
+            self.events.send(event).unwrap();
+        }
+
+        /// The message of each call so far.
+        fn messages(&self) -> Vec<String> {
+            std::fs::read_dir(self.calls.path())
+                .unwrap()
+                .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                .collect()
+        }
+
+        /// How many calls so far named session `id`.
+        fn calls(&self, id: &str) -> usize {
+            let named = format!(" {id}: ");
+            self.messages()
+                .iter()
+                .filter(|m| m.contains(&named))
+                .count()
+        }
+
+        /// Waits up to 10 s for the `n`th call naming `id`.
+        async fn wait_for(&self, id: &str, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.calls(id) < n && Instant::now() < deadline {
+                tokio::time::sleep(ms(10)).await;
+            }
+            assert_eq!(self.calls(id), n, "calls naming {id}");
+        }
+
+        /// Answers `id`'s dialog in a burst that overflows a small channel,
+        /// so the notifier lags and never sees the answer.
+        async fn lose_answer_in_a_lag(&self, id: &str) {
+            self.send(working(id));
+            for i in 0..8 {
+                self.send(working(&format!("b{i}")));
+            }
+            tokio::time::sleep(ms(100)).await;
+        }
+
+        /// Waits `quiet` for a call that shouldn't come, then stops the
+        /// loop and returns how many calls named each of `ids`, which must
+        /// be all the calls.
+        async fn finish(self, quiet: Duration, ids: &[&str]) -> Vec<usize> {
+            tokio::time::sleep(quiet).await;
+            let counts: Vec<usize> = ids.iter().map(|id| self.calls(id)).collect();
+            let all = self.messages();
+            assert_eq!(counts.iter().sum::<usize>(), all.len(), "{all:?}");
+            self.cancel.cancel();
+            self.task.await.unwrap();
+            counts
+        }
+    }
+
+    /// Checks that a call seen just now came at least `delay` after `since`.
+    fn no_sooner_than(since: Instant, delay: Duration) {
+        let elapsed = since.elapsed();
+        assert!(elapsed >= delay - ms(20), "notified {elapsed:?} after");
+    }
+
+    /// With a 400 ms delay: `answered` is answered at 50 ms; `open` is left
+    /// open; `again` is answered at 50 ms and reopened at 250 ms, before
+    /// its first timer ends, so only the second stretch may notify, 400 ms
+    /// after 250.
     #[tokio::test]
     async fn the_delay_skips_a_dialog_answered_in_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = dir.path().join("record");
-        std::fs::write(
-            &record,
-            format!(
-                "#!/bin/sh\nf=$(mktemp '{}/call.XXXXXX') && printf '%s' \"$1\" > \"$f\"\n",
-                dir.path().display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        let calls = |id: &str| {
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path()).ok())
-                .filter(|text| text.contains(&format!(" {id}: ")))
-                .count()
-        };
-        let delay = Duration::from_millis(400);
-        let (events, receiver) = broadcast::channel(16);
-        let cancel = CancellationToken::new();
-        // Through `sh`, which only reads the script: executing a file this
-        // process just wrote can fail with ETXTBSY while a sibling test forks.
-        let command = vec!["sh".to_string(), record.display().to_string()];
-        let notifier = spawn_notifier(receiver, command, delay, cancel.clone());
-        let send = |event| {
-            events.send(event).unwrap();
-        };
-        let pause = |ms| tokio::time::sleep(Duration::from_millis(ms));
-
-        // `answered` is answered at 50 ms; `open` is left open; `again` is
-        // answered at 50 ms and reopened at 250 ms, before its first timer
-        // ends, so only the second stretch may notify, 400 ms after 250.
-        send(updated("answered", AttentionNeeded));
-        send(updated("open", AttentionNeeded));
-        send(updated("again", AttentionNeeded));
-        pause(50).await;
-        send(updated("answered", Working));
-        send(updated("again", Working));
-        pause(200).await;
-        send(updated("again", AttentionNeeded));
-        let reopened = Instant::now();
-        assert_eq!(calls("open"), 0, "notified before the delay");
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while calls("again") == 0 && Instant::now() < deadline {
-            pause(10).await;
+        let delay = ms(400);
+        let notifier = Notifier::start(delay, 16);
+        for id in ["answered", "open", "again"] {
+            notifier.send(needs(id));
         }
-        assert_eq!(calls("again"), 1);
-        assert!(
-            reopened.elapsed() >= delay - Duration::from_millis(20),
-            "again notified {:?} after reopening",
-            reopened.elapsed()
-        );
-        pause(600).await;
-        assert_eq!(
-            (calls("answered"), calls("open"), calls("again")),
-            (0, 1, 1)
-        );
-        cancel.cancel();
-        notifier.await.unwrap();
+        tokio::time::sleep(ms(50)).await;
+        notifier.send(working("answered"));
+        notifier.send(working("again"));
+        tokio::time::sleep(ms(200)).await;
+        notifier.send(needs("again"));
+        let reopened = Instant::now();
+        assert_eq!(notifier.calls("open"), 0, "notified before the delay");
+
+        notifier.wait_for("again", 1).await;
+        no_sooner_than(reopened, delay);
+        let ids = ["answered", "open", "again"];
+        assert_eq!(notifier.finish(ms(600), &ids).await, [0, 1, 1]);
     }
 
     /// A lagging broadcast can drop a session's "left needs input" event.
     /// The notifier then forgets every session, so that session's next
-    /// dialog still notifies. A 4-slot channel and a burst sent without
-    /// yielding make the lag certain.
+    /// dialog still notifies.
     #[tokio::test]
     async fn a_lagged_notifier_still_notifies_the_next_dialog() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = dir.path().join("record");
-        std::fs::write(
-            &record,
-            format!(
-                "#!/bin/sh\nf=$(mktemp '{}/call.XXXXXX') && printf '%s' \"$1\" > \"$f\"\n",
-                dir.path().display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        let calls = || std::fs::read_dir(dir.path()).unwrap().count() - 1;
-        let wait_for = |n: usize| async move {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while calls() < n && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-        let (events, receiver) = broadcast::channel(4);
-        let cancel = CancellationToken::new();
-        // Through `sh`, which only reads the script: executing a file this
-        // process just wrote can fail with ETXTBSY while a sibling test forks.
-        let command = vec!["sh".to_string(), record.display().to_string()];
-        let notifier = spawn_notifier(receiver, command, Duration::ZERO, cancel.clone());
-
-        events.send(updated("a", AttentionNeeded)).unwrap();
-        wait_for(1).await;
-        assert_eq!(calls(), 1);
-        // The answer is among the events the burst pushes out.
-        events.send(updated("a", Working)).unwrap();
-        for i in 0..8 {
-            events.send(updated(&format!("b{i}"), Working)).unwrap();
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        events.send(updated("a", AttentionNeeded)).unwrap();
-        wait_for(2).await;
-        assert_eq!(calls(), 2, "the second dialog didn't notify");
-        cancel.cancel();
-        notifier.await.unwrap();
+        let notifier = Notifier::start(Duration::ZERO, 4);
+        notifier.send(needs("a"));
+        notifier.wait_for("a", 1).await;
+        notifier.lose_answer_in_a_lag("a").await;
+        notifier.send(needs("a"));
+        notifier.wait_for("a", 2).await;
+        assert_eq!(notifier.finish(ms(300), &["a"]).await, [2]);
     }
 
     /// After a lag, a delay timer from before it must not count for a
@@ -703,59 +675,17 @@ mod tests {
     /// the session's new dialog.
     #[tokio::test]
     async fn a_timer_from_before_a_lag_does_not_fire_for_a_new_stretch() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = dir.path().join("record");
-        std::fs::write(
-            &record,
-            format!(
-                "#!/bin/sh\nf=$(mktemp '{}/call.XXXXXX') && printf '%s' \"$1\" > \"$f\"\n",
-                dir.path().display()
-            ),
-        )
-        .unwrap();
-        let calls = || std::fs::read_dir(dir.path()).unwrap().count() - 1;
-        let delay = Duration::from_millis(400);
-        let (events, receiver) = broadcast::channel(4);
-        let cancel = CancellationToken::new();
-        let command = vec!["sh".to_string(), record.display().to_string()];
-        let notifier = spawn_notifier(receiver, command, delay, cancel.clone());
-
-        events.send(updated("a", AttentionNeeded)).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // A burst drops a's answer, so the notifier lags and resets.
-        events.send(updated("a", Working)).unwrap();
-        for i in 0..8 {
-            events.send(updated(&format!("b{i}"), Working)).unwrap();
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        events.send(updated("a", AttentionNeeded)).unwrap();
+        let delay = ms(400);
+        let notifier = Notifier::start(delay, 4);
+        notifier.send(needs("a"));
+        tokio::time::sleep(ms(50)).await;
+        notifier.lose_answer_in_a_lag("a").await;
+        notifier.send(needs("a"));
         let reopened = Instant::now();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while calls() == 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            reopened.elapsed() >= delay - Duration::from_millis(20),
-            "notified {:?} after the new dialog",
-            reopened.elapsed()
-        );
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert_eq!(calls(), 1);
-        cancel.cancel();
-        notifier.await.unwrap();
-    }
-
-    #[test]
-    fn sessions_are_tracked_apart() {
-        assert_eq!(
-            fired(&[
-                updated("a", AttentionNeeded),
-                updated("b", AttentionNeeded),
-                updated("a", AttentionNeeded),
-            ]),
-            [true, true, false]
-        );
+        notifier.wait_for("a", 1).await;
+        no_sooner_than(reopened, delay);
+        assert_eq!(notifier.finish(ms(800), &["a"]).await, [1]);
     }
 
     #[test]
@@ -793,10 +723,14 @@ mod tests {
         );
     }
 
+    /// Runs `script` with `sh -c` through `run_notify`.
+    async fn run_sh(script: &str, timeout: Duration) -> Result<(), NotifyError> {
+        run_notify(&["sh", "-c", script].map(String::from), timeout).await
+    }
+
     #[tokio::test]
     async fn run_notify_reports_a_command_that_fails() {
-        let argv = ["sh", "-c", "echo 'webhook said no' >&2; exit 3"].map(String::from);
-        let err = run_notify(&argv, Duration::from_secs(5))
+        let err = run_sh("echo 'webhook said no' >&2; exit 3", Duration::from_secs(5))
             .await
             .expect_err("exit 3 is a failure");
         let message = err.to_string();
@@ -808,13 +742,8 @@ mod tests {
     /// keeps at most `STDERR_LIMIT` bytes of its stderr.
     #[tokio::test]
     async fn run_notify_keeps_only_the_start_of_a_long_stderr() {
-        let argv = [
-            "sh",
-            "-c",
-            "head -c 1000000 /dev/zero | tr '\\0' x >&2; exit 1",
-        ]
-        .map(String::from);
-        let err = run_notify(&argv, Duration::from_secs(10))
+        let script = "head -c 1000000 /dev/zero | tr '\\0' x >&2; exit 1";
+        let err = run_sh(script, Duration::from_secs(10))
             .await
             .expect_err("a chatty failure is still a failure");
         let NotifyError::Failed { stderr, .. } = &err else {
@@ -833,8 +762,7 @@ mod tests {
     #[tokio::test]
     async fn run_notify_lets_a_chatty_command_finish() {
         let script = "printf '%5000s' x >&2; sleep 0.3; echo more >&2; exit 0";
-        let argv = ["sh", "-c", script].map(String::from);
-        run_notify(&argv, Duration::from_secs(10))
+        run_sh(script, Duration::from_secs(10))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
     }
@@ -851,8 +779,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_notify_succeeds_on_exit_zero() {
-        let argv = ["sh", "-c", "exit 0"].map(String::from);
-        run_notify(&argv, Duration::from_secs(5)).await.unwrap();
+        run_sh("exit 0", Duration::from_secs(5)).await.unwrap();
     }
 
     /// Live (not zombie) children of this process whose command line
@@ -879,10 +806,8 @@ mod tests {
     #[tokio::test]
     async fn run_notify_kills_a_command_that_outlives_the_timeout() {
         let marker = "5.031337";
-        let argv = ["sh", "-c", "exec sleep \"$1\"", "sh", marker].map(String::from);
-
         let started = Instant::now();
-        let err = run_notify(&argv, Duration::from_millis(200))
+        let err = run_sh(&format!("exec sleep {marker}"), ms(200))
             .await
             .expect_err("a 5 s command must time out after 200 ms");
         assert!(started.elapsed() < Duration::from_secs(3), "{err}");

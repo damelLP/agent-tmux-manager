@@ -170,7 +170,7 @@ fn calls(dir: &Path) -> Vec<Vec<String>> {
 }
 
 /// Waits until `n` calls have arrived, then a little more, so a call
-/// that should not happen has time to show up.
+/// that should not happen has time to show up, and checks there are `n`.
 fn settle(dir: &Path, n: usize, daemon: &Daemon) -> Vec<Vec<String>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while calls(dir).len() < n {
@@ -183,7 +183,9 @@ fn settle(dir: &Path, n: usize, daemon: &Daemon) -> Vec<Vec<String>> {
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(700));
-    calls(dir)
+    let all = calls(dir);
+    assert_eq!(all.len(), n, "{all:?}");
+    all
 }
 
 #[test]
@@ -232,7 +234,6 @@ fn atmd_notifies_once_per_permission_dialog() {
         client.apply(&ClientMessage::hook_event(hook.clone()));
     }
     let after_first = settle(&out, 1, &daemon);
-    assert_eq!(after_first.len(), 1, "{after_first:?}");
     let [dashes, message] = after_first[0].as_slice() else {
         panic!("expected `--` and one message, got {:?}", after_first[0]);
     };
@@ -252,8 +253,7 @@ fn atmd_notifies_once_per_permission_dialog() {
     for hook in &hooks[first_dialog_end + 1..] {
         client.apply(&ClientMessage::hook_event(hook.clone()));
     }
-    let all = settle(&out, 2, &daemon);
-    assert_eq!(all.len(), 2, "{all:?}");
+    settle(&out, 2, &daemon);
 }
 
 /// The default config `atm setup` writes leaves notify off, and its

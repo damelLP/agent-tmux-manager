@@ -143,7 +143,7 @@ in `<dir>`. Options: `-d left|right|above|below` (default below), `-s 30%`
 
 - **It prints the new pane's id** (`%13`) as soon as the pane exists:
   `pane=$(atm spawn -H pi -w <dir>)`. `-f json` prints
-  `{"pane": "%13", "harness": "pi", "cwd": "<dir>"}`. A failure after the
+  `{"cwd":"<dir>","harness":"pi","pane":"%13"}`. A failure after the
   id is printed means the pane exists but the harness may not have
   started: `atm peek` it, and `atm kill` it if you don't need it.
 - **The pane has no row in `atm list` until its harness reports.** Claude

@@ -282,8 +282,10 @@ pub fn spawn_notifier(
                     Err(RecvError::Lagged(skipped)) => {
                         // A dropped "left needs input" would mute that session's
                         // next dialog; forget them all (at worst one extra ping).
+                        // Stretch ids keep counting, so no pending timer matches
+                        // a stretch that starts after this.
                         warn!(skipped, "Notifier missed events");
-                        tracker = AttentionTracker::default();
+                        tracker.in_attention.clear();
                     }
                     Err(RecvError::Closed) => break,
                 },
@@ -692,6 +694,54 @@ mod tests {
         events.send(updated("a", AttentionNeeded)).unwrap();
         wait_for(2).await;
         assert_eq!(calls(), 2, "the second dialog didn't notify");
+        cancel.cancel();
+        notifier.await.unwrap();
+    }
+
+    /// After a lag, a delay timer from before it must not count for a
+    /// stretch that starts after it: one notification, a full delay after
+    /// the session's new dialog.
+    #[tokio::test]
+    async fn a_timer_from_before_a_lag_does_not_fire_for_a_new_stretch() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record");
+        std::fs::write(
+            &record,
+            format!(
+                "#!/bin/sh\nf=$(mktemp '{}/call.XXXXXX') && printf '%s' \"$1\" > \"$f\"\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let calls = || std::fs::read_dir(dir.path()).unwrap().count() - 1;
+        let delay = Duration::from_millis(400);
+        let (events, receiver) = broadcast::channel(4);
+        let cancel = CancellationToken::new();
+        let command = vec!["sh".to_string(), record.display().to_string()];
+        let notifier = spawn_notifier(receiver, command, delay, cancel.clone());
+
+        events.send(updated("a", AttentionNeeded)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A burst drops a's answer, so the notifier lags and resets.
+        events.send(updated("a", Working)).unwrap();
+        for i in 0..8 {
+            events.send(updated(&format!("b{i}"), Working)).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.send(updated("a", AttentionNeeded)).unwrap();
+        let reopened = Instant::now();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            reopened.elapsed() >= delay - Duration::from_millis(20),
+            "notified {:?} after the new dialog",
+            reopened.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(calls(), 1);
         cancel.cancel();
         notifier.await.unwrap();
     }

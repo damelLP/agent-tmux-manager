@@ -11,6 +11,9 @@ use crate::Harness;
 pub enum PromptMode {
     /// The harness accepts a prompt via a command-line flag.
     Flag(&'static str),
+    /// The harness takes an initial prompt as its last positional argument
+    /// (`<binary> '<prompt>'`) and stays interactive after answering it.
+    Positional,
     /// The harness must be launched first, then text is injected with tmux
     /// `send-keys`.
     KeystrokeInjection,
@@ -88,7 +91,8 @@ pub struct HarnessDefinition {
     /// Flag whose value, in a session process's argv, is the session id
     /// of the session that spawned it (e.g. an agent-team lead).
     pub parent_session_flag: Option<&'static str>,
-    /// How to pass an initial prompt, when/if spawn grows that option.
+    /// How `atm spawn --prompt` passes an initial prompt. Spawn refuses
+    /// `--prompt` for `KeystrokeInjection` and `Unsupported`.
     pub prompt_mode: PromptMode,
     /// Arguments used for installation/version probing.
     pub version_args: &'static [&'static str],
@@ -179,7 +183,10 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         model_flag: Some("--model"),
         // Verified against Claude Code 2.1.288 tmux-mode teammates.
         parent_session_flag: Some("--parent-session-id"),
-        prompt_mode: PromptMode::KeystrokeInjection,
+        // Verified 2026-11-05 against Claude Code 2.1.318: `claude '<prompt>'`
+        // submits it, a skill call (`/atm-implement ...`) included, and
+        // waits for a startup dialog (trust this folder?) to be answered first.
+        prompt_mode: PromptMode::Positional,
         version_args: &["--version"],
         process_matchers: CLAUDE_MATCHERS,
         discovery_enabled: true,
@@ -195,7 +202,9 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         default_args: &[],
         model_flag: Some("--model"),
         parent_session_flag: None,
-        prompt_mode: PromptMode::KeystrokeInjection,
+        // Verified 2026-11-05 against pi 0.73.1: `pi '<prompt>'`, including
+        // `/skill:atm-implement ...`.
+        prompt_mode: PromptMode::Positional,
         version_args: &["--version"],
         process_matchers: PI_MATCHERS,
         discovery_enabled: true,
@@ -211,7 +220,9 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         default_args: &[],
         model_flag: None,
         parent_session_flag: None,
-        prompt_mode: PromptMode::KeystrokeInjection,
+        // Verified 2026-11-05 against codex-cli 0.163.0: `codex '<prompt>'`,
+        // including `$atm-implement ...`.
+        prompt_mode: PromptMode::Positional,
         version_args: &["--version"],
         process_matchers: CODEX_MATCHERS,
         // Enabled since atm-codex-adapter landed: hook events flow via
@@ -403,6 +414,25 @@ mod tests {
             );
         }
         assert_eq!(FALLBACK_HARNESS_DEFINITION.parent_session_flag, None);
+    }
+
+    /// A positional prompt was checked for real only for these three
+    /// (2026-11-05: Claude Code 2.1.318, pi 0.73.1, codex-cli 0.163.0).
+    /// amp, qwen and gemini weren't installed, so they stay as they were.
+    #[test]
+    fn only_verified_harnesses_take_a_positional_prompt() {
+        for definition in builtin_harnesses() {
+            let expected = if matches!(definition.id, "claude" | "pi" | "codex") {
+                PromptMode::Positional
+            } else {
+                PromptMode::KeystrokeInjection
+            };
+            assert_eq!(definition.prompt_mode, expected, "{}", definition.id);
+        }
+        assert_eq!(
+            FALLBACK_HARNESS_DEFINITION.prompt_mode,
+            PromptMode::Unsupported
+        );
     }
 
     #[test]

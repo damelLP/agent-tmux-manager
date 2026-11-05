@@ -16,7 +16,7 @@ their refusals and what to do instead are in
 [`shared/references/atm-commands.md`](shared/references/atm-commands.md).
 
 This is v0 (#123): it works with today's CLI. `atm role` (#148), names
-(#118), `atm profile show` (#147) and spawn output (#121) will replace the
+(#118), `atm profile show` (#147) and `atm spawn --prompt` (#121) will replace the
 workarounds noted in the skills.
 
 ## Prerequisites

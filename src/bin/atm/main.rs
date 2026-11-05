@@ -85,6 +85,9 @@ enum Command {
     /// Remove atm integrations from supported harnesses
     Uninstall,
     /// Spawn a coding agent in a tmux pane
+    ///
+    /// Splits the pane given by -t, else the pane atm runs in ($TMUX_PANE),
+    /// and prints the new pane's id (e.g. %12) as soon as it exists.
     Spawn {
         /// Harness to launch (e.g., claude, pi, codex, amp, qwen, gemini). Defaults to [harness].default in config, or claude.
         #[arg(long = "harness", short = 'H')]
@@ -101,9 +104,12 @@ enum Command {
         /// Size of the new pane (e.g., "30%", "50%")
         #[arg(long, short = 's', default_value = "50%")]
         size: String,
-        /// Target pane to split from (e.g., "%5"). Passed by tmux keybindings via #{pane_id}.
+        /// Target pane to split from (e.g., "%5"). Defaults to $TMUX_PANE. Passed by tmux keybindings via #{pane_id}.
         #[arg(long, short = 't')]
         target_pane: Option<String>,
+        /// Output format: the new pane's id, or JSON {pane, harness, cwd}
+        #[arg(long, short = 'f', default_value = "text")]
+        format: SpawnFormat,
     },
     /// Kill an agent and close its tmux pane
     Kill {
@@ -230,6 +236,12 @@ impl From<SpawnDirection> for atm_tmux::PaneDirection {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
+enum SpawnFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
 enum ListFormat {
     Table,
     Json,
@@ -295,8 +307,18 @@ async fn main() -> Result<()> {
             direction,
             size,
             target_pane,
+            format,
         }) => {
-            return cmd_spawn(harness, model, worktree, direction, size, target_pane).await;
+            return cmd_spawn(
+                harness,
+                model,
+                worktree,
+                direction,
+                size,
+                target_pane,
+                format,
+            )
+            .await;
         }
         Some(Command::Kill { target }) => {
             return cmd_kill(target).await;

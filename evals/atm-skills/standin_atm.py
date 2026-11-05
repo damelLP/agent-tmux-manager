@@ -189,7 +189,20 @@ def do_write(rows, cmd, pane, args):
         print(f"Interrupted {pane}")
     elif cmd == "kill":
         print(f"Killed {pane}")
-    # spawn prints nothing, as atm 0.2.7 does.
+    elif cmd == "spawn":
+        # spawn prints the new pane's id (#121); no case's list has it yet.
+        # -f json prints {cwd, harness, pane} with sorted keys, as atm does.
+        if "json" in args and ("-f" in args or "--format" in args):
+            def flag(short, long, default):
+                for name in (short, long):
+                    if name in args and args.index(name) + 1 < len(args):
+                        return args[args.index(name) + 1]
+                return default
+            row = {"cwd": flag("-w", "--worktree", os.getcwd()),
+                   "harness": flag("-H", "--harness", "claude"), "pane": "%99"}
+            print(json.dumps(row, sort_keys=True, separators=(",", ":")))
+        else:
+            print("%99")
     return 0
 
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -14,9 +15,9 @@ use atm_tmux::{RealTmuxClient, TmuxClient};
 use atm_tui::setup;
 use atm_tui::tmux;
 
-use super::SpawnDirection;
 #[cfg(test)]
 use super::TEST_ENV_LOCK;
+use super::{SpawnDirection, SpawnFormat};
 
 /// POSIX shell-quote `s` by single-quoting and escaping embedded `'`.
 /// Result is exactly one shell token regardless of spaces or specials.
@@ -274,6 +275,7 @@ pub(super) async fn cmd_spawn(
     direction: SpawnDirection,
     size: String,
     target_pane: Option<String>,
+    format: SpawnFormat,
 ) -> Result<()> {
     let harness = resolve_spawn_harness(harness_id.as_deref())?;
     if model.is_some() && harness.model_flag.is_none() {
@@ -287,14 +289,19 @@ pub(super) async fn cmd_spawn(
     let client = RealTmuxClient::new();
 
     // Get current pane to split from.
-    // Prefer --target-pane (passed by tmux keybindings via #{pane_id}).
-    // Fall back to is_active heuristic for manual CLI invocations.
+    // Prefer --target-pane (passed by tmux keybindings via #{pane_id}), then
+    // $TMUX_PANE, the pane atm runs in. A tmux run-shell job has no
+    // $TMUX_PANE, or one leaked from tmux's global environment (tmux 3.8),
+    // which is why the keybindings pass -t. Fall back to the is_active
+    // heuristic only when neither is set.
+    let caller_pane = non_empty_env("TMUX_PANE");
     let panes = client
         .list_panes()
         .await
         .context("Failed to list tmux panes")?;
     let current_pane = target_pane
         .as_deref()
+        .or(caller_pane.as_deref())
         .or_else(|| {
             panes
                 .iter()
@@ -328,7 +335,31 @@ pub(super) async fn cmd_spawn(
     let new_pane = client
         .split_window(current_pane, &size, pane_dir, None)
         .await
-        .context("Failed to split tmux pane")?;
+        .with_context(|| {
+            // $TMUX_PANE can name a pane that is gone (leaked into tmux's
+            // global environment, or a Codex shared daemon's). Say so only
+            // then: a split also fails when the pane is too small.
+            let gone = target_pane.is_none()
+                && caller_pane.is_some()
+                && !panes.iter().any(|p| p.pane_id == current_pane);
+            if gone {
+                format!("Failed to split $TMUX_PANE ({current_pane}); pass -t <pane> to split another pane")
+            } else {
+                "Failed to split tmux pane".to_string()
+            }
+        })?;
+    // Print the pane as soon as it exists, so a caller can clean it up if
+    // starting the agent in it fails. A failed write (a closed pipe) is
+    // reported once the agent is started, not as a panic half-way.
+    let mut stdout = std::io::stdout();
+    let printed = match format {
+        SpawnFormat::Text => writeln!(stdout, "{new_pane}"),
+        SpawnFormat::Json => writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"pane": new_pane, "harness": harness.id, "cwd": cwd})
+        ),
+    };
 
     client
         .send_keys(&new_pane, &agent_cmd)
@@ -338,6 +369,7 @@ pub(super) async fn cmd_spawn(
         .send_keys(&new_pane, "Enter")
         .await
         .context("Failed to send Enter to new pane")?;
+    printed.context("Failed to print the new pane's id")?;
 
     Ok(())
 }

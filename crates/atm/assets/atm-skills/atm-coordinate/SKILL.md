@@ -46,8 +46,10 @@ in backticks. Write an apostrophe as `'\''`.
 4. **Implementers.** Ask the user which panes are your implementers, unless the
    user or the profile already said. Spawn one only when the user asks or
    agrees; you may suggest it, for example when every implementer is busy:
-   `atm spawn -H <harness> -w <dir> -t "$TMUX_PANE"`, then find its pane (see
-   the reference). Keep a table: name, pane (`%N`), harness, `project_root`,
+   `atm spawn -H <harness> -w <dir>`, which splits your pane and prints the
+   new pane's id (see the reference). If you are Codex, run as
+   `codex --no-daemon` or pass `-t <your pane>`: under Codex's shared daemon
+   `$TMUX_PANE` names another pane. Keep a table: name, pane (`%N`), harness, `project_root`,
    worktree, task, brief file. (`working_directory` in `atm list` is cut to
    30 characters, so record `project_root` and `worktree_path`.)
 

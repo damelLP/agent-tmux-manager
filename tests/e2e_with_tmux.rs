@@ -31,10 +31,14 @@
 //!    injection sidesteps that entirely.) The shim connects to atmd
 //!    over its socket, sends a `UserPromptSubmit` hook event carrying
 //!    `$TMUX_PANE`, and sleeps to keep the pane alive (atmd's
-//!    stale-session reaper runs every 2s). The test then polls
+//!    stale-session reaper runs every 2s). `atm spawn` must print the
+//!    pane it created. The test then polls
 //!    `atm list --format json` until a session whose `tmux_pane` matches
 //!    the pane atm spawn created shows up. This validates the entire
-//!    spawn → tmux split → hook event → registry update loop.
+//!    spawn → tmux split → hook event → registry update loop. A second
+//!    spawn with no `-t` and `$TMUX_PANE` set to the probe pane must split
+//!    that pane, where the old first-active-pane fallback would split
+//!    another, and print the new pane.
 //!
 //! 5. **`atm workspace create` / `atm workspace attach`**: verifies both
 //!    workspace flows install the resize and new-window hooks. The create
@@ -941,6 +945,12 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
         new_panes.iter().map(|p| &p.pane_id).collect::<Vec<_>>()
     );
     let spawned_pane = new_panes[0].pane_id.clone();
+    // A caller learns the new pane from atm spawn's stdout (#121).
+    assert_eq!(
+        String::from_utf8_lossy(&spawn_output.stdout),
+        format!("{spawned_pane}\n"),
+        "atm spawn should print the pane it created"
+    );
 
     // Poll `atm list --format json` until our fixture-minted session
     // shows up. We require BOTH the `id` prefix (rules out user-process
@@ -1017,6 +1027,113 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
         registered_pane, spawned_pane,
         "fixture session's tmux_pane should match the pane atm spawn created"
     );
+
+    scenario_atm_spawn_defaults_to_tmux_pane(env, &probe_pane_pre_spawn).await;
+}
+
+/// Scenario 4b — `atm spawn` with no `-t` splits `$TMUX_PANE`, the pane it
+/// runs in (gap 1 of #130), and prints the new pane. Another pane of the
+/// probe window is made active first, so the old fallback (the first
+/// active pane in `list-panes -a`) would split that one: the split must
+/// take its rows from the probe pane.
+async fn scenario_atm_spawn_defaults_to_tmux_pane(env: &E2eEnv, probe_pane: &str) {
+    // The first spawn's pane is active but only a row or two tall, too
+    // small to split. Make the roomiest other pane active instead, so that
+    // a wrong target fails the height check below, not tmux's split.
+    let panes = env.tmux.list_panes().await.expect("list panes (4b decoy)");
+    let decoy = panes
+        .iter()
+        .filter(|p| p.session_name == "probe" && p.pane_id != probe_pane)
+        .max_by_key(|p| p.height)
+        .expect("another pane in the probe window")
+        .pane_id
+        .clone();
+    env.tmux
+        .select_pane(&decoy)
+        .await
+        .expect("select the decoy pane");
+
+    let before = env.tmux.list_panes().await.expect("list panes (pre-4b)");
+    let probe_before = before
+        .iter()
+        .find(|p| p.pane_id == probe_pane)
+        .expect("probe pane still present")
+        .clone();
+    let fallback = before
+        .iter()
+        .find(|p| p.is_active)
+        .expect("an active pane")
+        .clone();
+    assert_ne!(
+        fallback.pane_id, probe_pane,
+        "precondition: the old fallback must pick another pane, or 4b proves nothing"
+    );
+
+    let out = Command::new(&env.atm_path)
+        .args(["spawn", "--direction", "below", "--size", "1"])
+        .env("TMUX", "atm-e2e-fixture-no-real-tmux-here")
+        .env("TMUX_PANE", probe_pane)
+        .env("ATM_TMUX_SOCKET", env.tmux_server.label())
+        // A command that ends at once: the split is what 4b checks.
+        .env("ATM_SPAWN_BIN", "true")
+        .env("ATM_SOCKET", &env.daemon.socket_path)
+        .env("XDG_STATE_HOME", &env.daemon.state_dir)
+        .output()
+        .expect("run atm spawn (4b)");
+    assert!(
+        out.status.success(),
+        "atm spawn (4b) exited with {:?}\nstdout: {}\nstderr: {}\npanes before: {before:?}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let after = env.tmux.list_panes().await.expect("list panes (post-4b)");
+    let new_panes: Vec<_> = after
+        .iter()
+        .filter(|p| !before.iter().any(|q| q.pane_id == p.pane_id))
+        .collect();
+    assert_eq!(
+        new_panes.len(),
+        1,
+        "4b should create one pane: {new_panes:?}"
+    );
+    let new_pane = new_panes[0];
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", new_pane.pane_id),
+        "atm spawn should print the pane it created"
+    );
+    assert_eq!(
+        (new_pane.session_name.as_str(), new_pane.window_index),
+        (
+            probe_before.session_name.as_str(),
+            probe_before.window_index
+        ),
+        "the new pane should sit beside the probe pane"
+    );
+    let height = |pane: &str| {
+        after
+            .iter()
+            .find(|p| p.pane_id == pane)
+            .map(|p| p.height)
+            .expect("pane still present")
+    };
+    assert!(
+        height(probe_pane) < probe_before.height,
+        "the split should take its rows from $TMUX_PANE's pane ({probe_pane}): {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        height(&fallback.pane_id),
+        fallback.height,
+        "the old fallback's pane ({}) should be untouched",
+        fallback.pane_id
+    );
+
+    env.tmux
+        .kill_pane(&new_pane.pane_id)
+        .await
+        .expect("kill 4b pane");
 }
 
 /// Scenario 5a — `atm workspace create` should install the same long-lived

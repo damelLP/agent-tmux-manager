@@ -1,8 +1,8 @@
 # atm command reference for coordinators
 
 The commands a coordinator uses to drive implementers, with what each one
-refuses and what to do instead. It follows atm's code after #119 and #145
-(`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run `atm <command> --help`
+refuses and what to do instead. It follows atm's code after #119, #145 and
+#154 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run `atm <command> --help`
 for the full flags.
 
 ## Targets: use the pane
@@ -135,20 +135,35 @@ Kills the pane and the harness in it. Work on disk stays. On a subagent's row
 it kills the lead's pane (#146). Kill an implementer only when the user asks
 or the loop is over.
 
-## `atm spawn -H <harness> -w <dir> -t "$TMUX_PANE"`
+## `atm spawn -H <harness> -w <dir>`
 
-Splits a pane and starts the harness in it, in `<dir>`. Options: `-d
-left|right|above|below` (default below), `-s 30%` (default 50%), `-m <model>`.
+Splits your own pane (`$TMUX_PANE`) and starts the harness in the new pane,
+in `<dir>`. Options: `-d left|right|above|below` (default below), `-s 30%`
+(default 50%), `-m <model>`, and `-t <pane>` to split another pane.
 
-- **Always pass `-t "$TMUX_PANE"`.** Without it, atm splits the first active
-  pane it finds in any tmux session, which is usually not yours (#130 gap 1).
-- **It prints nothing.** To find the new pane, list the panes in
-  `atm list -f json` before you spawn, then list again every few seconds for
-  up to about 60 s until a new `tmux_pane` appears (until #121). Claude Code
-  and pi report at startup. Codex 0.163.0 may not report before its first
-  prompt, and `atm list` doesn't make atmd look for new sessions (it does
-  that at startup or when a TUI asks). If nothing appears, ask the user for
-  the new pane's id.
+- **It prints the new pane's id** (`%13`) as soon as the pane exists:
+  `pane=$(atm spawn -H pi -w <dir>)`. `-f json` prints
+  `{"cwd":"<dir>","harness":"pi","pane":"%13"}`: `cwd` is `-w` as you gave
+  it (pass an absolute path to record it), else the split pane's
+  directory, or `null` when atm can't tell. A failure after the id is
+  printed means the pane exists but the harness may not have started:
+  `atm peek` it, and `atm kill` it if you don't need it.
+- **The pane has no row in `atm list` until its harness reports.** Claude
+  Code and pi report at startup. Codex 0.163.0 reports at its first prompt,
+  so its row appears only after your first send. `atm send %N` works
+  without a row.
+- **Wait for the harness before the first `atm send`.** Text sent before it
+  has started (up to about 0.4 s after spawn on a warm machine, longer on a
+  cold one) lands in the input box but isn't submitted: the terminal isn't
+  in raw mode yet, so Enter arrives as a newline (Claude Code 2.1.318, pi
+  0.73.1, Codex 0.163.0). Wait until `atm peek %N` shows the input box, or
+  for the row (Claude Code, pi).
+- **A Codex coordinator** under Codex's default shared app-server daemon
+  sees the `$TMUX_PANE` of the Codex TUI that started the daemon, not its
+  own (0.163.0). atm then splits that pane, or, if it's gone, fails with
+  "Failed to split $TMUX_PANE (%N); pass -t <pane> ...". Run the
+  coordinator as `codex --no-daemon`, or ask the user for your pane and
+  pass `-t`.
 - Spawn only when the user asks or agrees.
 
 ## A Codex coordinator needs its sandbox opened
@@ -175,7 +190,7 @@ implementer never runs `atm`, so it needs neither.
 | `atm name` and targets by name (#118) | keep a name-to-pane table in your notes and handover |
 | `atm role` and the TUI's `C`/`I` tag (#148) | nothing; skip the step |
 | `atm profile show <name>` (#147) | `scripts/atm-profile <name>` |
-| `atm spawn` printing the new pane (#121) | diff `atm list` before and after |
+| `atm spawn --prompt` for the first brief (#121) | spawn, wait for the input box, then `atm send` |
 
 ## Scripts in this skill
 

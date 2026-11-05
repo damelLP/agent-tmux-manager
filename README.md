@@ -42,6 +42,7 @@ An open TUI restarts the daemon within a few seconds if it goes away, including 
 ```bash
 atm spawn -m opus -d right         # spawn default harness with model and direction
 atm spawn --harness pi             # spawn a specific harness (pi, codex, ...)
+pane=$(atm spawn -H pi -w ../wt)   # it prints the new pane's id (-f json: pane, harness, cwd)
 ATM_SPAWN_PI_BIN=mise ATM_SPAWN_PI_ARGS='x pi' atm spawn --harness pi
 ```
 

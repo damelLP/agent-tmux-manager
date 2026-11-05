@@ -110,6 +110,9 @@ enum Command {
         /// Output format: the new pane's id, or JSON {pane, harness, cwd}
         #[arg(long, short = 'f', default_value = "text")]
         format: SpawnFormat,
+        /// First prompt, passed as the agent's last argument (claude, pi and codex only). One line: put a long brief in a file
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// Kill an agent and close its tmux pane
     Kill {
@@ -308,6 +311,7 @@ async fn main() -> Result<()> {
             size,
             target_pane,
             format,
+            prompt,
         }) => {
             return cmd_spawn(
                 harness,
@@ -317,6 +321,7 @@ async fn main() -> Result<()> {
                 size,
                 target_pane,
                 format,
+                prompt,
             )
             .await;
         }

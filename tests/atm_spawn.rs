@@ -1,5 +1,5 @@
-//! `atm spawn`: which pane it splits, and what it prints (#121, gap 1 of
-//! #130).
+//! `atm spawn`: which pane it splits, what it prints, and how `--prompt`
+//! reaches the harness's command line (#121, gap 1 of #130).
 //!
 //! `atm` runs with a cleared environment whose `PATH` holds only a
 //! stand-in `tmux`. The stand-in logs each call and answers like tmux:
@@ -255,4 +255,213 @@ fn spawn_starts_the_agent_when_stdout_cannot_be_written() {
         .filter(|c| c.starts_with("send-keys -t %42 "))
         .collect();
     assert_eq!(typed.len(), 2, "{calls:?}");
+}
+
+/// The command spawn typed into the new pane (the stand-in logs it as one
+/// argument), and whether `Enter` followed it as the last call.
+fn typed_command(dir: &Path) -> String {
+    let calls = calls(dir);
+    let typed: Vec<&str> = calls
+        .iter()
+        .filter_map(|c| c.strip_prefix("send-keys -t %42 "))
+        .collect();
+    assert_eq!(typed.len(), 2, "{calls:?}");
+    assert_eq!(typed.last(), Some(&"Enter"), "{calls:?}");
+    typed.first().map(|c| (*c).to_string()).unwrap_or_default()
+}
+
+/// No call that splits a pane or types into one.
+fn assert_nothing_split(dir: &Path) {
+    let calls = calls(dir);
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("split-window") || c.starts_with("send-keys")),
+        "{calls:?}"
+    );
+}
+
+/// Claude Code, pi and Codex take a first prompt as their last positional
+/// argument (verified 2026-11-05 against 2.1.318, 0.73.1 and 0.163.0). It
+/// goes last, after `ATM_SPAWN_*_ARGS` and `--model`, as one shell word.
+#[test]
+fn spawn_puts_the_prompt_last_on_the_command_line() {
+    let dir = rig();
+    let out = spawn_command(
+        dir.path(),
+        Some("%7"),
+        &[
+            "-H",
+            "cc",
+            "-m",
+            "opus",
+            "--prompt",
+            "/atm-implement --profile p it's \"$HOME\" & done;",
+        ],
+    )
+    .env("ATM_SPAWN_CLAUDE_ARGS", "--debug hooks")
+    .output()
+    .expect("run atm spawn");
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(stdout(&out), "%42\n");
+    assert_eq!(
+        typed_command(dir.path()),
+        r#"cd '/from/pane' && claude --debug hooks --model 'opus' '/atm-implement --profile p it'\''s "$HOME" & done;'"#
+    );
+
+    // Each harness's own skill call, as the coordinator sends it.
+    for (harness, prompt) in [
+        ("pi", "/skill:atm-implement --profile p /tmp/b.md"),
+        ("codex", "$atm-implement --profile p /tmp/b.md"),
+    ] {
+        let dir = rig();
+        let out = spawn(dir.path(), Some("%7"), &["-H", harness, "--prompt", prompt]);
+        assert!(out.status.success(), "atm spawn -H {harness}: {out:?}");
+        assert_eq!(
+            typed_command(dir.path()),
+            format!("cd '/from/pane' && {harness} '{prompt}'")
+        );
+    }
+
+    // Without --prompt, the command is as before.
+    let dir = rig();
+    let out = spawn(dir.path(), Some("%7"), &["-H", "cc"]);
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(typed_command(dir.path()), "cd '/from/pane' && claude");
+}
+
+/// A harness that would need the prompt typed in after it starts
+/// (KeystrokeInjection: amp, qwen, gemini) or that atm knows nothing about
+/// (a config-defined one) refuses `--prompt` before any pane is split.
+#[test]
+fn spawn_refuses_a_prompt_the_harness_cannot_take_before_splitting() {
+    let dir = rig();
+    let config = dir.path().join("config").join("atm");
+    std::fs::create_dir_all(&config).expect("mkdir config");
+    std::fs::write(
+        config.join("config.toml"),
+        "[harness.mine]\nbinary = 'my-agent'\n",
+    )
+    .expect("write config");
+    for harness in ["amp", "qwen", "gemini", "mine"] {
+        let out = spawn(dir.path(), Some("%7"), &["-H", harness, "--prompt", "hi"]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "atm spawn -H {harness}: {out:?}"
+        );
+        assert_eq!(stdout(&out), "");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("harness '{harness}' can't take --prompt yet")),
+            "{stderr}"
+        );
+    }
+    assert_nothing_split(dir.path());
+
+    // The same harnesses still spawn without a prompt.
+    let out = spawn(dir.path(), Some("%7"), &["-H", "mine"]);
+    assert!(out.status.success(), "atm spawn -H mine: {out:?}");
+}
+
+/// The command is typed into an interactive shell, where a newline would
+/// end it early and a tab would complete. A long brief goes in a file.
+#[test]
+fn spawn_refuses_control_characters_in_the_prompt_before_splitting() {
+    let dir = rig();
+    for prompt in ["line 1\nline 2", "a\tb", "a\rb", "\u{1b}[A", "a\u{7f}"] {
+        let out = spawn(dir.path(), Some("%7"), &["--prompt", prompt]);
+        assert_eq!(out.status.code(), Some(1), "{prompt:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("control characters") && stderr.contains("file"),
+            "{prompt:?}: {stderr}"
+        );
+    }
+    assert_nothing_split(dir.path());
+}
+
+/// Spawn types the whole command before the pane's shell is up, through the
+/// tty's line buffer (tmux 3.8, bash 5.3.20 or zsh 5.9.2 started late: a
+/// 4,095-byte line ran, 4,096 bytes were cut). With `--prompt`, a line over
+/// 4000 bytes is refused before anything is split, whichever part makes it
+/// long. Without `--prompt` the line is typed as before.
+#[test]
+fn spawn_refuses_a_prompt_line_too_long_to_type_before_splitting() {
+    let prompt = "/atm-implement /tmp/b.md";
+    // `cd '<w>' && claude '<prompt>'` is the -w path plus 42 bytes.
+    let w = |len: usize| format!("/{}", "w".repeat(len - 1));
+    let dir = rig();
+    let out = spawn(
+        dir.path(),
+        Some("%7"),
+        &["-w", &w(3958), "--prompt", prompt],
+    );
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(typed_command(dir.path()).len(), 4000);
+
+    let assert_refused = |dir: &Path, out: &Output, bytes: &str| {
+        assert_eq!(out.status.code(), Some(1), "atm spawn: {out:?}");
+        assert_eq!(stdout(out), "");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("{bytes} bytes")) && stderr.contains("file"),
+            "{stderr}"
+        );
+        assert_nothing_split(dir);
+    };
+    let dir = rig();
+    let out = spawn(
+        dir.path(),
+        Some("%7"),
+        &["-w", &w(3959), "--prompt", prompt],
+    );
+    assert_refused(dir.path(), &out, "4001");
+
+    // A prompt that fits by itself, after long harness arguments.
+    let dir = rig();
+    let out = spawn_command(
+        dir.path(),
+        Some("%7"),
+        &["--prompt", &format!("a {}", "b".repeat(2000))],
+    )
+    .env(
+        "ATM_SPAWN_CLAUDE_ARGS",
+        format!("--pad {}", "c".repeat(2100)),
+    )
+    .output()
+    .expect("run atm spawn");
+    assert_refused(dir.path(), &out, "4137");
+
+    let dir = rig();
+    let out = spawn(dir.path(), Some("%7"), &["-w", &w(5000)]);
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(typed_command(dir.path()).len(), 5015);
+}
+
+/// A one-word prompt may name one of the harness's subcommands (`claude
+/// update` updates Claude Code) and a leading '-' reads as an option, so
+/// both are refused before anything is split (the user's decision,
+/// 2026-11-05). clap already refuses `--prompt -x`; the `=` form gets here.
+#[test]
+fn spawn_refuses_a_one_word_or_dash_prompt_before_splitting() {
+    let dir = rig();
+    for arg in ["--prompt=update", "--prompt=-x", "--prompt=-p hello"] {
+        let out = spawn(dir.path(), Some("%7"), &["-H", "codex", arg]);
+        assert_eq!(out.status.code(), Some(1), "{arg}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("more than one word"), "{arg}: {stderr}");
+    }
+    assert_nothing_split(dir.path());
+
+    let out = spawn(
+        dir.path(),
+        Some("%7"),
+        &["-H", "codex", "--prompt", "$atm-implement /tmp/b.md"],
+    );
+    assert!(out.status.success(), "atm spawn: {out:?}");
+    assert_eq!(
+        typed_command(dir.path()),
+        "cd '/from/pane' && codex '$atm-implement /tmp/b.md'"
+    );
 }

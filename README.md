@@ -43,6 +43,7 @@ An open TUI restarts the daemon within a few seconds if it goes away, including 
 atm spawn -m opus -d right         # spawn default harness with model and direction
 atm spawn --harness pi             # spawn a specific harness (pi, codex, ...)
 pane=$(atm spawn -H pi -w ../wt)   # it prints the new pane's id (-f json: pane, harness, cwd)
+atm spawn -H claude -w ../wt --prompt '/atm-implement /tmp/brief.md'  # start on a first prompt (claude, pi, codex)
 ATM_SPAWN_PI_BIN=mise ATM_SPAWN_PI_ARGS='x pi' atm spawn --harness pi
 ```
 
@@ -58,6 +59,8 @@ default_args = ["x", "pi"]
 ```
 
 Environment overrides still take precedence when set (`ATM_SPAWN_PI_BIN/ARGS`, then legacy `ATM_SPAWN_BIN/ARGS`); otherwise config values are used, then built-in defaults.
+
+`atm spawn --prompt` puts the prompt last, after these arguments and `--model`. Don't end them with an option that takes several values, such as Claude Code's `--add-dir` or Codex's `-i`: it would take the prompt as one more value. Don't end them with `;`, `&`, `|` or `#` either: the shell would run the prompt as a command of its own, or read it as a comment.
 
 ```
 atm kill <id>                      # kill agent and close pane

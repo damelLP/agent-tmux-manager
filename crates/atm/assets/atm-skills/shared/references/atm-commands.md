@@ -148,16 +148,39 @@ in `<dir>`. Options: `-d left|right|above|below` (default below), `-s 30%`
   directory, or `null` when atm can't tell. A failure after the id is
   printed means the pane exists but the harness may not have started:
   `atm peek` it, and `atm kill` it if you don't need it.
+- **`--prompt '<text>'` gives the harness its first prompt as it starts**,
+  as the last argument of its command, so you need no `atm send` for it.
+  Claude Code, pi and Codex take a skill call there (2.1.318, 0.73.1,
+  0.163.0), in single quotes as for `atm send`:
+  `pane=$(atm spawn -H pi -w <dir> --prompt '<skill call>')`. Then wait on
+  the pane as after a send.
+  - Other harnesses refuse it ("can't take --prompt yet"), and so does text
+    with a newline, a tab or another control character: put a long brief in
+    a file and name the file.
+  - The harness reads it like any argument: a one-word prompt that names one
+    of its subcommands runs that instead (`update`, in all three). A skill
+    call never does.
+  - **A startup dialog holds the prompt**: Claude Code's and Codex's "trust
+    this folder?", and Codex's "Hooks need review" after `atm setup` changes
+    its hooks. The harness reports nothing until someone answers it, so the
+    pane has no row and `atm-wait` prints `GONE` within seconds. Peek, and
+    ask the user to answer the dialog; the prompt is sent after it. Don't
+    answer it yourself.
 - **The pane has no row in `atm list` until its harness reports.** Claude
   Code and pi report at startup. Codex 0.163.0 reports at its first prompt,
-  so its row appears only after your first send. `atm send %N` works
-  without a row.
-- **Wait for the harness before the first `atm send`.** Text sent before it
-  has started (up to about 0.4 s after spawn on a warm machine, longer on a
-  cold one) lands in the input box but isn't submitted: the terminal isn't
-  in raw mode yet, so Enter arrives as a newline (Claude Code 2.1.318, pi
-  0.73.1, Codex 0.163.0). Wait until `atm peek %N` shows the input box, or
-  for the row (Claude Code, pi).
+  so its row appears only after your first send or its `--prompt`.
+  `atm send %N` works without a row.
+- **Spawn a Codex implementer with `ATM_SPAWN_CODEX_ARGS=--no-daemon atm
+  spawn -H codex ...`.** Under Codex's default shared app-server daemon, every
+  Codex session's hooks report the daemon's process and the pane of the Codex
+  that started it (0.163.0): a second Codex's row lands on that pane, its own
+  pane gets none, and `atm-wait` on it prints `GONE`.
+- **Without `--prompt`, wait for the harness before the first `atm
+  send`.** Text sent before it has started (up to about 0.4 s after spawn
+  on a warm machine, longer on a cold one) lands in the input box but isn't
+  submitted: the terminal isn't in raw mode yet, so Enter arrives as a
+  newline (Claude Code 2.1.318, pi 0.73.1, Codex 0.163.0). Wait until
+  `atm peek %N` shows the input box, or for the row (Claude Code, pi).
 - **A Codex coordinator** under Codex's default shared app-server daemon
   sees the `$TMUX_PANE` of the Codex TUI that started the daemon, not its
   own (0.163.0). atm then splits that pane, or, if it's gone, fails with
@@ -190,7 +213,6 @@ implementer never runs `atm`, so it needs neither.
 | `atm name` and targets by name (#118) | keep a name-to-pane table in your notes and handover |
 | `atm role` and the TUI's `C`/`I` tag (#148) | nothing; skip the step |
 | `atm profile show <name>` (#147) | `scripts/atm-profile <name>` |
-| `atm spawn --prompt` for the first brief (#121) | spawn, wait for the input box, then `atm send` |
 
 ## Scripts in this skill
 

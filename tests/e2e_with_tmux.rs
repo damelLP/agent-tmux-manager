@@ -1041,11 +1041,13 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
     );
     // The shim got the prompt as its one argument, through the pane's
     // shell, quotes and all.
-    let argv: Value = session
+    let first_prompt = session
         .get("first_prompt")
         .and_then(Value::as_str)
-        .map(|p| serde_json::from_str(p).expect("the shim's argv as JSON"))
         .expect("fixture session should carry first_prompt");
+    // "fixture probe" here means the shim got no arguments at all.
+    let argv: Value = serde_json::from_str(first_prompt)
+        .unwrap_or_else(|e| panic!("the shim's argv as JSON ({e}): {first_prompt:?}"));
     assert_eq!(argv, serde_json::json!([SPAWN_PROMPT]));
 
     scenario_atm_spawn_defaults_to_tmux_pane(env, &probe_pane_pre_spawn).await;

@@ -21,10 +21,17 @@ echo "$*" >> 'DIR/tmux.log'
 case $2 in
   list-panes)
     printf '%%1\tother\t0\t100\t80\t24\t1\n%%7\tmine\t1\t101\t80\t24\t0\n%%9\tmine\t1\t102\t80\t24\t0\n' ;;
-  display-message) echo /from/pane ;;
+  display-message)
+    # tmux 3.8 prints an empty line, rc 0, for a pane that is gone.
+    case " $* " in
+      *" -t %1 "*|*" -t %7 "*|*" -t %9 "*) echo /from/pane ;;
+      *) echo ;;
+    esac ;;
   split-window)
     case " $* " in
-      *" -t %1 "*|*" -t %7 "*|*" -t %9 "*) echo %42 ;;
+      *" -t %1 "*|*" -t %7 "*|*" -t %9 "*)
+        if [ -e 'DIR/split-no-space' ]; then echo "no space for a new pane" >&2; exit 1; fi
+        echo %42 ;;
       *) echo "can't find pane: $4" >&2; exit 1 ;;
     esac ;;
   send-keys)
@@ -47,6 +54,12 @@ fn rig() -> tempfile::TempDir {
 /// Runs `atm spawn <args>` inside a fake tmux client (`TMUX` set), with
 /// `TMUX_PANE` set to `caller_pane` when given.
 fn spawn(dir: &Path, caller_pane: Option<&str>, args: &[&str]) -> Output {
+    spawn_command(dir, caller_pane, args)
+        .output()
+        .expect("run atm spawn")
+}
+
+fn spawn_command(dir: &Path, caller_pane: Option<&str>, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atm"));
     cmd.arg("spawn")
         .args(args)
@@ -61,7 +74,7 @@ fn spawn(dir: &Path, caller_pane: Option<&str>, args: &[&str]) -> Output {
     if let Some(pane) = caller_pane {
         cmd.env("TMUX_PANE", pane);
     }
-    cmd.output().expect("run atm spawn")
+    cmd
 }
 
 /// The stand-in's calls, without the leading `-u`.
@@ -201,4 +214,45 @@ fn spawn_prints_the_pane_even_when_typing_the_command_fails() {
     let out = spawn(dir.path(), Some("%7"), &[]);
     assert_eq!(out.status.code(), Some(1), "atm spawn: {out:?}");
     assert_eq!(stdout(&out), "%42\n");
+}
+
+/// A split of `$TMUX_PANE` can fail for reasons that have nothing to do
+/// with the variable, such as a pane too small to split. The "pass -t"
+/// hint is only for a pane that is gone.
+#[test]
+fn spawn_hints_at_tmux_pane_only_when_the_pane_is_gone() {
+    let dir = rig();
+    std::fs::write(dir.path().join("split-no-space"), "").expect("flag");
+    let out = spawn(dir.path(), Some("%7"), &[]);
+    assert_eq!(out.status.code(), Some(1), "atm spawn: {out:?}");
+    assert_eq!(stdout(&out), "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no space for a new pane"), "{stderr}");
+    assert!(stderr.contains("Failed to split tmux pane"), "{stderr}");
+    assert!(!stderr.contains("pass -t"), "{stderr}");
+}
+
+/// A stdout that can't be written (here `/dev/full`) must not stop spawn
+/// half-way: the pane already exists, so the agent still starts in it, and
+/// the failure to print is reported, not a panic (exit 101).
+#[test]
+fn spawn_starts_the_agent_when_stdout_cannot_be_written() {
+    let dir = rig();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let out = spawn_command(dir.path(), Some("%7"), &[])
+        .stdout(full)
+        .output()
+        .expect("run atm spawn");
+    assert_eq!(out.status.code(), Some(1), "atm spawn: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Failed to print the new pane"), "{stderr}");
+    let calls = calls(dir.path());
+    let typed: Vec<_> = calls
+        .iter()
+        .filter(|c| c.starts_with("send-keys -t %42 "))
+        .collect();
+    assert_eq!(typed.len(), 2, "{calls:?}");
 }

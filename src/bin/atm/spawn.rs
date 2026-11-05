@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -334,21 +335,31 @@ pub(super) async fn cmd_spawn(
     let new_pane = client
         .split_window(current_pane, &size, pane_dir, None)
         .await
-        .with_context(|| match (&target_pane, &caller_pane) {
-            (None, Some(_)) => format!(
-                "Failed to split $TMUX_PANE ({current_pane}); pass -t <pane> to split another pane"
-            ),
-            _ => "Failed to split tmux pane".to_string(),
+        .with_context(|| {
+            // $TMUX_PANE can name a pane that is gone (leaked into tmux's
+            // global environment, or a Codex shared daemon's). Say so only
+            // then: a split also fails when the pane is too small.
+            let gone = target_pane.is_none()
+                && caller_pane.is_some()
+                && !panes.iter().any(|p| p.pane_id == current_pane);
+            if gone {
+                format!("Failed to split $TMUX_PANE ({current_pane}); pass -t <pane> to split another pane")
+            } else {
+                "Failed to split tmux pane".to_string()
+            }
         })?;
     // Print the pane as soon as it exists, so a caller can clean it up if
-    // starting the agent in it fails.
-    match format {
-        SpawnFormat::Text => println!("{new_pane}"),
-        SpawnFormat::Json => println!(
+    // starting the agent in it fails. A failed write (a closed pipe) is
+    // reported once the agent is started, not as a panic half-way.
+    let mut stdout = std::io::stdout();
+    let printed = match format {
+        SpawnFormat::Text => writeln!(stdout, "{new_pane}"),
+        SpawnFormat::Json => writeln!(
+            stdout,
             "{}",
             serde_json::json!({"pane": new_pane, "harness": harness.id, "cwd": cwd})
         ),
-    }
+    };
 
     client
         .send_keys(&new_pane, &agent_cmd)
@@ -358,6 +369,7 @@ pub(super) async fn cmd_spawn(
         .send_keys(&new_pane, "Enter")
         .await
         .context("Failed to send Enter to new pane")?;
+    printed.context("Failed to print the new pane's id")?;
 
     Ok(())
 }

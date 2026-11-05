@@ -25,6 +25,8 @@ fn atmd(socket: &Path, state: &Path, args: &[&str]) -> Command {
         .args(args)
         .env("ATM_SOCKET", socket)
         .env("XDG_STATE_HOME", state)
+        // atmd reads `[notify]` from atm's config.toml: never the developer's.
+        .env("XDG_CONFIG_HOME", state.join("config"))
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null());

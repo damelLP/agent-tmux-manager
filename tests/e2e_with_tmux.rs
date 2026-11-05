@@ -1980,7 +1980,8 @@ async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
     let logged = std::fs::read_to_string(&log).expect("read the tmux argv log");
     let target = format!("[send-keys] [-t] [{agent_pane}] ");
     let agent_keys: Vec<&str> = logged.lines().filter(|l| l.contains(&target)).collect();
-    let call = format!("[-L] [{}] {target}", tmux.label());
+    // `-u`: tmux prints UTF-8 whatever the caller's locale (#138).
+    let call = format!("[-u] [-L] [{}] {target}", tmux.label());
     assert_eq!(
         agent_keys,
         [
@@ -1993,8 +1994,8 @@ async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
 }
 
 /// Writes a `tmux` into `dir` that appends its argv to `log`, one `[arg]` per
-/// argument, then execs the real tmux. A lone `-L <label> send-keys -t <pane>
-/// Enter` is logged with ` swallowed` and not forwarded.
+/// argument, then execs the real tmux. A lone `-u -L <label> send-keys -t
+/// <pane> Enter` is logged with ` swallowed` and not forwarded.
 fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
     let real = tmux_on_path().expect("tmux on PATH (checked at setup)");
     let (real, log) = (real.display().to_string(), log.display().to_string());
@@ -2005,7 +2006,7 @@ fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
     );
     let body = format!(
         "#!/bin/sh\nline=\nfor arg in \"$@\"; do line=\"$line [$arg]\"; done\n\
-         if [ \"$#\" -eq 6 ] && [ \"$3\" = send-keys ] && [ \"$6\" = Enter ]; then\n\
+         if [ \"$#\" -eq 7 ] && [ \"$4\" = send-keys ] && [ \"$7\" = Enter ]; then\n\
          \x20 printf '%s swallowed\\n' \"${{line# }}\" >> '{log}'\n\x20 exit 0\nfi\n\
          printf '%s\\n' \"${{line# }}\" >> '{log}'\nexec '{real}' \"$@\"\n"
     );

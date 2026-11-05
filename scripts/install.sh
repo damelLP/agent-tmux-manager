@@ -2,11 +2,11 @@
 # ATM Installer
 # Downloads and installs atm binaries and configures Claude Code hooks.
 #
-# Usage: curl -sSL https://raw.githubusercontent.com/damel/agent-tmux-manager/main/scripts/install.sh | sh
+# Usage: curl -sSL https://raw.githubusercontent.com/damelLP/agent-tmux-manager/main/scripts/install.sh | sh
 
 set -e
 
-REPO="damel/agent-tmux-manager"
+REPO="damelLP/agent-tmux-manager"
 INSTALL_DIR="${ATM_INSTALL_DIR:-$HOME/.local/bin}"
 
 # Colors (if terminal supports them)
@@ -51,7 +51,7 @@ detect_platform() {
 # Get latest release version
 get_latest_version() {
     curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' \
+        | grep -o '"tag_name": *"[^"]*"' \
         | cut -d'"' -f4
 }
 

@@ -4,6 +4,7 @@
 //! Every fixture has a real process named `claude` above fifteen shell parents.
 //! That padding keeps both this sentinel and any real Claude running cargo out
 //! of the hook's bounded walk, including on the old outermost-match code.
+//! Like atm_skills_scripts, these tests skip with a message if jq is absent.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -11,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -22,8 +24,20 @@ struct Capture {
     messages: Vec<Value>,
 }
 
+fn jq_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
+        let path = dir.join("jq");
+        let metadata = path.metadata().ok()?;
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            path.canonicalize().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// `tree` is ordered outermost to innermost; each pair is (comm, label).
-fn run_hook(tree: &[(&str, &str)], input: &Value) -> Capture {
+fn run_hook(tree: &[(&str, &str)], input: &Value, jq: &Path) -> Capture {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -32,6 +46,8 @@ fn run_hook(tree: &[(&str, &str)], input: &Value) -> Capture {
     for name in ["claude", "sh"] {
         symlink("/bin/bash", bin.join(name)).unwrap();
     }
+    // Resolve jq before clearing the environment: it may live outside /usr/bin.
+    symlink(jq, bin.join("jq")).unwrap();
     let node = dir.path().join("node.sh");
     fs::write(
         &node,
@@ -126,6 +142,10 @@ exit "$rc"
 }
 
 fn assert_pid(tree: &[(&str, &str)], expected: Option<&str>) {
+    let Some(jq) = jq_on_path() else {
+        eprintln!("SKIP: jq not on PATH");
+        return;
+    };
     // Both users of find_claude_pid must carry the same selected PID.
     for (message_type, input) in [
         (
@@ -137,7 +157,7 @@ fn assert_pid(tree: &[(&str, &str)], expected: Option<&str>) {
             json!({"session_id": "pid-test", "model": {"id": "test-model"}}),
         ),
     ] {
-        let capture = run_hook(tree, &input);
+        let capture = run_hook(tree, &input, &jq);
         assert!(capture.pids.contains_key("outside-fixture"));
         let Some(label) = expected else {
             assert!(

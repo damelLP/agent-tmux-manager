@@ -384,10 +384,15 @@ fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
 /// `/proc/{pid}/exe`), which would register one agent as two sessions.
 ///
 /// When only one member's `comm` equals the harness binary, keep it.
-/// When both do, keep the parent only if it matched via cmdline alone and
-/// its direct child matched via exe. A native wrapper launched through a
-/// symlink named for the harness has this shape. More distant ancestry is
-/// insufficient: an intervening shell can launch a separate nested agent.
+/// When both do, collapse to the parent only if it matched via cmdline alone
+/// and its direct child matched via exe; otherwise keep both. A native
+/// wrapper launched through a symlink named for the harness has this shape.
+/// More distant ancestry is insufficient: an intervening shell can launch a
+/// separate nested agent.
+/// The parent is kept because Claude's hook reports the top of the run of
+/// `claude` processes; forwarders that report the child (`atm-codex-hook`'s
+/// nearest Codex or pi-atm's `process.pid`) still yield two rows for this
+/// shape once events arrive, as on main.
 ///
 /// Ancestry is only collapsed *within* a harness: an agent spawning a
 /// different vendor's agent (e.g. Claude driving a Codex) stays two
@@ -1403,9 +1408,9 @@ mod tests {
     use atm_tmux::mock::MockCall;
     use atm_tmux::MockTmuxClient;
 
-    /// A stand-in Claude Code process: `/bin/sh` run through a symlink
-    /// named `claude`, so its comm is `claude` and its argv0 ends in
-    /// `/claude`. The matching comm keeps wrapper-chain dedupe from
+    /// A stand-in Claude Code process: `/bin/sh` run through a symlink or
+    /// executable copy named `claude`, so its comm is `claude` and its argv0
+    /// ends in `/claude`. The matching comm keeps wrapper-chain dedupe from
     /// dropping it when the tests run under a real Claude Code session.
     /// Killed on drop.
     struct StandIn {
@@ -1423,6 +1428,11 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join(name);
             std::os::unix::fs::symlink("/bin/sh", &path).unwrap();
+            Self::start(name, dir)
+        }
+
+        fn start(name: &str, dir: TempDir) -> Self {
+            let path = dir.path().join(name);
             let child = std::process::Command::new(&path)
                 .args(["-c", "while :; do sleep 1; done"])
                 .spawn()
@@ -1467,6 +1477,18 @@ mod tests {
         assert_eq!(matched.process.harness, Harness::ClaudeCode);
         assert!(matched.comm_is_binary);
         assert!(!matched.matched_via_exe);
+    }
+
+    #[test]
+    fn detection_records_exe_match() {
+        let dir = TempDir::new().unwrap();
+        // Copy the real file: a symlink would leave exe pointing to /bin/sh.
+        fs::copy("/bin/sh", dir.path().join("claude")).unwrap();
+        let native = StandIn::start("claude", dir);
+        let matched = detect_agent_process(native.pid()).expect("stand-in matches via exe");
+        assert_eq!(matched.process.harness, Harness::ClaudeCode);
+        assert!(matched.comm_is_binary);
+        assert!(matched.matched_via_exe);
     }
 
     /// The pane recorded for the session discovered at `pid`.

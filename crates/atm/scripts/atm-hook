@@ -21,7 +21,8 @@ log_debug() {
 
 # Find the actual Claude process by walking up the process tree.
 # In containerized environments, $PPID may be a transient shell, not Claude.
-# Returns the PID of the last (highest) "claude" process found in the tree.
+# Returns the PID at the top of the nearest uninterrupted run of "claude".
+# This includes direct wrappers named claude, but not sessions above a shell.
 find_claude_pid() {
     local pid=$PPID
     local claude_pid=""
@@ -32,7 +33,11 @@ find_claude_pid() {
         local comm
         comm=$(cat "/proc/$pid/comm" 2>/dev/null) || break
         log_debug "Tree walk: depth=$depth pid=$pid comm=$comm"
-        [ "$comm" = "claude" ] && claude_pid=$pid
+        if [ "$comm" = "claude" ]; then
+            claude_pid=$pid
+        elif [ -n "$claude_pid" ]; then
+            break
+        fi
         pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
         depth=$((depth + 1))
     done

@@ -301,6 +301,8 @@ struct ProcessMatch {
     /// binary name — the same test the vendor hook scripts use to
     /// resolve the agent PID they report to the daemon.
     comm_is_binary: bool,
+    /// True if the exe check succeeded; false if only cmdline matched.
+    matched_via_exe: bool,
     /// True if the definition's `process_excludes` mark this process as
     /// not a session. Excluded matches still take part in dedupe, so they
     /// suppress their own launcher wrappers, but are never reported.
@@ -362,8 +364,9 @@ fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
     builtin_harnesses()
         .filter(|definition| definition.discovery_enabled)
         .find_map(|definition| {
-            check_harness_process(pid, definition).map(|process| ProcessMatch {
+            check_harness_process(pid, definition).map(|(process, matched_via_exe)| ProcessMatch {
                 comm_is_binary: process_comm(pid).as_deref() == Some(definition.binary),
+                matched_via_exe,
                 ancestor_pids: collect_ancestor_pids(pid),
                 excluded: !definition.process_excludes.is_empty()
                     && is_excluded_process(pid, definition),
@@ -380,10 +383,11 @@ fn detect_agent_process(pid: u32) -> Option<ProcessMatch> {
 /// matches via a path-like cmdline argument, its native child via
 /// `/proc/{pid}/exe`), which would register one agent as two sessions.
 ///
-/// A pair is collapsed only when one member's `comm` equals the harness
-/// binary and the other's does not. That is evidence of the observed
-/// wrapper/native shape; ancestry alone is insufficient because one real
-/// agent can launch another agent of the same harness.
+/// When only one member's `comm` equals the harness binary, keep it.
+/// When both do, keep the parent only if it matched via cmdline alone and
+/// its direct child matched via exe. A native wrapper launched through a
+/// symlink named for the harness has this shape. More distant ancestry is
+/// insufficient: an intervening shell can launch a separate nested agent.
 ///
 /// Ancestry is only collapsed *within* a harness: an agent spawning a
 /// different vendor's agent (e.g. Claude driving a Codex) stays two
@@ -421,10 +425,15 @@ fn dedupe_wrapper_chains(matches: Vec<ProcessMatch>) -> Vec<DiscoveredProcess> {
         .collect()
 }
 
-/// True if `a` is the binary member of a same-harness wrapper/native pair.
+/// True if `a` is the member to keep in a same-harness wrapper/native pair.
 fn supersedes(a: &ProcessMatch, b: &ProcessMatch) -> bool {
-    if a.process.harness != b.process.harness || !a.comm_is_binary || b.comm_is_binary {
+    if a.process.harness != b.process.harness || !a.comm_is_binary {
         return false;
+    }
+    if b.comm_is_binary {
+        return !a.matched_via_exe
+            && b.matched_via_exe
+            && b.ancestor_pids.first() == Some(&a.process.pid);
     }
     let a_is_ancestor = b.ancestor_pids.contains(&a.process.pid);
     let b_is_ancestor = a.ancestor_pids.contains(&b.process.pid);
@@ -467,7 +476,7 @@ fn process_comm(pid: u32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Checks if a PID matches a built-in harness definition.
+/// Returns a matching process and whether the exe check succeeded.
 ///
 /// First attempts to identify via `/proc/{pid}/exe`. Falls back to
 /// `/proc/{pid}/cmdline` for shebang/node-based CLIs and path-like command
@@ -476,9 +485,9 @@ fn process_comm(pid: u32) -> Option<String> {
 fn check_harness_process(
     pid: u32,
     definition: &'static HarnessDefinition,
-) -> Option<DiscoveredProcess> {
+) -> Option<(DiscoveredProcess, bool)> {
     if let Some(process) = check_via_exe(pid, definition) {
-        return Some(process);
+        return Some((process, true));
     }
 
     let result = check_via_cmdline(pid, definition);
@@ -491,7 +500,7 @@ fn check_harness_process(
         );
     }
 
-    result
+    result.map(|process| (process, false))
 }
 
 /// Generic helper: tests `/proc/{pid}/exe` against a harness definition and
@@ -1186,6 +1195,7 @@ mod tests {
             },
             ancestor_pids,
             comm_is_binary,
+            matched_via_exe: true,
             excluded: false,
         }
     }
@@ -1249,6 +1259,97 @@ mod tests {
         let wrapper = fake_match(100, Harness::Codex, vec![50, 1], false);
         let native = fake_match(200, Harness::Codex, vec![100, 50, 1], true);
         assert_eq!(kept_pids(vec![wrapper, native]), vec![200]);
+    }
+
+    #[test]
+    fn wrapper_with_binary_comm_keeps_parent_over_native_child() {
+        // A native wrapper invoked through a symlink named `claude`
+        // matches via cmdline; its direct Claude child matches via exe.
+        // The rule depends on match data, not the harness identity.
+        for harness in [Harness::ClaudeCode, Harness::Pi, Harness::Codex] {
+            let wrapper = ProcessMatch {
+                matched_via_exe: false,
+                ..fake_match(100, harness, vec![50, 1], true)
+            };
+            let native = fake_match(200, harness, vec![100, 50, 1], true);
+            assert_eq!(kept_pids(vec![wrapper.clone(), native.clone()]), vec![100]);
+            assert_eq!(kept_pids(vec![native, wrapper]), vec![100]);
+        }
+    }
+
+    #[test]
+    fn nested_wrapper_pairs_separated_by_shell_keep_both_wrappers() {
+        // outer wrapper -> outer native -> shell (300) -> inner wrapper
+        // -> inner native. Only each wrapper's direct child is suppressed.
+        let outer = ProcessMatch {
+            matched_via_exe: false,
+            ..fake_match(100, Harness::ClaudeCode, vec![1], true)
+        };
+        let outer_native = fake_match(200, Harness::ClaudeCode, vec![100, 1], true);
+        let inner = ProcessMatch {
+            matched_via_exe: false,
+            ..fake_match(400, Harness::ClaudeCode, vec![300, 200, 100, 1], true)
+        };
+        let inner_native = fake_match(500, Harness::ClaudeCode, vec![400, 300, 200, 100, 1], true);
+        assert_eq!(
+            kept_pids(vec![outer, outer_native, inner, inner_native]),
+            vec![100, 400]
+        );
+    }
+
+    #[test]
+    fn binary_comm_wrapper_requires_a_direct_native_child() {
+        let wrapper = ProcessMatch {
+            matched_via_exe: false,
+            ..fake_match(100, Harness::ClaudeCode, vec![50, 1], true)
+        };
+        for ancestors in [vec![150, 100, 50, 1], vec![50, 1], vec![]] {
+            let native = fake_match(200, Harness::ClaudeCode, ancestors, true);
+            assert_eq!(kept_pids(vec![wrapper.clone(), native]), vec![100, 200]);
+        }
+    }
+
+    #[test]
+    fn binary_comm_pair_requires_cmdline_only_parent_and_exe_child() {
+        for (parent_exe, child_exe) in [(true, true), (true, false), (false, false)] {
+            let parent = ProcessMatch {
+                matched_via_exe: parent_exe,
+                ..fake_match(100, Harness::ClaudeCode, vec![50, 1], true)
+            };
+            let child = ProcessMatch {
+                matched_via_exe: child_exe,
+                ..fake_match(200, Harness::ClaudeCode, vec![100, 50, 1], true)
+            };
+            assert_eq!(kept_pids(vec![parent, child]), vec![100, 200]);
+        }
+    }
+
+    #[test]
+    fn binary_comm_wrapper_does_not_suppress_another_harness() {
+        let wrapper = ProcessMatch {
+            matched_via_exe: false,
+            ..fake_match(100, Harness::ClaudeCode, vec![50, 1], true)
+        };
+        let native = fake_match(200, Harness::Codex, vec![100, 50, 1], true);
+        assert_eq!(kept_pids(vec![wrapper, native]), vec![100, 200]);
+    }
+
+    #[test]
+    fn binary_comm_wrapper_preserves_excluded_match_policy() {
+        for (parent_excluded, child_excluded) in [(true, false), (false, true), (true, true)] {
+            let wrapper = ProcessMatch {
+                matched_via_exe: false,
+                excluded: parent_excluded,
+                ..fake_match(100, Harness::Codex, vec![50, 1], true)
+            };
+            let native = ProcessMatch {
+                excluded: child_excluded,
+                ..fake_match(200, Harness::Codex, vec![100, 50, 1], true)
+            };
+            // Excluded matches can still supersede, but are never reported.
+            let expected = if parent_excluded { vec![] } else { vec![100] };
+            assert_eq!(kept_pids(vec![wrapper, native]), expected);
+        }
     }
 
     #[test]
@@ -1357,6 +1458,15 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    #[test]
+    fn detection_records_cmdline_only_match() {
+        let wrapper = StandIn::spawn();
+        let matched = detect_agent_process(wrapper.pid()).expect("stand-in matches via cmdline");
+        assert_eq!(matched.process.harness, Harness::ClaudeCode);
+        assert!(matched.comm_is_binary);
+        assert!(!matched.matched_via_exe);
     }
 
     /// The pane recorded for the session discovered at `pid`.

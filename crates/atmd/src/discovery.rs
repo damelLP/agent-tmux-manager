@@ -1433,10 +1433,21 @@ mod tests {
 
         fn start(name: &str, dir: TempDir) -> Self {
             let path = dir.path().join(name);
-            let child = std::process::Command::new(&path)
-                .args(["-c", "while :; do sleep 1; done"])
-                .spawn()
-                .unwrap();
+            let mut tries = 0;
+            let child = loop {
+                let run = std::process::Command::new(&path)
+                    .args(["-c", "while :; do sleep 1; done"])
+                    .spawn();
+                match run {
+                    // A freshly copied executable is busy while a child that a
+                    // sibling test forked mid-copy still holds its write fd.
+                    Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                        tries += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    run => break run.expect("spawn discovery stand-in"),
+                }
+            };
             // spawn() returns once exec closes its CLOEXEC pipe, which is
             // before the kernel sets the new comm and cmdline: under load a
             // scan can still see the forked test thread. Wait for both.

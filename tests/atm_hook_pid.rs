@@ -46,8 +46,15 @@ fn run_hook(tree: &[(&str, &str)], input: &Value, jq: &Path) -> Capture {
     for name in ["claude", "sh"] {
         symlink("/bin/bash", bin.join(name)).unwrap();
     }
-    // Resolve jq before clearing the environment: it may live outside /usr/bin.
-    symlink(jq, bin.join("jq")).unwrap();
+    // Forward to jq at its original path so wrappers retain their $0, and keep
+    // the caller's PATH behind our transport stub for wrapper companions.
+    let jq_forwarder = bin.join("jq");
+    fs::write(&jq_forwarder, "#!/bin/sh\nexec \"$ATM_TEST_JQ\" \"$@\"\n").unwrap();
+    fs::set_permissions(jq_forwarder, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
     let node = dir.path().join("node.sh");
     fs::write(
         &node,
@@ -98,7 +105,8 @@ exit "$rc"
     }
     let output = command
         .env_clear()
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("PATH", path)
+        .env("ATM_TEST_JQ", jq)
         .env("ATM_SOCKET", socket_path)
         .env("ATM_TEST_BIN", &bin)
         .env("ATM_TEST_NODE", &node)
@@ -178,6 +186,65 @@ fn assert_pid(tree: &[(&str, &str)], expected: Option<&str>) {
             capture.pids
         );
     }
+}
+
+// Run a positive PID test in a subprocess so wrapper PATH changes cannot race
+// the other tests. These wrappers still execute the caller's real jq.
+fn assert_jq_wrapper(wrapper: &str) {
+    let Some(jq) = jq_on_path() else {
+        eprintln!("SKIP: jq not on PATH");
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("jq's wrappers ")
+        .tempdir()
+        .unwrap();
+    for (name, script) in [
+        ("jq", format!("#!/bin/sh\n{wrapper}\n")),
+        (
+            "atm-test-real-jq",
+            format!(
+                "#!/bin/sh\nexec '{}' \"$@\"\n",
+                jq.to_str().unwrap().replace('\'', "'\\''")
+            ),
+        ),
+    ] {
+        let path = dir.path().join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(dir.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let probe = Command::new("timeout")
+        .args(["--kill-after=1s", "5s"])
+        .arg(dir.path().join("jq"))
+        .arg("--version")
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(probe.status.success(), "{probe:?}");
+    let output = Command::new("timeout")
+        .args(["--kill-after=1s", "20s"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "direct_claude_parent", "--nocapture"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn jq_wrapper_can_find_companion_on_caller_path() {
+    assert_jq_wrapper("exec atm-test-real-jq \"$@\"");
+}
+
+#[test]
+fn jq_wrapper_can_find_companion_beside_itself() {
+    assert_jq_wrapper("exec \"${0%/*}/atm-test-real-jq\" \"$@\"");
 }
 
 #[test]

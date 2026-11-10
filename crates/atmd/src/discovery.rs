@@ -1440,7 +1440,7 @@ mod tests {
                     .spawn();
                 match run {
                     // A freshly copied executable is busy while a child that a
-                    // sibling test forked mid-copy still holds its write fd.
+                    // sibling test forked mid-copy still holds the copy's write fd.
                     Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
                         tries += 1;
                         std::thread::sleep(Duration::from_millis(20));

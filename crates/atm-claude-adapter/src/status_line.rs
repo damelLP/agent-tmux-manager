@@ -79,7 +79,7 @@ pub struct RawStatusLine {
     pub context_window: Option<RawContextWindow>,
     #[serde(default)]
     pub exceeds_200k_tokens: Option<bool>,
-    /// Process ID of the Claude Code process (injected by status line script via $PPID)
+    /// Process ID selected by atm-hook's Claude ancestor walk (not the hook's direct $PPID).
     #[serde(default)]
     pub pid: Option<u32>,
     /// Tmux pane ID (injected by hook script via $TMUX_PANE)

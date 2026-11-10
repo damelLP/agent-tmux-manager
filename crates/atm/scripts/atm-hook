@@ -20,9 +20,9 @@ log_debug() {
 }
 
 # Find the actual Claude process by walking up the process tree.
-# In containerized environments, $PPID may be a transient shell, not Claude.
+# In Claude Code 2.1.321 the hook's direct parent was /bin/sh.
 # Returns the PID at the top of the nearest uninterrupted run of "claude".
-# This includes direct wrappers named claude, but not sessions above a shell.
+# This includes direct wrappers named claude; any non-claude process ends the run.
 find_claude_pid() {
     local pid=$PPID
     local claude_pid=""

@@ -64,6 +64,9 @@ wait_case() {
 }
 
 wait_case turn_runs_then_ends IDLE 0 "[$idle]" "[$idle]" "[$busy]" "[$busy]" "[$idle]" -- %5
+wait_case role_metadata_does_not_change_waiting IDLE 0 \
+    "[$(printf '%s' "$busy" | jq -c '. + {role: "coordinator"}')]" \
+    "[$(printf '%s' "$idle" | jq -c '. + {role: null}')]" -- %5
 wait_case dialog_during_turn ATTENTION 0 "[$idle]" "[$busy]" "[$dialog]" -- %5
 wait_case dialog_at_first_poll ATTENTION 0 "[$dialog]" -- %5 6
 wait_case after_reply_turn_ends IDLE 0 "[$dialog]" "[$dialog]" "[$busy]" "[$idle]" -- --after-reply %5

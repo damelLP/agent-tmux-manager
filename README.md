@@ -63,6 +63,9 @@ Environment overrides still take precedence when set (`ATM_SPAWN_PI_BIN/ARGS`, t
 `atm spawn --prompt` puts the prompt last, after these arguments and `--model`. Don't end them with an option that takes several values, such as Claude Code's `--add-dir` or Codex's `-i`: it would take the prompt as one more value. Don't end them with `;`, `&`, `|` or `#` either: the shell would run the prompt as a command of its own, or read it as a comment.
 
 ```
+atm role coordinator               # tag your own pane ($TMUX_PANE)
+atm role coordinator -t %12         # tag another pane (or a session id prefix)
+atm role --clear                    # remove your pane's tag (-t also works)
 atm kill <id>                      # kill agent and close pane
 atm interrupt <id>                 # Ctrl+C an agent
 atm send <id> "fix the tests"     # send text to agent
@@ -75,6 +78,8 @@ atm workspace create               # new session with ATM sidebar + agent + shel
 atm workspace attach               # inject sidebar into current session
 atm layout pair                    # two agents + ATM sidebar
 ```
+
+`atm role` stores the tag on the pane, so it survives a clear or harness restart there. With no target or a `%N` target it needs only tmux, not atmd; without `$TMUX_PANE`, pass `-t`. A session-id target uses the daemon. `atm list -f json` adds `role: "coordinator"` for tagged leads and `role: null` otherwise (including subagents and failed tmux lookups); table and ids formats are unchanged. `/atm-coordinate` tags its pane during setup. TUI role display and keys are not included yet.
 
 ## Notifications
 

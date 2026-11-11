@@ -40,6 +40,11 @@ in backticks. Write an apostrophe as `'\''`.
    `atm list -f json` works from your shell tool. Codex's default sandbox
    blocks atm's unix sockets ("Operation not permitted"): ask the user to
    allow them (see the command reference) rather than working around it.
+   Then tag your pane with `atm role coordinator`. If you are Codex under
+   its shared daemon, `$TMUX_PANE` may name another pane: run as
+   `codex --no-daemon`, or ask the user for your own pane and use
+   `atm role coordinator -t <your pane>` instead. If tagging fails, report
+   the failure and carry on; the tag is a convenience.
 3. **Profile.** With `--profile <name>`, run
    `bash <this skill's folder>/scripts/atm-profile <name>` and follow the
    profile it prints. These rules win over it.

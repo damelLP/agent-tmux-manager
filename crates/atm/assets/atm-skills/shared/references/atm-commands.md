@@ -7,7 +7,7 @@ and #158 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run
 
 ## Targets: use the pane
 
-Every command below takes a session id prefix or a tmux pane id (`%12`).
+Commands that target an agent take a session id prefix or a tmux pane id (`%12`).
 **Use the pane id.** A pane stays the same for an implementer's whole life,
 but its session id doesn't:
 
@@ -28,6 +28,7 @@ reads:
 |---|---|
 | `tmux_pane` | `"%12"`, or `null` outside tmux |
 | `harness` | `"claude"`, `"pi"`, `"codex"`, ... |
+| `role` | `"coordinator"` for a lead on a tagged pane; `null` otherwise, including subagents on that pane or when the tmux lookup fails |
 | `status` | `"idle"`, `"working"` or `"attention_needed"` (a dialog waits for an answer) |
 | `parent_session_id` | set on a subagent. An in-process subagent (Claude's background agents) has its lead's pane |
 | `id`, `id_short` | the session id. A clear that starts a new session gives the pane a new id: Claude's `/clear`, pi's `/new` |
@@ -40,6 +41,28 @@ reads:
 Filters: `--status working|idle|attention`, `--project <part of the project
 root>`. A session appears after its harness's first event to atmd. `atm list`
 starts atmd if none is running.
+
+## `atm role coordinator [-t <target>]` / `atm role --clear [-t <target>]`
+
+Tags a pane as coordinator, or removes its tag. Without `-t`, uses your own
+`$TMUX_PANE`; if it is unset or empty, pass `-t`. An explicit target can be
+`%N` or a session id prefix, as with `atm kill`. A subagent's id tags its
+lead's pane. `coordinator` is the only role; give it or `--clear`, not both.
+
+With no `-t`, or a `%N` target, this talks only to tmux: it neither starts
+nor contacts atmd. A session-id target fetches sessions and may start atmd.
+Success prints nothing; a missing pane fails with tmux's error.
+
+The tag is the pane option `@atm-role=coordinator`. It survives a clear or
+a harness restart in that pane, including another agent taking over the
+pane, until cleared or the tmux server dies. Unknown option values count
+as untagged. JSON lists add `role` on every row; table and ids output stay
+unchanged. The TUI's `C` tag is still planned (#148), not displayed yet.
+
+**Codex coordinator:** under its shared daemon, `$TMUX_PANE` may belong to
+the Codex TUI that started the daemon (0.163.0). Run as `codex --no-daemon`,
+or ask the user for your own pane and pass `-t <your pane>`. If tagging
+fails, report it and continue coordinating.
 
 ## `atm peek <pane> [-n N] [--prompt]`
 
@@ -217,7 +240,6 @@ implementer never runs `atm`, so it needs neither.
 | Planned | Today |
 |---|---|
 | `atm name` and targets by name (#118) | keep a name-to-pane table in your notes and handover |
-| `atm role` and the TUI's `C`/`I` tag (#148) | nothing; skip the step |
 | `atm profile show <name>` (#147) | `scripts/atm-profile <name>` |
 
 ## Scripts in this skill

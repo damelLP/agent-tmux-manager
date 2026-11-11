@@ -257,6 +257,14 @@ fn send_refusal(
     None
 }
 
+/// CLI-only metadata: the daemon's SessionView and wire format stay unchanged.
+#[derive(serde::Serialize)]
+struct ListedSession<'a> {
+    #[serde(flatten)]
+    session: &'a SessionView,
+    role: Option<&'static str>,
+}
+
 pub(super) async fn cmd_list(
     format: ListFormat,
     status_filter: Option<String>,
@@ -317,8 +325,18 @@ pub(super) async fn cmd_list(
             }
         }
         ListFormat::Json => {
+            let panes = role::coordinator_panes(&RealTmuxClient::new())
+                .await
+                .unwrap_or_default();
+            let rows: Vec<_> = filtered
+                .iter()
+                .map(|session| ListedSession {
+                    session,
+                    role: role::is_coordinator(session, &panes).then_some("coordinator"),
+                })
+                .collect();
             let json =
-                serde_json::to_string_pretty(&filtered).context("Failed to serialize sessions")?;
+                serde_json::to_string_pretty(&rows).context("Failed to serialize sessions")?;
             println!("{json}");
         }
         ListFormat::Ids => {
@@ -611,6 +629,39 @@ pub(super) async fn cmd_status() -> Result<()> {
     println!("{}", parts.join(" "));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    #[test]
+    fn flattened_rows_keep_every_existing_field_byte() {
+        let populated = SessionView {
+            project_root: Some("/a\"b".into()),
+            worktree_path: Some("/work".into()),
+            worktree_branch: Some("main".into()),
+            parent_session_id: Some(atm_core::SessionId::new("lead")),
+            child_session_ids: vec![atm_core::SessionId::new("child")],
+            first_prompt: Some("hello\nworld".into()),
+            ..SessionView::default()
+        };
+        for session in [SessionView::default(), populated] {
+            let before = serde_json::to_string(&session).unwrap();
+            for role in [None, Some("coordinator")] {
+                let after = serde_json::to_string(&ListedSession {
+                    session: &session,
+                    role,
+                })
+                .unwrap();
+                let suffix = format!(",\"role\":{}}}", serde_json::to_string(&role).unwrap());
+                assert_eq!(
+                    format!("{}}}", after.strip_suffix(&suffix).unwrap()),
+                    before
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

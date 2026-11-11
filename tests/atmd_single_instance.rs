@@ -272,6 +272,8 @@ fn test_client_with_other_state_dir_uses_the_running_daemon() {
         .args(["list", "--format", "json"])
         .env("ATM_SOCKET", &socket)
         .env("XDG_STATE_HOME", dir.path().join("state2"))
+        .env("ATM_TMUX_SOCKET", "atm-single-instance")
+        .env("TMUX_TMPDIR", dir.path())
         .output()
         .expect("run atm list");
     let elapsed = started.elapsed();

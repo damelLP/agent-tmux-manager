@@ -1,8 +1,8 @@
 # atm command reference for coordinators
 
 The commands a coordinator uses to drive implementers, with what each one
-refuses and what to do instead. It follows atm's code after #119, #145, #154
-and #158 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run
+refuses and what to do instead. It follows atm's code after #119, #145, #154,
+#158 and #163 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run
 `atm <command> --help` for the full flags.
 
 ## Targets: use the pane
@@ -28,7 +28,7 @@ reads:
 |---|---|
 | `tmux_pane` | `"%12"`, or `null` outside tmux |
 | `harness` | `"claude"`, `"pi"`, `"codex"`, ... |
-| `role` | `"coordinator"` for a lead on a tagged pane; `null` otherwise, including subagents on that pane or when the tmux lookup fails |
+| `role` | `"coordinator"` for a lead on a tagged pane; `null` otherwise, including subagents on that pane or when the tmux lookup fails; a hung lookup waits up to tmux's 5 s command timeout, then all roles are null; a session on another server (`atm workspace create --isolate`) sharing a tagged pane's `%N` can falsely read `"coordinator"` (not verified) |
 | `status` | `"idle"`, `"working"` or `"attention_needed"` (a dialog waits for an answer) |
 | `parent_session_id` | set on a subagent. An in-process subagent (Claude's background agents) has its lead's pane |
 | `id`, `id_short` | the session id. A clear that starts a new session gives the pane a new id: Claude's `/clear`, pi's `/new` |

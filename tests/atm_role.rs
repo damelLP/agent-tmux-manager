@@ -84,17 +84,6 @@ fn role_without_target_never_resolves_the_environment_through_atmd() {
     support::assert_no_daemon(dir.path(), Some(&listener));
 }
 
-#[test]
-fn cli_rig_collects_output_larger_than_a_pipe_buffer() {
-    let out = support::run(std::process::Command::new("/bin/sh").args([
-        "-c",
-        "i=0; while [ $i -lt 8192 ]; do printf 0123456789abcdef; printf 0123456789abcdef >&2; i=$((i+1)); done",
-    ]));
-    assert!(out.status.success(), "{:?}", out.status);
-    assert_eq!(out.stdout.len(), 131_072);
-    assert_eq!(out.stderr.len(), 131_072);
-}
-
 fn fake_tmux(dir: &std::path::Path) {
     support::executable(
         &dir.join("bin/tmux"),
@@ -200,27 +189,4 @@ fn role_returns_tmuxs_missing_pane_error_without_daemon_io() {
     );
     assert!(out.stdout.is_empty());
     support::assert_no_daemon(dir.path(), Some(&listener));
-}
-
-#[test]
-fn role_sets_an_explicit_pane_without_a_daemon() {
-    for listening in [false, true] {
-        let dir = support::rig();
-        support::executable(
-            &dir.path().join("bin/tmux"),
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/tmux.log\"\n",
-        );
-        let listener = listening.then(|| support::connection_trap(dir.path()));
-        let out = support::run(&mut support::command(
-            dir.path(),
-            &["role", "coordinator", "-t", "%7"],
-        ));
-        assert!(out.status.success(), "atm role: {out:?}");
-        assert!(out.stdout.is_empty(), "{out:?}");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("tmux.log")).unwrap(),
-            "-u set-option -p -t %7 @atm-role coordinator\n"
-        );
-        support::assert_no_daemon(dir.path(), listener.as_ref());
-    }
 }

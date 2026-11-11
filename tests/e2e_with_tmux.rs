@@ -1065,6 +1065,7 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
             .args(["list", "--format", "json"])
             .env("ATM_SOCKET", &env.daemon.socket_path)
             .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_TMUX_SOCKET", env.tmux_server.label())
             .output()
             .expect("run atm list");
 

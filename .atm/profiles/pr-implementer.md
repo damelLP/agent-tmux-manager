@@ -19,17 +19,22 @@ AGENTS.md; this profile adds the PR flow.
    running. What you couldn't run goes under "Not verified".
 5. **fmt, clippy and test** (AGENTS.md §4) pass before you push.
    **Then the local gate, before every push to `origin`:** commit, then run
-   `~/.local/share/gitea-ci/bin/gate-pr` in your worktree, in the sealed
-   environment you use for cargo (its push runs the pre-push hook). It
-   mirrors GitHub's `main` to the gate, pushes your branch, opens or updates
-   its gate PR, and waits for `ci.yml` on that exact commit. Push that same
-   commit to `origin` only after it prints `GATE PASSED`. If it fails, read
-   the job log whose path it prints, and fix the cause. It can wait up to an
-   hour: if your shell tool times out first, run it again (for the same
-   commit it only resumes waiting) or run it in the background. If the gate
-   is down, missing or times out, ask the coordinator; never push around it.
-   Never merge or close gate PRs. Put the gate run URL in the PR and your
-   report.
+   `/home/damel/.local/share/gitea-ci/bin/gate-pr` in your worktree, in the
+   sealed environment you use for cargo (its push runs the pre-push hook;
+   the absolute path matters, since the seal's `HOME` hides `~`). It mirrors
+   GitHub's `main` to the gate, pushes your branch, opens or updates its gate
+   PR, and waits for `ci.yml` on that exact commit. Start it once, in the
+   background, and wait for that process; run again for a commit the gate
+   already has, it only resumes waiting. Push that same commit to `origin`
+   only after it prints `GATE PASSED`. Its exit codes are in `--help`. On a
+   failed run, read the job log whose path it prints and fix the cause.
+   Once a commit is on the gate, add commits; never amend or rebase it.
+   The gate tests your branch's head (not its merge with `main`) as root on
+   the host network. If a failure looks like a flake (`--rerun` re-runs it
+   once) or like the gate's own environment, or the gate is down or refuses
+   your commit, ask the coordinator; never push around it. Never merge or
+   close gate PRs. In the PR and your report, give the `GATE PASSED` line
+   (commit and run number) and each job's result.
 6. **Draft PR:** `gh pr create --draft`, Conventional Commits title, with the
    decisions, what you assumed vs. found, and "Not verified". Never write
    fix/fixes/close/closes/resolve/resolves directly before `#N` unless the PR

@@ -29,7 +29,7 @@ fn jq_on_path() -> Option<PathBuf> {
         let path = dir.join("jq");
         let metadata = path.metadata().ok()?;
         if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            path.canonicalize().ok()
+            std::path::absolute(path).ok()
         } else {
             None
         }
@@ -103,8 +103,14 @@ exit "$rc"
     for (comm, label) in nodes.iter().skip(1) {
         command.arg(comm).arg(label);
     }
+    // Keep jq's runtime environment, but isolate shell startup and the hook's
+    // ambient debug/tmux settings. ATM_SOCKET and fixture variables are replaced.
     let output = command
-        .env_clear()
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env("ATM_DEBUG", "0")
         .env("PATH", path)
         .env("ATM_TEST_JQ", jq)
         .env("ATM_SOCKET", socket_path)
@@ -199,8 +205,12 @@ fn assert_jq_wrapper(wrapper: &str) {
         .prefix("jq's wrappers ")
         .tempdir()
         .unwrap();
+    // Model a PATH entry symlink whose companion lives beside the symlink,
+    // not beside the implementation it points at.
+    fs::create_dir(dir.path().join("implementation")).unwrap();
+    symlink("implementation/wrapper", dir.path().join("jq")).unwrap();
     for (name, script) in [
-        ("jq", format!("#!/bin/sh\n{wrapper}\n")),
+        ("implementation/wrapper", format!("#!/bin/sh\n{wrapper}\n")),
         (
             "atm-test-real-jq",
             format!(
@@ -222,14 +232,21 @@ fn assert_jq_wrapper(wrapper: &str) {
         .args(["--kill-after=1s", "5s"])
         .arg(dir.path().join("jq"))
         .arg("--version")
+        .env("ATM_JQ_COMPANION", dir.path().join("atm-test-real-jq"))
         .env("PATH", &path)
         .output()
         .unwrap();
     assert!(probe.status.success(), "{probe:?}");
+    let startup = dir.path().join("bash-env");
+    fs::write(&startup, "exit 91\n").unwrap();
     let output = Command::new("timeout")
         .args(["--kill-after=1s", "20s"])
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", "direct_claude_parent", "--nocapture"])
+        .env("BASH_ENV", startup)
+        .env("TMUX", "must-not-leak")
+        .env("TMUX_PANE", "%12345")
+        .env("ATM_JQ_COMPANION", dir.path().join("atm-test-real-jq"))
         .env("PATH", path)
         .output()
         .unwrap();
@@ -245,6 +262,11 @@ fn jq_wrapper_can_find_companion_on_caller_path() {
 #[test]
 fn jq_wrapper_can_find_companion_beside_itself() {
     assert_jq_wrapper("exec \"${0%/*}/atm-test-real-jq\" \"$@\"");
+}
+
+#[test]
+fn jq_wrapper_can_use_caller_environment() {
+    assert_jq_wrapper("exec \"$ATM_JQ_COMPANION\" \"$@\"");
 }
 
 #[test]

@@ -8,6 +8,7 @@
 //! atm                        # Launch TUI dashboard
 //! atm --pick                 # Pick mode - exit after jumping to a session
 //! atm spawn                  # Spawn a new coding agent
+//! atm role coordinator      # Tag the caller's pane as coordinator
 //! atm kill <session-id>      # Kill an agent
 //! atm interrupt <session-id> # Send SIGINT to an agent
 //! atm send <session-id> <text> # Send text to agent pane
@@ -44,7 +45,7 @@ mod cli;
 mod spawn;
 mod tui;
 mod workspace;
-use cli::{cmd_interrupt, cmd_kill, cmd_list, cmd_peek, cmd_reply, cmd_send, cmd_status};
+use cli::{cmd_interrupt, cmd_kill, cmd_list, cmd_peek, cmd_reply, cmd_role, cmd_send, cmd_status};
 use spawn::cmd_spawn;
 use tui::{
     cleanup_terminal, run_event_loop, setup_terminal, spawn_beads_task, spawn_capture_task,
@@ -113,6 +114,18 @@ enum Command {
         /// First prompt, passed as the agent's last argument (claude, pi and codex only). One line: put a long brief in a file
         #[arg(long)]
         prompt: Option<String>,
+    },
+    /// Tag a pane as coordinator, or clear its tag; defaults to $TMUX_PANE
+    Role {
+        /// Role to set (coordinator only)
+        #[arg(value_parser = ["coordinator"], required_unless_present = "clear", conflicts_with = "clear")]
+        role: Option<String>,
+        /// Remove the pane's role tag
+        #[arg(long)]
+        clear: bool,
+        /// Session ID prefix or tmux pane ID; pane IDs need no daemon
+        #[arg(long, short = 't')]
+        target: Option<String>,
     },
     /// Kill an agent and close its tmux pane
     Kill {
@@ -324,6 +337,9 @@ async fn main() -> Result<()> {
                 prompt,
             )
             .await;
+        }
+        Some(Command::Role { role, target, .. }) => {
+            return cmd_role(target, role.is_some()).await;
         }
         Some(Command::Kill { target }) => {
             return cmd_kill(target).await;

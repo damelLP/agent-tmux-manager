@@ -1,4 +1,4 @@
-//! CLI commands that act on a session: kill, interrupt, send, list, reply, peek and status.
+//! CLI commands that act on a session: kill, interrupt, send, role, list, reply, peek and status.
 
 use std::time::Duration;
 
@@ -9,9 +9,9 @@ use tokio::net::UnixStream;
 use atm_core::SessionView;
 use atm_protocol::{ClientMessage, DaemonMessage};
 use atm_tmux::{RealTmuxClient, TmuxClient};
-use atm_tui::daemon;
+use atm_tui::{daemon, role};
 
-use super::ListFormat;
+use super::{spawn::non_empty_env, ListFormat};
 
 // ============================================================================
 // CLI Command Implementations
@@ -138,6 +138,18 @@ async fn daemon_sessions() -> Result<Vec<SessionView>> {
 /// `resolve_pane_id` (which returns a `%` pane ID as is).
 async fn pane_for_target(target: &str) -> Result<String> {
     resolve_pane_id(&daemon_sessions().await?, target)
+}
+
+pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
+    // Only an explicit session target may start or contact the daemon.
+    let pane = match target {
+        Some(target) if !target.starts_with('%') => pane_for_target(&target).await?,
+        Some(target) => target,
+        None => non_empty_env("TMUX_PANE")
+            .context("TMUX_PANE is not set; pass -t <target> to choose a pane")?,
+    };
+    role::set_coordinator(&RealTmuxClient::new(), &pane, on).await?;
+    Ok(())
 }
 
 pub(super) async fn cmd_kill(target: String) -> Result<()> {

@@ -207,7 +207,7 @@ fn harness_spawn_env_key(harness: &SpawnHarnessDefinition, suffix: &str) -> Stri
     )
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
+pub(super) fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 

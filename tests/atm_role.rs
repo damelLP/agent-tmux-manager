@@ -44,12 +44,11 @@ fn role_session_targets_use_the_existing_prefix_resolution() {
     ] {
         let dir = support::rig();
         fake_tmux(dir.path());
-        let server = daemon::serve_sessions(&dir.path().join("atmd.sock"), sessions.clone());
+        daemon::fake_daemon(dir.path(), Some(sessions.clone()));
         let out = support::run(&mut support::command(
             dir.path(),
             &["role", "coordinator", "-t", target],
         ));
-        server.join().unwrap();
         assert!(!dir.path().join("daemon-started").exists());
         assert!(out.stdout.is_empty());
         if let Some(error) = error {

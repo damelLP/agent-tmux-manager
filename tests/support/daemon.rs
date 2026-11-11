@@ -1,62 +1,43 @@
-//! A bounded one-exchange daemon fixture; readiness probes are ignored.
+//! Shared stand-in for CLI commands that fetch the daemon's session list.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use atm_core::SessionView;
-use atm_protocol::{ClientMessage, DaemonMessage, MessageType};
+use atm_protocol::DaemonMessage;
 
-pub fn serve_sessions(socket: &Path, sessions: Vec<SessionView>) -> JoinHandle<()> {
-    let listener = UnixListener::bind(socket).expect("bind fixture daemon");
-    listener.set_nonblocking(true).expect("nonblocking");
+/// A stand-in daemon on `dir/atmd.sock`. It answers `connect` with
+/// Connected, then answers ListSessions with `sessions`, or hangs up
+/// first when `sessions` is None.
+pub fn fake_daemon(dir: &Path, sessions: Option<Vec<SessionView>>) {
+    let listener = UnixListener::bind(dir.join("atmd.sock")).expect("bind");
+    let connected =
+        serde_json::to_string(&DaemonMessage::connected("cli".to_string())).expect("serialize");
+    let list = sessions.map(|sessions| {
+        serde_json::to_string(&DaemonMessage::session_list(sessions)).expect("serialize")
+    });
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            assert!(
-                Instant::now() < deadline,
-                "no session exchange before deadline"
-            );
-            let (mut stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(e) => panic!("accept: {e}"),
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept");
+            let mut reader = BufReader::new(&stream);
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 {
+            // `atm` first checks that something listens, then hangs up
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 continue;
             }
-            let connect: ClientMessage = serde_json::from_str(&line).unwrap();
-            assert!(matches!(connect.message, MessageType::Connect { .. }));
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&DaemonMessage::connected("test".into())).unwrap()
-            )
-            .unwrap();
+            (&stream)
+                .write_all(format!("{connected}\n").as_bytes())
+                .expect("reply Connected");
+            // Read ListSessions
             line.clear();
-            reader.read_line(&mut line).unwrap();
-            let list: ClientMessage = serde_json::from_str(&line).unwrap();
-            assert!(matches!(list.message, MessageType::ListSessions));
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&DaemonMessage::session_list(sessions)).unwrap()
-            )
-            .unwrap();
-            return;
+            let _ = reader.read_line(&mut line);
+            if let Some(list) = &list {
+                let _ = (&stream).write_all(format!("{list}\n").as_bytes());
+                // Read Disconnect
+                line.clear();
+                let _ = reader.read_line(&mut line);
+            }
         }
-    })
+    });
 }

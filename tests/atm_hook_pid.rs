@@ -1,0 +1,372 @@
+//! Exercise the complete atm-hook with real /proc ancestry, without a harness,
+//! daemon, or tmux. Only the socket transport is replaced by a recorder.
+//!
+//! Every fixture has a real process named `claude` above fifteen shell parents.
+//! That padding keeps both this sentinel and any real Claude running cargo out
+//! of the hook's bounded walk, including on the old outermost-match code.
+//! Like atm_skills_scripts, these tests skip with a message if jq or the
+//! required /bin/bash executable is unavailable.
+#![cfg(target_os = "linux")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde_json::{json, Value};
+
+const HOOK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/crates/atm/scripts/atm-hook");
+
+struct Capture {
+    pids: HashMap<String, u32>,
+    messages: Vec<Value>,
+}
+
+fn jq_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
+        let path = dir.join("jq");
+        let metadata = path.metadata().ok()?;
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            std::path::absolute(path).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn fixture_jq() -> Option<PathBuf> {
+    if !fs::metadata("/bin/bash")
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    {
+        eprintln!("SKIP: /bin/bash unavailable");
+        return None;
+    }
+    jq_on_path().or_else(|| {
+        eprintln!("SKIP: jq not on PATH");
+        None
+    })
+}
+
+/// `tree` is ordered outermost to innermost; each pair is (comm, label).
+fn run_hook(tree: &[(&str, &str)], input: &Value, jq: &Path) -> Capture {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    // Unlike `exec -a`, the executable's basename sets Linux comm. The live
+    // processes record comm below, so a platform change fails explicitly.
+    for name in ["claude", "sh"] {
+        symlink("/bin/bash", bin.join(name)).unwrap();
+    }
+    // Forward to jq at its original path so wrappers retain their $0, and keep
+    // the caller's PATH behind our transport stub for wrapper companions.
+    let jq_forwarder = bin.join("jq");
+    fs::write(&jq_forwarder, "#!/bin/sh\nexec \"$ATM_TEST_JQ\" \"$@\"\n").unwrap();
+    fs::set_permissions(jq_forwarder, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let node = dir.path().join("node.sh");
+    fs::write(
+        &node,
+        r#"set -eu
+label=$1
+shift
+read -r comm < "/proc/$$/comm"
+printf '%s %s %s %s\n' "$label" "$$" "$PPID" "$comm" >> "$ATM_TEST_PIDS"
+if [ "$#" -gt 0 ]; then
+    program=$1
+    shift
+    "$ATM_TEST_BIN/$program" "$ATM_TEST_NODE" "$@"
+else
+    /bin/bash "$ATM_TEST_HOOK" < "$ATM_TEST_INPUT"
+fi
+# Keep this shell as the child's direct parent, rather than exec'ing it.
+rc=$?
+exit "$rc"
+"#,
+    )
+    .unwrap();
+    let input_path = dir.path().join("input.json");
+    fs::write(&input_path, input.to_string()).unwrap();
+    let pid_path = dir.path().join("pids");
+    let messages_path = dir.path().join("messages.jsonl");
+    let socket_path = dir.path().join("atm.sock");
+    let _socket = UnixListener::bind(&socket_path).unwrap();
+    let socat = bin.join("socat");
+    fs::write(&socat, "#!/bin/sh\ncat > \"$ATM_TEST_MESSAGES\"\n").unwrap();
+    fs::set_permissions(&socat, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut nodes = vec![("claude".to_owned(), "outside-fixture".to_owned())];
+    nodes.extend((0..15).map(|i| ("sh".to_owned(), format!("guard-{i}"))));
+    nodes.extend(
+        tree.iter()
+            .map(|(comm, label)| (comm.to_string(), label.to_string())),
+    );
+    // timeout owns the process group, so a hung hook also kills its shell
+    // ancestors/children. On success each shell waits for and reaps its child.
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=1s", "10s"])
+        .arg(bin.join("claude"))
+        .arg(&node)
+        .arg("outside-fixture");
+    for (comm, label) in nodes.iter().skip(1) {
+        command.arg(comm).arg(label);
+    }
+    // Keep jq's runtime environment, but isolate shell startup and the hook's
+    // ambient debug/tmux settings. ATM_SOCKET and fixture variables are replaced.
+    let output = command
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env("ATM_DEBUG", "0")
+        .env("PATH", path)
+        .env("ATM_TEST_JQ", jq)
+        .env("ATM_SOCKET", socket_path)
+        .env("ATM_TEST_BIN", &bin)
+        .env("ATM_TEST_NODE", &node)
+        .env("ATM_TEST_HOOK", HOOK)
+        .env("ATM_TEST_INPUT", input_path)
+        .env("ATM_TEST_PIDS", &pid_path)
+        .env("ATM_TEST_MESSAGES", &messages_path)
+        .output()
+        .expect("run real process tree with timeout");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let records = fs::read_to_string(pid_path).unwrap();
+    assert_eq!(records.lines().count(), nodes.len(), "{records}");
+    let mut pids = HashMap::new();
+    let mut previous_pid = None;
+    for (line, (comm, label)) in records.lines().zip(&nodes) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(fields.len(), 4, "{line}");
+        assert_eq!(fields[0], label);
+        assert_eq!(
+            fields[3], comm,
+            "the fixture must set comm, not just argv[0]"
+        );
+        let pid: u32 = fields[1].parse().unwrap();
+        if let Some(parent) = previous_pid {
+            assert_eq!(fields[2].parse::<u32>().unwrap(), parent, "{records}");
+        }
+        previous_pid = Some(pid);
+        pids.insert(label.clone(), pid);
+    }
+    let messages = match fs::read_to_string(messages_path) {
+        Ok(text) => text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read captured messages: {error}"),
+    };
+    Capture { pids, messages }
+}
+
+fn assert_pid(tree: &[(&str, &str)], expected: Option<&str>) {
+    let Some(jq) = fixture_jq() else {
+        return;
+    };
+    // Both users of find_claude_pid must carry the same selected PID.
+    for (message_type, input) in [
+        (
+            "hook_event",
+            json!({"session_id": "pid-test", "hook_event_name": "SessionStart"}),
+        ),
+        (
+            "status_update",
+            json!({"session_id": "pid-test", "model": {"id": "test-model"}}),
+        ),
+    ] {
+        let capture = run_hook(tree, &input, &jq);
+        assert!(capture.pids.contains_key("outside-fixture"));
+        let Some(label) = expected else {
+            assert!(
+                capture.messages.is_empty(),
+                "unexpected PID match: {:?}",
+                capture.messages
+            );
+            continue;
+        };
+        assert_eq!(capture.messages.len(), 2, "{:?}", capture.messages);
+        assert_eq!(capture.messages[0]["type"], "connect");
+        assert_eq!(capture.messages[1]["type"], message_type);
+        let mut expected_data = input;
+        expected_data["pid"] = json!(capture.pids[label]);
+        assert_eq!(
+            capture.messages[1]["data"], expected_data,
+            "tree: {tree:?}; pids: {:?}",
+            capture.pids
+        );
+    }
+}
+
+// Run a positive PID test in a subprocess so wrapper PATH changes cannot race
+// the other tests. These wrappers still execute the caller's real jq.
+fn assert_jq_wrapper(wrapper: &str) {
+    let Some(jq) = fixture_jq() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("jq's wrappers ")
+        .tempdir()
+        .unwrap();
+    // Model a PATH entry symlink whose companion lives beside the symlink,
+    // not beside the implementation it points at.
+    fs::create_dir(dir.path().join("implementation")).unwrap();
+    symlink("implementation/wrapper", dir.path().join("jq")).unwrap();
+    for (name, script) in [
+        ("implementation/wrapper", format!("#!/bin/sh\n{wrapper}\n")),
+        (
+            "atm-test-real-jq",
+            format!(
+                "#!/bin/sh\nexec '{}' \"$@\"\n",
+                jq.to_str().unwrap().replace('\'', "'\\''")
+            ),
+        ),
+    ] {
+        let path = dir.path().join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(dir.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let probe = Command::new("timeout")
+        .args(["--kill-after=1s", "5s"])
+        .arg(dir.path().join("jq"))
+        .arg("--version")
+        .env("ATM_JQ_COMPANION", dir.path().join("atm-test-real-jq"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(probe.status.success(), "{probe:?}");
+    let startup = dir.path().join("bash-env");
+    fs::write(&startup, "exit 91\n").unwrap();
+    let output = Command::new("timeout")
+        .args(["--kill-after=1s", "20s"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "direct_claude_parent", "--nocapture"])
+        .env("BASH_ENV", startup)
+        .env("TMUX", "must-not-leak")
+        .env("TMUX_PANE", "%12345")
+        .env("ATM_JQ_COMPANION", dir.path().join("atm-test-real-jq"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn jq_wrapper_can_find_companion_on_caller_path() {
+    assert_jq_wrapper("exec atm-test-real-jq \"$@\"");
+}
+
+#[test]
+fn jq_wrapper_can_find_companion_beside_itself() {
+    assert_jq_wrapper("exec \"${0%/*}/atm-test-real-jq\" \"$@\"");
+}
+
+#[test]
+fn jq_wrapper_can_use_caller_environment() {
+    assert_jq_wrapper("exec \"$ATM_JQ_COMPANION\" \"$@\"");
+}
+
+#[test]
+fn direct_claude_parent() {
+    assert_pid(&[("claude", "session")], Some("session"));
+}
+
+#[test]
+fn skips_shells_before_claude() {
+    assert_pid(
+        &[("claude", "session"), ("sh", "hook-shell")],
+        Some("session"),
+    );
+}
+
+#[test]
+fn adjacent_wrapper_and_claude_report_wrapper() {
+    assert_pid(
+        &[
+            ("claude", "wrapper"),
+            ("claude", "session"),
+            ("sh", "hook-shell"),
+        ],
+        Some("wrapper"),
+    );
+}
+
+#[test]
+fn longer_adjacent_claude_run_reports_its_parent() {
+    assert_pid(
+        &[
+            ("claude", "wrapper"),
+            ("claude", "middle"),
+            ("claude", "session"),
+            ("sh", "hook-shell"),
+        ],
+        Some("wrapper"),
+    );
+}
+
+#[test]
+fn nested_claude_stops_at_shell_boundary() {
+    assert_pid(
+        &[
+            ("claude", "outer"),
+            ("sh", "tool-shell"),
+            ("claude", "inner"),
+            ("sh", "hook-shell"),
+        ],
+        Some("inner"),
+    );
+}
+
+#[test]
+fn nested_wrappers_report_inner_wrapper() {
+    assert_pid(
+        &[
+            ("claude", "outer-wrapper"),
+            ("claude", "outer"),
+            ("sh", "tool-shell"),
+            ("claude", "inner-wrapper"),
+            ("claude", "inner"),
+            ("sh", "hook-shell"),
+        ],
+        Some("inner-wrapper"),
+    );
+}
+
+#[test]
+fn claude_above_fixture_is_outside_walk_even_when_cargo_has_claude_ancestors() {
+    // With no test nodes, the fifteen guard shells occupy every visited
+    // ancestor. The real sentinel process has comm=claude at depth 15;
+    // cargo's own ancestors are still farther away. This must emit nothing.
+    assert_pid(&[], None);
+}
+
+#[test]
+fn claude_at_fifteenth_ancestor_is_found() {
+    let mut tree = vec![("claude", "session")];
+    let labels: Vec<_> = (0..14).map(|i| format!("shell-{i}")).collect();
+    tree.extend(labels.iter().map(|label| ("sh", label.as_str())));
+    assert_pid(&tree, Some("session"));
+}
+
+#[test]
+fn claude_at_sixteenth_ancestor_is_out_of_range() {
+    let mut tree = vec![("claude", "session")];
+    let labels: Vec<_> = (0..15).map(|i| format!("shell-{i}")).collect();
+    tree.extend(labels.iter().map(|label| ("sh", label.as_str())));
+    assert_pid(&tree, None);
+}

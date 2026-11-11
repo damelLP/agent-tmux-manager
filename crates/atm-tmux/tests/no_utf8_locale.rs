@@ -36,8 +36,15 @@ impl IsolatedServer {
     /// runs `cat -` in `cwd`. As two words, tmux runs it without a shell,
     /// so no shell startup file can change its directory. `-f /dev/null`
     /// keeps the developer's tmux.conf out.
+    ///
+    /// tmux 3.6/3.6a can report the child's inherited cwd while systemd
+    /// setup runs before chdir (tmux/tmux#4719; fixed in 3.7). Start the
+    /// server in `cwd` too, so the initial and final paths agree: this
+    /// tests UTF-8 output, not pane startup readiness. Verified with Ubuntu
+    /// 3.6a-2ubuntu0.2 and Arch 3.8-1, 2026-11-11, on isolated servers.
     fn start(cwd: &Path) -> Self {
         let output = Command::new("tmux")
+            .current_dir(cwd)
             .args(["-L", LABEL, "-f", "/dev/null", "new-session", "-d"])
             .args(["-s", SESSION, "-x", "80", "-y", "24", "-c"])
             .arg(cwd)

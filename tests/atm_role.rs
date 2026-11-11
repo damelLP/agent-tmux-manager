@@ -85,6 +85,17 @@ fn role_without_target_never_resolves_the_environment_through_atmd() {
     support::assert_no_daemon(dir.path(), Some(&listener));
 }
 
+#[test]
+fn cli_rig_collects_output_larger_than_a_pipe_buffer() {
+    let out = support::run(std::process::Command::new("/bin/sh").args([
+        "-c",
+        "i=0; while [ $i -lt 8192 ]; do printf 0123456789abcdef; printf 0123456789abcdef >&2; i=$((i+1)); done",
+    ]));
+    assert!(out.status.success(), "{:?}", out.status);
+    assert_eq!(out.stdout.len(), 131_072);
+    assert_eq!(out.stderr.len(), 131_072);
+}
+
 fn fake_tmux(dir: &std::path::Path) {
     support::executable(
         &dir.join("bin/tmux"),

@@ -1,6 +1,6 @@
 //! Shared isolated CLI rig: sibling-atmd trap, connection trap and bounded exec.
 
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -41,12 +41,16 @@ pub fn command(dir: &Path, args: &[&str]) -> Command {
 }
 
 pub fn run(cmd: &mut Command) -> Output {
+    // The real daemon can discover many sessions. Files let it finish a
+    // large JSON list while we poll for exit, without filling a pipe.
+    let mut stdout = tempfile::tempfile().expect("stdout file");
+    let mut stderr = tempfile::tempfile().expect("stderr file");
     let mut tries = 0;
     let mut child = loop {
         match cmd
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(stdout.try_clone().expect("clone stdout"))
+            .stderr(stderr.try_clone().expect("clone stderr"))
             .spawn()
         {
             // As in atm_cli_daemon.rs: a concurrent fork may inherit a
@@ -62,12 +66,21 @@ pub fn run(cmd: &mut Command) -> Output {
     while child.try_wait().expect("poll command").is_none() {
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let output = child.wait_with_output().expect("reap timed out command");
-            panic!("command timed out: {output:?}");
+            child.wait().expect("reap timed out command");
+            panic!("command timed out: {cmd:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    child.wait_with_output().expect("command output")
+    let mut output = Output {
+        status: child.wait().expect("command status"),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout.seek(SeekFrom::Start(0)).unwrap();
+    stderr.seek(SeekFrom::Start(0)).unwrap();
+    stdout.read_to_end(&mut output.stdout).unwrap();
+    stderr.read_to_end(&mut output.stderr).unwrap();
+    output
 }
 
 pub fn connection_trap(dir: &Path) -> UnixListener {

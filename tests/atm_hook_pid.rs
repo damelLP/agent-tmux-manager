@@ -4,7 +4,8 @@
 //! Every fixture has a real process named `claude` above fifteen shell parents.
 //! That padding keeps both this sentinel and any real Claude running cargo out
 //! of the hook's bounded walk, including on the old outermost-match code.
-//! Like atm_skills_scripts, these tests skip with a message if jq is absent.
+//! Like atm_skills_scripts, these tests skip with a message if jq or the
+//! required /bin/bash executable is unavailable.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -33,6 +34,19 @@ fn jq_on_path() -> Option<PathBuf> {
         } else {
             None
         }
+    })
+}
+
+fn fixture_jq() -> Option<PathBuf> {
+    if !fs::metadata("/bin/bash")
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    {
+        eprintln!("SKIP: /bin/bash unavailable");
+        return None;
+    }
+    jq_on_path().or_else(|| {
+        eprintln!("SKIP: jq not on PATH");
+        None
     })
 }
 
@@ -156,8 +170,7 @@ exit "$rc"
 }
 
 fn assert_pid(tree: &[(&str, &str)], expected: Option<&str>) {
-    let Some(jq) = jq_on_path() else {
-        eprintln!("SKIP: jq not on PATH");
+    let Some(jq) = fixture_jq() else {
         return;
     };
     // Both users of find_claude_pid must carry the same selected PID.
@@ -197,8 +210,7 @@ fn assert_pid(tree: &[(&str, &str)], expected: Option<&str>) {
 // Run a positive PID test in a subprocess so wrapper PATH changes cannot race
 // the other tests. These wrappers still execute the caller's real jq.
 fn assert_jq_wrapper(wrapper: &str) {
-    let Some(jq) = jq_on_path() else {
-        eprintln!("SKIP: jq not on PATH");
+    let Some(jq) = fixture_jq() else {
         return;
     };
     let dir = tempfile::Builder::new()

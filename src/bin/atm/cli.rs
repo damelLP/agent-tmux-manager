@@ -1,4 +1,4 @@
-//! CLI commands that act on a session: kill, interrupt, send, list, reply, peek and status.
+//! CLI commands that act on a session: kill, interrupt, send, role, list, reply, peek and status.
 
 use std::time::Duration;
 
@@ -9,9 +9,9 @@ use tokio::net::UnixStream;
 use atm_core::SessionView;
 use atm_protocol::{ClientMessage, DaemonMessage};
 use atm_tmux::{RealTmuxClient, TmuxClient};
-use atm_tui::daemon;
+use atm_tui::{daemon, role};
 
-use super::ListFormat;
+use super::{spawn::non_empty_env, ListFormat};
 
 // ============================================================================
 // CLI Command Implementations
@@ -140,6 +140,18 @@ async fn pane_for_target(target: &str) -> Result<String> {
     resolve_pane_id(&daemon_sessions().await?, target)
 }
 
+pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
+    // Only an explicit session target may start or contact the daemon.
+    let pane = match target {
+        Some(target) if !target.starts_with('%') => pane_for_target(&target).await?,
+        Some(target) => target,
+        None => non_empty_env("TMUX_PANE")
+            .context("TMUX_PANE is not set; pass -t <target> to choose a pane")?,
+    };
+    role::set_coordinator(&RealTmuxClient::new(), &pane, on).await?;
+    Ok(())
+}
+
 pub(super) async fn cmd_kill(target: String) -> Result<()> {
     let pane_id = pane_for_target(&target).await?;
     let client = RealTmuxClient::new();
@@ -245,6 +257,14 @@ fn send_refusal(
     None
 }
 
+/// CLI-only metadata: the daemon's SessionView and wire format stay unchanged.
+#[derive(serde::Serialize)]
+struct ListedSession<'a> {
+    #[serde(flatten)]
+    session: &'a SessionView,
+    role: Option<&'static str>,
+}
+
 pub(super) async fn cmd_list(
     format: ListFormat,
     status_filter: Option<String>,
@@ -305,8 +325,28 @@ pub(super) async fn cmd_list(
             }
         }
         ListFormat::Json => {
+            let panes = role::coordinator_panes(&RealTmuxClient::new())
+                .await
+                .unwrap_or_default();
+            let rows: Vec<_> = filtered
+                .iter()
+                .map(|session| {
+                    // Rows can share an id (one per live process); prefer the same pane.
+                    let parent = session.parent_session_id.as_ref().and_then(|id| {
+                        sessions
+                            .iter()
+                            .filter(|s| s.id == *id)
+                            .min_by_key(|s| s.tmux_pane != session.tmux_pane)
+                    });
+                    ListedSession {
+                        session,
+                        role: role::is_coordinator(session, parent, &panes)
+                            .then_some("coordinator"),
+                    }
+                })
+                .collect();
             let json =
-                serde_json::to_string_pretty(&filtered).context("Failed to serialize sessions")?;
+                serde_json::to_string_pretty(&rows).context("Failed to serialize sessions")?;
             println!("{json}");
         }
         ListFormat::Ids => {
@@ -599,6 +639,39 @@ pub(super) async fn cmd_status() -> Result<()> {
     println!("{}", parts.join(" "));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    #[test]
+    fn flattened_rows_keep_every_existing_field_byte() {
+        let populated = SessionView {
+            project_root: Some("/a\"b".into()),
+            worktree_path: Some("/work".into()),
+            worktree_branch: Some("main".into()),
+            parent_session_id: Some(atm_core::SessionId::new("lead")),
+            child_session_ids: vec![atm_core::SessionId::new("child")],
+            first_prompt: Some("hello\nworld".into()),
+            ..SessionView::default()
+        };
+        for session in [SessionView::default(), populated] {
+            let before = serde_json::to_string(&session).unwrap();
+            for role in [None, Some("coordinator")] {
+                let after = serde_json::to_string(&ListedSession {
+                    session: &session,
+                    role,
+                })
+                .unwrap();
+                let suffix = format!(",\"role\":{}}}", serde_json::to_string(&role).unwrap());
+                assert_eq!(
+                    format!("{}}}", after.strip_suffix(&suffix).unwrap()),
+                    before
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

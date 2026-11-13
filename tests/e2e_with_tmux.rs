@@ -1,6 +1,12 @@
 //! End-to-end harness exercising real binaries against a real tmux server.
 //!
-//! Six scenarios are covered:
+//! Six shared-fixture scenarios and a daemon-free role test are covered:
+//!
+//! **Coordinator roles**: a separate private-server test checks set/clear,
+//! caller-pane targeting and missing panes without starting/contacting atmd.
+//! A relocated atm has a sibling-atmd trap (not just a PATH trap), and a
+//! listener catches even readiness probes. Copied executables retry ETXTBSY.
+//! The real-daemon scenario also checks JSON coordinator/null roles.
 //!
 //! 1. **Protocol-level e2e**: spawn `atmd` as a child, hand-roll a client over
 //!    a Unix socket, register a session via `HookEvent`, observe via
@@ -91,6 +97,9 @@ use atm_protocol::{ClientMessage, DaemonMessage, ProtocolVersion};
 use atm_tmux::{PaneDirection, RealTmuxClient, TmuxClient};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+
+#[path = "support/role.rs"]
+mod role_support;
 
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -593,6 +602,7 @@ async fn scenario_atm_list_client(env: &E2eEnv, expected_session_id: &str) {
         .args(["list", "--format", "json"])
         .env("ATM_SOCKET", &env.daemon.socket_path)
         .env("XDG_STATE_HOME", &env.daemon.state_dir)
+        .env("ATM_TMUX_SOCKET", env.tmux_server.label())
         .output()
         .expect("run atm list");
 
@@ -614,6 +624,75 @@ async fn scenario_atm_list_client(env: &E2eEnv, expected_session_id: &str) {
         our_session.is_some(),
         "real `atm list` JSON output did not contain our session {expected_session_id}; got: {stdout}"
     );
+}
+
+/// Real daemon + real CLI, with synthetic hook sessions on private panes.
+async fn scenario_role_json(env: &E2eEnv, session_id: &str) {
+    let panes = env.tmux.list_panes().await.unwrap();
+    let pane = &panes
+        .iter()
+        .find(|p| p.session_name == "probe")
+        .unwrap()
+        .pane_id;
+    let other = env
+        .tmux
+        .split_window(pane, "30%", PaneDirection::Below, None)
+        .await
+        .unwrap();
+    let other_pid: u32 = env
+        .tmux
+        .raw_command("display-message", &["-p", "-t", &other, "#{pane_pid}"])
+        .await
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let other_id = format!("other-{session_id}");
+    let mut client = Client::connect(&env.daemon.socket_path);
+    client.send(ClientMessage::connect(Some("role-test".into())));
+    assert!(matches!(client.recv(), DaemonMessage::Connected { .. }));
+    for (id, pane, pid) in [
+        (session_id, pane.as_str(), std::process::id()),
+        (other_id.as_str(), other.as_str(), other_pid),
+    ] {
+        client.send(ClientMessage::hook_event(json!({
+            "session_id": id, "hook_event_name": "UserPromptSubmit",
+            "pid": pid, "tmux_pane": pane, "prompt": "role fixture",
+        })));
+    }
+    // Flush the two events through the actor before the CLI requests its list.
+    client.send(ClientMessage::list_sessions());
+    assert!(matches!(client.recv(), DaemonMessage::SessionList { .. }));
+    client.send(ClientMessage::disconnect());
+    let run_atm = |args: &[&str]| {
+        role_support::run(
+            Command::new(&env.atm_path)
+                .args(args)
+                .env("ATM_SOCKET", &env.daemon.socket_path)
+                .env("XDG_STATE_HOME", &env.daemon.state_dir)
+                .env("ATM_TMUX_SOCKET", env.tmux_server.label())
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE"),
+        )
+    };
+    for (arg, expected) in [
+        ("coordinator", json!("coordinator")),
+        ("--clear", Value::Null),
+    ] {
+        let tag = run_atm(&["role", arg, "-t", session_id]);
+        assert!(tag.status.success(), "{tag:?}");
+        assert!(tag.stdout.is_empty());
+        let list = run_atm(&["list", "-f", "json"]);
+        assert!(list.status.success(), "{list:?}");
+        let rows: Vec<Value> = serde_json::from_slice(&list.stdout).unwrap();
+        let lead = rows.iter().find(|row| row["id"] == session_id).unwrap();
+        assert_eq!(lead["tmux_pane"], pane.as_str());
+        assert_eq!(lead.get("role"), Some(&expected));
+        let other_row = rows.iter().find(|row| row["id"] == other_id).unwrap();
+        assert_eq!(other_row.get("role"), Some(&Value::Null));
+        assert!(rows.iter().all(|row| row.get("role").is_some()));
+    }
+    env.tmux.kill_pane(&other).await.unwrap();
 }
 
 /// Scenario 3 — drive the isolated tmux server through `atm-tmux`'s own
@@ -986,6 +1065,7 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
             .args(["list", "--format", "json"])
             .env("ATM_SOCKET", &env.daemon.socket_path)
             .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_TMUX_SOCKET", env.tmux_server.label())
             .output()
             .expect("run atm list");
 
@@ -2583,6 +2663,98 @@ async fn scenario_tui_capture_preview_filter(env: &E2eEnv) {
     rig.wait_for_no_preview("filter hides every session");
 }
 
+/// Independent of E2eEnv, which would start a real daemon before the test.
+#[test]
+fn atm_role_pane_targets_need_no_daemon() {
+    let Some(tmux_path) = tmux_on_path() else {
+        eprintln!("SKIP: tmux not on PATH");
+        return;
+    };
+    let label = PrivateTmux::fresh_label();
+    let server = PrivateTmux::start_with_label_session_env(
+        &label,
+        "role",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let tmux = |args: &[&str]| {
+        role_support::run(
+            Command::new(&tmux_path)
+                .args(["-L", server.label()])
+                .args(args)
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE"),
+        )
+    };
+    let panes = tmux(&["list-panes", "-F", "#{pane_id}"]);
+    assert!(panes.status.success(), "{panes:?}");
+    let pane = std::str::from_utf8(&panes.stdout).unwrap().trim();
+    let split = tmux(&["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", pane]);
+    assert!(split.status.success(), "{split:?}");
+    let other = std::str::from_utf8(&split.stdout).unwrap().trim();
+
+    for listening in [false, true] {
+        let dir = role_support::rig();
+        std::os::unix::fs::symlink(&tmux_path, dir.path().join("bin/tmux")).unwrap();
+        let listener = listening.then(|| role_support::connection_trap(dir.path()));
+        let role = |args: &[&str], caller: Option<&str>| {
+            let mut cmd = role_support::command(dir.path(), args);
+            cmd.env("ATM_TMUX_SOCKET", server.label())
+                .env_remove("TMUX_TMPDIR");
+            if let Some(tmp) = std::env::var_os("TMUX_TMPDIR") {
+                cmd.env("TMUX_TMPDIR", tmp);
+            }
+            if let Some(caller) = caller {
+                cmd.env("TMUX_PANE", caller);
+            }
+            let out = role_support::run(&mut cmd);
+            role_support::assert_no_daemon(dir.path(), listener.as_ref());
+            out
+        };
+        for (args, caller, tagged) in [
+            (vec!["role", "coordinator", "-t", pane], Some(other), true),
+            (vec!["role", "--clear", "-t", pane], None, false),
+            (vec!["role", "--clear", "-t", pane], None, false),
+            (vec!["role", "coordinator"], Some(pane), true),
+            (vec!["role", "--clear"], Some(pane), false),
+        ] {
+            let out = role(&args, caller);
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            assert!(out.stdout.is_empty(), "{out:?}");
+            let option = tmux(&["show-options", "-p", "-v", "-t", pane, "@atm-role"]);
+            if tagged {
+                assert!(option.status.success(), "{option:?}");
+                assert_eq!(option.stdout, b"coordinator\n");
+            } else {
+                assert!(
+                    !option.status.success(),
+                    "pane option was not removed: {option:?}"
+                );
+            }
+            assert!(
+                !tmux(&["show-options", "-p", "-v", "-t", other, "@atm-role"])
+                    .status
+                    .success(),
+                "explicit target tagged the caller's other pane"
+            );
+        }
+        let out = role(&["role", "coordinator", "-t", "%999999"], None);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("%999999"),
+            "{out:?}"
+        );
+        assert!(out.stdout.is_empty());
+        for caller in [None, Some("")] {
+            let out = role(&["role", "coordinator"], caller);
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("pass -t"),
+                "{out:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn atm_atmd_tmux_end_to_end() {
     let Some(env) = E2eEnv::try_setup().await else {
@@ -2595,6 +2767,7 @@ async fn atm_atmd_tmux_end_to_end() {
     // monolithic test body.
     let session_id = scenario_protocol_e2e(&env).await;
     scenario_atm_list_client(&env, &session_id).await;
+    scenario_role_json(&env, &session_id).await;
     scenario_real_tmux_lib(&env).await;
     scenario_paste_text_and_atm_send(&env).await;
 

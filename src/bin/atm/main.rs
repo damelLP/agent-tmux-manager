@@ -49,7 +49,7 @@ use cli::{cmd_interrupt, cmd_kill, cmd_list, cmd_peek, cmd_reply, cmd_role, cmd_
 use spawn::cmd_spawn;
 use tui::{
     cleanup_terminal, run_event_loop, setup_terminal, spawn_beads_task, spawn_capture_task,
-    spawn_filter_task, spawn_keyboard_task,
+    spawn_filter_task, spawn_keyboard_task, spawn_role_task,
 };
 use workspace::{cmd_workspace, cmd_workspace_attach};
 
@@ -479,6 +479,12 @@ async fn main() -> Result<()> {
 
     let keyboard_handle = spawn_keyboard_task(event_tx.clone(), cancel_token.clone());
 
+    let role_handle = spawn_role_task(
+        RealTmuxClient::new(),
+        event_tx.clone(),
+        cancel_token.clone(),
+    );
+
     // Spawn filter task if --tmux-session is set
     let filter_handle = args
         .tmux_session
@@ -515,6 +521,7 @@ async fn main() -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_millis(100), daemon_handle).await;
     let _ = tokio::time::timeout(Duration::from_millis(100), keyboard_handle).await;
     let _ = tokio::time::timeout(Duration::from_millis(100), capture_handle).await;
+    let _ = tokio::time::timeout(Duration::from_millis(100), role_handle).await;
     if let Some(handle) = filter_handle {
         let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
     }

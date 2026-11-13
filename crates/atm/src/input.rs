@@ -53,6 +53,9 @@ pub enum Event {
     /// Updated set of tmux pane IDs that belong to the filtered tmux session.
     FilterUpdate(HashSet<String>),
 
+    /// Updated set of coordinator panes on the TUI's tmux server.
+    RoleUpdate(HashSet<String>),
+
     /// Discovery operation completed.
     DiscoveryComplete {
         /// Number of sessions discovered.

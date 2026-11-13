@@ -6,8 +6,9 @@
 //! payloads (Claude `RawHookEvent` and `RawStatusLine`, pi `RawPiEvent`,
 //! Codex `RawCodexEvent`) live in their respective adapter crates.
 
+pub mod error_code;
 pub mod message;
 pub mod version;
 
-pub use message::{ClientMessage, DaemonMessage, MessageType};
+pub use message::{ClientMessage, DaemonMessage, MessageType, ResponseError, ResponsePayload};
 pub use version::ProtocolVersion;

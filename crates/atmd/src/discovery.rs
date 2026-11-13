@@ -1038,7 +1038,7 @@ mod tests {
             .and_then(|definition| definition.parent_session_flag)
             .expect("claude declares parent_session_flag");
         let teammate = proc_cmdline(&[
-            "/tmp/.tmpy921TZ/claude/versions/2.1.288",
+            "/tmp/xxxxxxxxxx/claude/versions/2.1.288",
             "--agent-id",
             "waiter@session-ae223ce3",
             "--agent-name",

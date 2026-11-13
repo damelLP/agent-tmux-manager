@@ -70,7 +70,7 @@
 //! the statusLine, and a wrapper logged each stdin before the real
 //! `atm-hook` ran. The project and config paths were rewritten to
 //! `/home/user/project` and `/home/user/.claude`, and Claude's
-//! `/tmp/claude-<uid>` task directory to `/tmp/claude-user`. Two traps
+//! `/tmp/xxxxxxxxxxxx` task directory to `/tmp/xxxxxxxxxxx`. Two traps
 //! for the next capture:
 //!
 //! - Auto mode is the default permission mode in 2.1.310, so the run

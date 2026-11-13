@@ -100,7 +100,7 @@
 //! The hand-copied JSON payloads in the `wire.rs` and `translate.rs`
 //! tests follow the spike trace. Captured: pi, version not recorded,
 //! 2026-05-02 (trace
-//! `/tmp/atm-pi-spike-pid1226148-2026-05-02T08-55-56-043Z.jsonl`, not
+//! `/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.jsonl`, not
 //! kept), pi-spike tracer in an interactive session, spike
 //! `agent-tmux-manager-9dn`; added in 7a20d86 on 2026-05-10.
 //!

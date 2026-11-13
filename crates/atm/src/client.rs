@@ -414,6 +414,7 @@ impl DaemonClient {
             DaemonMessage::Connected {
                 protocol_version,
                 client_id,
+                ..
             } => {
                 // Verify protocol version compatibility
                 if !ProtocolVersion::CURRENT.is_compatible_with(&protocol_version) {
@@ -634,6 +635,10 @@ impl DaemonClient {
                     error_code = ?code,
                     "Received error from daemon"
                 );
+            }
+            DaemonMessage::Response { .. } | DaemonMessage::Event { .. } => {
+                // Placeholder until control-plane client handling is implemented (U1b).
+                debug!("Ignoring control-plane message in the session client");
             }
             DaemonMessage::Connected { .. } | DaemonMessage::Rejected { .. } => {
                 // These should only appear during handshake

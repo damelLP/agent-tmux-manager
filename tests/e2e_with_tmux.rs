@@ -524,6 +524,7 @@ async fn scenario_protocol_e2e(env: &E2eEnv) -> String {
         DaemonMessage::Connected {
             protocol_version,
             client_id,
+            ..
         } => {
             assert_eq!(protocol_version, ProtocolVersion::CURRENT);
             assert_eq!(client_id, "e2e-harness");

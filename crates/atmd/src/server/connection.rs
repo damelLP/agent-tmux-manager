@@ -29,7 +29,7 @@ use atm_claude_adapter::{RawHookEvent, RawStatusLine};
 use atm_codex_adapter::RawCodexEvent;
 use atm_core::{SessionId, StatusLineData};
 use atm_pi_adapter::RawPiEvent;
-use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
+use atm_protocol::{error_code, ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 
 use super::MAX_TUI_CLIENTS;
 use crate::discovery::{DiscoveryResult, DiscoveryService};
@@ -327,6 +327,19 @@ impl ConnectionHandler {
                 // Already connected - send error
                 self.send_message(DaemonMessage::error("Already connected"))
                     .await?;
+            }
+
+            // Placeholders until control-plane dispatch is implemented (U1b).
+            MessageType::Request { id, method, .. } => {
+                self.send_message(DaemonMessage::response_err(
+                    id,
+                    error_code::UNKNOWN_METHOD,
+                    &format!("no method '{method}'"),
+                ))
+                .await?;
+            }
+            MessageType::Watch { .. } | MessageType::Unwatch => {
+                debug!("Ignoring watch request before control-plane dispatch is implemented");
             }
 
             MessageType::StatusUpdate { data } => {

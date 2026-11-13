@@ -202,6 +202,7 @@ async fn test_handshake_success() {
         DaemonMessage::Connected {
             protocol_version,
             client_id,
+            ..
         } => {
             assert_eq!(protocol_version, ProtocolVersion::CURRENT);
             assert_eq!(client_id, "test-client");
@@ -209,6 +210,28 @@ async fn test_handshake_success() {
         other => panic!("Expected Connected, got {other:?}"),
     }
 
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_request_placeholder_returns_unknown_method_with_id() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    timeout(Duration::from_secs(2), async {
+        client.writer.write_all(concat!(
+            r#"{"protocol_version":{"major":1,"minor":1},"type":"request","id":"r1","method":"x.y"}"#,
+            "\n"
+        ).as_bytes()).await.unwrap();
+        let mut line = String::new();
+        client.reader.read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response, serde_json::json!({
+            "type": "response",
+            "id": "r1",
+            "error": {"code": "unknown_method", "message": "no method 'x.y'"}
+        }));
+    }).await.expect("request response before timeout");
     server.shutdown().await;
 }
 
@@ -1199,7 +1222,7 @@ async fn test_e2e_notification_permission_prompt_becomes_needs_input() {
 /// must idle that session, not spawn a `waiter@<teammate>` child under
 /// it. Captured: Claude Code 2.1.288, 2026-10-04, a tmux-mode team run
 /// (see atm-claude-adapter's crate docs); paths rewritten to
-/// `/home/user` and `/tmp/claude-user`.
+/// `/home/user` and `/tmp/xxxxxxxxxxx`.
 #[tokio::test]
 async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
     let (server, registry) = TestServer::spawn_with_registry().await;
@@ -1230,7 +1253,7 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
         "session_id": "34d56705-0907-49a6-8785-e72091a93178",
         "transcript_path": "/home/user/.claude/projects/-home-user-project/34d56705-0907-49a6-8785-e72091a93178.jsonl",
         "cwd": "/home/user/project",
-        "scratchpad_dir": "/tmp/claude-user/-home-user-project/34d56705-0907-49a6-8785-e72091a93178/scratchpad",
+        "scratchpad_dir": "/tmp/xxxxxxxxxxx/-home-user-project/34d56705-0907-49a6-8785-e72091a93178/scratchpad",
         "permission_mode": "auto",
         "agent_type": "general-purpose",
         "hook_event_name": "TeammateIdle",
@@ -1264,7 +1287,7 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
 /// `offset_ms` from the first call. Captured: Claude Code 2.1.310,
 /// 2026-10-24, the run described under "Captured payloads" in
 /// atm-claude-adapter's crate docs; paths rewritten to `/home/user` and
-/// `/tmp/claude-user`. The payloads are those of atm-claude-adapter's
+/// `/tmp/xxxxxxxxxxx`. The payloads are those of atm-claude-adapter's
 /// `claude_tui_session_2.1.310.jsonl` and
 /// `claude_status_line_2.1.310.jsonl`; this file adds their order.
 const CLAUDE_INTERLEAVED: &str = "tests/fixtures/claude_tui_interleaved_2.1.310.jsonl";

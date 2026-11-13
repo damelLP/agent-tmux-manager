@@ -79,7 +79,7 @@ atm workspace attach               # inject sidebar into current session
 atm layout pair                    # two agents + ATM sidebar
 ```
 
-`atm role` stores the tag on the pane, so it survives a clear or harness restart there. With no target or a `%N` target it needs only tmux, not atmd; without `$TMUX_PANE`, pass `-t`. A session-id target uses the daemon. `atm list -f json` adds `role: "coordinator"` for tagged leads and `role: null` otherwise (including subagents and failed tmux lookups); table and ids formats are unchanged. `/atm-coordinate` tags its pane during setup. TUI role display and keys are not included yet.
+`atm role` stores the tag on the pane, so it survives a clear or harness restart there. With no target or a `%N` target it needs only tmux, not atmd; without `$TMUX_PANE`, pass `-t`. A session-id target uses the daemon. `atm list -f json` adds `role: "coordinator"` when a session's pane is tagged and its parent does not share that pane, or `role: null` otherwise (also on failed tmux lookups). No parent, or a parent missing from the full session list, passes: a separate-process teammate on its own tagged pane can coordinate, but an in-process subagent sharing its parent's pane stays null, even when filters hide the parent. Table and ids formats are unchanged. `/atm-coordinate` tags its pane during setup. TUI role display and keys are not included yet.
 
 ## Notifications
 

@@ -152,6 +152,114 @@ async fn list_keeps_filters_empty_arrays_and_non_json_bytes() {
     }
 }
 
+#[tokio::test]
+async fn json_tags_a_teammates_own_pane_but_not_its_subagent() {
+    use atm_core::{SessionId, SessionView};
+    let mut sessions = rows();
+    sessions.extend([
+        SessionView {
+            id: SessionId::new("teammate"),
+            parent_session_id: Some(SessionId::new("lead")),
+            tmux_pane: Some("%9".into()),
+            ..SessionView::default()
+        },
+        SessionView {
+            id: SessionId::new("teammate-child"),
+            parent_session_id: Some(SessionId::new("teammate")),
+            tmux_pane: Some("%9".into()),
+            ..SessionView::default()
+        },
+    ]);
+    let output = list_fixture(
+        sessions.clone(),
+        Some("printf '%s\\t%s\\n' %7 coordinator %9 coordinator"),
+        "json",
+        &[],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let mut listed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed.len(), sessions.len());
+    for ((actual, original), role) in listed.iter_mut().zip(&sessions).zip([
+        serde_json::json!("coordinator"),
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::json!("coordinator"),
+        serde_json::Value::Null,
+    ]) {
+        assert_eq!(
+            actual.as_object_mut().unwrap().remove("role"),
+            Some(role),
+            "session {}",
+            original.id
+        );
+        assert_eq!(*actual, serde_json::to_value(original).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn json_tags_a_child_whose_parent_is_missing() {
+    use atm_core::{SessionId, SessionView};
+    let output = list_fixture(
+        vec![SessionView {
+            id: SessionId::new("orphan"),
+            parent_session_id: Some(SessionId::new("missing")),
+            tmux_pane: Some("%7".into()),
+            ..SessionView::default()
+        }],
+        Some("printf '%s\\t%s\\n' %7 coordinator"),
+        "json",
+        &[],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], "orphan");
+    assert_eq!(listed[0]["role"], "coordinator");
+}
+
+#[tokio::test]
+async fn json_does_not_tag_a_subagent_when_filters_hide_its_parent() {
+    use atm_core::{SessionId, SessionStatus, SessionView};
+    let sessions = vec![
+        SessionView {
+            id: SessionId::new("lead"),
+            tmux_pane: Some("%7".into()),
+            status: SessionStatus::Idle,
+            project_root: Some("/lead-project".into()),
+            ..SessionView::default()
+        },
+        SessionView {
+            id: SessionId::new("child"),
+            parent_session_id: Some(SessionId::new("lead")),
+            tmux_pane: Some("%7".into()),
+            status: SessionStatus::Working,
+            project_root: Some("/child-project".into()),
+            ..SessionView::default()
+        },
+    ];
+    for filters in [["--status", "working"], ["--project", "child-project"]] {
+        let output = list_fixture(
+            sessions.clone(),
+            Some("printf '%s\\t%s\\n' %7 coordinator"),
+            "json",
+            &filters,
+        )
+        .await;
+        assert!(output.status.success(), "{filters:?}: {output:?}");
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(listed.len(), 1, "{filters:?}");
+        assert_eq!(listed[0]["id"], "child", "{filters:?}");
+        assert_eq!(
+            listed[0].get("role"),
+            Some(&serde_json::Value::Null),
+            "{filters:?}"
+        );
+    }
+}
+
 /// A daemon that dies mid-exchange closes the socket before sending
 /// SessionList. `atm list` must fail, not print an empty list.
 #[test]

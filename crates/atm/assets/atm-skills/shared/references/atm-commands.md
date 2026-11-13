@@ -28,9 +28,9 @@ reads:
 |---|---|
 | `tmux_pane` | `"%12"`, or `null` outside tmux |
 | `harness` | `"claude"`, `"pi"`, `"codex"`, ... |
-| `role` | `"coordinator"` for a lead on a tagged pane; `null` otherwise, including subagents on that pane or when the tmux lookup fails; a hung lookup waits up to tmux's 5 s command timeout, then all roles are null; a session on another server (`atm workspace create --isolate`) sharing a tagged pane's `%N` can falsely read `"coordinator"` (not verified) |
+| `role` | `"coordinator"` for a session on a tagged pane unless its parent shares that pane; no parent or a parent missing from the full session list passes. A separate-process teammate can coordinate; an in-process child sharing its parent's pane stays `null`, even if filters hide the parent. Also `null` when the tmux lookup fails; a hung lookup waits up to tmux's 5 s command timeout, then all roles are null; a session on another server (`atm workspace create --isolate`) sharing a tagged pane's `%N` can falsely read `"coordinator"` (not verified) |
 | `status` | `"idle"`, `"working"` or `"attention_needed"` (a dialog waits for an answer) |
-| `parent_session_id` | set on a subagent. An in-process subagent (Claude's background agents) has its lead's pane |
+| `parent_session_id` | set on a subagent or separate-process teammate. An in-process subagent (Claude's background agents) has its parent's pane; a separate-process teammate has its own |
 | `id`, `id_short` | the session id. A clear that starts a new session gives the pane a new id: Claude's `/clear`, pi's `/new` |
 | `last_activity` | an RFC 3339 time. Metadata events move it while the session is idle, so it doesn't prove a turn ran |
 | `project_root`, `worktree_path` | the git project (a worktree resolves to its main checkout) and the worktree. Record these in notes and handovers |
@@ -46,8 +46,9 @@ starts atmd if none is running.
 
 Tags a pane as coordinator, or removes its tag. Without `-t`, uses your own
 `$TMUX_PANE`; if it is unset or empty, pass `-t`. An explicit target can be
-`%N` or a session id prefix, as with `atm kill`. A subagent's id tags its
-lead's pane. `coordinator` is the only role; give it or `--clear`, not both.
+`%N` or a session id prefix, as with `atm kill`. An in-process subagent's id
+tags its parent's shared pane; a separate-process teammate's id tags its own
+pane. `coordinator` is the only role; give it or `--clear`, not both.
 
 With no `-t`, or a `%N` target, this talks only to tmux: it neither starts
 nor contacts atmd. A session-id target fetches sessions and may start atmd.

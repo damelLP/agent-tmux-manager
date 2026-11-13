@@ -330,9 +330,16 @@ pub(super) async fn cmd_list(
                 .unwrap_or_default();
             let rows: Vec<_> = filtered
                 .iter()
-                .map(|session| ListedSession {
-                    session,
-                    role: role::is_coordinator(session, &panes).then_some("coordinator"),
+                .map(|session| {
+                    let parent = session
+                        .parent_session_id
+                        .as_ref()
+                        .and_then(|id| sessions.iter().find(|s| s.id == *id));
+                    ListedSession {
+                        session,
+                        role: role::is_coordinator(session, parent, &panes)
+                            .then_some("coordinator"),
+                    }
                 })
                 .collect();
             let json =

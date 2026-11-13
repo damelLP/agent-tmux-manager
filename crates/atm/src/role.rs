@@ -16,14 +16,18 @@ pub fn parse_coordinator_panes(output: &str) -> HashSet<String> {
         .collect()
 }
 
-/// A subagent shares its lead's pane, but never inherits its coordinator tag.
+/// A tagged pane makes a coordinator unless the session's parent shares it.
+/// Pass the parent from the full, unfiltered session list; no or missing parent passes.
 #[must_use]
-pub fn is_coordinator(session: &SessionView, panes: &HashSet<String>) -> bool {
-    session.parent_session_id.is_none()
-        && session
-            .tmux_pane
-            .as_ref()
-            .is_some_and(|pane| panes.contains(pane))
+pub fn is_coordinator(
+    session: &SessionView,
+    parent: Option<&SessionView>,
+    panes: &HashSet<String>,
+) -> bool {
+    session.tmux_pane.as_ref().is_some_and(|pane| {
+        panes.contains(pane)
+            && !parent.is_some_and(|parent| parent.tmux_pane.as_ref() == Some(pane))
+    })
 }
 
 /// Reads coordinator panes on the client's tmux server.
@@ -67,20 +71,58 @@ mod tests {
     }
 
     #[test]
-    fn only_a_lead_on_a_tagged_pane_is_coordinator() {
-        let panes = HashSet::from(["%7".to_string()]);
-        let mut session = SessionView {
-            tmux_pane: Some("%7".to_string()),
+    fn tagged_panes_exclude_only_children_sharing_their_parents_pane() {
+        let panes = HashSet::from(["%7".to_string(), "%8".to_string()]);
+        let lead = SessionView {
+            id: SessionId::new("lead"),
+            tmux_pane: Some("%7".into()),
             ..SessionView::default()
         };
-        assert!(is_coordinator(&session, &panes));
-        session.parent_session_id = Some(SessionId::new("lead"));
-        assert!(!is_coordinator(&session, &panes));
-        session.parent_session_id = None;
-        session.tmux_pane = None;
-        assert!(!is_coordinator(&session, &panes));
-        session.tmux_pane = Some("%8".to_string());
-        assert!(!is_coordinator(&session, &panes));
+        let teammate = SessionView {
+            id: SessionId::new("teammate"),
+            parent_session_id: Some(lead.id.clone()),
+            tmux_pane: Some("%8".into()),
+            ..SessionView::default()
+        };
+        let parent_without_pane = SessionView {
+            id: SessionId::new("no-pane"),
+            ..SessionView::default()
+        };
+        for (name, pane, parent_id, parent, expected) in [
+            ("tagged lead", Some("%7"), None, None, true),
+            (
+                "lead's subagent",
+                Some("%7"),
+                Some("lead"),
+                Some(&lead),
+                false,
+            ),
+            ("teammate", Some("%8"), Some("lead"), Some(&lead), true),
+            ("missing parent", Some("%7"), Some("missing"), None, true),
+            (
+                "teammate's subagent",
+                Some("%8"),
+                Some("teammate"),
+                Some(&teammate),
+                false,
+            ),
+            ("no pane", None, None, None, false),
+            ("untagged pane", Some("%9"), None, None, false),
+            (
+                "parent without pane",
+                Some("%7"),
+                Some("no-pane"),
+                Some(&parent_without_pane),
+                true,
+            ),
+        ] {
+            let session = SessionView {
+                tmux_pane: pane.map(str::to_string),
+                parent_session_id: parent_id.map(SessionId::new),
+                ..SessionView::default()
+            };
+            assert_eq!(is_coordinator(&session, parent, &panes), expected, "{name}");
+        }
     }
 
     #[tokio::test]

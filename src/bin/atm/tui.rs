@@ -374,6 +374,21 @@ pub(super) async fn run_event_loop(
                             UiAction::ToggleFold => app.toggle_fold(),
                             UiAction::CollapseAllFolds => app.collapse_all(),
                             UiAction::ExpandAllFolds => app.expand_all(),
+                            UiAction::ToggleCoordinator => {
+                                if let Some((pane, on)) = app.toggle_selected_coordinator() {
+                                    tokio::spawn(async move {
+                                        if let Err(e) = atm_tui::role::set_coordinator(
+                                            &RealTmuxClient::new(),
+                                            &pane,
+                                            on,
+                                        )
+                                        .await
+                                        {
+                                            warn!(error = %e, pane_id = %pane, "Failed to toggle coordinator tag");
+                                        }
+                                    });
+                                }
+                            }
                             UiAction::KillAgent => {
                                 if let Some(session) = app.selected_session() {
                                     if let Some(ref pane_id) = session.tmux_pane {

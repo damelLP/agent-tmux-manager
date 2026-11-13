@@ -60,6 +60,8 @@ pub enum UiAction {
     ToggleFold,
     /// Kill the selected agent and close its tmux pane.
     KillAgent,
+    /// Toggle the selected eligible pane's coordinator tag.
+    ToggleCoordinator,
     /// Interrupt the selected agent (SIGINT).
     InterruptAgent,
     /// Move the cursor to the next agent that needs attention (`n`).
@@ -190,6 +192,14 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
         tmux_only: false,
     },
     // -- Actions -------------------------------------------------------------
+    KeybindingHint {
+        help_key: "c",
+        help_desc: "Toggle coordinator tag",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Actions,
+        tmux_only: true,
+    },
     KeybindingHint {
         help_key: "Enter",
         help_desc: "Jump to session (leaf) / toggle fold (group)",
@@ -426,6 +436,7 @@ impl VimKeyResolver {
             'h' | 'l' => KeyMeaning::SimpleAction(UiAction::ExpandNode),
             'o' => KeyMeaning::OPrefix,
             'z' => KeyMeaning::ZPrefix,
+            'c' => KeyMeaning::SimpleAction(UiAction::ToggleCoordinator),
             'n' => KeyMeaning::SimpleAction(UiAction::NextAttention),
             'N' => KeyMeaning::SimpleAction(UiAction::PrevAttention),
             'x' => KeyMeaning::SimpleAction(UiAction::KillAgent),
@@ -1184,6 +1195,23 @@ mod tests {
             h.handle(key(KeyCode::Char('N'))),
             Some(UiAction::PrevAttention)
         );
+    }
+
+    #[test]
+    fn c_toggles_coordinator_without_changing_control_c_or_zc() {
+        let mut h = InputHandler::new();
+        assert_eq!(
+            h.handle(key(KeyCode::Char('c'))),
+            Some(UiAction::ToggleCoordinator)
+        );
+        assert_eq!(
+            h.handle(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(UiAction::Quit)
+        );
+        assert_eq!(h.handle(key(KeyCode::Char('z'))), None);
+        assert_eq!(h.handle(key(KeyCode::Char('c'))), Some(UiAction::CloseFold));
+        assert_eq!(h.handle(key(KeyCode::Char('*'))), None);
+        assert_eq!(h.handle(key(KeyCode::Char('#'))), None);
     }
 
     #[test]

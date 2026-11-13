@@ -148,6 +148,98 @@ fn make_app_with_sessions() -> App {
     app
 }
 
+fn coordinator_app() -> App {
+    let mut app = make_app_with_sessions();
+    let mut sessions: Vec<_> = app.sessions.values().cloned().collect();
+    for session in &mut sessions {
+        session.tmux_pane = Some(
+            if session.id_short == "def67890" {
+                "%1"
+            } else {
+                "%0"
+            }
+            .into(),
+        );
+        session.worktree_branch = Some("a-long-coordinator-branch".into());
+    }
+    let lead = sessions
+        .iter()
+        .find(|s| s.id_short == "def67890")
+        .unwrap()
+        .clone();
+    for (id, pane, parent, time) in [
+        ("child000", "%1", lead.id.clone(), "2026-01-15T10:01:00Z"),
+        ("mate0000", "%2", lead.id.clone(), "2026-01-15T10:02:00Z"),
+        (
+            "grand000",
+            "%2",
+            SessionId::new("mate0000"),
+            "2026-01-15T10:03:00Z",
+        ),
+    ] {
+        let mut session = lead.clone();
+        session.id = SessionId::new(id);
+        session.id_short = id.into();
+        session.tmux_pane = Some(pane.into());
+        session.parent_session_id = Some(parent);
+        session.started_at = time.into();
+        session.worktree_branch = None;
+        sessions.push(session);
+    }
+    app.replace_sessions(sessions);
+    app.update_coordinator_panes(["%1".to_string(), "%2".to_string()].into());
+    app.expand_all();
+    app
+}
+
+fn assert_coordinator_cells(buf: &Buffer) {
+    let tags: Vec<_> = buf
+        .content
+        .iter()
+        .filter(|cell| cell.symbol() == "C")
+        .collect();
+    assert_eq!(tags.len(), 2, "only lead and separate-pane teammate show C");
+    for cell in tags {
+        assert_eq!(cell.fg, ratatui::style::Color::Cyan);
+        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+    }
+}
+
+#[test]
+fn session_list_coordinator() {
+    let app = coordinator_app();
+    let buf = render_buffer(60, 12, |frame, area| render_session_list(frame, area, &app));
+    assert_coordinator_cells(&buf);
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn compact_session_list_coordinator() {
+    let app = coordinator_app();
+    let buf = render_buffer(28, 12, |frame, area| {
+        render_compact_session_list(frame, area, &app)
+    });
+    assert_coordinator_cells(&buf);
+    insta::assert_debug_snapshot!(buf);
+}
+
+#[test]
+fn hidden_parent_rows_do_not_tag_shared_pane_children_in_either_layout() {
+    let mut app = coordinator_app();
+    app.tree_rows.retain(|row| matches!(&row.kind,
+        atm_core::TreeRowKind::Agent { session } if session.id_short == "child000" || session.id_short == "grand000"));
+    for compact in [false, true] {
+        let buf = render_buffer(60, 12, |frame, area| {
+            if compact {
+                render_compact_session_list(frame, area, &app);
+            } else {
+                render_session_list(frame, area, &app);
+            }
+        });
+        assert!(!buf.content.iter().any(|cell| cell.symbol() == "C"));
+    }
+}
+
 /// Renders into a `TestBackend` and returns a clone of the resulting buffer.
 /// Cloning is necessary because `terminal.backend()` borrows the terminal.
 fn render_buffer<F>(width: u16, height: u16, draw: F) -> Buffer

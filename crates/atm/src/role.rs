@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use atm_core::SessionView;
+use atm_core::{SessionView, TreeNode};
 use atm_tmux::{TmuxClient, TmuxError};
 
 /// Parses `pane_id<TAB>role` rows, ignoring unset or unknown roles.
@@ -28,6 +28,30 @@ pub fn is_coordinator(
         panes.contains(pane)
             && !parent.is_some_and(|parent| parent.tmux_pane.as_ref() == Some(pane))
     })
+}
+
+/// Stably puts coordinators first within each group, preserving subagent order.
+/// Group-level agents from `build_tree` have no parent in its input list;
+/// children with present parents are in `Agent::subagents`, which we leave alone.
+/// Passing no parent here also relies on filters retaining same-pane parents:
+/// the tmux-session filter selects by pane, and text filtering keeps ancestors.
+/// A filter that drops those ancestors would need the full-map parent here,
+/// matching the tag's classification even when the parent is hidden.
+pub fn coordinators_first(tree: &mut [TreeNode], panes: &HashSet<String>) {
+    for node in tree {
+        match node {
+            TreeNode::Project { children, .. }
+            | TreeNode::Worktree { children, .. }
+            | TreeNode::Team { children, .. } => {
+                children.sort_by_key(|node| {
+                    !matches!(node, TreeNode::Agent { session, .. }
+                        if is_coordinator(session, None, panes))
+                });
+                coordinators_first(children, panes);
+            }
+            TreeNode::Agent { .. } => {}
+        }
+    }
 }
 
 /// Reads coordinator panes on the client's tmux server.
@@ -60,6 +84,135 @@ mod tests {
     use super::*;
     use atm_core::SessionId;
     use atm_tmux::{mock::MockCall, MockTmuxClient};
+
+    fn agent(id: &str, time: &str, worktree: &str) -> SessionView {
+        SessionView {
+            id: SessionId::new(id),
+            started_at: time.into(),
+            tmux_pane: Some(format!("%{id}")),
+            project_root: Some("/project".into()),
+            worktree_path: Some(worktree.into()),
+            ..SessionView::default()
+        }
+    }
+
+    fn row_ids(tree: &[atm_core::TreeNode]) -> Vec<atm_core::TreeNodeId> {
+        atm_core::flatten_tree(tree, &atm_core::all_node_ids(tree))
+            .into_iter()
+            .map(|row| row.node_id)
+            .collect()
+    }
+
+    fn agent_ids(tree: &[atm_core::TreeNode]) -> Vec<String> {
+        row_ids(tree)
+            .into_iter()
+            .filter_map(|id| match id {
+                atm_core::TreeNodeId::Agent(id) => Some(id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coordinator_bands_keep_newest_first_under_projects_worktrees_and_teams() {
+        use atm_core::{build_tree, TreeNode};
+        for worktrees in [false, true] {
+            let mut sessions = vec![
+                agent("old", "1", "/a"),
+                agent("mid", "2", "/a"),
+                agent("new", "3", "/a"),
+                agent("newest", "4", "/a"),
+            ];
+            if worktrees {
+                sessions.extend([agent("b-old", "1", "/b"), agent("b-new", "2", "/b")]);
+            }
+            let mut tree = build_tree(&sessions);
+            let groups = |tree: &[TreeNode]| {
+                row_ids(tree)
+                    .into_iter()
+                    .filter(|id| !matches!(id, atm_core::TreeNodeId::Agent(_)))
+                    .collect::<Vec<_>>()
+            };
+            let before = groups(&tree);
+            coordinators_first(&mut tree, &HashSet::from(["%old".into()]));
+            let expected = if worktrees {
+                vec!["old", "newest", "new", "mid", "b-new", "b-old"]
+            } else {
+                vec!["old", "newest", "new", "mid"]
+            };
+            assert_eq!(agent_ids(&tree), expected);
+            assert_eq!(groups(&tree), before);
+
+            // Start with build_tree's newest order, then preserve it in each band.
+            let mut tree = build_tree(&sessions);
+            coordinators_first(
+                &mut tree,
+                &HashSet::from(["%old".into(), "%new".into(), "%b-old".into()]),
+            );
+            let expected = if worktrees {
+                vec!["new", "old", "newest", "mid", "b-old", "b-new"]
+            } else {
+                vec!["new", "old", "newest", "mid"]
+            };
+            assert_eq!(agent_ids(&tree), expected);
+            assert_eq!(groups(&tree), before);
+        }
+        let mut teams = vec![TreeNode::Team {
+            name: "team".into(),
+            children: vec![
+                TreeNode::Agent {
+                    session: agent("new", "2", "/a"),
+                    subagents: vec![],
+                },
+                TreeNode::Agent {
+                    session: agent("old", "1", "/a"),
+                    subagents: vec![],
+                },
+            ],
+        }];
+        coordinators_first(&mut teams, &HashSet::from(["%old".into()]));
+        assert_eq!(agent_ids(&teams), ["old", "new"]);
+    }
+
+    #[test]
+    fn coordinator_sort_leaves_descendants_in_spawn_order_but_promotes_orphans() {
+        let lead = agent("lead", "1", "/a");
+        let mut first = agent("first", "2", "/a");
+        first.parent_session_id = Some(lead.id.clone());
+        let mut mate = agent("mate", "3", "/a");
+        mate.parent_session_id = Some(lead.id.clone());
+        let mut child = agent("child", "4", "/a");
+        child.parent_session_id = Some(mate.id.clone());
+        child.tmux_pane.clone_from(&mate.tmux_pane);
+        let newer = agent("newer", "5", "/a");
+        let panes = HashSet::from(["%mate".into()]);
+        let mut tree = atm_core::build_tree(&[
+            lead,
+            first.clone(),
+            mate.clone(),
+            child.clone(),
+            newer.clone(),
+        ]);
+        coordinators_first(&mut tree, &panes);
+        assert_eq!(
+            agent_ids(&tree),
+            ["newer", "lead", "first", "mate", "child"]
+        );
+        let mut tree = atm_core::build_tree(&[first, mate, child, newer]);
+        coordinators_first(&mut tree, &panes);
+        assert_eq!(agent_ids(&tree), ["mate", "child", "newer", "first"]);
+    }
+
+    #[test]
+    fn empty_coordinator_set_preserves_the_entire_tree() {
+        let mut child = agent("child", "2", "/a");
+        child.parent_session_id = Some(SessionId::new("lead"));
+        let mut tree =
+            atm_core::build_tree(&[agent("lead", "1", "/a"), child, agent("other", "3", "/b")]);
+        let before = format!("{tree:?}");
+        coordinators_first(&mut tree, &HashSet::new());
+        assert_eq!(format!("{tree:?}"), before);
+    }
 
     #[test]
     fn parses_only_exact_coordinator_roles() {

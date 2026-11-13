@@ -374,6 +374,21 @@ pub(super) async fn run_event_loop(
                             UiAction::ToggleFold => app.toggle_fold(),
                             UiAction::CollapseAllFolds => app.collapse_all(),
                             UiAction::ExpandAllFolds => app.expand_all(),
+                            UiAction::ToggleCoordinator => {
+                                if let Some((pane, on)) = app.toggle_selected_coordinator() {
+                                    tokio::spawn(async move {
+                                        if let Err(e) = atm_tui::role::set_coordinator(
+                                            &RealTmuxClient::new(),
+                                            &pane,
+                                            on,
+                                        )
+                                        .await
+                                        {
+                                            warn!(error = %e, pane_id = %pane, "Failed to toggle coordinator tag");
+                                        }
+                                    });
+                                }
+                            }
                             UiAction::KillAgent => {
                                 if let Some(session) = app.selected_session() {
                                     if let Some(ref pane_id) = session.tmux_pane {
@@ -491,6 +506,9 @@ pub(super) async fn run_event_loop(
                     debug!(session_id = %session_id, "Session removed");
                     app.remove_session(&session_id);
                 }
+                Event::RoleUpdate(panes) => {
+                    app.update_coordinator_panes(panes);
+                }
                 Event::FilterUpdate(pane_ids) => {
                     app.update_filter_panes(pane_ids);
                 }
@@ -554,6 +572,116 @@ pub(super) fn spawn_filter_task(
             }
         }
     })
+}
+
+/// Polls pane roles independently of the optional tmux-session filter.
+/// Errors leave the last successful (or optimistic) role set on screen.
+pub(super) fn spawn_role_task(
+    client: impl TmuxClient + 'static,
+    event_tx: mpsc::UnboundedSender<Event>,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        let poll_loop = async {
+            loop {
+                interval.tick().await;
+                if let Ok(panes) = atm_tui::role::coordinator_panes(&client).await {
+                    if event_tx.send(Event::RoleUpdate(panes)).is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            () = cancel_token.cancelled() => {}
+            () = event_tx.closed() => {}
+            () = poll_loop => {}
+        }
+    })
+}
+
+#[cfg(test)]
+mod role_task_tests {
+    use super::*;
+    use atm_tmux::{MockTmuxClient, TmuxError};
+    use tokio::time::timeout;
+
+    async fn next_roles(
+        events: &mut mpsc::UnboundedReceiver<Event>,
+        within: Duration,
+    ) -> Option<HashSet<String>> {
+        match timeout(within, events.recv()).await {
+            Ok(Some(Event::RoleUpdate(panes))) => Some(panes),
+            Err(_) => None,
+            other => panic!("expected role update: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roles_arrive_immediately_then_every_three_seconds_including_empty_sets() {
+        let client = MockTmuxClient::new();
+        client.set_next_raw_output("%1\tcoordinator\n%2\t\n");
+        client.set_next_raw_output("%2\tcoordinator\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let handle = spawn_role_task(client, tx, cancel.clone());
+        assert_eq!(
+            next_roles(&mut rx, Duration::from_millis(1)).await,
+            Some(HashSet::from(["%1".into()]))
+        );
+        assert_eq!(next_roles(&mut rx, Duration::from_millis(2999)).await, None);
+        assert_eq!(
+            next_roles(&mut rx, Duration::from_millis(2)).await,
+            Some(HashSet::from(["%2".into()]))
+        );
+        assert_eq!(
+            next_roles(&mut rx, Duration::from_millis(3001)).await,
+            Some(HashSet::new())
+        );
+        cancel.cancel();
+        timeout(Duration::from_millis(100), handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_lookup_sends_nothing_and_next_success_recovers() {
+        let client = MockTmuxClient::new();
+        client.set_next_error(TmuxError::NotFound);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let handle = spawn_role_task(client.clone(), tx, cancel.clone());
+        assert_eq!(next_roles(&mut rx, Duration::from_millis(2999)).await, None);
+        client.set_next_raw_output("%7\tcoordinator\n");
+        assert_eq!(
+            next_roles(&mut rx, Duration::from_millis(2)).await,
+            Some(HashSet::from(["%7".into()]))
+        );
+        cancel.cancel();
+        timeout(Duration::from_millis(100), handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_receiver_stops_without_waiting_for_the_next_lookup() {
+        let client = MockTmuxClient::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn_role_task(client.clone(), tx, CancellationToken::new());
+        assert_eq!(
+            next_roles(&mut rx, Duration::from_millis(1)).await,
+            Some(HashSet::new())
+        );
+        client.set_next_error(TmuxError::NotFound);
+        drop(rx);
+        timeout(Duration::from_millis(100), handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

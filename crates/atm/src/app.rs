@@ -109,6 +109,9 @@ pub struct App {
     /// Pane IDs that belong to the filtered tmux session (populated by filter task).
     pub filter_pane_ids: HashSet<String>,
 
+    /// Panes tagged as coordinators on the TUI's tmux server.
+    pub coordinator_panes: HashSet<String>,
+
     /// Compact mode: vertical layout optimized for narrow sidebar panes.
     pub compact: bool,
 
@@ -161,6 +164,7 @@ impl App {
             beads_tasks: HashMap::new(),
             tmux_session_filter: None,
             filter_pane_ids: HashSet::new(),
+            coordinator_panes: HashSet::new(),
             compact: false,
             filter_query: String::new(),
             search_active: false,
@@ -192,6 +196,53 @@ impl App {
             self.filter_pane_ids = pane_ids;
             self.rebuild_tree();
         }
+    }
+
+    /// Rebuilds the tree only when the coordinator pane set changes.
+    pub fn update_coordinator_panes(&mut self, panes: HashSet<String>) {
+        if self.coordinator_panes != panes {
+            self.coordinator_panes = panes;
+            self.rebuild_tree();
+            if let Some(pos) = self
+                .last_selected_node
+                .as_ref()
+                .and_then(|id| self.tree_rows.iter().position(|row| &row.node_id == id))
+            {
+                self.selected_index = pos;
+            }
+        }
+    }
+
+    /// Classifies a row using its parent from the full, unfiltered session map.
+    #[must_use]
+    pub fn is_coordinator(&self, session: &SessionView) -> bool {
+        crate::role::is_coordinator(session, self.parent_of(session), &self.coordinator_panes)
+    }
+
+    fn parent_of(&self, session: &SessionView) -> Option<&SessionView> {
+        session
+            .parent_session_id
+            .as_ref()
+            .and_then(|id| self.sessions.get(id))
+    }
+
+    /// Optimistically toggles an eligible row, returning the pane and desired
+    /// value for the caller to write to tmux. Shared-parent-pane rows are no-ops.
+    #[must_use]
+    pub fn toggle_selected_coordinator(&mut self) -> Option<(String, bool)> {
+        let session = self.selected_session()?;
+        let pane = session.tmux_pane.clone()?;
+        let parent = self.parent_of(session);
+        let mut panes = self.coordinator_panes.clone();
+        let on = panes.insert(pane.clone());
+        if !crate::role::is_coordinator(session, parent, &panes) {
+            return None;
+        }
+        if !on {
+            panes.remove(&pane);
+        }
+        self.update_coordinator_panes(panes);
+        Some((pane, on))
     }
 
     /// Updates the session list with new data from the daemon.
@@ -266,6 +317,7 @@ impl App {
             Some(selection.matched)
         };
         let previous_tree = std::mem::replace(&mut self.tree, build_tree(&sessions));
+        crate::role::coordinators_first(&mut self.tree, &self.coordinator_panes);
 
         // On first build, expand everything so the tree starts open
         if self.expanded.is_empty() && !self.tree.is_empty() {
@@ -825,6 +877,146 @@ mod tests {
             tmux_pane: None,
             ..Default::default()
         }
+    }
+
+    fn role_session(id: &str, pane: Option<&str>, parent: Option<&str>, time: &str) -> SessionView {
+        let mut session = create_test_session(id, time);
+        session.tmux_pane = pane.map(str::to_string);
+        session.parent_session_id = parent.map(SessionId::new);
+        session
+    }
+
+    fn role_row_ids(app: &App) -> Vec<&str> {
+        app.tree_rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                TreeRowKind::Agent { session } => Some(session.id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coordinator_updates_reorder_without_losing_selection_or_rebuilding_unchanged_sets() {
+        let mut app = App::new();
+        assert!(app.coordinator_panes.is_empty());
+        app.update_sessions(vec![
+            role_session("old", Some("%1"), None, "1"),
+            role_session("new", Some("%2"), None, "2"),
+        ]);
+        select(&mut app, "old");
+        app.update_coordinator_panes(HashSet::from(["%1".into()]));
+        assert_eq!(role_row_ids(&app), ["old", "new"]);
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "old");
+        app.update_coordinator_panes(HashSet::new());
+        assert_eq!(role_row_ids(&app), ["new", "old"]);
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "old");
+        // A rebuild would replace these cached rows even though roles did not change.
+        app.tree_rows.clear();
+        app.update_coordinator_panes(HashSet::new());
+        assert!(app.tree_rows.is_empty());
+    }
+
+    #[test]
+    fn coordinator_classification_and_toggle_use_full_map_even_when_parent_rows_are_hidden() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            role_session("lead", Some("%1"), None, "1"),
+            role_session("child", Some("%1"), Some("lead"), "2"),
+            role_session("mate", Some("%2"), Some("lead"), "3"),
+            role_session("grandchild", Some("%2"), Some("mate"), "4"),
+            role_session("orphan", Some("%3"), Some("missing"), "5"),
+            role_session("no-pane", None, None, "6"),
+        ]);
+        app.update_coordinator_panes(HashSet::from(["%1".into(), "%2".into(), "%3".into()]));
+        for (id, expected) in [
+            ("lead", true),
+            ("child", false),
+            ("mate", true),
+            ("grandchild", false),
+            ("orphan", true),
+            ("no-pane", false),
+        ] {
+            assert_eq!(
+                app.is_coordinator(app.sessions.get(&SessionId::new(id)).unwrap()),
+                expected,
+                "{id}"
+            );
+        }
+        for id in ["child", "grandchild"] {
+            select(&mut app, id);
+            let selected = app.tree_rows[app.selected_index].clone();
+            app.tree_rows = vec![selected];
+            app.selected_index = 0;
+            assert!(!app.is_coordinator(app.selected_session().unwrap()));
+            assert_eq!(app.toggle_selected_coordinator(), None);
+            assert_eq!(app.coordinator_panes.len(), 3);
+        }
+    }
+
+    #[test]
+    fn coordinator_toggle_is_immediate_and_ignores_ineligible_rows() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            role_session("lead", Some("%1"), None, "1"),
+            role_session("child", Some("%1"), Some("lead"), "2"),
+            role_session("mate", Some("%2"), Some("lead"), "3"),
+            role_session("new", Some("%3"), None, "4"),
+            role_session("no-pane", None, None, "5"),
+        ]);
+        assert_eq!(app.toggle_selected_coordinator(), None, "group row");
+        for id in ["child", "no-pane"] {
+            select(&mut app, id);
+            assert_eq!(app.toggle_selected_coordinator(), None);
+            assert!(app.coordinator_panes.is_empty());
+        }
+        select(&mut app, "lead");
+        assert_eq!(app.toggle_selected_coordinator(), Some(("%1".into(), true)));
+        assert_eq!(
+            role_row_ids(&app),
+            ["lead", "child", "mate", "no-pane", "new"]
+        );
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "lead");
+        assert_eq!(
+            app.toggle_selected_coordinator(),
+            Some(("%1".into(), false))
+        );
+        assert!(app.coordinator_panes.is_empty());
+        assert_eq!(
+            role_row_ids(&app),
+            ["no-pane", "new", "lead", "child", "mate"]
+        );
+        select(&mut app, "mate");
+        assert_eq!(app.toggle_selected_coordinator(), Some(("%2".into(), true)));
+        assert!(app.is_coordinator(app.selected_session().unwrap()));
+        assert_eq!(
+            role_row_ids(&app),
+            ["no-pane", "new", "lead", "child", "mate"]
+        );
+    }
+
+    #[test]
+    fn filters_keep_same_pane_parents_and_promote_only_separate_pane_teammates() {
+        let lead = role_session("lead", Some("%1"), None, "1");
+        let child = role_session("child", Some("%1"), Some("lead"), "2");
+        let mate = role_session("mate", Some("%2"), Some("lead"), "3");
+        let newer = role_session("newer", Some("%3"), None, "4");
+        let mut app = App::with_tmux_session_filter("private".into());
+        app.update_filter_panes(HashSet::from(["%1".into(), "%2".into(), "%3".into()]));
+        app.update_sessions(vec![lead, child, mate, newer]);
+        app.update_coordinator_panes(HashSet::from(["%1".into(), "%2".into()]));
+        app.start_search();
+        for c in "child".chars() {
+            app.push_search_char(c);
+        }
+        assert_eq!(role_row_ids(&app), ["lead", "child"]);
+        assert!(!app.is_coordinator(app.sessions.get(&SessionId::new("child")).unwrap()));
+        app.clear_filter();
+        app.update_filter_panes(HashSet::from(["%2".into(), "%3".into()]));
+        assert_eq!(role_row_ids(&app), ["mate", "newer"]);
+        assert!(app.sessions.contains_key(&SessionId::new("lead")));
+        app.remove_session("lead");
+        assert_eq!(role_row_ids(&app), ["mate", "newer"]);
     }
 
     fn beads_task(id: &str) -> BeadsTask {

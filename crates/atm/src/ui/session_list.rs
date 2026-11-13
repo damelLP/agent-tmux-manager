@@ -35,7 +35,14 @@ pub fn render_session_list(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, row)| {
-            let item = create_tree_row_item(row, idx == app.selected_index, app.blink_visible);
+            let coordinator = matches!(&row.kind, TreeRowKind::Agent { session }
+                if app.is_coordinator(session));
+            let item = create_tree_row_item(
+                row,
+                idx == app.selected_index,
+                app.blink_visible,
+                coordinator,
+            );
             dim_if_filter_context(item, row, app)
         })
         .collect();
@@ -94,6 +101,7 @@ pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
                     is_selected,
                     app.blink_visible,
                     inner_width,
+                    app.is_coordinator(session),
                 ),
             };
 
@@ -132,6 +140,7 @@ fn create_tree_row_item(
     row: &TreeRow,
     is_selected: bool,
     blink_visible: bool,
+    coordinator: bool,
 ) -> ListItem<'static> {
     let indent = "  ".repeat(row.depth as usize);
 
@@ -145,7 +154,7 @@ fn create_tree_row_item(
         }
         TreeRowKind::Team { name } => create_group_line(&indent, name, row, is_selected),
         TreeRowKind::Agent { session } => {
-            create_agent_line(&indent, session, is_selected, blink_visible)
+            create_agent_line(&indent, session, is_selected, blink_visible, coordinator)
         }
     };
 
@@ -213,6 +222,7 @@ fn create_agent_line(
     session: &SessionView,
     is_selected: bool,
     blink_visible: bool,
+    coordinator: bool,
 ) -> Line<'static> {
     let context_pct = session.context_percentage;
     let ctx_color = context_color(context_pct, session.context_critical);
@@ -245,6 +255,7 @@ fn create_agent_line(
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw(" "),
+        coordinator_span(coordinator),
         // Harness badge: `[pi]`, `[claude]`, `[?]`. Rendered in
         // a distinct color so vendor differences are scannable.
         Span::styled(
@@ -260,6 +271,15 @@ fn create_agent_line(
     ];
 
     Line::from(spans)
+}
+
+fn coordinator_span(coordinator: bool) -> Span<'static> {
+    Span::styled(
+        if coordinator { "C " } else { "" },
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 /// Display label for the harness badge. Empty string (legacy sessions
@@ -286,7 +306,7 @@ fn harness_color(harness: &str) -> Color {
 
 /// Creates a compact line for an agent row in narrow sidebars.
 ///
-/// Format: `{selector}{indent}{icon} {ctx%} {name}`
+/// Format: `{selector}{indent}{icon} {ctx%} {optional C }{name}`
 /// Name is resolved from worktree branch (preferred) or short ID (fallback),
 /// then adaptively truncated to fit `available_width`.
 fn create_compact_agent_line(
@@ -295,6 +315,7 @@ fn create_compact_agent_line(
     is_selected: bool,
     blink_visible: bool,
     available_width: u16,
+    coordinator: bool,
 ) -> Line<'static> {
     let icon = status_icon(session.status, blink_visible);
     let icon_color = status_color(session.status);
@@ -305,7 +326,9 @@ fn create_compact_agent_line(
         .as_deref()
         .unwrap_or(&session.id_short);
 
-    let overhead = 9u16.saturating_add(indent.len() as u16);
+    let overhead = 9u16
+        .saturating_add(indent.len() as u16)
+        .saturating_add(if coordinator { 2 } else { 0 });
     let name_width = available_width.saturating_sub(overhead) as usize;
     let truncated_name = truncate_string(name, name_width.max(1));
 
@@ -326,6 +349,7 @@ fn create_compact_agent_line(
             Style::default().fg(ctx_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
+        coordinator_span(coordinator),
         Span::styled(truncated_name, Style::default().fg(Color::White)),
     ];
 
@@ -511,6 +535,32 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
 mod tests {
     use super::*;
     use atm_core::SessionStatus;
+
+    #[test]
+    fn coordinator_span_precedes_badge_or_name_without_reserving_untagged_space() {
+        let session = SessionView {
+            id_short: "short-id".into(),
+            model: "model".into(),
+            harness: "pi".into(),
+            worktree_branch: Some("abcdefghijklmnop".into()),
+            ..SessionView::default()
+        };
+        let full = create_agent_line("  ", &session, false, true, true);
+        let plain = create_agent_line("  ", &session, false, true, false);
+        assert_eq!(full.width(), plain.width() + 2);
+        assert!(full.to_string().contains("short-id C [pi]"));
+        assert!(plain.to_string().contains("short-id [pi]"));
+        for tagged in [false, true] {
+            let line = create_compact_agent_line("  ", &session, false, true, 20, tagged);
+            assert_eq!(line.width(), 20);
+            let suffix = if tagged { "C abcd..." } else { "abcdef..." };
+            assert!(line.to_string().ends_with(suffix), "{line}");
+            for span in line.spans.iter().filter(|span| span.content == "C ") {
+                assert_eq!(span.style.fg, Some(Color::Cyan));
+                assert!(span.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
 
     #[test]
     fn test_status_icon_via_theme() {

@@ -260,6 +260,41 @@ async fn json_does_not_tag_a_subagent_when_filters_hide_its_parent() {
     }
 }
 
+#[tokio::test]
+async fn json_duplicate_parent_ids_exclude_a_shared_pane_in_either_row_order() {
+    use atm_core::{SessionId, SessionView};
+    let mut roles = Vec::new();
+    for parent_panes in [["%1", "%7"], ["%7", "%1"]] {
+        let mut sessions: Vec<_> = parent_panes
+            .into_iter()
+            .map(|pane| SessionView {
+                id: SessionId::new("dup"),
+                tmux_pane: Some(pane.into()),
+                ..SessionView::default()
+            })
+            .collect();
+        sessions.push(SessionView {
+            id: SessionId::new("child"),
+            parent_session_id: Some(SessionId::new("dup")),
+            tmux_pane: Some("%7".into()),
+            ..SessionView::default()
+        });
+        let output = list_fixture(
+            sessions,
+            Some("printf '%s\\t%s\\n' %7 coordinator"),
+            "json",
+            &[],
+        )
+        .await;
+        assert!(output.status.success(), "{parent_panes:?}: {output:?}");
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(listed.len(), 3, "{parent_panes:?}");
+        let child = listed.iter().find(|row| row["id"] == "child").unwrap();
+        roles.push(child.get("role").cloned());
+    }
+    assert_eq!(roles, vec![Some(serde_json::Value::Null); 2]);
+}
+
 /// A daemon that dies mid-exchange closes the socket before sending
 /// SessionList. `atm list` must fail, not print an empty list.
 #[test]

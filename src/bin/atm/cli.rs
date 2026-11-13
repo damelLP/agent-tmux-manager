@@ -331,10 +331,13 @@ pub(super) async fn cmd_list(
             let rows: Vec<_> = filtered
                 .iter()
                 .map(|session| {
-                    let parent = session
-                        .parent_session_id
-                        .as_ref()
-                        .and_then(|id| sessions.iter().find(|s| s.id == *id));
+                    // Rows can share an id (one per live process); prefer the same pane.
+                    let parent = session.parent_session_id.as_ref().and_then(|id| {
+                        sessions
+                            .iter()
+                            .filter(|s| s.id == *id)
+                            .min_by_key(|s| s.tmux_pane != session.tmux_pane)
+                    });
                     ListedSession {
                         session,
                         role: role::is_coordinator(session, parent, &panes)

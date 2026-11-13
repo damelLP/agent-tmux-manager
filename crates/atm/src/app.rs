@@ -216,11 +216,14 @@ impl App {
     /// Classifies a row using its parent from the full, unfiltered session map.
     #[must_use]
     pub fn is_coordinator(&self, session: &SessionView) -> bool {
-        let parent = session
+        crate::role::is_coordinator(session, self.parent_of(session), &self.coordinator_panes)
+    }
+
+    fn parent_of(&self, session: &SessionView) -> Option<&SessionView> {
+        session
             .parent_session_id
             .as_ref()
-            .and_then(|id| self.sessions.get(id));
-        crate::role::is_coordinator(session, parent, &self.coordinator_panes)
+            .and_then(|id| self.sessions.get(id))
     }
 
     /// Optimistically toggles an eligible row, returning the pane and desired
@@ -229,10 +232,7 @@ impl App {
     pub fn toggle_selected_coordinator(&mut self) -> Option<(String, bool)> {
         let session = self.selected_session()?;
         let pane = session.tmux_pane.clone()?;
-        let parent = session
-            .parent_session_id
-            .as_ref()
-            .and_then(|id| self.sessions.get(id));
+        let parent = self.parent_of(session);
         let mut panes = self.coordinator_panes.clone();
         let on = panes.insert(pane.clone());
         if !crate::role::is_coordinator(session, parent, &panes) {

@@ -33,6 +33,10 @@ pub fn is_coordinator(
 /// Stably puts coordinators first within each group, preserving subagent order.
 /// Group-level agents from `build_tree` have no parent in its input list;
 /// children with present parents are in `Agent::subagents`, which we leave alone.
+/// Passing no parent here also relies on filters retaining same-pane parents:
+/// the tmux-session filter selects by pane, and text filtering keeps ancestors.
+/// A filter that drops those ancestors would need the full-map parent here,
+/// matching the tag's classification even when the parent is hidden.
 pub fn coordinators_first(tree: &mut [TreeNode], panes: &HashSet<String>) {
     for node in tree {
         match node {

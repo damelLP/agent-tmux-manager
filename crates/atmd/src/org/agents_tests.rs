@@ -20,10 +20,26 @@ mod reconciliation {
 
     const IDLE: &str =
         include_str!("../../../atm-pi-adapter/tests/fixtures/screen_pi-after-clear_1.5.0.txt");
-    // Captured: codex-cli 0.167.0; see the Codex adapter's fixture README (U5b).
+    // Real styled captures; each adapter's fixture README has the `Captured:`
+    // line, which `body` removes. The P1 ones are `-e -N` with tmux's padding.
     const CODEX_IDLE: &str = include_str!(
         "../../../atm-codex-adapter/tests/fixtures/screen_styled_u5b_rich-fresh_0.167.0.txt"
     );
+    const CODEX_PADDED: &str = include_str!(
+        "../../../atm-codex-adapter/tests/fixtures/screen_styled_p1_c11-working-released-100x24_0.167.0.txt"
+    );
+    const PI_PADDED: &str = include_str!(
+        "../../../atm-pi-adapter/tests/fixtures/screen_styled_p1_A-ready-120x40_1.5.0.txt"
+    );
+    const CLAUDE_PADDED: [&str; 2] = [
+        include_str!(
+            "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-ready-120x40_2.1.325.txt"
+        ),
+        include_str!(
+            "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_B-baseline-conversation-120x40_2.1.325.txt"
+        ),
+    ];
+    use super::super::agent_screen_tests::body;
     struct Rig {
         org: super::super::OrgHandle,
         registry: RegistryHandle,
@@ -325,7 +341,7 @@ mod reconciliation {
         rig.agent_of("lead", "codex", Some("%1"), Some("recorded"))
             .await;
         rig.row_of("pending-100", "%1", false, Harness::Codex).await;
-        rig.frame_of("%1", "p/lead", CODEX_IDLE, "codex");
+        rig.frame_of("%1", "p/lead", body(CODEX_IDLE), "codex");
         let before = rig.org.status().unwrap();
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
@@ -344,6 +360,53 @@ mod reconciliation {
         assert_eq!(agent.status, AgentStatus::Ready);
         assert_eq!(agent.session_id, Some(SessionId::new("recorded")));
         assert_eq!(rig.org.status().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn restart_check_reads_real_padded_idle_editors() {
+        // The control actor captures with `-N`, which pads rows to the pane's
+        // width. A real padded capture of each harness's idle editor must read
+        // as safe, or every restart suspends a Ready bound agent. For Claude
+        // this takes the control observer: its legacy one does not know the
+        // manual-mode footer of these two frames.
+        for (harness, tag, command, text) in [
+            ("pi", Harness::Pi, "pi", PI_PADDED),
+            ("codex", Harness::Codex, "codex", CODEX_PADDED),
+            ("claude", Harness::ClaudeCode, "claude", CLAUDE_PADDED[0]),
+            ("claude", Harness::ClaudeCode, "claude", CLAUDE_PADDED[1]),
+        ] {
+            let text = body(text);
+            assert!(
+                text.lines().filter(|line| line.ends_with(' ')).count() > 5,
+                "{harness}: not a padded capture"
+            );
+            let rig = Rig::new().await;
+            rig.agent_of("lead", harness, Some("%1"), Some("recorded"))
+                .await;
+            rig.row_of("pending-100", "%1", false, tag).await;
+            rig.frame_of("%1", "p/lead", text, command);
+            let before = rig.org.status().unwrap();
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            assert_eq!(
+                rig.client
+                    .pending_reads(&PaneId::parse("%1").unwrap())
+                    .unwrap(),
+                0,
+                "{harness}"
+            );
+            assert_eq!(
+                agents.list(ListParams::default()).await.unwrap()[0].reason,
+                None,
+                "{harness}"
+            );
+            assert_eq!(
+                rig.state("lead").await.status,
+                AgentStatus::Ready,
+                "{harness}"
+            );
+            assert_eq!(rig.org.status().unwrap(), before, "{harness}");
+        }
     }
 
     #[tokio::test]
@@ -370,7 +433,7 @@ mod reconciliation {
         progress(&mut events, "finished", Some("p/lead")).await;
         assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
         assert_eq!(rig.org.status().unwrap(), before);
-        rig.frame_of("%1", "p/lead", CODEX_IDLE, "codex");
+        rig.frame_of("%1", "p/lead", body(CODEX_IDLE), "codex");
         update(&rig, "s1").await;
         progress(&mut events, "finished", Some("p/lead")).await;
         let agent = rig.state("lead").await;

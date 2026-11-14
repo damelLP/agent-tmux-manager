@@ -90,6 +90,99 @@ fn reservation_decodes_real_tmux_frames_and_preserves_whitespace_style() {
     }
 }
 #[test]
+fn reservation_focus_is_exact_and_malformed_clients_are_unknown() {
+    let pane = PaneId::parse("%0").unwrap();
+    let data = fixture();
+    let base = data["ansi"].as_str().unwrap();
+    for (clients, expected) in [
+        ("", Some(false)),
+        ("focused,UTF-8\t%0\n", Some(true)),
+        ("UTF-8,focused\t%9\nUTF-8\t%0\n", Some(false)),
+        ("unfocused\t%0\n", Some(false)),
+        ("UTF-8\t%0\nfocused\t%0\n", Some(true)),
+        ("focused\t%0\nmalformed\n", None),
+        ("focused\t%00\n", None),
+        ("\t%0\n", None),
+        ("#{client_flags}\t%0\n", None),
+        ("focused,,UTF-8\t%0\n", None),
+        ("focused\t%0", None),
+    ] {
+        let framed = base.replace("ATM-END", &format!("ATM-CLIENTS-v1\n{clients}ATM-END"));
+        let captured = decode_capture(&pane, &framed, CaptureFormat::Ansi).unwrap();
+        assert_eq!(captured.focused, expected, "{clients:?}");
+        assert!(captured.text.starts_with("\x1b[31mprobe"));
+    }
+}
+
+#[test]
+fn reservation_current_frames_cannot_consume_the_clients_marker_as_a_viewport_row() {
+    let pane = PaneId::parse("%0").unwrap();
+    let data = fixture();
+    let v2 = data["plain"]
+        .as_str()
+        .unwrap()
+        .replacen("ATM-PANE-v1", "ATM-PANE-v2", 1)
+        .replacen('\n', "\t\tneutral\n", 1)
+        .replace("ATM-END", "ATM-CLIENTS-v1\nATM-END");
+    assert_eq!(
+        decode_capture(&pane, &v2, CaptureFormat::Plain)
+            .unwrap()
+            .focused,
+        Some(false)
+    );
+    let truncated = v2.replace("ready     \n", "");
+    assert!(matches!(
+        decode_capture(&pane, &truncated, CaptureFormat::Plain),
+        Err(ReservationError::InvalidObservation { .. })
+    ));
+}
+
+#[test]
+fn reservation_process_facts_are_optional_and_never_classified() {
+    let pane = PaneId::parse("%0").unwrap();
+    let data = fixture();
+    let base = data["filtered_list"].as_str().unwrap().trim_end();
+    let v2 = base.replace("ATM-PANE-v1", "ATM-PANE-v2");
+    for command in ["neutral-program", "", "name with spaces"] {
+        let parsed = decode_metadata(&pane, &format!("{v2}\t\t{command}\n")).unwrap();
+        assert_eq!(parsed.pane_root_pid(), Some(2353666));
+        assert_eq!(parsed.foreground_pid, None);
+        assert_eq!(
+            parsed.foreground_command.as_deref(),
+            (!command.is_empty()).then_some(command)
+        );
+    }
+    let unsupported =
+        decode_metadata(&pane, &format!("{}\t\t\n", v2.replace("2353666", ""))).unwrap();
+    assert_eq!(unsupported.pane_root_pid(), None);
+    assert_eq!(unsupported.foreground_command, None);
+}
+
+#[test]
+fn reservation_grouped_panes_agree_and_mode_count_is_not_boolean() {
+    let data = fixture();
+    let pane = PaneId::parse("%0").unwrap();
+    let metadata = data["filtered_list"].as_str().unwrap();
+    let first = decode_metadata(&pane, metadata).unwrap();
+    let linked = metadata.replace(
+        &format!(
+            "\t{}\t{}\t",
+            first.pane.session_name, first.pane.window_index
+        ),
+        "\tlinked\t99\t",
+    );
+    assert_eq!(
+        decode_metadata(&pane, &format!("{metadata}{linked}")).unwrap(),
+        first
+    );
+    assert!(
+        decode_metadata(&pane, &metadata.replace("\t0\t0\t0\t5", "\t0\t2\t0\t5"))
+            .unwrap()
+            .in_mode
+    );
+}
+
+#[test]
 fn reservation_rejects_malformed_metadata_and_incomplete_framing() {
     let data = fixture();
     let pane = PaneId::parse("%0").unwrap();
@@ -99,8 +192,9 @@ fn reservation_rejects_malformed_metadata_and_incomplete_framing() {
         metadata.replace("\t40\t", "\t0\t"),
         metadata.replace("\t5\t1\n", "\t5\t8\n"),
         metadata.replace("%0", "%00"),
-        metadata.replace("\t0\t0\t0\t5", "\t0\t2\t0\t5"),
-        format!("{metadata}{metadata}"),
+        metadata.replace("\t0\t0\t0\t5", "\t0\tbad\t0\t5"),
+        format!("{metadata}{}", metadata.replace("2353666", "2353667")),
+        format!("{metadata}{}", metadata.replace("%0", "%1")),
         data["missing_display"].as_str().unwrap().into(),
         metadata.trim_end().into(),
     ] {

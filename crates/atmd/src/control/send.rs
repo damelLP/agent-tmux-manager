@@ -48,29 +48,54 @@ pub async fn send(
     text: &str,
 ) -> Result<String, ControlError> {
     let pane_id = resolve_pane_id(sessions, target)?;
+    send_resolved(client, sessions, target, &pane_id, text).await
+}
+
+/// The actor resolves, fences and projects rows before entering this same turn.
+pub(super) async fn send_resolved(
+    client: &(impl TmuxClient + ?Sized),
+    sessions: &[SessionView],
+    target: &str,
+    pane_id: &str,
+    text: &str,
+) -> Result<String, ControlError> {
+    check_send(client, sessions, target, pane_id, text).await?;
+    paste_and_submit(client, pane_id, text).await
+}
+
+pub(super) async fn check_send(
+    client: &(impl TmuxClient + ?Sized),
+    sessions: &[SessionView],
+    target: &str,
+    pane_id: &str,
+    text: &str,
+) -> Result<(), ControlError> {
     let pane_state = client
         .raw_command(
             "display-message",
-            &[
-                "-p",
-                "-t",
-                &pane_id,
-                "#{pane_in_mode} #{bracket_paste_flag}",
-            ],
+            &["-p", "-t", pane_id, "#{pane_in_mode} #{bracket_paste_flag}"],
         )
         .await
         .map_err(|source| ControlError::Tmux {
             context: format!("Failed to read the state of pane {pane_id}"),
             source,
         })?;
-    if let Some(reason) = send_refusal(sessions, target, &pane_id, &pane_state, text) {
+    if let Some(reason) = send_refusal(sessions, target, pane_id, &pane_state, text) {
         return Err(ControlError::SendRefused {
-            pane: pane_id,
+            pane: pane_id.into(),
             reason,
         });
     }
+    Ok(())
+}
+
+pub(super) async fn paste_and_submit(
+    client: &(impl TmuxClient + ?Sized),
+    pane_id: &str,
+    text: &str,
+) -> Result<String, ControlError> {
     client
-        .paste_text(&pane_id, text)
+        .paste_text(pane_id, text)
         .await
         .map_err(|source| ControlError::Tmux {
             context: format!("Failed to paste into pane {pane_id}"),
@@ -79,13 +104,13 @@ pub async fn send(
     // Send Enter to submit the text, on its own call: tmux reads an
     // argument ending in `;` as a command separator.
     client
-        .send_keys(&pane_id, "Enter")
+        .send_keys(pane_id, "Enter")
         .await
         .map_err(|source| ControlError::Tmux {
             context: format!("Failed to send Enter to pane {pane_id}"),
             source,
         })?;
-    Ok(pane_id)
+    Ok(pane_id.into())
 }
 
 /// Why `atm send` must not paste `text` into `pane` for `target`, if it
@@ -129,10 +154,28 @@ fn send_refusal(
              or, if the dialog is gone, type in the pane",
         );
     }
+    input_refusal(
+        in_mode,
+        false,
+        bracketed_paste.map(|flag| flag != "0"),
+        Some(text),
+    )
+}
+
+/// Shared tmux-state rule. None retains U7's pre-3.7 unknown/allow policy.
+pub(super) fn input_refusal(
+    in_mode: bool,
+    dead: bool,
+    bracketed_paste: Option<bool>,
+    text: Option<&str>,
+) -> Option<&'static str> {
     if in_mode {
         return Some("the pane is in copy mode (or another mode), so Enter would go to tmux");
     }
-    if bracketed_paste == Some("0") && text.contains(['\n', '\r']) {
+    if dead {
+        return Some("the pane is dead, so input would be lost");
+    }
+    if bracketed_paste == Some(false) && text.is_some_and(|text| text.contains(['\n', '\r'])) {
         return Some("the program didn't ask for bracketed paste, so each line would submit alone");
     }
     None

@@ -178,21 +178,8 @@ pub(super) fn build_spawn_command(cwd: Option<&str>, model: Option<&str>) -> Str
     build_spawn_command_for_harness(&harness, cwd, model)
 }
 
-fn harness_spawn_env_key(harness: &SpawnHarnessDefinition, suffix: &str) -> String {
-    format!(
-        "ATM_SPAWN_{}_{}",
-        harness.id.replace('-', "_").to_ascii_uppercase(),
-        suffix
-    )
-}
-
 pub(super) fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
-}
-
-fn spawn_env_override(harness: &SpawnHarnessDefinition, suffix: &str) -> Option<String> {
-    let harness_key = harness_spawn_env_key(harness, suffix);
-    non_empty_env(&harness_key).or_else(|| non_empty_env(&format!("ATM_SPAWN_{suffix}")))
 }
 
 /// Build the shell command string sent to a freshly-split tmux pane.
@@ -211,12 +198,13 @@ fn spawn_env_override(harness: &SpawnHarnessDefinition, suffix: &str) -> Option<
 ///
 /// `*_BIN` is one token: a plain word is typed bare so a shell alias of that
 /// name still works, and anything else is shell-quoted, so spaces/specials in
-/// a path "just work."
+/// a path "just work." A `*_BIN` override drops configured `default_args`.
 ///
 /// `*_ARGS` is inserted *between* the bin and appended model flag and is
 /// interpolated verbatim — the user's intent is multi-token wrapper syntax. The
 /// user is responsible for quoting anything inside `*_ARGS` that needs to be
-/// one token (same contract as `bash -c "..."`).
+/// one token (same contract as `bash -c "..."`). The adapter's required
+/// arguments follow `*_ARGS`, before the model flag, even with a BIN override.
 ///
 /// `cwd` and `model` go through `shell_quote`, so a model name like
 /// `opus 4.5` or a cwd with spaces compose safely without the caller
@@ -232,8 +220,12 @@ pub(super) fn build_spawn_command_for_harness(
         harness.model_flag.as_deref(),
         cwd,
         model,
-        spawn_env_override(harness, "BIN").as_deref(),
-        spawn_env_override(harness, "ARGS").as_deref(),
+        control::spawn_env_override(&harness.id, "BIN", |key| std::env::var(key).ok()).as_deref(),
+        control::spawn_env_override(&harness.id, "ARGS", |key| std::env::var(key).ok()).as_deref(),
+        &[],
+        find_harness_definition(&harness.id)
+            .and_then(|definition| control::launch_policy(definition.harness))
+            .map_or(&[], |policy| policy.required_args),
     )
 }
 
@@ -617,7 +609,10 @@ mod spawn_command_tests {
         );
 
         let codex = resolve_spawn_harness(Some("codex")).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(build_spawn_command_for_harness(&codex, None, None), "codex");
+        assert_eq!(
+            build_spawn_command_for_harness(&codex, None, None),
+            "codex '--no-daemon'"
+        );
 
         // 14. Harness-specific overrides take precedence over the legacy
         //     global overrides, so users can customize one harness without

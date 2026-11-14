@@ -37,10 +37,11 @@ pub fn summary() -> SessionSummary {
     }
 }
 // Invariants of histories produced by serialized decide/apply, not arbitrary
-// historical facts. Session-less adoption can retain an exclusion in Starting.
+// historical facts. Starting may retain a binding after Revalidate; session-less
+// adoption can retain an exclusion. Clearing must still be unbound.
 pub fn assert_agent_invariants(state: &OrgState) {
     for agent in state.agents() {
-        if matches!(agent.status, AgentStatus::Starting | AgentStatus::Clearing) {
+        if agent.status == AgentStatus::Clearing {
             assert_eq!(agent.session_id, None, "{agent:?}");
         }
         if agent.excluded_session_id.is_some() {
@@ -76,7 +77,9 @@ pub fn assert_decided_bindings(state: &OrgState, events: &[OrgEvent]) {
 }
 
 pub fn assert_editor_ready_preserves(before: &OrgState, after: &OrgState, event: &OrgEvent) {
-    if let OrgEvent::AgentEditorReady { agent_id } = event {
+    if let OrgEvent::AgentEditorReady { agent_id }
+    | OrgEvent::AgentRevalidationRequested { agent_id } = event
+    {
         let before = before.agent(agent_id).unwrap();
         let after = after.agent(agent_id).unwrap();
         assert_eq!(after.session_id, before.session_id);

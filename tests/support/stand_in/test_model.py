@@ -53,6 +53,26 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 model.parse_args(args)
 
+    def test_terminal_cursor_reply_is_atomic_and_not_editor_input(self):
+        parser = model.InputParser()
+        self.assertEqual(parser.feed(b"draft\x1b[12;"), [])
+        self.assertEqual(parser.feed(b"34R"), [("cursor_report", "12;34")])
+        self.assertEqual(parser.feed(b"\r"), [("submit", "draft")])
+        self.assertEqual(parser.feed(b"\x1b[?12;34R\x1b[0;0R\x1b[12R"), [])
+
+    def test_cursor_reply_inside_paste_remains_literal_draft(self):
+        parser = model.InputParser()
+        self.assertEqual(parser.feed(b"\x1b[200~\x1b[12;34R\x1b[201~\r"),
+                         [("submit", "\x1b[12;34R")])
+
+    def test_no_daemon_does_not_consume_model_or_initial_prompt(self):
+        for flag in ["-m", "--model"]:
+            with self.subTest(flag=flag):
+                self.assertEqual(model.parse_args([
+                    "--no-daemon", "--profile", "a b", flag, "role model",
+                    "initial 'quoted' prompt",
+                ]), (None, "initial 'quoted' prompt"))
+
     def test_escape_inside_paste_is_data(self):
         parser = model.InputParser()
         self.assertEqual(parser.feed(b"\x1b[200~a\x1bb\x1b[201~\r"),
@@ -188,6 +208,7 @@ class LifecycleTests(unittest.TestCase):
                 m.handle(("submit", "work"), 0)
                 self.assertEqual(events(m.handle(("submit", "/atm/dialog"), 1)),
                                  ["PreToolUse", "PermissionRequest"])
+                m.handle(("down", ""), 1)  # Deny, not the approving default.
                 effects = m.handle(action, 2)
                 self.assertEqual(events(effects), [])
                 self.assertEqual(events(m.tick(1000)), [])

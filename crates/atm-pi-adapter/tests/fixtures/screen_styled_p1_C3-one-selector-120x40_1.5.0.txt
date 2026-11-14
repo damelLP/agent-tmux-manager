@@ -1,0 +1,41 @@
+Captured: pi 1.5.0, 2026-11-14, P1 private tmux capture-pane -p -e -N; sanitized.
+ SEALED_REPLY_22              
+
+
+ C2_STEER_FIRST               
+
+ "last" café                  
+
+
+ SEALED_REPLY_23              
+
+
+ C2-follow-multi_RUNNING      
+
+
+ SEALED_REPLY_24              
+
+
+ C2_FOLLOW_FIRST              
+
+ "last" café                  
+
+
+ SEALED_REPLY_25              
+
+[38;5;4m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[38;5;3mOnly showing models from configured providers. Use /login to add providers.[39m                                             
+
+> [7m [0m                           
+
+[38;5;5m→ ✓ sealed-model[39m [2m[sealed][0m     
+
+[2m  Model Name: Sealed Model[0m    
+
+[38;5;2m  Model catalogs refreshed.[39m   
+
+[2m  Enter to select · Ctrl+S to set as default · Escape/Ctrl+C to cancel[0m                                                  
+[38;5;4m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[2m[39m/tmp/xxxxxxxxxxxxxxxxxxx/project[0m                            
+[2m↑1.2k ↓120 0.1%/200k (auto)                                                                                 sealed-model

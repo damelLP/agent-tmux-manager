@@ -15,7 +15,8 @@
 //!   Mirrors how pi-amplike documents local-dev installs.
 //! - **Codex CLI**: writes the `atm-codex-hook` bash script to
 //!   `~/.local/bin/`, then registers it for every Codex hook event in
-//!   `~/.codex/hooks.json`'s `hooks` object (5s timeout per hook; no
+//!   `~/.codex/hooks.json`'s `hooks` object (3s timeout for SessionEnd, 5s
+//!   for other hooks; existing ATM SessionEnd timeouts above 3s are capped; no
 //!   statusLine equivalent exists). Codex requires a one-time trust
 //!   approval of non-managed hooks — `setup_codex` prints the `/hooks`
 //!   instruction for this. codex-cli 0.163.0 also asks at startup

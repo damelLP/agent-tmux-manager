@@ -8,7 +8,7 @@
 //!
 //! # Read contract
 //!
-//! Implemented reserved operations consume these sequences. Fixed tag writes
+//! Implemented operations consume these sequences. Fixed tag writes
 //! are recorded in mock() and need no extra observation script:
 //!
 //! | Operation | Ordered reads before any effect | Script |
@@ -16,9 +16,10 @@
 //! | inspect, present pane | filtered metadata; pane-local tag (2) | script_inspect(Some) |
 //! | inspect, missing pane | successful empty filtered metadata only (1) | script_inspect(None) |
 //! | tag / untag / unguarded keys / paste / kill | filtered metadata; pane-local tag (2), then effect | script_tag_check |
-//! | capture | filtered metadata; single metadata/capture/end command list; pane-local tag (3) | script_capture |
+//! | capture / observe | filtered metadata; single metadata/capture/clients/end command list; pane-local tag (3) | script_capture / script_observe |
 //! | keys_guarded / paste_guarded | same 3 reads as capture, pure check, then effect if approved | script_capture |
 //! | split | no observation reads; SplitWindow, then claim before replying | mock().set_next_pane_id |
+//! | legacy send / spawn_type, unavailable org | ownership: filtered metadata; pane-local tag (2), before input | script_tag_check |
 //!
 //! A missing pane stops after the first read. Fence, kind or expected-agent
 //! rejection can stop before any read. Metadata/capture framing matches the
@@ -32,7 +33,18 @@
 //! unsupported raw command returns TmuxError, never a plausible empty answer.
 //! Non-raw effects delegate to mock(); use its calls/errors/unique split IDs,
 //! not set_next_raw_output, which cannot script these reserved reads.
-use super::{CaptureFormat, PaneCapture, PaneId, PaneInspection};
+//!
+//! Legacy ownership is the only legacy read this client serves. It cannot serve
+//! U7 send's `#{pane_in_mode} #{bracket_paste_flag}` state read or a noncanonical
+//! target's `#{pane_id}` resolution read: both are rejected, not answered by the
+//! mock's raw-output FIFO. Of legacy input, only canonical-target spawn_type is
+//! supported end-to-end (script an
+//! untagged ownership check when the org is unavailable); use MockTmuxClient for
+//! legacy sends or alias resolution.
+use super::{
+    pane_ops::{CLIENTS, CLIENTS_MARKER, FORMAT},
+    CaptureFormat, PaneCapture, PaneId, PaneInspection,
+};
 use atm_tmux::{MockTmuxClient, PaneDirection, PaneInfo, TmuxClient, TmuxError};
 use std::{
     collections::{HashMap, VecDeque},
@@ -41,7 +53,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const FORMAT: &str = "ATM-PANE-v1\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}";
+const LEGACY_FORMAT: &str = "ATM-PANE-v1\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}";
 const END: &str = "ATM-END\t#{pane_id}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +123,12 @@ impl ScriptedTmuxClient {
         self.script_inspect(&pane_id(&inspection.pane.pane_id)?, Some(inspection))
     }
 
+    /// Queue one read-only observation through ControlHandle, with the same
+    /// framing/metadata/focus as a reserved capture. No reservation is scripted.
+    pub fn script_observe(&self, capture: &PaneCapture) -> Result<(), TmuxError> {
+        self.script_capture(capture)
+    }
+
     /// Queue one capture/guard (three reads). Requires exactly height newline-
     /// terminated rows, preserving text/style bytes and meaningful whitespace.
     pub fn script_capture(&self, capture: &PaneCapture) -> Result<(), TmuxError> {
@@ -124,7 +142,20 @@ impl ScriptedTmuxClient {
             ));
         }
         let first = metadata(&capture.inspection);
-        let output = format!("{}{}ATM-END\t{}\n", first.output, capture.text, pane);
+        let clients = match capture.focused {
+            Some(true) => format!("{CLIENTS_MARKER}\nfocused\t{pane}\n"),
+            Some(false) => format!("{CLIENTS_MARKER}\n"),
+            // Unknown current output is explicitly malformed, not empty clients
+            // (which means observed absence). Preserve historical v1 fixtures.
+            None if first.output.starts_with("ATM-PANE-v2\t") => {
+                format!("{CLIENTS_MARKER}\n\t{pane}\n")
+            }
+            None => String::new(),
+        };
+        let output = format!(
+            "{}{}{clients}ATM-END\t{}\n",
+            first.output, capture.text, pane
+        );
         self.push(
             pane,
             vec![
@@ -180,26 +211,40 @@ impl ScriptedTmuxClient {
 
 fn metadata(inspection: &PaneInspection) -> Read {
     let pane = &inspection.pane;
+    let mut output = format!(
+        "ATM-PANE-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        pane.pane_id,
+        pane.session_name,
+        pane.window_index,
+        pane.pane_pid,
+        pane.width,
+        pane.height,
+        u8::from(pane.is_active),
+        u8::from(inspection.dead),
+        u8::from(inspection.in_mode),
+        inspection
+            .bracketed_paste
+            .map(|b| u8::from(b).to_string())
+            .unwrap_or_default(),
+        inspection.cursor_column,
+        inspection.cursor_row,
+    );
+    if inspection.foreground_pid.is_some() || inspection.foreground_command.is_some() {
+        output = format!(
+            "{}\t{}\t{}\n",
+            output
+                .trim_end_matches('\n')
+                .replacen("ATM-PANE-v1", "ATM-PANE-v2", 1),
+            inspection
+                .foreground_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_default(),
+            inspection.foreground_command.as_deref().unwrap_or_default()
+        );
+    }
     Read {
         kind: ReadKind::Metadata,
-        output: format!(
-            "ATM-PANE-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            pane.pane_id,
-            pane.session_name,
-            pane.window_index,
-            pane.pane_pid,
-            pane.width,
-            pane.height,
-            u8::from(pane.is_active),
-            u8::from(inspection.dead),
-            u8::from(inspection.in_mode),
-            inspection
-                .bracketed_paste
-                .map(|b| u8::from(b).to_string())
-                .unwrap_or_default(),
-            inspection.cursor_column,
-            inspection.cursor_row,
-        ),
+        output,
     }
 }
 
@@ -216,7 +261,9 @@ fn local_tag(inspection: &PaneInspection) -> Read {
 
 fn requested_read(subcommand: &str, args: &[&str]) -> Result<(PaneId, ReadKind), TmuxError> {
     match (subcommand, args) {
-        ("list-panes", ["-a", "-f", filter, "-F", format]) if *format == FORMAT => {
+        ("list-panes", ["-a", "-f", filter, "-F", format])
+            if matches!(*format, FORMAT | LEGACY_FORMAT) =>
+        {
             let pane = filter
                 .strip_prefix("#{==:#{pane_id},")
                 .and_then(|s| s.strip_suffix('}'))
@@ -228,14 +275,32 @@ fn requested_read(subcommand: &str, args: &[&str]) -> Result<(PaneId, ReadKind),
         }
         ("display-message", ["-p", "-t", pane, ..]) => {
             let pane_id = pane_id(pane)?;
-            for format in [CaptureFormat::Plain, CaptureFormat::Ansi] {
-                let mut expected = vec!["-p", "-t", pane, FORMAT, ";", "capture-pane", "-p", "-N"];
-                if format == CaptureFormat::Ansi {
-                    expected.push("-e");
-                }
-                expected.extend(["-t", pane, ";", "display-message", "-p", "-t", pane, END]);
-                if args == expected {
-                    return Ok((pane_id, ReadKind::Frame(format)));
+            for metadata in [FORMAT, LEGACY_FORMAT] {
+                for format in [CaptureFormat::Plain, CaptureFormat::Ansi] {
+                    let mut expected =
+                        vec!["-p", "-t", pane, metadata, ";", "capture-pane", "-p", "-N"];
+                    if format == CaptureFormat::Ansi {
+                        expected.push("-e");
+                    }
+                    expected.extend(["-t", pane, ";", "display-message", "-p", "-t", pane]);
+                    if metadata == FORMAT {
+                        expected.extend([
+                            CLIENTS_MARKER,
+                            ";",
+                            "list-clients",
+                            "-F",
+                            CLIENTS,
+                            ";",
+                            "display-message",
+                            "-p",
+                            "-t",
+                            pane,
+                        ]);
+                    }
+                    expected.push(END);
+                    if args == expected {
+                        return Ok((pane_id, ReadKind::Frame(format)));
+                    }
                 }
             }
             Err(error("unexpected capture command list"))

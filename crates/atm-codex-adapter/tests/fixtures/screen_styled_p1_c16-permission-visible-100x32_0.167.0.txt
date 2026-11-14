@@ -1,0 +1,33 @@
+Captured: codex 0.167.0, 2026-11-14, P1 private tmux capture-pane -p -e -N; sanitized.
+  [38;2;99;168;248m>_ [1m[39mOpenAI Codex[0;2m (v0.167.0)[0m                      
+     [2m/tmp/xxxxxxxxxxxxxxxxxxxxxx/repo[0m             
+                                                  
+[48;5;8m                                                                                                    
+[1;2m› [0m[48;5;8mB_NODAEMON_FIRST                                                                                  
+                                                                                                    
+[49m                                                                                                    
+[2m• [0mPROBE_REPLY_4019643_4                                                                             
+                                                                                                    
+[2m  Worked for <1s • 16:38                                                                            
+[0m                                                                                                    
+[48;5;8m                                                                                                    
+[1;2m› [0m[48;5;8mC_PERMISSION_ON_REQUEST                                                                           
+                                                                                                    
+[49m                                                                                                    
+[1m[38;2;128;128;128m•[0m [1mRunning[0m [38;2;137;180;250mprintf[38;2;205;214;244m PROBE_TOOL_OK[39m                                                                      
+                                                                                                    
+                                                                                                    
+  [1mWould you like to run the following command?[0m                                                      
+                                                                                                    
+  Environment: [1mlocal[0m                                                                                
+                                                                                                    
+  Reason: [3mAllow the harmless sealed probe printf?[0m                                                   
+                                                                                                    
+  $ [38;2;137;180;250mprintf[38;2;205;214;244m PROBE_TOOL_OK[39m 
+                                                  
+                         
+[1;7m› 1. Yes, proceed (y)                                                                               
+[0m  2. Yes, and don't ask again for commands that start with `printf PROBE_TOOL_OK` ([1mp[0m)               
+  3. No, and tell Codex what to do differently ([1mesc[0m)                                                
+                                                                                                    
+  [2mPress [0;1menter[0;2m to confirm or [0;1mesc[0;2m to cancel                                                           

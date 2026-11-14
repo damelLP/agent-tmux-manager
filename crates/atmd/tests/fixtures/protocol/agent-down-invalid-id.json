@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-down-invalid-id","method":"agent.down","params":{"agent":"lead"}},
+  "response": {"type":"response","id":"agent-down-invalid-id","error":{"code":"invalid_params","message":"invalid agent id: \"lead\" (expected project/name)"}},
+  "ignore": []
+}

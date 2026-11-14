@@ -13,6 +13,7 @@
 
 mod actor;
 mod agent_methods;
+mod agent_project;
 mod agent_types;
 pub mod agents;
 #[cfg(test)]
@@ -24,6 +25,7 @@ pub mod message_history;
 mod message_history_tests;
 mod message_inbox;
 mod message_methods;
+pub mod message_notify;
 #[cfg(test)]
 mod message_persistence_tests;
 #[cfg(test)]

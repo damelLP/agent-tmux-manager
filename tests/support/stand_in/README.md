@@ -27,16 +27,21 @@ use stand_in::{StandInConfig, StandInMode, StandInRig};
 
 let mut rig = StandInRig::start(); // real request round trip, not socket existence
 let mut config = StandInConfig::new(StandInMode::Claude);
-config.work_ms = 1200; // observation window, not a real-provider latency claim
+config.manual_clock = true; // hold phases until the test releases them
+config.work_ms = 1200;
 config.clear_gap_ms = 1200;
-let pane = rig.launch(&config); // current-process idle journal + exact screen line
+let pane = rig.launch(&config); // current-process terminal-acknowledged first frame
 let old = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
 assert!(rig.atm(&["send", &pane.pane_id, "one\ntwo"]).status.success());
 rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
+rig.control(&pane, serde_json::json!({"command":"advance_to", "now_ms":1200}));
 rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
 rig.wait_ready(&pane, Some(old.id.as_str()));
+let after = rig.event_cursor(&pane);
 rig.paste(&pane, "/clear");
+rig.wait_event(&pane, after, |e| e["kind"] == "rendered" && e["state"] == "clearing");
 rig.wait_for_absent(&old.id);
+rig.control(&pane, serde_json::json!({"command":"advance_to", "now_ms":2400}));
 let new = rig.wait_for_row(&pane, |r| r.id != old.id);
 rig.wait_ready(&pane, Some(new.id.as_str()));
 rig.close();
@@ -45,41 +50,96 @@ rig.close();
 - `launch(config)` starts a named Python process in a new private window and
   retains a shell after exit. `StandInPane` exposes `pane_id`, `pid`, `launcher`,
   and `log`; actions reject handles from another rig.
-- `wait_ready(pane, optional_id)` checks the current process's latest idle render
-  and the **exact** `stand-in <mode> <id>: idle` screen line, joining wrapped
-  terminal lines. Bracketed paste is enabled before that line is printed. It does
-  not require `#{bracket_paste_flag}` (absent in tmux 3.6); an empty format means
-  **unknown**, not off. Readiness is not a claim that the input draft is empty:
-  inspect the active `❯ ` input line, not scrollback, before delivery.
-- Polls are every 20ms, with 10-second deadlines. Use predicates rather than
-  fixed sleeps. After sending clear, first wait for a changed ID or a `clearing`
-  render; `wait_ready(None)` called before the command is processed can still
-  describe the old editor. A long configured clear gap allows absence assertions
-  before the new start, so PID-based replacement cannot hide a missing end event.
-- `wait_for_row`, `wait_for_absent`, `pane_rows`, `rows` query the real daemon.
+- `launch` returns after the first terminal-acknowledged frame, not necessarily
+  idle. `wait_ready(pane, optional_id)` waits on the private event stream for an
+  idle frame at least as recent as a control barrier. Bracketed paste is enabled
+  first; no `#{bracket_paste_flag}` or journal/screen polling is required. This
+  is a rig milestone, **not** proof of empty input or readiness for delivery.
+- `event_cursor(pane)` and `wait_event(pane, after, predicate)` replay and await
+  sequenced runtime events with a 30-second outer hang guard. The listener is
+  bound before launch. Every record has `pid`, procfs `start_time`, `pane`, and
+  `event_sequence`; respawn cannot reuse an old process's ready record.
+  `sequence` remains the separate per-process frame counter. Frame records also
+  carry `frame` (scene), `source` (capture path), and the draft, so fragmented input can be awaited before capture, without
+  polling for text. Take a cursor
+  **before** an action, then await its `rendered` event before capture. A control
+  barrier alone does not prove that earlier tmux key input has been consumed.
+- Set `config.manual_clock = true` to hold working/clearing phases without a
+  duration race. Model time starts at zero; `control(pane, json!({"command":
+  "advance_to", "now_ms": 500}))` advances it explicitly and acknowledges
+  completed effect dispatch. Await `rendered` separately for the terminal.
+  Time must be a nondecreasing integer. `{"command":"barrier"}` only acknowledges
+  effects already processed; controls never become editor input. Autonomous
+  model completion is disabled, not delayed. The selector blocks on input,
+  controls and actual deadlines (only lone Escape needs a 20ms ambiguity timer).
+- `wait_for_row` and `wait_for_absent` consume one persistent daemon subscription,
+  whose initial snapshot is received before actions. Updates/removals notify
+  waiters after the cached committed state changes; no list-sessions polling.
+  Restart creates a fresh subscription. `pane_rows` and `rows` make explicit
+  snapshot queries to the real daemon.
   SessionView has no PID: use owned panes/IDs, never total host row counts.
   `discover()` can see unrelated procfs processes. A pending row becoming one
   real-ID row proves discovery and the hook agree on PID.
-- `capture(pane)` joins wrapped screen lines. `paste(pane, text)` uses bracketed
+- `capture(pane)` joins wrapped screen lines; `capture_plain(pane)` preserves
+  viewport line structure and trailing newlines (`capture-pane -p`, no `-J`).
+  `capture_styled(pane)` uses `capture-pane -e -N -p`, retaining SGR and trailing
+  cells. This is a renderer test seam, not a styled observer API.
+  `paste(pane, text)` uses bracketed
   paste plus a separate Enter. `key(pane, "Escape")` sends a key to the private
   server only. For an unsubmitted paste use `tmux` load/set-buffer + paste-buffer
   without Enter; typed and pasted text are visible in the active input line.
 - `atm(args)` and `tmux(args)` return bounded command output, including refusals.
+  Commands and `wait_for_shell` wait on Linux pidfd exit notification with a
+  30-second hang guard, not repeated `try_wait`/procfs polling. Command output
+  goes through temporary files so large output cannot fill a pipe.
   `command(path)` supplies the same sealed environment to custom invocations;
   execute with `rig.run(&mut command)`. `tmux` supplies the private `-L` label.
   If also using role support, import `stand_in::bounded` rather than including
   `support/role.rs` twice.
 - `journal(pane)` is diagnostic JSONL: identity, accepted/rejected/queued input,
-  event/dropped, status, draft, render, ready, selection, connected/reconnecting.
-  Every entry includes PID and monotonic time. Events/status are **send attempts**,
+  event/dropped, status, draft, render, ready, selection, connected/disconnected,
+  transport_dropped.
+  Render entries carry a per-process `sequence`. A subsequent `rendered` entry
+  acknowledges tmux's cursor-position reply to a DSR query following that frame;
+  `ready` follows only for the latest idle frame, not merely a stdout flush.
+  Replies for superseded frames are discarded; replies never trigger a redraw.
+  Frame output is deferred during fragmented paste/escape sequences. Exit stops
+  input processing and discards pending frame acknowledgements, so no later
+  render/ready can describe the exited process. These are rig milestones, not
+  evidence of empty input or confirmed hook delivery. The same records are sent
+  over `ATM_STANDIN_EVENTS`, a private Unix stream, before any model announcement.
+  Every entry includes process identity and model time (manual when configured). Events/status are **send attempts**,
   not acknowledgments. Hook exit zero cannot prove delivery. Timeout diagnostics
   include journals, daemon logs and panes, and name possible lost handshakes.
 - `close()` checks cleanup; Drop is the unwind fallback. Cleanup discovers every
   `atmd` with an environment path inside this rig, including CLI-auto-started
   daemons, rechecks procfs start time/environment, and stops it before removing
   state. The canonical tmux socket is recorded before fallible startup queries;
-  cleanup uses that socket and rechecks its identity, including with symlinked
-  TMPDIR. No broad process-name kill is used.
+  cleanup owns that canonical socket, not the first server PID. A replacement
+  server at the same socket is accepted only after its private TMUX_TMPDIR,
+  procfs start identity and returned socket/PID are checked and rechecked. An
+  already-stopped server is clean only when no matching owned server remains;
+  a live server with an unavailable socket is an error, not silently abandoned.
+  `tmux_env()` queries the current identity after a restart. Daemon disappearance
+  during a recheck is already stopped; a changed identity is never signalled.
+  Both daemon and tmux cleanup are attempted even when the first fails. Process
+  termination uses pidfd notifications, not cleanup polling. Symlinked TMPDIR is
+  canonicalized for ownership; no broad process-name kill is used. Diagnostics
+  also read the known detached-daemon path `state/atm/atm.log` without recursively
+  scanning unrelated paths.
+- The symlinked-TMPDIR subprocess test uses `parent::ChildGuard`, not the shared
+  short command-timeout helper. The parent owns its base before spawn; the child
+  reports its root, canonical socket and creator identity, then waits for an
+  acknowledgment **before** starting event listeners/tmux/atmd. After acknowledgment
+  the child's TempDir no longer deletes its directory: only the parent may do so.
+  A second socket barrier holds the fully started child for normal finish or a
+  deliberate forced exit. Parent cleanup uses the same procfs ownership rules,
+  rechecks before signals/server shutdown, then removes the child root. Drop also
+  handles parent assertion unwinding; cleanup failure retains the directory for
+  diagnosis rather than deleting a live server's socket. Tests check directory
+  retention after forced exit, so this path prevents the old missing-socket leak
+  instead of relying on socket reconstruction. Deliberate external deletion of
+  a guarded socket directory is not modeled.
 
 ### Daemon control
 
@@ -89,10 +149,11 @@ Stop also finds detached daemons. With the daemon stopped, `rig.atm(...)` can
 exercise the real CLI auto-start path, which cleanup owns too.
 
 `set_daemon_env(key, value)` sets extra environment for **subsequent explicit
-starts**, e.g. set `ATM_SPAWN_BIN` to `rig.launcher(mode)` and then restart. It
-cannot override sealing variables or TMUX/PANE. It does not change environment
-inside an already-running daemon or in CLI-auto-started daemons; for the latter,
-set the extra variable on `rig.command(...)` before invoking the CLI.
+starts**. It cannot override sealing variables or TMUX/PANE. It does not change
+environment inside an already-running daemon or CLI-auto-started daemons; for
+the latter set the extra variable on `rig.command(...)` before invoking the CLI.
+**ATM_SPAWN_BIN is CLI-only at this tip**: setting it in the daemon's environment
+does not change daemon command construction.
 
 ### Spawn, arguments, IDs and respawn
 
@@ -100,6 +161,10 @@ set the extra variable on `rig.command(...)` before invoking the CLI.
 `pi`, suitable for `ATM_SPAWN_BIN` (or a per-harness override). It is not shipped
 as a binary. Arguments are validated **before** identity/session announcement.
 One positional initial prompt is supported; `--` makes a leading dash literal.
+It remains pending through startup dialogs and is submitted once after they
+finish, never interpreted as a trust/update selection. This is a synthetic safe
+composition of the stand-in's CLI and dialog controls; the combined real-CLI
+startup behavior has not been captured.
 Harness options such as `--model X` are ignored. Unknown options accept an
 optional following non-option value; `--name=value`, `--no-*`, `--offline` and
 `--dangerously-skip-permissions` need no following value. This is a test parser,
@@ -130,6 +195,27 @@ let pane = rig.observe_pane(id, StandInMode::Claude, log);
 // observe_pane waits for live identity, not idle: initial prompt may be working.
 ```
 
+For a **daemon-built command**, put the explicit absolute `rig.launcher(mode)`
+in the role/config command accepted by that consumer, with `--atm-config` pointing
+to a private JSON file containing `LOG` and `ID_PREFIX`. Alternatively configure
+those values in the private tmux server environment as above. Do not rely on
+ATM_SPAWN_BIN or weaken the sealed PATH. For example, the command builder's argv
+can be `[rig.launcher(mode), "--atm-config", rig.root().join("role.json")]`:
+
+```rust,ignore
+let config_path = rig.root().join("role.json");
+std::fs::write(&config_path, serde_json::json!({
+    "LOG": rig.root().join("role.jsonl"), "ID_PREFIX": "role", "MANUAL_CLOCK": 1
+}).to_string()).unwrap();
+let command = [rig.launcher(StandInMode::Claude).into_os_string(),
+               "--atm-config".into(), config_path.into_os_string()];
+// Supply command to the consumer's role/command builder, not ATM_SPAWN_BIN.
+```
+
+`stand_in_explicit_launcher_without_cli_spawn_override` exercises that executable
+and config through a private tmux pane without the CLI override. It verifies the
+launch route, not a future consumer's command builder.
+
 Current `atm spawn --prompt` rejects control characters: use single-line prompts
 there and multiline `atm send` for delivery tests.
 
@@ -143,7 +229,8 @@ time as well as PID; readiness ignores old-process renders.
 `--atm-config <path>` in the original pane command. `respawn-pane -k -t <pane>`
 therefore retains configuration without shell exports. A retained-shell relaunch
 can use `pane.launcher --atm-config <that-path>`. The file has `LOG`, `ID_PREFIX`,
-`WORK_MS`, `CLEAR_GAP_MS` keys; it and the log/socket must resolve inside
+`WORK_MS`, `CLEAR_GAP_MS`, `MANUAL_CLOCK` (0/1), `SCREEN_VARIANT`, `FOLDER`, and
+optional dialog flags described below; it and the log/socket must resolve inside
 `ATM_STANDIN_ROOT`. Defaults for the timers are 500ms/100ms; negatives fail before
 announcement. Direct launch also requires the private TMUX/PANE and root; never
 unset ATM_SOCKET to use a default.
@@ -160,11 +247,17 @@ Codex discovery may create `pending-{pid}` and its old row remains across clear.
 Waiting for its new-ID hook before the next prompt deadlocks: wait for the new
 render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
 
-- `/atm/dialog` (Claude only) sends PreToolUse and PermissionRequest and displays
-  the captured permission question/Yes/No/Esc screen. Up/Down select, Enter records
-  a 1-based `selection.option`, Escape denies. Selection emits no hook and executes
-  nothing (Synthetic: safe selection, not actual tool approval). Denial erases the
-  dialog but leaves the daemon attention_needed. `atm reply --option 2` and
+- `/atm/dialog` sends captured PreToolUse and PermissionRequest **before** the
+  Claude permission screen or optional Codex three-option modal appears (Codex
+  requires `permission_dialog = true` and announces the generation if needed).
+  Up/Down select; Enter records a 1-based `selection.option`. Claude option 1 and
+  Codex options 1/2 approve: replay PostToolUse immediately and show working;
+  Stop stays at the work deadline. P1 observed PostToolUse shortly after Enter,
+  before Stop, so the daemon row leaves attention_needed during that interval.
+  Synthetic: tool execution is represented by its
+  captured completion, never by running arbitrary shell commands. No/Enter and
+  Escape retain the denial/interruption screens and emit no completion hooks;
+  the daemon may remain attention_needed. `atm reply --option 2` for Claude and
   `peek --prompt` exercise the real parser/key path.
 - `/atm/drop-next [EVENT]` suppresses the next matching hook, or literally the next
   hook if omitted. Names are case-sensitive; invalid names don't arm loss. Status
@@ -179,28 +272,147 @@ render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
   is cancelled. Claude restores the interrupted prompt as a visible draft (U5 C5).
   At idle Ctrl-C clears the draft; a second within one second exits. Ctrl-U clears
   the draft without submitting it. Up/Down are ignored outside dialogs.
-- Claude submits busy input into a FIFO and emits UserPromptSubmit **only when the
-  preceding turn ends**. This reproduces late confirmation/double-delivery risks.
-  Clear discards queued input. Synthetic: queuing was not captured by U5; abort
-  while a queue exists is not a faithful queue-cancellation model (pending entries
-  remain until another turn completes). Codex/pi busy input is still rejected.
+- **Synthetic adversarial FIFO, not current Claude fidelity:** busy input is
+  queued and emits UserPromptSubmit only when the preceding turn ends. P1's real
+  Claude Code 2.1.325 capture (2026-11-14) instead observed accepted/queued prompt
+  receipt **before** the held turn completed. Do not use this FIFO as evidence of
+  real receipt timing, and never infer execution from receipt. Clear discards
+  the synthetic queue; abort leaves entries until another turn completes, also
+  not a faithful cancellation model. Existing queue tests deliberately retain
+  this adversarial contract. Codex/pi busy input remains rejected.
 - Whole-line controls only: multiline text containing a control is an ordinary
   prompt. Input during the clear gap is rejected and journalled, not submitted.
 - Bracketed paste handles fragmented UTF-8/delimiters. CR becomes LF as in normal
   tty input. Lone ESC resolves after a 20ms gap; CSI arrows are parsed atomically.
   This is not a full editor/terminal emulator (no cursor editing/history).
-- Claude/Codex use `/bin/sh -c` to run the real repository hook scripts and socat,
-  exercising their parent-process walk; PID/pane fields aren't injected.
-- Pi **replays envelopes**, never loads pi-atm. One socket spans `/new`; after
-  disconnect it retries and buffers unsent frames while the daemon is down.
-  Buffering/backoff are synthetic, not an SDK transport conformance test. As with
-  real unacknowledged writes, a disconnect during a write can lose/duplicate a
-  frame; process exit does not guarantee flushing while the daemon is unavailable.
+- Claude/Codex launch `/bin/bash <real repository hook>` directly, matching U5's
+  Claude Code 2.1.325/Codex 0.167.0 ancestry: socat ← timeout ← hook ← harness.
+  A private Bash-startup barrier checks the actual child's PID/PPID; existing real
+  daemon tests still check forwarded identity. PID/pane fields aren't injected.
+- Pi **replays envelopes**, never loads pi-atm. One socket spans `/new`. Observed
+  EOF triggers a 1000ms close backoff on monotonic transport time, never the
+  manual model clock; sends inside it are dropped, not replayed. Timer expiry
+  emits `transport_retry_ready` for condition-based test synchronization but
+  never reconnects: a later send
+  initiates the next connection. With no socket outside backoff, a 256-entry
+  drop-oldest FIFO waits for a later send. A write attempt is unacknowledged and
+  is not retried as if delivery were known. The daemon-restart test awaits EOF
+  and the backoff-expired event, then sends a new event; pure supplied-clock
+  tests prove backoff drops without racing real input against a one-second timer.
+  Connect and outbox writes never wait for a handshake reply, matching pi-atm.
+  This models the repository pi-atm send/close/outbox rules, not SDK conformance:
+  Python performs bounded synchronous connect/write, not Node's
+  pending-socket/drain callbacks or high-water-mark behavior. Process exit does
+  not guarantee flushing while the daemon is unavailable.
 
-Remaining gaps: no Codex/pi native dialogs, trust/update prompts, permission
-Notification hook or post-denial status timing, provider errors/resumptions,
-real tokens/usage evolution, subagents, tool execution, or paid model calls.
-Input-line rendering is deliberately simple, not a pixel-perfect vendor TUI.
+Remaining gaps: pi native selectors, permission Notification hook or post-denial
+status timing, provider errors/resumptions, real tokens/usage evolution, subagents,
+tool execution, or paid model calls. Input editing and uncaptured viewport sizes
+are synthetic, not a complete vendor TUI.
+
+## Captured screens and optional dialogs
+
+The runtime renders `screens.json`'s 76 source variants through the pure
+`screens.py` renderer and `scene.py` lifecycle mapping. Sources reuse adapter plain
+captures, 20 U5b SGR/cursor pairs, and 16 sanitized P1 captures (provenance in
+`fixtures/screens/README.md`). No runtime ID or diagnostic status text is visible.
+`frame` records the model's fresh, working, idle after a turn, clearing,
+clear-complete, interrupted and modal phases; `source` identifies the actual
+capture chosen, including draft/completion-menu substitutions. Claude clear shows the real SessionEnd hook spinner;
+pi retains a captured old conversation; Codex can show the captured blank
+transition. Completed clear uses genuine fresh captures, not the misleading
+post-turn `after-clear` fixtures. These scenes are snapshots, not transcript replay.
+
+Native output preserves rows, NBSP and padding. Trusted SGR is validated against
+plain text; styled cursor spaces survive even when plain capture drops them.
+Cursor sidecars retain evidence for a later cursor-aware renderer/observer, but
+hardware cursor coordinates are not restored to those captures; current adapter
+conformance passes `None` for cursor. No cursor-placement fidelity is claimed.
+Absolute row positioning avoids bottom-row newline scrolling. Synthetic runtime
+drafts replace only the active editor slot and render control bytes visibly.
+Capture-specific draft styling is preserved for an exact captured draft; other
+drafts use normal attributes. Modal text never becomes an editor draft. Diagnostics
+and suppressed hooks remain in event records, not invented screen chrome.
+
+`config.columns/rows` default to 120x40 and establish the private window size
+before launch. A stand-in draws at its launch size: do not resize or split its
+pane after launch (split another pane instead). SIGWINCH is not handled and the
+minimum size is not rechecked after a resize. `screen_variant` defaults to `u5`; choose `rich-enabled`/`poor`
+for Claude or `rich`/`poor` for Codex at 100x30. Native geometry wins over a variant
+from another size. `screen_variant = "values"` (JSON `SCREEN_VARIANT`) selects
+Synthetic value-only variation: equal-width version/model substitutions, another
+Claude/pi spinner, and nonzero pi cost on nonfresh frames. Fresh pi usage stays
+zero; drafts/folder input are inserted afterwards and never rewritten. Source
+replay bypasses mutations and still reproduces the original captures. Contract
+tests pin unchanged facts across the variants, not particular scalar literals.
+P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
+Uncaptured combinations are explicitly synthetic: redundant blank padding is
+removed before old transcript, preserving editor blanks and history separators.
+Pi rules reflow to equal widths and aligned usage/model and Codex shortcut/warning
+footers retain complete tokens. Codex fresh panes below 25 rows use P1's compact
+100x24 header/editor/footer capture (a18), not the tall logo, which needs 25 rows.
+This is a source splice from P1's gpt-5.4 session into the U5 lifecycle; resizing
+that capture to other compact sizes is Synthetic. The adapter contract pins
+all lifecycle facts at 100x30, 80x24 (Codex), 100x24, 120x19 and the supported minima: **Codex 80x19,
+pi 86x19**. A 60x40 split is too narrow for their captured interrupt/startup chrome:
+scene rendering explicitly refuses it. Only `launch`, `wait_ready` and `wait_event`
+surface the scene error immediately rather than waiting for a misleading ready
+frame; `observe_pane` and `wait_for_row` do not surface scene errors. Use a wider pane for these modes.
+Source-only replay remains native-size evidence. This is not real-harness resize
+fidelity. Other long transcript lines may clip; drafts cell-wrap.
+Optional `config.folder` substitutes
+only the trust path (control bytes escaped); omission preserves the capture.
+
+All dialog flags default false, survive respawn, and reject incompatible modes
+before identity or lifecycle announcement. Config JSON/environment flags use
+`FOLDER_TRUST`, `UPDATE_PROMPT`, `WORKTREE_CHOICE`, `HOOKS_REVIEW`,
+`PERMISSION_DIALOG` with 0/1 values (environment prefix `ATM_STANDIN_`).
+
+| Flag | Modes | Keys and behavior |
+|---|---|---|
+| `folder_trust` | Claude | Default No; Down selects Yes, Enter accepts and only then emits SessionStart. No/Enter or Esc exits without lifecycle hooks. |
+| `folder_trust` | Codex | Default Trust and continue; Enter advances. Option 2/Back is explicitly refused in place: Command Center is not modeled. |
+| `update_prompt` | Codex | Esc skips for this launch; update execution is refused. |
+| `hooks_review` | Codex | Enter opens the captured hook list; `t` trusts, Esc returns. Down/Enter trusts all; option 3 continues but suppresses hooks as advertised. |
+| `worktree_choice` | Codex | `/new` holds old generation at the modal; Enter on default commits clear, Esc restores old scene/ID. Creating a checkout is refused. |
+| `permission_dialog` | Codex | Enables the safe `/atm/dialog` control described above. |
+
+When combined, Codex start order is update → folder → hooks → editor. Pi has no
+start dialog. `launch` returns on the first **rendered modal**, without waiting
+for ready or a daemon row. Use `wait_event` after keys; no `ready` is emitted for
+a modal. Selecting it cannot confirm delivery. Claude/Codex restore the normal
+terminal screen on exit; pi retains history and puts the shell below it. Claude
+follows U5's clean-shell capture (without its resume hint); P1 captured the same
+2.1.325 version leaving the UI inline above the shell instead. Exit-display
+fidelity is therefore not universal. P1 also saw the first quick Down/Enter on
+Claude trust reset to No; the stand-in models stable selection, not that reset.
+No frame/ready event is emitted after exit. Codex hook-review Esc and permission
+`y`/`p` shortcuts are not modeled: use the documented arrows/Enter or modal Escape.
+
+Pure source/scene/key tests run through the Cargo Python contract; private tmux
+integration tests cover native fresh replay, modal keys and retained shells.
+`stand_in_screens` calls all three real adapters, not copied parsers. It compares
+all 76 sources through private tmux with independent source text and pinned U8a
+facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
+allowing tmux to normalize SGR encodings. Separate key-driven tests cover drafts,
+working/idle, each clear phase, repeated identical clear snapshots, interruptions,
+actual retained shells, trust, update, hook review/list, worktree and permission.
+P1 Codex dialogs and selected Claude trust remain Unknown under unchanged U8a.
+Claude's rich identical-draft source has a separate warning footer and is wholly
+Unknown, not merely unknown input. No parser special cases are added.
+
+For supplementary source-only conformance, `control(pane, json!({"command":
+"render_source", "key": "claude.permission.u5"}))` replays a catalog entry for
+that pane's mode. Set the private window to its catalog geometry first and hold
+model time. Await `rendered` with `state == "source-replay"`; this uses the same
+renderer and terminal barrier but does not change the model or emit `ready`.
+Unknown/cross-mode keys and replay during incomplete terminal input/paste refuse.
+This diagnostic control never proves a lifecycle
+transition; the key-driven tests are the independent transition evidence.
+
+A real-looking placeholder, selected trust option or Codex draft may still be
+Unknown to the current parsers. Neither the journal nor a rendered frame is
+permission to deliver a prompt.
 
 ## Captured templates
 
@@ -212,6 +424,17 @@ Unix proxy into atmd. `claude_2.1.325.jsonl` selects source lines
 Captured: Codex 0.167.0, 2026-11-14, U5 real TUI with `--no-daemon` through the same
 proxy. `codex_0.167.0.jsonl` selects lines 3, 4, 5, 12.
 
+Captured: Claude Code 2.1.325 and Codex 0.167.0, 2026-11-14, P1 private proxy
+permission probes. Claude's appended PostToolUse is raw record 52; Codex's
+appended PreToolUse, PermissionRequest and PostToolUse are raw records 39–41.
+They preserve payload shapes and tool results, with the identifier/path
+sanitization below. These are source splices, not one continuous captured tool
+flow: Codex permission events carry P1's gpt-5.4 rather than U5's gpt-6-luna,
+so the daemon's model changes during permission handling. Claude's P1 PostToolUse
+closes U5's PreToolUse/PermissionRequest with a matching sanitized tool_use_id but
+different tool_input and permission_mode. The stand-in replays these events
+rather than executing tools.
+
 Captured: pi 1.5.0, 2026-11-14, U5 real TUI with pi-atm through the same proxy.
 `pi_1.5.0.jsonl` selects lines 1, 2, 3, 5, 6, 7, 8, 18, 19. agent_end retains only
 the assistant; system/tools/user context and signed text metadata are omitted.
@@ -219,6 +442,7 @@ The capture carries `/new` on one persistent connection.
 
 Sanitization: paths become `/fixture/...`; identifiers become `fixture-*`;
 timestamps become zero. PID/pane are removed for the real forwarder to derive.
-Model names, source/reason/stopReason and usage shapes are retained. The permission
-screen is an excerpt with marker text replaced. Synthetic: runtime IDs, paths,
-prompt and timing substitutions construct controlled scenarios, not new captures.
+Model names, source/reason/stopReason and usage shapes are retained. Permission
+screens use the full catalog captures; synthetic selection changes only the
+selected marker. Synthetic: runtime IDs, paths, prompt and timing substitutions
+construct controlled scenarios, not new captures.

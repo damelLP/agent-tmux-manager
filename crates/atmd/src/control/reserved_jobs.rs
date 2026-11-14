@@ -14,6 +14,9 @@ use super::{
     Completion, ControlHandle, Reservation, ReservationError, ReservationRequest,
 };
 
+#[path = "capture_pacing.rs"]
+mod capture_pacing;
+
 type JobFuture = Pin<Box<dyn Future<Output = Finished> + Send>>;
 type Response<T, E> = oneshot::Receiver<Result<T, E>>;
 
@@ -157,6 +160,12 @@ pub(in crate::control) struct Admission {
 
 pub(in crate::control) enum Command {
     Acquire(Admission),
+    Observe {
+        pane: super::PaneId,
+        format: super::CaptureFormat,
+        deadline: Instant,
+        reply: oneshot::Sender<Result<super::PaneCapture, ReservationError>>,
+    },
     Pane {
         fence: Fence,
         action: super::pane_ops::Action,
@@ -165,7 +174,7 @@ pub(in crate::control) enum Command {
     },
     Drain {
         fence: Fence,
-        reply: oneshot::Sender<Result<Option<Arc<KillAudit>>, ReservationError>>,
+        reply: oneshot::Sender<Result<Vec<Arc<KillAudit>>, ReservationError>>,
     },
     Cleanup {
         fence: Fence,
@@ -182,6 +191,9 @@ impl Command {
     pub(in crate::control) fn reject_with(self, error: ReservationError) {
         match self {
             Self::Acquire(admission) => admission.job.reject(error),
+            Self::Observe { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             Self::Pane { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -202,7 +214,8 @@ pub(in crate::control) struct Jobs {
     task_ids: HashMap<Id, OperationId>,
     cancel: CancellationToken,
     audit_queue: crate::control::service::AuditQueue,
-    kill_audits: HashMap<OperationId, Arc<KillAudit>>,
+    kill_audits: HashMap<OperationId, Vec<Arc<KillAudit>>>,
+    captures: capture_pacing::Pacing,
 }
 
 impl Jobs {
@@ -218,6 +231,7 @@ impl Jobs {
             cancel,
             audit_queue,
             kill_audits: HashMap::new(),
+            captures: capture_pacing::Pacing::default(),
         }
     }
 
@@ -228,7 +242,42 @@ impl Jobs {
         stopping: bool,
         client: &dyn atm_tmux::TmuxClient,
     ) {
+        // Fence before pacing as well as at execution: an old capability must
+        // fail immediately, and a queued capture must recheck after cleanup.
+        if let Command::Pane { fence, .. } = &command {
+            if let Err(error) = self.state.check(fence, None, now) {
+                command.reject_with(error);
+                return;
+            }
+        }
+        if stopping && matches!(command, Command::Observe { .. }) {
+            command.reject();
+            return;
+        }
+        let Some(command) = self.captures.admit(command, now) else {
+            return;
+        };
         match command {
+            Command::Observe {
+                pane,
+                format,
+                deadline,
+                reply,
+            } => {
+                let result = if stopping {
+                    Err(ReservationError::Unavailable)
+                } else if now >= deadline {
+                    Err(ReservationError::Timeout)
+                } else {
+                    tokio::time::timeout_at(
+                        deadline,
+                        super::pane_ops::capture(client, &pane, format),
+                    )
+                    .await
+                    .unwrap_or(Err(ReservationError::Timeout))
+                };
+                let _ = reply.send(result);
+            }
             Command::Acquire(admission) => {
                 let result = if stopping {
                     Err(ReservationError::Unavailable)
@@ -249,6 +298,10 @@ impl Jobs {
                 reply,
             } => {
                 let audit = action.audit();
+                if let Some(pending) = self.kill_audits.get_mut(&fence.operation) {
+                    pending.retain(|ack| ack.pending());
+                }
+                let mut permit = None;
                 let mut result = match self
                     .state
                     .check(&fence, None, now)
@@ -261,34 +314,56 @@ impl Jobs {
                             && self
                                 .kill_audits
                                 .get(&fence.operation)
-                                .is_some_and(|audit| audit.pending()) =>
+                                .is_some_and(|audits| audits.len() >= 2) =>
                     {
                         Err(ReservationError::InvalidRequest {
-                            reason: "await the previous kill audit before killing another pane"
-                                .into(),
+                            reason: "at most two pending kill audits per job".into(),
                         })
                     }
-                    Ok(work_deadline) => tokio::time::timeout_at(
-                        deadline.min(work_deadline),
-                        super::pane_ops::execute(client, &mut self.state, &fence, action, now),
-                    )
-                    .await
-                    .unwrap_or(Err(ReservationError::Timeout)),
+                    Ok(work_deadline) => {
+                        let reserved = audit
+                            .as_ref()
+                            .map(|_| self.audit_queue.reserve())
+                            .transpose();
+                        match reserved {
+                            Err(error) => Err(error),
+                            Ok(slot) => {
+                                permit = slot;
+                                tokio::time::timeout_at(
+                                    deadline.min(work_deadline),
+                                    super::pane_ops::execute(
+                                        client,
+                                        &mut self.state,
+                                        &fence,
+                                        action,
+                                        now,
+                                    ),
+                                )
+                                .await
+                                .unwrap_or(Err(ReservationError::Timeout))
+                            }
+                        }
+                    }
                 };
                 if result.is_ok() {
-                    if let Some((command, time)) = audit {
-                        let ack = KillAudit::submit(&self.audit_queue, command, time);
-                        self.kill_audits.insert(fence.operation, ack.clone());
+                    if let (Some((command, time)), Some(permit)) = (audit, permit) {
+                        let ack = KillAudit::submit(permit, command, time);
+                        self.kill_audits
+                            .entry(fence.operation)
+                            .or_default()
+                            .push(ack.clone());
                         result = Ok(super::pane_ops::Output::Audit(ack));
                     }
                 }
                 let _ = reply.send(result);
             }
             Command::Drain { fence, reply } => {
-                let result = self
-                    .state
-                    .check(&fence, None, now)
-                    .map(|()| self.kill_audits.get(&fence.operation).cloned());
+                let result = self.state.check(&fence, None, now).map(|()| {
+                    self.kill_audits
+                        .get(&fence.operation)
+                        .cloned()
+                        .unwrap_or_default()
+                });
                 let _ = reply.send(result);
             }
             Command::Cleanup {
@@ -304,6 +379,21 @@ impl Jobs {
                 let _ = reply.send(result);
             }
         }
+    }
+
+    pub(in crate::control) async fn capture_ready(
+        &mut self,
+        client: &dyn atm_tmux::TmuxClient,
+        stopping: bool,
+    ) {
+        for command in self.captures.take_ready(Instant::now()) {
+            self.dispatch(command, Instant::now(), stopping, client)
+                .await;
+        }
+    }
+
+    pub(in crate::control) fn idle(&self) -> bool {
+        self.is_empty() && self.captures.is_empty()
     }
 
     pub(in crate::control) fn ready(&mut self, now: Instant) {
@@ -332,14 +422,23 @@ impl Jobs {
         }
     }
 
+    pub(in crate::control) fn input_gate(&self, pane: &super::PaneId) -> super::state::InputGate {
+        self.state.input_gate(pane)
+    }
+
     pub(in crate::control) fn next_deadline(&self) -> Option<Instant> {
-        self.state.next_deadline()
+        self.state
+            .next_deadline()
+            .into_iter()
+            .chain(self.captures.next_deadline())
+            .min()
     }
     pub(in crate::control) fn is_empty(&self) -> bool {
         self.running.is_empty()
     }
 
     pub(in crate::control) fn stop_waiting(&mut self) {
+        self.captures.stop();
         self.state.stop_waiting();
         for (_, admission) in self.waiting.drain() {
             admission.job.reject(ReservationError::Unavailable);

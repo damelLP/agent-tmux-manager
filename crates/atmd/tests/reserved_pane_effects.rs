@@ -23,7 +23,7 @@ fn inspection(tag: Option<&str>) -> PaneInspection {
         tag.map(str::to_owned),
         false,
         false,
-        Some(false),
+        Some(true),
         5,
         1,
     )
@@ -51,7 +51,156 @@ fn effects(mock: &atm_tmux::MockTmuxClient) -> Vec<MockCall> {
     mock.calls().into_iter().filter(|call| !matches!(call, MockCall::RawCommand { subcommand, .. } if subcommand != "set-option")).collect()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn reserved_input_refuses_unsafe_state_before_any_guard_or_effect() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let client = testing::ScriptedTmuxClient::new();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(client.clone()),
+        atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("safety test"),
+        cancel.clone(),
+    );
+    let scripts = client.clone();
+    control
+        .run_reserved(
+            request(ReservationKind::Delivery),
+            move |r| async move {
+                for dead in [false, true] {
+                    for operation in 0..4 {
+                        let mut fresh = frame(Some("project/lead"), CaptureFormat::Plain);
+                        fresh.inspection.dead = dead;
+                        fresh.inspection.in_mode = !dead;
+                        if operation >= 2 {
+                            scripts.script_capture(&fresh).unwrap();
+                        } else {
+                            scripts.script_tag_check(&fresh.inspection).unwrap();
+                        }
+                        let called = Arc::new(AtomicBool::new(false));
+                        let mark = called.clone();
+                        let guard = move |_: &PaneCapture| {
+                            mark.store(true, Ordering::SeqCst);
+                            true
+                        };
+                        let result = match operation {
+                            0 => r.keys(&pane(), r.agent().clone(), PaneKey::Enter).await,
+                            1 => r.paste(&pane(), r.agent().clone(), "a\nb".into()).await,
+                            2 => {
+                                r.keys_guarded(
+                                    &pane(),
+                                    r.agent().clone(),
+                                    PaneKey::Enter,
+                                    CaptureFormat::Plain,
+                                    guard,
+                                )
+                                .await
+                            }
+                            _ => {
+                                r.paste_guarded(
+                                    &pane(),
+                                    r.agent().clone(),
+                                    "a\nb".into(),
+                                    CaptureFormat::Plain,
+                                    guard,
+                                )
+                                .await
+                            }
+                        };
+                        assert!(
+                            matches!(
+                                result,
+                                Err(ReservationError::Control(
+                                    atmd::control::ControlError::SendRefused { .. }
+                                ))
+                            ),
+                            "{result:?}"
+                        );
+                        assert!(!called.load(Ordering::SeqCst));
+                        assert!(effects(&scripts.mock()).is_empty());
+                    }
+                }
+                Ok(())
+            },
+            noop,
+        )
+        .await
+        .unwrap();
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn reserved_paste_preserves_unknown_flag_policy_but_refuses_control_bytes() {
+    let client = testing::ScriptedTmuxClient::new();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(client.clone()),
+        atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("paste safety test"),
+        cancel.clone(),
+    );
+    let scripts = client.clone();
+    control
+        .run_reserved(
+            request(ReservationKind::Delivery),
+            move |r| async move {
+                for guarded in [false, true] {
+                    for bracketed in [Some(false), Some(true), None] {
+                        for text in [
+                            "a",
+                            "a\nb",
+                            "a\rb",
+                            "a\tb",
+                            "a\x1b[201~b",
+                            "a\x03b",
+                            "a\0b",
+                            "a\x7fb",
+                        ] {
+                            let mut fresh = frame(Some("project/lead"), CaptureFormat::Plain);
+                            fresh.inspection.bracketed_paste = bracketed;
+                            if guarded {
+                                scripts.script_capture(&fresh).unwrap();
+                            } else {
+                                scripts.script_tag_check(&fresh.inspection).unwrap();
+                            }
+                            let before = effects(&scripts.mock()).len();
+                            let result = if guarded {
+                                r.paste_guarded(
+                                    &pane(),
+                                    r.agent().clone(),
+                                    text.into(),
+                                    CaptureFormat::Plain,
+                                    |_| true,
+                                )
+                                .await
+                            } else {
+                                r.paste(&pane(), r.agent().clone(), text.into()).await
+                            };
+                            let refuse = (bracketed == Some(false) && text.contains(['\n', '\r']))
+                                || text.contains(['\x1b', '\x03', '\0', '\x7f']);
+                            assert_eq!(result.is_err(), refuse, "{guarded} {bracketed:?} {text:?}");
+                            assert_eq!(
+                                effects(&scripts.mock()).len(),
+                                before + usize::from(!refuse)
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            },
+            noop,
+        )
+        .await
+        .unwrap();
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn reserved_guard_uses_fresh_capture_and_refuses_changed_screen() {
     let client = testing::ScriptedTmuxClient::new();
     let cancel = CancellationToken::new();
@@ -69,20 +218,25 @@ async fn reserved_guard_uses_fresh_capture_and_refuses_changed_screen() {
                 scripts
                     .script_capture(&frame(Some("project/lead"), CaptureFormat::Ansi))
                     .unwrap();
+                let (seen, received) = tokio::sync::oneshot::channel();
                 assert!(matches!(
                     r.keys_guarded(
                         &pane(),
                         r.agent().clone(),
                         PaneKey::Enter,
                         CaptureFormat::Ansi,
-                        |fresh| {
-                            assert_eq!(fresh.text, "probe     \nready     \n\n\n\n\n\n\n");
+                        move |fresh| {
+                            let _ = seen.send(fresh.text.clone());
                             false
                         }
                     )
                     .await,
                     Err(ReservationError::ScreenChanged { .. })
                 ));
+                assert_eq!(
+                    received.await.unwrap(),
+                    "probe     \nready     \n\n\n\n\n\n\n"
+                );
                 assert!(effects(&scripts.mock()).is_empty());
                 scripts
                     .script_capture(&frame(Some("project/lead"), CaptureFormat::Plain))
@@ -130,7 +284,7 @@ async fn reserved_guard_uses_fresh_capture_and_refuses_changed_screen() {
     actor.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reserved_every_effect_rechecks_local_tag_and_expected_agent() {
     let client = testing::ScriptedTmuxClient::new();
     let cancel = CancellationToken::new();
@@ -231,10 +385,11 @@ async fn reserved_missing_is_positive_and_transport_errors_are_not_absence() {
                     r.capture(&pane(), CaptureFormat::Plain).await,
                     Err(ReservationError::PaneGone { .. })
                 ));
-                assert!(matches!(
-                    r.inspect(&pane()).await,
-                    Err(ReservationError::Control(_))
-                ));
+                let error = r.inspect(&pane()).await.unwrap_err().to_string();
+                assert!(
+                    error.contains("%0") && error.contains("read pane metadata"),
+                    "{error}"
+                );
                 Ok(())
             },
             noop,

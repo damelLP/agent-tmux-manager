@@ -167,7 +167,27 @@ impl DaemonServer {
         } else {
             None
         };
+        let agents_cancel = CancellationToken::new();
+        let agents_task = if services.agents.is_none() && services.org.status().is_ok() {
+            services.control.clone().map(|control| {
+                let (agents, task) = crate::org::agents::spawn_agents(
+                    services.org.clone(),
+                    self.registry.clone(),
+                    control,
+                    agents_cancel.clone(),
+                );
+                services.agents = Some(agents);
+                task
+            })
+        } else {
+            None
+        };
         let result = self.run_with_services(services).await;
+        // Drain agent reservations while the shared control and org still exist.
+        agents_cancel.cancel();
+        if let Some(task) = agents_task {
+            let _ = task.await;
+        }
         control_cancel.cancel();
         if let Some(task) = control_task {
             let _ = task.await;

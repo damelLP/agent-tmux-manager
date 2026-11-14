@@ -17,9 +17,26 @@ use crate::client::resolve_socket_path;
 
 /// Returns the path to the daemon PID file.
 fn pid_file_path() -> PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("atm")
+    resolve_pid_file_path(
+        std::env::var("ATM_STATE_DIR").ok().as_deref(),
+        dirs::state_dir(),
+    )
+}
+
+// Keep this override/legacy fallback aligned with src/bin/atmd.rs. Event-log
+// storage has a separate resolver with different relative-XDG/HOME fallbacks.
+fn resolve_pid_file_path(
+    atm_state_dir: Option<&str>,
+    default_state_dir: Option<PathBuf>,
+) -> PathBuf {
+    atm_state_dir
+        .filter(|state| !state.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            default_state_dir
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("atm")
+        })
         .join("atmd.pid")
 }
 
@@ -156,6 +173,39 @@ fn ensure_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Dropping override precedence, treating empty as a directory, or changing
+    // the legacy fallback would make the client address another daemon's PID.
+    #[test]
+    fn pid_path_override_and_legacy_defaults() {
+        for (override_dir, default_dir, expected) in [
+            (Some("/candidate"), Some("/state"), "/candidate/atmd.pid"),
+            (Some("relative"), Some("/state"), "relative/atmd.pid"),
+            (Some(""), Some("/state"), "/state/atm/atmd.pid"),
+            (None, Some("/state"), "/state/atm/atmd.pid"),
+            (None, None, "/tmp/atm/atmd.pid"),
+            (Some(""), None, "/tmp/atm/atmd.pid"),
+        ] {
+            assert_eq!(
+                resolve_pid_file_path(override_dir, default_dir.map(PathBuf::from)),
+                PathBuf::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn unset_override_preserves_the_existing_pid_path_byte_for_byte() {
+        let default = dirs::state_dir();
+        let legacy = default
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("atm")
+            .join("atmd.pid");
+        assert_eq!(
+            resolve_pid_file_path(None, default).as_os_str(),
+            legacy.as_os_str()
+        );
+    }
 
     #[test]
     fn readiness_requires_a_listener_even_when_the_pid_is_alive() {

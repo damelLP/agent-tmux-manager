@@ -10,6 +10,8 @@ use std::path::PathBuf;
 pub struct UpParams {
     pub project_root: PathBuf,
     pub name: String,
+    /// Caller tmux socket path; absence retains legacy server selection.
+    pub caller_server: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +19,8 @@ pub struct AdoptParams {
     pub project_root: PathBuf,
     pub name: String,
     pub pane: String,
+    /// Caller tmux socket path; absence retains legacy server selection.
+    pub caller_server: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +37,8 @@ pub const fn default_clear_timeout_ms() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct RespawnParams {
     pub agent: AgentId,
+    /// Caller tmux socket path; absence retains legacy server selection.
+    pub caller_server: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

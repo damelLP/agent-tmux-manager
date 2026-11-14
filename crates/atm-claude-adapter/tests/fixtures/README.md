@@ -1,5 +1,67 @@
 # Claude screen fixtures
 
+## Lifecycle control observations (B0)
+
+Captured: Claude Code 2.1.325, 2026-11-14, sealed P1 private-tmux
+`capture-pane -p -e -N`. `screen_control_p1_<stem>_2.1.325.txt` maps to
+`<stem>.styled-N.txt`; corresponding `.plain.txt` and `.meta.json` contain
+wording and cursor/geometry evidence. Only private run roots are replaced by
+equal-width `/tmp/xxx…` paths. Attributes, rows, spaces and composer text are
+unchanged; the first provenance line is removed at test load.
+
+`tests/control_screen.rs` covers A80/A120/A200 default, selected, reset and
+ready frames; A-race-0/1-yes; A-auto-ready; B-clear-007;
+B-baseline-conversation; C1-auto-settled; B-auto-submitted; and C3-dialog.
+The new control observer recognizes both trust selections and captured manual/
+auto launch chrome. Lines above the first complete header are uninterpreted;
+a later copied header cannot erase earlier history. The legacy observer and
+its existing Unknown assertions are unchanged. Mutations are marked Synthetic.
+
+Full trust paths are not filesystem authorization; long/wrapped paths and
+unseeded onboarding remain unverified. Retry count is policy, not a key sender.
+Conversation=false is not proof of freshness. The four-option permission
+capture remains Unknown. Older limitations below describe the legacy observer.
+
+## Styled fixtures (U8d)
+
+Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30
+`capture-pane -p -e`, and P1 private tmux `capture-pane -p -e -N`.
+`screen_styled_u5b_<state>_2.1.325.txt` maps to
+`claude-<state>.sgr.txt`; `screen_styled_p1_<state>_2.1.325.txt` maps to
+`<state>.styled-N.txt` (dimensions are in each P1 state name). Headers are
+provenance, removed only at test load. U5b is attribute evidence, not retained
+space evidence. Its cursor sidecars are `<source without .sgr.txt>.cursor.txt`;
+P1 geometry/cursor sidecars are `<state>.meta.json`.
+
+U5b bytes are unchanged. P1 replaces only the non-composer private run root
+with an equal-width `/tmp/xxx…` token; no row, SGR, OSC, space or glyph moves.
+The retained tests cover three terminal modes, Home drafts, blank editors,
+80/120/200-column trust, Yes-selected refusal, manual mode, four-option
+permission, and a shell launch prefix. Synthetic mutations are labelled in
+`tests/styled_screen.rs`.
+
+These styled tests supersede the **plain-only** limitations below: inverse/faint
+suggestions are distinguishable, while coordinates alone still prove nothing.
+Blank/padding stays Empty despite its whitespace-only-draft collision; consumers
+must verify the exact staged draft before Enter. Leading whitespace is preserved.
+Multiline reconstruction returns unknown. Trailing ASCII spaces are chrome;
+expected text must have no trailing whitespace. `-N` retains allocated grid
+padding, not just authored spaces (verified with tmux 3.8 and 3.6).
+Captured: Claude Code 2.1.325, 2026-11-14, sealed private-tmux command probe:
+`/clear   ` followed by Enter emitted SessionEnd/SessionStart with reason/source
+clear, not UserPromptSubmit; no API request occurred.
+
+P1 `B-auto-pasted-120x40` pins a matching padded real draft. `B-clear-001-120x40`
+pins the slash menu (it replaces the footer), and
+`C2-queued-001-120x40` pins the unsupported manual-mode queued frame. Legacy
+facts remain Unknown for both. B0's staged matcher now checks the single selected
+completion command and active editor exactly; description wording may vary but
+wrapped description alignment must remain intact. No selection, two selections,
+missing editor or malformed layout refuses. The menu is None (not a modal) only
+in the control observer. The manual queued staged check remains None. The queued
+frame's captured editor row is also transplanted into supported auto chrome in
+a labelled Synthetic test. A match alone never proves what Enter will do.
+
 The original text fixtures are the 15 distinct frames among 48 raw U5 Claude
 screens (40 rows, 120 columns). The additional coordinator and U5b frames are
 described below; there are 65 Claude screen fixture files in total. Existing JSON/JSONL hook fixtures retain the

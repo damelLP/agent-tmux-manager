@@ -40,6 +40,54 @@ fn threshold_is_five_cents_since_last_summary_not_last_update() {
     assert!(entry.due(false));
 }
 
+// Synthetic replay of the M1 trial facts (pi 1.5.0, 2026-11-14), not a raw
+// harness capture: summaries at start/first prompt, 359 microdollars at restart.
+// A turn-status trigger, ignored flush flag, or lowered material-cost threshold
+// would change this result. No wall-clock waits or observer scheduling assumptions.
+#[test]
+fn m1_turn_end_under_material_cost_waits_for_shutdown_flush() {
+    use atm_core::SessionStatus;
+
+    let mut live = view("m1-trial", 0.0, None);
+    let mut entry = Entry::new(from_view(&live).unwrap(), None);
+    assert!(entry.due(false), "seq 3: initial session facts are due");
+    entry.saved = Some(entry.latest.clone());
+
+    live.first_prompt = Some("Reply with one word".into());
+    live.status = SessionStatus::Working;
+    entry.update(from_view(&live).unwrap());
+    assert!(entry.due(false), "seq 5: first prompt is due");
+    entry.saved = Some(entry.latest.clone());
+
+    live.cost_usd = 0.000359;
+    live.status = SessionStatus::Idle;
+    entry.update(from_view(&live).unwrap());
+    assert_eq!(entry.latest.cost, Some(Money::from_microdollars(359)));
+    assert!(!entry.due(false), "turn end is not session end or $0.05");
+    assert!(entry.latest.ended.is_none());
+    assert!(entry.due(true), "seq 6: clean restart flushes exact cost");
+    let persisted = entry.latest.clone();
+
+    // Restart defaults must not erase the flushed cost; a second turn changing
+    // only working/idle status adds no summary (seq 7 is control.sent).
+    let mut resumed = Entry::new(
+        from_view(&view("m1-trial", 0.0, None)).unwrap(),
+        Some(&persisted),
+    );
+    assert!(!resumed.due(false));
+    for status in [SessionStatus::Working, SessionStatus::Idle] {
+        live.status = status;
+        resumed.update(from_view(&live).unwrap());
+        assert!(!resumed.due(false));
+        assert!(
+            !resumed.due(true),
+            "unchanged facts need no duplicate flush"
+        );
+        assert_eq!(resumed.latest.cost, Some(Money::from_microdollars(359)));
+        assert!(resumed.latest.ended.is_none());
+    }
+}
+
 #[test]
 fn first_prompt_model_pane_and_end_bypass_cost_threshold() {
     for change in 0..4 {

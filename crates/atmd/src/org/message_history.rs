@@ -302,6 +302,7 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::AgentSessionBound { agent_id, .. }
         | OrgEvent::AgentSessionLost { agent_id }
         | OrgEvent::AgentEditorReady { agent_id }
+        | OrgEvent::AgentRevalidationRequested { agent_id }
         | OrgEvent::AgentClearRequested { agent_id }
         | OrgEvent::AgentStuck { agent_id, .. }
         | OrgEvent::AgentDown { agent_id, .. } => Some(agent_id),

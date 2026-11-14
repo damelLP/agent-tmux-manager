@@ -84,15 +84,17 @@ async fn frame(client: &dyn TmuxClient, pane: &str, format: CaptureFormat) -> St
     client.raw_command("display-message", &args).await.unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn guarded_input_contract_runs_predicates_against_fresh_scripted_captures() {
     let client = ScriptedTmuxClient::new();
     let mock = client.mock();
+    let mut safe = inspection("%0", Some("project/lead"));
+    safe.bracketed_paste = Some(true);
     for format in [CaptureFormat::Ansi, CaptureFormat::Plain] {
         client
             .script_capture(&PaneCapture::new(
                 "probe     \nready     \n\n\n\n\n\n\n".into(),
-                inspection("%0", Some("project/lead")),
+                safe.clone(),
                 format,
             ))
             .unwrap();
@@ -118,6 +120,8 @@ async fn guarded_input_contract_runs_predicates_against_fresh_scripted_captures(
             move |r| async move {
                 let pane = PaneId::parse("%0").unwrap();
                 let key_called = called.clone();
+                let (key_seen, key_received) = tokio::sync::oneshot::channel();
+                let (paste_seen, paste_received) = tokio::sync::oneshot::channel();
                 assert!(matches!(
                     r.keys_guarded(
                         &pane,
@@ -126,7 +130,7 @@ async fn guarded_input_contract_runs_predicates_against_fresh_scripted_captures(
                         CaptureFormat::Ansi,
                         move |capture: &PaneCapture| {
                             key_called.store(true, Ordering::SeqCst);
-                            assert!(!capture.inspection.in_mode);
+                            let _ = key_seen.send(capture.inspection.in_mode);
                             false
                         }
                     )
@@ -141,13 +145,15 @@ async fn guarded_input_contract_runs_predicates_against_fresh_scripted_captures(
                         CaptureFormat::Plain,
                         move |capture: &PaneCapture| {
                             called.store(true, Ordering::SeqCst);
-                            assert!(!capture.inspection.dead);
+                            let _ = paste_seen.send(capture.inspection.dead);
                             false
                         }
                     )
                     .await,
                     Err(ReservationError::ScreenChanged { .. })
                 ));
+                assert!(!key_received.await.unwrap());
+                assert!(!paste_received.await.unwrap());
                 assert_eq!(
                     ReservationError::ScreenChanged { pane }.to_string(),
                     "pane %0 no longer passes the approved screen check; nothing was sent"
@@ -227,6 +233,7 @@ async fn consumer_capture_scripts_match_real_plain_and_ansi_probe_framing() {
                 text: text.into(),
                 inspection: inspection("%0", Some("project/lead")),
                 format,
+                focused: None,
             })
             .unwrap();
         assert_eq!(client.pending_reads(&pane).unwrap(), 3);
@@ -281,7 +288,8 @@ async fn consumer_missing_scripts_fail_closed_and_missing_pane_is_explicit() {
         .script_capture(&PaneCapture {
             text: "truncated".into(),
             inspection: inspection("%0", None),
-            format: CaptureFormat::Plain
+            format: CaptureFormat::Plain,
+            focused: None,
         })
         .is_err());
 }
@@ -291,6 +299,7 @@ async fn consumer_scripted_client_works_with_real_control_handle() {
     let client = ScriptedTmuxClient::new();
     let mock = client.mock();
     mock.set_next_pane_id("%42");
+    client.script_tag_check(&inspection("%42", None)).unwrap();
     let cancel = CancellationToken::new();
     let (control, task) = spawn_control(
         Box::new(client),

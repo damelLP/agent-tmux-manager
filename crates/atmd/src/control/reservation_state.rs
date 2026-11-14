@@ -77,7 +77,36 @@ fn quarantined(entry: &Entry) -> ReservationError {
     }
 }
 
+pub(in crate::control) enum InputGate {
+    Free,
+    Held,
+    Clearing(atm_org::AgentId),
+    Quarantined(atm_org::AgentId),
+    Unavailable,
+}
+
 impl State {
+    pub(super) fn input_gate(&self, pane: &PaneId) -> InputGate {
+        if self.quarantine_overflow {
+            return InputGate::Unavailable;
+        }
+        let owners = || self.entries.iter().filter(|entry| owns(entry, pane));
+        if let Some(entry) = owners().find(|entry| entry.phase == Phase::Quarantined) {
+            return InputGate::Quarantined(entry.request.agent.clone());
+        }
+        if let Some(entry) = owners().find(|entry| {
+            entry.request.kind == ReservationKind::Clear
+                && matches!(entry.phase, Phase::Work | Phase::Cleanup)
+        }) {
+            return InputGate::Clearing(entry.request.agent.clone());
+        }
+        if owners().next().is_some() {
+            InputGate::Held
+        } else {
+            InputGate::Free
+        }
+    }
+
     pub(super) fn admit(
         &mut self,
         request: ReservationRequest,

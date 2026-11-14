@@ -45,10 +45,18 @@ pub enum OrgCommand {
     SessionLost {
         agent_id: AgentId,
     },
+    /// Suspend readiness during restart/adopt revalidation, retaining the pane,
+    /// recorded session and exclusion. Observe and report under the same agent
+    /// reservation. Ready transitions to Starting; Starting with a recorded
+    /// session is already revalidating. Other source states refuse.
+    Revalidate {
+        agent_id: AgentId,
+    },
     /// The caller must observe the fresh editor after the operation this report
-    /// completes (clear, up or respawn), and submit it in the same serialized
-    /// step owning the agent. An observation queued across a later clear or
-    /// respawn can complete the wrong readiness: this command carries no pane
+    /// completes (clear, up or respawn), or a safe idle editor during restart/
+    /// adopt revalidation, and submit it in the same serialized step owning the
+    /// agent. An observation queued across a later clear or respawn can complete
+    /// the wrong readiness: this command carries no pane
     /// or generation to reject it. See the crate's command-policy limits.
     EditorReady {
         agent_id: AgentId,
@@ -151,6 +159,7 @@ impl OrgCommand {
             },
             Self::SessionLost { agent_id } => OrgEvent::AgentSessionLost { agent_id },
             Self::EditorReady { agent_id } => OrgEvent::AgentEditorReady { agent_id },
+            Self::Revalidate { agent_id } => OrgEvent::AgentRevalidationRequested { agent_id },
             Self::Stuck { agent_id, reason } => OrgEvent::AgentStuck { agent_id, reason },
             Self::SendMessage(content) => OrgEvent::MessageSent(content),
             Self::DeliveryAttempted {
@@ -281,6 +290,14 @@ impl OrgState {
                     return Err(agent_refusal(agent, "record editor ready"));
                 }
                 agent.status != AgentStatus::Ready
+            }
+            OrgCommand::Revalidate { agent_id } => {
+                let agent = self.require_agent(agent_id)?;
+                match agent.status {
+                    AgentStatus::Ready => true,
+                    AgentStatus::Starting if agent.session_id.is_some() => false,
+                    _ => return Err(agent_refusal(agent, "revalidate")),
+                }
             }
             OrgCommand::SessionLost { agent_id } => {
                 let agent = self.require_agent(agent_id)?;

@@ -16,6 +16,7 @@ pub mod harness_registry;
 pub mod lifecycle;
 pub mod model;
 pub mod session;
+pub mod styled_screen;
 pub mod tool;
 pub mod tree;
 
@@ -27,7 +28,7 @@ pub use error::{DomainError, DomainResult};
 pub use harness::Harness;
 pub use harness_control::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
-    TurnState,
+    ScreenInput, ScreenTextFormat, TurnState,
 };
 pub use harness_registry::{
     builtin_harness_ids_display, builtin_harnesses, default_harness_definition,

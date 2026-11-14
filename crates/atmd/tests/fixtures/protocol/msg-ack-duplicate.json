@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"duplicate","method":"msg.ack","params":{"ids":["m1","m1"]}},
+  "response": {"type":"response","id":"duplicate","error":{"code":"invalid_params","message":"invalid message parameters: ids must be distinct"}},
+  "ignore": []
+}

@@ -1442,6 +1442,7 @@ mod tests {
     use super::*;
 
     use atm_core::{AgentType, Model, SessionDomain, SessionView};
+    use std::os::fd::AsFd;
     use tokio::net::UnixStream;
 
     use crate::registry::RemovalReason;
@@ -1459,6 +1460,16 @@ mod tests {
             Arc::new(MethodRouter::default()),
         );
         (handler, peer)
+    }
+
+    /// Shut down the socket itself, not just our descriptor: a concurrent
+    /// subprocess spawn can retain another descriptor until exec. Queued input
+    /// remains readable, but replies now fail and the input ends with EOF.
+    fn close_peer(peer: UnixStream) {
+        peer.into_std()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
     }
 
     fn handshake_hook() -> ClientMessage {
@@ -1493,8 +1504,8 @@ mod tests {
                 vec![ClientMessage::connect(None), handshake_hook()],
             )
             .await;
-            // Full close, before run: Connected must fail, but the event is readable.
-            drop(peer);
+            // Full shutdown, before run: Connected fails, but the event is readable.
+            close_peer(peer);
             handler.run().await;
             assert!(
                 registry
@@ -1523,7 +1534,7 @@ mod tests {
                 vec![ClientMessage::connect(None), handshake_hook(), prompt],
             )
             .await;
-            drop(peer);
+            close_peer(peer);
             handler.run().await;
             let row = registry
                 .get_session(SessionId::new("closed-hook"))
@@ -1542,12 +1553,14 @@ mod tests {
     async fn closed_hook_payload_is_valid_and_buffered() {
         timeout(Duration::from_secs(30), async {
             let (mut handler, mut peer) = handshake_pair();
+            // Model a concurrent spawn retaining this descriptor until exec.
+            let _inherited_peer = peer.as_fd().try_clone_to_owned().unwrap();
             queue_messages(
                 &mut peer,
                 vec![ClientMessage::connect(None), handshake_hook()],
             )
             .await;
-            drop(peer);
+            close_peer(peer);
             let error = handler
                 .send_message(DaemonMessage::pong(0))
                 .await
@@ -1616,7 +1629,7 @@ mod tests {
                     vec![ClientMessage::connect(None), event.clone(), event],
                 )
                 .await;
-                drop(peer);
+                close_peer(peer);
                 handler.run().await;
                 let row = registry
                     .get_session(SessionId::new("closed-hook"))
@@ -1666,7 +1679,7 @@ mod tests {
                 ],
             )
             .await;
-            drop(peer);
+            close_peer(peer);
             handler.handle_handshake().await.unwrap();
             let mut requests = JoinSet::new();
             handler.process_message_loop(&mut requests).await.unwrap();
@@ -1702,7 +1715,7 @@ mod tests {
                 ],
             )
             .await;
-            drop(peer);
+            close_peer(peer);
             handler.handle_handshake().await.unwrap();
             let writer = handler.writer_handle();
             let _held = writer.lock().await;
@@ -1736,7 +1749,7 @@ mod tests {
                         .unwrap();
                     queue_messages(&mut peer, vec![handshake_hook()]).await;
                     if closed {
-                        drop(peer);
+                        close_peer(peer);
                         assert!(handler.run().await.is_none());
                     } else {
                         peer.shutdown().await.unwrap();
@@ -1812,7 +1825,7 @@ mod tests {
                 vec![ClientMessage::connect(None), handshake_hook()],
             )
             .await;
-            drop(peer);
+            close_peer(peer);
             handler.cancel.cancel();
             assert!(handler.run().await.is_none());
             assert!(registry
@@ -1863,7 +1876,7 @@ mod tests {
             vec![ClientMessage::connect(None), handshake_hook()],
         )
         .await;
-        drop(peer);
+        close_peer(peer);
         // Prime the reader before pausing: no real socket I/O is pending when
         // the clock auto-advances to the deadline on the held writer mutex.
         timeout(Duration::from_secs(30), handler.reader.fill_buf())
@@ -3337,6 +3350,8 @@ mod tests {
     #[tokio::test]
     async fn reply_writer_frames_one_line_and_reports_closed_peer() {
         let (writer, peer) = subscriber_pair();
+        // The reply must fail even while another descriptor keeps the peer alive.
+        let _inherited_peer = peer.as_fd().try_clone_to_owned().unwrap();
         write_message(&writer, &DaemonMessage::pong(42))
             .await
             .unwrap();
@@ -3344,7 +3359,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         assert_eq!(line, "{\"type\":\"pong\",\"seq\":42}\n");
-        drop(reader);
+        close_peer(reader.into_inner());
         assert!(matches!(
             write_message(&writer, &DaemonMessage::pong(43)).await,
             Err(ConnectionError::Io(_))

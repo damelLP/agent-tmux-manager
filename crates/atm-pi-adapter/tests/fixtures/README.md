@@ -1,5 +1,50 @@
 # Pi screen fixtures
 
+## Lifecycle control observations (B0)
+
+Captured: pi 1.5.0, 2026-11-14, sealed P1 private tmux
+`capture-pane -p -e -N`. New
+`screen_control_p1_B-conversation-120x40_1.5.0.txt` maps to
+`B-conversation-120x40.styled-N.txt`, paired with `.plain.txt` and `.meta.json`.
+Only the private run root becomes an equal-width `/tmp/xxx…` path; all rows,
+attributes, spaces and composer content remain. Strip the provenance label at
+load. Other control tests reuse the existing styled P1 fixtures below.
+
+No startup dialogs appeared: the control observer emits None only for existing
+recognized editors, Unknown otherwise. Conversation is independent of draft/
+turn facts: content beyond recognized startup blocks proves visible history.
+P1's scrolled working/draft screens have separate indented transcript blocks
+and nonzero usage; neither usage nor an old new-session notice alone proves
+conversation or freshness. A draft alone is not conversation. Unknown custom
+UI, trust-gated project startup and permission extensions remain unverified.
+Mutations are Synthetic; legacy observation and staged-check results do not change.
+
+## Styled fixtures (U8d)
+
+Captured: pi 1.5.0, 2026-11-14, P1 private tmux 120x40
+`capture-pane -p -e -N`.
+`screen_styled_p1_<state>_1.5.0.txt` maps to `<state>.styled-N.txt`;
+`<state>.meta.json` holds source geometry/cursor metadata. Provenance headers
+are removed only at test load. Only the private run root outside composers was
+replaced by an equal-width `/tmp/xxx…` token. No SGR, rows, spaces or composer
+content was normalized. Tests cover blank startup/new session, one/multiline
+drafts, working/queued input, selector and retry countdown. The held retry
+request has a Working border; only the countdown is an unknown border.
+
+Styled coverage supersedes the plain-only limitations below. Blank/padding
+stays Empty with its accepted whitespace-only-draft collision. Tmux 3.8/3.6
+probes show -N keeps allocated padding as well as authored spaces. Safety
+requires exact staged-draft verification before Enter, refusing unknown.
+Leading spaces survive comparison; multiline reconstruction remains unknown.
+Trailing ASCII spaces are chrome; expected text must have no trailing whitespace.
+P1 `C4-one-draft`, `B-0-event-pasted` and `C4-one-pasted` pin matching real padded
+drafts. Faint text is not typed input, and a match alone does not prove Enter
+submits rather than interacting with a popup.
+Captured: pi 1.5.0, 2026-11-14, sealed private-tmux command probe: `/new   `
+followed by Enter emitted shutdown/start with reason new and a changed ID,
+not input; no API request occurred.
+Synthetic adversarial cases are labelled in `tests/styled_screen.rs`.
+
 Ten distinct frames cover all 15 raw U5 pi screens (40 rows, 120 columns).
 Existing JSONL fixtures retain the provenance in the crate docs. The screen
 parser's `captured_screens` table checks all four facts for every frame.

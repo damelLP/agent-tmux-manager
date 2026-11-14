@@ -1,0 +1,31 @@
+Captured: codex-cli 0.167.0, 2026-11-14, capture-pane -e -p; private tmux, 100x30; rich.
+
+  [38;2;99;168;248m>_ [1m[39mOpenAI Codex[0;2m (v0.167.0)[0m
+     [2m~[0m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1m›[0m Ask Codex to do anything
+
+  [38;2;246;226;183mGPT-6.1-Sol default[39m · [38;2;171;223;167m~
+[39m

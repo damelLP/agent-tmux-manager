@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use atm_codex_adapter::CodexEventType;
 use serde_json::{json, Map, Value};
 
-use super::hooks::{add_hook_entries, install_executable_script};
+use super::hooks::{add_hook_entries, install_executable_script, is_marker_command};
 use super::json::{read_json_file_or_empty, write_json_file_pretty};
 use super::skills::setup_atm_skills;
 use super::{Result, SetupError};
@@ -55,14 +55,14 @@ pub(super) fn write_codex_hooks(hooks: &Map<String, Value>) -> Result<()> {
     write_json_file_pretty(&path, hooks)
 }
 
-/// Creates a Codex hook entry for the given hook type.
+/// Creates a Codex hook entry with the default timeout.
 ///
 /// Shape validated against codex-cli 0.146.1 and, on 2026-10-24, 0.163.0
 /// (all 11 events registered): entries live under a
 /// top-level `hooks` object keyed by event name; omitting `matcher`
-/// fires for all tools. Codex clamps the SessionEnd hook timeout to
-/// 3s (0.163.0 warns that it does); 5s is a comfortable ceiling for the
-/// fire-and-forget script everywhere else.
+/// fires for all tools. Setup caps new and existing SessionEnd entries at
+/// 3s before writing: codex-cli 0.167.0 otherwise shows a startup warning.
+/// The fire-and-forget script keeps a 5s ceiling everywhere else.
 pub(super) fn create_codex_hook_entry() -> Value {
     let hook_path = codex_hook_script_path();
     let command = hook_path.to_string_lossy().to_string();
@@ -74,6 +74,33 @@ pub(super) fn create_codex_hook_entry() -> Value {
             "timeout": 5
         }]
     })
+}
+
+/// Caps ATM's SessionEnd timeouts without changing user commands or shorter
+/// timeouts. Returns whether settings changed, including on an old install.
+#[must_use]
+fn limit_session_end_timeout(settings: &mut Map<String, Value>) -> bool {
+    let entries = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut("SessionEnd"))
+        .and_then(Value::as_array_mut);
+    let mut changed = false;
+    for entry in entries.into_iter().flatten() {
+        let hooks = entry.get_mut("hooks").and_then(Value::as_array_mut);
+        for hook in hooks.into_iter().flatten() {
+            if !is_marker_command(hook, "atm-codex-hook") {
+                continue;
+            }
+            if let Some(timeout) = hook
+                .get_mut("timeout")
+                .filter(|t| t.as_u64().is_some_and(|seconds| seconds > 3))
+            {
+                *timeout = json!(3);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Wires `atm-codex-hook` into Codex's `~/.codex/hooks.json`.
@@ -94,7 +121,8 @@ pub(super) fn setup_codex() -> Result<()> {
         |_| create_codex_hook_entry(),
     )?;
 
-    if added > 0 {
+    let updated = limit_session_end_timeout(&mut settings);
+    if added > 0 || updated {
         write_codex_hooks(&settings)?;
         println!("  Codex configuration written.");
         println!("\n  IMPORTANT: Codex requires one-time trust approval for hooks");

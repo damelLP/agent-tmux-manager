@@ -11,6 +11,11 @@
 //! Older readers skip editor-ready facts and may remain clearing, starting or
 //! stuck: they cannot reconstruct the newer semantics. Compatibility is newer reads older,
 //! not a guarantee of safe downgrade or equivalent state in older readers.
+//!
+//! `agent.revalidation_requested` is additive with the same agent-ID-only body.
+//! It records Starting while retaining pane, session and exclusion. Existing
+//! kinds are unchanged. Older readers skip it and may incorrectly retain Ready;
+//! this is another reason downgrading a newer log is not a safety guarantee.
 
 use crate::{Address, AgentId, MessageId, ProjectId, RoleSpec, TaskId};
 use atm_core::{Harness, Money, SessionId};
@@ -124,6 +129,8 @@ pub enum OrgEvent {
     AgentSessionLost { agent_id: AgentId },
     #[serde(rename = "agent.editor_ready")]
     AgentEditorReady { agent_id: AgentId },
+    #[serde(rename = "agent.revalidation_requested")]
+    AgentRevalidationRequested { agent_id: AgentId },
     #[serde(rename = "agent.clear_requested")]
     AgentClearRequested { agent_id: AgentId },
     #[serde(rename = "agent.stuck")]
@@ -174,6 +181,7 @@ impl OrgEvent {
             Self::AgentSessionBound { .. } => "agent.session_bound",
             Self::AgentSessionLost { .. } => "agent.session_lost",
             Self::AgentEditorReady { .. } => "agent.editor_ready",
+            Self::AgentRevalidationRequested { .. } => "agent.revalidation_requested",
             Self::AgentClearRequested { .. } => "agent.clear_requested",
             Self::AgentStuck { .. } => "agent.stuck",
             Self::AgentDown { .. } => "agent.down",
@@ -212,6 +220,7 @@ impl OrgEvent {
                 | "agent.session_bound"
                 | "agent.session_lost"
                 | "agent.editor_ready"
+                | "agent.revalidation_requested"
                 | "agent.clear_requested"
                 | "agent.stuck"
                 | "agent.down"

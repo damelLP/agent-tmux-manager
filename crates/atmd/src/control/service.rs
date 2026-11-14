@@ -16,10 +16,12 @@ mod tests {
         mock.set_next_pane_id("%42");
         mock.set_pane_cwd("%7", "/pane");
         let cancel = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
         let (control, task) = spawn_control(
             Box::new(mock.clone()),
             crate::registry::spawn_registry(),
-            OrgHandle::disabled("test disabled"),
+            org,
             cancel.clone(),
         );
         assert_eq!(
@@ -68,10 +70,13 @@ mod tests {
     async fn refusal_and_tmux_failures_are_values_without_further_effects() {
         let mock = MockTmuxClient::new();
         mock.set_next_raw_output("1 0");
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = CancellationToken::new();
+        let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
         let (control, task) = spawn_control(
             Box::new(mock.clone()),
             crate::registry::spawn_registry(),
-            OrgHandle::disabled("test disabled"),
+            org,
             CancellationToken::new(),
         );
         let error = control.send("%7".into(), "hi".into()).await.unwrap_err();
@@ -87,6 +92,7 @@ mod tests {
         assert_eq!(mock.call_count(), 1);
         drop(control);
         task.await.unwrap();
+        org_cancel.cancel();
     }
 
     #[tokio::test]
@@ -97,9 +103,21 @@ mod tests {
         let mock = MockTmuxClient::new();
         let (reply, response) = oneshot::channel();
         drop(response);
-        execute(
+        let mut mirror = org_mirror::Mirror::start(org.clone());
+        while matches!(mirror.view(), org_mirror::View::Loading) {
+            mirror.changed().await;
+        }
+        let (sender, mut receive) = mpsc::channel(AUDIT_CAPACITY);
+        let audits = AuditQueue {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        let mut jobs = Jobs::new(cancel.clone(), audits.clone());
+        let pending = legacy_input::dispatch(
             &mock,
             &crate::registry::spawn_registry(),
+            &mut jobs,
+            &mirror,
             Pending {
                 server: None,
                 deadline: Instant::now(),
@@ -110,14 +128,22 @@ mod tests {
                     reply,
                 },
             },
+            &audits,
+            true,
         )
         .await;
+        assert!(pending.is_none());
+        assert!(matches!(
+            receive.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         assert_eq!(mock.call_count(), 0);
         assert_eq!(
             org.status().unwrap(),
             0,
             "expired queued work is not an action"
         );
+        mirror.stop().await;
         cancel.cancel();
     }
 
@@ -184,6 +210,7 @@ mod tests {
             let (control, task) = spawn_control_with_audit(
                 Box::new(MockTmuxClient::new()),
                 crate::registry::spawn_registry(),
+                org_mirror::Mirror::start(org.clone()),
                 cancel.clone(),
                 {
                     let gate = gate.clone();
@@ -283,6 +310,7 @@ mod tests {
             let (control, task) = spawn_control_with_audit(
                 Box::new(MockTmuxClient::new()),
                 crate::registry::spawn_registry(),
+                org_mirror::Mirror::start(org.clone()),
                 CancellationToken::new(),
                 {
                     let gate = gate.clone();
@@ -381,7 +409,17 @@ mod tests {
 #[path = "reservation_audit_tests.rs"]
 mod reservation_audit_tests;
 
+#[cfg(test)]
+#[path = "legacy_input_tests.rs"]
+mod legacy_input_tests;
+
+#[path = "legacy_input.rs"]
+mod legacy_input;
+#[path = "org_mirror.rs"]
+mod org_mirror;
+
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -438,6 +476,15 @@ pub enum ServiceError {
     ServerRefused(String),
 }
 
+fn reservation_error(error: ServiceError) -> ReservationError {
+    match error {
+        ServiceError::Timeout => ReservationError::Timeout,
+        ServiceError::Unavailable => ReservationError::Unavailable,
+        ServiceError::Control(error) => error.into(),
+        ServiceError::ServerRefused(reason) => ReservationError::InvalidRequest { reason },
+    }
+}
+
 type Reply<T> = oneshot::Sender<Result<T, ServiceError>>;
 
 enum Request {
@@ -483,7 +530,32 @@ pub struct AuditQueue {
     dropped: Arc<AtomicU64>,
 }
 
+pub(in crate::control) struct AuditPermit(mpsc::OwnedPermit<Audit>);
+
+impl AuditPermit {
+    pub(in crate::control) fn submit(
+        self,
+        command: OrgCommand,
+        now: chrono::DateTime<chrono::Utc>,
+        acknowledgement: AuditAcknowledgement,
+    ) {
+        self.0.send(Audit::Record {
+            command: Box::new(command),
+            now,
+            acknowledgement: Some(acknowledgement),
+        });
+    }
+}
+
 impl AuditQueue {
+    pub(in crate::control) fn reserve(&self) -> Result<AuditPermit, ReservationError> {
+        self.sender
+            .clone()
+            .try_reserve_owned()
+            .map(AuditPermit)
+            .map_err(|_| ReservationError::Unavailable)
+    }
+
     /// Capture time at the effect, not when persistence eventually catches up.
     /// Optional acknowledgement is awaited by callers outside the control actor.
     pub fn submit(
@@ -666,22 +738,30 @@ impl ControlHandle {
 /// services. Inject clones of the same handle into RPC, U8 and U9b consumers.
 /// The owner cancels and joins this task before dropping its registry.
 /// Send/spawn and reserved kills share the sole bounded audit queue. A disabled
-/// OrgHandle permits control but logs audit failures without retrying effects.
+/// OrgHandle permits input only after positively inspecting an untagged pane;
+/// audit failures are logged without retrying effects.
 pub fn spawn_control(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
     org: OrgHandle,
     cancel: CancellationToken,
 ) -> (ControlHandle, JoinHandle<()>) {
-    spawn_control_with_audit(client, registry, cancel, move |audit, now| {
-        let org = org.clone();
-        async move { org.execute(audit, now).await }
-    })
+    spawn_control_with_audit(
+        client,
+        registry,
+        org_mirror::Mirror::start(org.clone()),
+        cancel,
+        move |audit, now| {
+            let org = org.clone();
+            async move { org.execute(audit, now).await }
+        },
+    )
 }
 
 fn spawn_control_with_audit<F, Fut>(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
+    mut mirror: org_mirror::Mirror,
     cancel: CancellationToken,
     mut persist: F,
 ) -> (ControlHandle, JoinHandle<()>)
@@ -724,13 +804,44 @@ where
             }
         });
         let mut jobs = Jobs::new(cancel.clone(), audits.clone());
+        let mut parked = VecDeque::<Pending>::new();
+        #[cfg(test)]
+        let mut audit_barriers = Vec::new();
         let mut stopping = false;
+        let mut input_closed = false;
         loop {
-            if stopping && jobs.is_empty() {
+            if stopping && jobs.idle() {
                 requests.close();
             }
             jobs.ready(Instant::now());
-            let deadline = jobs.next_deadline();
+            jobs.capture_ready(&*client, stopping).await;
+            // One pass per wake, not a busy retry loop. Re-resolve original targets
+            // against current registry, org projection and reservation ownership.
+            for _ in 0..parked.len() {
+                if let Some(pending) = parked.pop_front() {
+                    if let Some(pending) = legacy_input::dispatch(
+                        &*client, &registry, &mut jobs, &mirror, pending, &audits, !stopping,
+                    )
+                    .await
+                    {
+                        parked.push_back(pending);
+                    }
+                }
+            }
+            #[cfg(test)]
+            if parked.is_empty() {
+                for reply in audit_barriers.drain(..) {
+                    let _ = audits.sender.send(Audit::Barrier(reply)).await;
+                }
+            }
+            if input_closed && parked.is_empty() && jobs.idle() {
+                break;
+            }
+            let deadline = jobs
+                .next_deadline()
+                .into_iter()
+                .chain(parked.iter().map(|p| p.deadline))
+                .min();
             tokio::select! {
                 biased;
                 _ = cancel.cancelled(), if !stopping => {
@@ -738,27 +849,42 @@ where
                     jobs.stop_waiting();
                 }
                 () = jobs.join_next(), if !jobs.is_empty() => {}
+                () = mirror.changed() => {}
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {}
-                pending = requests.recv() => {
-                    let Some(pending) = pending else { break };
+                pending = requests.recv(), if !input_closed => {
+                    let Some(pending) = pending else {
+                        // Last caller EOF is not cancellation of admitted input.
+                        // Keep mirror/deadline/job progress alive until it drains.
+                        input_closed = true;
+                        continue;
+                    };
                     match pending {
+                        #[cfg(test)]
+                        self::Pending { request: Request::FlushAudit(reply), .. } if !parked.is_empty() => {
+                            audit_barriers.push(reply);
+                        }
                         self::Pending { request: Request::Reserved(command), server, deadline, .. } => {
                             // A capability is minted only after U7's server-identity
                             // guard; later operations carry its same actor fence.
-                            if !stopping && matches!(command, Command::Acquire(_)) {
+                            if !stopping && matches!(command, Command::Acquire(_) | Command::Observe { .. }) {
                                 if let Some(server) = server {
                                     let budget = deadline.min(Instant::now() + ACTION_TIMEOUT);
                                     if let Err(error) = outcome(budget, verify_server(&*client, server, "reserve pane control".into())).await {
-                                        command.reject_with(ReservationError::InvalidRequest { reason: error.to_string() });
+                                        command.reject_with(reservation_error(error));
                                         continue;
                                     }
                                 }
                             }
                             jobs.dispatch(command, Instant::now(), stopping, &*client).await;
                         }
+                        pending if legacy_input::is_input(&pending) => {
+                            if let Some(pending) = legacy_input::dispatch(&*client, &registry, &mut jobs, &mirror, pending, &audits, !stopping && parked.len() < CAPACITY).await {
+                                parked.push_back(pending);
+                            }
+                        }
                         pending => {
                             // Keep U7's drain: never cancel admitted paste before Enter.
-                            match execute(&*client, &registry, pending).await {
+                            match execute(&*client, pending).await {
                                 #[cfg(test)]
                                 Some(Audit::Barrier(reply)) => { let _ = audits.sender.send(Audit::Barrier(reply)).await; }
                                 Some(audit) => audits.enqueue(audit),
@@ -769,6 +895,7 @@ where
                 }
             }
         }
+        mirror.stop().await;
         if tokio::time::timeout(AUDIT_DRAIN_TIMEOUT, async {
             let _ = audits.sender.send(Audit::Finish).await;
             let _ = (&mut forwarder).await;
@@ -801,9 +928,9 @@ where
 ///
 /// Alias for U7's organisation-aware startup. Both entry points create the same
 /// reservation-capable actor and audit queue; use only one per daemon.
-/// **Checkpoint:** durable clearing/exclusion gating still awaits Task 4.
-/// Legacy gating must consume an org snapshot/watch mirror outside the tmux
-/// actor, never await org snapshots inside a short pane operation.
+/// Legacy gating consumes a conservative snapshot/watch projection outside the
+/// tmux actor. Inputs park until it covers the writer's current committed cursor;
+/// no org snapshot or persistence is awaited in a short pane operation.
 pub fn spawn_control_with_org(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
@@ -906,18 +1033,13 @@ async fn verify_server(
     Ok(())
 }
 
-async fn execute(
-    client: &dyn TmuxClient,
-    registry: &RegistryHandle,
-    pending: Pending,
-) -> Option<Audit> {
+// Reserved commands and legacy input are dispatched before this non-input path.
+async fn execute(client: &dyn TmuxClient, pending: Pending) -> Option<Audit> {
     let deadline = pending.deadline;
     let expired = Instant::now() >= deadline;
     let caller = pending.caller.as_ref();
     if let Some(server) = pending.server {
         let operation = match &pending.request {
-            Request::Reserved(_) => "reserved pane control".into(),
-            Request::Send { target, .. } => format!("send to {target}"),
             Request::Prepare { target, caller, .. } => format!(
                 "spawn from {}",
                 target
@@ -926,26 +1048,23 @@ async fn execute(
                     .unwrap_or("the active pane")
             ),
             Request::Split { context, .. } => format!("spawn from {}", context.target_pane),
-            Request::Type { pane, .. } => format!("spawn in {pane}"),
             #[cfg(test)]
             Request::FlushAudit(_) => "flush audits".into(),
+            _ => return None,
         };
         if let Err(error) = outcome(deadline, verify_server(client, server, operation)).await {
             match pending.request {
-                Request::Reserved(command) => command.reject(),
-                Request::Send { reply, .. } | Request::Split { reply, .. } => {
+                Request::Split { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
                 Request::Prepare { reply, .. } => {
-                    let _ = reply.send(Err(error));
-                }
-                Request::Type { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
                 #[cfg(test)]
                 Request::FlushAudit(reply) => {
                     let _ = reply.send(Err(error));
                 }
+                _ => {}
             }
             return None;
         }
@@ -953,34 +1072,6 @@ async fn execute(
     let audit = match pending.request {
         #[cfg(test)]
         Request::FlushAudit(reply) => return Some(Audit::Barrier(reply)),
-        Request::Reserved(command) => {
-            command.reject();
-            return None;
-        }
-        Request::Send {
-            target,
-            text,
-            reply,
-        } => {
-            let mut pane = target.starts_with('%').then(|| target.clone());
-            let result = outcome(deadline, async {
-                if !registry.is_connected() {
-                    return Err(ServiceError::Unavailable);
-                }
-                let sessions = registry.get_all_sessions().await;
-                if !registry.is_connected() {
-                    return Err(ServiceError::Unavailable);
-                }
-                pane = super::resolve_pane_id(&sessions, &target).ok();
-                Ok(super::send(client, &sessions, &target, &text).await?)
-            })
-            .await;
-            respond(reply, result, |result| {
-                pane.as_deref().map(|pane| {
-                    OrgCommand::ControlSent(control_audit("session.send", pane, caller, result))
-                })
-            })
-        }
         Request::Prepare {
             target,
             cwd,
@@ -1021,24 +1112,7 @@ async fn execute(
                 )))
             })
         }
-        Request::Type {
-            pane,
-            command,
-            reply,
-        } => {
-            let result = outcome(deadline, async {
-                Ok(super::type_spawn_command(client, &pane, &command).await?)
-            })
-            .await;
-            respond(reply, result, |result| {
-                Some(OrgCommand::ControlSent(control_audit(
-                    "session.spawn_type",
-                    &pane,
-                    caller,
-                    result,
-                )))
-            })
-        }
+        _ => return None,
     };
     audit.filter(|_| !expired).map(|command| Audit::Record {
         command: Box::new(command),

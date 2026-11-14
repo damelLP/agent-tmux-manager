@@ -7,10 +7,25 @@
 //!
 //! The placeholder may also be an identical draft: it always remains Unknown.
 //! **Consumers cannot deliver into Codex under this plain-text contract yet.**
-//! U5b captured cursor/attribute collisions; styled inference remains a follow-up.
-//! Only the captured `/new` completion is a known draft; U5b's real free-text
-//! drafts lack shortcut chrome and remain Unknown. No permission/trust dialog
-//! was captured; no speculative recognizer is added.
+//! Styled input instead requires `capture-pane -p -e -N`. Coordinates are ignored,
+//! never emptiness evidence. The strict decoder refuses unknown/malformed escapes
+//! and conceal without fallback. Only the complete regular footer plus the exact
+//! all-faint placeholder proves Empty; non-faint text is a draft, including the
+//! captured footer without shortcut help. Drafts never grant fresh-editor evidence.
+//!
+//! Captured: codex-cli 0.167.0, 2026-11-14, U5b styled and P1 styled-N private tmux.
+//! `staged_draft_matches` preserves leading whitespace exactly: ` /clear` differs
+//! from `/clear`. Consumers must verify the staged draft before Enter (unknown
+//! refuses too); padding/whitespace collisions alone are not safe. Tmux 3.8/3.6
+//! probes show `-N` retains allocated grid padding, not only authored spaces.
+//! Only a single visible row can be compared; multiline/wrapped input returns
+//! unknown. Trailing ASCII spaces are chrome: a sealed 0.167.0 probe confirmed
+//! `/new   ` executes new, not a prompt. A match does not prove Enter submits:
+//! completion popups for `/`, `@` and `$` appear above the composer and must be
+//! handled by the consumer, not mistaken for harmless history.
+//! Under Plain only the captured `/new` completion is a known draft; free-text
+//! drafts lack shortcut chrome and remain Unknown. P1 permission/trust dialogs
+//! remain unsupported; no speculative action/selection recognizer is added.
 //!
 //! Captured: codex-cli 0.167.0, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
 //! Fresh means a header and otherwise blank history, with optional startup help
@@ -18,10 +33,17 @@
 //! captures from different operations are byte-identical. Consumers own operation
 //! transitions, pane/process identity, live viewport, copy-mode and temporal checks.
 
+mod control;
+pub use control::{observe_control_screen, validate_hook_list, CONTROL_POLICY};
+
+use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
-    TurnState,
+    ScreenInput, ScreenTextFormat, TurnState,
 };
+
+/// Requires attributes and retained grid spaces (`capture-pane -p -e -N`).
+pub const SCREEN_TEXT_FORMAT: ScreenTextFormat = ScreenTextFormat::Styled;
 
 /// Submit only after the caller has established a safe active input.
 pub const CLEAR_COMMAND: &str = "/new";
@@ -63,20 +85,67 @@ const LOGO: &[&str] = &[
 
 /// Recognize complete captured suffixes; unknown never authorizes input.
 #[must_use]
-pub fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
-    if cursor.is_some() || text.chars().any(|c| c.is_control() && c != '\n') {
-        return ScreenFacts::default();
+pub fn observe_screen(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> ScreenFacts {
+    inspect(input, cursor).0
+}
+
+fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts, Option<String>) {
+    let decoded;
+    let (text, styled) = match input {
+        ScreenInput::Plain(text) if cursor.is_none() => (text, None),
+        ScreenInput::Styled(text) => {
+            let Ok(screen) = StyledScreen::parse(text) else {
+                return Default::default();
+            };
+            decoded = screen;
+            (decoded.text(), Some(&decoded))
+        }
+        _ => return Default::default(),
+    };
+    if text.chars().any(|c| c.is_control() && c != '\n') {
+        return Default::default();
     }
-    let mut lines: Vec<_> = text.lines().collect();
+    let mut lines: Vec<_> = text
+        .lines()
+        .map(|line| {
+            if styled.is_some() {
+                line.trim_end_matches(' ')
+            } else {
+                line
+            }
+        })
+        .collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
     if known_dialog(&lines) {
         let mut facts = ScreenFacts::default();
         facts.dialog = DialogState::Other;
-        return facts;
+        return (facts, None);
     }
-    editor(&lines).unwrap_or_default()
+    editor(&lines, styled).unwrap_or_default()
+}
+
+/// Compare only a reconstructable active single-line draft, never history.
+///
+/// Requires Styled and a nonempty expected string without controls or trailing
+/// whitespace. Compares after removing trailing ASCII spaces from the draft only;
+/// leading whitespace stays exact. Other differences return Some(false); unknown
+/// layouts, faint text and multiline/wrapped drafts return None. A match proves
+/// visible text only, not that Enter submits it: consumers must handle completion
+/// popups (including `/`, `@` and `$`) and refuse both Some(false) and None.
+#[must_use]
+pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
+    if !matches!(input, ScreenInput::Styled(_))
+        || expected.is_empty()
+        || expected.ends_with(char::is_whitespace)
+        || expected.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let (_, draft) = inspect(input, None);
+    let draft = draft?;
+    Some(draft.trim_end_matches(' ') == expected)
 }
 
 fn nonblank<'a>(lines: &[&'a str]) -> Vec<&'a str> {
@@ -99,15 +168,10 @@ fn header<'a>(lines: &[&'a str]) -> Option<(usize, &'a str)> {
 
 fn known_dialog(lines: &[&str]) -> bool {
     let body = nonblank(lines);
-    match body.as_slice() {
-        [update, "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
-            if update
-                .strip_prefix("Update available · ")
-                .and_then(|s| s.split_once(" → "))
-                .is_some_and(|(old, new)| version(old) && version(new)) =>
-        {
-            true
-        }
+    if update_prompt(&body) {
+        return true;
+    }
+    matches!(body.as_slice(),
         [.., title, message, "k keep & next · esc dismiss & close · ^o copy · ←/→ warning"]
             if !message.is_empty()
                 && title
@@ -116,15 +180,21 @@ fn known_dialog(lines: &[&str]) -> bool {
                     .and_then(|s| s.split_once(" of "))
                     .is_some_and(|(index, total)| {
                         positive_integer(index) && positive_integer(total)
-                    }) =>
-        {
-            true
-        }
-        _ => false,
-    }
+                    })
+    )
 }
 
-fn editor(lines: &[&str]) -> Option<ScreenFacts> {
+fn update_prompt(body: &[&str]) -> bool {
+    matches!(body,
+        [update, "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
+            if update
+                .strip_prefix("Update available · ")
+                .and_then(|s| s.split_once(" → "))
+                .is_some_and(|(old, new)| version(old) && version(new))
+    )
+}
+
+fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {
     let header_index = header(lines).map(|(index, _)| index);
     let (last, before_last) = lines.split_last()?;
     let shortcuts = last.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -136,7 +206,16 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
             .is_some_and(|(count, label)| {
                 positive_integer(count) && matches!(label, "warning" | "warnings")
             });
-    let (model, before_model) = if regular {
+    // A typed composer drops shortcut help but may retain warning chrome.
+    let warning_only = styled.is_some()
+        && shortcuts
+            .strip_prefix("⚠ ")
+            .and_then(|s| s.strip_suffix(" · f2 to view"))
+            .and_then(|s| s.split_once(' '))
+            .is_some_and(|(count, label)| {
+                positive_integer(count) && matches!(label, "warning" | "warnings")
+            });
+    let (model, before_model) = if regular || warning_only {
         before_last.split_last()?
     } else {
         (last, before_last)
@@ -155,8 +234,39 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     if !separator.is_empty() {
         return None;
     }
+    let typed = composer.strip_prefix("› ");
+    let offset = styled.map(|screen| {
+        screen
+            .text()
+            .split_inclusive('\n')
+            .take(before_composer.len())
+            .map(str::len)
+            .sum::<usize>()
+            + "› ".len()
+    });
+    let normal_draft = styled
+        .zip(offset)
+        .zip(typed)
+        .is_some_and(|((screen, offset), text)| {
+            !text.is_empty()
+                && text
+                    .char_indices()
+                    .all(|(i, _)| screen.faint_at(offset + i) == Some(false))
+        });
     let (input, dialog, history) = if regular && *composer == "› Ask Codex to do anything" {
-        (InputState::Unknown, DialogState::None, before_composer)
+        let input = match styled.zip(offset).zip(typed) {
+            Some(((screen, offset), text))
+                if text.char_indices().all(|(i, _)| {
+                    screen.faint_at(offset + i) == Some(true)
+                        && screen.inverse_at(offset + i) == Some(false)
+                }) =>
+            {
+                InputState::Empty
+            }
+            _ if normal_draft => InputState::Draft,
+            _ => InputState::Unknown,
+        };
+        (input, DialogState::None, before_composer)
     } else if !regular && *composer == "› /new" {
         let (blank, before_blank) = before_composer.split_last()?;
         let (menu, history) = before_blank.split_last()?;
@@ -164,6 +274,8 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
             return None;
         }
         (InputState::Draft, DialogState::Other, history)
+    } else if normal_draft {
+        (InputState::Draft, DialogState::None, before_composer)
     } else {
         return None;
     };
@@ -196,10 +308,15 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     facts.input = input;
     facts.turn = turn;
     facts.dialog = dialog;
-    if fresh {
+    if fresh && input != InputState::Draft {
         facts.fresh_editor = FreshEditorEvidence::Present;
     }
-    Some(facts)
+    let draft = styled
+        .filter(|_| input == InputState::Draft && normal_draft)
+        .and_then(|screen| screen.text().lines().nth(before_composer.len()))
+        .and_then(|line| line.strip_prefix("› "))
+        .map(str::to_owned);
+    Some((facts, draft))
 }
 
 fn positive_integer(value: &str) -> bool {
@@ -224,6 +341,26 @@ fn duration(value: &str) -> bool {
         })
 }
 
+fn worked_duration(value: &str) -> bool {
+    let component = |part: &str, suffix: char, range: std::ops::RangeInclusive<u64>| {
+        part.strip_suffix(suffix)
+            .filter(|n| *n == "0" || (!n.starts_with('0') && positive_integer(n)))
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| range.contains(&n))
+    };
+    match value.split(' ').collect::<Vec<_>>().as_slice() {
+        ["<1s"] => true,
+        [seconds] => component(seconds, 's', 1..=59),
+        [minutes, seconds] => component(minutes, 'm', 1..=59) && component(seconds, 's', 0..=59),
+        [hours, minutes, seconds] => {
+            component(hours, 'h', 1..=u64::MAX)
+                && component(minutes, 'm', 0..=59)
+                && component(seconds, 's', 0..=59)
+        }
+        _ => false,
+    }
+}
+
 fn worked_status(line: &str) -> bool {
     let Some((elapsed, clock)) = line
         .strip_prefix("Worked for ")
@@ -231,15 +368,20 @@ fn worked_status(line: &str) -> bool {
     else {
         return false;
     };
-    let Some((clock, period)) = clock.split_once(' ') else {
-        return false;
+    let (clock, hours) = match clock.split_once(' ') {
+        Some((clock, "AM" | "PM")) if !clock.starts_with('0') => (clock, 1..=12),
+        None if clock.len() == 5 => (clock, 0..=23),
+        _ => return false,
     };
-    duration(elapsed)
-        && matches!(period, "AM" | "PM")
+    // Finished durations are unpadded and range-bounded, unlike running status.
+    worked_duration(elapsed)
         && clock.split_once(':').is_some_and(|(hour, minute)| {
-            positive_integer(hour)
+            (1..=2).contains(&hour.len())
+                && hour.chars().all(|c| c.is_ascii_digit())
+                && hour.parse::<u8>().is_ok_and(|n| hours.contains(&n))
                 && minute.len() == 2
                 && minute.chars().all(|c| c.is_ascii_digit())
+                && minute.parse::<u8>().is_ok_and(|n| n < 60)
         })
 }
 
@@ -271,7 +413,55 @@ fn status_output(body: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_minute_completion_line_is_recognized() {
+        // Captured: codex-cli 0.167.0, 2026-11-14, sealed loopback stub held
+        // 65 seconds, private tmux capture-pane -p -e -N at both widths.
+        for capture in [
+            include_str!("../tests/fixtures/screen_styled_u8g_finished-100x32_0.167.0.txt"),
+            include_str!("../tests/fixtures/screen_styled_u8g_finished-120x40_0.167.0.txt"),
+        ] {
+            let text = capture.split_once('\n').unwrap().1;
+            let decoded = StyledScreen::parse(text).unwrap();
+            let line = decoded
+                .text()
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("Worked for "))
+                .unwrap();
+            assert!(worked_status(line), "{line}");
+            // This argv-started session has compact footer chrome not supported
+            // by the editor parser. Duration evidence must not broaden that gate.
+            assert_eq!(
+                super::observe_screen(ScreenInput::Styled(text), None).turn,
+                TurnState::Unknown
+            );
+            // Synthetic: transplant the real completed line into a captured
+            // supported editor to exercise both public observers end to end.
+            let supported =
+                include_str!("../tests/fixtures/screen_styled_p1_c02-multiline-100x24_0.167.0.txt")
+                    .split_once('\n')
+                    .unwrap()
+                    .1
+                    .replace("Worked for <1s • 16:34", line);
+            assert_eq!(
+                super::observe_screen(ScreenInput::Styled(&supported), None).turn,
+                TurnState::NotRunning
+            );
+            assert_eq!(
+                observe_control_screen(ScreenInput::Styled(&supported), None)
+                    .facts
+                    .turn,
+                TurnState::NotRunning
+            );
+        }
+    }
     use proptest::prelude::*;
+
+    fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
+        super::observe_screen(ScreenInput::Plain(text), cursor)
+    }
     macro_rules! facts {
         ($($field:ident: $value:expr),* $(,)?) => {{
             let mut facts = ScreenFacts::default();
@@ -436,7 +626,7 @@ mod tests {
                     "~/another/project (feature/topic)",
                 )
                 .replace("Reply ok", "A different conversation title")
-                .replace("Worked for 1s • 11:31 AM", "Worked for 12m 3s • 09:45 PM")
+                .replace("Worked for 1s • 11:31 AM", "Worked for 12m 3s • 9:45 PM")
                 .replace(
                     "Worked for 2s • 11:32 AM",
                     "Worked for 1h 2m 30s • 10:59 AM",

@@ -36,7 +36,9 @@ pub enum RpcError {
 /// call; spawn uses separate prepare/split/type calls so it can print between
 /// split and type. Other session commands retain their legacy exchange.
 pub async fn call(method: &str, mut params: Value, budget: Duration) -> Result<Value, RpcError> {
-    if method.starts_with("session.") {
+    if method.starts_with("session.")
+        || matches!(method, "agent.up" | "agent.adopt" | "agent.respawn")
+    {
         let path = caller_server_path(
             std::env::var_os("ATM_TMUX_SOCKET").as_deref(),
             std::env::var_os("TMUX").as_deref(),

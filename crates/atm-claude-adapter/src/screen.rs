@@ -10,10 +10,29 @@
 //! text. They remain Unknown: consumers cannot deliver into a freshly started
 //! Claude editor until a later evidence-backed implementation resolves this.
 //! U5b also captured cursors and confirmed that Home-position drafts collide with
-//! empty editors. Supplying a cursor still returns all Unknown, not emptiness.
+//! empty editors. Supplying a cursor with Plain returns all Unknown, not emptiness.
 //! Unknown layouts, modes, overlays and incomplete dialogs also fail closed.
 //! Plain capture drops trailing spaces: a whitespace-only draft may read Empty.
-//! Styled capture with retained spaces is deferred; these facts cannot solve it.
+//! Styled input requires the full `capture-pane -p -e -N` viewport. The shared
+//! strict decoder rejects unsupported escapes (including conceal), never falling
+//! back to Plain. Cursor coordinates are ignored, not used as emptiness proof.
+//!
+//! Captured: Claude Code 2.1.325, 2026-11-14, U5b styled and P1 styled-N private tmux.
+//! An inverse `T` followed by faint non-space suggestion glyphs proves the known
+//! placeholder; identical non-faint text is a draft. Blank/padding-only input
+//! stays Empty: tmux 3.8/3.6 retained-grid probes show it collides with authored
+//! spaces. This is safe ONLY if consumers verify the staged draft exactly before
+//! Enter, refusing both false and unknown. Leading spaces are never normalized:
+//! ` /clear` is not `/clear` (the former can submit a plain prompt).
+//! `staged_draft_matches` supports a single visible row only, Styled only. It
+//! refuses multiline/wrapped reconstruction. Trailing ASCII spaces are chrome:
+//! a sealed 2.1.325 probe confirmed `/clear   ` executes clear, not a prompt.
+//! The queued-message placeholder uses the same inverse-first-cell/faint-rest
+//! evidence as suggestions; other faint text is not a typed draft.
+//! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
+//! Legacy facts stay Unknown; the staged matcher accepts only the complete
+//! captured completion layout with both editor and selected command exact.
+//! The control observer additionally recognizes captured launch/footer modes.
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
 //! Header, bordered input and footer are found by chrome, not absolute rows.
@@ -26,10 +45,17 @@
 //! process/pane identity and copy-mode checks; identical historical text cannot
 //! prove that it came from a currently live editor.
 
+mod control;
+pub use control::{observe_control_screen, CONTROL_POLICY};
+
+use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
-    TurnState,
+    ScreenInput, ScreenTextFormat, TurnState,
 };
+
+/// Requires attributes and retained grid spaces (`capture-pane -p -e -N`).
+pub const SCREEN_TEXT_FORMAT: ScreenTextFormat = ScreenTextFormat::Styled;
 
 /// Submit only after the caller has established a safe active input.
 pub const CLEAR_COMMAND: &str = "/clear";
@@ -41,20 +67,75 @@ pub const LAUNCH_POLICY: LaunchPolicy = LaunchPolicy {
 
 /// Recognize only complete captured terminal suffixes; unknown never means safe.
 #[must_use]
-pub fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
-    if cursor.is_some() || text.chars().any(|c| c.is_control() && c != '\n') {
-        return ScreenFacts::default();
+pub fn observe_screen(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> ScreenFacts {
+    inspect(input, cursor).0
+}
+
+fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts, Option<String>) {
+    let decoded;
+    let (text, styled) = match input {
+        ScreenInput::Plain(text) if cursor.is_none() => (text, None),
+        ScreenInput::Styled(text) => {
+            let Ok(screen) = StyledScreen::parse(text) else {
+                return Default::default();
+            };
+            decoded = screen;
+            (decoded.text(), Some(&decoded))
+        }
+        _ => return Default::default(),
+    };
+    if text.chars().any(|c| c.is_control() && c != '\n') {
+        return Default::default();
     }
-    let mut lines: Vec<_> = text.lines().collect();
+    let mut lines: Vec<_> = text
+        .lines()
+        .map(|line| {
+            if styled.is_some() {
+                line.trim_end_matches(' ')
+            } else {
+                line
+            }
+        })
+        .collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
     if let Some(dialog) = dialog(&lines) {
         let mut facts = ScreenFacts::default();
         facts.dialog = dialog;
-        return facts;
+        return (facts, None);
     }
-    editor(&lines).unwrap_or_default()
+    editor(&lines, styled).unwrap_or_default()
+}
+
+/// Compare only a reconstructable active single-line draft, never history.
+///
+/// Requires Styled and a nonempty expected string without controls or trailing
+/// whitespace. Compares after removing trailing ASCII spaces from the draft only;
+/// leading whitespace stays exact. The known single-command completion menu also
+/// matches when both the editor draft and selected command equal expected exactly;
+/// its description is not command identity. Other differences return Some(false);
+/// unknown layouts, faint text and multiline/wrapped drafts return None. A match proves
+/// visible text only, not that Enter submits it: consumers must handle popups
+/// and refuse both Some(false) and None.
+#[must_use]
+pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
+    if !matches!(input, ScreenInput::Styled(_))
+        || expected.is_empty()
+        || expected.ends_with(char::is_whitespace)
+        || expected.chars().any(char::is_control)
+    {
+        return None;
+    }
+    if let ScreenInput::Styled(text) = input {
+        let screen = StyledScreen::parse(text).ok()?;
+        if let Some((draft, selected)) = control::completion_draft(&screen) {
+            return Some(draft == expected && selected == expected);
+        }
+    }
+    let (_, draft) = inspect(input, None);
+    let draft = draft?;
+    Some(draft.trim_end_matches(' ') == expected)
 }
 
 fn rule(line: &str, glyph: char) -> bool {
@@ -113,7 +194,7 @@ fn dialog(lines: &[&str]) -> Option<DialogState> {
     }
 }
 
-fn editor(lines: &[&str]) -> Option<ScreenFacts> {
+fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {
     let header_end = header_end(lines);
     let (footer, before_footer) = lines.split_last()?;
     let (footer, before_footer) = if footer.trim() == "Ctrl+Y to paste deleted text" {
@@ -133,6 +214,15 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     ) {
         return None;
     }
+    editor_facts(lines, styled, header_end, before_footer)
+}
+
+fn editor_facts(
+    lines: &[&str],
+    styled: Option<&StyledScreen>,
+    header_end: Option<usize>,
+    before_footer: &[&str],
+) -> Option<(ScreenFacts, Option<String>)> {
     let lower = before_footer.iter().rposition(|line| rule(line, '─'))?;
     if !before_footer
         .get(lower + 1..)?
@@ -148,13 +238,60 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     }
     let (first, continuation) = lines.get(top + 1..lower)?.split_first()?;
     let input = first.strip_prefix("❯\u{a0}")?;
+    let raw_input = styled
+        .and_then(|screen| screen.text().lines().nth(top + 1))
+        .and_then(|line| line.strip_prefix("❯\u{a0}"));
+    let offset = styled.map(|screen| {
+        screen
+            .text()
+            .split_inclusive('\n')
+            .take(top + 1)
+            .map(str::len)
+            .sum::<usize>()
+            + "❯\u{a0}".len()
+    });
+    let draft = (continuation.is_empty())
+        .then(|| raw_input.map(str::to_owned))
+        .flatten();
     // Preserve any spaces supplied by the caller, though capture-pane -p drops
     // trailing spaces and cannot distinguish a spaces-only draft from empty.
     let input = if !continuation.is_empty() {
         InputState::Draft
     } else if input.is_empty() {
         InputState::Empty
-    } else if input.starts_with("Try \"") && input.ends_with('"') {
+    } else if (input.starts_with("Try \"") && input.ends_with('"'))
+        || (styled.is_some() && input == "Press up to edit queued messages")
+    {
+        match styled.zip(offset) {
+            Some((screen, offset))
+                if screen.inverse_at(offset) == Some(true)
+                    && screen.faint_at(offset) == Some(false)
+                    && input
+                        .char_indices()
+                        .skip(1)
+                        .filter(|(_, c)| !c.is_whitespace())
+                        .all(|(i, _)| {
+                            screen.faint_at(offset + i) == Some(true)
+                                && screen.inverse_at(offset + i) == Some(false)
+                        }) =>
+            {
+                InputState::Empty
+            }
+            Some((screen, offset))
+                if input
+                    .char_indices()
+                    .filter(|(_, c)| !c.is_whitespace())
+                    .all(|(i, _)| screen.faint_at(offset + i) == Some(false)) =>
+            {
+                InputState::Draft
+            }
+            _ => InputState::Unknown,
+        }
+    } else if styled.zip(offset).is_some_and(|(screen, offset)| {
+        input
+            .char_indices()
+            .any(|(i, c)| c != ' ' && screen.faint_at(offset + i) != Some(false))
+    }) {
         InputState::Unknown
     } else {
         InputState::Draft
@@ -204,7 +341,7 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     facts.turn = turn;
     facts.dialog = DialogState::None;
     facts.fresh_editor = fresh_editor;
-    Some(facts)
+    Some((facts, draft.filter(|_| input == InputState::Draft)))
 }
 
 fn skip_startup_notice(history: &mut Vec<&str>) {
@@ -261,6 +398,10 @@ fn effort_status(line: &str) -> bool {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
+        super::observe_screen(ScreenInput::Plain(text), cursor)
+    }
 
     macro_rules! facts {
         ($($field:ident: $value:expr),* $(,)?) => {{

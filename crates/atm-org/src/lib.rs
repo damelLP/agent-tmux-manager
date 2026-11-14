@@ -25,6 +25,7 @@
 //! | SessionBound | unknown agent; down; no pane | excluded session; ready with same session | ready, including stuck recovery/manual clear; reset exclusion |
 //! | EditorReady | unknown agent; down; no pane | ready, with or without session | starting/clearing/stuck → ready; session unchanged, reason cleared |
 //! | SessionLost | unknown agent | starting, stuck or ready without session; clearing; down | starting, session removed; exclusion retained |
+//! | Revalidate | unknown agent; neither ready nor starting with a recorded session | starting with a recorded session | ready → starting; pane, session and exclusion retained; reason cleared |
 //! | Clear | unknown agent; not ready | — | clearing, session removed and excluded; retain exclusion if no session |
 //! | Stuck | unknown agent; down | stuck with identical reason | stuck with reason |
 //! | Down | unknown agent | already down | down, release pane/session/exclusion |
@@ -32,7 +33,8 @@
 //!
 //! EditorReady reports a positively observed fresh editor in the recorded pane.
 //! The caller must observe it after the operation it completes (clear, up or
-//! respawn) and submit the report in the same serialized step owning the agent.
+//! respawn), or observe a safe idle editor during restart/adopt revalidation,
+//! and submit the report in the same serialized step owning the agent.
 //! Serializing decide/append/apply alone does not protect an earlier observation.
 //! Known limits, confirmed with command sequences:
 //! - Clear → observe editor → Respawn → PaneCreated on a replacement pane →
@@ -44,9 +46,14 @@
 //! changing the log, because commands are not logged; today callers must prevent
 //! these interleavings by serializing observation with the report.
 //!
-//! Starting/clearing agents reached through commands have no session: Up and
-//! session-less Adopt start without one; Clear and SessionLost remove it. Thus
-//! EditorReady makes these agents ready without a session. Stuck recovery keeps
+//! Up and session-less Adopt start without a session; Clear and SessionLost
+//! remove it. Revalidate instead preserves the recorded binding while suspending
+//! readiness: Starting can now have a session. The caller uses it under an Observe
+//! reservation on restart/adopt when readiness must be checked again. Busy or
+//! unknown observations remain Starting until new evidence; silence alone is not
+//! a reason to mark Stuck. EditorReady restores readiness without discarding that
+//! binding; a new SessionBound still replaces it by the existing policy.
+//! EditorReady after Up/Clear/SessionLost remains session-less. Stuck recovery keeps
 //! any session already bound, and a late report on ready is a no-op. Applying
 //! the fact preserves session, pane and exclusion; replay does not revalidate
 //! the screen. The caller must revalidate it on startup. A ready agent without
@@ -55,7 +62,7 @@
 //!
 //! Clear retains one pre-clear session ID to ignore obsolete SessionBound
 //! reports, even before EditorReady. Repeated clears without a new binding keep
-//! that exclusion; EditorReady, SessionLost and Stuck retain it. A new binding,
+//! that exclusion; EditorReady, Revalidate, SessionLost and Stuck retain it. A new binding,
 //! Down or fresh Up resets it. Adopt with a session explicitly overrides the
 //! exclusion; session-less Adopt repairs status to starting while retaining it.
 //! Routine session observations must use SessionBound, not Adopt. Two known

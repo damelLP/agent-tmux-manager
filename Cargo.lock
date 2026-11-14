@@ -162,6 +162,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "atm-org"
+version = "0.3.0"
+dependencies = [
+ "atm-core",
+ "chrono",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "atm-pi-adapter"
 version = "0.3.0"
 dependencies = [

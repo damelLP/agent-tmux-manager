@@ -18,6 +18,7 @@ exclude = ["/evals/"]
 resolver = "2"
 members = [
     "crates/atm-core",
+    "crates/atm-org",
     "crates/atm-protocol",
     "crates/atm-tmux",
     "crates/atm-claude-adapter",
@@ -107,6 +108,7 @@ proptest = "1"
 
 # Internal crates (version required for crates.io, path for local dev)
 atm-core = { version = "0.3.0", path = "crates/atm-core" }
+atm-org = { version = "0.3.0", path = "crates/atm-org" }
 atm-protocol = { version = "0.3.0", path = "crates/atm-protocol" }
 atm-tmux = { version = "0.3.0", path = "crates/atm-tmux" }
 atm-claude-adapter = { version = "0.3.0", path = "crates/atm-claude-adapter" }

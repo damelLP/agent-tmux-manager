@@ -113,6 +113,123 @@ async fn pending_append_is_not_replayed_or_released_live_before_apply() {
     );
 }
 
+#[tokio::test]
+async fn failed_or_hung_events_append_keeps_socket_tracking_and_ping_live() {
+    use crate::server::{
+        methods::{router, MethodServices},
+        ConnectionHandler,
+    };
+    use atm_protocol::{ClientMessage, DaemonMessage};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for fail in [false, true] {
+        let (entered, mut entry) = mpsc::channel(8);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = release.clone();
+        let (org, org_cancel, actor) = spawn(move |_| {
+            let entered = entered.clone();
+            let gate = gate.clone();
+            async move {
+                entered.send(()).await.unwrap();
+                if fail {
+                    return Err(EventLogError::Closed);
+                }
+                let _permit = gate.acquire().await.unwrap();
+                Ok(1)
+            }
+        });
+        let registry = crate::registry::spawn_registry();
+        let observer = crate::org::SummaryObserver::spawn(registry.clone(), org.clone());
+        let (ours, peer) = tokio::net::UnixStream::pair().unwrap();
+        let (read, write) = ours.into_split();
+        let connection_cancel = CancellationToken::new();
+        let methods = Arc::new(router(MethodServices::new(registry.clone())).unwrap());
+        let handler = ConnectionHandler::new(
+            read,
+            write,
+            registry.clone(),
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            1,
+            connection_cancel.clone(),
+            methods,
+        )
+        .with_org(org.clone());
+        let task = tokio::spawn(handler.run());
+        let (read, mut write) = peer.into_split();
+        let mut read = BufReader::new(read);
+        let fixture =
+            include_str!("../../../atm-pi-adapter/tests/fixtures/pi_session_cost_0.73.1.jsonl");
+        let mut frames: Vec<serde_json::Value> = fixture
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for frame in &mut frames {
+            frame["data"]["pid"] = serde_json::json!(std::process::id());
+        }
+        let probe = async {
+            write
+                .write_all(
+                    format!(
+                        "{}\n{}\n",
+                        serde_json::to_string(&ClientMessage::connect(None)).unwrap(),
+                        frames[0]
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut line = String::new();
+            read.read_line(&mut line).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Connected { .. }
+            ));
+            entry.recv().await.unwrap(); // summary append has failed or is stuck
+            for frame in frames
+                .iter()
+                .skip(1)
+                .filter(|frame| frame["data"]["event"] != "session_shutdown")
+            {
+                write
+                    .write_all(format!("{frame}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&ClientMessage::ping(42)).unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            line.clear();
+            read.read_line(&mut line).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<DaemonMessage>(&line).unwrap(),
+                DaemonMessage::Pong { seq: 42 }
+            ));
+            let id = atm_core::SessionId::new(frames[0]["data"]["session_id"].as_str().unwrap());
+            let session = registry.get_session(id).await.unwrap();
+            assert_eq!(session.cost_usd, 0.01065);
+            assert_eq!(
+                session.first_prompt.as_deref(),
+                Some("Read note.txt and reply.")
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(1), probe)
+            .await
+            .unwrap();
+        release.add_permits(1);
+        observer.finish().await;
+        connection_cancel.cancel();
+        org_cancel.cancel();
+        task.await.unwrap();
+        actor.await.unwrap();
+    }
+}
+
 // Deliberately control only the disk boundary; decisions/apply/queue are real.
 #[tokio::test]
 async fn cancelled_reply_does_not_cancel_command_or_publish_early() {

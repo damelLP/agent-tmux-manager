@@ -3,13 +3,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use atm_protocol::ClientMessage;
+use atmd::eventlog::{read_from, Envelope, EventLog, Stream};
+use chrono::Utc;
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 struct Daemon {
     dir: tempfile::TempDir,
@@ -26,6 +30,10 @@ impl Daemon {
 
     fn socket(&self) -> PathBuf {
         self.dir.path().join("atm.sock")
+    }
+
+    fn state(&self) -> PathBuf {
+        self.dir.path().join("relative-state")
     }
 
     fn pid_file(&self) -> PathBuf {
@@ -145,12 +153,421 @@ impl Drop for Daemon {
     }
 }
 
+struct Client {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl Client {
+    fn connect(daemon: &Daemon) -> Self {
+        let stream = UnixStream::connect(daemon.socket()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut client = Self { stream, reader };
+        client.send(ClientMessage::connect(None));
+        let connected = client.recv();
+        assert_eq!(connected["type"], "connected");
+        assert!(connected["methods"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("log.tail")));
+        client
+    }
+
+    fn send(&mut self, message: ClientMessage) {
+        writeln!(self.stream, "{}", serde_json::to_string(&message).unwrap()).unwrap();
+    }
+
+    fn recv(&mut self) -> Value {
+        let mut line = String::new();
+        assert_ne!(
+            self.reader.read_line(&mut line).unwrap(),
+            0,
+            "unexpected daemon EOF"
+        );
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn tail(&mut self, after: u64) -> Vec<Envelope> {
+        self.send(ClientMessage::request(
+            "tail".into(),
+            "log.tail".into(),
+            json!({"after_seq":after,"limit":1000}),
+            None,
+        ));
+        let response = self.recv();
+        assert!(response.get("error").is_none(), "{response}");
+        serde_json::from_value(response["result"].clone()).unwrap()
+    }
+
+    fn replay(&mut self, after: u64, expected: &[Envelope]) {
+        self.send(ClientMessage::watch(vec![], after));
+        for envelope in expected {
+            let event = self.recv();
+            assert_eq!(event["type"], "event");
+            assert_eq!(event["seq"], envelope.seq);
+            assert_eq!(event["kind"], envelope.kind);
+            assert_eq!(event["body"], envelope.body);
+            assert_eq!(event["ts"], json!(envelope.ts));
+        }
+        // A duplicate event would appear before this pong. Unwatch keeps the
+        // connection reusable without assuming a ping flushes pending replay.
+        self.send(ClientMessage::unwatch());
+        self.send(ClientMessage::ping(42));
+        assert_eq!(self.recv(), json!({"type":"pong","seq":42}));
+    }
+
+    fn captured(&mut self, fixture: &str, finish: bool) -> String {
+        let mut id = String::new();
+        for line in fixture.lines() {
+            let mut frame: Value = serde_json::from_str(line).unwrap();
+            let data = &mut frame["data"];
+            if !finish && data["event"] == "session_shutdown" {
+                continue;
+            }
+            data["pid"] = json!(std::process::id()); // live PID owned by this test
+            id = data["session_id"].as_str().unwrap().to_owned();
+            self.send(serde_json::from_value(frame).unwrap());
+        }
+        id
+    }
+
+    fn assert_live_cost(&mut self, id: &str) {
+        self.send(ClientMessage::list_sessions());
+        let rows = self.recv();
+        let row = rows["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        assert_eq!(row["cost_usd"], 0.01065);
+        assert_eq!(row["first_prompt"], "Read note.txt and reply.");
+        self.send(ClientMessage::ping(7));
+        assert_eq!(self.recv(), json!({"type":"pong","seq":7}));
+    }
+}
+
+const COST_CAPTURE: &str =
+    include_str!("../crates/atm-pi-adapter/tests/fixtures/pi_session_cost_0.73.1.jsonl");
+const CLEAR_CAPTURE: &str =
+    include_str!("../crates/atm-pi-adapter/tests/fixtures/pi_new_session_0.73.1.jsonl");
+
+fn wait_for_log_close(daemon: &Daemon) {
+    // Drop of EventLog doesn't join its worker; wait for its actual lock release
+    // before starting a daemon. This never opens/retries another log worker.
+    let file = std::fs::File::open(daemon.state().join("log/events/.lock")).unwrap();
+    wait_until(|| unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0);
+}
+
+fn seed(daemon: &Daemon) -> Vec<Envelope> {
+    let log = EventLog::open(&daemon.state(), Stream::Events).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        for (kind, body) in [
+            ("project.registered", json!({"project_id":"demo","root":"/fixture"})),
+            ("agent.adopted", json!({"agent_id":"demo/lead","pane":"%0","session_id":null})),
+            ("msg.sent", json!({"from":"owner","to":"demo/lead","kind":"brief","body":"fixture task","attachments":[],"task":null})),
+            ("msg.sent", json!({"from":"demo/lead","to":"owner","kind":"report","body":"fixture report","attachments":[],"task":null})),
+            ("msg.read", json!({"message_ids":["m4"]})),
+        ] {
+            log.append(Utc::now(), kind, body).await.unwrap();
+        }
+    });
+    drop(log);
+    wait_for_log_close(daemon);
+    read_from(&daemon.state(), Stream::Events, 0)
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn latest<'a>(history: &'a [Envelope], id: &str) -> &'a Value {
+    &history
+        .iter()
+        .rev()
+        .find(|event| event.kind == "session.summary" && event.body["session_id"] == id)
+        .unwrap()
+        .body
+}
+
 fn wait_until(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready() {
         assert!(Instant::now() < deadline, "private daemon timed out");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn real_daemon_restart_keeps_history_cost_prompt_and_org_state() {
+    for finish in [false, true] {
+        let mut daemon = Daemon::new();
+        let seeded = seed(&daemon);
+        daemon.start(false);
+        let mut client = Client::connect(&daemon);
+        assert_eq!(client.tail(0), seeded);
+        client.replay(0, &seeded);
+        let id = client.captured(COST_CAPTURE, finish);
+        if !finish {
+            client.assert_live_cost(&id);
+        }
+        let mut saved = Vec::new();
+        // Watch/tail is the persistence barrier, not just connection ping.
+        wait_until(|| {
+            saved = client.tail(0);
+            saved.iter().rev().any(|record| {
+                record.kind == "session.summary"
+                    && record.body["session_id"] == id
+                    && record.body["first_prompt"] == "Read note.txt and reply."
+                    && (!finish
+                        || (record.body["cost"]["microdollars"] == 10650
+                            && !record.body["ended"].is_null()))
+            })
+        });
+        let cursor = saved.last().unwrap().seq;
+        client.replay(0, &saved);
+        drop(client);
+        daemon.stop();
+        // On clean shutdown an ACTIVE session's sub-threshold cost is flushed
+        // exactly; no fabricated session-end event accompanies daemon exit.
+        let durable: Vec<_> = read_from(&daemon.state(), Stream::Events, 0)
+            .map(Result::unwrap)
+            .collect();
+        assert!(durable.starts_with(&saved));
+        let summary = latest(&durable, &id);
+        assert_eq!(summary["cost"], json!({"microdollars":10650}));
+        assert_eq!(summary["first_prompt"], "Read note.txt and reply.");
+        assert_eq!(summary["agent_id"], "demo/lead");
+        assert_eq!(!summary["ended"].is_null(), finish);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let before = runtime.block_on(async {
+            let cancel = CancellationToken::new();
+            let org = atmd::org::OrgHandle::open(daemon.state(), cancel.clone()).await;
+            let state = org.snapshot().await.unwrap();
+            cancel.cancel();
+            state
+        });
+        wait_for_log_close(&daemon);
+        assert_eq!(before.projects().count(), 1);
+        assert_eq!(before.agents().count(), 1);
+        assert_eq!(
+            before.inbox(&"demo/lead".parse().unwrap())[0].content.body,
+            "fixture task"
+        );
+        assert!(before.inbox(&"owner".parse().unwrap())[0].read_at.is_some());
+        daemon.start(false);
+        let mut client = Client::connect(&daemon);
+        assert_eq!(client.tail(0), durable);
+        client.replay(0, &durable);
+        let suffix: Vec<_> = durable
+            .iter()
+            .filter(|row| row.seq > cursor)
+            .cloned()
+            .collect();
+        client.replay(cursor, &suffix);
+        drop(client);
+        daemon.stop();
+        let after = runtime.block_on(async {
+            let cancel = CancellationToken::new();
+            let org = atmd::org::OrgHandle::open(daemon.state(), cancel.clone()).await;
+            let state = org.snapshot().await.unwrap();
+            cancel.cancel();
+            state
+        });
+        wait_for_log_close(&daemon);
+        assert_eq!(before, after);
+    }
+}
+
+#[test]
+fn real_daemon_resume_defaults_do_not_erase_first_prompt_start_or_cost() {
+    let mut daemon = Daemon::new();
+    daemon.start(false);
+    let mut client = Client::connect(&daemon);
+    let id = client.captured(COST_CAPTURE, false);
+    client.assert_live_cost(&id);
+    drop(client);
+    daemon.stop();
+    daemon.start(false);
+    let mut client = Client::connect(&daemon);
+    let before = client.tail(0);
+    let summary = latest(&before, &id).clone();
+    // Captured startup/input with a different resumed prompt; no new usage yet.
+    // The registry's initial zero is not a correction to the recovered cost.
+    for line in COST_CAPTURE.lines().take(2) {
+        let mut frame: Value = serde_json::from_str(line).unwrap();
+        frame["data"]["pid"] = json!(std::process::id());
+        if frame["data"]["event"] == "input" {
+            frame["data"]["payload"]["text"] = json!("Later resumed prompt.");
+        }
+        client.send(serde_json::from_value(frame).unwrap());
+    }
+    client.send(ClientMessage::list_sessions());
+    let live = client.recv();
+    let row = live["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap();
+    assert_eq!(row["first_prompt"], "Later resumed prompt.");
+    assert_eq!(row["cost_usd"], 0.0);
+    drop(client);
+    daemon.stop(); // flush the resumed row, not merely a ping barrier
+    daemon.start(false);
+    let mut client = Client::connect(&daemon);
+    let after = client.tail(0);
+    assert_eq!(latest(&after, &id), &summary);
+    assert_eq!(summary["cost"]["microdollars"], 10650);
+    assert_eq!(summary["first_prompt"], "Read note.txt and reply.");
+    drop(client);
+    daemon.stop();
+}
+
+#[test]
+fn real_daemon_clear_and_end_summaries_survive_restart() {
+    let mut daemon = Daemon::new();
+    daemon.start(false);
+    let mut client = Client::connect(&daemon);
+    client.captured(CLEAR_CAPTURE, true);
+    let ids: std::collections::BTreeSet<_> = CLEAR_CAPTURE
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["data"]["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    let mut saved = Vec::new();
+    wait_until(|| {
+        saved = client.tail(0);
+        ids.iter().all(|id| {
+            saved.iter().any(|record| {
+                record.kind == "session.summary"
+                    && record.body["session_id"] == *id
+                    && !record.body["ended"].is_null()
+            })
+        })
+    });
+    client.replay(0, &saved);
+    drop(client);
+    daemon.stop();
+    daemon.start(false);
+    let mut client = Client::connect(&daemon);
+    assert_eq!(client.tail(0), saved);
+    client.replay(0, &saved);
+    for id in ids {
+        assert!(!latest(&saved, &id)["ended"].is_null());
+    }
+    drop(client);
+    daemon.stop();
+}
+
+#[test]
+fn real_daemon_bad_newer_or_locked_events_keep_session_tracking_usable() {
+    for fault in ["corrupt-old", "invalid-body", "newer-format", "locked"] {
+        let mut daemon = Daemon::new();
+        let events = daemon.state().join("log/events");
+        std::fs::create_dir_all(&events).unwrap();
+        let lock = if fault == "locked" {
+            Some(EventLog::open(&daemon.state(), Stream::Events).unwrap())
+        } else {
+            None
+        };
+        let expected = match fault {
+            "corrupt-old" | "invalid-body" => {
+                let old = if fault == "corrupt-old" {
+                    "not json\n".to_owned()
+                } else {
+                    format!(
+                        "{}\n",
+                        json!({"seq":1,"ts":"2023-11-14T22:13:20Z","kind":"agent.down","body":{"agent_id":"absent/a","reason":"gone"}})
+                    )
+                };
+                std::fs::write(events.join("00000001.jsonl"), old).unwrap();
+                std::fs::write(
+                    events.join("00000002.jsonl"),
+                    format!(
+                        "{}\n",
+                        json!({"seq":2,"ts":"2023-11-14T22:13:20Z","kind":"future.kind","body":{}})
+                    ),
+                )
+                .unwrap();
+                if fault == "corrupt-old" {
+                    "line 1"
+                } else {
+                    "events replay at sequence 1"
+                }
+            }
+            "newer-format" => {
+                std::fs::write(daemon.state().join("log/format"), "2\n").unwrap();
+                "unsupported log format"
+            }
+            "locked" => "locked",
+            _ => unreachable!(),
+        };
+        daemon.start(false);
+        let mut client = Client::connect(&daemon);
+        client.send(ClientMessage::request(
+            "tail".into(),
+            "log.tail".into(),
+            json!({}),
+            None,
+        ));
+        let error = client.recv();
+        assert_eq!(error["error"]["code"], "unavailable", "{fault}: {error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{fault}: {error}"
+        );
+        client.send(ClientMessage::watch(vec![], 0));
+        let error = client.recv();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["code"], "unavailable");
+        assert!(error.get("id").is_none());
+        let id = client.captured(COST_CAPTURE, false);
+        client.assert_live_cost(&id);
+        drop(client);
+        daemon.stop();
+        drop(lock);
+    }
+}
+
+#[test]
+fn real_daemon_failed_raw_open_does_not_disable_summaries_or_sessions() {
+    let mut daemon = Daemon::new();
+    std::fs::create_dir_all(daemon.state().join("log")).unwrap();
+    std::fs::write(daemon.state().join("log/raw"), "not a directory").unwrap();
+    daemon.start(false);
+    let mut client = Client::connect(&daemon);
+    let id = client.captured(COST_CAPTURE, false);
+    client.assert_live_cost(&id);
+    drop(client);
+    daemon.stop();
+    daemon.start(false);
+    let mut client = Client::connect(&daemon);
+    let saved = client.tail(0);
+    assert_eq!(latest(&saved, &id)["cost"]["microdollars"], 10650);
+    assert_eq!(
+        latest(&saved, &id)["first_prompt"],
+        "Read note.txt and reply."
+    );
+    assert_eq!(
+        std::fs::read_to_string(daemon.state().join("log/raw")).unwrap(),
+        "not a directory"
+    );
+    drop(client);
+    daemon.stop();
 }
 
 #[test]

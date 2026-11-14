@@ -1357,3 +1357,196 @@ async fn cancelled_service_reports_unavailable() {
         Err(MessageError::Unavailable(_))
     ));
 }
+
+/// A capture as U8c's reserved or read-only observation returns it.
+fn capture(
+    pane: &str,
+    dead: bool,
+    in_mode: bool,
+    focused: Option<bool>,
+) -> crate::control::reservation::PaneCapture {
+    use crate::control::reservation::{CaptureFormat, PaneCapture, PaneInspection};
+    let info = atm_tmux::PaneInfo {
+        pane_id: pane.into(),
+        session_name: "private".into(),
+        window_index: 0,
+        pane_pid: 1,
+        width: 80,
+        height: 24,
+        is_active: false,
+    };
+    let inspection = PaneInspection::new(info, None, dead, in_mode, None, 0, 0);
+    PaneCapture::new("screen text".into(), inspection, CaptureFormat::Plain).with_focus(focused)
+}
+
+fn idle_session() -> super::message_history::SessionObservation {
+    super::message_history::SessionObservation {
+        id: "s1".into(),
+        harness: atm_core::Harness::Pi,
+        status: atm_core::SessionStatus::Idle,
+        last_event_at: Some(utc()),
+    }
+}
+
+/// An empty editor, no running turn, no dialog: what an adapter reads on an
+/// idle screen.
+fn empty_editor() -> atm_core::ScreenFacts {
+    let mut facts = atm_core::ScreenFacts::default();
+    facts.input = atm_core::InputState::Empty;
+    facts.turn = atm_core::TurnState::NotRunning;
+    facts.dialog = atm_core::DialogState::None;
+    facts
+}
+
+#[test]
+fn converter_maps_capture_metadata_and_passes_session_and_facts_through() {
+    use super::message_history::PanePresence;
+    use crate::control::reservation::PaneId;
+    let observation = recipient_observation(
+        &capture("%7", false, false, Some(false)),
+        Some(idle_session()),
+        empty_editor(),
+    )
+    .unwrap();
+    assert_eq!(observation.pane, Some(PaneId::parse("%7").unwrap()));
+    assert_eq!(observation.presence, PanePresence::Alive);
+    assert_eq!(observation.copy_mode, Some(false));
+    assert_eq!(observation.focused, Some(false));
+    assert_eq!(observation.session, Some(idle_session()));
+    assert_eq!(observation.facts, empty_editor());
+    // No row is no session, not a dead pane; the facts are the caller's.
+    let bare = recipient_observation(
+        &capture("%7", false, true, Some(true)),
+        None,
+        atm_core::ScreenFacts::default(),
+    )
+    .unwrap();
+    assert_eq!(bare.session, None);
+    assert_eq!(bare.presence, PanePresence::Alive);
+    assert_eq!(bare.copy_mode, Some(true));
+    assert_eq!(bare.focused, Some(true));
+    assert_eq!(bare.facts, atm_core::ScreenFacts::default());
+}
+
+#[test]
+fn converter_never_guesses_focus() {
+    for focused in [None, Some(true), Some(false)] {
+        let observation =
+            recipient_observation(&capture("%7", false, false, focused), None, empty_editor())
+                .unwrap();
+        assert_eq!(observation.focused, focused);
+    }
+}
+
+#[test]
+fn converter_reads_a_dead_pane_as_gone() {
+    use super::message_history::PanePresence;
+    // The pane exists and its process has exited: positive absence of
+    // anything that could take input, not an unknown.
+    let observation = recipient_observation(
+        &capture("%7", true, false, Some(false)),
+        Some(idle_session()),
+        empty_editor(),
+    )
+    .unwrap();
+    assert_eq!(observation.presence, PanePresence::Gone);
+    assert!(observation.pane.is_some());
+}
+
+#[test]
+fn converter_refuses_a_capture_without_a_canonical_pane() {
+    for pane in ["7", "", "%", "%7 ", "demo/worker"] {
+        let refused = recipient_observation(
+            &capture(pane, false, false, Some(false)),
+            None,
+            empty_editor(),
+        );
+        assert!(refused.is_err(), "{pane:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn converted_observation_drives_the_real_policy() {
+    use super::message_history::HistoryUpdate;
+    use atm_org::delivery::{next_delivery, DeliveryStep, WaitReason};
+    // One queued message for demo/worker, bound to s1 on %1.
+    let step = |shot: crate::control::reservation::PaneCapture, later: i64| {
+        let replay = Replay::new(3);
+        replay.feed(1, &project());
+        replay.feed(2, &adopted());
+        replay.feed(3, &sent(Address::Agent(worker()), "brief"));
+        async move {
+            guarded(replay.messages.initialized()).await.unwrap();
+            let history = &replay.rt.history;
+            let observed = |now| {
+                let observation =
+                    recipient_observation(&shot, Some(idle_session()), empty_editor()).unwrap();
+                history.record(
+                    HistoryUpdate::Observed {
+                        recipient: worker(),
+                        observation,
+                    },
+                    now,
+                )
+            };
+            let now = utc() + chrono::TimeDelta::seconds(later);
+            observed(utc())?;
+            observed(now)?;
+            let snapshot = history.snapshot(MessageId::new(3), now)?;
+            Ok::<_, MessageError>(
+                next_delivery(&snapshot.message, &snapshot.live, now, &replay.rt.policy).unwrap(),
+            )
+        }
+    };
+    // An idle, unfocused, empty editor for the stable-idle time: paste.
+    let ready = step(capture("%1", false, false, Some(false)), 10)
+        .await
+        .unwrap();
+    assert_eq!(ready, DeliveryStep::PasteNow { attempt: 1 });
+    // The same screen with the owner on it, or with focus unknown: wait.
+    for focused in [Some(true), None] {
+        let waiting = step(capture("%1", false, false, focused), 10)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                waiting,
+                DeliveryStep::Wait {
+                    reason: WaitReason::OwnerFocused,
+                    ..
+                }
+            ),
+            "{focused:?}: {waiting:?}"
+        );
+    }
+    // Copy mode holds, and a dead pane is on its way to a failure, not a paste.
+    let copying = step(capture("%1", false, true, Some(false)), 10)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            copying,
+            DeliveryStep::Wait {
+                reason: WaitReason::CopyMode,
+                ..
+            }
+        ),
+        "{copying:?}"
+    );
+    let dead = step(capture("%1", true, false, Some(false)), 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            dead,
+            DeliveryStep::Wait {
+                reason: WaitReason::PaneGoneGrace,
+                ..
+            }
+        ),
+        "{dead:?}"
+    );
+    // A capture of another pane is not this recipient's observation.
+    let elsewhere = step(capture("%9", false, false, Some(false)), 10).await;
+    assert!(matches!(elsewhere, Err(MessageError::Conflict(_))));
+}

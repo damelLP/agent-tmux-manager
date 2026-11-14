@@ -358,36 +358,6 @@ fn message_reference_and_focus_notice_have_one_shared_representation() {
 }
 
 #[test]
-fn message_capture_converter_remains_unavailable() {
-    use crate::control::reservation::{CaptureFormat, PaneCapture, PaneInspection};
-    let capture = PaneCapture::new(
-        String::new(),
-        PaneInspection::new(
-            atm_tmux::PaneInfo {
-                pane_id: "%1".into(),
-                session_name: "private".into(),
-                window_index: 0,
-                pane_pid: 1,
-                width: 80,
-                height: 24,
-                is_active: false,
-            },
-            None,
-            false,
-            false,
-            None,
-            0,
-            0,
-        ),
-        CaptureFormat::Plain,
-    );
-    unavailable(
-        super::messages::recipient_observation(&capture, None, ScreenFacts::default()),
-        "message observation converter is not configured",
-    );
-}
-
-#[test]
 fn message_attempt_phase_names_are_available_to_b() {
     // A declaration test only; no claim that these states execute yet.
     let phases = [

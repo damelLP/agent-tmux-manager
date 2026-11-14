@@ -17,17 +17,59 @@ U5's control-plane findings verified Escape skips that launch; P1's sealed
 probe could not provoke an update prompt. No styled update evidence is claimed.
 Warnings is Blocked, not LaunchSkip; unsupported modals stay Unknown.
 
-All three real hook pages show eight of eleven rows with a down indicator.
-There is NO real complete/lower-page capture or upper marker; those layouts
-remain unsupported. Complete-set validation tests are marked Synthetic data,
-not invented accepted screens. Pending requires Installed=1, Active in {0,1},
-Review=1-Active and the exact trust-all footer. Trusted omits Review, requires
-Active=1, no review banner and the details footer. Missing/duplicate/extra
-complete-set names refuse. Counts/event names cannot establish command identity:
-a foreign replacement with identical event/count is undetectable. Page traversal
-and sending literal t are not implemented here. Descriptions validate grammar,
-not identity. Existing legacy observations/tests and Worked-line parsing stay
-unchanged; the older limitations below describe that legacy observer.
+All three P1 hook pages show eight required event rows with a down indicator.
+B0's complete-set tests used Synthetic data; P2 below now supplies real lower
+pages. P6 remains unchanged: exactly the eleven ATM names, Installed=1 each;
+pending Active in {0,1}, Review=1-Active; trusted Active=1, no Review column.
+Missing/duplicate/extra complete-set names and mixed layouts refuse.
+Counts/event names cannot establish command identity: a foreign replacement
+with identical event/count is undetectable. Page traversal and sending literal
+t are not implemented here. Descriptions validate grammar, not identity.
+Existing legacy observations/tests and Worked-line parsing stay unchanged;
+the older limitations below describe that legacy observer.
+
+## Complete hook-list evidence (P2)
+
+Captured: codex-cli 0.167.0, 2026-11-14, sealed P2 private tmux 3.8,
+`capture-pane -p -e -N`. All 263 list frames are retained as
+`screen_control_p2_<stem>_0.167.0.txt`, mapping to source
+`p2-<stem>.styled.txt`. The versioned TSV manifest lists every fixture and its
+first visible event, independently extracted from companion plain captures.
+Only the private run root becomes an equal-width `/tmp/xxx…` path; terminal
+attributes, rows, spacing, counts, descriptions and selections are unchanged.
+Tests strip only the added provenance line. No harness is launched by tests.
+
+The manifest includes the full pending/trusted down/up sweeps, both wraps and
+restored top, plus the initial exploratory pending sweep. Scenarios: eleven
+registered hooks at 100x32, 100x24 and 120x40; ten registered hooks (missing
+SubagentStop) at 100x32. Every viewport has eight rows, selected at any position;
+scrolling moves one row at a time. The complete UI vocabulary has fourteen
+rows, not eleven. Top pages have only a lower marker, middle pages both, and
+bottom pages only an upper marker. Down at the bottom wraps to the top, not a
+no-op; consumers must not wait for a no-op to establish completeness.
+
+The parser validates contiguous UI order, exact edge markers and exactly one
+selection. Descriptions are exact, clipped only at the description column's
+available width from the retained header geometry (pending width-100 frames
+clip Interrupt and PostModelRequest). Zero-count rows parse even for missing
+ATM registrations. Only the known uninstalled Interrupt, PreModelRequest and
+PostModelRequest rows are omitted from returned authorization entries: unknown
+events or installed extras refuse the entire page. Zero-count SubagentStop is
+retained, so the ten-hook collected sets fail P6. Returned rows never imply
+that a page is complete; `above`/`below` describe the full UI vocabulary.
+
+Tests replay all 263 frames, compare exact entries/counts and edge flags, and
+collect eight sets with consistent overlaps and evidence of both ends. Six
+complete eleven-hook sets pass P6; both ten-hook sets and every proper subset
+of every set refuse. Marked Synthetic mutations of every real page cover
+missing/damaged markers, false ends, missing/duplicate/reordered rows,
+missing/multiple selections, damaged chrome/descriptions, extra installations
+and unknown events. Conflicting repeated counts and mixed layouts are refused
+by complete-set validation; a stateless observer cannot compare separate
+frames, so consumers must compare overlaps before deduplicating them.
+
+No new controller/collection API is added. Other versions, sizes, plugin hook
+combinations and same-count command identity remain unverified.
 
 ## Styled fixtures (U8d)
 

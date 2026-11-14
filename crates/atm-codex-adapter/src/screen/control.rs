@@ -1,7 +1,8 @@
-//! Captured: codex-cli 0.167.0, 2026-11-14, U5 and sealed P1 private tmux.
-//! See fixture README. Only captured default dialog selections and partial top
-//! hook pages are recognized. Full/lower pages need real evidence. Hook counts
-//! cannot identify commands: same-event/count replacement remains undetectable.
+//! Captured: codex-cli 0.167.0, 2026-11-14, U5 and sealed P1/P2 private tmux.
+//! See fixture README. Hook pages include selection movement, both scroll edges
+//! and zero-count vocabulary rows. Only ATM rows are returned for P6 validation;
+//! known uninstalled extras are checked, never silently discarded if installed.
+//! Counts cannot identify commands: same-event/count replacement is undetectable.
 use super::*;
 use crate::CodexEventType;
 use atm_core::harness_control::{
@@ -77,7 +78,7 @@ pub fn observe_control_screen(
         } else {
             ControlDialog::Blocked
         };
-    } else if let Some(dialog) = start_dialog(&body).or_else(|| hook_list(&body)) {
+    } else if let Some(dialog) = start_dialog(&body).or_else(|| hook_list(&body, text)) {
         result.dialog = dialog;
     } else if result.facts.dialog == DialogState::None {
         result.dialog = ControlDialog::None;
@@ -123,7 +124,7 @@ fn start_dialog(body: &[&str]) -> Option<ControlDialog> {
     }
 }
 
-fn hook_list(body: &[&str]) -> Option<ControlDialog> {
+fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
     let start = body.iter().rposition(|s| *s == "Hooks")?;
     let ["Hooks", "Lifecycle hooks from config and enabled plugins.", tail @ ..] =
         body.get(start..)?
@@ -153,6 +154,13 @@ fn hook_list(body: &[&str]) -> Option<ControlDialog> {
         _ => tail,
     };
     let (columns, tail) = tail.split_first()?;
+    // Retained capture padding gives the viewport edge; the header anchors the
+    // description column in both layouts. Never accept arbitrary text prefixes.
+    let header = text.lines().rev().find(|line| line.trim() == *columns)?;
+    let description_width = header
+        .chars()
+        .count()
+        .checked_sub(header.find("Description")?)?;
     let columns = columns.split_whitespace().collect::<Vec<_>>().join(" ");
     if columns
         != if pending {
@@ -173,15 +181,26 @@ fn hook_list(body: &[&str]) -> Option<ControlDialog> {
     {
         return None;
     }
-    // Only the captured top-page down indicator is evidence-backed. No inferred
-    // completion from its absence, and no guessed lower-page/up-marker grammar.
-    let ("↓", rows) = tail.split_last().map(|(marker, rows)| (*marker, rows))? else {
-        return None;
+    let above = tail.first() == Some(&"↑");
+    let rows = if above { tail.get(1..)? } else { tail };
+    let below = rows.last() == Some(&"↓");
+    let rows = if below {
+        rows.get(..rows.len().checked_sub(1)?)?
+    } else {
+        rows
     };
+    // All P1/P2 viewports have eight rows, independent of terminal height.
+    // Missing markers must not turn a damaged page into evidence of an end.
+    if rows.len() != 8 {
+        return None;
+    }
     let mut entries = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
-        let row = if i == 0 {
-            row.strip_prefix("› ")?
+    let mut first = None;
+    let mut selections = 0;
+    for (offset, row) in rows.iter().enumerate() {
+        let row = if let Some(row) = row.strip_prefix("› ") {
+            selections += 1;
+            row
         } else {
             row
         };
@@ -195,37 +214,59 @@ fn hook_list(body: &[&str]) -> Option<ControlDialog> {
             None
         };
         let entry = HookListEntry::new(event.into(), installed, active, review);
-        if !valid_counts(&entry)
-            || !CodexEventType::hook_names().any(|name| name == event)
-            || entries.iter().any(|old: &HookListEntry| old.event == event)
-            || description(event)? != columns.collect::<Vec<_>>().join(" ")
+        let position = HOOK_ROWS.iter().position(|(name, _)| *name == event)?;
+        let first = *first.get_or_insert(position);
+        let expected: String = HOOK_ROWS
+            .get(position)?
+            .1
+            .chars()
+            .take(description_width)
+            .collect();
+        let required = CodexEventType::hook_names().any(|name| name == event);
+        let uninstalled = entry.installed == 0
+            && entry.active == 0
+            && entry.review.is_none_or(|review| review == 0);
+        if position != first + offset
+            || !(uninstalled || (required && valid_counts(&entry)))
+            || expected.trim_end() != columns.collect::<Vec<_>>().join(" ")
         {
             return None;
         }
-        entries.push(entry);
+        if required {
+            entries.push(entry);
+        }
     }
-    if entries.is_empty() || entries.len() >= CodexEventType::hook_names().count() {
+    let first = first?;
+    if selections != 1 || above != (first != 0) || below != (first + rows.len() < HOOK_ROWS.len()) {
         return None;
     }
     Some(ControlDialog::HookList {
         entries,
-        above: false,
-        below: true,
+        above,
+        below,
         trust: ControlKey::Character('t'),
         close: ControlKey::Escape,
     })
 }
 
-fn description(event: &str) -> Option<&'static str> {
-    match event {
-        "PreToolUse" => Some("Before a tool executes"),
-        "PermissionRequest" => Some("When permission is requested"),
-        "PostToolUse" => Some("After a tool executes"),
-        "PreCompact" => Some("Before context compaction"),
-        "PostCompact" => Some("After context compaction"),
-        "SessionStart" => Some("When a new session starts"),
-        "SessionEnd" => Some("Right before a session ends"),
-        "UserPromptSubmit" => Some("When the user submits a prompt"),
-        _ => None,
-    }
-}
+// UI order is distinct from registration order. The final three events are
+// vocabulary only, not ATM subscriptions; their counts must all remain zero.
+const HOOK_ROWS: [(&str, &str); 14] = [
+    ("PreToolUse", "Before a tool executes"),
+    ("PermissionRequest", "When permission is requested"),
+    ("PostToolUse", "After a tool executes"),
+    ("PreCompact", "Before context compaction"),
+    ("PostCompact", "After context compaction"),
+    ("SessionStart", "When a new session starts"),
+    ("SessionEnd", "Right before a session ends"),
+    ("UserPromptSubmit", "When the user submits a prompt"),
+    ("SubagentStart", "When a subagent is created"),
+    ("SubagentStop", "Right before a subagent ends its turn"),
+    ("Stop", "Right before Codex ends its turn"),
+    ("Interrupt", "Right before an interrupted turn is aborted"),
+    ("PreModelRequest", "Before a model request"),
+    (
+        "PostModelRequest",
+        "After a model request, including failures",
+    ),
+];

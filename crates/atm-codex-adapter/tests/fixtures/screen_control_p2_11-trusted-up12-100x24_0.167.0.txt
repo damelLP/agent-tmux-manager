@@ -1,0 +1,25 @@
+Captured: codex-cli 0.167.0, 2026-11-14, sealed P2 private-tmux capture; paths sanitized.
+  /permissions[2m - choose what Codex is allowed to do[0m                                                 
+  /model[2m - choose what model and reasoning effort to use[0m                                            
+  /review[2m - review any changes and find issues[0m    
+                                                                                                    
+                                                                                                    
+  [1mHooks[0m                  
+  [2mLifecycle hooks from config and enabled plugins.[0m                                                  
+                                                  
+  [1mIssues[0m                                          
+  ⚠ clamping SessionEnd hook timeout to 3s in /tmp/xxxxxxxxxxxxxxxxxxxxxx/c24/hooks.json            
+                                                                                                    
+  Event                 Installed   Active      Description                                         
+[38;2;99;168;248m↑[39m                        
+[1;7m› PermissionRequest     1           1           When permission is requested                        
+[0m  PostToolUse           [2m1           1           After a tool executes[0m                               
+  PreCompact            [2m1           1           Before context compaction[0m                           
+  PostCompact           [2m1           1           After context compaction[0m                            
+  SessionStart          [2m1           1           When a new session starts[0m                           
+  SessionEnd            [2m1           1           Right before a session ends[0m                         
+  UserPromptSubmit      [2m1           1           When the user submits a prompt[0m                      
+  SubagentStart         [2m1           1           When a subagent is created[0m                          
+[38;2;99;168;248m↓[39m                        
+                         
+  [1menter[0;2m details · [0;1mesc[0;2m close                                                                         

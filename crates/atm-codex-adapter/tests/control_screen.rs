@@ -40,6 +40,265 @@ const PENDING: &str = capture!("a04-review-detail-100x32");
 const TRUSTED: &str = capture!("a05-trust-t-100x32");
 const FRESH: &str = styled!("b14-fresh-baseline-32-100x32");
 
+// Captured: codex-cli 0.167.0, 2026-11-14, sealed P2 private tmux.
+// The manifest's first visible events come from the companion plain captures,
+// independently of observe_control_screen. It includes both wraps and every
+// selection, viewport, size and layout, including the missing-SubagentStop run.
+const UI_EVENTS: [&str; 14] = [
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+    "Interrupt",
+    "PreModelRequest",
+    "PostModelRequest",
+];
+
+fn p2_frames() -> Vec<(String, String, usize)> {
+    include_str!("fixtures/screen_control_p2_0.167.0.tsv")
+        .lines()
+        .map(|line| {
+            let (name, first) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("invalid P2 manifest line: {line}"));
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name);
+            (
+                name.to_owned(),
+                std::fs::read_to_string(path)
+                    .unwrap_or_else(|error| panic!("missing P2 fixture {name}: {error}")),
+                UI_EVENTS
+                    .iter()
+                    .position(|event| *event == first)
+                    .unwrap_or_else(|| panic!("unknown P2 first event: {first}")),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn p2_every_real_page_and_complete_collections_preserve_p6() {
+    use std::collections::BTreeMap;
+    let frames = p2_frames();
+    assert_eq!(frames.len(), 263);
+    let mut collections: BTreeMap<String, BTreeMap<String, HookListEntry>> = BTreeMap::new();
+    let mut ends: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    for (name, text, first) in frames {
+        let pending = name.contains("-pending-");
+        let missing = name.starts_with("screen_control_p2_10-");
+        let size = name.rsplit_once('-').unwrap().1;
+        let key = format!("{missing}-{pending}-{size}");
+        let ControlDialog::HookList {
+            entries,
+            above,
+            below,
+            trust,
+            close,
+        } = observe(&text).dialog
+        else {
+            panic!("unrecognized P2 frame: {name}");
+        };
+        assert_eq!((above, below), (first != 0, first + 8 != 14), "{name}");
+        assert_eq!(trust, ControlKey::Character('t'));
+        assert_eq!(close, ControlKey::Escape);
+        let expected: Vec<_> = UI_EVENTS[first..first + 8]
+            .iter()
+            .filter(|event| !["Interrupt", "PreModelRequest", "PostModelRequest"].contains(event))
+            .map(|event| {
+                let installed = u32::from(!(missing && *event == "SubagentStop"));
+                HookListEntry::new(
+                    (*event).into(),
+                    installed,
+                    if pending { 0 } else { installed },
+                    pending.then_some(installed),
+                )
+            })
+            .collect();
+        assert_eq!(entries, expected, "{name}");
+        assert!(!validate_hook_list(&entries), "partial page {name}");
+        let end = ends.entry(key.clone()).or_default();
+        end.0 |= !above;
+        end.1 |= !below;
+        let collection = collections.entry(key).or_default();
+        for entry in entries {
+            if let Some(old) = collection.insert(entry.event.clone(), entry.clone()) {
+                assert_eq!(old, entry, "conflicting overlap in {name}");
+            }
+        }
+    }
+    assert_eq!(collections.len(), 8);
+    for (key, collection) in collections {
+        assert_eq!(ends[&key], (true, true));
+        let entries: Vec<_> = collection.into_values().collect();
+        assert_eq!(entries.len(), 11);
+        assert_eq!(
+            validate_hook_list(&entries),
+            key.starts_with("false-"),
+            "{key}"
+        );
+        // Every proper subset, not only each eight-row viewport, must refuse.
+        for mask in 0..(1usize << entries.len()) - 1 {
+            let partial: Vec<_> = entries
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, row)| row.clone())
+                .collect();
+            assert!(!validate_hook_list(&partial), "{key}: subset {mask}");
+        }
+    }
+}
+
+#[test]
+fn p2_synthetic_page_damage_stays_unknown() {
+    // Synthetic: mutate EVERY accepted real shape, including selected extras,
+    // both layouts, all widths, all marker combinations and the 10-hook run.
+    for (name, text, _) in p2_frames() {
+        let text = plain(&text);
+        let lines: Vec<_> = text.lines().collect();
+        let row_indices: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let event = line
+                    .trim()
+                    .trim_start_matches("› ")
+                    .split_whitespace()
+                    .next()?;
+                UI_EVENTS.contains(&event).then_some(i)
+            })
+            .collect();
+        assert_eq!(row_indices.len(), 8);
+        let mut mutations = vec![
+            text.replace('↑', "⇧").replace('↓', "⇩"),
+            text.replace(['↑', '↓'], ""), // falsely claims both ends
+            text.replace('›', " "),
+            text.replace(
+                "Lifecycle hooks from config and enabled plugins.",
+                "Lifecycle hooks",
+            ),
+            text.replace("esc close", "esc trust"),
+            format!("{text}\nunknown footer"),
+        ];
+        for marker in ['↑', '↓'] {
+            if text.contains(marker) {
+                mutations.push(text.replace(marker, ""));
+            }
+        }
+        // Missing/overlapping/reordered rows must not hide a gap between pages.
+        for index in &row_indices {
+            let mut damaged = lines.clone();
+            damaged.remove(*index);
+            mutations.push(damaged.join("\n"));
+        }
+        let mut overlap = lines.clone();
+        overlap[row_indices[3]] = overlap[row_indices[2]];
+        mutations.push(overlap.join("\n"));
+        let mut swapped = lines.clone();
+        swapped.swap(row_indices[3], row_indices[4]);
+        mutations.push(swapped.join("\n"));
+        let mut two_selected: Vec<_> = lines.iter().map(|line| (*line).to_owned()).collect();
+        let unselected = row_indices
+            .iter()
+            .find(|i| !lines[**i].starts_with('›'))
+            .unwrap();
+        two_selected[*unselected] = format!("› {}", lines[*unselected].trim());
+        mutations.push(two_selected.join("\n"));
+        for damaged in mutations {
+            assert_eq!(
+                observe(&damaged).dialog,
+                ControlDialog::Unknown,
+                "{name}\n{damaged}"
+            );
+        }
+        // Row description clipping is exact, not arbitrary prefix acceptance.
+        for index in &row_indices {
+            let mut damaged: Vec<_> = lines.iter().map(|line| (*line).to_owned()).collect();
+            damaged[*index] = damaged[*index].trim_end().to_owned();
+            damaged[*index].pop();
+            assert_eq!(
+                observe(&damaged.join("\n")).dialog,
+                ControlDialog::Unknown,
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn p2_synthetic_extra_installations_and_conflicting_collections_refuse() {
+    let mut pending = Vec::new();
+    let mut trusted = Vec::new();
+    for (name, text, first) in p2_frames() {
+        if !name.starts_with("screen_control_p2_11-") || !name.contains("100x32") {
+            continue;
+        }
+        let ControlDialog::HookList { entries, .. } = observe(&text).dialog else {
+            panic!("unrecognized {name}");
+        };
+        let collection = if name.contains("-pending-") {
+            &mut pending
+        } else {
+            &mut trusted
+        };
+        for entry in entries {
+            if !collection.contains(&entry) {
+                collection.push(entry);
+            }
+        }
+        if first != 6 {
+            continue;
+        }
+        // Synthetic: the known non-ATM vocabulary cannot hide an installation,
+        // or an unknown event, behind the omission from authorization entries.
+        let text = plain(&text);
+        for event in ["Interrupt", "PreModelRequest", "PostModelRequest"] {
+            let row = text.lines().find(|line| line.contains(event)).unwrap();
+            let installed = row.replacen("0           0", "1           1", 1);
+            assert_ne!(installed, row);
+            for replacement in [
+                row.replacen('0', "1", 1),
+                installed, // Valid installed counts still cannot authorize an extra event.
+                row.replace(event, "Foreign"),
+            ] {
+                assert_eq!(
+                    observe(&text.replace(row, &replacement)).dialog,
+                    ControlDialog::Unknown
+                );
+            }
+        }
+    }
+    assert!(validate_hook_list(&pending));
+    assert!(validate_hook_list(&trusted));
+    // Synthetic: preserve conflicting repeated rows rather than silently
+    // last-write-wins deduplicating. B0's caller must compare overlaps; the
+    // stateless observer cannot know what an earlier capture contained.
+    let mut conflict = pending.clone();
+    let mut repeated = conflict[0].clone();
+    repeated.active = 1;
+    repeated.review = Some(0);
+    conflict.push(repeated);
+    assert!(!validate_hook_list(&conflict));
+    let mut overlap = pending.clone();
+    overlap.push(overlap[0].clone());
+    assert!(!validate_hook_list(&overlap));
+    let mut mixed = pending;
+    mixed[0] = trusted
+        .iter()
+        .find(|row| row.event == mixed[0].event)
+        .unwrap()
+        .clone();
+    assert!(!validate_hook_list(&mixed));
+}
+
 #[test]
 fn policy_reuses_existing_constants() {
     assert_eq!(CONTROL_POLICY.capture, screen::SCREEN_TEXT_FORMAT);

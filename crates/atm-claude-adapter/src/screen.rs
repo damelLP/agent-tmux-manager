@@ -202,6 +202,15 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
     ) {
         return None;
     }
+    editor_facts(lines, styled, header_end, before_footer)
+}
+
+fn editor_facts(
+    lines: &[&str],
+    styled: Option<&StyledScreen>,
+    header_end: Option<usize>,
+    before_footer: &[&str],
+) -> Option<(ScreenFacts, Option<String>)> {
     let lower = before_footer.iter().rposition(|line| rule(line, '─'))?;
     if !before_footer
         .get(lower + 1..)?

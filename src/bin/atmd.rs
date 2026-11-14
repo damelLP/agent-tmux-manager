@@ -19,14 +19,26 @@
 //! # Check daemon status
 //! atmd status
 //! ```
+//!
+//! `stop` observes process exit, including unreaped zombies, not PID/socket-file
+//! removal. It reports progress once after 5 seconds and gives up after 75 seconds
+//! from signaling, without killing the daemon or removing its state. Nominal
+//! shutdown allows 2 s for connections, 30 s for admitted control deadlines,
+//! 30 s for audits, then 2 s for concurrent summary/raw flushes (64 s total).
+//! Blocking I/O, including Tokio blocking-pool work at runtime drop, can outlast
+//! that allowance. A stop timeout leaves the daemon potentially still shutting
+//! down; successful exit does not promise every pending write was persisted.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -203,19 +215,159 @@ fn exit_already_running(pid: Option<u32>) -> ! {
     process::exit(1);
 }
 
-fn stop_daemon(pid: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result != 0 {
-            bail!("Failed to send SIGTERM to process {pid}");
+// Keep the candidate kit's process-exit policy aligned (scripts/atm_candidate.py).
+// 64 s of nominal drains plus margin, NOT a hard bound on daemon blocking I/O.
+const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
+const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopWaitAction {
+    Stopped,
+    Progress,
+    Wait(Duration),
+    TimedOut,
+}
+
+fn stop_wait_action(elapsed: Duration, exited: bool, reported: bool) -> StopWaitAction {
+    if exited {
+        StopWaitAction::Stopped
+    } else if elapsed >= STOP_WAIT_TIMEOUT {
+        StopWaitAction::TimedOut
+    } else if !reported && elapsed >= STOP_PROGRESS_AFTER {
+        StopWaitAction::Progress
+    } else {
+        let next = if reported {
+            STOP_WAIT_TIMEOUT
+        } else {
+            STOP_PROGRESS_AFTER
+        };
+        StopWaitAction::Wait(next.saturating_sub(elapsed))
+    }
+}
+
+fn wait_for_exit(
+    pid: u32,
+    mut wait: impl FnMut(Duration) -> std::io::Result<bool>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut progress: impl FnMut(),
+) -> Result<()> {
+    let mut reported = false;
+    loop {
+        // Check exit even at the deadline; never infer it from elapsed time.
+        let exited = wait(Duration::ZERO)?;
+        match stop_wait_action(elapsed(), exited, reported) {
+            StopWaitAction::Stopped => return Ok(()),
+            StopWaitAction::Progress => {
+                progress();
+                reported = true;
+            }
+            StopWaitAction::Wait(duration) => {
+                if wait(duration)? {
+                    return Ok(());
+                }
+            }
+            StopWaitAction::TimedOut => bail!(
+                "Daemon (PID {pid}) did not exit within {} seconds; it may still be shutting down.",
+                STOP_WAIT_TIMEOUT.as_secs()
+            ),
         }
     }
-    #[cfg(not(unix))]
-    {
-        bail!("Stop command is only supported on Unix systems");
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> std::io::Result<Option<OwnedFd>> {
+    // SAFETY: pidfd_open takes a PID and flags, no pointers.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if fd >= 0 {
+        // SAFETY: the syscall returned a new, uniquely owned descriptor.
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
     }
-    Ok(())
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOSYS) {
+        Ok(None) // Old kernels retain T6's conservative zombie-aware polling.
+    } else {
+        Err(error)
+    }
+}
+
+fn wait_for_process(
+    pid: u32,
+    pidfd: Option<&OwnedFd>,
+    duration: Duration,
+) -> std::io::Result<bool> {
+    if let Some(fd) = pidfd {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: poll points to one initialized descriptor, kept alive by fd.
+        if unsafe { libc::poll(&mut poll, 1, millis) } < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::other("Cannot observe daemon pidfd"));
+        }
+        // HUP is also an exited process: the parent has already reaped it.
+        Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+    } else {
+        if is_process_running(pid) && !duration.is_zero() {
+            std::thread::sleep(duration.min(Duration::from_millis(100)));
+        }
+        Ok(!is_process_running(pid))
+    }
+}
+
+fn stop_daemon(pid: u32) -> Result<()> {
+    let numeric_pid = i32::try_from(pid).context("Invalid daemon PID")?;
+    if numeric_pid <= 0 {
+        bail!("Invalid daemon PID {pid}");
+    }
+    #[cfg(target_os = "linux")]
+    let pidfd = match open_pidfd(pid) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+        Err(error) => return Err(error).context("Failed to open daemon pidfd"),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let pidfd: Option<OwnedFd> = None;
+    let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let result = if let Some(fd) = &pidfd {
+        // SAFETY: the owned pidfd pins this process; null siginfo uses SIGTERM.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                libc::SIGTERM,
+                0usize,
+                0,
+            ) as i32
+        }
+    } else {
+        // SAFETY: validated positive PID; old-kernel compatibility only.
+        unsafe { libc::kill(numeric_pid, libc::SIGTERM) }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = unsafe { libc::kill(numeric_pid, libc::SIGTERM) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("Failed to send SIGTERM to process {pid}"));
+        }
+    }
+    wait_for_exit(
+        pid,
+        |duration| wait_for_process(pid, pidfd.as_ref(), duration),
+        || started.elapsed(),
+        || println!("Daemon is still stopping; waiting for shutdown to finish..."),
+    )
 }
 
 fn main() -> Result<()> {
@@ -277,16 +429,8 @@ fn main() -> Result<()> {
                 println!("Stopping daemon (PID {pid})...");
                 stop_daemon(pid)?;
 
-                for _ in 0..50 {
-                    if !is_process_running(pid) {
-                        println!("Daemon stopped.");
-                        return Ok(());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-
-                eprintln!("Daemon did not stop within 5 seconds.");
-                process::exit(1);
+                println!("Daemon stopped.");
+                Ok(())
             } else {
                 println!("Daemon is not running.");
                 Ok(())
@@ -694,6 +838,120 @@ mod tests {
                 legacy.as_os_str()
             );
         }
+    }
+
+    #[test]
+    fn stop_wait_progress_once_and_exit_wins_at_deadline() {
+        use StopWaitAction::*;
+        for (millis, exited, reported, expected) in [
+            (
+                4_999,
+                false,
+                false,
+                Wait(std::time::Duration::from_millis(1)),
+            ),
+            (5_000, false, false, Progress),
+            (5_001, false, false, Progress),
+            (5_000, false, true, Wait(std::time::Duration::from_secs(70))),
+            (
+                74_999,
+                false,
+                true,
+                Wait(std::time::Duration::from_millis(1)),
+            ),
+            (75_000, false, true, TimedOut),
+            (75_000, false, false, TimedOut),
+            (0, true, false, Stopped),
+            (5_000, true, false, Stopped),
+            (75_000, true, true, Stopped),
+            (80_000, true, true, Stopped),
+        ] {
+            assert_eq!(
+                stop_wait_action(std::time::Duration::from_millis(millis), exited, reported),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn stop_waits_for_exit_after_progress_without_repeating_it() {
+        use std::{cell::Cell, time::Duration};
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut progress = Vec::new();
+        wait_for_exit(
+            123,
+            |wait| {
+                elapsed.set((elapsed.get() + wait).min(Duration::from_secs(6)));
+                Ok(elapsed.get() == Duration::from_secs(6))
+            },
+            || elapsed.get(),
+            || progress.push(elapsed.get()),
+        )
+        .unwrap();
+        assert_eq!(progress, [Duration::from_secs(5)]);
+        assert_eq!(elapsed.get(), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn stop_timeout_names_still_live_pid_at_seventy_five_seconds() {
+        use std::{cell::Cell, time::Duration};
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut progress = Vec::new();
+        let error = wait_for_exit(
+            123,
+            |wait| {
+                elapsed.set(elapsed.get() + wait);
+                Ok(false)
+            },
+            || elapsed.get(),
+            || progress.push(elapsed.get()),
+        )
+        .unwrap_err();
+        assert_eq!(elapsed.get(), Duration::from_secs(75));
+        assert_eq!(progress, [Duration::from_secs(5)]);
+        let message = error.to_string();
+        assert!(message.contains("PID 123"), "{message}");
+        assert!(message.contains("75 seconds"), "{message}");
+        assert!(message.contains("still be shutting down"), "{message}");
+    }
+
+    #[test]
+    fn failed_exit_probe_is_not_success() {
+        let error = wait_for_exit(
+            123,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            || std::time::Duration::ZERO,
+            || panic!("must not report progress after a failed probe"),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_exit_observation_survives_reaping() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let fd = open_pidfd(pid)
+            .unwrap()
+            .expect("Linux test requires pidfds");
+        assert!(child.wait().unwrap().success());
+        assert!(wait_for_process(pid, Some(&fd), Duration::ZERO).unwrap());
+        assert!(wait_for_process(pid, None, Duration::ZERO).unwrap());
+        assert!(!wait_for_process(std::process::id(), None, Duration::ZERO).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_accepts_exit_before_pidfd_open_and_rejects_nonpositive_pids() {
+        let absent = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        stop_daemon(absent).unwrap();
+        assert!(stop_daemon(0).is_err());
+        assert!(stop_daemon(u32::MAX).is_err());
     }
 
     fn socket_in(dir: &Path) -> PathBuf {

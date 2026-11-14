@@ -316,6 +316,93 @@ async fn reservation_other_raw_sends_and_spawn_wait_without_blocking_other_panes
 }
 
 #[tokio::test]
+async fn reservation_up_created_pane_parks_send_and_spawn_once_in_order() {
+    let (_dir, org, cancel) = healthy().await;
+    let mock = MockTmuxClient::new();
+    let (control, actor) = spawn_control_with_audit(
+        Box::new(mock.clone()),
+        crate::registry::spawn_registry(),
+        org_mirror::Mirror::start(org),
+        cancel.clone(),
+        |_, _| async { Ok(Vec::new()) },
+    );
+    // Wait for the real mirror before testing ownership, so Loading cannot hide
+    // a missing created-pane fence.
+    control
+        .type_spawn_command("%2".into(), "warmup".into())
+        .await
+        .unwrap();
+    control.flush_audits().await;
+    mock.clear_calls();
+    mock.set_next_pane_id("%9");
+    let (split, created) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let c = control.clone();
+    let up = queued(async move {
+        c.run_reserved(
+            ReservationRequest::new(
+                "p/a".parse().unwrap(),
+                None,
+                ReservationKind::Up,
+                WaitPolicy::Wait,
+                Instant::now() + Duration::from_secs(60),
+            ),
+            move |r| async move {
+                let pane = r
+                    .split(
+                        SpawnContext::new("%0".into(), None, false),
+                        PaneDirection::Below,
+                        "50%".into(),
+                    )
+                    .await?;
+                split.send(pane).unwrap();
+                released.await.unwrap();
+                Ok::<_, ReservationError>(())
+            },
+            noop,
+        )
+        .await
+    })
+    .await;
+    assert_eq!(created.await.unwrap().as_str(), "%9");
+    let c = control.clone();
+    let send = queued(async move { c.send("%9".into(), "raw".into()).await }).await;
+    let c = control.clone();
+    let spawn =
+        queued(async move { c.type_spawn_command("%9".into(), "launch".into()).await }).await;
+    barrier(&control).await;
+    assert!(input_calls(&mock).is_empty());
+    mock.set_next_raw_output("0 1");
+    release.send(()).unwrap();
+    up.await.unwrap().unwrap();
+    assert_eq!(send.await.unwrap().unwrap(), "%9");
+    spawn.await.unwrap().unwrap();
+    assert_eq!(
+        input_calls(&mock),
+        vec![
+            MockCall::PasteText {
+                pane: "%9".into(),
+                text: "raw".into()
+            },
+            MockCall::SendKeys {
+                pane: "%9".into(),
+                keys: "Enter".into()
+            },
+            MockCall::SendKeys {
+                pane: "%9".into(),
+                keys: "launch".into()
+            },
+            MockCall::SendKeys {
+                pane: "%9".into(),
+                keys: "Enter".into()
+            },
+        ]
+    );
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
 async fn reservation_durable_clearing_and_excluded_rows_survive_actor_restart() {
     let (_dir, org, cancel) = healthy().await;
     ready(&org).await;

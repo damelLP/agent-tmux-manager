@@ -99,7 +99,8 @@
 //! unknown observations keep the overall readiness timeout. `send_now` still
 //! waits for a positively empty editor during a fresh busy turn.
 //!
-//! Queued retries reserve their attempted pane via [`delivery::delivery_in_flight`].
+//! Queued retries reserve their recipient agent via [`delivery::delivery_in_flight`],
+//! following pane moves without holding a different agent that reuses the old pane.
 //! Blocked emits no event and retains that reservation until receipt or owner
 //! give-up. `Wait(OtherDelivery)` is deliberately unbounded: the blocked message's
 //! owner notice must list the messages queued behind it, not silently hide them.

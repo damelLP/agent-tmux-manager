@@ -58,20 +58,31 @@ impl Queue {
     fn message(&self, id: MessageId) -> &Message {
         self.state.message(&id).unwrap()
     }
+    fn recipient(&self, id: MessageId) -> &AgentId {
+        match &self.message(id).content.to {
+            Address::Agent(recipient) => recipient,
+            Address::Owner | Address::System => panic!("queue fixture messages must target agents"),
+        }
+    }
     fn view(&self, id: MessageId) -> RecipientLiveView {
+        let agent = self.state.agent(self.recipient(id)).unwrap();
         RecipientLiveView {
             session: Some(LiveSession {
                 status: SessionStatus::Idle,
                 status_since: at(-10),
                 last_event_at: at(0),
             }),
-            pane: PaneLiveness::Alive,
-            agent_status: AgentStatus::Ready,
+            pane: if agent.pane.is_some() {
+                PaneLiveness::Alive
+            } else {
+                PaneLiveness::Unknown
+            },
+            agent_status: agent.status,
             agent_not_ready_since: None,
             other_delivery_in_flight: self
                 .state
                 .messages()
-                .any(|m| m.id != id && delivery_in_flight(m, "%1")),
+                .any(|m| m.id != id && delivery_in_flight(m, self.recipient(id))),
             last_paste_at: self.last_paste_at,
             hold_since: None,
             stale_blocker_since: None,
@@ -99,7 +110,13 @@ impl Queue {
             OrgCommand::DeliveryAttempted {
                 message_id: id,
                 attempt,
-                pane: "%1".into(),
+                pane: self
+                    .state
+                    .agent(self.recipient(id))
+                    .unwrap()
+                    .pane
+                    .clone()
+                    .unwrap(),
             },
             now,
         );
@@ -179,6 +196,102 @@ fn queued_retry_reserves_the_pane_before_another_message() {
 }
 
 #[test]
+fn pending_reservation_follows_the_recipient_to_a_new_pane() {
+    for blocked in [false, true] {
+        let (mut q, [a, b]) = Queue::new();
+        let policy = DeliveryPolicy::default();
+        q.paste(a, 1, 0);
+        q.fail(a, false, 3);
+        q.command(
+            OrgCommand::Down {
+                agent_id: support::id(),
+                reason: "pane lost".into(),
+            },
+            4,
+        );
+        q.command(
+            OrgCommand::Adopt {
+                agent_id: support::id(),
+                pane: "%2".into(),
+                session_id: Some("s2".into()),
+            },
+            5,
+        );
+        // Evaluate B first: it must not overtake A on the recipient's new pane.
+        assert!(matches!(
+            q.step(b, &q.view(b), 20, &policy),
+            DeliveryStep::Wait {
+                reason: WaitReason::OtherDelivery,
+                ..
+            }
+        ));
+        let mut live = q.view(a);
+        live.probably_landed = blocked; // evidence from A's original session only
+        if blocked {
+            assert_eq!(
+                q.step(a, &live, 20, &policy),
+                DeliveryStep::Blocked {
+                    reason: FailureReason::ProbablyDelivered
+                }
+            );
+        } else {
+            assert_eq!(
+                q.step(a, &live, 20, &policy),
+                DeliveryStep::PasteNow { attempt: 2 }
+            );
+            q.paste(a, 2, 20);
+            assert_eq!(q.message(a).last_attempt.as_ref().unwrap().pane, "%2");
+            assert!(matches!(
+                q.step(b, &q.view(b), 30, &policy),
+                DeliveryStep::Wait {
+                    reason: WaitReason::OtherDelivery,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[test]
+fn reused_pane_does_not_reserve_a_different_recipient() {
+    let (mut q, [a, _]) = Queue::new();
+    let policy = DeliveryPolicy::default();
+    q.paste(a, 1, 0);
+    q.fail(a, false, 3);
+    q.command(
+        OrgCommand::Down {
+            agent_id: support::id(),
+            reason: "pane lost".into(),
+        },
+        4,
+    );
+    let other: AgentId = "p/other".parse().unwrap();
+    q.command(
+        OrgCommand::Adopt {
+            agent_id: other.clone(),
+            pane: "%1".into(),
+            session_id: Some("s2".into()),
+        },
+        5,
+    );
+    q.command(
+        OrgCommand::SendMessage(support::content(Address::Agent(other))),
+        5,
+    );
+    let c = MessageId::new(q.log.len() as u64);
+    assert_eq!(
+        q.step(a, &q.view(a), 86400, &policy),
+        DeliveryStep::Blocked {
+            reason: FailureReason::AgentUnavailable
+        }
+    );
+    assert_eq!(
+        q.step(c, &q.view(c), 86400, &policy),
+        DeliveryStep::PasteNow { attempt: 1 }
+    );
+}
+
+#[test]
 fn retry_delays_never_release_pane_ownership() {
     for slow_retry in [false, true] {
         let (mut q, [a, b]) = Queue::new();
@@ -248,21 +361,24 @@ fn resolved_attempt_keeps_post_paste_stability() {
 #[test]
 fn delivery_in_flight_conformance() {
     let (mut q, [a, b]) = Queue::new();
-    assert!(!delivery_in_flight(q.message(a), "%1"));
+    assert!(!delivery_in_flight(q.message(a), &support::id()));
     q.paste(a, 1, 0);
-    assert!(delivery_in_flight(q.message(a), "%1"));
-    assert!(!delivery_in_flight(q.message(a), "%2"));
+    assert!(delivery_in_flight(q.message(a), &support::id()));
+    assert!(!delivery_in_flight(
+        q.message(a),
+        &"p/other".parse().unwrap()
+    ));
     assert!(!q.view(a).other_delivery_in_flight); // exclude the current message
     assert!(q.view(b).other_delivery_in_flight);
     q.fail(a, false, 3);
-    assert!(delivery_in_flight(q.message(a), "%1"));
+    assert!(delivery_in_flight(q.message(a), &support::id()));
     q.fail(a, true, 4);
-    assert!(!delivery_in_flight(q.message(a), "%1"));
+    assert!(!delivery_in_flight(q.message(a), &support::id()));
     q.confirm(a, 5); // late receipt after give-up
-    assert!(!delivery_in_flight(q.message(a), "%1"));
+    assert!(!delivery_in_flight(q.message(a), &support::id()));
     q.paste(b, 1, 10);
     q.confirm(b, 11);
-    assert!(!delivery_in_flight(q.message(b), "%1"));
+    assert!(!delivery_in_flight(q.message(b), &support::id()));
 }
 
 #[test]

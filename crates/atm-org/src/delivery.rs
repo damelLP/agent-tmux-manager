@@ -1,8 +1,10 @@
 //! Pure delivery policy; observations and time belong to the executor.
 //!
 //! Consume each decision once, serialized per recipient pane: at most one
-//! message may have an unconfirmed attempt there, including a queued retry.
-//! Use [`delivery_in_flight`] for all other messages to compute the pane veto.
+//! message may have an unconfirmed attempt for that recipient agent, including
+//! a queued retry. The reservation follows the agent if its pane changes; it
+//! never holds a different agent that reuses the old pane. Use
+//! [`delivery_in_flight`] for all other messages to compute the recipient veto.
 //! Decide/append/apply `DeliveryAttempted`
 //! before paste + Enter; never paste if append fails or the command produces no
 //! event. Recheck live guards immediately before I/O and update the pane's last
@@ -17,7 +19,7 @@
 //! `RetryAt` while queued only schedules. `Fail` requires final `DeliveryFailed`
 //! (accepted from queued or delivering). `Blocked` emits no message event:
 //! retain state, notify the owner once per reason, and reevaluate on changes.
-//! A blocked attempt keeps its pane reservation until receipt or owner give-up.
+//! A blocked attempt keeps its recipient reservation until receipt or owner give-up.
 //! `Wait(OtherDelivery)` is unbounded: the blocked predecessor's notice must
 //! list the messages queued behind it, rather than send separate timeout notices.
 //! `Wait(OwnerFocused)` also shows a deduplicated notice, with no timeout.
@@ -60,7 +62,7 @@
 //! | Queued, owner focused (unknown focus is focused) | Wait(OwnerFocused), notice, no timeout |
 //! | Queued, agent starting/clearing | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after continuous non-ready + readiness_timeout |
 //! | Queued, agent stuck/down | Blocked(AgentUnavailable); ready resumes |
-//! | Queued, another message delivering or retry-pending on pane | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
+//! | Queued, another message delivering or retry-pending for recipient | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
 //! | Queued, fresh non-idle row, no send_now OR input not EmptySince | Wait(SessionBusy) until stale or new observation |
 //! | Stale non-idle row, draft/dialog | Wait; Blocked after three guard polls of this blocker, capped by the overall hold |
@@ -115,7 +117,7 @@
 //! a measured maximum automatic-retry gap: the executor's real integration
 //! check must measure that gap and tune the setting.
 
-use crate::{Address, AgentStatus, DeliveryReceipt, DeliveryStatus, Message};
+use crate::{Address, AgentId, AgentStatus, DeliveryReceipt, DeliveryStatus, Message};
 use atm_core::SessionStatus;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -247,9 +249,11 @@ pub struct RecipientLiveView {
     /// clock (even recording a pane changes it). Without history, start at the
     /// first observation; None starts now and must be retained on later polls.
     pub agent_not_ready_since: Option<DateTime<Utc>>,
-    /// Another message has an unconfirmed attempt on this pane, including queued
-    /// retries and blocked attempts. Compute with delivery_in_flight over other
-    /// messages, excluding this message by ID. Serialize reservations per pane.
+    /// Another message has an unconfirmed attempt for this recipient agent,
+    /// including queued retries and blocked attempts, even after a pane move.
+    /// Compute with delivery_in_flight over other messages, excluding this message
+    /// by ID. A different recipient never reserves this agent, even if it used the
+    /// same pane before. Serialize reservations per current recipient pane.
     pub other_delivery_in_flight: bool,
     /// Last paste to this pane (any message). Reset readiness after every paste.
     /// On restart use recovery time if the last paste cannot be reconstructed.
@@ -288,8 +292,11 @@ pub struct RecipientLiveView {
     /// may name an earlier session/attempt; current live guards cannot veto it.
     pub confirmation: Option<DeliveryReceipt>,
     /// A session event or non-idle status RECEIVED after DeliveryAttempted was
-    /// applied (receive order, NOT timestamp comparison), or token seen in pane.
-    /// Includes working -> working activity. Not a receipt. Latch across polls
+    /// applied (receive order, NOT timestamp comparison), or this message's token
+    /// seen in its attempted pane. Session evidence is scoped to the session in
+    /// the attempted pane at reservation, not a replacement recipient session or
+    /// a later occupant of that pane. Includes working -> working activity.
+    /// Not a receipt. Latch across polls
     /// and failure/retry scheduling; reset only on a new reserved attempt.
     /// A restart loses the latch: set last_attempt_before_start for ALL replayed
     /// messages with prior attempts, including queued ones with late evidence.
@@ -395,19 +402,19 @@ pub enum DeliveryPolicyError {
     TimeOverflow,
 }
 
-/// Whether an unconfirmed attempt reserves this pane, including a queued retry.
-/// The caller excludes the current message by ID before computing its live-view
-/// veto over other messages. Blocked emits no event and retains the reservation;
-/// a receipt or final failure releases it. Inputs are applied message state.
+/// Whether an unconfirmed attempt reserves this recipient, including a queued
+/// retry. Reservation follows the agent across pane moves and never holds a
+/// different agent that reuses the attempted pane. The caller excludes the
+/// current message by ID before computing its live-view veto over other messages.
+/// Blocked emits no event and retains the reservation; a receipt or final failure
+/// releases it. Inputs are applied message state.
 #[must_use]
-pub fn delivery_in_flight(message: &Message, pane: &str) -> bool {
+pub fn delivery_in_flight(message: &Message, recipient: &AgentId) -> bool {
     matches!(
         message.status,
         DeliveryStatus::Queued | DeliveryStatus::Delivering
-    ) && message
-        .last_attempt
-        .as_ref()
-        .is_some_and(|attempt| attempt.pane == pane)
+    ) && message.last_attempt.is_some()
+        && matches!(&message.content.to, Address::Agent(id) if id == recipient)
 }
 
 /// Decide without mutation. Caller must apply commands before another decision.

@@ -161,9 +161,15 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
         _ => tail,
     };
     let (columns, tail) = tail.split_first()?;
-    // Header padding is tmux allocation, not the viewport edge. The selected
-    // row spans the pane; a clipped description's visible text must reach it.
-    let width = text.lines().map(|line| line.chars().count()).max()?;
+    // Header padding is tmux allocation, not the viewport edge. Clip from the
+    // header's description column to the widest captured line, including spaces.
+    let header = text.lines().rev().find(|line| line.trim() == *columns)?;
+    let start = header.get(..header.find("Description")?)?.chars().count();
+    let clip = text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()?
+        .checked_sub(start)?;
     let columns = columns.split_whitespace().collect::<Vec<_>>().join(" ");
     if columns
         != if pending {
@@ -201,9 +207,6 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
     let mut first = None;
     let mut selections = 0;
     for (offset, row) in rows.iter().enumerate() {
-        let reaches_edge = text
-            .lines()
-            .any(|line| line.trim() == *row && line.trim_end().chars().count() == width);
         let row = if let Some(row) = row.strip_prefix("› ") {
             selections += 1;
             row
@@ -222,7 +225,7 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
         let entry = HookListEntry::new(event.into(), installed, active, review);
         let position = HOOK_ROWS.iter().position(|(name, _)| *name == event)?;
         let first = *first.get_or_insert(position);
-        let expected = HOOK_ROWS.get(position)?.1;
+        let expected: String = HOOK_ROWS.get(position)?.1.chars().take(clip).collect();
         let description = columns.collect::<Vec<_>>().join(" ");
         let required = CodexEventType::hook_names().any(|name| name == event);
         let uninstalled = entry.installed == 0
@@ -230,7 +233,7 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
             && entry.review.is_none_or(|review| review == 0);
         if position != first + offset
             || !(uninstalled || (required && valid_counts(&entry)))
-            || !(description == expected || (reaches_edge && expected.starts_with(&description)))
+            || expected.trim_end() != description
         {
             return None;
         }

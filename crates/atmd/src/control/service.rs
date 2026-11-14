@@ -477,25 +477,21 @@ where
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled(), if !requests.is_closed() => requests.close(),
                 pending = requests.recv() => {
                     let Some(pending) = pending else { break };
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        audit = execute(&*client, &registry, pending) => {
-                            match audit {
-                                #[cfg(test)]
-                                Some(Audit::Barrier(reply)) => { let _ = audits.send(Audit::Barrier(reply)).await; }
-                                Some(audit) => {
-                                    if audits.try_send(audit).is_err() {
-                                        dropped = dropped.saturating_add(1);
-                                        tracing::warn!(dropped, "control audit queue full or closed; dropping audit");
-                                    }
-                                }
-                                None => {}
+                    // Drain admitted work under its original absolute deadline;
+                    // shutdown must not drop a paste before its separate Enter.
+                    match execute(&*client, &registry, pending).await {
+                        #[cfg(test)]
+                        Some(Audit::Barrier(reply)) => { let _ = audits.send(Audit::Barrier(reply)).await; }
+                        Some(audit) => {
+                            if audits.try_send(audit).is_err() {
+                                dropped = dropped.saturating_add(1);
+                                tracing::warn!(dropped, "control audit queue full or closed; dropping audit");
                             }
                         }
+                        None => {}
                     }
                 }
             }

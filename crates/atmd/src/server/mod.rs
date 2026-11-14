@@ -152,7 +152,9 @@ impl DaemonServer {
     /// This method does not return until shutdown.
     pub async fn run(&self) -> Result<(), ServerError> {
         let mut services = self.method_services.clone();
-        let control_cancel = self.cancel_token.child_token();
+        // Control drains only after connections; parent cancellation must not
+        // interrupt a paste before its Enter or discard its pending audit.
+        let control_cancel = CancellationToken::new();
         let control_task = if services.control.is_none() {
             let (control, task) = crate::control::service::spawn_control(
                 Box::new(atm_tmux::RealTmuxClient::new()),

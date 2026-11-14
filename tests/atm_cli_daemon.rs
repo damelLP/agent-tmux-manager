@@ -18,6 +18,112 @@ use daemon::fake_daemon;
 #[path = "support/control.rs"]
 mod control_support;
 
+mod shutdown {
+    use atm_tmux::{mock::MockCall, MockTmuxClient, PaneDirection, TmuxClient, TmuxError};
+    use atmd::{control::service::spawn_control, org::OrgHandle};
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::{Notify, Semaphore};
+    use tokio_util::sync::CancellationToken;
+
+    struct PausedPaste {
+        mock: MockTmuxClient,
+        pasted: Arc<Notify>,
+        release: Arc<Semaphore>,
+    }
+    #[async_trait::async_trait]
+    impl TmuxClient for PausedPaste {
+        async fn raw_command(&self, cmd: &str, args: &[&str]) -> Result<String, TmuxError> {
+            self.mock.raw_command(cmd, args).await
+        }
+        async fn split_window(
+            &self,
+            target: &str,
+            size: &str,
+            direction: PaneDirection,
+            command: Option<&str>,
+        ) -> Result<String, TmuxError> {
+            self.mock
+                .split_window(target, size, direction, command)
+                .await
+        }
+        async fn get_pane_cwd(&self, pane: &str) -> Result<Option<String>, TmuxError> {
+            self.mock.get_pane_cwd(pane).await
+        }
+        async fn new_window(
+            &self,
+            session: &str,
+            command: Option<&str>,
+        ) -> Result<String, TmuxError> {
+            self.mock.new_window(session, command).await
+        }
+        async fn kill_pane(&self, pane: &str) -> Result<(), TmuxError> {
+            self.mock.kill_pane(pane).await
+        }
+        async fn resize_pane(
+            &self,
+            pane: &str,
+            width: Option<u16>,
+            height: Option<u16>,
+        ) -> Result<(), TmuxError> {
+            self.mock.resize_pane(pane, width, height).await
+        }
+        async fn send_keys(&self, pane: &str, keys: &str) -> Result<(), TmuxError> {
+            self.mock.send_keys(pane, keys).await
+        }
+        async fn paste_text(&self, pane: &str, text: &str) -> Result<(), TmuxError> {
+            self.mock.paste_text(pane, text).await?;
+            self.pasted.notify_one();
+            let _permit = self.release.acquire().await.unwrap();
+            Ok(())
+        }
+        async fn list_panes(&self) -> Result<Vec<atm_tmux::PaneInfo>, TmuxError> {
+            self.mock.list_panes().await
+        }
+        async fn display_popup(
+            &self,
+            width: &str,
+            height: &str,
+            command: &str,
+        ) -> Result<(), TmuxError> {
+            self.mock.display_popup(width, height, command).await
+        }
+        async fn select_pane(&self, pane: &str) -> Result<(), TmuxError> {
+            self.mock.select_pane(pane).await
+        }
+        async fn capture_pane(&self, pane: &str) -> Result<Vec<String>, TmuxError> {
+            self.mock.capture_pane(pane).await
+        }
+        async fn new_session(&self, name: &str) -> Result<String, TmuxError> {
+            self.mock.new_session(name).await
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_paste_enter_and_drains_its_audit() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let org_cancel = CancellationToken::new();
+            let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+            let mock = MockTmuxClient::new();
+            let pasted = Arc::new(Notify::new());
+            let release = Arc::new(Semaphore::new(0));
+            let cancel = CancellationToken::new();
+            let (control, task) = spawn_control(Box::new(PausedPaste { mock: mock.clone(), pasted: pasted.clone(), release: release.clone() }), atmd::registry::spawn_registry(), org.clone(), cancel.clone());
+            let action = tokio::spawn(async move { control.send("%7".into(), "once".into()).await });
+            pasted.notified().await;
+            cancel.cancel();
+            release.add_permits(1);
+            assert_eq!(action.await.unwrap().unwrap(), "%7");
+            task.await.unwrap();
+            assert!(matches!(mock.calls().last(), Some(MockCall::SendKeys { keys, .. }) if keys == "Enter"));
+            let events = org.tail(atmd::org::TailParams::default()).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].body["action"]["outcome"], "ok");
+            org_cancel.cancel();
+        }).await.unwrap();
+    }
+}
+
 fn autostart_control(args: &[&str], expected: &[u8]) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("path");

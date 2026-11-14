@@ -5,7 +5,8 @@
 //! `run_reserved` now admits bounded daemon-owned jobs, serializes conflicting
 //! ownership, rotates cleanup fences and quarantines failed cleanup. Pane methods
 //! validate the live fence, then return [`ReservationError::NotImplemented`];
-//! tmux effects, org integration and legacy send/spawn isolation are still pending.
+//! tmux effects, guarded input, org integration and legacy send/spawn isolation
+//! are still pending. The additive guarded methods are typed stubs too.
 //! The full effect/legacy-path guarantees below remain the implementation contract,
 //! **not guarantees provided by this checkpoint**. Existing send/spawn is unchanged.
 //!
@@ -44,10 +45,10 @@
 //!
 //! | Operation | Calls, in order |
 //! |---|---|
-//! | Up | Validate role and use [`ControlHandle::prepare_spawn`] before admission. Request Up with no pane; execute `OrgCommand::Up`; [`Reservation::split`]; [`Reservation::tag`] with Absent; execute `PaneCreated`; [`Reservation::paste`] launch text then [`Reservation::keys`] Enter; [`Reservation::capture`] and registry observation; execute `SessionBound` or `EditorReady`; return, cleanup, release. |
+//! | Up | Validate role and use [`ControlHandle::prepare_spawn`] before admission. Request Up with no pane; execute `OrgCommand::Up`; [`Reservation::split`]; [`Reservation::tag`] with Absent; execute `PaneCreated`; [`Reservation::paste_guarded`] launch text then [`Reservation::keys_guarded`] Enter, each with the caller's pure expected-screen check; guard trust/update-dialog keys too; [`Reservation::capture`] and registry observation; execute `SessionBound` or `EditorReady`; return, cleanup, release. |
 //! | Adopt | Request Adopt with its pane; [`Reservation::inspect`]; tag Absent only for explicitly untagged adoption, otherwise require this agent's tag; re-read eligible registry row; execute `Adopt`; return. Never send keys or restart. |
-//! | Clear | Request Clear before prechecks; inspect/capture exact ownership and editor; subscribe and take baseline; execute `Clear`; paste adapter clear command; keys Enter; await post-command evidence outside actor; capture again; execute `SessionBound`/`EditorReady` before returning. |
-//! | Respawn | Validate role/placement first; request Respawn with old pane if any; inspect; [`Reservation::kill`] matching old pane (with audit); execute `Respawn`; split, tag Absent, `PaneCreated`, paste launch, keys Enter, observe, durable ready as Up. Old-pane ownership lasts until the whole job releases. |
+//! | Clear | Request Clear before prechecks; inspect/capture exact ownership and editor; subscribe and take baseline; execute `Clear`; paste_guarded adapter clear command; observe the displayed draft, then keys_guarded Enter with the adapter-derived draft/dialog check; guard any subsequent dialog keys too; await post-command evidence outside actor; capture again; execute `SessionBound`/`EditorReady` before returning. |
+//! | Respawn | Validate role/placement first; request Respawn with old pane if any; inspect; [`Reservation::kill`] matching old pane (with audit); execute `Respawn`; split, tag Absent, `PaneCreated`, guarded launch paste/keys, observe, durable ready as Up. Old-pane ownership lasts until the whole job releases. |
 //! | Down | Request Down with current pane; inspect; kill with audit or [`Reservation::untag`]; execute `Down`; return. Never act on a foreign replacement pane. |
 //! | Binding observer | Request Observe; acquire before observing; re-read pane/registry and durable exclusion; observe then execute `SessionBound`/`EditorReady` in this same job. Never spawn a late report outside it. |
 //!
@@ -63,13 +64,22 @@
 //! acquisition, re-read organisation policy and eligible registry rows, inspect
 //! ownership/copy mode, and capture the adapter-requested format. If lifecycle
 //! moved the pane while waiting, return to policy for rescheduling; never deliver
-//! against the pre-acquire snapshot. Record `DeliveryAttempted`, paste the text,
-//! keys Enter, await confirmation outside the tmux actor, then record
-//! `Delivered`/`DeliveryFailed` before cleanup and release. The caller supplies
-//! vendor-specific screen/confirmation policy; this module never infers it.
+//! against the pre-acquire snapshot. Record `DeliveryAttempted`, paste_guarded
+//! the text using an adapter-derived editor check; observe the displayed draft,
+//! then keys_guarded Enter using an adapter-derived draft/dialog check. Await
+//! confirmation outside the tmux actor, then record `Delivered`/`DeliveryFailed`
+//! before cleanup and release. The caller supplies vendor-specific screen and
+//! confirmation policy; this module never infers it.
+//!
+//! **An unguarded Enter after a paste is never safe for U8/U9b.** A prior capture
+//! is not authorization: a dialog or shell may replace the editor while a key
+//! waits in the actor queue. Both guarded forms re-capture and invoke the caller's
+//! pure, quick predicate in the same actor turn as the effect. Use predicates,
+//! not whole-frame equality: harmless counters/spinners may change. This closes
+//! the actor-queue gap, not races with external harness redraws or tmux clients.
 //!
 //! Do not call legacy `send` or `type_spawn_command` inside a reservation: those
-//! paths wait behind its ownership. Use reserved paste/keys instead. Raw send
+//! paths wait behind its ownership. Use reserved guarded paste/keys instead. Raw send
 //! during Clear (including durable Clearing after restart) refuses immediately;
 //! other reservation kinds make legacy send/spawn_type wait within their original
 //! action budget and re-resolve/recheck, without retry. An excluded old session
@@ -90,6 +100,11 @@ use super::{service::ControlHandle, ControlError, SpawnContext};
 pub(super) mod jobs;
 #[path = "reservation_state.rs"]
 pub(super) mod state;
+
+/// Consumer test scripting, available to integration tests without cfg(test).
+#[doc(hidden)]
+#[path = "reservation_testing.rs"]
+pub mod testing;
 
 /// Exact tmux pane target: `%` followed by one or more ASCII digits.
 ///
@@ -363,6 +378,8 @@ impl Reservation {
     }
 
     /// One allowed key, after checking the matching agent tag inside the actor.
+    /// This unguarded form is retained for legacy callers, not U8/U9b input:
+    /// an unguarded Enter after paste is never safe. Use [`Self::keys_guarded`].
     pub async fn keys(
         &self,
         _pane: &PaneId,
@@ -375,6 +392,7 @@ impl Reservation {
 
     /// Literal text with no implicit Enter, after matching-tag/fence checks.
     /// Reuses TmuxClient::paste_text; adapters/callers own editor safety policy.
+    /// U8/U9b use [`Self::paste_guarded`], not a prior capture plus this call.
     pub async fn paste(
         &self,
         _pane: &PaneId,
@@ -383,6 +401,64 @@ impl Reservation {
     ) -> Result<(), ReservationError> {
         self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented { operation: "paste" })
+    }
+
+    /// Re-capture, run a caller-supplied pure screen check, then send one key.
+    ///
+    /// The implementation contract is one actor turn: validate fence/ownership
+    /// and expected agent, capture in `format`, check the fresh local tag, invoke
+    /// `check` on the fresh capture, and send only if it returns true. False
+    /// returns [`ReservationError::ScreenChanged`] without sending anything.
+    /// `check` must be quick and pure: no I/O, awaiting, or blocking. Build it
+    /// from the adapter's observation policy, allowing irrelevant chrome changes;
+    /// no vendor knowledge or whole-frame equality is built into this actor.
+    ///
+    /// U8 uses this for launch Enter and every trust/update/clear-dialog key;
+    /// U9b uses it for delivery Enter after observing the displayed draft. An
+    /// unguarded Enter after a paste is never safe for either consumer. This
+    /// removes actor queue delay between approval and effect, not external races.
+    ///
+    /// **Contract checkpoint:** typed NotImplemented; `check` is not invoked.
+    pub async fn keys_guarded<P>(
+        &self,
+        pane: &PaneId,
+        _expected: AgentId,
+        _key: PaneKey,
+        _format: CaptureFormat,
+        _check: P,
+    ) -> Result<(), ReservationError>
+    where
+        P: FnOnce(&PaneCapture) -> bool + Send + 'static,
+    {
+        self.check(Some(pane)).await?;
+        Err(ReservationError::NotImplemented {
+            operation: "keys_guarded",
+        })
+    }
+
+    /// Re-capture, run a caller-supplied pure screen check, then paste literal
+    /// text without Enter. Same actor-turn, predicate and failure contract as
+    /// [`Self::keys_guarded`]. U8 uses it for launch/clear text; U9b for delivery
+    /// text. A true predicate must authorize this text in this editor/shell,
+    /// not merely recognize the harness's name or a still-matching pane tag.
+    /// Observe the resulting draft and use keys_guarded to submit it.
+    ///
+    /// **Contract checkpoint:** typed NotImplemented; `check` is not invoked.
+    pub async fn paste_guarded<P>(
+        &self,
+        pane: &PaneId,
+        _expected: AgentId,
+        _text: String,
+        _format: CaptureFormat,
+        _check: P,
+    ) -> Result<(), ReservationError>
+    where
+        P: FnOnce(&PaneCapture) -> bool + Send + 'static,
+    {
+        self.check(Some(pane)).await?;
+        Err(ReservationError::NotImplemented {
+            operation: "paste_guarded",
+        })
     }
 
     /// Capture only a pane owned by this reservation, with no vendor flags.
@@ -442,6 +518,8 @@ pub enum ReservationError {
     },
     #[error("stale pane reservation")]
     StaleReservation,
+    #[error("pane {pane} no longer passes the approved screen check; nothing was sent")]
+    ScreenChanged { pane: PaneId },
     #[error("pane {pane} tag mismatch: expected {expected:?}, found {actual:?}")]
     TagMismatch {
         pane: PaneId,

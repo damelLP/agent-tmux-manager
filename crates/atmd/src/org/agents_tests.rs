@@ -2646,6 +2646,121 @@ mod reconciliation {
         Ok(())
     }
 
+    // Observations started for p/lead among the progress events received so far.
+    fn drain_started(
+        events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+    ) -> usize {
+        let mut started = 0;
+        while let Ok(event) = events.try_recv() {
+            started += usize::from(event.phase == "started" && event.agent.is_some());
+        }
+        started
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn down_drops_a_failed_restart_check_and_admits_up_at_once() {
+        // Review 16 H2: the restart check of an agent keeps failing (tmux does
+        // not answer), the owner takes it down and asks for it again. The
+        // failure belonged to the pane that is gone; it must not hold `up`
+        // until the backed-off retry fires.
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(130)).await;
+        let up = || {
+            agents.lifecycle(
+                request("p/lead", None, ReservationKind::Up),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+        };
+        // The twin: while the check is still failing, `up` is refused.
+        match up().await {
+            Err(AgentError::Unavailable(reason)) => {
+                assert!(
+                    reason.contains("restart check is being retried"),
+                    "{reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let at = tokio::time::Instant::now();
+        rig.command(OrgCommand::Down {
+            agent_id: "p/lead".parse().unwrap(),
+            reason: "owner".into(),
+        })
+        .await;
+        agents.failure_cleared(&"p/lead".parse().unwrap()).await;
+        up().await.unwrap();
+        // No timer was needed: the virtual clock has not moved.
+        assert_eq!(at.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(
+            agents.list(ListParams::default()).await.unwrap()[0]
+                .reason
+                .as_deref(),
+            Some("owner")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_during_backoff_retries_within_the_minimum_delay() {
+        // Review 16 H2: after 40 s of failed checks the retry is some 20 s away.
+        // A session registering then, with tmux answering again, is bound within
+        // RETRY_MIN (plus the pacing between two observations), not when the old
+        // timer fires.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        drain_started(&mut events);
+        rig.inspect_only("%1", "p/lead");
+        rig.inspect_only("%1", "p/lead");
+        let at = tokio::time::Instant::now();
+        rig.row("fresh", "%1", false).await;
+        // The restart check, then the binding it re-queues.
+        progress(&mut events, "finished", Some("p/lead")).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("fresh"))
+        );
+        assert!(
+            at.elapsed() >= std::time::Duration::from_secs(1),
+            "the retry is never pulled in to the pacing interval: {:?}",
+            at.elapsed()
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            at.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wakes_during_backoff_retry_at_most_once_per_minimum_delay() {
+        // The other side of H2: a busy agent whose pane can't be read must not
+        // be retried on every hook (that was 20 warnings a second).
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.row("busy", "%1", false).await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        drain_started(&mut events);
+        // 40 hooks in two seconds, tmux still not answering.
+        for _ in 0..40 {
+            update(&rig, "busy").await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let started = drain_started(&mut events);
+        assert!((1..=3).contains(&started), "{started} retries in 2 s");
+    }
+
     #[tokio::test]
     async fn duplicate_clear_conflicts_and_slot_survives_disconnect_through_cleanup() {
         use crate::control::reservation::ReservationKind;

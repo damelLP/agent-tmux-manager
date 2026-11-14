@@ -221,6 +221,16 @@ impl AgentHandle {
         self.inner.runtime.as_ref().unwrap().progress.subscribe()
     }
 
+    /// Resolves once no observation failure is stored for `agent`.
+    #[cfg(test)]
+    pub(super) async fn failure_cleared(&self, agent: &AgentId) {
+        let mut errors = self.inner.errors.clone();
+        errors
+            .wait_for(|errors| !errors.contains_key(agent))
+            .await
+            .unwrap();
+    }
+
     #[cfg(test)]
     pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
         let rt = self.inner.runtime.as_ref().unwrap();
@@ -1232,7 +1242,12 @@ async fn observer(
                                 tracing::warn!(agent = %id, %error, retry_in = ?delay, "Agent observation failed");
                             }
                             Ok(()) => {
-                                next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
+                                // An agent that is Down by now keeps no timer entry.
+                                if routes.agents.contains_key(&id) {
+                                    next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
+                                } else {
+                                    next_observation.remove(&id);
+                                }
                                 backoff.remove(&id);
                                 // A binding wake that arrived before or during the restart check was
                                 // dropped, or fenced by the check's own write: look at the rows once more.
@@ -1260,14 +1275,24 @@ async fn observer(
                             Ok(state) => routes.refresh(&state),
                             Err(error) => tracing::warn!(%error, "Agent routing refresh deferred"),
                         }
+                        let id: Option<AgentId> = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok());
                         if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") {
-                            if let Some(id) = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok()) {
+                            if let Some(id) = id {
+                                pull_in(&BTreeSet::from([id.clone()]), &backoff, &mut next_observation);
                                 if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id]), Wake::Observe).await {
                                     tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
                                 }
                             }
                             #[cfg(test)]
                             rt.progress("committed_scheduled", None);
+                        } else if let Some(id) = id.filter(|_| event.kind == "agent.down") {
+                            // The failure was about a pane the agent no longer has: it
+                            // must not outlive the Down and hold the next `up`. A queued
+                            // retry now runs at once and finds the agent Down.
+                            restart.remove(&id);
+                            backoff.remove(&id);
+                            next_observation.remove(&id);
+                            errors.send_modify(|errors| { errors.remove(&id); });
                         }
                     },
                     Ok(_) => {},
@@ -1286,7 +1311,10 @@ async fn observer(
                 #[cfg(test)]
                 rt.progress("scheduling", None);
                 let result = match routes.wake(&rt, event).await {
-                    Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
+                    Ok(ids) => {
+                        pull_in(&ids, &backoff, &mut next_observation);
+                        schedule(&rt, &mut pending, ids, Wake::Bind).await
+                    }
                     Err(error) => Err(error),
                 };
                 #[cfg(test)]
@@ -1300,6 +1328,22 @@ async fn observer(
     // Keep the control/org alive until all admitted Observe jobs finish cleanup.
     while jobs.join_next().await.is_some() {}
     Ok(())
+}
+
+/// A wake for an agent whose observations are failing brings its next retry in
+/// to `RETRY_MIN` from now. Never sooner: a busy agent on an unreadable pane
+/// would otherwise be retried, and logged, on every hook.
+fn pull_in(
+    ids: &BTreeSet<AgentId>,
+    backoff: &BTreeMap<AgentId, Duration>,
+    next_observation: &mut BTreeMap<AgentId, Instant>,
+) {
+    let soonest = Instant::now() + RETRY_MIN;
+    for id in ids.iter().filter(|id| backoff.contains_key(*id)) {
+        if let Some(at) = next_observation.get_mut(id) {
+            *at = (*at).min(soonest);
+        }
+    }
 }
 
 /// What a scheduled observation is for.

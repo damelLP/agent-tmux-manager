@@ -804,26 +804,25 @@ where
         pane: Option<&str>,
         harness: atm_core::Harness,
     ) -> bool {
+        // Without a pane no event binds or confirms: there is nothing to prove.
+        let Some(pane) = pane else {
+            return false;
+        };
         let Ok(rows) = timeout(Duration::from_secs(1), self.registry.get_all_sessions()).await
         else {
             warn!(session_id = %session, "Registry snapshot timed out; message event is unproven");
             return false;
         };
-        let mut own = rows.iter().filter(|row| {
-            row.id == *session
-                && row.harness == harness.short_tag()
-                && row.parent_session_id.is_none()
-                && pane.is_none_or(|pane| row.tmux_pane.as_deref() == Some(pane))
-        });
+        let on_pane = |row: &&atm_core::SessionView| {
+            row.parent_session_id.is_none() && row.tmux_pane.as_deref() == Some(pane)
+        };
+        let mut own = rows
+            .iter()
+            .filter(on_pane)
+            .filter(|row| row.id == *session && row.harness == harness.short_tag());
         own.next().is_some()
             && own.next().is_none()
-            && !pane.is_some_and(|pane| {
-                rows.iter().any(|row| {
-                    row.parent_session_id.is_none()
-                        && row.tmux_pane.as_deref() == Some(pane)
-                        && row.id != *session
-                })
-            })
+            && !rows.iter().filter(on_pane).any(|row| row.id != *session)
     }
 
     /// The one neutral tap, after the registry's answer. A status line passes
@@ -2424,6 +2423,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_evidence_pane_less_event_takes_no_snapshot() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let row = evidence_row(&handler).await;
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![row]));
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload.as_object_mut().unwrap().remove("tmux_pane");
+        handler.handle_pi_event(payload).await.unwrap();
+        // Its session is the bound one, so it is activity; it cannot confirm.
+        assert_held_without_receipt(&evidence);
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn message_evidence_activity_only_events_take_no_snapshot() {
         // A status line and a SessionEnd can neither bind nor confirm.
         let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
@@ -2507,6 +2519,19 @@ mod tests {
     async fn message_evidence_row_of_another_harness_never_confirms() {
         let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
         replace_evidence_row(&handler, |row| row.harness = atm_core::Harness::Codex).await;
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_row_on_another_pane_never_confirms() {
+        // The event names the scope's pane, but the registry knows the
+        // session on another one: the row does not prove the event.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        replace_evidence_row(&handler, |row| row.tmux_pane = Some("%8".into())).await;
         handler
             .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
             .await

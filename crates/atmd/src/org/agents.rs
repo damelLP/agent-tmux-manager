@@ -4,6 +4,8 @@
 //! bound Ready agents, preserving their binding; ordinary wakes never do. A
 //! session-less Ready agent retains its lifecycle state even on an unsafe screen.
 //! Delivery must independently check the screen before input.
+//! A Stuck agent recovers only when one observation finds its session row and
+//! captures a safe editor; a binding alone never clears Stuck.
 //! Lifecycle effects remain unavailable until the flow slice is installed.
 
 pub use super::agent_methods::register_agent_methods;
@@ -37,6 +39,18 @@ const MIN_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
 // U8c has 32 active+parked slots. Observers use at most a quarter, leaving
 // headroom for lifecycle work and deliveries even during restart or event lag.
 const OBSERVER_CONCURRENCY: usize = 8;
+// A failed observation is retried without waiting for a registry event: the
+// harness may be quiet, or its only row excluded. Doubling, capped.
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Why an agent's last observation failed; cleared by its next success.
+#[derive(Debug, Clone)]
+struct ObservationFailure {
+    reason: String,
+    /// The agent's restart check has not completed yet.
+    restart: bool,
+}
 
 // A wake may wait both in the coalescer and in control admission. Retain only
 // its identity context, never a readiness decision or an event-history mirror.
@@ -132,7 +146,7 @@ struct AgentService {
     runtime: Option<AgentRuntime>,
     projects: Option<AgentProjects>,
     ready: watch::Receiver<Option<Result<(), String>>>,
-    errors: watch::Receiver<BTreeMap<AgentId, String>>,
+    errors: watch::Receiver<BTreeMap<AgentId, ObservationFailure>>,
     lifecycle: Option<mpsc::Sender<LifecycleJob>>,
 }
 
@@ -220,11 +234,25 @@ impl AgentHandle {
             .lifecycle
             .as_ref()
             .ok_or_else(|| self.unavailable("lifecycle admission"))?;
-        if let Some(reason) = self.inner.errors.borrow().get(&request.agent) {
-            return Err(AgentError::Unavailable(format!(
-                "{}: {reason}",
-                request.agent
-            )));
+        // Down and Respawn inspect the pane under their own reservation, so a failed
+        // observation never refuses them. Other work waits only for an agent whose
+        // restart check is still open, not for a runtime failure of a checked one.
+        if !matches!(
+            request.kind,
+            ReservationKind::Down | ReservationKind::Respawn
+        ) {
+            if let Some(failure) = self
+                .inner
+                .errors
+                .borrow()
+                .get(&request.agent)
+                .filter(|failure| failure.restart)
+            {
+                return Err(AgentError::Unavailable(format!(
+                    "{}: restart check is being retried: {}",
+                    request.agent, failure.reason
+                )));
+            }
         }
         let control = rt.control.clone();
         let (admitted, admission) = oneshot::channel();
@@ -398,7 +426,9 @@ impl AgentHandle {
                 .filter(|a| filter.as_ref().is_none_or(|id| &a.id.project == id))
                 .map(|a| {
                     let mut entry = list_entry(&state, a, &rows);
-                    if let Some(error) = self.inner.errors.borrow().get(&a.id) {
+                    if let Some(ObservationFailure { reason: error, .. }) =
+                        self.inner.errors.borrow().get(&a.id)
+                    {
                         entry.reason = Some(match entry.reason {
                             Some(reason) => format!("{reason}; observation unavailable: {error}"),
                             None => format!("observation unavailable: {error}"),
@@ -506,7 +536,7 @@ impl AgentRuntime {
         r: &Reservation,
         state: &OrgState,
         agent: &Agent,
-        mut bind: Option<BindingCandidate>,
+        bind: Option<BindingCandidate>,
         initial: bool,
     ) -> Result<(), AgentError> {
         // Registry failure is never evidence that every agent is gone.
@@ -562,8 +592,11 @@ impl AgentRuntime {
                     task: None,
                 };
                 // Repair a partial Stuck/Note prefix, without duplicating a note
-                // whose append completed after its caller timed out.
-                if !state.messages().any(|message| message.content == content) {
+                // whose append completed after its caller timed out. A note sent
+                // before the agent's last change belongs to an earlier incident.
+                if !state.messages().any(|message| {
+                    message.content == content && message.sent_at >= agent.updated_at
+                }) {
                     self.org
                         .execute(OrgCommand::SendMessage(content), chrono::Utc::now())
                         .await?;
@@ -583,27 +616,39 @@ impl AgentRuntime {
                     && row.harness == expected.short_tag()
             })
             .collect();
-        if let Some(candidate) = bind.as_mut() {
-            if !in_mode
+        // The single eligible row this wake may bind, checked again at the write.
+        let mut binding = bind.filter(|candidate| {
+            !in_mode
                 && eligible.len() == 1
                 && eligible
                     .first()
                     .is_some_and(|row| row.id == candidate.session)
-                && candidate.valid(agent)
-            {
-                self.org
-                    .execute(
-                        OrgCommand::SessionBound {
-                            agent_id: agent.id.clone(),
-                            session_id: candidate.session.clone(),
-                        },
-                        chrono::Utc::now(),
-                    )
-                    .await?;
-                return Ok(());
+        });
+        // Binding is an identity event and needs no screen read, except to leave
+        // Stuck: that takes this observation's own capture of a safe editor.
+        let stuck = agent.status == AgentStatus::Stuck;
+        if !stuck {
+            if let Some(candidate) = binding.as_mut() {
+                if candidate.valid(agent) {
+                    self.org
+                        .execute(
+                            OrgCommand::SessionBound {
+                                agent_id: agent.id.clone(),
+                                session_id: candidate.session.clone(),
+                            },
+                            chrono::Utc::now(),
+                        )
+                        .await?;
+                    return Ok(());
+                }
             }
+            binding = None;
         }
-        if agent.status == AgentStatus::Stuck || (!initial && agent.status == AgentStatus::Ready) {
+        // A capture can change nothing for a Ready agent on an ordinary wake, or
+        // for a session-less one at the restart check: don't read, or fail on, it.
+        if (stuck && binding.is_none())
+            || (agent.status == AgentStatus::Ready && (!initial || agent.session_id.is_none()))
+        {
             return Ok(());
         }
         let Some(pane) = &agent.pane else {
@@ -622,17 +667,32 @@ impl AgentRuntime {
             .filter(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
             .collect();
         let parents = live.iter().filter(|row| !row.id.is_pending()).count();
-        let revalidating = agent.status == AgentStatus::Ready || agent.session_id.is_some();
-        if revalidating
-            && !capture.inspection.dead
+        let safe = !capture.inspection.dead
             && !capture.inspection.in_mode
             && capture.inspection.local_agent_tag.as_deref() == Some(&agent.id.to_string())
             && !live.is_empty()
             && parents <= 1
             && facts.input == InputState::Empty
             && facts.turn == TurnState::NotRunning
-            && facts.dialog == DialogState::None
-        {
+            && facts.dialog == DialogState::None;
+        if let Some(mut candidate) = binding {
+            // A dialog, a running turn or an unknown screen keeps Stuck and its reason.
+            if safe && live.iter().any(|row| row.id == candidate.session) && candidate.valid(agent)
+            {
+                self.org
+                    .execute(
+                        OrgCommand::SessionBound {
+                            agent_id: agent.id.clone(),
+                            session_id: candidate.session.clone(),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        let revalidating = agent.status == AgentStatus::Ready || agent.session_id.is_some();
+        if revalidating && safe {
             if agent.status != AgentStatus::Ready {
                 self.org
                     .execute(
@@ -829,6 +889,7 @@ struct AgentRoute {
     binding: Option<SessionId>,
     excluded: Option<SessionId>,
     harness: Option<Harness>,
+    ready: bool,
 }
 
 impl AgentRoute {
@@ -861,6 +922,7 @@ impl AgentRoutes {
                         binding: a.session_id.clone(),
                         excluded: a.excluded_session_id.clone(),
                         harness: a.role.as_ref().map(|r| r.config.harness),
+                        ready: a.status == AgentStatus::Ready,
                     },
                 )
             })
@@ -895,6 +957,22 @@ impl AgentRoutes {
         affected
     }
 
+    /// A Ready agent's own session reporting in from its own pane has nothing to
+    /// bind and is plainly alive: no observation. Its removal, a pane move, any
+    /// other row, and agents in every other state (Stuck included) still wake.
+    fn own_ready_session(&self, ids: &mut BTreeSet<AgentId>, row: Option<&SessionView>) {
+        let Some(row) = row else {
+            return;
+        };
+        ids.retain(|id| {
+            !self.agents.get(id).is_some_and(|route| {
+                route.ready
+                    && route.binding.as_ref() == Some(&row.id)
+                    && route.pane == row.tmux_pane
+            })
+        });
+    }
+
     async fn rebuild(&mut self, rt: &AgentRuntime) -> Result<BTreeSet<AgentId>, AgentError> {
         self.dirty = true;
         let state = rt.org.snapshot().await?;
@@ -916,7 +994,11 @@ impl AgentRoutes {
             return self.rebuild(rt).await;
         }
         match event {
-            Ok(SessionEvent::Updated { session }) => Ok(self.affected(&session.id, Some(&session))),
+            Ok(SessionEvent::Updated { session }) => {
+                let mut ids = self.affected(&session.id, Some(&session));
+                self.own_ready_session(&mut ids, Some(&session));
+                Ok(ids)
+            }
             Ok(SessionEvent::Removed { session_id, .. }) => Ok(self.affected(&session_id, None)),
             Ok(SessionEvent::Registered { session_id, .. }) => {
                 if self.agents.values().all(|a| a.pane.is_none()) {
@@ -927,7 +1009,9 @@ impl AgentRoutes {
                 let row = timeout(LIST_BUDGET, rt.registry.get_session(session_id.clone()))
                     .await
                     .map_err(|_| AgentError::Timeout)?;
-                Ok(self.affected(&session_id, row.as_ref()))
+                let mut ids = self.affected(&session_id, row.as_ref());
+                self.own_ready_session(&mut ids, row.as_ref());
+                Ok(ids)
             }
             Err(_) => Ok(BTreeSet::new()),
         }
@@ -939,7 +1023,7 @@ async fn observer(
     mut events: broadcast::Receiver<SessionEvent>,
     mut committed: broadcast::Receiver<Arc<crate::eventlog::Envelope>>,
     ready: &watch::Sender<Option<Result<(), String>>>,
-    errors: &watch::Sender<BTreeMap<AgentId, String>>,
+    errors: &watch::Sender<BTreeMap<AgentId, ObservationFailure>>,
     cancel: &CancellationToken,
 ) -> Result<(), AgentError> {
     let state = loop {
@@ -964,6 +1048,7 @@ async fn observer(
     let mut jobs = JoinSet::new();
     let mut restart = initial.clone();
     let mut next_observation = BTreeMap::new();
+    let mut backoff: BTreeMap<AgentId, Duration> = BTreeMap::new();
     let mut routes = AgentRoutes::default();
     routes.refresh(&state);
     if let Ok(rows) = rt.rows().await {
@@ -975,14 +1060,14 @@ async fn observer(
         if initial.is_empty() && ready.borrow().is_none() {
             ready.send_replace(Some(Ok(())));
         }
+        // One clock read per pass: an agent due between two reads would be
+        // neither started nor timed, and wait for an unrelated event.
+        let now = Instant::now();
         while active.len() < OBSERVER_CONCURRENCY {
             let next = pending
                 .keys()
                 .find(|id| {
-                    !active.contains(*id)
-                        && next_observation
-                            .get(*id)
-                            .is_none_or(|at| *at <= Instant::now())
+                    !active.contains(*id) && next_observation.get(*id).is_none_or(|at| *at <= now)
                 })
                 .cloned();
             let Some(id) = next else {
@@ -1004,7 +1089,7 @@ async fn observer(
             .keys()
             .filter(|id| !active.contains(*id))
             .filter_map(|id| next_observation.get(id).copied())
-            .filter(|at| *at > Instant::now())
+            .filter(|at| *at > now)
             .min();
         #[cfg(test)]
         rt.progress("dispatched", None);
@@ -1019,17 +1104,29 @@ async fn observer(
                 match result {
                     Some(Ok((id, result))) => {
                         active.remove(&id);
-                        next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
                         #[cfg(test)]
                         rt.progress("finished", Some(id.clone()));
                         initial.remove(&id);
                         match result {
                             Err(error) => {
-                                errors.send_modify(|errors| { errors.insert(id.clone(), error.to_string()); });
-                                tracing::warn!(agent = %id, %error, "Agent observation failed");
+                                let delay = backoff.get(&id).map_or(RETRY_MIN, |last| last.saturating_mul(2).min(RETRY_MAX));
+                                backoff.insert(id.clone(), delay);
+                                next_observation.insert(id.clone(), Instant::now() + delay);
+                                pending.entry(id.clone()).or_insert(None);
+                                let failure = ObservationFailure { reason: error.to_string(), restart: restart.contains(&id) };
+                                errors.send_modify(|errors| { errors.insert(id.clone(), failure); });
+                                tracing::warn!(agent = %id, %error, retry_in = ?delay, "Agent observation failed");
                             }
                             Ok(()) => {
-                                restart.remove(&id);
+                                next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
+                                backoff.remove(&id);
+                                // A binding wake that arrived before or during the restart check was
+                                // dropped, or fenced by the check's own write: look at the rows once more.
+                                if restart.remove(&id) {
+                                    if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id.clone()]), Wake::BindOnly).await {
+                                        tracing::warn!(agent = %id, %error, "Agent scheduling failed; waiting for next wake");
+                                    }
+                                }
                                 errors.send_modify(|errors| { errors.remove(&id); });
                             }
                         }
@@ -1039,20 +1136,8 @@ async fn observer(
                 }
             }
             _ = async { if let Some(at) = next_wake { tokio::time::sleep_until(at).await; } }, if next_wake.is_some() => {},
-            event = events.recv() => {
-                if matches!(event, Err(broadcast::error::RecvError::Closed)) { break; }
-                #[cfg(test)]
-                rt.progress("scheduling", None);
-                let result = match routes.wake(&rt, event).await {
-                    Ok(ids) => schedule(&rt, &mut pending, ids, true).await,
-                    Err(error) => Err(error),
-                };
-                #[cfg(test)]
-                rt.progress(if result.is_ok() { "scheduled" } else { "schedule_failed" }, None);
-                if let Err(error) = result {
-                    tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
-                }
-            }
+            // Before registry events: routing must reflect a committed lifecycle change
+            // (an agent that just left Ready) before a later row event is filtered by it.
             event = committed.recv() => {
                 match event {
                     Ok(event) if event.kind.starts_with("agent.") => {
@@ -1063,7 +1148,7 @@ async fn observer(
                         }
                         if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") {
                             if let Some(id) = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok()) {
-                                if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id]), false).await {
+                                if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id]), Wake::Observe).await {
                                     tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
                                 }
                             }
@@ -1074,12 +1159,26 @@ async fn observer(
                     Ok(_) => {},
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let result = match routes.rebuild(&rt).await {
-                            Ok(ids) => schedule(&rt, &mut pending, ids, true).await,
+                            Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
                             Err(error) => Err(error),
                         };
                         if let Err(error) = result { tracing::warn!(%error, "Agent rescan deferred until next wake"); }
                     },
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            event = events.recv() => {
+                if matches!(event, Err(broadcast::error::RecvError::Closed)) { break; }
+                #[cfg(test)]
+                rt.progress("scheduling", None);
+                let result = match routes.wake(&rt, event).await {
+                    Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
+                    Err(error) => Err(error),
+                };
+                #[cfg(test)]
+                rt.progress(if result.is_ok() { "scheduled" } else { "schedule_failed" }, None);
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
                 }
             }
         }
@@ -1089,11 +1188,22 @@ async fn observer(
     Ok(())
 }
 
+/// What a scheduled observation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// Observe without a binding candidate.
+    Observe,
+    /// Observe, with a candidate when the current rows offer one.
+    Bind,
+    /// Queue nothing unless the current rows offer a candidate.
+    BindOnly,
+}
+
 async fn schedule(
     rt: &AgentRuntime,
     pending: &mut BTreeMap<AgentId, Option<BindingCandidate>>,
     ids: BTreeSet<AgentId>,
-    bind: bool,
+    wake: Wake,
 ) -> Result<(), AgentError> {
     for id in ids {
         // Subscribe before the FIFO snapshot. A complete clear can leave the
@@ -1104,7 +1214,7 @@ async fn schedule(
         let Some(agent) = current.agent(&id).filter(|a| a.status != AgentStatus::Down) else {
             continue;
         };
-        let candidate = if bind {
+        let candidate = if wake != Wake::Observe {
             let current_rows = rt.rows().await?;
             let expected = harness(&current, agent, &current_rows);
             let eligible: Vec<_> = current_rows
@@ -1138,7 +1248,7 @@ async fn schedule(
         };
         // One dirty bit/candidate per agent; event floods never create one
         // reservation waiter per event. Acquire re-reads all authoritative state.
-        if candidate.is_some() || !pending.contains_key(&agent.id) {
+        if candidate.is_some() || (wake != Wake::BindOnly && !pending.contains_key(&agent.id)) {
             pending.insert(agent.id.clone(), candidate);
         }
     }

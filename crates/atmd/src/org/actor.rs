@@ -4,11 +4,11 @@
 #[path = "actor_tests.rs"]
 mod tests;
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use atm_org::{OrgCommand, OrgState};
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{Health, OrgServiceError, Request};
@@ -18,6 +18,7 @@ pub(super) async fn run<F, Fut>(
     mut state: OrgState,
     mut requests: mpsc::Receiver<Request>,
     health: watch::Sender<Health>,
+    publication: broadcast::Sender<Arc<Envelope>>,
     cancel: CancellationToken,
     mut append: F,
 ) where
@@ -42,7 +43,15 @@ pub(super) async fn run<F, Fut>(
                 now,
                 reply,
             } => {
-                let result = execute(&mut state, &command, now, &health, &mut append).await;
+                let result = execute(
+                    &mut state,
+                    &command,
+                    now,
+                    &health,
+                    &publication,
+                    &mut append,
+                )
+                .await;
                 let failed = matches!(result, Err(OrgServiceError::Unavailable(_)));
                 let _ = reply.send(result);
                 if failed {
@@ -61,6 +70,7 @@ async fn execute<F, Fut>(
     command: &OrgCommand,
     now: DateTime<Utc>,
     health: &watch::Sender<Health>,
+    publication: &broadcast::Sender<Arc<Envelope>>,
     append: &mut F,
 ) -> Result<Vec<Envelope>, OrgServiceError>
 where
@@ -108,7 +118,10 @@ where
             let _ = health.send_replace(Err(reason.clone()));
             return Err(OrgServiceError::Unavailable(reason));
         }
+        // One owner advances the replay fence and publishes only applied records.
+        // Subscribing before reading that fence makes replay/live overlap gapless.
         let _ = health.send_replace(Ok(envelope.seq));
+        let _ = publication.send(Arc::new(envelope.clone()));
         committed.push(envelope);
     }
     Ok(committed)

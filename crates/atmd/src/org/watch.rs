@@ -8,13 +8,12 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use super::{storage::Reader, OrgHandle, OrgServiceError};
-use crate::eventlog::{Envelope, EventLog};
+use crate::eventlog::Envelope;
 
 pub(super) const TAIL_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub(super) struct ReadAccess {
-    pub log: EventLog,
     pub reader: Reader,
 }
 
@@ -87,7 +86,8 @@ impl OrgHandle {
     /// Subscribe BEFORE capturing the replay fence. Replay and live records
     /// overlap deliberately; EventWatch discards all seq <= its scanned cursor.
     pub fn watch(&self, topics: Vec<String>, cursor: u64) -> Result<EventWatch, OrgServiceError> {
-        let live = self.reads()?.log.subscribe();
+        self.reads()?;
+        let live = self.committed.subscribe();
         let fence = self.status()?;
         Ok(EventWatch {
             org: self.clone(),
@@ -103,7 +103,7 @@ impl OrgHandle {
 
 /// A watch holds at most one replay page and one pending live record. Dropping
 /// it cancels future delivery, not the shared filesystem worker. `next` may be
-/// cancelled safely: pending live data survives a cancelled ACK wait.
+/// cancelled safely: pending live data survives a cancelled gap replay.
 pub struct EventWatch {
     org: OrgHandle,
     live: broadcast::Receiver<Arc<Envelope>>,
@@ -117,7 +117,7 @@ pub struct EventWatch {
 impl EventWatch {
     pub async fn next(&mut self) -> Result<Option<Arc<Envelope>>, OrgServiceError> {
         loop {
-            let committed = self.org.status()?;
+            self.org.status()?;
             if let Some(record) = self.replay.pop_front() {
                 return Ok(Some(record));
             }
@@ -138,19 +138,17 @@ impl EventWatch {
                     self.pending = None;
                     continue;
                 }
-                if record.seq <= committed {
-                    self.cursor = record.seq;
-                    if matches(&self.topics, &record.kind) {
-                        return Ok(self.pending.take());
-                    }
-                    self.pending = None;
+                if record.seq > self.cursor.saturating_add(1) {
+                    // Never skip a committed hole, even without a Lagged signal.
+                    // Keep this record pending while disk supplies its predecessors.
+                    self.fence = record.seq.saturating_sub(1);
                     continue;
                 }
-                self.org
-                    .health
-                    .changed()
-                    .await
-                    .map_err(|_| self.org.closed_error())?;
+                self.cursor = record.seq;
+                if matches(&self.topics, &record.kind) {
+                    return Ok(self.pending.take());
+                }
+                self.pending = None;
                 continue;
             }
             tokio::select! {
@@ -190,4 +188,67 @@ pub(crate) fn message(record: &Envelope) -> atm_protocol::DaemonMessage {
         record.kind.clone(),
         record.body.clone(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atm_org::{ControlAudit, OrgCommand};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn live_gap_replays_missing_records_before_advancing_cursor() {
+        for filtered in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cancel = CancellationToken::new();
+            let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+            let topics = if filtered {
+                vec!["control".into()]
+            } else {
+                vec![]
+            };
+            let mut watch = org.watch(topics, 0).unwrap();
+            let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+            org.execute(
+                OrgCommand::RegisterProject {
+                    project_id: "demo".parse().unwrap(),
+                    root: "/demo".into(),
+                    move_root: false,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+            org.execute(
+                OrgCommand::ControlSent(ControlAudit {
+                    pane: "%1".into(),
+                    action: serde_json::json!({"n": 2}),
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+            // Fault injection: omit notifications without a Lagged signal.
+            // Committed records remain on disk, so the next live seq reveals the gap.
+            watch.live = org.committed.subscribe();
+            org.execute(
+                OrgCommand::ControlSent(ControlAudit {
+                    pane: "%1".into(),
+                    action: serde_json::json!({"n": 3}),
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+            for expected in if filtered { 2..=3 } else { 1..=3 } {
+                let record = tokio::time::timeout(std::time::Duration::from_secs(60), watch.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.seq, expected);
+            }
+            cancel.cancel();
+        }
+    }
 }

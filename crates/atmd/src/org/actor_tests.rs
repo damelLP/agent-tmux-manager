@@ -27,11 +27,13 @@ where
 {
     let (requests, receive) = mpsc::channel(64);
     let (health, status) = watch::channel(Ok(0));
+    let (committed, _) = broadcast::channel(1024);
     let cancel = CancellationToken::new();
     let task = tokio::spawn(run(
         OrgState::default(),
         receive,
         health,
+        committed.clone(),
         cancel.clone(),
         append,
     ));
@@ -39,6 +41,7 @@ where
         OrgHandle {
             requests,
             health: status,
+            committed,
             reads: None,
         },
         cancel,
@@ -50,7 +53,7 @@ where
 async fn pending_append_is_not_replayed_or_released_live_before_apply() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_owned();
-    let log = crate::org::storage::detached_open(Duration::from_secs(2), move || {
+    let log = crate::org::storage::detached_open(Duration::from_secs(60), move || {
         crate::eventlog::EventLog::open(&path, crate::eventlog::Stream::Events)
             .map_err(|e| e.to_string())
     })
@@ -72,7 +75,6 @@ async fn pending_append_is_not_replayed_or_released_live_before_apply() {
         }
     });
     org.reads = Some(crate::org::watch::ReadAccess {
-        log,
         reader: crate::org::storage::Reader::start(dir.path().into()).unwrap(),
     });
     let mut watch = org.watch(vec![], 0).unwrap();
@@ -88,13 +90,12 @@ async fn pending_append_is_not_replayed_or_released_live_before_apply() {
         .await
         .unwrap()
         .is_empty());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), watch.next())
-            .await
-            .is_err()
-    );
-    // The cancelled next was awaiting apply, with a live record already read.
-    // It must retain that pending record rather than lose it on cancellation.
+    tokio::select! {
+        biased;
+        result = watch.next() => panic!("unapplied event released: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    // Cancelling an idle next must not lose the later committed publication.
     release.add_permits(1);
     command.await.unwrap().unwrap();
     assert_eq!(watch.next().await.unwrap().unwrap().seq, 1);
@@ -111,6 +112,84 @@ async fn pending_append_is_not_replayed_or_released_live_before_apply() {
         watch.next().await.is_err(),
         "stopped actor must invalidate a quiet watch"
     );
+}
+
+// A watch opened after the writer broadcasts but before apply must not lose
+// that record. Only the append acknowledgment is gated; disk and actor are real.
+#[tokio::test]
+async fn watch_opened_between_broadcast_and_apply_misses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let log = crate::org::storage::detached_open(Duration::from_secs(60), move || {
+        crate::eventlog::EventLog::open(&path, crate::eventlog::Stream::Events)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap();
+    let (entered, mut entry) = mpsc::channel(4);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let disk = log.clone();
+    let (mut org, cancel, task) = spawn(move |record| {
+        let log = disk.clone();
+        let entered = entered.clone();
+        let gate = gate.clone();
+        async move {
+            let seq = log.append(record.ts, &record.kind, record.body).await?;
+            entered.send(()).await.unwrap();
+            let _permit = gate.acquire().await.unwrap();
+            Ok(seq)
+        }
+    });
+    org.reads = Some(crate::org::watch::ReadAccess {
+        reader: crate::org::storage::Reader::start(dir.path().into()).unwrap(),
+    });
+    let caller = org.clone();
+    let first = tokio::spawn(async move { caller.execute(project(), now()).await });
+    entry.recv().await.unwrap(); // seq 1 is on disk and broadcast, but not applied
+    assert_eq!(org.status().unwrap(), 0);
+    let mut watch = org.watch(vec![], 0).unwrap();
+    let mut quiet_watch = org.watch(vec![], 0).unwrap();
+    release.add_permits(1);
+    first.await.unwrap().unwrap();
+    // Publication must deliver even if no later event exposes a sequence gap.
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(60), quiet_watch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .seq,
+        1
+    );
+    let caller = org.clone();
+    let second = tokio::spawn(async move {
+        caller
+            .execute(
+                OrgCommand::ControlSent(atm_org::ControlAudit {
+                    pane: "%1".into(),
+                    action: serde_json::json!({"n": 2}),
+                }),
+                now(),
+            )
+            .await
+    });
+    entry.recv().await.unwrap();
+    release.add_permits(1);
+    second.await.unwrap().unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(60), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        got.seq, 1,
+        "watch skipped seq 1 and delivered seq {}",
+        got.seq
+    );
+    assert_eq!(watch.next().await.unwrap().unwrap().seq, 2);
+    cancel.cancel();
+    task.await.unwrap();
 }
 
 #[tokio::test]
@@ -356,6 +435,7 @@ async fn failed_second_event_preserves_committed_prefix() {
         &command,
         now(),
         &health,
+        &broadcast::channel(1024).0,
         &mut |envelope: Envelope| {
             kinds.push(envelope.kind);
             std::future::ready(if kinds.len() == 1 {
@@ -404,6 +484,7 @@ async fn queue_overload_is_an_explicit_refusal_not_unbounded_work() {
     let org = OrgHandle {
         requests,
         health: status,
+        committed: broadcast::channel(1024).0,
         reads: None,
     };
     let (reply, _) = oneshot::channel();

@@ -23,11 +23,11 @@ pub use watch::{EventWatch, TailParams};
 pub use raw::RawHandle;
 pub use summary::SummaryObserver;
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use atm_org::{OrgCommand, OrgState, Refusal};
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, oneshot, watch as health_watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch as health_watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::eventlog::Envelope;
@@ -66,6 +66,7 @@ enum Request {
 pub struct OrgHandle {
     requests: mpsc::Sender<Request>,
     health: health_watch::Receiver<Health>,
+    committed: broadcast::Sender<Arc<Envelope>>,
     reads: Option<watch::ReadAccess>,
 }
 
@@ -74,9 +75,11 @@ impl OrgHandle {
     pub fn disabled(reason: impl Into<String>) -> Self {
         let (requests, _) = mpsc::channel(1);
         let (_, health) = health_watch::channel(Err(reason.into()));
+        let (committed, _) = broadcast::channel(1024);
         Self {
             requests,
             health,
+            committed,
             reads: None,
         }
     }
@@ -95,16 +98,15 @@ impl OrgHandle {
             Ok(reader) => reader,
             Err(error) => return Self::disabled(error),
         };
-        let reads = Some(watch::ReadAccess {
-            log: ready.log.clone(),
-            reader,
-        });
+        let reads = Some(watch::ReadAccess { reader });
+        let (committed, _) = broadcast::channel(1024);
         let (requests, receive) = mpsc::channel(64);
         let (health, status) = health_watch::channel(Ok(ready.seq));
         tokio::spawn(actor::run(
             ready.state,
             receive,
             health,
+            committed.clone(),
             cancel,
             move |envelope| {
                 let log = ready.log.clone();
@@ -114,6 +116,7 @@ impl OrgHandle {
         Self {
             requests,
             health: status,
+            committed,
             reads,
         }
     }

@@ -4,7 +4,7 @@ use super::agents::{
     AdoptParams, AgentError, AgentHandle, ClearParams, DownParams, ListParams, RespawnParams,
     UpParams,
 };
-use crate::control::reservation::PaneId;
+use crate::control::reservation::{PaneId, ReservationError};
 use crate::server::methods::{control_error, parse_params, MethodError, MethodRouter};
 use atm_protocol::error_code;
 use std::time::Duration;
@@ -12,9 +12,27 @@ use std::time::Duration;
 impl From<AgentError> for MethodError {
     fn from(error: AgentError) -> Self {
         use super::OrgServiceError;
-        use crate::control::reservation::ReservationError;
+        use crate::control::reservation::ExpectedTag;
         use atm_org::{ApplyError, Refusal};
-        let message = error.to_string();
+        let message = match &error {
+            AgentError::Reservation(ReservationError::Busy { agent, .. }) => format!(
+                "agent {agent} is busy; inspect agent list before retrying"
+            ),
+            AgentError::Reservation(ReservationError::TagMismatch { pane, expected, .. }) => {
+                let expected = match expected {
+                    ExpectedTag::Agent(agent) => format!("@atm-agent={agent}"),
+                    ExpectedTag::Absent => "@atm-agent to be absent".into(),
+                };
+                format!("Refusing to control {pane}: expected {expected}; pane ownership does not match")
+            }
+            AgentError::Reservation(ReservationError::ScreenChanged { pane }) => format!(
+                "Refusing input to {pane}: screen changed or is no longer safe; nothing was sent by this action"
+            ),
+            AgentError::Reservation(ReservationError::Quarantined { agent, .. }) => format!(
+                "agent service unavailable: {agent} is quarantined; restart atmd and reconcile before retrying"
+            ),
+            _ => error.to_string(),
+        };
         let code = match error {
             AgentError::NotImplemented { .. } | AgentError::Unavailable(_) => {
                 error_code::UNAVAILABLE
@@ -113,7 +131,10 @@ pub fn register_agent_methods(
     register!("agent.adopt", 45, adopt; p: AdoptParams => {
         validate_root(&p.project_root)?;
         validate_name(&p.name)?;
-        PaneId::parse(p.pane.clone()).map_err(AgentError::from)?;
+        PaneId::parse(p.pane.clone()).map_err(|error| match error {
+            ReservationError::InvalidRequest { reason } => AgentError::InvalidParams(reason),
+            error => AgentError::from(error),
+        })?;
     });
     register!("agent.clear", 135, clear; p: ClearParams => {
         if !(1..=120_000).contains(&p.timeout_ms) {
@@ -166,7 +187,7 @@ mod tests {
             (
                 R::ScreenChanged { pane: pane() },
                 "refused",
-                "pane %7 no longer passes the approved screen check; nothing was sent",
+                "Refusing input to %7: screen changed or is no longer safe; nothing was sent by this action",
             ),
             (
                 R::Quarantined {
@@ -174,7 +195,7 @@ mod tests {
                     pane: Some(pane()),
                 },
                 "unavailable",
-                "agent project/lead (pane %7) is quarantined; restart atmd and reconcile",
+                "agent service unavailable: project/lead is quarantined; restart atmd and reconcile before retrying",
             ),
             (
                 R::Quarantined {
@@ -182,7 +203,7 @@ mod tests {
                     pane: None,
                 },
                 "unavailable",
-                "agent project/lead (pane no pane) is quarantined; restart atmd and reconcile",
+                "agent service unavailable: project/lead is quarantined; restart atmd and reconcile before retrying",
             ),
             (
                 R::Control(ControlError::PaneQuarantined {
@@ -203,7 +224,7 @@ mod tests {
                     pane: Some(pane()),
                 },
                 "conflict",
-                "agent project/lead or pane %7 is reserved",
+                "agent project/lead is busy; inspect agent list before retrying",
             ),
             (
                 R::TagMismatch {
@@ -212,7 +233,30 @@ mod tests {
                     actual: Some("project/other".into()),
                 },
                 "refused",
-                "pane %7 tag mismatch: expected project/lead, found project/other",
+                "Refusing to control %7: expected @atm-agent=project/lead; pane ownership does not match",
+            ),
+            (
+                R::Busy { agent: agent(), pane: None },
+                "conflict",
+                "agent project/lead is busy; inspect agent list before retrying",
+            ),
+            (
+                R::TagMismatch {
+                    pane: pane(),
+                    expected: ExpectedTag::Agent(agent()),
+                    actual: None,
+                },
+                "refused",
+                "Refusing to control %7: expected @atm-agent=project/lead; pane ownership does not match",
+            ),
+            (
+                R::TagMismatch {
+                    pane: pane(),
+                    expected: ExpectedTag::Absent,
+                    actual: Some("project/other".into()),
+                },
+                "refused",
+                "Refusing to control %7: expected @atm-agent to be absent; pane ownership does not match",
             ),
             (R::StaleReservation, "refused", "stale pane reservation"),
             (R::PaneGone { pane: pane() }, "not_found", "pane %7 is gone"),

@@ -236,6 +236,23 @@ Notification hook or post-denial status timing, provider errors/resumptions,
 real tokens/usage evolution, subagents, tool execution, or paid model calls.
 Input-line rendering is deliberately simple, not a pixel-perfect vendor TUI.
 
+## Fixture renderer (staged; lifecycle integration pending)
+
+`screens.json` catalogs 59 native-size source variants; `screens.py` is a pure
+renderer taking a catalog entry and preloaded asset strings. It reuses adapter
+plain captures and carries 20 selected U5b SGR/cursor pairs (provenance in
+`fixtures/screens/README.md`). It preserves rows, NBSP and padding, refuses unsafe
+non-SGR controls or oversized geometry, and emits absolute row positions rather
+than a bottom-row newline that would scroll the screen. It neither guesses parser
+facts nor reconstructs styles. Styled cursor spaces are preserved even when the
+paired plain capture drops them.
+
+The standalone renderer is covered by `test_screens.py` through the Cargo Python
+contract test. **It is not yet wired into `harness.py`; the pane still uses the old
+placeholder renderer.** Lifecycle frame selection, synthetic draft insertion,
+new P1 dialog captures/keys, and actual pane/parser conformance remain the next
+steps. Consumers must not infer that this catalog alone makes readiness work.
+
 ## Captured templates
 
 Captured: Claude Code 2.1.325, 2026-11-14, U5 real TUI through a timestamped private

@@ -1,0 +1,573 @@
+[
+  {
+    "key": "claude.fresh.rich-enabled",
+    "mode": "claude",
+    "state": "fresh",
+    "variant": "rich-enabled",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-rich-enabled-fresh_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-fresh_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-fresh_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.draft.rich-enabled",
+    "mode": "claude",
+    "state": "draft",
+    "variant": "rich-enabled",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-rich-enabled-different-draft_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-different-draft_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-different-draft_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.draft-identical.rich-enabled",
+    "mode": "claude",
+    "state": "draft-identical",
+    "variant": "rich-enabled",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-rich-enabled-same-text-draft_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-same-text-draft_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-same-text-draft_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.erased.rich-enabled",
+    "mode": "claude",
+    "state": "erased",
+    "variant": "rich-enabled",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-rich-enabled-erased_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-erased_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-erased_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.clear-complete.rich-enabled",
+    "mode": "claude",
+    "state": "clear-complete",
+    "variant": "rich-enabled",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-rich-enabled-after-clear_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-after-clear_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-rich-enabled-after-clear_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.fresh.poor",
+    "mode": "claude",
+    "state": "fresh",
+    "variant": "poor",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-poor-fresh_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-fresh_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-fresh_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.draft.poor",
+    "mode": "claude",
+    "state": "draft",
+    "variant": "poor",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-poor-different-draft_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-different-draft_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-different-draft_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.draft-identical.poor",
+    "mode": "claude",
+    "state": "draft-identical",
+    "variant": "poor",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-poor-same-pattern-draft_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-same-pattern-draft_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-same-pattern-draft_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.erased.poor",
+    "mode": "claude",
+    "state": "erased",
+    "variant": "poor",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-poor-erased_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-erased_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-erased_2.1.325.cursor.txt"
+  },
+  {
+    "key": "claude.clear-complete.poor",
+    "mode": "claude",
+    "state": "clear-complete",
+    "variant": "poor",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_u5b_claude-poor-after-clear_2.1.325.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-after-clear_2.1.325.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_claude-poor-after-clear_2.1.325.cursor.txt"
+  },
+  {
+    "key": "codex.fresh.rich",
+    "mode": "codex",
+    "state": "fresh",
+    "variant": "rich",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-rich-fresh_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-fresh_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-fresh_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.draft.rich",
+    "mode": "codex",
+    "state": "draft",
+    "variant": "rich",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-rich-different-draft_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-different-draft_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-different-draft_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.draft-identical.rich",
+    "mode": "codex",
+    "state": "draft-identical",
+    "variant": "rich",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-rich-same-text-draft_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-same-text-draft_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-same-text-draft_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.erased.rich",
+    "mode": "codex",
+    "state": "erased",
+    "variant": "rich",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-rich-erased_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-erased_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-erased_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.clear-complete.rich",
+    "mode": "codex",
+    "state": "clear-complete",
+    "variant": "rich",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-rich-after-clear_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-after-clear_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-rich-after-clear_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.fresh.poor",
+    "mode": "codex",
+    "state": "fresh",
+    "variant": "poor",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-poor-fresh_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-fresh_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-fresh_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.draft.poor",
+    "mode": "codex",
+    "state": "draft",
+    "variant": "poor",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-poor-different-draft_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-different-draft_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-different-draft_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.draft-identical.poor",
+    "mode": "codex",
+    "state": "draft-identical",
+    "variant": "poor",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-poor-same-text-draft_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-same-text-draft_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-same-text-draft_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.erased.poor",
+    "mode": "codex",
+    "state": "erased",
+    "variant": "poor",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-poor-erased_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-erased_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-erased_0.167.0.cursor.txt"
+  },
+  {
+    "key": "codex.clear-complete.poor",
+    "mode": "codex",
+    "state": "clear-complete",
+    "variant": "poor",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_u5b_codex-poor-after-clear_0.167.0.txt",
+    "columns": 100,
+    "rows": 30,
+    "style": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-after-clear_0.167.0.sgr.txt",
+    "cursor_source": "tests/support/stand_in/fixtures/screens/u5b_codex-poor-after-clear_0.167.0.cursor.txt"
+  },
+  {
+    "key": "claude.fresh.u5",
+    "mode": "claude",
+    "state": "fresh",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-ready_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.fresh.restart",
+    "mode": "claude",
+    "state": "fresh",
+    "variant": "restart",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-restarted_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.working.u5",
+    "mode": "claude",
+    "state": "working",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-before-escape_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.idle.u5",
+    "mode": "claude",
+    "state": "idle",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-arrival_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.idle.after-turn",
+    "mode": "claude",
+    "state": "idle",
+    "variant": "after-turn",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-after-clear_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.clearing.u5",
+    "mode": "claude",
+    "state": "clearing",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-clear-poll-01_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.clear-complete.u5",
+    "mode": "claude",
+    "state": "clear-complete",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-clear-poll-02_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.interrupted.u5",
+    "mode": "claude",
+    "state": "interrupted",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-escape-5_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.permission.u5",
+    "mode": "claude",
+    "state": "permission",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-permission_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.permission.denial-pending",
+    "mode": "claude",
+    "state": "permission",
+    "variant": "denial-pending",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-denied-0_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.denied.u5",
+    "mode": "claude",
+    "state": "denied",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-denied-5_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.folder-trust.u5",
+    "mode": "claude",
+    "state": "folder-trust",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-startup_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.shell.u5",
+    "mode": "claude",
+    "state": "shell",
+    "variant": "u5",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-shell_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.shell.final",
+    "mode": "claude",
+    "state": "shell",
+    "variant": "final",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-final-shell_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.fresh.u5",
+    "mode": "codex",
+    "state": "fresh",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-clear-poll-01_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.working.u5",
+    "mode": "codex",
+    "state": "working",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-before-escape_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.idle.u5",
+    "mode": "codex",
+    "state": "idle",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-arrival_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.idle.after-turn",
+    "mode": "codex",
+    "state": "idle",
+    "variant": "after-turn",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-after-clear_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.clear-menu.u5",
+    "mode": "codex",
+    "state": "clear-menu",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-clear-poll-00_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.clear-complete.u5",
+    "mode": "codex",
+    "state": "clear-complete",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-clear-poll-01_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.interrupted.u5",
+    "mode": "codex",
+    "state": "interrupted",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-escape-5_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.update.u5",
+    "mode": "codex",
+    "state": "update",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-startup_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.update.restart",
+    "mode": "codex",
+    "state": "update",
+    "variant": "restart",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-restart-startup_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.shell.u5",
+    "mode": "codex",
+    "state": "shell",
+    "variant": "u5",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-shell_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "codex.shell.final",
+    "mode": "codex",
+    "state": "shell",
+    "variant": "final",
+    "source": "crates/atm-codex-adapter/tests/fixtures/screen_codex-final-shell_0.167.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.fresh.u5",
+    "mode": "pi",
+    "state": "fresh",
+    "variant": "u5",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-startup_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.fresh.notice",
+    "mode": "pi",
+    "state": "fresh",
+    "variant": "notice",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-trust-startup_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.working.u5",
+    "mode": "pi",
+    "state": "working",
+    "variant": "u5",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.idle.u5",
+    "mode": "pi",
+    "state": "idle",
+    "variant": "u5",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-arrival_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.idle.after-turn",
+    "mode": "pi",
+    "state": "idle",
+    "variant": "after-turn",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-after-clear_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.clearing.u5",
+    "mode": "pi",
+    "state": "clearing",
+    "variant": "u5",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-arrival_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.clear-complete.u5",
+    "mode": "pi",
+    "state": "clear-complete",
+    "variant": "u5",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-clear-poll-01_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.interrupted.u5",
+    "mode": "pi",
+    "state": "interrupted",
+    "variant": "u5",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-escape-5_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.shell.u5",
+    "mode": "pi",
+    "state": "shell",
+    "variant": "u5",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-shell_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.shell.final",
+    "mode": "pi",
+    "state": "shell",
+    "variant": "final",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-final-shell_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.idle.coordinator-1",
+    "mode": "pi",
+    "state": "idle",
+    "variant": "coordinator-1",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-extra-idle-1_1.5.0.txt",
+    "columns": 116,
+    "rows": 20
+  },
+  {
+    "key": "pi.idle.coordinator-2",
+    "mode": "pi",
+    "state": "idle",
+    "variant": "coordinator-2",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-extra-idle-2_1.5.0.txt",
+    "columns": 116,
+    "rows": 19
+  },
+  {
+    "key": "pi.working.coordinator-1",
+    "mode": "pi",
+    "state": "working",
+    "variant": "coordinator-1",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-extra-working-1_1.5.0.txt",
+    "columns": 116,
+    "rows": 28
+  },
+  {
+    "key": "pi.working.coordinator-2",
+    "mode": "pi",
+    "state": "working",
+    "variant": "coordinator-2",
+    "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-extra-working-2_1.5.0.txt",
+    "columns": 116,
+    "rows": 28
+  }
+]

@@ -719,7 +719,15 @@ fn stand_in_readiness_does_not_require_tmux_paste_format() {
 fn stand_in_model_contract() {
     let output = bounded::run(
         std::process::Command::new("python3")
-            .args(["-B", "-m", "unittest", "-v", "test_model", "test_runtime"])
+            .args([
+                "-B",
+                "-m",
+                "unittest",
+                "-v",
+                "test_model",
+                "test_runtime",
+                "test_screens",
+            ])
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .current_dir(concat!(

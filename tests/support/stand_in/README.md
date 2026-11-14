@@ -114,8 +114,18 @@ rig.close();
   `atmd` with an environment path inside this rig, including CLI-auto-started
   daemons, rechecks procfs start time/environment, and stops it before removing
   state. The canonical tmux socket is recorded before fallible startup queries;
-  cleanup uses that socket and rechecks its identity, including with symlinked
-  TMPDIR. No broad process-name kill is used.
+  cleanup owns that canonical socket, not the first server PID. A replacement
+  server at the same socket is accepted only after its private TMUX_TMPDIR,
+  procfs start identity and returned socket/PID are checked and rechecked. An
+  already-stopped server is clean only when no matching owned server remains;
+  a live server with an unavailable socket is an error, not silently abandoned.
+  `tmux_env()` queries the current identity after a restart. Daemon disappearance
+  during a recheck is already stopped; a changed identity is never signalled.
+  Both daemon and tmux cleanup are attempted even when the first fails. Process
+  termination uses pidfd notifications, not cleanup polling. Symlinked TMPDIR is
+  canonicalized for ownership; no broad process-name kill is used. Diagnostics
+  also read the known detached-daemon path `state/atm/atm.log` without recursively
+  scanning unrelated paths.
 
 ### Daemon control
 

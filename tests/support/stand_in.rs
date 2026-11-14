@@ -286,38 +286,39 @@ impl StandInRig {
     fn stop_daemons(&mut self) -> Result<(), String> {
         self.rows = None;
         for pid in self.daemon_pids() {
-            let identity = self
-                .daemon_identity(pid)
-                .ok_or("daemon identity vanished")?;
-            if self.daemon_identity(pid).as_ref() != Some(&identity) {
-                return Err("daemon identity changed".into());
-            }
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while self.daemon_identity(pid).as_ref() == Some(&identity) {
-                if Instant::now() >= deadline {
-                    // Rechecked environment + procfs start time immediately before signalling.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                    break;
+            let Some(identity) = self.daemon_identity(pid) else {
+                continue; // Exited between scan and identity read.
+            };
+            self.signal_daemon(pid, &identity, libc::SIGTERM)?;
+            if let Err(error) = process::wait_exit(pid, Duration::from_secs(3)) {
+                if error.kind() != std::io::ErrorKind::TimedOut {
+                    return Err(error.to_string());
                 }
-                std::thread::sleep(POLL);
+                self.signal_daemon(pid, &identity, libc::SIGKILL)?;
+                process::wait_exit(pid, Duration::from_secs(30)).map_err(|e| e.to_string())?;
             }
         }
         if let Some(mut child) = self.daemon.take() {
             child.wait().map_err(|e| e.to_string())?;
         }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !self.daemon_pids().is_empty() {
-            if Instant::now() >= deadline {
-                return Err("private daemon failed to exit".into());
-            }
-            std::thread::sleep(POLL);
+        if !self.daemon_pids().is_empty() {
+            return Err("private daemon failed to exit".into());
         }
         Ok(())
+    }
+
+    fn signal_daemon(&self, pid: u32, identity: &str, signal: i32) -> Result<(), String> {
+        signal_if_unchanged(identity, self.daemon_identity(pid).as_deref(), || {
+            if unsafe { libc::kill(pid as i32, signal) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error.to_string())
+            }
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -330,8 +331,12 @@ impl StandInRig {
         self.root().join("bin").join(mode.name())
     }
     pub fn tmux_env(&self) -> String {
-        let (socket, pid) = self.tmux_identity.as_ref().expect("private server");
-        format!("{},{},0", socket.display(), pid.expect("server pid"))
+        let (socket, _) = self.tmux_identity.as_ref().expect("private server");
+        let (pid, _) = self
+            .current_tmux(socket)
+            .expect("private server identity")
+            .expect("running private server");
+        format!("{},{},0", socket.display(), pid)
     }
 
     pub fn command(&self, program: &Path) -> Command {
@@ -619,6 +624,10 @@ impl StandInRig {
                 ));
             }
         }
+        let log = self.root().join("state/atm/atm.log");
+        if let Ok(text) = std::fs::read_to_string(&log) {
+            out.push_str(&format!("\n{}:\n{text}", log.display()));
+        }
         if out.contains("Handshake failed") {
             out.push_str("\nPossible lost hook: daemon logged Handshake failed; journal event entries are send attempts, not acknowledgments.\n");
         }
@@ -641,38 +650,97 @@ impl StandInRig {
         self.cleanup().expect("private rig cleanup");
     }
     fn cleanup(&mut self) -> Result<(), String> {
-        self.stop_daemons()?;
-        if let Some((socket, pid)) = &self.tmux_identity {
-            let mut cmd = self.command(Path::new("tmux"));
-            cmd.args([
-                "-S",
-                socket.to_str().ok_or("socket utf8")?,
-                "display-message",
-                "-p",
-                "#{socket_path} #{pid}",
-            ]);
-            let output = process::run(&mut cmd);
-            if !socket.exists() && pid.is_none() {
-                self.tmux_identity = None;
-                return Ok(());
-            }
-            let identity = String::from_utf8_lossy(&output.stdout);
-            let actual = identity.trim().rsplit_once(' ');
-            if !output.status.success()
-                || !actual.is_some_and(|(path, actual_pid)| {
-                    Path::new(path) == socket
-                        && actual_pid.parse::<u32>().is_ok_and(|actual_pid| {
-                            pid.is_none_or(|expected| actual_pid == expected)
-                        })
-                })
-                || !socket.starts_with(
-                    self.root()
-                        .join("tmux")
-                        .canonicalize()
-                        .map_err(|e| e.to_string())?,
-                )
-            {
-                return Err("refusing to kill tmux: server identity mismatch".into());
+        self.cleanup_with(Self::stop_daemons)
+    }
+
+    fn cleanup_with(
+        &mut self,
+        stop_daemons: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let daemon = stop_daemons(self);
+        let tmux = self.stop_tmux(); // Always attempt both, returning the first error.
+        daemon.and(tmux)
+    }
+
+    fn tmux_process_identity(&self, pid: u32) -> Option<String> {
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        if std::fs::read_to_string(proc.join("comm")).ok()?.trim() != "tmux: server" {
+            return None;
+        }
+        let root = self.root().join("tmux").canonicalize().ok()?;
+        let env = std::fs::read(proc.join("environ")).ok()?;
+        let owns = env
+            .split(|b| *b == 0)
+            .filter_map(|entry| entry.strip_prefix(b"TMUX_TMPDIR="))
+            .any(|path| {
+                std::str::from_utf8(path)
+                    .ok()
+                    .and_then(|path| Path::new(path).canonicalize().ok())
+                    .as_ref()
+                    == Some(&root)
+            });
+        if !owns {
+            return None;
+        }
+        let stat = std::fs::read_to_string(proc.join("stat")).ok()?;
+        Some(stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.into())
+    }
+
+    fn current_tmux(&self, socket: &Path) -> Result<Option<(u32, String)>, String> {
+        let root = self
+            .root()
+            .join("tmux")
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if !socket.starts_with(&root) {
+            return Err("refusing foreign tmux socket".into());
+        }
+        let output = process::run(self.command(Path::new("tmux")).args([
+            "-S",
+            socket.to_str().ok_or("socket utf8")?,
+            "display-message",
+            "-p",
+            "#{socket_path} #{pid}",
+        ]));
+        if !output.status.success() {
+            let owned = std::fs::read_dir("/proc")
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|s| s.parse().ok())
+                        .is_some_and(|pid| self.tmux_process_identity(pid).is_some())
+                });
+            return if owned {
+                Err("private tmux alive but socket unavailable".into())
+            } else {
+                Ok(None)
+            };
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let (path, pid) = text
+            .trim()
+            .rsplit_once(' ')
+            .ok_or("invalid tmux identity")?;
+        if Path::new(path) != socket {
+            return Err("tmux socket identity changed".into());
+        }
+        let pid = pid.parse().map_err(|_| "invalid tmux pid")?;
+        let start = self
+            .tmux_process_identity(pid)
+            .ok_or("tmux process identity mismatch")?;
+        Ok(Some((pid, start)))
+    }
+
+    fn stop_tmux(&mut self) -> Result<(), String> {
+        let Some((socket, _)) = &self.tmux_identity else {
+            return Ok(());
+        };
+        if let Some(identity) = self.current_tmux(socket)? {
+            if self.current_tmux(socket)?.as_ref() != Some(&identity) {
+                return Err("tmux identity changed during cleanup".into());
             }
             let result = process::run(self.command(Path::new("tmux")).args([
                 "-S",
@@ -682,8 +750,9 @@ impl StandInRig {
             if !result.status.success() {
                 return Err(format!("kill private server: {result:?}"));
             }
-            self.tmux_identity = None;
+            process::wait_exit(identity.0, Duration::from_secs(30)).map_err(|e| e.to_string())?;
         }
+        self.tmux_identity = None;
         Ok(())
     }
 }
@@ -698,6 +767,18 @@ impl Drop for StandInRig {
                 self.root().display()
             );
         }
+    }
+}
+
+fn signal_if_unchanged(
+    expected: &str,
+    current: Option<&str>,
+    signal: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    match current {
+        None => Ok(()), // Already stopped, not an error that aborts other cleanup.
+        Some(current) if current == expected => signal(),
+        Some(_) => Err("process identity changed".into()),
     }
 }
 
@@ -743,3 +824,7 @@ pub fn protocol_request(
         .await?
     })
 }
+
+#[cfg(test)]
+#[path = "stand_in/test_cleanup.rs"]
+mod test_cleanup;

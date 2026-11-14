@@ -360,3 +360,118 @@ pub(super) fn launch_line_is_staged(capture: &PaneCapture, before: &str, text: &
         line.len() == before.len() + text.len() && line.starts_with(before) && line.ends_with(text)
     })
 }
+
+/// What procfs says about a pane's root process. A flow reads it once, when it
+/// records a baseline or checks for a return to the shell; never a guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProcFacts {
+    /// The root's process group.
+    pub process_group: i32,
+    /// The foreground process group of the root's terminal.
+    pub foreground_group: i32,
+    /// The root's executable is one of the system's login shells.
+    pub system_shell: bool,
+    /// How many child processes the root has.
+    pub children: usize,
+    /// The root's name as tmux shows it: the basename of its `argv[0]`
+    /// without a login shell's leading `-`.
+    pub name: String,
+}
+
+impl ProcFacts {
+    /// Build the facts from what was read: the content of `/proc/<pid>/stat`,
+    /// of `/proc/<pid>/cmdline` and of `/proc/<pid>/task/<pid>/children`, the
+    /// canonical path of `/proc/<pid>/exe`, and the canonical paths listed in
+    /// `/etc/shells`. `None` when any of it does not parse.
+    #[must_use]
+    pub(super) fn parse(
+        stat: &str,
+        cmdline: &[u8],
+        children: &str,
+        exe: &std::path::Path,
+        shells: &[PathBuf],
+    ) -> Option<Self> {
+        // The command name in `stat` may hold spaces and parentheses; the
+        // numeric fields follow its last `)`: state, ppid, pgrp, session,
+        // tty_nr, tpgid.
+        let mut fields = stat.rsplit_once(')')?.1.split_ascii_whitespace().skip(2);
+        let process_group: i32 = fields.next()?.parse().ok()?;
+        let foreground_group: i32 = fields.nth(2)?.parse().ok()?;
+        let argv0 = std::str::from_utf8(cmdline.split(|byte| *byte == 0).next()?).ok()?;
+        let name = argv0.rsplit('/').next()?;
+        let name = name.strip_prefix('-').unwrap_or(name);
+        let mut count = 0;
+        for child in children.split_ascii_whitespace() {
+            child.parse::<u32>().ok()?;
+            count += 1;
+        }
+        (process_group > 0 && !name.is_empty()).then(|| Self {
+            process_group,
+            foreground_group,
+            system_shell: shells.iter().any(|shell| shell == exe),
+            children: count,
+            name: name.to_owned(),
+        })
+    }
+}
+
+/// Which of four shapes a pane's processes are in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaneShape {
+    /// A job other than the root holds the terminal (a shell with job control
+    /// running a program).
+    JobInFront,
+    /// The root holds the terminal and is not a shell: the pane's command is
+    /// the program itself.
+    RootProgram,
+    /// A shell holds the terminal and has children: a program run without job
+    /// control. Which of the two is in front can't be told.
+    ShellHoldingChild,
+    /// A shell holds the terminal and has no children: it is at its prompt.
+    IdleShell,
+}
+
+/// Classify a pane. `None` when the terminal has no foreground group.
+#[must_use]
+pub(super) fn classify_pane(facts: &ProcFacts) -> Option<PaneShape> {
+    if facts.foreground_group <= 0 {
+        None
+    } else if facts.foreground_group != facts.process_group {
+        Some(PaneShape::JobInFront)
+    } else if !facts.system_shell {
+        Some(PaneShape::RootProgram)
+    } else if facts.children > 0 {
+        Some(PaneShape::ShellHoldingChild)
+    } else {
+        Some(PaneShape::IdleShell)
+    }
+}
+
+/// The baseline of a pane a launch is about to type into: its root is an idle
+/// shell, and tmux names the foreground program as that shell.
+#[must_use]
+pub(super) fn shell_baseline(
+    facts: &ProcFacts,
+    root_pid: u32,
+    command: &str,
+) -> Option<PaneBaseline> {
+    (classify_pane(facts) == Some(PaneShape::IdleShell) && command == facts.name)
+        .then(|| PaneBaseline::shell(root_pid, command.to_owned()))
+}
+
+/// The baseline of a pane that already runs something (an adopt, or the pass
+/// after a daemon restart), before any harness name is pinned: a foreground
+/// job whose name is not its shell's, or a program that is the pane's root.
+/// A shell holding a child without job control, and an idle shell, get none.
+#[must_use]
+pub(super) fn adopt_baseline(
+    facts: &ProcFacts,
+    root_pid: u32,
+    command: &str,
+) -> Option<PaneBaseline> {
+    match classify_pane(facts)? {
+        PaneShape::JobInFront if command != facts.name => Some(PaneBaseline::adopted(root_pid)),
+        PaneShape::RootProgram => Some(PaneBaseline::adopted(root_pid)),
+        _ => None,
+    }
+}

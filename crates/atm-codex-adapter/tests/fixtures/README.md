@@ -1,5 +1,46 @@
 # Codex screen fixtures
 
+## Finished-turn clocks (U8g)
+
+Captured: codex-cli 0.167.0, 2026-11-14, U5 and sealed P1 private-tmux
+captures. The P1/P2 corpus contains `<1s` and integer-second finished durations
+(`1s`, `2s`, `7s`, `16s`), with 12-hour `h:mm AM`/`h:mm PM` or 24-hour `HH:mm`
+clocks. P2 has no Worked lines. The sealed long-turn capture below adds `1m 5s`.
+Finished durations accept `<1s`, seconds 1–59, minutes 1–59 plus seconds 0–59,
+or positive hours plus minutes/seconds 0–59, all without zero padding.
+Hour-duration shapes follow the codex-cli 0.167.0 binary's formatter and are
+Synthetic test coverage, **not verified on screen**. Running-duration parsing
+is unchanged. The 12-hour hour is unpadded (1–12); the 24-hour hour is padded
+(00–23), and minutes are padded (00–59). Extra text or malformed separators
+are not completion evidence. Date-prefixed clocks (for example `• Nov 13 at
+16:34`) stay Unknown; a resumed session may remain Unknown until its next turn.
+
+The existing P1 c02/c03 and B0 b12 fixtures now read NotRunning, retaining their
+other facts. New `screen_styled_p1_<stem>_0.167.0.txt` fixtures map to P1
+`<stem>.styled.txt`, captured with `capture-pane -p -e -N`:
+
+- `c11-working-released-100x24`: final `7s` completion.
+- `c18-permission-enter-approved-100x32`: final `16s` completion.
+- `c21-permission-multi-approved-100x32`: final `1s` completion.
+
+Only the private run root is replaced with an equal-width `/tmp/xxx…` token;
+attributes, whitespace and rows remain intact. `tests/worked_status.rs` tests
+these full frames, c02/c03, old Worked lines before working/dialog suffixes,
+and explicitly Synthetic clock-boundary and malformed-line mutations.
+
+Captured: codex-cli 0.167.0, 2026-11-14, private network namespace with the
+unchanged P1 loopback Responses stub held for 65 seconds, private tmux 3.8
+`capture-pane -p -e -N`, at 100x32 and 120x40. Both
+`screen_styled_u8g_finished-<size>_0.167.0.txt` frames show
+`Worked for 1m 5s • 21:19`. Only the private run root is replaced with an
+equal-width `/tmp/xxx…` token; styles and rows are unchanged. The initial
+prompt was passed through argv, with no pane keys sent or real API access.
+This launch displays compact footer chrome without the supported shortcuts
+row: the full observer still refuses it. A unit test reads the real duration
+line directly; an explicitly Synthetic transplant into the supported P1
+editor tests that duration through both public observers. No compact-footer
+support or style-based completion recognition is added here.
+
 ## Lifecycle control observations (B0)
 
 Captured: codex-cli 0.167.0, 2026-11-14, sealed P1 private-tmux
@@ -25,8 +66,8 @@ Missing/duplicate/extra complete-set names and mixed layouts refuse.
 Counts/event names cannot establish command identity: a foreign replacement
 with identical event/count is undetectable. Page traversal and sending literal
 t are not implemented here. Descriptions validate grammar, not identity.
-Existing legacy observations/tests and Worked-line parsing stay unchanged;
-the older limitations below describe that legacy observer.
+B0 left Worked-line parsing unchanged; U8g's finished-turn correction is
+documented above. The older limitations below describe the legacy observer.
 
 ## Complete hook-list evidence (P2)
 

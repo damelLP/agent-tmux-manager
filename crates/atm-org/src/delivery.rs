@@ -62,8 +62,9 @@
 //! | Queued, agent stuck/down | Blocked(AgentUnavailable); ready resumes |
 //! | Queued, another message delivering or retry-pending on pane | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
-//! | Queued, fresh non-idle row, no send_now | Wait(SessionBusy) until stale or new observation |
-//! | Copy mode, dialog, draft, unknown guards/input | Wait; Blocked after continuous hold + readiness_timeout |
+//! | Queued, fresh non-idle row, no send_now OR input not EmptySince | Wait(SessionBusy) until stale or new observation |
+//! | Stale non-idle row, draft/dialog | Wait; Blocked after three guard polls of this blocker, capped by the overall hold |
+//! | Other copy mode, dialog, draft, unknown guards/input | Wait; Blocked after continuous hold + readiness_timeout |
 //! | No row, positive empty input | Wait until max(empty_since,last_paste) + stable_empty_input |
 //! | Idle row, no send_now | Wait until max(status_since,empty_since,last_paste) + stable_idle |
 //! | Stale non-idle row, or send_now with any row | Wait until max(empty_since,last_paste) + stable_idle |
@@ -96,7 +97,14 @@
 //! status changes and focus waits; see [`RecipientLiveView::agent_not_ready_since`].
 //! `EmptySince` means a positively recognized
 //! empty editor **and no running turn**, never a blank screen or an empty box
-//! during active work. `send_now` skips row status/stability, not input stability.
+//! during active work. `send_now` skips row status/stability only once the editor
+//! is positively empty; it never spends the hold budget on a fresh running turn.
+//!
+//! A stale-row draft/dialog has a separate short confirmation: three guard polls
+//! (750 ms by default). The executor supplies `stale_blocker_since`, resetting it
+//! on a changed/cleared/unknown blocker, a fresh row, or a non-hold wait. Never
+//! borrow an earlier blocker's short confirmation. The overall hold still caps
+//! flapping, and unknown observations retain the full readiness timeout.
 //!
 //! # Defaults
 //!
@@ -247,6 +255,12 @@ pub struct RecipientLiveView {
     /// samples. Reset on paste or a non-hold wait (focus, busy row, agent state,
     /// other delivery); see the module's table. None starts now, never sent_at.
     pub hold_since: Option<DateTime<Utc>>,
+    /// Start of continuous observation of this effective draft/dialog on a stale
+    /// non-idle row. Reset on blocker change/clear/unknown, row freshness, or a
+    /// non-hold wait; do NOT reset hold_since when just the blocker changes.
+    /// None starts now and must be retained on later polls. The short bound is
+    /// three guard polls; the overall readiness bound still caps flapping.
+    pub stale_blocker_since: Option<DateTime<Utc>>,
     /// The last attempt predates this daemon process, including queued retries.
     /// Compute from replay/process lifetime, not wall-clock timestamp order.
     /// Lost receipt/landing latches require a hold until receipt or explicit
@@ -260,7 +274,8 @@ pub struct RecipientLiveView {
     /// A turn end only triggers a recheck, never overrides focus.
     pub owner_focused: bool,
     pub input_line: InputLine,
-    /// Bypass row status/stability only, never empty-input/post-paste stability.
+    /// Bypass row status/stability only with positively empty input; never skip
+    /// empty-input/post-paste stability or spend readiness budget on a fresh turn.
     pub send_now: bool,
     /// Executor validated this message's token in a prompt-submitted event for
     /// its target pane/session. Latch until Delivered is applied. The receipt
@@ -348,9 +363,9 @@ pub enum FailureReason {
     ConfirmationTimeout,
     #[error("recipient pane is not alive")]
     PaneGone,
-    #[error("input draft persisted past readiness timeout")]
+    #[error("input draft persisted past the delivery hold deadline")]
     DraftPresent,
-    #[error("dialog persisted past readiness timeout")]
+    #[error("dialog persisted past the delivery hold deadline")]
     DialogOpen,
     #[error("recipient readiness could not be established")]
     ReadinessTimeout,
@@ -435,8 +450,13 @@ pub fn next_delivery(
             reason,
         })
     };
-    let bounded_wait = |reason, blocked_reason, since: Option<DateTime<Utc>>, wake_at| {
+    let bounded_wait = |reason,
+                        blocked_reason,
+                        since: Option<DateTime<Utc>>,
+                        wake_at,
+                        limit: Option<DateTime<Utc>>| {
         let until = deadline(since.unwrap_or(now), settings.readiness_timeout)?;
+        let until = limit.map_or(until, |limit| until.min(limit));
         Ok(if now >= until {
             DeliveryStep::Blocked {
                 reason: blocked_reason,
@@ -452,13 +472,15 @@ pub fn next_delivery(
             }
         })
     };
-    let hold = |reason, blocked_reason| bounded_wait(reason, blocked_reason, live.hold_since, None);
+    let hold =
+        |reason, blocked_reason| bounded_wait(reason, blocked_reason, live.hold_since, None, None);
     let stabilize = |reason, until| {
         bounded_wait(
             reason,
             FailureReason::ReadinessTimeout,
             live.hold_since,
             Some(until),
+            None,
         )
     };
     let pane_guard = || match live.pane {
@@ -528,6 +550,7 @@ pub fn next_delivery(
                 FailureReason::AgentNotReadyTimeout,
                 live.agent_not_ready_since,
                 None,
+                None,
             );
         }
         AgentStatus::Stuck | AgentStatus::Down => {
@@ -551,7 +574,7 @@ pub fn next_delivery(
         .transpose()?;
     let stale = stale_at.is_some_and(|at| now >= at);
 
-    if !live.send_now && !stale {
+    if !stale && (!live.send_now || !matches!(live.input_line, InputLine::EmptySince(_))) {
         if let Some(at) = stale_at {
             return Ok(DeliveryStep::Wait {
                 until: deadline(now, settings.guard_poll_interval)?.min(at),
@@ -564,13 +587,30 @@ pub fn next_delivery(
         None => return hold(WaitReason::UnknownGuards, FailureReason::ReadinessTimeout),
         Some(false) => {}
     }
+    let editor_hold = |reason, blocked_reason| {
+        let limit = if stale {
+            let confirmation = settings
+                .guard_poll_interval
+                .checked_mul(3)
+                .ok_or(DeliveryPolicyError::InvalidConfiguration)?;
+            Some(deadline(
+                live.stale_blocker_since.unwrap_or(now),
+                confirmation,
+            )?)
+        } else {
+            None
+        };
+        bounded_wait(reason, blocked_reason, live.hold_since, None, limit)
+    };
     match live.dialog_open {
-        Some(true) => return hold(WaitReason::DialogOpen, FailureReason::DialogOpen),
+        Some(true) => return editor_hold(WaitReason::DialogOpen, FailureReason::DialogOpen),
         None => return hold(WaitReason::UnknownGuards, FailureReason::ReadinessTimeout),
         Some(false) => {}
     }
     let empty_since = match live.input_line {
-        InputLine::NonEmpty => return hold(WaitReason::InputNotEmpty, FailureReason::DraftPresent),
+        InputLine::NonEmpty => {
+            return editor_hold(WaitReason::InputNotEmpty, FailureReason::DraftPresent)
+        }
         InputLine::Unknown => {
             return hold(WaitReason::InputUnknown, FailureReason::ReadinessTimeout)
         }
@@ -779,6 +819,7 @@ mod tests {
             other_delivery_in_flight: false,
             last_paste_at: None,
             hold_since: Some(time(0)),
+            stale_blocker_since: None,
             last_attempt_before_start: false,
             copy_mode: Some(false),
             dialog_open: Some(false),
@@ -1533,6 +1574,289 @@ mod tests {
     }
 
     #[test]
+    fn send_now_waits_without_notice_during_a_fresh_turn() {
+        let h = History::new(false);
+        for status in [SessionStatus::Working, SessionStatus::AttentionNeeded] {
+            for send_now in [false, true] {
+                for input in [InputLine::Unknown, InputLine::NonEmpty] {
+                    let mut live = ready();
+                    live.send_now = send_now;
+                    live.input_line = input;
+                    live.session.as_mut().unwrap().status = status;
+                    for now in 0..=300 {
+                        live.session.as_mut().unwrap().last_event_at = time(now);
+                        let step = h.step(&live, now);
+                        wait(step.clone(), WaitReason::SessionBusy);
+                        track_hold(&mut live, &step, time(now));
+                    }
+                    live.input_line = InputLine::EmptySince(time(290));
+                    if send_now {
+                        assert_eq!(h.step(&live, 300), DeliveryStep::PasteNow { attempt: 1 });
+                        live.copy_mode = Some(true);
+                        wait(h.step(&live, 300), WaitReason::CopyMode);
+                        live.copy_mode = Some(false);
+                        live.dialog_open = Some(true);
+                        wait(h.step(&live, 300), WaitReason::DialogOpen);
+                    } else {
+                        wait(h.step(&live, 300), WaitReason::SessionBusy);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_draft_and_dialog_notify_after_three_polls() {
+        let h = History::new(false);
+        for (poll_ms, confirmation_ms) in [(250, 750), (400, 1200)] {
+            let policy = DeliveryPolicy::new(DeliverySettings {
+                guard_poll_interval: Duration::from_millis(poll_ms),
+                ..DeliverySettings::default()
+            })
+            .unwrap();
+            for status in [SessionStatus::Working, SessionStatus::AttentionNeeded] {
+                for send_now in [false, true] {
+                    for dialog in [false, true] {
+                        let mut live = ready();
+                        live.session.as_mut().unwrap().status = status;
+                        live.send_now = send_now;
+                        live.hold_since = Some(time(120));
+                        live.stale_blocker_since = Some(time(120));
+                        live.dialog_open = Some(dialog);
+                        live.input_line = if dialog {
+                            InputLine::EmptySince(time(0))
+                        } else {
+                            InputLine::NonEmpty
+                        };
+                        let reason = if dialog {
+                            WaitReason::DialogOpen
+                        } else {
+                            WaitReason::InputNotEmpty
+                        };
+                        let failure = if dialog {
+                            FailureReason::DialogOpen
+                        } else {
+                            FailureReason::DraftPresent
+                        };
+                        wait(
+                            next_delivery(h.message(), &live, time(120), &policy).unwrap(),
+                            reason,
+                        );
+                        let deadline = time(120) + TimeDelta::milliseconds(confirmation_ms);
+                        assert_eq!(
+                            wait(
+                                next_delivery(
+                                    h.message(),
+                                    &live,
+                                    deadline - TimeDelta::nanoseconds(1),
+                                    &policy
+                                )
+                                .unwrap(),
+                                reason
+                            ),
+                            deadline
+                        );
+                        assert_eq!(
+                            next_delivery(h.message(), &live, deadline, &policy).unwrap(),
+                            DeliveryStep::Blocked { reason: failure }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_unknown_keeps_the_full_readiness_bound() {
+        let h = History::new(false);
+        for which in 0..4 {
+            let mut live = ready();
+            live.session.as_mut().unwrap().status = SessionStatus::Working;
+            live.hold_since = Some(time(120));
+            live.stale_blocker_since = Some(time(0)); // unrelated old draft clock
+            let reason = match which {
+                0 => {
+                    live.input_line = InputLine::Unknown;
+                    WaitReason::InputUnknown
+                }
+                1 => {
+                    live.dialog_open = None;
+                    WaitReason::UnknownGuards
+                }
+                2 => {
+                    live.copy_mode = None;
+                    WaitReason::UnknownGuards
+                }
+                _ => {
+                    live.pane = PaneLiveness::Unknown;
+                    WaitReason::UnknownGuards
+                }
+            };
+            for now in [
+                time(120),
+                time(120) + TimeDelta::milliseconds(750),
+                time(240) - TimeDelta::nanoseconds(1),
+            ] {
+                wait(
+                    next_delivery(h.message(), &live, now, &DeliveryPolicy::default()).unwrap(),
+                    reason,
+                );
+            }
+            assert_eq!(
+                h.step(&live, 240),
+                DeliveryStep::Blocked {
+                    reason: FailureReason::ReadinessTimeout
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn stale_confirmation_does_not_borrow_other_blocker_history() {
+        let h = History::new(false);
+        let policy = DeliveryPolicy::default();
+        let mut live = ready();
+        live.session.as_mut().unwrap().status = SessionStatus::Working;
+        live.hold_since = Some(time(120));
+        live.dialog_open = Some(true);
+        live.stale_blocker_since = Some(time(120));
+        wait(h.step(&live, 120), WaitReason::DialogOpen);
+        // Draft replaces the dialog halfway through its short confirmation.
+        live.dialog_open = Some(false);
+        live.input_line = InputLine::NonEmpty;
+        live.stale_blocker_since = Some(time(120) + TimeDelta::milliseconds(500));
+        wait(
+            next_delivery(
+                h.message(),
+                &live,
+                time(120) + TimeDelta::milliseconds(750),
+                &policy,
+            )
+            .unwrap(),
+            WaitReason::InputNotEmpty,
+        );
+        assert_eq!(
+            next_delivery(
+                h.message(),
+                &live,
+                time(121) + TimeDelta::milliseconds(250),
+                &policy
+            )
+            .unwrap(),
+            DeliveryStep::Blocked {
+                reason: FailureReason::DraftPresent
+            }
+        );
+        // An unknown sample interrupts the short confirmation, not the hold.
+        live.input_line = InputLine::Unknown;
+        live.stale_blocker_since = None;
+        wait(h.step(&live, 122), WaitReason::InputUnknown);
+        live.input_line = InputLine::NonEmpty;
+        wait(h.step(&live, 123), WaitReason::InputNotEmpty);
+        live.stale_blocker_since = Some(time(123));
+        assert_eq!(
+            next_delivery(
+                h.message(),
+                &live,
+                time(123) + TimeDelta::milliseconds(750),
+                &policy
+            )
+            .unwrap(),
+            DeliveryStep::Blocked {
+                reason: FailureReason::DraftPresent
+            }
+        );
+        live.stale_blocker_since = Some(time(125));
+        // A future clock never shortens confirmation.
+        wait(h.step(&live, 124), WaitReason::InputNotEmpty);
+        // A fresh event is a normal busy wait; a later stale observation starts
+        // both clocks anew, rather than inheriting this old draft's timestamp.
+        live.session.as_mut().unwrap().last_event_at = time(124);
+        let step = h.step(&live, 124);
+        wait(step.clone(), WaitReason::SessionBusy);
+        track_hold(&mut live, &step, time(124));
+        live.stale_blocker_since = None;
+        wait(h.step(&live, 244), WaitReason::InputNotEmpty);
+        live.hold_since = Some(time(244));
+        live.stale_blocker_since = Some(time(244));
+        assert_eq!(
+            next_delivery(
+                h.message(),
+                &live,
+                time(244) + TimeDelta::milliseconds(750),
+                &policy
+            )
+            .unwrap(),
+            DeliveryStep::Blocked {
+                reason: FailureReason::DraftPresent
+            }
+        );
+    }
+
+    #[test]
+    fn stale_flapping_blockers_keep_the_overall_bound() {
+        let h = History::new(false);
+        let mut live = ready();
+        live.session.as_mut().unwrap().status = SessionStatus::Working;
+        live.hold_since = Some(time(120));
+        for poll in 0..=480 {
+            let now = time(120) + TimeDelta::milliseconds(poll * 250);
+            live.dialog_open = Some(poll % 3 == 0);
+            live.input_line = if poll % 3 == 1 {
+                InputLine::Unknown
+            } else {
+                InputLine::NonEmpty
+            };
+            live.stale_blocker_since = Some(now); // no blocker lasts even two polls
+            let step = next_delivery(h.message(), &live, now, &DeliveryPolicy::default()).unwrap();
+            if poll < 480 {
+                assert!(matches!(step, DeliveryStep::Wait { .. }));
+            } else {
+                assert_eq!(
+                    step,
+                    DeliveryStep::Blocked {
+                        reason: FailureReason::DialogOpen
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_stale_editors_ignore_the_short_confirmation_clock() {
+        let h = History::new(false);
+        for row in [false, true] {
+            for dialog in [false, true] {
+                let mut live = ready();
+                if !row {
+                    live.session = None;
+                }
+                live.hold_since = Some(time(120));
+                live.stale_blocker_since = Some(time(0));
+                live.dialog_open = Some(dialog);
+                live.input_line = InputLine::NonEmpty;
+                let reason = if dialog {
+                    WaitReason::DialogOpen
+                } else {
+                    WaitReason::InputNotEmpty
+                };
+                wait(h.step(&live, 121), reason);
+                wait(h.step(&live, 239), reason);
+                assert_eq!(
+                    h.step(&live, 240),
+                    DeliveryStep::Blocked {
+                        reason: if dialog {
+                            FailureReason::DialogOpen
+                        } else {
+                            FailureReason::DraftPresent
+                        },
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn send_now_only_bypasses_idle_and_each_guard_still_vetoes() {
         let h = History::new(false);
         for status in [
@@ -1587,7 +1911,11 @@ mod tests {
                 blocked.copy_mode = copy;
                 blocked.dialog_open = dialog;
                 blocked.input_line = input;
-                wait(h.step(&blocked, 0), reason);
+                if status != SessionStatus::Idle && !matches!(input, InputLine::EmptySince(_)) {
+                    wait(h.step(&blocked, 0), WaitReason::SessionBusy);
+                } else {
+                    wait(h.step(&blocked, 0), reason);
+                }
             }
             live.pane = PaneLiveness::GoneSince(time(-2));
             assert_eq!(
@@ -1610,30 +1938,44 @@ mod tests {
             for send_now in [false, true] {
                 live.send_now = send_now;
                 live.hold_since = Some(time(120));
+                live.stale_blocker_since = Some(time(120));
+                live.dialog_open = Some(false);
                 live.input_line = InputLine::NonEmpty;
                 wait(h.step(&live, 120), WaitReason::InputNotEmpty);
                 assert_eq!(
-                    h.step(&live, 240),
+                    next_delivery(
+                        h.message(),
+                        &live,
+                        time(120) + TimeDelta::milliseconds(750),
+                        &DeliveryPolicy::default()
+                    )
+                    .unwrap(),
                     DeliveryStep::Blocked {
                         reason: FailureReason::DraftPresent
                     }
                 );
                 live.input_line = InputLine::EmptySince(time(0));
                 live.dialog_open = Some(true);
-                live.hold_since = Some(time(240));
-                wait(h.step(&live, 240), WaitReason::DialogOpen);
+                live.stale_blocker_since = Some(time(121));
+                wait(h.step(&live, 121), WaitReason::DialogOpen);
                 assert_eq!(
-                    h.step(&live, 360),
+                    next_delivery(
+                        h.message(),
+                        &live,
+                        time(121) + TimeDelta::milliseconds(750),
+                        &DeliveryPolicy::default()
+                    )
+                    .unwrap(),
                     DeliveryStep::Blocked {
                         reason: FailureReason::DialogOpen
                     }
                 );
                 live.dialog_open = Some(false);
                 live.input_line = InputLine::Unknown;
-                live.hold_since = Some(time(360));
-                wait(h.step(&live, 479), WaitReason::InputUnknown);
+                live.stale_blocker_since = None;
+                wait(h.step(&live, 239), WaitReason::InputUnknown);
                 assert_eq!(
-                    h.step(&live, 480),
+                    h.step(&live, 240),
                     DeliveryStep::Blocked {
                         reason: FailureReason::ReadinessTimeout
                     }

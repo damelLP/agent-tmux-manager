@@ -74,6 +74,7 @@ impl Queue {
                 .any(|m| m.id != id && delivery_in_flight(m, "%1")),
             last_paste_at: self.last_paste_at,
             hold_since: None,
+            stale_blocker_since: None,
             last_attempt_before_start: false,
             copy_mode: Some(false),
             dialog_open: Some(false),

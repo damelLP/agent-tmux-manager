@@ -90,6 +90,20 @@
 //! Control audits refuse an empty pane; otherwise they always emit and do not
 //! change organisation state.
 //!
+//! # Delivery policy
+//!
+//! [`delivery::next_delivery`] is pure: the executor supplies observations and
+//! continuity clocks, serializes per-pane attempts, and consumes each step once.
+//! The module documents hold resets and reconstruction of the independent agent
+//! readiness clock. A stale-row draft/dialog is reported after three guard polls;
+//! unknown observations keep the overall readiness timeout. `send_now` still
+//! waits for a positively empty editor during a fresh busy turn.
+//!
+//! Queued retries reserve their attempted pane via [`delivery::delivery_in_flight`].
+//! Blocked emits no event and retains that reservation until receipt or owner
+//! give-up. `Wait(OtherDelivery)` is deliberately unbounded: the blocked message's
+//! owner notice must list the messages queued behind it, not silently hide them.
+//!
 //! # Compatibility direction
 //!
 //! A newer daemon must read every older log. An older daemon may fail on a newer

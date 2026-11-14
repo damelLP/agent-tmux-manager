@@ -342,3 +342,521 @@ async fn untag_ok_then_down_append_refused_quarantines() {
     assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
     assert_quarantined(&rig).await;
 }
+
+// --- agent.adopt ---
+
+use super::super::super::agent_flow::ProcFacts;
+
+const PI_RUNNING: &str =
+    include_str!("../../../atm-pi-adapter/tests/fixtures/screen_styled_p1_C2-steer-one-held-120x40_1.5.0.txt");
+// Captured: codex-cli 0.167.0 (U8g): a finished turn of a Codex that was
+// started with a positional prompt, drawn with a compact footer the adapter
+// does not read.
+const CODEX_COMPACT: &str = include_str!(
+    "../../../atm-codex-adapter/tests/fixtures/screen_styled_u8g_finished-100x32_0.167.0.txt"
+);
+
+/// The pane's root is pid 100 in every scripted inspection.
+fn job_in_front() -> ProcFacts {
+    ProcFacts {
+        process_group: 100,
+        foreground_group: 150,
+        system_shell: true,
+        children: 1,
+        name: "zsh".into(),
+    }
+}
+fn shell_holding_child() -> ProcFacts {
+    ProcFacts {
+        foreground_group: 100,
+        ..job_in_front()
+    }
+}
+fn root_program(name: &str) -> ProcFacts {
+    ProcFacts {
+        process_group: 100,
+        foreground_group: 100,
+        system_shell: false,
+        children: 0,
+        name: name.into(),
+    }
+}
+
+/// An adopt of %1 as `q/lead`, with its project on disk.
+struct Adoption {
+    rig: Rig,
+    agents: AgentHandle,
+    project: tempfile::TempDir,
+    events: broadcast::Receiver<crate::org::agents::ObservationProgress>,
+}
+
+fn adoptee() -> AgentId {
+    "q/lead".parse().unwrap()
+}
+
+impl Adoption {
+    async fn new() -> Self {
+        let rig = Rig::new().await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let events = agents.observation_events();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("q")).unwrap();
+        Self {
+            rig,
+            agents,
+            project,
+            events,
+        }
+    }
+    fn inspection(tag: Option<&str>, command: &str, text: &str) -> PaneInspection {
+        let mut inspection = Rig::inspection("%1", "q/lead", false)
+            .with_foreground_process(None, Some(command.into()));
+        inspection.local_agent_tag = tag.map(Into::into);
+        inspection.pane.height = text.lines().count().max(1) as u16;
+        inspection
+    }
+    /// The reads of an adopt of an untagged pane up to and including the tag.
+    fn script_tagging(&self) {
+        let untagged = Self::inspection(None, "pi", "");
+        self.rig
+            .client
+            .script_inspect(&pane("%1"), Some(&untagged))
+            .unwrap();
+        self.rig.client.script_tag_check(&untagged).unwrap();
+    }
+    /// One capture of the tagged pane showing `text` with `command` in front.
+    fn script_capture(&self, text: &str, command: &str) {
+        let text = body(text);
+        self.rig
+            .client
+            .script_capture(&PaneCapture::new(
+                text.into(),
+                Self::inspection(Some("q/lead"), command, text),
+                CaptureFormat::Ansi,
+            ))
+            .unwrap();
+    }
+    async fn adopt(&self) -> Result<AdoptResult, AgentError> {
+        self.agents
+            .adopt(AdoptParams {
+                project_root: self.project.path().join("q"),
+                name: "lead".into(),
+                pane: "%1".into(),
+                caller_server: None,
+            })
+            .await
+    }
+    /// Script the observation the adoption's commit starts; its reads follow
+    /// the adopt's own. A Starting agent's reads its screen (and uses none of
+    /// it); a Ready one's only inspects.
+    fn script_follow_up(&self, starting: Option<(&str, &str)>) {
+        let tagged = Self::inspection(Some("q/lead"), "pi", "");
+        self.rig
+            .client
+            .script_inspect(&pane("%1"), Some(&tagged))
+            .unwrap();
+        if let Some((text, command)) = starting {
+            self.script_capture(text, command);
+        }
+    }
+    /// Wait for that observation: it succeeded and every scripted read was used.
+    async fn followed(&mut self) {
+        progress(&mut self.events, "finished", Some("q/lead")).await;
+        assert_eq!(self.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(
+            self.agents.list(ListParams::default()).await.unwrap()[0].reason,
+            None
+        );
+    }
+    async fn agent(&self) -> Option<atm_org::Agent> {
+        self.rig
+            .org
+            .snapshot()
+            .await
+            .unwrap()
+            .agent(&adoptee())
+            .cloned()
+    }
+    fn tags_set(&self) -> usize {
+        mutations(&self.rig)
+            .iter()
+            .filter(|call| call.starts_with("set-option"))
+            .count()
+    }
+    /// Nothing but the tag was ever done to a pane.
+    fn only_tags(&self) -> bool {
+        mutations(&self.rig)
+            .iter()
+            .all(|call| call.starts_with("set-option"))
+    }
+}
+
+#[tokio::test]
+async fn adopt_tags_absent_pane_and_binds_one_eligible_row() {
+    // Also adopt_job_in_front_with_live_row_and_harness_screen_pins and
+    // adopt_sends_no_keys: the whole happy path of a pi under a shell.
+    let mut adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_follow_up(None);
+    let result = adoption.adopt().await.unwrap();
+    assert_eq!(result.agent_id, adoptee());
+    assert_eq!(result.state, AgentStatus::Ready);
+    assert_eq!(adoption.tags_set(), 1);
+    assert!(adoption.only_tags(), "{:?}", mutations(&adoption.rig));
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.pane.as_deref(), Some("%1"));
+    assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::adopted(100).with_harness("pi".into()).unwrap()
+    );
+    adoption.followed().await;
+}
+
+#[tokio::test]
+async fn adopt_same_tag_is_idempotent() {
+    let mut adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    let script_tagged = |adoption: &Adoption, text: &str| {
+        adoption
+            .rig
+            .client
+            .script_inspect(
+                &pane("%1"),
+                Some(&Adoption::inspection(Some("q/lead"), "pi", "")),
+            )
+            .unwrap();
+        adoption.script_capture(text, "pi");
+        adoption.script_capture(text, "pi");
+    };
+    // The pane already carries this agent's tag: no tag is set again.
+    script_tagged(&adoption, PI_PADDED);
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(adoption.tags_set(), 0);
+    adoption.followed().await;
+    // Adopting the adopted agent again writes nothing, on an idle screen and
+    // on a busy one: its recorded binding is kept, not dropped.
+    let before = adoption.rig.org.status().unwrap();
+    for text in [PI_PADDED, PI_RUNNING] {
+        script_tagged(&adoption, text);
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(adoption.rig.org.status().unwrap(), before);
+        assert_eq!(
+            adoption.agent().await.unwrap().session_id,
+            Some(SessionId::new("s1"))
+        );
+    }
+    assert_eq!(adoption.tags_set(), 0);
+}
+
+#[tokio::test]
+async fn adopt_foreign_or_empty_tag_refuses() {
+    // Twin: adopt_tags_absent_pane_and_binds_one_eligible_row.
+    for (found, named) in [("p/other", "p/other"), ("", "nobody (an empty tag)")] {
+        let adoption = Adoption::new().await;
+        adoption.rig.row("s1", "%1", false).await;
+        adoption
+            .rig
+            .client
+            .script_inspect(&pane("%1"), Some(&Adoption::inspection(Some(found), "pi", "")))
+            .unwrap();
+        match adoption.adopt().await {
+            Err(AgentError::Refused(reason)) => {
+                assert!(reason.contains(named), "{reason}");
+                assert!(reason.contains("nothing was changed"), "{reason}");
+            }
+            other => panic!("{found:?}: {other:?}"),
+        }
+        assert!(mutations(&adoption.rig).is_empty());
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert!(adoption.agent().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn adopt_ambiguous_rows_refuse() {
+    let adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    adoption.rig.row("s2", "%1", false).await;
+    adoption
+        .rig
+        .client
+        .script_inspect(&pane("%1"), Some(&Adoption::inspection(None, "pi", "")))
+        .unwrap();
+    match adoption.adopt().await {
+        Err(AgentError::Refused(reason)) => {
+            assert!(reason.contains("more than one session"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(mutations(&adoption.rig).is_empty(), "refused before the tag");
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert!(adoption.agent().await.is_none());
+}
+
+#[tokio::test]
+async fn adopt_refuses_panes_it_cannot_take() {
+    // A pane that does not exist, and one whose program has exited.
+    let adoption = Adoption::new().await;
+    adoption.rig.client.script_inspect(&pane("%1"), None).unwrap();
+    match adoption.adopt().await {
+        Err(AgentError::Refused(reason)) => assert!(reason.contains("does not exist"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    let mut dead = Adoption::inspection(None, "pi", "");
+    dead.dead = true;
+    adoption
+        .rig
+        .client
+        .script_inspect(&pane("%1"), Some(&dead))
+        .unwrap();
+    match adoption.adopt().await {
+        Err(AgentError::Refused(reason)) => assert!(reason.contains("has exited"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(mutations(&adoption.rig).is_empty());
+    assert!(adoption.agent().await.is_none());
+}
+
+#[tokio::test]
+async fn adopt_refuses_a_pane_another_agent_holds() {
+    let rig = Rig::new().await;
+    rig.agent("holder", Some("%1"), None).await;
+    rig.inspect_only("%1", "p/holder");
+    let (agents, _) = rig.start();
+    agents.reconciled().await.unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("q")).unwrap();
+    let result = agents
+        .adopt(AdoptParams {
+            project_root: project.path().join("q"),
+            name: "lead".into(),
+            pane: "%1".into(),
+            caller_server: None,
+        })
+        .await;
+    match result {
+        Err(AgentError::Refused(reason)) => {
+            assert!(
+                reason.contains("already belongs to agent p/holder"),
+                "{reason}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(mutations(&rig).is_empty());
+    assert!(rig.client.mock().calls().iter().all(|call| !matches!(
+        call,
+        MockCall::SendKeys { .. } | MockCall::PasteText { .. } | MockCall::KillPane { .. }
+    )));
+}
+
+#[tokio::test]
+async fn adopt_busy_or_unknown_screen_stays_starting() {
+    // A running turn: the harness is recognised (and pinned), but not idle.
+    let mut adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture(PI_RUNNING, "pi");
+    adoption.script_capture(PI_RUNNING, "pi");
+    adoption.script_follow_up(Some((PI_RUNNING, "pi")));
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Starting);
+    assert_eq!(agent.session_id, None, "no session is bound on a busy screen");
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::adopted(100).with_harness("pi".into()).unwrap()
+    );
+    assert!(adoption.only_tags());
+    adoption.followed().await;
+    // The harness's next event binds it, as after a daemon restart.
+    adoption
+        .rig
+        .client
+        .script_inspect(
+            &pane("%1"),
+            Some(&Adoption::inspection(Some("q/lead"), "pi", "")),
+        )
+        .unwrap();
+    update(&adoption.rig, "s1").await;
+    progress(&mut adoption.events, "finished", Some("q/lead")).await;
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+
+    // A screen the adapter does not know: nothing is pinned either.
+    let mut adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture("unknown\n", "pi");
+    adoption.script_capture("unknown\n", "pi");
+    adoption.script_follow_up(Some(("unknown\n", "pi")));
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::unproven()
+    );
+    adoption.followed().await;
+}
+
+#[tokio::test]
+async fn adopt_records_a_baseline_only_for_a_harness_it_can_place() {
+    // (the procfs answer, tmux's command, pinned?, why). Without process
+    // facts the second capture is never taken.
+    let cases: [(Option<ProcFacts>, &str, bool, &str); 6] = [
+        (Some(job_in_front()), "pi", true, "adopt_job_in_front"),
+        (Some(root_program("pi")), "pi", true, "adopt_root_program_pins"),
+        (
+            Some(shell_holding_child()),
+            "zsh",
+            false,
+            "adopt_shell_holding_child_gets_no_baseline_and_stays_starting",
+        ),
+        (
+            Some(job_in_front()),
+            "zsh",
+            false,
+            "adopt_shell_named_job_gets_no_baseline",
+        ),
+        (None, "pi", false, "adopt_unreadable_procfs_gets_no_baseline"),
+        (
+            Some(ProcFacts {
+                children: 0,
+                ..shell_holding_child()
+            }),
+            "zsh",
+            false,
+            "an idle shell under a stale harness frame",
+        ),
+    ];
+    for (facts, command, pinned, case) in cases {
+        let mut adoption = Adoption::new().await;
+        adoption.rig.row("s1", "%1", false).await;
+        let readable = facts.is_some();
+        *adoption.rig.proc.lock().unwrap() = facts;
+        adoption.script_tagging();
+        // The same safe idle frame every time: only the process facts differ.
+        adoption.script_capture(PI_PADDED, command);
+        if readable {
+            adoption.script_capture(PI_PADDED, command);
+        }
+        adoption.script_follow_up((!pinned).then_some((PI_PADDED, command)));
+        let result = adoption.adopt().await.unwrap();
+        assert_eq!(
+            result.state,
+            if pinned { AgentStatus::Ready } else { AgentStatus::Starting },
+            "{case}"
+        );
+        assert_eq!(
+            adoption.agents.baseline_of(&adoptee(), "%1"),
+            if pinned {
+                PaneBaseline::adopted(100).with_harness(command.into()).unwrap()
+            } else {
+                PaneBaseline::unproven()
+            },
+            "{case}"
+        );
+        assert!(adoption.only_tags(), "{case}");
+        adoption.followed().await;
+    }
+}
+
+#[tokio::test]
+async fn adopt_command_changed_between_captures_gets_no_baseline() {
+    let mut adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    // The process facts were read between a `node` and a `pi`: they describe neither.
+    adoption.script_capture(PI_PADDED, "node");
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_follow_up(Some((PI_PADDED, "pi")));
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::unproven()
+    );
+    adoption.followed().await;
+}
+
+#[tokio::test]
+async fn adopt_compact_codex_footer_stays_starting() {
+    // A Codex started with a positional prompt: its real frame reads Unknown,
+    // so nothing is guessed. Twin: the fresh Codex editor below.
+    let mut adoption = Adoption::new().await;
+    adoption
+        .rig
+        .row_of("pending-100", "%1", false, Harness::Codex)
+        .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture(CODEX_COMPACT, "codex");
+    adoption.script_capture(CODEX_COMPACT, "codex");
+    adoption.script_follow_up(Some((CODEX_COMPACT, "codex")));
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::unproven()
+    );
+    adoption.followed().await;
+
+    // A Codex that has had no prompt yet has only its discovery row. Its fresh
+    // editor is Ready without a session, which arrives with the first prompt.
+    let mut adoption = Adoption::new().await;
+    adoption
+        .rig
+        .row_of("pending-100", "%1", false, Harness::Codex)
+        .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture(CODEX_PADDED, "codex");
+    adoption.script_capture(CODEX_PADDED, "codex");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, None);
+    adoption.followed().await;
+}
+
+#[tokio::test]
+async fn adopt_without_any_session_row_tags_and_stays_starting() {
+    // Nothing tells which harness this is: no screen is read at all.
+    let mut adoption = Adoption::new().await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    // The observer that follows knows no harness either, and asks for a plain capture.
+    let tagged = Adoption::inspection(Some("q/lead"), "zsh", "unknown\n");
+    adoption
+        .rig
+        .client
+        .script_inspect(&pane("%1"), Some(&tagged))
+        .unwrap();
+    adoption
+        .rig
+        .client
+        .script_capture(&PaneCapture::new(
+            "unknown\n".into(),
+            tagged,
+            CaptureFormat::Plain,
+        ))
+        .unwrap();
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    assert_eq!(adoption.tags_set(), 1);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.pane.as_deref(), Some("%1"));
+    assert_eq!(agent.session_id, None);
+    adoption.followed().await;
+}

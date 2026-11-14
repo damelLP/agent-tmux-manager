@@ -86,6 +86,20 @@ class SceneTests(unittest.TestCase):
         self.assertIn("✳ Generating…", "\n".join(render("claude", "working", variant="values").lines))
         self.assertIn("⠏ Working", "\n".join(render("pi", "working", variant="values").lines))
 
+    def test_codex_value_variant_update_banner_offers_a_newer_version(self):
+        import re
+        for spec in SPECS:
+            if spec["mode"] == "codex" and spec["state"] == "update":
+                with self.subTest(source=spec["source"]):
+                    result = scene.render_state([spec], ASSETS, "codex", "update", "",
+                                                "values", 120, 40, 1)
+                    text = "\n".join(result.lines)
+                    match = re.search(r"(\d+\.\d+\.\d+) → (\d+\.\d+\.\d+)", text)
+                    self.assertIsNotNone(match)
+                    current, offered = match.groups()
+                    self.assertGreater(tuple(map(int, offered.split("."))),
+                                       tuple(map(int, current.split("."))))
+
     def test_pi_draft_keeps_current_session_history_and_footer(self):
         for frame in ["fresh", "clear-complete", "idle"]:
             original = render("pi", frame)

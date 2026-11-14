@@ -68,7 +68,8 @@ def vary_values(line, mode, frame):
     """Synthetic equal-width scalar mutations; never applied to user input."""
     replacements = {
         "claude": {"2.1.325": "9.8.765", "Haiku 5.5": "Opus 9.99", "✶ Levitating…": "✳ Generating…"},
-        "codex": {"0.167.0": "0.987.6", "GPT-6-Luna": "GPT-9-Dawn", "GPT-6.1-Sol": "GPT-9.2-Sky"},
+        "codex": {"0.167.0": "0.987.6", "0.167.1": "0.987.7", "0.169.0": "0.989.0",
+                  "GPT-6-Luna": "GPT-9-Dawn", "GPT-6.1-Sol": "GPT-9.2-Sky"},
         "pi": {"1.5.0": "9.8.7", "gpt-6-luna": "gpt-9-dawn", "⠇ Working": "⠏ Working"},
     }[mode]
     for old, new in replacements.items():

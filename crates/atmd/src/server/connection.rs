@@ -362,7 +362,11 @@ impl ConnectionHandler {
                         _ = peer_failed.cancelled() => return Err(ConnectionError::WriteTimeout),
                         Some(done) = requests.join_next(), if !requests.is_empty() => {
                             let response = done.map_err(|e| ConnectionError::RequestTask(e.to_string()))?;
-                            write_message(&writer, &response).await?;
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return Ok(()),
+                                result = write_message(&writer, &response) => result?,
+                            }
                             idle_at = tokio::time::Instant::now() + READ_TIMEOUT;
                         }
                         read = &mut read => break read,
@@ -870,7 +874,14 @@ impl ConnectionHandler {
     /// Stops the current subscription's forwarder, if any.
     async fn stop_forwarder(&mut self) {
         if let Some(forwarder) = self.forwarder.take() {
-            forwarder.stop().await;
+            // Unsubscribe/disconnect preserves frame boundaries. Shutdown
+            // closes the socket, so dropping a partial write is safe and must
+            // not wait for a stuck reader's write deadline.
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {},
+                _ = forwarder.stop() => {},
+            }
         }
     }
 
@@ -919,7 +930,11 @@ impl ConnectionHandler {
 
     /// Sends a message to the client.
     async fn send_message(&self, msg: DaemonMessage) -> Result<(), ConnectionError> {
-        write_message(&self.writer, &msg).await
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(ConnectionError::Eof),
+            result = write_message(&self.writer, &msg) => result,
+        }
     }
 
     /// Checks if this client is subscribed to events.
@@ -1803,6 +1818,88 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_blocked_replies_including_disconnect_drain() {
+        for disconnect in [false, true] {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let ready = release.clone();
+            let mut router = MethodRouter::default();
+            router
+                .register("wait", Duration::from_secs(30), move |_, _| {
+                    let ready = ready.clone();
+                    async move {
+                        ready.notified().await;
+                        Ok(serde_json::json!("x".repeat(4 * 1024 * 1024)))
+                    }
+                })
+                .unwrap();
+            let (mut read, mut write, cancel, mut run) = request_connection(Arc::new(router)).await;
+            send_client(&mut write, request("blocked", 0)).await;
+            if disconnect {
+                send_client(&mut write, ClientMessage::disconnect()).await;
+            }
+            release.notify_one();
+            // The first byte proves a reply write started; leaving the rest
+            // unread fills the real socket, not a mocked writer.
+            timeout(Duration::from_secs(5), read.read_u8())
+                .await
+                .unwrap()
+                .unwrap();
+            cancel.cancel();
+            let stopped = timeout(Duration::from_millis(500), &mut run).await;
+            if stopped.is_err() {
+                run.abort();
+            }
+            assert!(
+                stopped.is_ok(),
+                "shutdown waited for a blocked reply (disconnect={disconnect})"
+            );
+            stopped.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_blocked_subscription_forwarder() {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let (read, write) = ours.into_split();
+        let cancel = CancellationToken::new();
+        let mut handler = ConnectionHandler::new(
+            read,
+            write,
+            crate::registry::spawn_registry(),
+            Arc::new(RwLock::new(HashMap::new())),
+            1,
+            cancel.clone(),
+            request_router(),
+        );
+        let (tx, rx) = broadcast::channel(1);
+        handler.forwarder = Some(Forwarder::spawn(
+            "stuck".into(),
+            rx,
+            handler.writer_handle(),
+            None,
+            &handler.peer_failed,
+        ));
+        let mut event = updated("stuck");
+        if let SessionEvent::Updated { session } = &mut event {
+            session.first_prompt = Some("x".repeat(4 * 1024 * 1024));
+        }
+        tx.send(event).unwrap();
+        let mut peer = BufReader::new(peer);
+        timeout(Duration::from_secs(5), peer.read_u8())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run = tokio::spawn(async move { handler.process_messages().await });
+        cancel.cancel();
+        let stopped = timeout(Duration::from_millis(500), &mut run).await;
+        if stopped.is_err() {
+            run.abort();
+        }
+        assert!(stopped.is_ok(), "shutdown waited for a blocked forwarder");
+        stopped.unwrap().unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]

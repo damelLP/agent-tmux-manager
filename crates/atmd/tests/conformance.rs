@@ -14,7 +14,7 @@ use atmd::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -260,6 +260,40 @@ async fn fixture_barrier_rejects_an_extra_response() {
         write,
     };
     client.require_next_pong().await;
+}
+
+#[tokio::test]
+async fn server_shutdown_does_not_wait_for_stuck_subscriber_drain_limit() {
+    let registry = spawn_registry();
+    let mut server = Server::with_services(MethodServices::new(registry.clone())).await;
+    let mut client = server.client().await;
+    client.connect().await;
+    client
+        .send(serde_json::to_value(ClientMessage::subscribe(None)).unwrap())
+        .await;
+    assert_eq!(client.recv().await["type"], "session_list");
+    registry
+        .register_discovered(
+            atm_core::SessionId::new("stuck-reader"),
+            1234,
+            PathBuf::from("x".repeat(4 * 1024 * 1024)),
+            None,
+            atm_core::Harness::Pi,
+        )
+        .await
+        .unwrap();
+    // At least one byte arrived: the forwarder is writing the oversized view.
+    timeout(Duration::from_secs(5), client.read.read_u8())
+        .await
+        .unwrap()
+        .unwrap();
+    server.cancel.cancel();
+    let stopped = timeout(Duration::from_millis(500), &mut server.task).await;
+    if stopped.is_err() {
+        server.task.abort();
+    }
+    assert!(stopped.is_ok(), "shutdown hit the connection drain limit");
+    stopped.unwrap().unwrap().unwrap();
 }
 
 #[tokio::test]

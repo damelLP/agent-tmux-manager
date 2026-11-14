@@ -68,13 +68,7 @@ async fn contract_operations_return_typed_not_implemented() {
                     not_implemented(reservation.tag(&pane, expected).await, "tag");
                 }
                 not_implemented(reservation.untag(&pane, agent()).await, "untag");
-                for key in [
-                    PaneKey::Enter,
-                    PaneKey::Escape,
-                    PaneKey::Up,
-                    PaneKey::Down,
-                    PaneKey::CtrlC,
-                ] {
+                for key in [PaneKey::Enter, PaneKey::Escape, PaneKey::Up, PaneKey::Down] {
                     not_implemented(reservation.keys(&pane, agent(), key).await, "keys");
                 }
                 not_implemented(

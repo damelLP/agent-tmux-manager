@@ -22,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 const FORMAT: &str = "ATM-PANE-v1\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}";
 
 fn inspection(pane: &str, tag: Option<&str>) -> PaneInspection {
-    PaneInspection {
-        pane: PaneInfo {
+    PaneInspection::new(
+        PaneInfo {
             pane_id: pane.into(),
             session_name: "private".into(),
             window_index: 0,
@@ -32,13 +32,13 @@ fn inspection(pane: &str, tag: Option<&str>) -> PaneInspection {
             height: 8,
             is_active: true,
         },
-        local_agent_tag: tag.map(str::to_owned),
-        dead: false,
-        in_mode: false,
-        bracketed_paste: Some(false),
-        cursor_column: 5,
-        cursor_row: 1,
-    }
+        tag.map(str::to_owned),
+        false,
+        false,
+        Some(false),
+        5,
+        1,
+    )
 }
 
 fn fixtures() -> serde_json::Value {
@@ -97,13 +97,13 @@ async fn guarded_input_contract_is_additive_and_does_not_run_a_predicate_at_chec
     let observed = called.clone();
     control
         .run_reserved(
-            ReservationRequest {
-                agent: "project/lead".parse().unwrap(),
-                pane: Some(PaneId::parse("%0").unwrap()),
-                kind: ReservationKind::Delivery,
-                wait: WaitPolicy::Wait,
-                deadline: Instant::now() + Duration::from_secs(30),
-            },
+            ReservationRequest::new(
+                "project/lead".parse().unwrap(),
+                Some(PaneId::parse("%0").unwrap()),
+                ReservationKind::Delivery,
+                WaitPolicy::Wait,
+                Instant::now() + Duration::from_secs(30),
+            ),
             move |r| async move {
                 let pane = PaneId::parse("%0").unwrap();
                 let key_called = called.clone();

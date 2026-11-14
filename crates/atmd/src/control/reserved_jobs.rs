@@ -1,6 +1,6 @@
 //! Bounded daemon-owned jobs. No caller future owns release or callback lifetime.
 
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::{collections::HashMap, fmt::Display, future::Future, pin::Pin};
 use tokio::{
     sync::oneshot,
     task::{Id, JoinSet},
@@ -30,7 +30,7 @@ struct Call<T, E, W, C> {
 pub(super) fn job<T, E, W, WF, C, CF>(work: W, cleanup: C) -> (Box<dyn Job>, Response<T, E>)
 where
     T: Send + 'static,
-    E: From<ReservationError> + Send + 'static,
+    E: From<ReservationError> + Display + Send + 'static,
     W: FnOnce(Reservation) -> WF + Send + 'static,
     WF: Future<Output = Result<T, E>> + Send + 'static,
     C: FnOnce(Reservation, Completion) -> CF + Send + 'static,
@@ -56,7 +56,7 @@ pub(super) struct Finished {
 impl<T, E, W, WF, C, CF> Job for Call<T, E, W, C>
 where
     T: Send + 'static,
-    E: From<ReservationError> + Send + 'static,
+    E: From<ReservationError> + Display + Send + 'static,
     W: FnOnce(Reservation) -> WF + Send + 'static,
     WF: Future<Output = Result<T, E>> + Send + 'static,
     C: FnOnce(Reservation, Completion) -> CF + Send + 'static,
@@ -90,8 +90,8 @@ where
                 Err(error) => Err(error.into()),
             };
             let reusable = cleaned.is_ok();
-            if !reusable {
-                tracing::warn!(agent = %reservation.agent(), "reservation cleanup failed; quarantining agent and panes");
+            if let Err(error) = &cleaned {
+                tracing::warn!(agent = %reservation.agent(), %error, "reservation cleanup failed; quarantining agent and panes");
             }
             let result = match (result, cleaned) {
                 (Ok(value), Ok(())) => Ok(value),

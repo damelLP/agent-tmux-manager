@@ -172,6 +172,26 @@ pub struct ReservationRequest {
     pub deadline: Instant,
 }
 
+impl ReservationRequest {
+    /// Prefer this constructor over a struct literal so new metadata can be added.
+    #[must_use]
+    pub fn new(
+        agent: AgentId,
+        pane: Option<PaneId>,
+        kind: ReservationKind,
+        wait: WaitPolicy,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            agent,
+            pane,
+            kind,
+            wait,
+            deadline,
+        }
+    }
+}
+
 /// Outcome of work, supplied to cleanup while ownership is still exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completion {
@@ -197,7 +217,6 @@ pub enum PaneKey {
     Escape,
     Up,
     Down,
-    CtrlC,
 }
 
 /// Selected by the consumer's adapter policy; never caller-supplied tmux flags.
@@ -221,6 +240,30 @@ pub struct PaneInspection {
     /// Zero-based terminal-cell coordinates, not UTF-8 offsets.
     pub cursor_column: u32,
     pub cursor_row: u32,
+}
+
+impl PaneInspection {
+    /// Prefer this constructor over a struct literal so new metadata can be added.
+    #[must_use]
+    pub fn new(
+        pane: PaneInfo,
+        local_agent_tag: Option<String>,
+        dead: bool,
+        in_mode: bool,
+        bracketed_paste: Option<bool>,
+        cursor_column: u32,
+        cursor_row: u32,
+    ) -> Self {
+        Self {
+            pane,
+            local_agent_tag,
+            dead,
+            in_mode,
+            bracketed_paste,
+            cursor_column,
+            cursor_row,
+        }
+    }
 }
 
 /// Full visible viewport and its metadata; never prompt extraction/scrollback.
@@ -248,6 +291,18 @@ pub struct PaneCapture {
     pub text: String,
     pub inspection: PaneInspection,
     pub format: CaptureFormat,
+}
+
+impl PaneCapture {
+    /// Prefer this constructor over a struct literal so new metadata can be added.
+    #[must_use]
+    pub fn new(text: String, inspection: PaneInspection, format: CaptureFormat) -> Self {
+        Self {
+            text,
+            inspection,
+            format,
+        }
+    }
 }
 
 /// An opaque capability minted only by the supervisor, never a drop-unlock guard.
@@ -291,7 +346,7 @@ impl ControlHandle {
     ) -> Result<T, E>
     where
         T: Send + 'static,
-        E: From<ReservationError> + Send + 'static,
+        E: From<ReservationError> + fmt::Display + Send + 'static,
         W: FnOnce(Reservation) -> WF + Send + 'static,
         WF: Future<Output = Result<T, E>> + Send + 'static,
         C: FnOnce(Reservation, Completion) -> CF + Send + 'static,

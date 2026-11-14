@@ -1253,3 +1253,605 @@ fn launch_text_refuses_non_ascii() {
         assert!(!launch_text_is_safe(text), "{text:?}");
     }
 }
+
+// --- the pane's process shape (section 3.2, the procfs read) ---
+
+// Captured: tmux 3.8 (bash 5.3, zsh 5.9, bash as sh) and tmux 3.6 (bash, dash
+// as sh), 2026-11-14, private-server probe with a blocking stand-in program.
+// Per state: the root's process group and its terminal's foreground group
+// (both relative to the root's pid), the root's child count and `argv[0]`,
+// whether the root is a shell, tmux's `pane_current_command`, and the shape
+// the probe's findings assign. The probe checked the shells against
+// `/etc/shells` by hand; it did not record the root's executable.
+type Measured = (
+    &'static str,
+    i32,
+    i32,
+    usize,
+    &'static str,
+    bool,
+    &'static str,
+    PaneShape,
+);
+const MEASURED: &[Measured] = &[
+    (
+        "bash on tmux 3.8: fresh_split",
+        0,
+        0,
+        0,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.8: job_control_on_running",
+        0,
+        116,
+        1,
+        "-bash",
+        true,
+        "python3",
+        PaneShape::JobInFront,
+    ),
+    (
+        "bash on tmux 3.8: job_control_on_after_exit",
+        0,
+        0,
+        0,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.8: job_control_off_running",
+        0,
+        0,
+        1,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "bash on tmux 3.8: job_control_off_after_exit",
+        0,
+        0,
+        0,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.8: command_then_exec_shell_running",
+        0,
+        0,
+        1,
+        "bash",
+        true,
+        "bash",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "bash on tmux 3.8: command_then_exec_shell_after_exit",
+        0,
+        0,
+        0,
+        "/bin/bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.8: harness_as_pane_command_running",
+        0,
+        0,
+        0,
+        "/usr/bin/python3",
+        false,
+        "python3",
+        PaneShape::RootProgram,
+    ),
+    (
+        "zsh on tmux 3.8: fresh_split",
+        0,
+        0,
+        0,
+        "-zsh",
+        true,
+        "zsh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "zsh on tmux 3.8: job_control_on_running",
+        0,
+        61,
+        1,
+        "-zsh",
+        true,
+        "python3",
+        PaneShape::JobInFront,
+    ),
+    (
+        "zsh on tmux 3.8: job_control_on_after_exit",
+        0,
+        0,
+        0,
+        "-zsh",
+        true,
+        "zsh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "zsh on tmux 3.8: job_control_off_running",
+        0,
+        0,
+        1,
+        "-zsh",
+        true,
+        "zsh",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "zsh on tmux 3.8: job_control_off_after_exit",
+        0,
+        0,
+        0,
+        "-zsh",
+        true,
+        "zsh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "zsh on tmux 3.8: command_then_exec_shell_running",
+        0,
+        0,
+        1,
+        "zsh",
+        true,
+        "zsh",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "zsh on tmux 3.8: command_then_exec_shell_after_exit",
+        0,
+        0,
+        0,
+        "/bin/zsh",
+        true,
+        "zsh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "zsh on tmux 3.8: harness_as_pane_command_running",
+        0,
+        0,
+        0,
+        "/usr/bin/python3",
+        false,
+        "python3",
+        PaneShape::RootProgram,
+    ),
+    (
+        "sh on tmux 3.8: fresh_split",
+        0,
+        0,
+        0,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.8: job_control_on_running",
+        0,
+        101,
+        1,
+        "-sh",
+        true,
+        "python3",
+        PaneShape::JobInFront,
+    ),
+    (
+        "sh on tmux 3.8: job_control_on_after_exit",
+        0,
+        0,
+        0,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.8: job_control_off_running",
+        0,
+        0,
+        1,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "sh on tmux 3.8: job_control_off_after_exit",
+        0,
+        0,
+        0,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.8: command_then_exec_shell_running",
+        0,
+        0,
+        1,
+        "sh",
+        true,
+        "sh",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "sh on tmux 3.8: command_then_exec_shell_after_exit",
+        0,
+        0,
+        0,
+        "/bin/sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.8: harness_as_pane_command_running",
+        0,
+        0,
+        0,
+        "/usr/bin/python3",
+        false,
+        "python3",
+        PaneShape::RootProgram,
+    ),
+    (
+        "bash on tmux 3.6: fresh_split",
+        0,
+        0,
+        0,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.6: job_control_on_running",
+        0,
+        46,
+        1,
+        "-bash",
+        true,
+        "python3",
+        PaneShape::JobInFront,
+    ),
+    (
+        "bash on tmux 3.6: job_control_on_after_exit",
+        0,
+        0,
+        0,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.6: job_control_off_running",
+        0,
+        0,
+        1,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "bash on tmux 3.6: job_control_off_after_exit",
+        0,
+        0,
+        0,
+        "-bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.6: command_then_exec_shell_running",
+        0,
+        0,
+        1,
+        "bash",
+        true,
+        "bash",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "bash on tmux 3.6: command_then_exec_shell_after_exit",
+        0,
+        0,
+        0,
+        "/bin/bash",
+        true,
+        "bash",
+        PaneShape::IdleShell,
+    ),
+    (
+        "bash on tmux 3.6: harness_as_pane_command_running",
+        0,
+        0,
+        0,
+        "/usr/bin/python3",
+        false,
+        "python3",
+        PaneShape::RootProgram,
+    ),
+    (
+        "sh on tmux 3.6: fresh_split",
+        0,
+        0,
+        0,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.6: job_control_on_running",
+        0,
+        47,
+        1,
+        "-sh",
+        true,
+        "python3",
+        PaneShape::JobInFront,
+    ),
+    (
+        "sh on tmux 3.6: job_control_on_after_exit",
+        0,
+        0,
+        0,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.6: job_control_off_running",
+        0,
+        0,
+        1,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "sh on tmux 3.6: job_control_off_after_exit",
+        0,
+        0,
+        0,
+        "-sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.6: command_then_exec_shell_running",
+        0,
+        0,
+        1,
+        "sh",
+        true,
+        "sh",
+        PaneShape::ShellHoldingChild,
+    ),
+    (
+        "sh on tmux 3.6: command_then_exec_shell_after_exit",
+        0,
+        0,
+        0,
+        "/bin/sh",
+        true,
+        "sh",
+        PaneShape::IdleShell,
+    ),
+    (
+        "sh on tmux 3.6: harness_as_pane_command_running",
+        0,
+        0,
+        1,
+        "sh",
+        true,
+        "sh",
+        PaneShape::ShellHoldingChild,
+    ),
+];
+
+const SHELL_EXE: &str = "/usr/bin/a-shell";
+
+fn facts(
+    group: i32,
+    foreground: i32,
+    children: usize,
+    argv0: &str,
+    shell: bool,
+) -> Option<ProcFacts> {
+    let pid = 5000;
+    let stat = format!(
+        "{pid} (comm) S 1 {} {} 34816 {} 4194304 100 0 0 0",
+        pid + group,
+        pid + group,
+        pid + foreground
+    );
+    let children: Vec<String> = (0..children)
+        .map(|child| (pid + 100 + child as i32).to_string())
+        .collect();
+    ProcFacts::parse(
+        &stat,
+        format!("{argv0}\0--flag\0").as_bytes(),
+        &children.join(" "),
+        std::path::Path::new(if shell { SHELL_EXE } else { "/usr/bin/python3" }),
+        &[
+            PathBuf::from("/usr/bin/other-shell"),
+            PathBuf::from(SHELL_EXE),
+        ],
+    )
+}
+
+#[test]
+fn pane_shape_table() {
+    let mut seen = std::collections::BTreeMap::new();
+    for (label, group, foreground, children, argv0, shell, command, expected) in MEASURED {
+        let facts = facts(*group, *foreground, *children, argv0, *shell).unwrap();
+        assert_eq!(classify_pane(&facts), Some(*expected), "{label}");
+        *seen.entry(format!("{expected:?}")).or_insert(0) += 1;
+        // tmux names an idle shell as the root's own name.
+        if *expected == PaneShape::IdleShell {
+            assert_eq!(*command, facts.name, "{label}");
+        }
+    }
+    assert_eq!(MEASURED.len(), 40);
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [
+            ("IdleShell".to_owned(), 20),
+            ("JobInFront".to_owned(), 5),
+            ("RootProgram".to_owned(), 4),
+            ("ShellHoldingChild".to_owned(), 11),
+        ]
+    );
+    // Synthetic: a terminal with no foreground group is none of the four.
+    let mut detached = facts(0, 0, 0, "-zsh", true).unwrap();
+    detached.foreground_group = -1;
+    assert_eq!(classify_pane(&detached), None);
+    detached.foreground_group = 0;
+    assert_eq!(classify_pane(&detached), None);
+}
+
+#[test]
+fn baseline_table() {
+    for (label, group, foreground, children, argv0, shell, command, shape) in MEASURED {
+        let facts = facts(*group, *foreground, *children, argv0, *shell).unwrap();
+        let launch = shell_baseline(&facts, ROOT, command);
+        let adopt = adopt_baseline(&facts, ROOT, command);
+        match shape {
+            // A launch may type into an idle shell; there is nothing to adopt.
+            PaneShape::IdleShell => {
+                assert_eq!(
+                    launch,
+                    Some(PaneBaseline::shell(ROOT, (*command).into())),
+                    "{label}"
+                );
+                assert_eq!(adopt, None, "{label}");
+            }
+            // A job in front, or the program as the pane's root: adoptable, and
+            // never a shell to type a launch into.
+            PaneShape::JobInFront | PaneShape::RootProgram => {
+                assert_eq!(launch, None, "{label}");
+                assert_eq!(adopt, Some(PaneBaseline::adopted(ROOT)), "{label}");
+            }
+            // Job control off, `child; exec shell`, dash's `sh -c`: the shell's
+            // name is shown while the child runs. Nothing is recorded.
+            PaneShape::ShellHoldingChild => {
+                assert_eq!(launch, None, "{label}");
+                assert_eq!(adopt, None, "{label}");
+            }
+        }
+    }
+    // Synthetic: a foreground job that runs under its shell's own name (a
+    // wrapper script that does not exec) can't be told from the shell.
+    let wrapper = facts(0, 50, 1, "-bash", true).unwrap();
+    assert_eq!(classify_pane(&wrapper), Some(PaneShape::JobInFront));
+    assert_eq!(adopt_baseline(&wrapper, ROOT, "bash"), None);
+    assert_eq!(
+        adopt_baseline(&wrapper, ROOT, "claude"),
+        Some(PaneBaseline::adopted(ROOT))
+    );
+    // Synthetic: an idle shell while tmux names another program (the two reads
+    // raced): no launch baseline.
+    let idle = facts(0, 0, 0, "-zsh", true).unwrap();
+    assert_eq!(shell_baseline(&idle, ROOT, "node"), None);
+    assert_eq!(
+        shell_baseline(&idle, ROOT, "zsh"),
+        Some(PaneBaseline::shell(ROOT, "zsh".into()))
+    );
+}
+
+#[test]
+fn proc_facts_parse_or_refuse() {
+    let shells = [PathBuf::from(SHELL_EXE)];
+    let exe = std::path::Path::new(SHELL_EXE);
+    // A command name with spaces and parentheses does not shift the fields.
+    let stat = "4242 (tmux: (odd) name) S 1 4242 4242 34816 4300 4194304 100 0 0 0";
+    let parsed =
+        ProcFacts::parse(stat, b"/usr/local/bin/zsh\0-i\0", "4300 4301", exe, &shells).unwrap();
+    assert_eq!(
+        parsed,
+        ProcFacts {
+            process_group: 4242,
+            foreground_group: 4300,
+            system_shell: true,
+            children: 2,
+            name: "zsh".into(),
+        }
+    );
+    assert!(
+        !ProcFacts::parse(
+            stat,
+            b"zsh\0",
+            "",
+            std::path::Path::new("/usr/bin/python3"),
+            &shells
+        )
+        .unwrap()
+        .system_shell
+    );
+    assert!(
+        !ProcFacts::parse(stat, b"zsh\0", "", exe, &[])
+            .unwrap()
+            .system_shell
+    );
+    // Every unreadable or malformed source refuses: no facts, no baseline.
+    for (case, stat, cmdline, children) in [
+        ("empty stat", "", &b"zsh\0"[..], ""),
+        (
+            "no command name",
+            "4242 S 1 4242 4242 34816 4300",
+            &b"zsh\0"[..],
+            "",
+        ),
+        ("truncated stat", "4242 (zsh) S 1 4242", &b"zsh\0"[..], ""),
+        (
+            "non-numeric group",
+            "4242 (zsh) S 1 x 4242 34816 4300",
+            &b"zsh\0"[..],
+            "",
+        ),
+        (
+            "non-numeric foreground",
+            "4242 (zsh) S 1 4242 4242 34816 y",
+            &b"zsh\0"[..],
+            "",
+        ),
+        ("empty command line", stat, &b""[..], ""),
+        ("a bare dash", stat, &b"-\0"[..], ""),
+        ("a directory as argv0", stat, &b"/usr/bin/\0"[..], ""),
+        ("command line not UTF-8", stat, &b"\xff\xfe\0"[..], ""),
+        ("children not pids", stat, &b"zsh\0"[..], "4300 oops"),
+    ] {
+        assert_eq!(
+            ProcFacts::parse(stat, cmdline, children, exe, &shells),
+            None,
+            "{case}"
+        );
+    }
+}

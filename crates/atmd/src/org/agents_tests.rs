@@ -2762,6 +2762,170 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn own_hook_queued_with_the_commit_that_left_ready_still_wakes() {
+        // Review 16 H1: the observer handles committed organisation events
+        // before registry events. An agent's own hook that is queued together
+        // with the commit that made it Stuck must be routed against the new
+        // state, or the "Ready agent's own session" filter drops the one wake
+        // that can recover it.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        // Park the observer in its select before the two events are queued.
+        rig.events
+            .send(crate::registry::SessionEvent::Removed {
+                session_id: SessionId::new("unrelated"),
+                reason: crate::registry::RemovalReason::Explicit,
+            })
+            .unwrap();
+        progress(&mut events, "scheduled", None).await;
+        progress(&mut events, "idle", None).await;
+        let row = rig
+            .registry
+            .get_session(SessionId::new("s1"))
+            .await
+            .unwrap();
+        rig.frame("%1", "p/lead", IDLE);
+        let command = rig.command(OrgCommand::Stuck {
+            agent_id: "p/lead".parse().unwrap(),
+            reason: "unexpected screen in %1; inspect the pane".into(),
+        });
+        tokio::pin!(command);
+        // One poll: the command is in the organisation actor's queue, not applied.
+        tokio::select! {
+            biased;
+            _ = &mut command => panic!("the actor cannot have replied yet"),
+            _ = std::future::ready(()) => {}
+        }
+        rig.events
+            .send(crate::registry::SessionEvent::Updated {
+                session: Box::new(row),
+            })
+            .unwrap();
+        command.await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.reason, None);
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_observation_resets_the_backoff() {
+        // Four failed checks grow the delay to 8 s. After one success the next
+        // failure must be retried after RETRY_MIN again, not after 16 s.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        // The first check failed before the subscription; its retries follow.
+        assert_eq!(drain_started(&mut events), 3, "retries at 1, 3 and 7 s");
+        // tmux answers the retry at 15 s.
+        rig.inspect_only("%1", "p/lead");
+        progress(&mut events, "finished", Some("p/lead")).await;
+        agents.failure_cleared(&"p/lead".parse().unwrap()).await;
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+        // A new session wakes the agent and tmux fails again.
+        rig.row("fresh", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let failed = tokio::time::Instant::now();
+        progress(&mut events, "started", Some("p/lead")).await;
+        assert_eq!(failed.elapsed(), std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn stuck_binding_honours_the_event_fence() {
+        // A Stuck agent's binding candidate waits behind another reservation.
+        // An agent event committed meanwhile (here: Stuck again, for a new
+        // reason) must fence it, even though the pane, binding and exclusion
+        // are unchanged and the screen is safe. `fenced = false` is the twin.
+        use crate::control::reservation::ReservationKind;
+        for fenced in [true, false] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("s1")).await;
+            rig.command(OrgCommand::Stuck {
+                agent_id: "p/lead".parse().unwrap(),
+                reason: "first".into(),
+            })
+            .await;
+            rig.inspect_only("%1", "p/lead");
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let mut events = agents.observation_events();
+            let (entered, entry) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let control = rig.control.clone();
+            let held = tokio::spawn(async move {
+                control
+                    .run_reserved(
+                        request("p/lead", Some("%1"), ReservationKind::Clear),
+                        move |_| async move {
+                            entered.send(()).unwrap();
+                            released.await.unwrap();
+                            Ok(())
+                        },
+                        cleanup,
+                    )
+                    .await
+                    .unwrap();
+            });
+            entry.await.unwrap();
+            // The agent's session reports in: a candidate, parked behind the hold.
+            rig.row("s1", "%1", false).await;
+            progress(&mut events, "started", Some("p/lead")).await;
+            if fenced {
+                rig.command(OrgCommand::Stuck {
+                    agent_id: "p/lead".parse().unwrap(),
+                    reason: "second".into(),
+                })
+                .await;
+            }
+            rig.frame("%1", "p/lead", IDLE);
+            release.send(()).unwrap();
+            held.await.unwrap();
+            progress(&mut events, "finished", Some("p/lead")).await;
+            let agent = rig.state("lead").await;
+            if fenced {
+                assert_eq!(agent.status, AgentStatus::Stuck);
+                assert_eq!(agent.reason.as_deref(), Some("second"));
+            } else {
+                assert_eq!(agent.status, AgentStatus::Ready);
+                assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+            }
+            // Both read the safe screen: the fence decided, not a failed read.
+            assert_eq!(
+                rig.client
+                    .pending_reads(&PaneId::parse("%1").unwrap())
+                    .unwrap(),
+                0,
+                "fenced={fenced}"
+            );
+            assert_eq!(
+                agents.list(ListParams::default()).await.unwrap()[0]
+                    .reason
+                    .as_deref(),
+                fenced.then_some("second")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn duplicate_clear_conflicts_and_slot_survives_disconnect_through_cleanup() {
         use crate::control::reservation::ReservationKind;
         use std::{

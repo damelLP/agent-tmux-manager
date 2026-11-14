@@ -29,7 +29,7 @@ pub fn validate_hook_list(entries: &[HookListEntry]) -> bool {
         && names
             .iter()
             .all(|name| entries.iter().filter(|e| e.event == *name).count() == 1)
-        && entries.iter().all(|e| valid_counts(e))
+        && entries.iter().all(valid_counts)
         && (entries.iter().all(|e| e.review.is_some())
             || entries.iter().all(|e| e.review.is_none()))
 }

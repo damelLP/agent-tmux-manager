@@ -22,7 +22,7 @@ macro_rules! styled {
 }
 fn body(s: &str) -> &str {
     if s.starts_with("Captured:") {
-        s.split_once('\n').unwrap().1
+        s.split_once('\n').map_or(s, |(_, body)| body)
     } else {
         s
     }
@@ -31,7 +31,10 @@ fn observe(s: &str) -> atm_core::harness_control::ControlScreen {
     observe_control_screen(ScreenInput::Styled(body(s)), None)
 }
 fn plain(s: &str) -> String {
-    StyledScreen::parse(body(s)).unwrap().text().to_owned()
+    StyledScreen::parse(body(s))
+        .unwrap_or_else(|error| panic!("invalid fixture styles: {error}"))
+        .text()
+        .to_owned()
 }
 const PENDING: &str = capture!("a04-review-detail-100x32");
 const TRUSTED: &str = capture!("a05-trust-t-100x32");

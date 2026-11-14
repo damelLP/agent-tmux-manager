@@ -13,7 +13,10 @@ fn observe(s: &str) -> atm_core::harness_control::ControlScreen {
     observe_control_screen(ScreenInput::Styled(s), None)
 }
 fn plain(s: &str) -> String {
-    StyledScreen::parse(s).unwrap().text().to_owned()
+    StyledScreen::parse(s)
+        .unwrap_or_else(|error| panic!("invalid fixture styles: {error}"))
+        .text()
+        .to_owned()
 }
 
 #[test]

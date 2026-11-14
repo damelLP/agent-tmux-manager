@@ -20,13 +20,16 @@ fn observe(text: &str) -> atm_core::harness_control::ControlScreen {
 }
 fn body(text: &str) -> &str {
     if text.starts_with("Captured:") {
-        text.split_once('\n').unwrap().1
+        text.split_once('\n').map_or(text, |(_, body)| body)
     } else {
         text
     }
 }
 fn plain(text: &str) -> String {
-    StyledScreen::parse(body(text)).unwrap().text().to_owned()
+    StyledScreen::parse(body(text))
+        .unwrap_or_else(|error| panic!("invalid fixture styles: {error}"))
+        .text()
+        .to_owned()
 }
 
 #[test]

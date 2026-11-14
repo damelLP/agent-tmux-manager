@@ -541,7 +541,32 @@ pub(super) async fn cmd_status() -> Result<()> {
         parts.push(format!("{attention}!"));
     }
     parts.push(format!("${total_cost:.2}"));
-    println!("{}", parts.join(" "));
+    use atmd::org::messages::{Address, InboxParams};
+    let unread = super::msg::inbox_request(InboxParams {
+        recipient: Some(Address::Owner),
+        unread_only: false,
+        count_only: true,
+        id: None,
+        after: None,
+        limit: 100,
+    })
+    .await
+    .and_then(|result| {
+        if !result.messages.is_empty() || result.next_after.is_some() {
+            bail!("invalid aggregate result from daemon");
+        }
+        Ok(result.unread_count)
+    });
+    match unread {
+        Ok(0) => {}
+        Ok(count) => parts.push(format!("{count} unread")),
+        Err(error) => {
+            parts.push("? unread".into());
+            eprintln!("unread count unavailable: {error}");
+        }
+    }
+    use std::io::Write;
+    writeln!(std::io::stdout().lock(), "{}", parts.join(" "))?;
 
     Ok(())
 }

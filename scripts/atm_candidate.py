@@ -161,8 +161,33 @@ def wait_for(predicate, description, seconds=30):
         time.sleep(.05)  # bounded condition polling, never a settling delay
 
 
+def lock_holders(lock):
+    """Best-effort Linux diagnostics: never attribute a stale owner file."""
+    info = os.fstat(lock.fileno())
+    key = f'{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino}'
+    holders = []
+    try:
+        for line in Path('/proc/locks').read_text().splitlines():
+            fields = line.split()
+            if len(fields) != 8:
+                continue
+            _, kind, _, _, pid, inode, _, _ = fields
+            if kind != 'FLOCK' or inode != key:
+                continue
+            argv = iter(os.fsdecode((Path('/proc') / pid / 'cmdline').read_bytes()).split('\0'))
+            operation = Path(next(argv, '')).name
+            for arg in argv:
+                if Path(arg).name in ('atm_candidate.py', 'atm-candidate', 'atm'):
+                    operation = Path(arg).name + ' ' + next(argv, '')
+                    break
+            holders.append(f'{operation} (pid {pid})')
+    except OSError:
+        pass  # holder may have exited, or procfs may hide it
+    return ', '.join(holders) or 'unknown operation'
+
+
 class Kit:
-    def __init__(self, read_only=False):
+    def __init__(self, read_only=False, shared=False):
         home = Path.home()
         self.root = owned_root(os.environ.get('ATM_CANDIDATE_ROOT', str(home / '.local/share/atm-candidate')), not read_only)
         self.state = owned_root(os.environ.get('ATM_CANDIDATE_STATE_ROOT', str(home / '.local/state/atm-candidate')), not read_only)
@@ -179,13 +204,21 @@ class Kit:
             private_dir(self.installs)
         self.active_file = self.root / 'active.json'
         self.lock = None
+        self.shared = shared or read_only
         if not read_only or (self.root / 'lock').exists():
             require(not (self.root / 'lock').is_symlink(), 'lock is a symlink')
             self.lock = (self.root / 'lock').open('r' if read_only else 'a')
+            def acquired():
+                try:
+                    mode = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
+                    fcntl.flock(self.lock, mode | fcntl.LOCK_NB)
+                    return True
+                except BlockingIOError:
+                    return False
             try:
-                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise Refused('another kit operation holds the lock') from error
+                wait_for(acquired, 'kit lock')
+            except Refused as error:
+                raise Refused('timeout waiting for kit lock; held by ' + lock_holders(self.lock)) from error
 
     def installation(self, name):
         require(re.fullmatch(r'[0-9a-f]{40}-(release|debug|prebuilt)', name or '') is not None,
@@ -348,7 +381,8 @@ class Kit:
             expected = identity(int(fields[1]))
             require(expected and self.owns(a, expected['pid']), 'unowned partial server')
             a['server'] = expected
-            save(self.active_file, a)
+            if not self.shared:
+                save(self.active_file, a)
         actual = identity(expected.get('pid'))
         if actual is None:
             require(not self.tmux_listening(a), 'stale server record with a live listener')
@@ -536,9 +570,13 @@ class Kit:
                             a['tmux_socket'] + ',' + str(a['server']['pid']) + ',')):
                     env.update({k: os.environ[k] for k in ('TMUX', 'TMUX_PANE') if k in os.environ})
                 argv = [str(Path(a['bin']) / 'atm'), *args.args]
-            # Interactive atm/attach must not hold the lifecycle lock indefinitely.
-            self.lock.close()
-            os.execvpe(argv[0], argv, env)
+            if command == 'attach':
+                # Attachment must not prevent stop from closing its own terminal.
+                self.lock.close()
+                os.execvpe(argv[0], argv, env)
+            # Keep the wrapper's shared lock until atm exits, without passing its
+            # fd to autostarted daemons/descendants. TUI/watch may run indefinitely.
+            sys.exit(subprocess.call(argv, env=env))
 
 
 def main():
@@ -568,7 +606,8 @@ def main():
     require(args.command != 'attach' or not os.environ.get('TMUX'),
             'attach from a terminal outside tmux')
     os.umask(0o077)
-    Kit(read_only=args.command in ('status', 'installs')).dispatch(args)
+    Kit(read_only=args.command in ('status', 'installs'),
+        shared=args.command in ('atm', 'attach')).dispatch(args)
 
 
 if __name__ == '__main__':

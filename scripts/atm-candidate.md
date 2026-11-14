@@ -122,14 +122,21 @@ Daemon-routed send/spawn are verified separately when that milestone lands.
 are not garbage-collected automatically.
 
 Known operational limits:
-- The exclusive kit lock is held throughout an install/build (up to the
-  30-minute build guard). Other wrapper commands, including status, attach,
-  stop and restart, refuse rather than wait. Finish the build before using them.
-- Lifecycle races can report failure although a re-run succeeds: a TUI can
-  autostart a daemon during restart or stop, and a dying harness can briefly
+- `atm` passthroughs, read-only `status`/`installs`, and `attach` validation
+  share the kit lock. Multiple commands can run together. Install/build, start,
+  stop, restart-daemon and uninstall hold it exclusively for their whole operation
+  (builds have a 30-minute guard). Contenders wait up to 30 seconds, then report
+  a timeout with the holding operation/PID when Linux procfs exposes it.
+- The wrapper retains its shared lock until `atm` exits, without leaking it to
+  spawned daemons or harnesses. Exit long-running `atm` TUIs/watch commands before
+  lifecycle operations; otherwise those operations can time out. `attach` releases
+  its lock after validation so an attached terminal does not prevent `stop`.
+  Shared validation can recover a server identity in memory but never writes it.
+- Direct binary calls bypass the lock as well as the mutation guard: they can
+  autostart a daemon during restart or stop. A dying harness can also briefly
   leave a hook process in the final token scan. The runtime/manifest is retained
-  on failure; close candidate TUIs and re-run from outside. These race schedules
-  are unverified; the ordinary autostart cleanup path has a real-process test.
+  on failure; close direct candidate TUIs and re-run from outside. These race
+  schedules are unverified; ordinary autostart cleanup has a real-process test.
 
 ## Checks
 

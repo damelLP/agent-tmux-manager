@@ -19,6 +19,7 @@ SCRIPT = Path(__file__).with_name('atm-candidate')
 
 class CandidateKit(unittest.TestCase):
     def setUp(self):
+        self.lock_cleanups = []
         self.temp = tempfile.TemporaryDirectory(prefix='kit-')
         self.root = Path(self.temp.name)
         self.script = SCRIPT
@@ -48,6 +49,8 @@ class CandidateKit(unittest.TestCase):
             (self.bin / name).symlink_to(os.environ['CANDIDATE_TEST_' + name.upper()])
 
     def tearDown(self):
+        for cleanup in reversed(self.lock_cleanups):
+            cleanup()
         if self.script.exists():
             out = self.call('stop', ok=None)
             self.assertEqual(out.returncode, 0, out.stderr)
@@ -561,14 +564,146 @@ class CandidateKit(unittest.TestCase):
         self.call('start', install, env=env, ok=False)
         self.assertFalse((self.root / 'kit/active.json').exists())
 
-    # Lifecycle calls serialize; status must not signal or wait indefinitely on a lock.
-    def test_lock_refuses_concurrent_operation(self):
-        self.install()
+    def lock_child(self, *args, trace_contention=False, expire=False):
+        # Observe real flock contention, then hold a pipe barrier before retry.
+        # This instruments the syscall boundary, not the kit's lock decision.
+        code = ('import sys; sys.path.insert(0, sys.argv[1]); '
+                'sys.argv = sys.argv[2:]; import atm_candidate as kit\n')
+        if trace_contention:
+            code += ('original = kit.fcntl.flock\n'
+                     'def traced(*args):\n'
+                     ' try: return original(*args)\n'
+                     ' except BlockingIOError:\n'
+                     '  print("contended", flush=True)\n'
+                     '  assert sys.stdin.readline() == "release\\n"\n'
+                     '  raise\n'
+                     'kit.fcntl.flock = traced\n')
+        if expire:
+            code += ('ticks = iter((0, 31))\n'
+                     'kit.time.monotonic = lambda: next(ticks)\n')
+        code += ('try: kit.main()\n'
+                 'except kit.Refused as error:\n'
+                 ' print("candidate:", error, file=sys.stderr); sys.exit(1)\n')
+        child = subprocess.Popen([sys.executable, '-B', '-c', code, str(SCRIPT.parent),
+                                  str(SCRIPT.with_name('atm_candidate.py')), *args],
+                                 env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        def cleanup():
+            if child.poll() is None:
+                child.stdin.close()  # release stand-in/barrier, even after failure
+                child.wait(timeout=35)
+            for stream in (child.stdin, child.stdout, child.stderr):
+                stream.close()
+        self.lock_cleanups.append(cleanup)
+        return child
+
+    def child_line(self, child, expected):
+        import select
+        self.assertTrue(select.select([child.stdout], [], [], 35)[0], 'child did not reach barrier')
+        line = child.stdout.readline().strip()
+        if not line:
+            child.wait(timeout=35)
+            self.fail(child.stderr.read())
+        self.assertEqual(line, expected)
+
+    def release_child(self, child):
+        child.stdin.write('release\n')
+        child.stdin.flush()
+
+    def lock_fixture(self):
+        self.call('start', self.install())
+        status = self.status()
+        binary = Path(status['bin']) / 'atm'
+        binary.write_text('#!/usr/bin/python3\nimport sys\n'
+                          'print("running", flush=True)\nsys.stdin.readline()\n')
+        return status
+
+    # Exclusive-at-entry or dropped-at-exec locks break concurrent protected calls.
+    def test_overlapping_passthroughs_share_lock_through_execution(self):
         import fcntl
-        with (self.root / 'kit/lock').open('a') as lock:
+        self.lock_fixture()
+        with (self.root / 'kit/lock').open('r') as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            children = [self.lock_child('atm', 'list') for _ in range(2)]
+            for child in children:
+                self.child_line(child, 'running')
+            self.assertTrue(self.status()['running'], 'status must share with atm')
+            self.call('installs')
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            for child in children:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.release_child(child)
+                self.assertEqual(child.wait(timeout=35), 0, child.stderr.read())
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    # Immediate refusal or running before an exclusive holder exits breaks ordering.
+    def test_passthrough_waits_for_exclusive_operation(self):
+        import fcntl
+        self.lock_fixture()
+        with (self.root / 'kit/lock').open('r') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            for command in ('stop', 'status', 'installs', 'atm', 'attach', 'restart-daemon'):
-                self.assertIn('holds the lock', self.call(command, ok=False).stderr)
+            child = self.lock_child('atm', 'list', trace_contention=True)
+            self.child_line(child, 'contended')
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            self.release_child(child)
+            self.child_line(child, 'running')
+            self.release_child(child)
+            self.assertEqual(child.wait(timeout=35), 0, child.stderr.read())
+
+    # A released-at-exec lock would allow stop to tear down a running command.
+    def test_exclusive_operation_waits_for_running_passthrough(self):
+        self.lock_fixture()
+        reader = self.lock_child('atm', 'list')
+        self.child_line(reader, 'running')
+        writer = self.lock_child('stop', trace_contention=True)
+        self.child_line(writer, 'contended')
+        self.release_child(reader)
+        self.assertEqual(reader.wait(timeout=35), 0, reader.stderr.read())
+        self.release_child(writer)
+        self.assertEqual(writer.wait(timeout=35), 0, writer.stderr.read())
+        self.assertEqual(self.status(), {'running': False})
+
+    # Every lifecycle writer must wait, not overlap a reader or fail immediately.
+    def test_lifecycle_operations_wait_for_shared_lock(self):
+        import fcntl
+        install = self.install()
+        with (self.root / 'kit/lock').open('r') as lock:
+            for args in [('install', 'HEAD', '--prebuilt', str(self.bin)),
+                         ('start', 'invalid-id'), ('stop',), ('restart-daemon',),
+                         ('uninstall', install)]:
+                fcntl.flock(lock, fcntl.LOCK_SH)
+                child = self.lock_child(*args, trace_contention=True)
+                self.child_line(child, 'contended')
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                self.release_child(child)
+                child.wait(timeout=35)
+                self.assertNotIn('lock', child.stderr.read())
+
+    # Shared validation must not repair manifests while other readers use them.
+    def test_passthrough_recovers_server_without_writing_manifest(self):
+        self.call('start', self.install())
+        active = self.root / 'kit/active.json'
+        data = json.loads(active.read_text())
+        data['server'] = None
+        active.write_text(json.dumps(data))
+        original = active.read_bytes()
+        self.call('atm', '--version')
+        self.assertEqual(active.read_bytes(), original)
+
+    # Acquisition timeout identifies the actual kernel holder, not stale metadata.
+    def test_lock_timeout_names_holder(self):
+        self.lock_fixture()
+        reader = self.lock_child('atm', 'list')
+        self.child_line(reader, 'running')
+        writer = self.lock_child('stop', expire=True)
+        self.assertNotEqual(writer.wait(timeout=35), 0)
+        error = writer.stderr.read()
+        self.assertIn('timeout', error)
+        self.assertIn('atm', error)
+        self.assertIn(str(reader.pid), error)
+        self.release_child(reader)
+        self.assertEqual(reader.wait(timeout=35), 0, reader.stderr.read())
 
     # Intermediate symlinks must not turn an owned install into foreign binaries.
     def test_rejects_symlinked_bin_directory(self):

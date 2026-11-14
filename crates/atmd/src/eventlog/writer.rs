@@ -206,7 +206,19 @@ mod tests {
             .unwrap();
         assert_eq!(segments(&path).unwrap().len(), 1, "rotated at exact limit");
         drop(writer);
-        let mut writer = Writer::open(&path, Stream::Raw).unwrap();
+        // Parallel subprocess tests can fork while the lock fd is open. Even
+        // CLOEXEC fds retain flock in that child until exec; wait for that brief
+        // inheritance window, just as the public reopen tests wait for cleanup.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut writer = loop {
+            match Writer::open(&path, Stream::Raw) {
+                Ok(writer) => break writer,
+                Err(EventLogError::Locked(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("reopen: {error}"),
+            }
+        };
         writer.max_bytes = one * 2;
         // Existing destination must not be overwritten; failed rotation sync
         // or create must leave the committed old file and next seq intact.

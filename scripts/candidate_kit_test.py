@@ -710,16 +710,20 @@ class CandidateKit(unittest.TestCase):
     # Acquisition timeout identifies the actual kernel holder, not stale metadata.
     def test_lock_timeout_names_holder(self):
         self.lock_fixture()
-        reader = self.lock_child('atm', 'list')
-        self.child_line(reader, 'running')
-        writer = self.lock_child('stop', expire=True)
-        self.assertNotEqual(writer.wait(timeout=35), 0)
-        error = writer.stderr.read()
-        self.assertIn('timeout', error)
-        self.assertIn('atm', error)
-        self.assertIn(str(reader.pid), error)
-        self.release_child(reader)
-        self.assertEqual(reader.wait(timeout=35), 0, reader.stderr.read())
+        for args, operation in [(('atm', '--pick'), 'atm --pick'),
+                                (('atm',), 'atm'),
+                                (('atm', 'send', '%1', 'hello there'),
+                                 "atm send %1 'hello there'")]:
+            with self.subTest(args=args):
+                reader = self.lock_child(*args)
+                self.child_line(reader, 'running')
+                writer = self.lock_child('stop', expire=True)
+                self.assertNotEqual(writer.wait(timeout=35), 0)
+                error = writer.stderr.read()
+                self.assertIn('timeout', error)
+                self.assertIn(f'atm_candidate.py {operation} (pid {reader.pid})', error)
+                self.release_child(reader)
+                self.assertEqual(reader.wait(timeout=35), 0, reader.stderr.read())
 
     # Intermediate symlinks must not turn an owned install into foreign binaries.
     def test_rejects_symlinked_bin_directory(self):

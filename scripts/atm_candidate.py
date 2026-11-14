@@ -174,11 +174,11 @@ def lock_holders(lock):
             _, kind, _, _, pid, inode, _, _ = fields
             if kind != 'FLOCK' or inode != key:
                 continue
-            argv = iter(os.fsdecode((Path('/proc') / pid / 'cmdline').read_bytes()).split('\0'))
+            argv = iter(os.fsdecode((Path('/proc') / pid / 'cmdline').read_bytes()).removesuffix('\0').split('\0'))
             operation = Path(next(argv, '')).name
             for arg in argv:
                 if Path(arg).name in ('atm_candidate.py', 'atm-candidate', 'atm'):
-                    operation = Path(arg).name + ' ' + next(argv, '')
+                    operation = shlex.join([Path(arg).name, *argv])
                     break
             holders.append(f'{operation} (pid {pid})')
     except OSError:

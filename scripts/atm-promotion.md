@@ -64,6 +64,8 @@ nonblocking lock at `<bin>/.atm-promotion/lock`, copies both current binaries
 **each** into place. No managed entrypoint symlinks; a later cargo install can
 still replace the ordinary files. The previous record refers to the most recent
 pre-promotion pair, not necessarily the build cargo most recently installed.
+Promotion refuses an already-installed pair (same bytes and modes), preserving
+its rollback target.
 
 The rename pair is deliberately **not atomic**. SIGKILL or power loss between
 renames can leave mixed binaries. With the daemon stopped and TUIs closed,
@@ -91,7 +93,9 @@ to bypass recovery. On install/copy/rename/setup failure after the backup was
 recorded, both saved files are copied/renamed back and old setup reruns. The
 command still exits nonzero and reports recovery success or failure. Failure
 before the complete backup is recorded leaves the installed pair and prior
-record alone. If recovery fails, the backup remains available; do not restart.
+record alone. Successful recovery restores the prior previous record if one
+existed; otherwise the first backup remains selected. If recovery fails, the new
+backup stays selected for rollback; do not restart.
 
 Rollback copies/renames the recorded previous pair into place and reruns its
 setup. It retains that same previous record, so repeated rollback is idempotent,

@@ -789,23 +789,7 @@ impl ConnectionHandler {
 
     /// Sends a message to the client.
     async fn send_message(&self, msg: DaemonMessage) -> Result<(), ConnectionError> {
-        let json =
-            serde_json::to_string(&msg).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
-
-        let mut writer = self.writer.lock().await;
-
-        match timeout(WRITE_TIMEOUT, async {
-            writer.write_all(json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            Ok::<(), std::io::Error>(())
-        })
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(ConnectionError::Io(e.to_string())),
-            Err(_) => Err(ConnectionError::WriteTimeout),
-        }
+        write_message(&self.writer, &msg).await
     }
 
     /// Checks if this client is subscribed to events.
@@ -1008,8 +992,16 @@ pub async fn send_event(
         }
     };
 
+    write_message(writer, &msg).await
+}
+
+/// Serializes one complete reply under the connection's shared writer lock.
+async fn write_message(
+    writer: &SubscriberWriter,
+    msg: &DaemonMessage,
+) -> Result<(), ConnectionError> {
     let json =
-        serde_json::to_string(&msg).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
+        serde_json::to_string(msg).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
 
     let mut writer = writer.lock().await;
 
@@ -1092,6 +1084,23 @@ mod tests {
             err.to_string(),
             "Parse error: invalid type: string \"x\", expected f64"
         );
+    }
+
+    #[tokio::test]
+    async fn reply_writer_frames_one_line_and_reports_closed_peer() {
+        let (writer, peer) = subscriber_pair();
+        write_message(&writer, &DaemonMessage::pong(42))
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(peer);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "{\"type\":\"pong\",\"seq\":42}\n");
+        drop(reader);
+        assert!(matches!(
+            write_message(&writer, &DaemonMessage::pong(43)).await,
+            Err(ConnectionError::Io(_))
+        ));
     }
 
     /// A subscriber writer on one end of a socket pair, plus the peer end.

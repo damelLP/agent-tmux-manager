@@ -1256,6 +1256,21 @@ fn activity_of_a_bound_or_observed_session_survives_pruning() {
 }
 
 #[test]
+fn session_rebind_keeps_paste_time_while_the_agent_holds_the_same_pane() {
+    let mut f = Fixture::new(0);
+    f.attempt(1_000);
+    paste(&mut f, EffectCertainty::Applied, 1_500);
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "s2".into(),
+        },
+        2_000,
+    );
+    assert_eq!(f.snapshot(2_000).live.last_paste_at, Some(at(1_500)));
+}
+
+#[test]
 fn paste_time_is_dropped_when_no_agent_holds_the_pane() {
     let mut f = Fixture::new(0);
     f.attempt(10_000);
@@ -1447,6 +1462,25 @@ fn zero_effect_attempt_discounts_the_evidence_latch_in_either_order() {
         );
         assert_eq!(f.step(12_000), DeliveryStep::Confirm { receipt });
     }
+}
+
+#[test]
+fn no_effect_discount_ends_when_the_next_attempt_is_armed() {
+    let mut f = Fixture::new(0);
+    let scope = f.attempt(1_000);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        1_000,
+    );
+    paste(&mut f, EffectCertainty::NotStarted, 1_000);
+    fail_for_retry(&mut f, 2_000);
+    second_attempt(&mut f, &scope, 40_000);
+    // No paste record for attempt 2 yet: attempt 1's NotStarted must not
+    // discount activity received after the new arm.
+    evidence_latch(&mut f, 40_500);
+    blocked(f.step(43_000), FailureReason::ProbablyDelivered);
 }
 
 #[test]
@@ -1804,6 +1838,28 @@ fn stale_evidence_copy_before_the_new_arm_does_not_pin_the_old_latch() {
     // A latch copied after the arm is the new attempt's.
     evidence_latch(&mut f, 6_000);
     assert!(f.snapshot(6_000).live.probably_landed);
+}
+
+#[test]
+fn applied_identity_change_preserves_the_readiness_hold() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    wait(f.consume(0), WaitReason::InputNotEmpty);
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "s2".into(),
+        },
+        60_000,
+    );
+    obs.session.as_mut().unwrap().id = "s2".into();
+    f.observe(obs, 60_000);
+    wait(f.consume(60_000), WaitReason::InputNotEmpty);
+    assert_eq!(f.snapshot(60_000).live.hold_since, Some(at(0)));
+    wait(f.step(119_999), WaitReason::InputNotEmpty);
+    blocked(f.step(120_000), FailureReason::DraftPresent);
 }
 
 #[test]

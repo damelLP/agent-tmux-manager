@@ -53,6 +53,14 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 model.parse_args(args)
 
+    def test_no_daemon_does_not_consume_model_or_initial_prompt(self):
+        for flag in ["-m", "--model"]:
+            with self.subTest(flag=flag):
+                self.assertEqual(model.parse_args([
+                    "--no-daemon", "--profile", "a b", flag, "role model",
+                    "initial 'quoted' prompt",
+                ]), (None, "initial 'quoted' prompt"))
+
     def test_escape_inside_paste_is_data(self):
         parser = model.InputParser()
         self.assertEqual(parser.feed(b"\x1b[200~a\x1bb\x1b[201~\r"),

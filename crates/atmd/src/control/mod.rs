@@ -5,7 +5,7 @@ mod send;
 pub mod service;
 mod spawn;
 
-pub use command::{build_spawn_command, shell_quote, spawn_env_override};
+pub use command::{build_spawn_command, launch_policy, shell_quote, spawn_env_override};
 pub use send::{resolve_pane_id, send};
 pub use spawn::{prepare_spawn, split_spawn, type_spawn_command, SpawnContext};
 

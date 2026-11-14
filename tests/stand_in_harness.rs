@@ -401,6 +401,54 @@ fn stand_in_spawn_prompt() {
 }
 
 #[test]
+fn stand_in_codex_spawn_receives_required_argument_and_exact_prompt() {
+    let mut rig = StandInRig::start();
+    let log = rig.root().join("codex-spawn.jsonl");
+    for (name, value) in [
+        ("ATM_STANDIN_LOG", log.to_str().unwrap()),
+        ("ATM_STANDIN_ID_PREFIX", "codex-spawn-fixture"),
+        ("ATM_STANDIN_WORK_MS", "0"),
+    ] {
+        success(rig.tmux(&["set-environment", "-g", name, value]));
+    }
+    let target = success(rig.tmux(&["display-message", "-p", "-t", "fixture:0", "#{pane_id}"]));
+    let prompt = "spawn 'quote', \"double quote\", $literal;";
+    let mut command = rig.command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
+    command
+        .args([
+            "spawn",
+            "-H",
+            "codex-cli",
+            "--target-pane",
+            &target,
+            "--prompt",
+            prompt,
+        ])
+        .env("TMUX", rig.tmux_env())
+        .env("ATM_SPAWN_BIN", rig.launcher(StandInMode::Codex));
+    let pane_id = success(rig.run(&mut command));
+    let pane = rig.observe_pane(pane_id, StandInMode::Codex, log);
+    let row = rig.wait_for_row(&pane, |r| {
+        r.first_prompt.as_deref() == Some(prompt) && r.status == SessionStatus::Idle
+    });
+    let identity = rig
+        .journal(&pane)
+        .into_iter()
+        .find(|e| e["kind"] == "identity")
+        .unwrap();
+    let argv = identity["argv"].as_array().unwrap();
+    assert_eq!(
+        &argv[1..],
+        &[serde_json::json!("--no-daemon"), serde_json::json!(prompt)]
+    );
+    assert_eq!(row.tmux_pane.as_deref(), Some(pane.pane_id.as_str()));
+    rig.paste(&pane, "/atm/exit");
+    rig.wait_for_absent(&row.id);
+    rig.wait_for_shell(&pane);
+    rig.close();
+}
+
+#[test]
 fn stand_in_observes_restarted_process() {
     let mut rig = StandInRig::start();
     let first = rig.launch(&StandInConfig::new(StandInMode::Claude));

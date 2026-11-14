@@ -379,6 +379,153 @@ fn spawn_override_whitespace_args_mask_global_args() {
     );
 }
 
+// These cases catch required/role arguments being lost under BIN, or placed
+// before a wrapper's raw prefix or after its model argument.
+#[test]
+fn pure_builder_keeps_required_and_role_args_under_binary_overrides() {
+    let defaults = ["x".into(), "codex".into()];
+    let role = ["--profile".into(), "a b".into()];
+    for (binary, defaults, bin, raw, extra, flag, model, expected) in [
+        (
+            "codex",
+            &[][..],
+            None,
+            None,
+            &[][..],
+            None,
+            None,
+            "codex '--no-daemon'",
+        ),
+        (
+            "mise",
+            &defaults[..],
+            Some("/my stand-in"),
+            None,
+            &[][..],
+            None,
+            None,
+            "'/my stand-in' '--no-daemon'",
+        ),
+        (
+            "codex",
+            &[][..],
+            Some("mise"),
+            Some("x codex"),
+            &[][..],
+            None,
+            None,
+            "mise x codex '--no-daemon'",
+        ),
+        (
+            "mise",
+            &defaults[..],
+            None,
+            None,
+            &[][..],
+            None,
+            None,
+            "mise 'x' 'codex' '--no-daemon'",
+        ),
+        (
+            "mise",
+            &defaults[..],
+            Some("/my stand-in"),
+            None,
+            &role[..],
+            Some("-m"),
+            Some("role model"),
+            "'/my stand-in' '--no-daemon' '--profile' 'a b' -m 'role model'",
+        ),
+    ] {
+        assert_eq!(
+            build_spawn_command(
+                binary,
+                defaults,
+                flag,
+                None,
+                model,
+                bin,
+                raw,
+                extra,
+                &["--no-daemon"]
+            ),
+            expected
+        );
+    }
+}
+
+#[test]
+fn launch_policy_requirements_reach_the_shared_builder() {
+    use atm_core::Harness;
+    for (harness, binary, expected) in [
+        (Harness::ClaudeCode, "claude", "claude"),
+        (Harness::Pi, "pi", "pi"),
+        (Harness::Codex, "codex", "codex '--no-daemon'"),
+    ] {
+        let policy = super::launch_policy(harness).unwrap();
+        assert_eq!(
+            build_spawn_command(
+                binary,
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                policy.required_args
+            ),
+            expected
+        );
+    }
+    for harness in [
+        Harness::Amp,
+        Harness::Qwen,
+        Harness::Gemini,
+        Harness::Unknown,
+    ] {
+        assert!(super::launch_policy(harness).is_none());
+    }
+}
+
+#[test]
+fn empty_requirements_preserve_legacy_command_bytes() {
+    for binary in ["claude", "pi", "my-agent"] {
+        for (bin, raw, expected_suffix) in [
+            (None, None, " '--profile' 'a b' --model 'model name'"),
+            (
+                None,
+                Some("   "),
+                " '--profile' 'a b'  --model 'model name'",
+            ),
+            (
+                Some("wrapper"),
+                Some("  x --raw;  "),
+                " x --raw; --model 'model name'",
+            ),
+        ] {
+            let expected = format!(
+                "cd '/work dir' && {}{expected_suffix}",
+                bin.unwrap_or(binary)
+            );
+            assert_eq!(
+                build_spawn_command(
+                    binary,
+                    &["--profile".into(), "a b".into()],
+                    Some("--model"),
+                    Some("/work dir"),
+                    Some("model name"),
+                    bin,
+                    raw,
+                    &[],
+                    &[]
+                ),
+                expected
+            );
+        }
+    }
+}
+
 #[test]
 fn pure_builder_preserves_defaults_overrides_quoting_and_raw_arguments() {
     let defaults = ["--profile".into(), "a b".into()];
@@ -390,7 +537,9 @@ fn pure_builder_preserves_defaults_overrides_quoting_and_raw_arguments() {
             Some("/work/it's"),
             Some("model name"),
             None,
-            None
+            None,
+            &[],
+            &[],
         ),
         "cd '/work/it'\\''s' && agent '--profile' 'a b' --model 'model name'"
     );
@@ -402,16 +551,28 @@ fn pure_builder_preserves_defaults_overrides_quoting_and_raw_arguments() {
             None,
             Some("ignored"),
             Some("/my wrapper"),
-            Some("  x --raw;  ")
+            Some("  x --raw;  "),
+            &[],
+            &[],
         ),
         "'/my wrapper' x --raw;"
     );
     assert_eq!(
-        build_spawn_command("agent", &[], None, None, None, None, Some("   ")),
+        build_spawn_command("agent", &[], None, None, None, None, Some("   "), &[], &[]),
         "agent "
     );
     assert_eq!(
-        build_spawn_command("agent", &defaults, None, None, None, Some("wrapper"), None),
+        build_spawn_command(
+            "agent",
+            &defaults,
+            None,
+            None,
+            None,
+            Some("wrapper"),
+            None,
+            &[],
+            &[]
+        ),
         "wrapper"
     );
 }

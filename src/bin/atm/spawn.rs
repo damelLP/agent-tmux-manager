@@ -221,6 +221,10 @@ pub(super) fn build_spawn_command_for_harness(
         model,
         control::spawn_env_override(&harness.id, "BIN", |key| std::env::var(key).ok()).as_deref(),
         control::spawn_env_override(&harness.id, "ARGS", |key| std::env::var(key).ok()).as_deref(),
+        &[],
+        find_harness_definition(&harness.id)
+            .and_then(|definition| control::launch_policy(definition.harness))
+            .map_or(&[], |policy| policy.required_args),
     )
 }
 
@@ -604,7 +608,10 @@ mod spawn_command_tests {
         );
 
         let codex = resolve_spawn_harness(Some("codex")).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(build_spawn_command_for_harness(&codex, None, None), "codex");
+        assert_eq!(
+            build_spawn_command_for_harness(&codex, None, None),
+            "codex '--no-daemon'"
+        );
 
         // 14. Harness-specific overrides take precedence over the legacy
         //     global overrides, so users can customize one harness without

@@ -1,5 +1,23 @@
 //! Pure shell command construction from resolved config and spawn overrides.
 
+use atm_core::{Harness, LaunchPolicy};
+
+/// Adapter-owned launch requirements for supported built-in harnesses.
+#[must_use]
+pub fn launch_policy(harness: Harness) -> Option<&'static LaunchPolicy> {
+    const POLICIES: &[(Harness, &LaunchPolicy)] = &[
+        (
+            Harness::ClaudeCode,
+            &atm_claude_adapter::screen::LAUNCH_POLICY,
+        ),
+        (Harness::Pi, &atm_pi_adapter::screen::LAUNCH_POLICY),
+        (Harness::Codex, &atm_codex_adapter::screen::LAUNCH_POLICY),
+    ];
+    POLICIES
+        .iter()
+        .find_map(|(id, policy)| (*id == harness).then_some(*policy))
+}
+
 /// Resolve a spawn override using the caller's environment reader.
 /// `harness_id` is canonical; its uppercase form replaces hyphens with underscores.
 /// A nonempty harness-specific value wins over the global value. Whitespace is
@@ -46,9 +64,11 @@ fn shell_word(s: &str) -> String {
 
 /// Build the command from resolved overrides, without reading environment or
 /// config. Callers resolve empty-as-unset and harness/global precedence.
-/// A binary override replaces default arguments; the args override is raw shell
-/// syntax, trimmed and inserted before the quoted model. Cwd is shell-quoted.
+/// A binary override replaces ordinary defaults, never required or extra args.
+/// Raw shell args (trimmed) precede quoted required and role/extra arguments;
+/// the model follows them. Cwd is shell-quoted.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // Resolved fields avoid duplicating a harness type.
 pub fn build_spawn_command(
     binary: &str,
     default_args: &[String],
@@ -57,6 +77,8 @@ pub fn build_spawn_command(
     model: Option<&str>,
     bin_override: Option<&str>,
     args_override: Option<&str>,
+    extra_args: &[String],
+    required_args: &[&str],
 ) -> String {
     let base = bin_override.unwrap_or(binary);
     let mut cmd = shell_word(base);
@@ -71,6 +93,15 @@ pub fn build_spawn_command(
     if let Some(args) = args_override {
         cmd.push(' ');
         cmd.push_str(args.trim());
+    }
+
+    for arg in required_args
+        .iter()
+        .copied()
+        .chain(extra_args.iter().map(String::as_str))
+    {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(arg));
     }
 
     if let (Some(flag), Some(m)) = (model_flag, model) {

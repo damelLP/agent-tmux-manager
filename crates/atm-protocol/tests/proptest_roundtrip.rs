@@ -606,6 +606,30 @@ fn daemon_message_strategy_covers_every_variant() {
 }
 
 #[test]
+fn daemon_message_strategy_covers_both_response_payloads() {
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig::default(),
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
+    let strategy = arb_daemon_message();
+    let mut saw_result = false;
+    let mut saw_error = false;
+    for _ in 0..256 {
+        let message = strategy.new_tree(&mut runner).expect("generate").current();
+        let json = serde_json::to_value(message).expect("serialize");
+        if json.get("type").and_then(Value::as_str) == Some("response") {
+            saw_result |= json.get("result").is_some();
+            saw_error |= json.get("error").is_some();
+        }
+    }
+    assert!(
+        saw_result,
+        "daemon strategy must generate a response result"
+    );
+    assert!(saw_error, "daemon strategy must generate a response error");
+}
+
+#[test]
 fn session_status_strategy_covers_every_variant() {
     assert_covers_every_variant(arb_session_status());
 }

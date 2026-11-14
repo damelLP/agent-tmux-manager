@@ -15,32 +15,6 @@ pub enum MessageType {
         client_id: Option<String>,
     },
 
-    /// Invoke a control-plane method.
-    Request {
-        /// Caller-supplied correlation ID.
-        id: String,
-        /// Method name advertised by the daemon.
-        method: String,
-        /// Method-specific parameters; omitted means null.
-        #[serde(default)]
-        params: serde_json::Value,
-        /// Caller's tmux pane, when available.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        from_pane: Option<String>,
-    },
-
-    /// Replay events after a cursor, then follow live events.
-    Watch {
-        /// Event-kind prefixes; empty means all events.
-        #[serde(default)]
-        topics: Vec<String>,
-        /// Last sequence seen by the caller; required even for a new watch.
-        cursor: u64,
-    },
-
-    /// Stop watching events.
-    Unwatch,
-
     /// Status line update from Claude Code (raw `RawStatusLine` payload).
     /// Parsed by `atm-claude-adapter` at the daemon boundary.
     StatusUpdate {
@@ -97,6 +71,32 @@ pub enum MessageType {
     /// harness with
     /// [`discovery_enabled`](atm_core::HarnessDefinition::discovery_enabled)
     Discover,
+
+    /// Invoke a control-plane method.
+    Request {
+        /// Caller-supplied correlation ID.
+        id: String,
+        /// Method name advertised by the daemon.
+        method: String,
+        /// Method-specific parameters; omitted means null.
+        #[serde(default)]
+        params: serde_json::Value,
+        /// Caller's tmux pane, when available.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from_pane: Option<String>,
+    },
+
+    /// Replay events after a cursor, then follow live events.
+    Watch {
+        /// Event-kind prefixes; empty means all events.
+        #[serde(default)]
+        topics: Vec<String>,
+        /// Last sequence seen by the caller; required even for a new watch.
+        cursor: u64,
+    },
+
+    /// Stop watching events.
+    Unwatch,
 }
 
 /// Messages sent from client to daemon.
@@ -277,29 +277,6 @@ pub enum DaemonMessage {
         methods: Vec<String>,
     },
 
-    /// Reply to a control-plane request.
-    Response {
-        /// Request correlation ID.
-        id: String,
-        /// Exactly one result or error on the wire.
-        #[serde(flatten)]
-        payload: ResponsePayload,
-    },
-
-    /// One event from a watched topic.
-    Event {
-        /// Event stream topic.
-        topic: String,
-        /// Sequence number used for replay cursors.
-        seq: u64,
-        /// Caller-supplied timestamp string.
-        ts: String,
-        /// Event kind, matched against watch prefixes.
-        kind: String,
-        /// Event-specific data.
-        body: serde_json::Value,
-    },
-
     /// Connection rejected (version mismatch, etc.)
     Rejected {
         /// Reason for rejection
@@ -347,6 +324,29 @@ pub enum DaemonMessage {
         discovered: u32,
         /// Number of discovery failures (logged at debug)
         failed: u32,
+    },
+
+    /// Reply to a control-plane request.
+    Response {
+        /// Request correlation ID.
+        id: String,
+        /// Exactly one result or error on the wire.
+        #[serde(flatten)]
+        payload: ResponsePayload,
+    },
+
+    /// One event from a watched topic.
+    Event {
+        /// Event stream topic.
+        topic: String,
+        /// Sequence number used for replay cursors.
+        seq: u64,
+        /// Caller-supplied timestamp string.
+        ts: String,
+        /// Event kind, matched against watch prefixes.
+        kind: String,
+        /// Event-specific data.
+        body: serde_json::Value,
     },
 }
 

@@ -223,6 +223,7 @@ fn invalid_response_shapes() {
         r#"{"type":"response","id":"r1","error":{"code":"x","message":"y"},"result":{}}"#,
         r#"{"type":"response","id":"r1","result":null,"error":{"code":"x","message":"y"}}"#,
         r#"{"type":"response","id":"r1","result":{},"error":null}"#,
+        r#"{"type":"response","id":"r1","error":null,"result":{}}"#,
         r#"{"type":"response","id":"r1","result":null,"error":null}"#,
         r#"{"type":"response","id":"r1","error":null}"#,
         r#"{"type":"response","id":"r1","error":{}}"#,

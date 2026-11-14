@@ -214,6 +214,25 @@ async fn test_handshake_success() {
 }
 
 #[tokio::test]
+async fn test_legacy_hook_connect_is_accepted() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    let response = timeout(Duration::from_secs(2), async {
+        // Literal atm-hook handshake with a fixed session ID and PID.
+        client.writer.write_all(concat!(
+            r#"{"protocol_version":{"major":1,"minor":0},"type":"connect","client_id":"hook-source-check-1063205"}"#,
+            "\n"
+        ).as_bytes()).await.unwrap();
+        client.recv().await
+    }).await.expect("legacy handshake before timeout");
+    assert!(
+        matches!(response, DaemonMessage::Connected { client_id, .. }
+        if client_id == "hook-source-check-1063205")
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_request_placeholder_returns_unknown_method_with_id() {
     let server = TestServer::spawn().await;
     let mut client = server.connect().await;

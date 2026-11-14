@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 fn now() -> DateTime<Utc> {
@@ -38,10 +39,78 @@ where
         OrgHandle {
             requests,
             health: status,
+            reads: None,
         },
         cancel,
         task,
     )
+}
+
+#[tokio::test]
+async fn pending_append_is_not_replayed_or_released_live_before_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let log = crate::org::storage::detached_open(Duration::from_secs(2), move || {
+        crate::eventlog::EventLog::open(&path, crate::eventlog::Stream::Events)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap();
+    let (entered, mut entry) = mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let disk = log.clone();
+    let (mut org, cancel, task) = spawn(move |record| {
+        let log = disk.clone();
+        let entered = entered.clone();
+        let gate = gate.clone();
+        async move {
+            let seq = log.append(record.ts, &record.kind, record.body).await?;
+            entered.send(()).await.unwrap();
+            let _permit = gate.acquire().await.unwrap();
+            Ok(seq)
+        }
+    });
+    org.reads = Some(crate::org::watch::ReadAccess {
+        log,
+        reader: crate::org::storage::Reader::start(dir.path().into()).unwrap(),
+    });
+    let mut watch = org.watch(vec![], 0).unwrap();
+    let caller = org.clone();
+    let command = tokio::spawn(async move { caller.execute(project(), now()).await });
+    entry.recv().await.unwrap();
+    assert_eq!(
+        crate::eventlog::read_from(dir.path(), crate::eventlog::Stream::Events, 0).count(),
+        1
+    );
+    assert!(org
+        .tail(crate::org::TailParams::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), watch.next())
+            .await
+            .is_err()
+    );
+    // The cancelled next was awaiting apply, with a live record already read.
+    // It must retain that pending record rather than lose it on cancellation.
+    release.add_permits(1);
+    command.await.unwrap().unwrap();
+    assert_eq!(watch.next().await.unwrap().unwrap().seq, 1);
+    assert_eq!(
+        org.tail(crate::org::TailParams::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    cancel.cancel();
+    task.await.unwrap();
+    assert!(
+        watch.next().await.is_err(),
+        "stopped actor must invalidate a quiet watch"
+    );
 }
 
 // Deliberately control only the disk boundary; decisions/apply/queue are real.
@@ -218,6 +287,7 @@ async fn queue_overload_is_an_explicit_refusal_not_unbounded_work() {
     let org = OrgHandle {
         requests,
         health: status,
+        reads: None,
     };
     let (reply, _) = oneshot::channel();
     org.submit(Request::Snapshot(reply)).unwrap();

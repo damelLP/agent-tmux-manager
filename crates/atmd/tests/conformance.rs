@@ -176,7 +176,12 @@ async fn replay_all_protocol_fixtures() {
     assert!(!paths.is_empty());
     for path in paths {
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let server = Server::start().await;
+        let state = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let mut services = MethodServices::new(spawn_registry());
+        services.state_dir = state.path().into();
+        services.org = atmd::org::OrgHandle::open(state.path().into(), cancel.clone()).await;
+        let server = Server::with_services(services).await;
         let mut client = server.client().await;
         client.connect().await;
         client.send(fixture.request).await;
@@ -184,6 +189,7 @@ async fn replay_all_protocol_fixtures() {
         let compared = compare(actual, fixture.response, &fixture.ignore);
         client.require_next_pong().await;
         server.stop().await;
+        cancel.cancel();
         assert!(compared.is_ok(), "{}: {compared:?}", path.display());
     }
 }
@@ -203,10 +209,13 @@ async fn watch_refused_unwatch_noop_and_legacy_traffic_unchanged() {
         .await;
     let watch = client.recv().await;
     server.stop().await;
-    assert_eq!(
-        watch,
-        json!({"type":"error","code":"unavailable","message":"event watching is not available yet"})
-    );
+    assert_eq!(watch["type"], "error");
+    assert_eq!(watch["code"], "unavailable");
+    assert!(watch["message"]
+        .as_str()
+        .unwrap()
+        .contains("not configured"));
+    assert!(watch.get("id").is_none());
 }
 
 #[tokio::test]

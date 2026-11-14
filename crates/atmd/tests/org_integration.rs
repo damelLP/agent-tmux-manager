@@ -10,7 +10,7 @@ use atmd::server::{methods::MethodServices, DaemonServer};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::{path::Path, time::Duration};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{
     unix::{OwnedReadHalf, OwnedWriteHalf},
     UnixStream,
@@ -215,6 +215,400 @@ async fn captured_cost_clean_flush_and_clear_end_snapshots() {
         }
         cancel.cancel();
     }
+}
+
+#[tokio::test]
+async fn wire_watch_unwatch_independent_of_unsubscribe_and_rewatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let registry = atmd::registry::spawn_registry();
+    let mut services = MethodServices::new(registry.clone());
+    services.org = org.clone();
+    let mut server = SocketServer::start(services).await;
+    org.execute(audit("one"), now()).await.unwrap();
+    server
+        .send(ClientMessage::watch(vec!["control".into()], 0))
+        .await;
+    let event = serde_json::to_value(server.recv().await).unwrap();
+    assert_eq!(
+        event,
+        json!({"type":"event","topic":"control","seq":1,"ts":"2023-11-14T22:13:20Z","kind":"control.sent","body":{"pane":"%12","action":{"text":"one"}}})
+    );
+    server
+        .send(ClientMessage::new(atm_protocol::MessageType::Unsubscribe))
+        .await;
+    server.send(ClientMessage::ping(7)).await;
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::Pong { seq: 7 }
+    ));
+    org.execute(audit("two"), now()).await.unwrap();
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::Event { seq: 2, .. }
+    ));
+    server.send(ClientMessage::subscribe(None)).await;
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::SessionList { .. }
+    ));
+    server.send(ClientMessage::unwatch()).await;
+    server.send(ClientMessage::ping(8)).await;
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::Pong { seq: 8 }
+    ));
+    org.execute(audit("three"), now()).await.unwrap();
+    registry
+        .register_discovered(
+            SessionId::new("live"),
+            1234,
+            "/fixture".into(),
+            None,
+            Harness::Pi,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::SessionUpdated { .. }
+    ));
+    // Replacing an active watch must not leave the old forwarder alive.
+    server
+        .send(ClientMessage::watch(vec!["never".into()], 0))
+        .await;
+    server
+        .send(ClientMessage::watch(vec!["control".into()], 2))
+        .await;
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::Event { seq: 3, .. }
+    ));
+    org.execute(audit("four"), now()).await.unwrap();
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::Event { seq: 4, .. }
+    ));
+    server.send(ClientMessage::ping(9)).await;
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::Pong { seq: 9 }
+    ));
+    server.stop().await;
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn wire_tail_oversized_envelope_and_id_are_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let mut services = MethodServices::new(atmd::registry::spawn_registry());
+    services.org = org.clone();
+    let mut server = SocketServer::start(services).await;
+    org.execute(audit("x".repeat(300_000)), now())
+        .await
+        .unwrap();
+    let id = "i".repeat(800_000);
+    server
+        .send(ClientMessage::request(
+            id.clone(),
+            "log.tail".into(),
+            json!({}),
+            None,
+        ))
+        .await;
+    let result = serde_json::to_value(server.recv().await).unwrap();
+    assert_eq!(result["id"], id);
+    assert_eq!(result["error"]["code"], "refused");
+    assert!(serde_json::to_vec(&result).unwrap().len() < 1_048_576);
+    org.execute(audit("x".repeat(600_000)), now())
+        .await
+        .unwrap();
+    server
+        .send(ClientMessage::request(
+            "r1".into(),
+            "log.tail".into(),
+            json!({"after_seq":1}),
+            None,
+        ))
+        .await;
+    let result = serde_json::to_value(server.recv().await).unwrap();
+    assert_eq!(result["error"]["code"], "refused");
+    assert!(result["error"]["message"].as_str().unwrap().contains('2'));
+    for params in [
+        json!({"limit":1001}),
+        json!({"limits":2}),
+        json!([]),
+        json!({"after_seq":-1}),
+        json!({"topics":"x"}),
+    ] {
+        server
+            .send(ClientMessage::request(
+                "r1".into(),
+                "log.tail".into(),
+                params,
+                None,
+            ))
+            .await;
+        assert_eq!(
+            serde_json::to_value(server.recv().await).unwrap()["error"]["code"],
+            "invalid_params"
+        );
+    }
+    server.stop().await;
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn tail_id_with_no_room_for_even_an_error_closes_without_partial_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let mut services = MethodServices::new(atmd::registry::spawn_registry());
+    services.org = org;
+    let mut server = SocketServer::start(services).await;
+    let mut request = ClientMessage::request(String::new(), "log.tail".into(), json!({}), None);
+    let base = serde_json::to_vec(&request).unwrap().len() + 1;
+    if let atm_protocol::MessageType::Request { id, .. } = &mut request.message {
+        *id = "i".repeat(1_048_576 - base);
+    }
+    assert_eq!(serde_json::to_vec(&request).unwrap().len() + 1, 1_048_576);
+    server.send(request).await;
+    let mut frame = String::new();
+    assert_eq!(
+        timeout(Duration::from_secs(2), server.read.read_line(&mut frame))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    server.stop().await;
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn watch_unwatch_keeps_frame_boundaries_but_shutdown_cancels_blocked_write() {
+    for shutdown in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+        let mut services = MethodServices::new(atmd::registry::spawn_registry());
+        services.org = org.clone();
+        let mut server = SocketServer::start(services).await;
+        org.execute(audit("x".repeat(4 * 1024 * 1024)), now())
+            .await
+            .unwrap();
+        server.send(ClientMessage::watch(vec![], 0)).await;
+        assert_eq!(
+            timeout(Duration::from_secs(2), server.read.read_u8())
+                .await
+                .unwrap()
+                .unwrap(),
+            b'{'
+        );
+        if shutdown {
+            server.cancel.cancel();
+            timeout(Duration::from_millis(500), server.task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        } else {
+            server.send(ClientMessage::unwatch()).await;
+            server.send(ClientMessage::ping(42)).await;
+            let mut frame = String::from("{");
+            timeout(Duration::from_secs(2), server.read.read_line(&mut frame))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&frame).unwrap()["seq"],
+                1
+            );
+            assert!(matches!(
+                server.recv().await,
+                DaemonMessage::Pong { seq: 42 }
+            ));
+            server.stop().await;
+        }
+        cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn watch_replay_error_has_code_without_id_and_ping_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    org.execute(audit("one"), now()).await.unwrap();
+    // A real post-start read fault, not a disabled-service setup refusal.
+    std::fs::write(dir.path().join("log/events/00000001.jsonl"), b"broken\n").unwrap();
+    let mut services = MethodServices::new(atmd::registry::spawn_registry());
+    services.org = org;
+    let mut server = SocketServer::start(services).await;
+    server.send(ClientMessage::watch(vec![], 0)).await;
+    let error = serde_json::to_value(server.recv().await).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["code"], "unavailable");
+    assert!(error.get("id").is_none());
+    assert!(error["message"].as_str().unwrap().contains("line 1"));
+    server.send(ClientMessage::ping(8)).await;
+    assert!(matches!(
+        server.recv().await,
+        DaemonMessage::Pong { seq: 8 }
+    ));
+    server.stop().await;
+    cancel.cancel();
+}
+
+fn audit(text: impl Into<String>) -> OrgCommand {
+    OrgCommand::ControlSent(atm_org::ControlAudit {
+        pane: "%12".into(),
+        action: json!({"text":text.into()}),
+    })
+}
+
+#[tokio::test]
+async fn watch_replay_live_overlap_reconnect_and_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    org.execute(project(), now()).await.unwrap();
+    let mut watch = org.watch(vec![], 0).unwrap();
+    // These writes occur after subscription but before replay: exactly once.
+    org.execute(audit("two"), now()).await.unwrap();
+    org.execute(audit("three"), now()).await.unwrap();
+    for seq in 1..=3 {
+        assert_eq!(
+            timeout(Duration::from_secs(2), watch.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .seq,
+            seq
+        );
+    }
+    org.execute(audit("four"), now()).await.unwrap();
+    assert_eq!(watch.next().await.unwrap().unwrap().seq, 4);
+    let mut reconnect = org
+        .watch(vec!["control".into(), "control.sent".into()], 2)
+        .unwrap();
+    assert_eq!(reconnect.next().await.unwrap().unwrap().seq, 3);
+    assert_eq!(reconnect.next().await.unwrap().unwrap().seq, 4);
+    assert!(timeout(Duration::from_millis(30), reconnect.next())
+        .await
+        .is_err());
+    // Cancelling an idle next must not lose the next event.
+    org.execute(audit("five"), now()).await.unwrap();
+    assert_eq!(reconnect.next().await.unwrap().unwrap().seq, 5);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn watch_lag_replays_without_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let mut watch = org.watch(vec![], 0).unwrap();
+    org.execute(audit("first"), now()).await.unwrap();
+    assert_eq!(watch.next().await.unwrap().unwrap().seq, 1);
+    // Exceed the actual EventLog broadcast capacity while not polling watch.
+    for n in 2..=1100 {
+        org.execute(audit(n.to_string()), now()).await.unwrap();
+    }
+    for seq in 2..=1100 {
+        assert_eq!(
+            timeout(Duration::from_secs(2), watch.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .seq,
+            seq
+        );
+    }
+    assert!(timeout(Duration::from_millis(30), watch.next())
+        .await
+        .is_err());
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn tail_pages_by_count_and_bytes_and_sparse_filters_progress() {
+    use atmd::org::TailParams;
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    for n in 0..600 {
+        org.execute(audit(n.to_string()), now()).await.unwrap();
+    }
+    org.execute(project(), now()).await.unwrap();
+    let sparse = org
+        .tail(TailParams {
+            topics: vec!["project".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(sparse.len(), 1);
+    assert_eq!(sparse[0].seq, 601);
+    let page = org
+        .tail(TailParams {
+            after_seq: 598,
+            limit: 2,
+            topics: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), [599, 600]);
+    for _ in 0..3 {
+        org.execute(audit("x".repeat(220_000)), now())
+            .await
+            .unwrap();
+    }
+    let page = org
+        .tail(TailParams {
+            after_seq: 601,
+            limit: 1000,
+            topics: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), [602, 603]);
+    assert!(serde_json::to_vec(&page).unwrap().len() <= 512 * 1024);
+    let page = org
+        .tail(TailParams {
+            after_seq: 603,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].seq, 604);
+    org.execute(audit("x".repeat(600_000)), now())
+        .await
+        .unwrap();
+    let err = org
+        .tail(TailParams {
+            after_seq: 604,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("605"));
+    for limit in [0, 1001] {
+        assert!(org
+            .tail(TailParams {
+                limit,
+                ..Default::default()
+            })
+            .await
+            .is_err());
+    }
+    cancel.cancel();
 }
 
 fn now() -> DateTime<Utc> {

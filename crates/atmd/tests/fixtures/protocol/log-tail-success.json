@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"tail-empty","method":"log.tail","params":{}},
+  "response": {"type":"response","id":"tail-empty","result":[]},
+  "ignore": []
+}

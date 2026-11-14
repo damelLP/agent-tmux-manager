@@ -144,6 +144,8 @@ pub struct ConnectionHandler {
 
     methods: Arc<MethodRouter>,
     raw: crate::org::RawHandle,
+    org: crate::org::OrgHandle,
+    watcher: Option<Forwarder>,
 }
 
 impl ConnectionHandler {
@@ -182,11 +184,18 @@ impl ConnectionHandler {
             forwarder: None,
             methods,
             raw: crate::org::RawHandle::default(),
+            org: crate::org::OrgHandle::disabled("organisation service not configured"),
+            watcher: None,
         }
     }
 
     pub fn with_raw(mut self, raw: crate::org::RawHandle) -> Self {
         self.raw = raw;
+        self
+    }
+
+    pub fn with_org(mut self, org: crate::org::OrgHandle) -> Self {
+        self.org = org;
         self
     }
 
@@ -323,6 +332,7 @@ impl ConnectionHandler {
         let mut requests = JoinSet::new();
         let result = self.process_message_loop(&mut requests).await;
         self.stop_forwarder().await;
+        self.stop_watcher().await;
         let mut writable = result.is_ok() && !self.peer_failed.is_cancelled();
         // EOF/disconnect closes only input. Finish accepted work up to its own
         // deadline, even if the peer can no longer receive replies. Only daemon
@@ -356,6 +366,12 @@ impl ConnectionHandler {
         let writer = Arc::clone(&self.writer);
         loop {
             let subscribed = self.subscribed;
+            let watch_stop = self
+                .watcher
+                .as_ref()
+                .map(|watcher| watcher.stop.clone())
+                .unwrap_or_default();
+            let mut watching = self.watcher.is_some() && !watch_stop.is_cancelled();
             let mut idle_at = tokio::time::Instant::now() + READ_TIMEOUT;
             let read = {
                 // Keep this future alive across job completions: read_message
@@ -377,7 +393,11 @@ impl ConnectionHandler {
                             idle_at = tokio::time::Instant::now() + READ_TIMEOUT;
                         }
                         read = &mut read => break read,
-                        _ = tokio::time::sleep_until(idle_at), if !subscribed && requests.is_empty() => {
+                        _ = watch_stop.cancelled(), if watching => {
+                            watching = false;
+                            idle_at = tokio::time::Instant::now() + READ_TIMEOUT;
+                        }
+                        _ = tokio::time::sleep_until(idle_at), if !subscribed && !watching && requests.is_empty() => {
                             return Err(ConnectionError::Timeout);
                         }
                     }
@@ -449,6 +469,24 @@ impl ConnectionHandler {
                     let response = done.map_err(|e| ConnectionError::RequestTask(e.to_string()))?;
                     self.send_message(response).await?;
                 }
+                // The tail payload budget leaves room for ordinary IDs. A
+                // pathological ID can still push the complete line over 1 MiB.
+                // Check before admission too: overload errors must fit as well.
+                let tail_refusal = if method == "log.tail" {
+                    let refusal = DaemonMessage::response_err(
+                        id.clone(),
+                        error_code::REFUSED,
+                        "log.tail response exceeds 1 MiB; use a shorter id or smaller limit",
+                    );
+                    if !fits_response(&refusal) {
+                        return Err(ConnectionError::Io(
+                            "log.tail request id leaves no room for a response".into(),
+                        ));
+                    }
+                    Some(refusal)
+                } else {
+                    None
+                };
                 if requests.len() >= 64 {
                     self.send_message(DaemonMessage::response_err(
                         id,
@@ -466,22 +504,38 @@ impl ConnectionHandler {
                 };
                 let methods = Arc::clone(&self.methods);
                 requests.spawn(async move {
-                    match methods.call(context, &method, params).await {
+                    let response = match methods.call(context, &method, params).await {
                         Ok(value) => DaemonMessage::response_ok(id, value),
                         Err(error) => {
                             DaemonMessage::response_err(id, &error.0.code, &error.0.message)
                         }
+                    };
+                    match tail_refusal {
+                        Some(refusal) if !fits_response(&response) => refusal,
+                        _ => response,
                     }
                 });
             }
-            MessageType::Watch { .. } => {
-                self.send_message(DaemonMessage::error_with_code(
-                    "event watching is not available yet",
-                    error_code::UNAVAILABLE,
-                ))
-                .await?;
+            MessageType::Watch { topics, cursor } => {
+                self.stop_watcher().await;
+                match self.org.watch(topics, cursor) {
+                    Ok(watch) => {
+                        self.watcher = Some(Forwarder::watch(
+                            watch,
+                            Arc::clone(&self.writer),
+                            &self.peer_failed,
+                        ));
+                    }
+                    Err(error) => {
+                        self.send_message(DaemonMessage::error_with_code(
+                            &error.to_string(),
+                            error_code::UNAVAILABLE,
+                        ))
+                        .await?
+                    }
+                }
             }
-            MessageType::Unwatch => {}
+            MessageType::Unwatch => self.stop_watcher().await,
 
             MessageType::StatusUpdate { data } => {
                 self.raw
@@ -903,6 +957,16 @@ impl ConnectionHandler {
         }
     }
 
+    async fn stop_watcher(&mut self) {
+        if let Some(watcher) = self.watcher.take() {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {},
+                _ = watcher.stop() => {},
+            }
+        }
+    }
+
     /// Handles a discovery request from a TUI client.
     async fn handle_discover(&mut self) -> DiscoveryResult {
         info!(client_id = ?self.client_id, "Processing discovery request");
@@ -1067,6 +1131,45 @@ impl Forwarder {
         Self { stop, task }
     }
 
+    fn watch(
+        mut events: crate::org::EventWatch,
+        writer: SubscriberWriter,
+        connection: &CancellationToken,
+    ) -> Self {
+        let stop = connection.child_token();
+        let mut task = JoinSet::new();
+        let stopped = stop.clone();
+        let connection = connection.clone();
+        task.spawn(async move {
+            let _done = stopped.clone().drop_guard();
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = stopped.cancelled() => break,
+                    event = events.next() => event,
+                };
+                let (message, done) = match event {
+                    Ok(Some(event)) => (crate::org::event_message(&event), false),
+                    Ok(None) => break,
+                    Err(error) => (
+                        DaemonMessage::error_with_code(&error.to_string(), error_code::UNAVAILABLE),
+                        true,
+                    ),
+                };
+                // Unwatch waits at frame boundaries. Shutdown drops the owning
+                // JoinSet, cancelling even a blocked write to this peer.
+                if write_message(&writer, &message).await.is_err() {
+                    connection.cancel();
+                    break;
+                }
+                if done {
+                    break;
+                }
+            }
+        });
+        Self { stop, task }
+    }
+
     /// Stops forwarding and waits for the task. The task only checks
     /// `stop` between events, so it never leaves half a line behind.
     async fn stop(mut self) {
@@ -1159,6 +1262,10 @@ pub async fn send_event(
     };
 
     write_message(writer, &msg).await
+}
+
+fn fits_response(message: &DaemonMessage) -> bool {
+    serde_json::to_vec(message).is_ok_and(|bytes| bytes.len() < MAX_MESSAGE_SIZE)
 }
 
 /// Serializes one complete reply under the connection's shared writer lock.
@@ -1751,6 +1858,65 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn watch_only_survives_idle_timeout_then_unwatch_restores_it() {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let (read, write) = ours.into_split();
+        let cancel = CancellationToken::new();
+        let mut handler = ConnectionHandler::new(
+            read,
+            write,
+            crate::registry::spawn_registry(),
+            Arc::new(RwLock::new(HashMap::new())),
+            1,
+            cancel,
+            request_router(),
+        );
+        // Idle transport only: a fake quiet watch avoids paused clocks racing
+        // filesystem workers. Real watch setup/delivery is tested over sockets.
+        let stop = CancellationToken::new();
+        let stopped = stop.clone();
+        let mut task = JoinSet::new();
+        task.spawn(async move {
+            stopped.cancelled().await;
+        });
+        handler.watcher = Some(Forwarder { stop, task });
+        let run = tokio::spawn(handler.run());
+        let (read, mut write) = peer.into_split();
+        let mut read = BufReader::new(read);
+        send_client(&mut write, ClientMessage::connect(None)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Connected { .. }
+        ));
+        tokio::time::sleep(READ_TIMEOUT + Duration::from_secs(1)).await;
+        send_client(&mut write, ClientMessage::ping(1)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 1 }
+        ));
+        send_client(&mut write, ClientMessage::unwatch()).await;
+        send_client(&mut write, ClientMessage::ping(2)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 2 }
+        ));
+        let start = tokio::time::Instant::now();
+        let mut line = String::new();
+        assert_eq!(
+            timeout(
+                READ_TIMEOUT + Duration::from_secs(1),
+                read.read_line(&mut line)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            0
+        );
+        assert!(start.elapsed() >= READ_TIMEOUT);
+        run.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pending_request_exempts_idle_then_completion_restarts_idle() {
         let (mut read, mut write, _cancel, run) = request_connection(request_router()).await;
         send_client(&mut write, request("long", 301)).await;
@@ -1768,6 +1934,37 @@ mod tests {
         );
         assert!(start.elapsed() >= READ_TIMEOUT);
         run.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tail_response_limit_also_applies_when_request_queue_is_full() {
+        let (mut read, mut write, cancel, run) = request_connection(request_router()).await;
+        for n in 0..64 {
+            send_client(&mut write, request(&n.to_string(), 100)).await;
+        }
+        send_client(&mut write, ClientMessage::ping(42)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 42 }
+        ));
+        let mut message = ClientMessage::request(
+            String::new(),
+            "log.tail".into(),
+            serde_json::json!({}),
+            None,
+        );
+        let base = serde_json::to_vec(&message).unwrap().len() + 1;
+        if let MessageType::Request { id, .. } = &mut message.message {
+            *id = "i".repeat(MAX_MESSAGE_SIZE - base);
+        }
+        send_client(&mut write, message).await;
+        let byte = timeout(Duration::from_millis(50), read.read_u8()).await;
+        cancel.cancel();
+        timeout(Duration::from_secs(1), run).await.unwrap().unwrap();
+        assert!(
+            byte.is_err() || matches!(byte, Ok(Err(_))),
+            "oversized capacity error started a frame"
+        );
     }
 
     #[tokio::test(start_paused = true)]

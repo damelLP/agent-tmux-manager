@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"tail-invalid","method":"log.tail","params":{"limit":0}},
+  "response": {"type":"response","id":"tail-invalid","error":{"code":"invalid_params","message":"MESSAGE"}},
+  "ignore": ["/error/message"]
+}

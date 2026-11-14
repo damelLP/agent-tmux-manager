@@ -15,6 +15,10 @@ mod actor;
 mod raw;
 mod storage;
 mod summary;
+mod watch;
+
+pub(crate) use watch::message as event_message;
+pub use watch::{EventWatch, TailParams};
 
 pub use raw::RawHandle;
 pub use summary::SummaryObserver;
@@ -23,7 +27,7 @@ use std::{path::PathBuf, time::Duration};
 
 use atm_org::{OrgCommand, OrgState, Refusal};
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch as health_watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::eventlog::Envelope;
@@ -39,6 +43,10 @@ pub enum OrgServiceError {
     Refused(#[from] Refusal),
     #[error("organisation request timed out; accepted work may still complete")]
     Timeout,
+    #[error("invalid log.tail parameters: {0}")]
+    InvalidParams(String),
+    #[error("event at sequence {0} exceeds the log.tail byte budget")]
+    Oversized(u64),
 }
 
 type Health = Result<u64, String>;
@@ -57,29 +65,42 @@ enum Request {
 #[derive(Clone, Debug)]
 pub struct OrgHandle {
     requests: mpsc::Sender<Request>,
-    health: watch::Receiver<Health>,
+    health: health_watch::Receiver<Health>,
+    reads: Option<watch::ReadAccess>,
 }
 
 impl OrgHandle {
     /// An explicitly disabled service, useful before startup or for legacy tests.
     pub fn disabled(reason: impl Into<String>) -> Self {
         let (requests, _) = mpsc::channel(1);
-        let (_, health) = watch::channel(Err(reason.into()));
-        Self { requests, health }
+        let (_, health) = health_watch::channel(Err(reason.into()));
+        Self {
+            requests,
+            health,
+            reads: None,
+        }
     }
 
     /// Opens/replays once; an error becomes an unavailable service, not a daemon
     /// startup error. The caller must not retry a hung filesystem operation.
     pub async fn open(state_dir: PathBuf, cancel: CancellationToken) -> Self {
-        let ready = match storage::open(state_dir).await {
+        let ready = match storage::open(state_dir.clone()).await {
             Ok(ready) => ready,
             Err(error) => {
                 tracing::warn!(%error, "Organisation persistence disabled");
                 return Self::disabled(error);
             }
         };
+        let reader = match storage::Reader::start(state_dir) {
+            Ok(reader) => reader,
+            Err(error) => return Self::disabled(error),
+        };
+        let reads = Some(watch::ReadAccess {
+            log: ready.log.clone(),
+            reader,
+        });
         let (requests, receive) = mpsc::channel(64);
-        let (health, status) = watch::channel(Ok(ready.seq));
+        let (health, status) = health_watch::channel(Ok(ready.seq));
         tokio::spawn(actor::run(
             ready.state,
             receive,
@@ -93,6 +114,7 @@ impl OrgHandle {
         Self {
             requests,
             health: status,
+            reads,
         }
     }
 

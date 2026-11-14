@@ -151,6 +151,27 @@ pub fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, MethodError
 /// here; their addition never requires another connection dispatch arm.
 pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     let mut router = MethodRouter::default();
+    let org = services.org;
+    router.register("log.tail", Duration::from_secs(5), move |_, params| {
+        let org = org.clone();
+        async move {
+            let params = parse_params::<crate::org::TailParams>(params)?;
+            let records = org.tail(params).await.map_err(|error| {
+                use crate::org::OrgServiceError;
+                let code = match &error {
+                    OrgServiceError::InvalidParams(_) => error_code::INVALID_PARAMS,
+                    OrgServiceError::Oversized(_) | OrgServiceError::Refused(_) => {
+                        error_code::REFUSED
+                    }
+                    OrgServiceError::Timeout => error_code::TIMEOUT,
+                    OrgServiceError::Unavailable(_) => error_code::UNAVAILABLE,
+                };
+                MethodError::new(code, error.to_string())
+            })?;
+            serde_json::to_value(records)
+                .map_err(|error| MethodError::new(error_code::INTERNAL, error.to_string()))
+        }
+    })?;
 
     // Add service-backed registrations above this finalization. The factory,
     // not callers, owns the complete capability snapshot used by daemon.info.

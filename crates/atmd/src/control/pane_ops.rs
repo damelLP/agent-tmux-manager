@@ -29,19 +29,40 @@ pub(in crate::control) enum Action {
         guard: Option<(CaptureFormat, Guard)>,
     },
     Split(SpawnContext, PaneDirection, String),
-    Kill(PaneId, AgentId),
+    Kill(
+        PaneId,
+        AgentId,
+        serde_json::Value,
+        chrono::DateTime<chrono::Utc>,
+    ),
 }
 pub(in crate::control) enum Output {
     Inspection(Option<PaneInspection>),
     Capture(PaneCapture),
     Pane(PaneId),
+    Audit(std::sync::Arc<super::kill_audit::KillAudit>),
     Done,
 }
 impl Action {
+    pub(super) fn audit(&self) -> Option<(atm_org::OrgCommand, chrono::DateTime<chrono::Utc>)> {
+        match self {
+            Self::Kill(pane, _, action, now) => Some((
+                atm_org::OrgCommand::ControlKilled(atm_org::ControlAudit {
+                    pane: pane.to_string(),
+                    action: action.clone(),
+                }),
+                *now,
+            )),
+            _ => None,
+        }
+    }
+
     fn owned_pane(&self) -> Option<&PaneId> {
         match self {
             Self::Inspect(_) | Self::Split(..) => None,
-            Self::Capture(p, _) | Self::Tag(p, _) | Self::Untag(p, _) | Self::Kill(p, _) => Some(p),
+            Self::Capture(p, _) | Self::Tag(p, _) | Self::Untag(p, _) | Self::Kill(p, ..) => {
+                Some(p)
+            }
             Self::Input { pane, .. } => Some(pane),
         }
     }
@@ -49,7 +70,7 @@ impl Action {
         match self {
             Self::Tag(_, ExpectedTag::Agent(agent))
             | Self::Untag(_, agent)
-            | Self::Kill(_, agent) => Some(agent),
+            | Self::Kill(_, agent, ..) => Some(agent),
             Self::Input { expected, .. } => Some(expected),
             _ => None,
         }
@@ -148,7 +169,7 @@ pub(super) async fn execute(
                 .map_err(tmux)?;
             Ok(Output::Done)
         }
-        Action::Kill(pane, expected) => {
+        Action::Kill(pane, expected, _, _) => {
             check_tag(
                 &pane,
                 &ExpectedTag::Agent(expected),

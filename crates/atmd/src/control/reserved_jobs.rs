@@ -1,6 +1,6 @@
 //! Bounded daemon-owned jobs. No caller future owns release or callback lifetime.
 
-use std::{collections::HashMap, fmt::Display, future::Future, pin::Pin};
+use std::{collections::HashMap, fmt::Display, future::Future, pin::Pin, sync::Arc};
 use tokio::{
     sync::oneshot,
     task::{Id, JoinSet},
@@ -9,6 +9,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    kill_audit::KillAudit,
     state::{self, Fence, OperationId, State},
     Completion, ControlHandle, Reservation, ReservationError, ReservationRequest,
 };
@@ -81,11 +82,16 @@ where
             let deadline = Instant::now() + state::CLEANUP_TIMEOUT;
             let cleaned = match reservation.begin_cleanup(deadline).await {
                 Ok(cleanup_token) => {
-                    phase(deadline, None, async move {
+                    let drain_token = cleanup_token.clone();
+                    let cleaned = phase(deadline, None, async move {
                         cleanup(cleanup_token, completion).await
                     })
                     .await
-                    .0
+                    .0;
+                    // Even if work dropped its kill future, the actor retained
+                    // its ack. Never release ownership while it is pending.
+                    let drained = drain_token.drain_audits(deadline).await.map_err(E::from);
+                    cleaned.and(drained)
                 }
                 Err(error) => Err(error.into()),
             };
@@ -157,6 +163,10 @@ pub(in crate::control) enum Command {
         deadline: Instant,
         reply: oneshot::Sender<Result<super::pane_ops::Output, ReservationError>>,
     },
+    Drain {
+        fence: Fence,
+        reply: oneshot::Sender<Result<Option<Arc<KillAudit>>, ReservationError>>,
+    },
     Cleanup {
         fence: Fence,
         deadline: Instant,
@@ -166,13 +176,20 @@ pub(in crate::control) enum Command {
 
 impl Command {
     pub(in crate::control) fn reject(self) {
+        self.reject_with(ReservationError::Unavailable);
+    }
+
+    pub(in crate::control) fn reject_with(self, error: ReservationError) {
         match self {
-            Self::Acquire(admission) => admission.job.reject(ReservationError::Unavailable),
+            Self::Acquire(admission) => admission.job.reject(error),
             Self::Pane { reply, .. } => {
-                let _ = reply.send(Err(ReservationError::Unavailable));
+                let _ = reply.send(Err(error));
+            }
+            Self::Drain { reply, .. } => {
+                let _ = reply.send(Err(error));
             }
             Self::Cleanup { reply, .. } => {
-                let _ = reply.send(Err(ReservationError::Unavailable));
+                let _ = reply.send(Err(error));
             }
         }
     }
@@ -184,16 +201,23 @@ pub(in crate::control) struct Jobs {
     running: JoinSet<Finished>,
     task_ids: HashMap<Id, OperationId>,
     cancel: CancellationToken,
+    audit_queue: crate::control::service::AuditQueue,
+    kill_audits: HashMap<OperationId, Arc<KillAudit>>,
 }
 
 impl Jobs {
-    pub(in crate::control) fn new(cancel: CancellationToken) -> Self {
+    pub(in crate::control) fn new(
+        cancel: CancellationToken,
+        audit_queue: crate::control::service::AuditQueue,
+    ) -> Self {
         Self {
             state: State::default(),
             waiting: HashMap::new(),
             running: JoinSet::new(),
             task_ids: HashMap::new(),
             cancel,
+            audit_queue,
+            kill_audits: HashMap::new(),
         }
     }
 
@@ -224,13 +248,26 @@ impl Jobs {
                 deadline,
                 reply,
             } => {
-                let result = match self
+                let audit = action.audit();
+                let mut result = match self
                     .state
                     .check(&fence, None, now)
                     .and_then(|()| self.state.deadline(&fence))
                 {
                     Err(error) => Err(error),
                     Ok(_) if now >= deadline => Err(ReservationError::Timeout),
+                    Ok(_)
+                        if audit.is_some()
+                            && self
+                                .kill_audits
+                                .get(&fence.operation)
+                                .is_some_and(|audit| audit.pending()) =>
+                    {
+                        Err(ReservationError::InvalidRequest {
+                            reason: "await the previous kill audit before killing another pane"
+                                .into(),
+                        })
+                    }
                     Ok(work_deadline) => tokio::time::timeout_at(
                         deadline.min(work_deadline),
                         super::pane_ops::execute(client, &mut self.state, &fence, action, now),
@@ -238,6 +275,20 @@ impl Jobs {
                     .await
                     .unwrap_or(Err(ReservationError::Timeout)),
                 };
+                if result.is_ok() {
+                    if let Some((command, time)) = audit {
+                        let ack = KillAudit::submit(&self.audit_queue, command, time);
+                        self.kill_audits.insert(fence.operation, ack.clone());
+                        result = Ok(super::pane_ops::Output::Audit(ack));
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            Command::Drain { fence, reply } => {
+                let result = self
+                    .state
+                    .check(&fence, None, now)
+                    .map(|()| self.kill_audits.get(&fence.operation).cloned());
                 let _ = reply.send(result);
             }
             Command::Cleanup {
@@ -302,6 +353,7 @@ impl Jobs {
                 Err(error) => error.id(),
             };
             if let Some(id) = self.task_ids.remove(&task_id) {
+                self.kill_audits.remove(&id);
                 match result {
                     Ok((_, finished)) => {
                         self.state.finish(id, finished.reusable);
@@ -336,7 +388,7 @@ mod tests {
             crate::org::OrgHandle::disabled("supervisor test"),
             cancel.clone(),
         );
-        let mut jobs = Jobs::new(cancel.clone());
+        let mut jobs = Jobs::new(cancel.clone(), control.audit_queue());
         let (job, response) = job::<(), ReservationError, _, _, _, _>(
             |_| async { panic!("ungranted work ran after shutdown") },
             |_, _| async { panic!("ungranted cleanup ran after shutdown") },

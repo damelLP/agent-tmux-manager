@@ -81,6 +81,44 @@ fn reservation_waiters_fifo_atomic_and_one_kind_cannot_fill_pool() {
     assert_eq!(ready[0].0, second);
 }
 #[test]
+fn reservation_lifecycle_contention_holds_agent_and_pane_atomically() {
+    let now = Instant::now();
+    let mut state = State::default();
+    let active = state
+        .admit(request("p/a", Some("%1"), ReservationKind::Clear, now), now)
+        .unwrap();
+    state.ready(now);
+    let waiting = state
+        .admit(
+            request("p/a", Some("%2"), ReservationKind::Respawn, now),
+            now,
+        )
+        .unwrap();
+    assert!(state.ready(now).is_empty());
+    assert_eq!(
+        state
+            .entries
+            .iter()
+            .find(|entry| entry.id == waiting)
+            .unwrap()
+            .phase,
+        Phase::Waiting
+    );
+    // The held agent blocks replacement even when the requested pane differs.
+    state.finish(active, true);
+    let ready = state.ready(now);
+    assert_eq!(ready.len(), 1);
+    let fence = ready[0].1.as_ref().unwrap();
+    state
+        .check(fence, Some(&PaneId::parse("%2").unwrap()), now)
+        .unwrap();
+    assert!(matches!(
+        state.check(fence, Some(&PaneId::parse("%1").unwrap()), now),
+        Err(ReservationError::StaleReservation)
+    ));
+}
+
+#[test]
 fn reservation_quarantine_does_not_take_live_pool_capacity() {
     let now = Instant::now();
     let mut state = State::default();

@@ -3,6 +3,69 @@ fn fixture() -> serde_json::Value {
     serde_json::from_str(include_str!("fixtures/tmux_3.8_reserved_observations.json")).unwrap()
 }
 #[test]
+fn reservation_kind_allowlist_excludes_observer_input_and_delivery_destruction() {
+    let pane = PaneId::parse("%0").unwrap();
+    let agent = "p/a".parse().unwrap();
+    let actions = [
+        Action::Inspect(pane.clone()),
+        Action::Capture(pane.clone(), CaptureFormat::Plain),
+        Action::Tag(pane.clone(), ExpectedTag::Absent),
+        Action::Untag(pane.clone(), agent),
+        Action::Input {
+            pane: pane.clone(),
+            expected: "p/a".parse().unwrap(),
+            input: Input::Key(PaneKey::Enter),
+            guard: None,
+        },
+        Action::Split(
+            SpawnContext::new("%0".into(), None, false),
+            PaneDirection::Below,
+            "50%".into(),
+        ),
+        Action::Kill(
+            pane,
+            "p/a".parse().unwrap(),
+            serde_json::Value::Null,
+            chrono::Utc::now(),
+        ),
+    ];
+    for (kind, allowed) in [
+        (
+            ReservationKind::Up,
+            [true, true, true, false, true, true, false],
+        ),
+        (
+            ReservationKind::Adopt,
+            [true, true, true, false, false, false, false],
+        ),
+        (
+            ReservationKind::Clear,
+            [true, true, false, false, true, false, false],
+        ),
+        (
+            ReservationKind::Respawn,
+            [true, true, true, true, true, true, true],
+        ),
+        (
+            ReservationKind::Down,
+            [true, true, false, true, false, false, true],
+        ),
+        (
+            ReservationKind::Delivery,
+            [true, true, false, false, true, false, false],
+        ),
+        (
+            ReservationKind::Observe,
+            [true, true, false, false, false, false, false],
+        ),
+    ] {
+        for (action, expected) in actions.iter().zip(allowed) {
+            assert_eq!(action.allowed(kind), expected, "{kind:?}");
+        }
+    }
+}
+
+#[test]
 fn reservation_decodes_real_tmux_frames_and_preserves_whitespace_style() {
     let data = fixture();
     let pane = PaneId::parse("%0").unwrap();

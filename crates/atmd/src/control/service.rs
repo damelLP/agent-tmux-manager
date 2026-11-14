@@ -377,6 +377,10 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "reservation_audit_tests.rs"]
+mod reservation_audit_tests;
+
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -661,7 +665,8 @@ impl ControlHandle {
 /// Start exactly one actor at the daemon's I/O boundary, not when constructing
 /// services. Inject clones of the same handle into RPC, U8 and U9b consumers.
 /// The owner cancels and joins this task before dropping its registry.
-/// This compatibility constructor does not audit kills.
+/// Send/spawn and reserved kills share the sole bounded audit queue. A disabled
+/// OrgHandle permits control but logs audit failures without retrying effects.
 pub fn spawn_control(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
@@ -718,7 +723,7 @@ where
                 }
             }
         });
-        let mut jobs = Jobs::new(cancel.clone());
+        let mut jobs = Jobs::new(cancel.clone(), audits.clone());
         let mut stopping = false;
         loop {
             if stopping && jobs.is_empty() {
@@ -737,7 +742,18 @@ where
                 pending = requests.recv() => {
                     let Some(pending) = pending else { break };
                     match pending {
-                        self::Pending { request: Request::Reserved(command), .. } => {
+                        self::Pending { request: Request::Reserved(command), server, deadline, .. } => {
+                            // A capability is minted only after U7's server-identity
+                            // guard; later operations carry its same actor fence.
+                            if !stopping && matches!(command, Command::Acquire(_)) {
+                                if let Some(server) = server {
+                                    let budget = deadline.min(Instant::now() + ACTION_TIMEOUT);
+                                    if let Err(error) = outcome(budget, verify_server(&*client, server, "reserve pane control".into())).await {
+                                        command.reject_with(ReservationError::InvalidRequest { reason: error.to_string() });
+                                        continue;
+                                    }
+                                }
+                            }
                             jobs.dispatch(command, Instant::now(), stopping, &*client).await;
                         }
                         pending => {
@@ -783,19 +799,18 @@ where
 /// Inject it from MethodServices at the daemon's I/O boundary; tests may use the
 /// real control actor over MockTmuxClient, with a private or disabled OrgHandle.
 ///
-/// **Contract checkpoint:** organisation-aware behavior is not wired yet. This
-/// starts the reservation-capable actor; the org argument is not used yet.
-/// Reserved pane effects and cleanup run, but kills are not audited yet.
-/// Production startup continues using spawn_control until org integration lands.
+/// Alias for U7's organisation-aware startup. Both entry points create the same
+/// reservation-capable actor and audit queue; use only one per daemon.
+/// **Checkpoint:** durable clearing/exclusion gating still awaits Task 4.
 /// Legacy gating must consume an org snapshot/watch mirror outside the tmux
 /// actor, never await org snapshots inside a short pane operation.
 pub fn spawn_control_with_org(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
-    _org: crate::org::OrgHandle,
+    org: crate::org::OrgHandle,
     cancel: CancellationToken,
 ) -> (ControlHandle, JoinHandle<()>) {
-    spawn_control(client, registry, _org, cancel)
+    spawn_control(client, registry, org, cancel)
 }
 
 async fn outcome<T>(

@@ -2,11 +2,10 @@
 //!
 //! # Implementation checkpoint — fenced pane effects
 //!
-//! Ownership, supervision, pane effects and guarded input are implemented.
-//! Kill audit and legacy send/spawn isolation still await integration: **existing
-//! legacy send/spawn bypass reservations at this checkpoint**, and kill is not
-//! audited yet. The legacy-path/audit recipes below are the remaining contract,
-//! not guarantees provided by this checkpoint.
+//! Ownership, supervision, pane effects, guarded input and kill audit are
+//! implemented. Legacy send/spawn isolation still awaits integration: **existing
+//! legacy send/spawn bypass reservations at this checkpoint**. The legacy-path
+//! recipes below are the remaining contract, not guarantees of this checkpoint.
 //!
 //! # Ownership and ordering
 //!
@@ -117,6 +116,8 @@ use super::{service::ControlHandle, ControlError, SpawnContext};
 
 #[path = "reserved_jobs.rs"]
 pub(super) mod jobs;
+#[path = "kill_audit.rs"]
+pub(super) mod kill_audit;
 #[path = "pane_ops.rs"]
 pub(super) mod pane_ops;
 #[path = "reservation_state.rs"]
@@ -434,6 +435,22 @@ impl Reservation {
         }
     }
 
+    async fn drain_audits(&self, deadline: Instant) -> Result<(), ReservationError> {
+        let pending = self
+            .control
+            .reservation_request(deadline, |reply| jobs::Command::Drain {
+                fence: self.fence.clone(),
+                reply,
+            })
+            .await?;
+        if let Some(audit) = pending {
+            tokio::time::timeout_at(deadline, audit.wait())
+                .await
+                .map_err(|_| ReservationError::Timeout)?;
+        }
+        Ok(())
+    }
+
     async fn begin_cleanup(&self, deadline: Instant) -> Result<Self, ReservationError> {
         let fence = self
             .control
@@ -622,9 +639,11 @@ impl Reservation {
     }
 
     /// Down/Respawn: kill once after fence/tag checks; expected must equal
-    /// self.agent(). **Checkpoint: kill works but audit is not wired yet.**
-    /// The integration contract is to submit ControlKilled through the
-    /// configured OrgHandle using the supplied action/time. Audit failure never
+    /// self.agent(). Submit ControlKilled through the actor's sole audit queue
+    /// using the supplied action/time, then await its acknowledgement outside
+    /// the actor. At most one unacknowledged kill per job; await it before another.
+    /// A disabled organisation still permits the kill but cannot persist an audit.
+    /// The actor/supervisor retain the acknowledgement even if this future drops. Audit failure never
     /// fails/repeats a successful kill. The owned continuation attempts audit even
     /// if the reply future disappears; persistence does not block the tmux actor.
     /// No success audit is invented for a failed or outcome-unknown kill.
@@ -632,11 +651,24 @@ impl Reservation {
         &self,
         pane: &PaneId,
         expected: AgentId,
-        _action: serde_json::Value,
-        _now: DateTime<Utc>,
+        action: serde_json::Value,
+        now: DateTime<Utc>,
     ) -> Result<(), ReservationError> {
-        self.effect(pane_ops::Action::Kill(pane.clone(), expected))
-            .await
+        match self
+            .operation(pane_ops::Action::Kill(pane.clone(), expected, action, now))
+            .await?
+        {
+            pane_ops::Output::Audit(audit) => {
+                if tokio::time::timeout_at(self.deadline, audit.wait())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(%pane, "kill audit wait timed out; supervisor retains acknowledgement, kill is not retried");
+                }
+                Ok(())
+            }
+            _ => Err(ReservationError::Unavailable),
+        }
     }
 }
 

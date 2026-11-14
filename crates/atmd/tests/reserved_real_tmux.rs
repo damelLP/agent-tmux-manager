@@ -35,10 +35,13 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
         .unwrap();
     verify_private(&client, &root).await;
     let cancel = CancellationToken::new();
+    let org_cancel = CancellationToken::new();
+    let state = tempfile::tempdir().unwrap();
+    let org = atmd::org::OrgHandle::open(state.path().into(), org_cancel.clone()).await;
     let (control, actor) = spawn_control(
         Box::new(client.clone()),
         atmd::registry::spawn_registry(),
-        atmd::org::OrgHandle::disabled("real pane probe"),
+        org.clone(),
         cancel.clone(),
     );
     let verifier = client.clone();
@@ -123,4 +126,9 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
     verify_private(&client, &root).await;
     client.raw_command("kill-server", &[]).await.unwrap();
     result.unwrap();
+    let records = org.tail(atmd::org::TailParams::default()).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, "control.killed");
+    assert_eq!(records[0].body["action"]["probe"], true);
+    org_cancel.cancel();
 }

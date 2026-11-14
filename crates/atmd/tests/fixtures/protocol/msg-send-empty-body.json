@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"empty","method":"msg.send","params":{"to":"owner","body":""}},
+  "response": {"type":"response","id":"empty","error":{"code":"invalid_params","message":"invalid message parameters: empty body requires an attachment"}},
+  "ignore": []
+}

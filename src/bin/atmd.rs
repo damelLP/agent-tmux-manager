@@ -106,17 +106,20 @@ fn remove_pid_file(state_dir: &Path) {
     let _ = fs::remove_file(path);
 }
 
-fn proc_stat_has_exited(stat: &str) -> bool {
-    // comm may contain spaces and ')'; the state follows its final delimiter.
-    let Some((_, fields)) = stat.rsplit_once(')') else {
+fn proc_stat_has_exited(stat: &[u8]) -> bool {
+    // comm may contain spaces, ')' and truncated UTF-8; use its final delimiter.
+    let mut parts = stat.rsplitn(2, |&byte| byte == b')');
+    let (Some(fields), Some(_)) = (parts.next(), parts.next()) else {
         return false;
     };
-    let mut fields = fields.split_whitespace();
+    let mut fields = fields
+        .split(u8::is_ascii_whitespace)
+        .filter(|f| !f.is_empty());
     match fields.next() {
-        Some("X" | "x") => true,
+        Some(b"X" | b"x") => true,
         // The leader is Z as soon as it exits, while the group's other threads
         // may still be exiting: only num_threads (field 20) == 1 is all of it.
-        Some("Z") => fields.nth(16) == Some("1"),
+        Some(b"Z") => fields.nth(16) == Some(b"1".as_slice()),
         _ => false,
     }
 }
@@ -125,8 +128,7 @@ fn is_process_running(pid: u32) -> bool {
     let path = PathBuf::from(format!("/proc/{pid}"));
     // An exited process retains procfs until reaped. If its state cannot be
     // read or recognized, keep the old, conservative existence answer.
-    path.exists()
-        && !fs::read_to_string(path.join("stat")).is_ok_and(|stat| proc_stat_has_exited(&stat))
+    path.exists() && !fs::read(path.join("stat")).is_ok_and(|stat| proc_stat_has_exited(&stat))
 }
 
 /// Read-only: `stop` and `status` call this without the lock, so a stale
@@ -564,11 +566,11 @@ mod tests {
     // may still be exiting; stop reported success in that window under load.
     #[test]
     fn zombie_leader_has_not_exited_while_other_threads_live() {
-        assert!(!proc_stat_has_exited(ZOMBIE_LEADER_LIVE_THREAD));
-        assert!(proc_stat_has_exited(ZOMBIE_WHOLE_GROUP));
+        assert!(!proc_stat_has_exited(ZOMBIE_LEADER_LIVE_THREAD.as_bytes()));
+        assert!(proc_stat_has_exited(ZOMBIE_WHOLE_GROUP.as_bytes()));
         for threads in ["2", "17", "0", "-1", "one"] {
             assert!(
-                !proc_stat_has_exited(&stat("atmd", "Z", threads)),
+                !proc_stat_has_exited(stat("atmd", "Z", threads).as_bytes()),
                 "num_threads {threads}"
             );
         }
@@ -591,7 +593,7 @@ mod tests {
             ("?", false),
         ] {
             assert_eq!(
-                proc_stat_has_exited(&stat("atmd", state, "1")),
+                proc_stat_has_exited(stat("atmd", state, "1").as_bytes()),
                 exited,
                 "state {state}"
             );
@@ -606,7 +608,30 @@ mod tests {
             (stat("name) Z still name", "S", "1"), false),
             (stat("name\nwith ) parentheses", "x", "1"), true),
         ] {
-            assert_eq!(proc_stat_has_exited(&stat), exited, "{stat:?}");
+            assert_eq!(proc_stat_has_exited(stat.as_bytes()), exited, "{stat:?}");
+        }
+    }
+
+    // Synthetic: captured whole-group fields with the invalid UTF-8 comm
+    // reproduced by PR_SET_NAME truncation on Linux 7.2.14 (2026-11-14).
+    #[test]
+    fn proc_stat_accepts_non_utf8_comm_without_changing_exit_rules() {
+        for (state, threads, exited) in [
+            ("Z", "1", true),
+            ("Z", "2", false),
+            ("Z", "", false),
+            ("X", "2", true),
+            ("x", "", true),
+            ("S", "1", false),
+        ] {
+            let mut line = b"614980 (name) bad utf8\xe2)".to_vec();
+            let text = stat("atmd", state, threads);
+            line.extend_from_slice(text.rsplit_once(')').unwrap().1.as_bytes());
+            assert_eq!(
+                proc_stat_has_exited(&line),
+                exited,
+                "state {state}, threads {threads}"
+            );
         }
     }
 
@@ -622,7 +647,7 @@ mod tests {
             // A zombie without its thread count does not prove the group exited.
             "123 (atmd) Z 1 2 3",
         ] {
-            assert!(!proc_stat_has_exited(stat), "{stat:?}");
+            assert!(!proc_stat_has_exited(stat.as_bytes()), "{stat:?}");
         }
     }
 

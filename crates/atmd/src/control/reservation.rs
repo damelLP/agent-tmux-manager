@@ -216,6 +216,15 @@ pub struct PaneInspection {
 /// make an application's multi-write redraw atomic, freeze user input, or prove
 /// a particular clear completed. Partial/unknown frames remain unsafe.
 ///
+/// Captured: tmux 3.8, 2026-11-14, private shell/printable-output probes.
+/// `control/fixtures/tmux_3.8_reserved_observations.json` records a metadata →
+/// `capture-pane -p -N` (optionally `-e`) → end-marker command list, filtered
+/// `list-panes`, and local `show-options -p -q -v` output. All 150 changing-output
+/// samples agreed with the first metadata's cursor (59 distinct positions).
+/// Local absent/inherited tags produce no bytes; an empty local tag produces
+/// one newline. A missing-target display can succeed with empty fields, so it
+/// is not positive liveness evidence. Versions 3.6a and 3.4 remain unverified.
+///
 /// Preserve meaningful whitespace and rows. A consumer may construct its
 /// shared ScreenCursor from the inspection's coordinates when its adapter
 /// supports them; otherwise pass None, and request Plain for text-only parsers.

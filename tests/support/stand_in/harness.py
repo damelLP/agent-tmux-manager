@@ -65,8 +65,9 @@ class Runtime:
         Path("/proc/self/comm").write_text(self.mode)
         if Path("/proc/self/comm").read_text().strip() != self.mode:
             raise RuntimeError("failed to set process comm")
+        start_time = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
         self.record({"kind": "identity", "pid": os.getpid(), "pane": os.environ["TMUX_PANE"],
-                     "mode": self.mode, "argv": sys.argv})
+                     "mode": self.mode, "argv": sys.argv, "start_time": start_time})
 
     def next_id(self):
         return f"{self.prefix}-{self.generation}"

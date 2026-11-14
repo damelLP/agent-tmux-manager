@@ -343,6 +343,32 @@ fn stand_in_spawn_prompt() {
 }
 
 #[test]
+fn stand_in_observes_restarted_process() {
+    let mut rig = StandInRig::start();
+    let first = rig.launch(&StandInConfig::new(StandInMode::Claude));
+    rig.paste(&first, "/atm/exit");
+    rig.wait_for_shell(&first);
+    // Reuse the existing pane's exported fixture env and journal, as respawn does.
+    let launcher = first.launcher.to_str().unwrap().replace('\'', "'\\''");
+    rig.paste(
+        &first,
+        &format!("ATM_STANDIN_ID_PREFIX=respawn '{launcher}'"),
+    );
+    let second = rig.observe_pane(
+        first.pane_id.clone(),
+        StandInMode::Claude,
+        first.log.clone(),
+    );
+    assert_ne!(
+        second.pid, first.pid,
+        "must not return the old journal identity"
+    );
+    rig.wait_ready(&second, Some("respawn-1"));
+    rig.wait_for_row(&second, |r| r.id.as_str() == "respawn-1");
+    rig.close();
+}
+
+#[test]
 fn stand_in_model_contract() {
     let output = bounded::run(
         std::process::Command::new("python3")

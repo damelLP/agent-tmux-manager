@@ -96,8 +96,13 @@ let out = rig.run(&mut cmd);
 assert!(out.status.success(), "{out:?}");
 let pane_id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
 let pane = rig.observe_pane(pane_id, StandInMode::Claude, log);
-// observe_pane waits for identity, not idle: initial prompt may already be working.
+// observe_pane waits for a live identity, not idle: initial prompt may be working.
 ```
+
+For respawn in the same pane, the journal may be reused: `observe_pane` selects
+its newest live identity and verifies procfs start time, not just PID. Give each
+new process a fresh ID prefix and wait for that process's expected session ID;
+`wait_ready(None)` alone cannot distinguish an old ready screen from a new one.
 
 The rig also inherits private ATM_SOCKET, ATM_TMUX_SOCKET, TMUX_TMPDIR,
 ATM_STATE_DIR, HOME and XDG directories into its server. Direct program launch

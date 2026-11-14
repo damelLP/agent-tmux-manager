@@ -264,16 +264,21 @@ impl StandInRig {
             owner: self.root().into(),
         };
         self.wait("stand-in identity", || {
-            self.journal(&pane)
-                .iter()
-                .any(|e| e["kind"] == "identity" && e["pane"] == pane.pane_id)
+            let identity = self.journal(&pane).into_iter().rev().find_map(|e| {
+                if e["kind"] != "identity" || e["pane"] != pane.pane_id || e["mode"] != mode.name()
+                {
+                    return None;
+                }
+                let pid = u32::try_from(e["pid"].as_u64()?).ok()?;
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let start_time = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?;
+                (Some(start_time) == e["start_time"].as_str()).then_some(pid)
+            });
+            if let Some(pid) = identity {
+                pane.pid = pid;
+            }
+            identity.is_some()
         });
-        pane.pid = self
-            .journal(&pane)
-            .iter()
-            .find(|e| e["kind"] == "identity")
-            .and_then(|e| e["pid"].as_u64())
-            .expect("identity PID") as u32;
         pane
     }
 
@@ -409,6 +414,18 @@ impl StandInRig {
                 ));
             }
         }
+        if self.tmux_identity.is_some() {
+            let panes = self.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]);
+            if panes.status.success() {
+                for pane in String::from_utf8_lossy(&panes.stdout).lines() {
+                    let capture = self.tmux(&["capture-pane", "-p", "-t", pane]);
+                    out.push_str(&format!(
+                        "\npane {pane}:\n{}",
+                        String::from_utf8_lossy(&capture.stdout)
+                    ));
+                }
+            }
+        }
         out
     }
 
@@ -525,6 +542,24 @@ fn protocol_request(
         })
         .await?
     })
+}
+
+#[test]
+fn startup_diagnostics_include_private_pane_errors() {
+    let mut rig = StandInRig::start();
+    let pane = checked(rig.tmux(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "printf 'stand-in-startup-error\\n'; exec /bin/bash --noprofile --norc",
+    ]));
+    rig.wait("error marker", || {
+        checked(rig.tmux(&["capture-pane", "-p", "-t", &pane])).contains("stand-in-startup-error")
+    });
+    assert!(rig.diagnostics().contains("stand-in-startup-error"));
+    rig.close();
 }
 
 #[test]

@@ -28,7 +28,6 @@ fn create_segment(directory: &Path, seq: u64) -> Result<(File, PathBuf), EventLo
         .create_new(true)
         .open(&path)
         .map_err(|e| io_error(&path, e))?;
-    sync_directory(directory)?;
     Ok((file, path))
 }
 
@@ -87,13 +86,16 @@ impl Writer {
         let ages = if stream == Stream::Raw {
             files
                 .iter()
-                .map(|segment| {
-                    let modified = fs::metadata(&segment.path)
-                        .and_then(|m| m.modified())
-                        .map_err(|e| io_error(&segment.path, e))?;
-                    Ok((segment.path.clone(), modified))
+                .filter_map(|segment| {
+                    match fs::metadata(&segment.path).and_then(|m| m.modified()) {
+                        Ok(modified) => Some((segment.path.clone(), modified)),
+                        Err(error) => {
+                            tracing::warn!(path = %segment.path.display(), %error, "Cannot inspect raw segment for pruning");
+                            None
+                        }
+                    }
                 })
-                .collect::<Result<Vec<_>, EventLogError>>()?
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -119,6 +121,7 @@ impl Writer {
             )
         } else {
             let (file, path) = create_segment(directory, 1)?;
+            sync_directory(directory)?;
             (file, path, Some(1))
         };
         let size = file.metadata().map_err(|e| io_error(&path, e))?.len();
@@ -133,19 +136,7 @@ impl Writer {
             max_bytes: SEGMENT_BYTES,
         };
         let expired = prune_candidates(&ages, SystemTime::now(), RAW_MAX_AGE);
-        if writer.size > 0 && expired.contains(&writer.path) {
-            // Preserve the high-water mark even if an older file has a newer
-            // mtime. A crash before/during deletion leaves this empty successor.
-            writer.rotate()?;
-        }
-        for path in &expired {
-            if *path != writer.path {
-                fs::remove_file(path).map_err(|e| io_error(path, e))?;
-            }
-        }
-        if !expired.is_empty() {
-            sync_directory(directory)?;
-        }
+        writer.prune(&expired);
         Ok(writer)
     }
 
@@ -183,6 +174,28 @@ impl Writer {
         Ok(envelope)
     }
 
+    fn prune(&mut self, expired: &[PathBuf]) {
+        if self.size > 0 && expired.contains(&self.path) {
+            // Never delete the newest nonempty segment without its successor.
+            if let Err(error) = self.rotate() {
+                tracing::warn!(path = %self.path.display(), %error, "Cannot prepare raw pruning; keeping old segments");
+                return;
+            }
+        }
+        for path in expired {
+            if *path != self.path {
+                if let Err(error) = fs::remove_file(path) {
+                    tracing::warn!(path = %path.display(), %error, "Cannot prune raw segment");
+                }
+            }
+        }
+        if !expired.is_empty() {
+            if let Err(error) = sync_directory(&self.directory) {
+                tracing::warn!(path = %self.directory.display(), %error, "Cannot sync raw pruning");
+            }
+        }
+    }
+
     fn rotate(&mut self) -> Result<(), EventLogError> {
         let next = self.next.ok_or(EventLogError::SequenceExhausted)?;
         // Raw is synced at segment boundaries, never per record. Events have
@@ -192,7 +205,10 @@ impl Writer {
         self.file = file;
         self.path = path;
         self.size = 0;
-        Ok(())
+        // Even if directory sync fails, future writes must use the new highest
+        // filename, not put its sequence back in the old segment. Pruning then
+        // keeps all old segments; an append caller gets a known-unwritten error.
+        sync_directory(&self.directory)
     }
 
     pub fn close(&self) -> Result<(), EventLogError> {
@@ -307,6 +323,35 @@ mod tests {
             .map(|r| r.unwrap().seq)
             .collect();
         assert_eq!(rows, [2, 3]);
+    }
+
+    #[test]
+    fn failed_prune_preparation_keeps_old_records_and_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut writer = Writer::open(&Stream::Raw.directory(dir.path()), Stream::Raw).unwrap();
+        writer
+            .append(ts, "first".into(), serde_json::Value::Null)
+            .unwrap();
+        let old = writer.path.clone();
+        let real = std::mem::replace(
+            &mut writer.file,
+            OpenOptions::new().write(true).open("/dev/null").unwrap(),
+        );
+        writer.prune(std::slice::from_ref(&old));
+        assert!(old.exists(), "deleted newest after its sync failed");
+        writer.file = real;
+        assert_eq!(
+            writer
+                .append(ts, "second".into(), serde_json::Value::Null)
+                .unwrap()
+                .seq,
+            2
+        );
+        let rows: Vec<_> = super::super::read_from(dir.path(), Stream::Raw, 0)
+            .map(|row| row.unwrap().seq)
+            .collect();
+        assert_eq!(rows, [1, 2]);
     }
 
     #[test]

@@ -361,8 +361,17 @@ async fn empty_newest_marker_survives_age_and_interrupted_pruning() {
     );
 }
 
-#[test]
-fn event_files_are_never_pruned_and_raw_delete_errors_are_not_hidden() {
+#[tokio::test]
+async fn event_files_are_never_pruned_and_raw_delete_errors_are_warned() {
+    if std::env::var_os("ATM_TEST_PRUNE_CHILD").is_none() {
+        super::test_support::run_child(
+            "eventlog::tests::event_files_are_never_pruned_and_raw_delete_errors_are_warned",
+            |command| {
+                command.env("ATM_TEST_PRUNE_CHILD", "1");
+            },
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let event = segment(dir.path(), Stream::Events, 1, &record(1));
     expire(&event);
@@ -373,8 +382,43 @@ fn event_files_are_never_pruned_and_raw_delete_errors_are_not_hidden() {
     fs::create_dir(&old).unwrap();
     expire(&old);
     segment(dir.path(), Stream::Raw, 2, &record(2));
-    let error = EventLog::open(dir.path(), Stream::Raw).expect_err("delete directory must fail");
-    assert!(error.to_string().contains(&old.display().to_string()));
+    let output = TraceBuffer(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let capture = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || capture.clone())
+        .finish();
+    let raw =
+        tracing::subscriber::with_default(subscriber, || EventLog::open(dir.path(), Stream::Raw))
+            .expect("a failed prune must not prevent opening raw");
+    let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("WARN") && text.contains(&old.display().to_string()),
+        "{text}"
+    );
+    assert_eq!(
+        raw.append(ts(), "after prune error", serde_json::Value::Null)
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn unstatable_old_raw_file_does_not_prevent_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = segment(dir.path(), Stream::Raw, 1, b"");
+    fs::remove_file(&old).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("missing"), &old).unwrap();
+    segment(dir.path(), Stream::Raw, 2, &record(2));
+    let raw = EventLog::open(dir.path(), Stream::Raw).unwrap();
+    assert_eq!(
+        raw.append(ts(), "after stat failure", serde_json::Value::Null)
+            .await
+            .unwrap(),
+        3
+    );
 }
 
 #[test]

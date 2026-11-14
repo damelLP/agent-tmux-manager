@@ -292,15 +292,23 @@ pub(super) async fn cmd_spawn(
     let fallback_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
+    // Get current pane to split from.
+    // Prefer --target-pane (passed by tmux keybindings via #{pane_id}), then
+    // $TMUX_PANE, the pane atm runs in. A tmux run-shell job has no
+    // $TMUX_PANE, or one leaked from tmux's global environment (tmux 3.8),
+    // which is why the keybindings pass -t. Fall back to the is_active
+    // heuristic only when neither is set.
     let context: control::SpawnContext = serde_json::from_value(super::rpc::call(
         "session.spawn_prepare",
         serde_json::json!({"target_pane": target_pane, "cwd": worktree, "fallback_cwd": fallback_cwd}), budget,
     ).await?).context("Invalid session.spawn_prepare response")?;
     let cwd = &context.cwd;
     let mut agent_cmd = build_spawn_command_for_harness(&harness, cwd.as_deref(), model.as_deref());
+    // Last, after ATM_SPAWN_*_ARGS and --model.
     if let Some(words) = prompt {
         agent_cmd.push(' ');
         agent_cmd.push_str(&words);
+        // Only with a prompt: without one the command is as before.
         if agent_cmd.len() > MAX_TYPED_LINE {
             bail!("with --prompt, the command to type is {} bytes, more than the {MAX_TYPED_LINE} a starting shell reads as one line: put a long brief in a file and name the file in the prompt, or shorten -w or the harness's arguments", agent_cmd.len());
         }
@@ -314,6 +322,9 @@ pub(super) async fn cmd_spawn(
         .get("pane")
         .and_then(serde_json::Value::as_str)
         .context("Invalid session.spawn response: missing pane")?;
+    // Print the pane as soon as it exists, so a caller can clean it up if
+    // starting the agent in it fails. A failed write (a closed pipe) is
+    // reported once the agent is started, not as a panic half-way.
     let mut stdout = std::io::stdout();
     let printed = match format {
         SpawnFormat::Text => writeln!(stdout, "{new_pane}"),

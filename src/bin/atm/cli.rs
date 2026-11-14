@@ -148,6 +148,23 @@ pub(super) async fn cmd_interrupt(target: String) -> Result<()> {
 }
 
 pub(super) async fn cmd_send(target: String, text: String) -> Result<()> {
+    let result = super::rpc::call(
+        "session.send",
+        serde_json::json!({"target": target, "text": text}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let pane = result
+        .get("pane")
+        .and_then(serde_json::Value::as_str)
+        .context("Invalid session.send response: missing pane")?;
+    println!("Sent to {pane} by tmux paste");
+    Ok(())
+}
+
+// Removed separately once daemon-path acceptance tests pass.
+#[allow(dead_code)]
+async fn direct_send(target: String, text: String) -> Result<()> {
     let sessions = daemon_sessions().await?;
     let pane_id = control::send(&RealTmuxClient::new(), &sessions, &target, &text).await?;
     println!("Sent to {pane_id} by tmux paste");

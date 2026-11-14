@@ -15,10 +15,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[path = "support/control.rs"]
+mod control_support;
+
 const STAND_IN_TMUX: &str = r#"#!/bin/sh
-echo "$*" >> 'DIR/tmux.log'
-# $1 is -u; the subcommand comes next.
-case $2 in
+[ "$1" = -u ] && shift
+if [ "$1" = -L ]; then shift; shift; fi
+echo "-u $*" >> 'DIR/tmux.log'
+case $1 in
   list-panes)
     printf '%%1\tother\t0\t100\t80\t24\t1\n%%7\tmine\t1\t101\t80\t24\t0\n%%9\tmine\t1\t102\t80\t24\t0\n' ;;
   display-message)
@@ -32,7 +36,7 @@ case $2 in
       *" -t %1 "*|*" -t %7 "*|*" -t %9 "*)
         if [ -e 'DIR/split-no-space' ]; then echo "no space for a new pane" >&2; exit 1; fi
         echo %42 ;;
-      *) echo "can't find pane: $4" >&2; exit 1 ;;
+      *) echo "can't find pane: $3" >&2; exit 1 ;;
     esac ;;
   send-keys)
     if [ -e 'DIR/fail-send-keys' ]; then echo "send-keys failed" >&2; exit 1; fi ;;
@@ -40,7 +44,19 @@ esac
 "#;
 
 /// A temp dir whose `path/` holds the stand-in `tmux`.
-fn rig() -> tempfile::TempDir {
+struct Rig {
+    // Drop the daemon before deleting its private state.
+    _daemon: control_support::Daemon,
+    dir: tempfile::TempDir,
+}
+
+impl Rig {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn rig() -> Rig {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("path");
     std::fs::create_dir_all(&path).expect("mkdir PATH dir");
@@ -48,7 +64,21 @@ fn rig() -> tempfile::TempDir {
     let script = STAND_IN_TMUX.replace("DIR", &dir.path().display().to_string());
     std::fs::write(&tmux, script).expect("write stand-in tmux");
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).expect("chmod tmux");
-    dir
+    let cli_path = dir.path().join("cli-path");
+    std::fs::create_dir(&cli_path).unwrap();
+    let forbidden = cli_path.join("tmux");
+    std::fs::write(
+        &forbidden,
+        "#!/bin/sh\necho 'CLI reached tmux' >&2\nexit 91\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&forbidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = control_support::Daemon::start(dir.path(), &path);
+    std::fs::write(dir.path().join("tmux.log"), "").unwrap();
+    Rig {
+        _daemon: daemon,
+        dir,
+    }
 }
 
 /// Runs `atm spawn <args>` inside a fake tmux client (`TMUX` set), with
@@ -61,10 +91,10 @@ fn spawn(dir: &Path, caller_pane: Option<&str>, args: &[&str]) -> Output {
 
 fn spawn_command(dir: &Path, caller_pane: Option<&str>, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atm"));
+    control_support::isolated(&mut cmd, dir);
     cmd.arg("spawn")
         .args(args)
-        .env_clear()
-        .env("PATH", dir.join("path"))
+        .env("PATH", dir.join("cli-path"))
         .env("HOME", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("XDG_STATE_HOME", dir.join("state"))

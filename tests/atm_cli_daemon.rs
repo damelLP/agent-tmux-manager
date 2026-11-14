@@ -19,12 +19,104 @@ use atm_core::{SessionId, SessionView};
 mod daemon;
 use daemon::fake_daemon;
 
-/// The five commands that act on one agent's pane.
+/// The CLI has no tmux executable; registry resolution and safety checks run
+/// in the real server through its injected control actor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_uses_daemon_registry_and_preserves_refusals() {
+    use atm_core::{SessionDomain, SessionStatus};
+    use atm_tmux::{mock::MockCall, MockTmuxClient};
+    use atmd::{
+        control::service::spawn_control,
+        server::{methods::MethodServices, DaemonServer},
+    };
+    use tokio_util::sync::CancellationToken;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = atmd::registry::spawn_registry();
+    registry
+        .register(SessionDomain {
+            id: SessionId::new("abc-session-1"),
+            tmux_pane: Some("%5".into()),
+            ..SessionDomain::default()
+        })
+        .await
+        .unwrap();
+    let mock = MockTmuxClient::new();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(Box::new(mock.clone()), registry.clone(), cancel.clone());
+    let mut services = MethodServices::new(registry.clone());
+    services.control = Some(control);
+    let server =
+        DaemonServer::with_services(dir.path().join("atmd.sock"), services, cancel.clone());
+    let server = tokio::spawn(async move { server.run().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !dir.path().join("atmd.sock").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
+    mock.set_next_raw_output("0 1");
+    let out = atm(exe, dir.path(), &["send", "abc", "hello;"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"Sent to %5 by tmux paste\n");
+    assert!(
+        matches!(mock.calls().as_slice(), [MockCall::RawCommand { .. }, MockCall::PasteText { pane, text }, MockCall::SendKeys { keys, .. }] if pane == "%5" && text == "hello;" && keys == "Enter")
+    );
+    mock.clear_calls();
+    let args = ["send", "nope", "hello"];
+    assert_fails_with(
+        &atm(exe, dir.path(), &args),
+        &args,
+        "Error: No session matching 'nope'",
+    );
+    assert!(mock.calls().is_empty());
+    for (state, text, reason) in [
+        (
+            "1 0",
+            "hi",
+            "the pane is in copy mode (or another mode), so Enter would go to tmux",
+        ),
+        (
+            "0 0",
+            "a\nb",
+            "the program didn't ask for bracketed paste, so each line would submit alone",
+        ),
+    ] {
+        mock.set_next_raw_output(state);
+        let args = ["send", "%5", text];
+        assert_fails_with(
+            &atm(exe, dir.path(), &args),
+            &args,
+            &format!("Error: Refusing to send to %5: {reason}"),
+        );
+    }
+    registry
+        .register(SessionDomain {
+            id: SessionId::new("dialog"),
+            tmux_pane: Some("%5".into()),
+            status: SessionStatus::AttentionNeeded,
+            ..SessionDomain::default()
+        })
+        .await
+        .unwrap();
+    mock.set_next_raw_output("0 1");
+    let args = ["send", "%5", "hi"];
+    assert_fails_with(&atm(exe, dir.path(), &args), &args, "Error: Refusing to send to %5: the session is waiting on a dialog that Enter would answer; use `atm reply`, or, if the dialog is gone, type in the pane");
+    assert!(mock
+        .calls()
+        .iter()
+        .all(|c| matches!(c, MockCall::RawCommand { .. })));
+    cancel.cancel();
+    server.await.unwrap().unwrap();
+    actor.await.unwrap();
+}
+
+/// The four legacy commands that resolve an agent through ListSessions.
 fn pane_commands(target: &str) -> Vec<Vec<&str>> {
     vec![
         vec!["kill", target],
         vec!["interrupt", target],
-        vec!["send", target, "hello"],
         vec!["reply", target],
         vec!["peek", target],
     ]
@@ -93,7 +185,10 @@ fn test_commands_fail_when_the_daemon_cannot_start() {
         std::fs::copy(env!("CARGO_BIN_EXE_atm"), &exe).expect("copy atm");
     }
 
-    for args in all_commands() {
+    for args in all_commands()
+        .into_iter()
+        .chain([vec!["send", "%0", "hello"]])
+    {
         let out = atm(&exe, dir.path(), &args);
         // `ensure_daemon_running`'s own message already starts with
         // "Failed to start daemon", and the CLI adds the same words.
@@ -165,18 +260,10 @@ fn test_commands_read_the_daemons_session_list() {
     assert!(status.status.success(), "atm status: {status:?}");
     assert_eq!(String::from_utf8_lossy(&status.stdout), "1\u{2191} $0.00\n");
 
-    // Each command's tmux subcommands, in `pane_commands` order. `send`
-    // reads the pane's state, then pastes through a buffer (#116);
-    // `load-buffer` fills the buffer and names no pane.
-    let subcommands: [&[&str]; 5] = [
+    // Each legacy command's tmux subcommands, in `pane_commands` order.
+    let subcommands: [&[&str]; 4] = [
         &["kill-pane"],
         &["send-keys"],
-        &[
-            "display-message",
-            "load-buffer",
-            "paste-buffer",
-            "send-keys",
-        ],
         &["send-keys"],
         &["capture-pane"],
     ];

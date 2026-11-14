@@ -6,7 +6,7 @@ use atm_tmux::{PaneDirection, TmuxClient};
 use super::ControlError;
 
 /// Resolved split target, working directory and stale-caller diagnostic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpawnContext {
     pub target_pane: String,
     pub cwd: Option<String>,

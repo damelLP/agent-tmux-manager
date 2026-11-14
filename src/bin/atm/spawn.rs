@@ -286,6 +286,73 @@ pub(super) async fn cmd_spawn(
     let prompt = prompt
         .map(|text| prompt_words(&harness, &text))
         .transpose()?;
+    if !tmux::is_in_tmux() {
+        bail!("atm spawn requires running inside tmux");
+    }
+    let budget = std::time::Duration::from_secs(40);
+    let fallback_cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    let context: control::SpawnContext = serde_json::from_value(super::rpc::call(
+        "session.spawn_prepare",
+        serde_json::json!({"target_pane": target_pane, "cwd": worktree, "fallback_cwd": fallback_cwd}), budget,
+    ).await?).context("Invalid session.spawn_prepare response")?;
+    let cwd = &context.cwd;
+    let mut agent_cmd = build_spawn_command_for_harness(&harness, cwd.as_deref(), model.as_deref());
+    if let Some(words) = prompt {
+        agent_cmd.push(' ');
+        agent_cmd.push_str(&words);
+        if agent_cmd.len() > MAX_TYPED_LINE {
+            bail!("with --prompt, the command to type is {} bytes, more than the {MAX_TYPED_LINE} a starting shell reads as one line: put a long brief in a file and name the file in the prompt, or shorten -w or the harness's arguments", agent_cmd.len());
+        }
+    }
+    let direction: atm_tmux::PaneDirection = direction.into();
+    let result = super::rpc::call("session.spawn", serde_json::json!({
+        "target_pane": context.target_pane, "caller_pane_missing": context.caller_pane_missing(),
+        "direction": direction, "size": size,
+    }), budget).await?;
+    let new_pane = result
+        .get("pane")
+        .and_then(serde_json::Value::as_str)
+        .context("Invalid session.spawn response: missing pane")?;
+    let mut stdout = std::io::stdout();
+    let printed = match format {
+        SpawnFormat::Text => writeln!(stdout, "{new_pane}"),
+        SpawnFormat::Json => writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"pane": new_pane, "harness": harness.id, "cwd": cwd})
+        ),
+    };
+    super::rpc::call(
+        "session.spawn_type",
+        serde_json::json!({"pane": new_pane, "command": agent_cmd}),
+        budget,
+    )
+    .await?;
+    printed.context("Failed to print the new pane's id")?;
+    Ok(())
+}
+
+// Removed separately once daemon-path acceptance tests pass.
+#[allow(dead_code, clippy::too_many_arguments)]
+async fn direct_spawn(
+    harness_id: Option<String>,
+    model: Option<String>,
+    worktree: Option<String>,
+    direction: SpawnDirection,
+    size: String,
+    target_pane: Option<String>,
+    format: SpawnFormat,
+    prompt: Option<String>,
+) -> Result<()> {
+    let harness = resolve_spawn_harness(harness_id.as_deref())?;
+    if model.is_some() && harness.model_flag.is_none() {
+        bail!("harness '{}' does not support --model yet", harness.id);
+    }
+    let prompt = prompt
+        .map(|text| prompt_words(&harness, &text))
+        .transpose()?;
 
     if !tmux::is_in_tmux() {
         bail!("atm spawn requires running inside tmux");

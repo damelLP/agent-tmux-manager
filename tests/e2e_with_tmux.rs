@@ -302,8 +302,20 @@ impl PrivateTmux {
 
 impl Drop for PrivateTmux {
     fn drop(&mut self) {
+        let Some(identity) = tmux_run_capture(
+            &self.socket_label,
+            &["display-message", "-p", "#{socket_path}\t#{pid}"],
+        ) else {
+            return;
+        };
+        let Some((socket, pid)) = identity.trim().split_once('\t') else {
+            panic!("missing tmux identity");
+        };
+        let private_root = std::env::var_os("TMUX_TMPDIR").expect("sealed TMUX_TMPDIR required");
+        assert!(Path::new(socket).starts_with(private_root));
+        assert!(pid.parse::<u32>().is_ok());
         let _ = Command::new("tmux")
-            .args(["-L", &self.socket_label, "kill-server"])
+            .args(["-S", socket, "kill-server"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();

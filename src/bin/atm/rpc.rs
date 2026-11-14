@@ -22,10 +22,12 @@ static STARTUP_SLOT: LazyLock<Arc<tokio::sync::Semaphore>> =
 pub enum RpcError {
     #[error("the daemon is too old; restart atmd")]
     TooOld,
-    #[error("{code}: {message}", code = .0.code, message = .0.message)]
+    #[error("{message}", message = .0.message)]
     Daemon(ResponseError),
     #[error("daemon request timed out")]
     Timeout,
+    #[error("Failed to start daemon: {0}")]
+    Startup(String),
     #[error("daemon connection failed: {0}")]
     Connection(String),
 }
@@ -77,7 +79,7 @@ where
         receive
             .await
             .map_err(connection_error)?
-            .map_err(RpcError::Connection)?;
+            .map_err(RpcError::Startup)?;
         exchange(socket, method, params, from_pane).await
     })
     .await
@@ -477,7 +479,7 @@ mod tests {
         .await;
         assert!(rx.await.is_ok());
         assert!(
-            matches!(result, Err(RpcError::Connection(message)) if message.contains("startup refused"))
+            matches!(result, Err(RpcError::Startup(message)) if message.contains("startup refused"))
         );
     }
 

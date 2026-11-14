@@ -340,6 +340,49 @@ fn lifecycle_facts_survive_documented_and_split_height_viewports() {
 }
 
 #[test]
+fn value_only_variants_keep_lifecycle_facts_without_pinning_literals() {
+    let mut rig = StandInRig::start();
+    for (mode, version, model) in [
+        (StandInMode::Claude, "9.8.765", "Opus 9.99"),
+        (StandInMode::Codex, "0.987.6", "GPT-9-Dawn"),
+        (StandInMode::Pi, "9.8.7", "gpt-9-dawn"),
+    ] {
+        let mut config = StandInConfig::new(mode);
+        config.manual_clock = true;
+        config.screen_variant = "values".into();
+        let pane = rig.launch(&config);
+        let text = rig.capture_plain(&pane);
+        assert!(text.contains(version) && text.contains(model), "{text}");
+        assert_eq!(
+            observe(mode, &text),
+            expected(&format!("{}.fresh.u5", mode.name()))
+        );
+        let after = rig.event_cursor(&pane);
+        rig.paste(&pane, "held work");
+        rendered(&rig, &pane, after, "working");
+        assert_eq!(
+            observe(mode, &rig.capture_plain(&pane)),
+            expected(&format!("{}.working.u5", mode.name()))
+        );
+        let after = rig.event_cursor(&pane);
+        rig.control(
+            &pane,
+            serde_json::json!({"command":"advance_to", "now_ms":500}),
+        );
+        rendered(&rig, &pane, after, "idle");
+        let text = rig.capture_plain(&pane);
+        assert_eq!(
+            observe(mode, &text),
+            expected(&format!("{}.idle.u5", mode.name()))
+        );
+        if mode == StandInMode::Pi {
+            assert!(text.contains("$4.321"));
+        }
+    }
+    rig.close();
+}
+
+#[test]
 fn narrow_split_reports_minimum_through_the_rig() {
     let mut rig = StandInRig::start();
     for mode in [StandInMode::Codex, StandInMode::Pi] {

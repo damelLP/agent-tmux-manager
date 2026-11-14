@@ -64,6 +64,20 @@ def editor_slot(lines, mode):
     return slots[-1], slots[-1] + 1, "❯\u00a0" if mode == "claude" else "› "
 
 
+def vary_values(line, mode, frame):
+    """Synthetic equal-width scalar mutations; never applied to user input."""
+    replacements = {
+        "claude": {"2.1.325": "9.8.765", "Haiku 5.5": "Opus 9.99", "✶ Levitating…": "✳ Generating…"},
+        "codex": {"0.167.0": "0.987.6", "GPT-6-Luna": "GPT-9-Dawn", "GPT-6.1-Sol": "GPT-9.2-Sky"},
+        "pi": {"1.5.0": "9.8.7", "gpt-6-luna": "gpt-9-dawn", "⠇ Working": "⠏ Working"},
+    }[mode]
+    for old, new in replacements.items():
+        line = line.replace(old, new)
+    if mode == "pi" and frame not in ("fresh", "clear-complete"):
+        line = line.replace("$0.000", "$4.321")
+    return line
+
+
 def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, selection, folder=None):
     minimum = {"codex": (80, 19), "pi": (86, 19)}.get(mode, (2, 2))
     if columns < minimum[0] or rows < minimum[1]:
@@ -82,6 +96,10 @@ def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, se
     result = render_screen(spec, assets)
     lines = list(result.lines)
     styled = list(result.styled_lines) if result.styled_lines is not None else None
+    if variant == "values":
+        lines = [vary_values(line, mode, frame) for line in lines]
+        if styled is not None:
+            styled = [vary_values(line, mode, frame) for line in styled]
     if frame in ("folder-trust", "folder-trust-selected") and folder is not None:
         for i, line in enumerate(lines):
             if line.lstrip().startswith(("/fixture/", "/tmp/u8a-fixture/")):

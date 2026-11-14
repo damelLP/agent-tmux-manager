@@ -69,6 +69,23 @@ class SceneTests(unittest.TestCase):
         active = [line for line in result.lines if line.startswith("❯")][-1]
         self.assertEqual(active, "❯\u00a0")
 
+    def test_value_variant_changes_only_scalars_and_never_user_draft(self):
+        for mode, version, model in [("claude", "9.8.765", "Opus 9.99"),
+                                     ("codex", "0.987.6", "GPT-9-Dawn"),
+                                     ("pi", "9.8.7", "gpt-9-dawn")]:
+            with self.subTest(mode=mode):
+                fresh = render(mode, "fresh", variant="values")
+                text = "\n".join(fresh.lines)
+                self.assertIn(version, text)
+                self.assertIn(model, text)
+                self.assertEqual(fresh.source, render(mode, "fresh").source)
+                draft = "Haiku 5.5 gpt-6-luna $0.000 1.5.0"
+                self.assertIn(draft, "\n".join(render(mode, "idle", draft, variant="values").lines))
+        self.assertIn("$0.000", "\n".join(render("pi", "fresh", variant="values").lines))
+        self.assertIn("$4.321", "\n".join(render("pi", "idle", variant="values").lines))
+        self.assertIn("✳ Generating…", "\n".join(render("claude", "working", variant="values").lines))
+        self.assertIn("⠏ Working", "\n".join(render("pi", "working", variant="values").lines))
+
     def test_pi_draft_keeps_current_session_history_and_footer(self):
         for frame in ["fresh", "clear-complete", "idle"]:
             original = render("pi", frame)

@@ -335,7 +335,13 @@ and suppressed hooks remain in event records, not invented screen chrome.
 `config.columns/rows` default to 120x40 and establish the private window size
 before launch. `screen_variant` defaults to `u5`; choose `rich-enabled`/`poor`
 for Claude or `rich`/`poor` for Codex at 100x30. Native geometry wins over a variant
-from another size. P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
+from another size. `screen_variant = "values"` (JSON `SCREEN_VARIANT`) selects
+Synthetic value-only variation: equal-width version/model substitutions, another
+Claude/pi spinner, and nonzero pi cost on nonfresh frames. Fresh pi usage stays
+zero; drafts/folder input are inserted afterwards and never rewritten. Source
+replay bypasses mutations and still reproduces the original captures. Contract
+tests pin unchanged facts across the variants, not particular scalar literals.
+P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
 Uncaptured combinations are explicitly synthetic: redundant blank padding is
 removed before old transcript, preserving editor blanks and history separators.
 Pi rules reflow to equal widths and aligned usage/model and Codex shortcut/warning

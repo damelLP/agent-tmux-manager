@@ -596,6 +596,18 @@ fn pure_builder_preserves_raw_shell_args_with_required_tokens() {
 }
 
 #[test]
+fn launch_policies_cover_exactly_discovery_enabled_harnesses() {
+    for definition in atm_core::builtin_harnesses() {
+        assert_eq!(
+            super::launch_policy(definition.harness).is_some(),
+            definition.discovery_enabled,
+            "launch policy coverage for {:?}",
+            definition.harness
+        );
+    }
+}
+
+#[test]
 fn launch_policy_requirements_reach_the_shared_builder() {
     use atm_core::Harness;
     for (harness, binary, expected) in [

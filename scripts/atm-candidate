@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Isolated candidate kit (Linux). Usage and safety limits: atm-candidate.md.
+# install REF [--debug | --prebuilt BIN_DIR]; installs; start [ID]; attach;
+# atm ARGS...; restart-daemon; status; stop; uninstall ID [--wipe-state].
+# Keep this launcher and atm_candidate.py together. Never runs atm setup.
+set -euo pipefail
+exec python3 "$(dirname -- "${BASH_SOURCE[0]}")/atm_candidate.py" "$@"

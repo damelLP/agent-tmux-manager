@@ -16,8 +16,14 @@ Styled coverage supersedes the plain-only limitations below. Blank/padding
 stays Empty with its accepted whitespace-only-draft collision. Tmux 3.8/3.6
 probes show -N keeps allocated padding as well as authored spaces. Safety
 requires exact staged-draft verification before Enter, refusing unknown.
-Leading spaces survive comparison; multiline reconstruction and differences
-only in trailing padding are unknown rather than inferred matches.
+Leading spaces survive comparison; multiline reconstruction remains unknown.
+Trailing ASCII spaces are chrome; expected text must have no trailing whitespace.
+P1 `C4-one-draft`, `B-0-event-pasted` and `C4-one-pasted` pin matching real padded
+drafts. Faint text is not typed input, and a match alone does not prove Enter
+submits rather than interacting with a popup.
+Captured: pi 1.5.0, 2026-11-14, sealed private-tmux command probe: `/new   `
+followed by Enter emitted shutdown/start with reason new and a changed ID,
+not input; no API request occurred.
 Synthetic adversarial cases are labelled in `tests/styled_screen.rs`.
 
 Ten distinct frames cover all 15 raw U5 pi screens (40 rows, 120 columns).

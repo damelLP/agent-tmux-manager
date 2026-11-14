@@ -22,9 +22,19 @@ These styled tests supersede the **plain-only** limitations below: inverse/faint
 suggestions are distinguishable, while coordinates alone still prove nothing.
 Blank/padding stays Empty despite its whitespace-only-draft collision; consumers
 must verify the exact staged draft before Enter. Leading whitespace is preserved.
-Multiline reconstruction and trailing-padding-only differences return unknown
-from the staged matcher, not equality. `-N` retains allocated grid padding, not
-just authored spaces (verified with tmux 3.8 and 3.6).
+Multiline reconstruction returns unknown. Trailing ASCII spaces are chrome;
+expected text must have no trailing whitespace. `-N` retains allocated grid
+padding, not just authored spaces (verified with tmux 3.8 and 3.6).
+Captured: Claude Code 2.1.325, 2026-11-14, sealed private-tmux command probe:
+`/clear   ` followed by Enter emitted SessionEnd/SessionStart with reason/source
+clear, not UserPromptSubmit; no API request occurred.
+
+P1 `B-auto-pasted-120x40` pins a matching padded real draft. `B-clear-001-120x40`
+pins the unsupported slash menu (it replaces the footer), and
+`C2-queued-001-120x40` pins the unsupported manual-mode queued frame. Both remain
+Unknown/None; U8 slice B owns other modes and slash-menu parsing. The queued
+frame's captured editor row is also transplanted into supported auto chrome in
+a labelled Synthetic test. A match alone never proves what Enter will do.
 
 The original text fixtures are the 15 distinct frames among 48 raw U5 Claude
 screens (40 rows, 120 columns). The additional coordinator and U5b frames are

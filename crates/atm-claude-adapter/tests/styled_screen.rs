@@ -129,7 +129,7 @@ fn blank_padding_collision_stays_empty_but_staged_leading_spaces_refuse() {
             Some(false)
         );
     }
-    // Synthetic: exact unpadded single-line draft; padding-only differences cannot prove exactness.
+    // Synthetic: trailing ASCII padding is chrome; leading spaces remain exact.
     let exact = BLANK.replace("\x1b[7m \x1b[0m", "/clear");
     assert_eq!(
         staged_draft_matches(ScreenInput::Styled(&exact), "/clear"),
@@ -140,7 +140,7 @@ fn blank_padding_collision_stays_empty_but_staged_leading_spaces_refuse() {
             ScreenInput::Styled(&exact.replace("❯\u{a0}/clear", "❯\u{a0}/clear   ")),
             "/clear"
         ),
-        None
+        Some(true)
     );
     assert_eq!(
         staged_draft_matches(ScreenInput::Plain(&exact), "/clear"),
@@ -180,6 +180,129 @@ fn captured_dialogs_and_unsupported_modes() {
 }
 
 #[test]
+fn real_retained_padding_matches_staged_text() {
+    let text = capture!("p1_B-auto-pasted-120x40");
+    assert_eq!(
+        staged_draft_matches(ScreenInput::Styled(text), "B_AUTO_EVENT_SENTINEL"),
+        Some(true)
+    );
+    assert_eq!(
+        staged_draft_matches(ScreenInput::Styled(text), "B_AUTO_EVENT_SENTINEL_WRONG"),
+        Some(false)
+    );
+}
+
+#[test]
+fn real_slash_menu_and_manual_queued_frame_remain_unknown() {
+    for (text, expected) in [
+        (capture!("p1_B-clear-001-120x40"), "/clear"),
+        (
+            capture!("p1_C2-queued-001-120x40"),
+            "Press up to edit queued messages",
+        ),
+    ] {
+        check(text, ScreenFacts::default());
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(text), expected),
+            None
+        );
+    }
+}
+
+#[test]
+fn faint_text_is_not_a_typed_draft() {
+    // Synthetic: faint or partly faint command text is not typed input.
+    for command in ["\x1b[2m/clear", "/cl\x1b[2mear"] {
+        let text = BLANK.replace("\x1b[7m \x1b[0m", &format!("{command}\x1b[0m"));
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+            None
+        );
+        assert_eq!(
+            observe_screen(ScreenInput::Styled(&text), None).input,
+            InputState::Unknown
+        );
+    }
+}
+
+#[test]
+fn captured_queued_placeholder_row_in_auto_frame_is_empty() {
+    let queued = capture!("p1_C2-queued-001-120x40");
+    let row = queued
+        .lines()
+        .find(|line| line.contains("ress up to edit queued messages"))
+        .unwrap();
+    // Synthetic: transplant the captured manual-mode placeholder row into supported
+    // auto-mode chrome; manual-mode parsing belongs to the control consumer's slice.
+    let text = BLANK
+        .lines()
+        .map(|line| {
+            if line.contains("❯\u{a0}") {
+                row
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    check(
+        &text,
+        facts(
+            InputState::Empty,
+            TurnState::NotRunning,
+            FreshEditorEvidence::Present,
+        ),
+    );
+    assert_eq!(
+        staged_draft_matches(
+            ScreenInput::Styled(&text),
+            "Press up to edit queued messages"
+        ),
+        None
+    );
+    // Synthetic: removing faint styling makes the identical visible text a draft.
+    let typed = text.replace("[0;2mress", "[0mress");
+    assert_ne!(typed, text);
+    assert_eq!(
+        staged_draft_matches(
+            ScreenInput::Styled(&typed),
+            "Press up to edit queued messages"
+        ),
+        Some(true)
+    );
+    // Synthetic: partial faint evidence must not turn mixed text into Empty or Draft.
+    let mixed = text.replace("edit queued", "edit\x1b[22m queued");
+    assert_eq!(
+        observe_screen(ScreenInput::Styled(&mixed), None).input,
+        InputState::Unknown
+    );
+    assert_eq!(
+        staged_draft_matches(
+            ScreenInput::Styled(&mixed),
+            "Press up to edit queued messages"
+        ),
+        None
+    );
+}
+
+#[test]
+fn non_ascii_trailing_whitespace_is_not_padding() {
+    // Synthetic: only ASCII spaces are chrome; other trailing whitespace stays distinct.
+    for suffix in ["\u{a0}", "\u{2003}"] {
+        let expected = format!("/clear{suffix}");
+        let text = BLANK.replace("\x1b[7m \x1b[0m", &expected);
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&text), &expected),
+            None
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+            Some(false)
+        );
+    }
+}
+
+#[test]
 fn expected_trailing_spaces_cannot_turn_padding_into_exactness() {
     // Synthetic: expected text could accidentally equal the renderer's padding.
     let padded = BLANK.replace("\x1b[7m \x1b[0m", "/clear   ");
@@ -206,9 +329,22 @@ fn placeholder_first_cell_requires_exact_intensity() {
 #[test]
 fn synthetic_style_and_frame_mutations_never_create_empty() {
     // Synthetic: partial faint, missing inverse, hidden and malformed text, changed/cropped chrome.
-    for text in [FRESH.replace("0;2mry", "0mry"), FRESH.replace("[7mT", "[0mT"), format!("{FRESH}\x1b[8m"), format!("{FRESH}\x1b["), FRESH.replace("cycle)", "changed)"), FRESH.replace("────────────────────────────────────────────────────────────────────────────────────────────────────\n", "\n")] {
-        assert_ne!(observe_screen(ScreenInput::Styled(&text), None).input, InputState::Empty);
-        assert_ne!(staged_draft_matches(ScreenInput::Styled(&text), "/clear"), Some(true));
+    for text in [
+        FRESH.replace("0;2mry", "0mry"),
+        FRESH.replace("[7mT", "[0mT"),
+        format!("{FRESH}\x1b[8m"),
+        format!("{FRESH}\x1b["),
+        FRESH.replace("cycle)", "changed)"),
+        FRESH.replace(&format!("{}\n", "─".repeat(100)), "\n"),
+    ] {
+        assert_ne!(
+            observe_screen(ScreenInput::Styled(&text), None).input,
+            InputState::Empty
+        );
+        assert_ne!(
+            staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+            Some(true)
+        );
     }
     let changed = FRESH
         .replace("logging.py", "other.rs")

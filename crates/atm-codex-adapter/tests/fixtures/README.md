@@ -19,8 +19,14 @@ slash completion and folder/hook/worktree/permission refusals.
 Styled evidence supersedes the plain-only limitations below: an all-faint
 placeholder in a complete regular editor reads Empty; typed text reads Draft.
 `-N` preserves allocated padding, not just authored spaces (tmux 3.8/3.6 probes).
-The exact staged matcher never removes leading whitespace. It refuses multiline
-reconstruction and trailing-padding ambiguity rather than authorizing Enter.
+The staged matcher never removes leading whitespace. It refuses multiline
+reconstruction and treats trailing ASCII spaces as chrome; expected text must
+have no trailing whitespace. P1 `c03`, `b05`, `b09` and `b23` pin all four real
+padded drafts. A match is not permission to press Enter: `/`, `@` and `$`
+completion popups above the composer must be handled by the consumer.
+Captured: codex-cli 0.167.0, 2026-11-14, sealed private-tmux command probe:
+`/new   ` followed by Enter replaced startup help with a fresh logo/editor;
+no API request occurred.
 New mutations are explicitly Synthetic in `tests/styled_screen.rs`.
 
 Fourteen distinct frames cover all 19 raw U5 Codex screens (40 rows, 120

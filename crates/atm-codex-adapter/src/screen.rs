@@ -18,8 +18,11 @@
 //! from `/clear`. Consumers must verify the staged draft before Enter (unknown
 //! refuses too); padding/whitespace collisions alone are not safe. Tmux 3.8/3.6
 //! probes show `-N` retains allocated grid padding, not only authored spaces.
-//! Only a single visible row can be compared; trailing-padding-only differences
-//! and multiline/wrapped input cannot prove exact equality and return unknown.
+//! Only a single visible row can be compared; multiline/wrapped input returns
+//! unknown. Trailing ASCII spaces are chrome: a sealed 0.167.0 probe confirmed
+//! `/new   ` executes new, not a prompt. A match does not prove Enter submits:
+//! completion popups for `/`, `@` and `$` appear above the composer and must be
+//! handled by the consumer, not mistaken for harmless history.
 //! Under Plain only the captured `/new` completion is a known draft; free-text
 //! drafts lack shortcut chrome and remain Unknown. P1 permission/trust dialogs
 //! remain unsupported; no speculative action/selection recognizer is added.
@@ -122,27 +125,24 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 
 /// Compare only a reconstructable active single-line draft, never history.
 ///
-/// Requires Styled. Preserves leading whitespace, refuses multiline/controls and
-/// expected trailing spaces. An exact unpadded row can match; trailing-padding
-/// differences return None. Consumers must refuse both Some(false) and None.
+/// Requires Styled and a nonempty expected string without controls or trailing
+/// whitespace. Compares after removing trailing ASCII spaces from the draft only;
+/// leading whitespace stays exact. Other differences return Some(false); unknown
+/// layouts, faint text and multiline/wrapped drafts return None. A match proves
+/// visible text only, not that Enter submits it: consumers must handle completion
+/// popups (including `/`, `@` and `$`) and refuse both Some(false) and None.
 #[must_use]
 pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
     if !matches!(input, ScreenInput::Styled(_))
         || expected.is_empty()
-        || expected.ends_with(' ')
+        || expected.ends_with(char::is_whitespace)
         || expected.chars().any(char::is_control)
     {
         return None;
     }
     let (_, draft) = inspect(input, None);
     let draft = draft?;
-    if draft == expected {
-        Some(true)
-    } else if draft.trim_end_matches(' ') == expected.trim_end_matches(' ') {
-        None
-    } else {
-        Some(false)
-    }
+    Some(draft.trim_end_matches(' ') == expected)
 }
 
 fn nonblank<'a>(lines: &[&'a str]) -> Vec<&'a str> {
@@ -308,7 +308,7 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
         facts.fresh_editor = FreshEditorEvidence::Present;
     }
     let draft = styled
-        .filter(|_| input == InputState::Draft)
+        .filter(|_| input == InputState::Draft && normal_draft)
         .and_then(|screen| screen.text().lines().nth(before_composer.len()))
         .and_then(|line| line.strip_prefix("› "))
         .map(str::to_owned);

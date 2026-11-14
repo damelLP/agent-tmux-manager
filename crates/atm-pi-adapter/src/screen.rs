@@ -21,8 +21,9 @@
 //! This is safe ONLY when consumers verify the staged draft exactly before Enter
 //! and refuse unknown too. Leading whitespace is never stripped: ` /clear` is a
 //! different draft from `/clear`. `staged_draft_matches` accepts Styled only and
-//! refuses multiline/wrapped reconstruction and trailing-padding-only ambiguity;
-//! even the inverse cursor blank cannot prove which trailing spaces are authored.
+//! refuses multiline/wrapped reconstruction. Trailing ASCII spaces are chrome:
+//! a sealed 1.5.0 probe confirmed `/new   ` executes new, not a prompt. Faint text
+//! is not typed draft evidence.
 //! The active upper border, not startup's interrupt help, establishes turn state.
 //! Fresh layout requires zero usage and startup-only history: the new-session
 //! notice survives later turns and alone proves nothing. Present does not prove
@@ -86,27 +87,24 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 
 /// Compare only a reconstructable active single-line draft, never history.
 ///
-/// Requires Styled. Preserves leading whitespace, refuses multiline/controls and
-/// expected trailing spaces. An exact unpadded row can match; trailing-padding
-/// differences return None. Consumers must refuse both Some(false) and None.
+/// Requires Styled and a nonempty expected string without controls or trailing
+/// whitespace. Compares after removing trailing ASCII spaces from the draft only;
+/// leading whitespace stays exact. Other differences return Some(false); unknown
+/// layouts, faint text and multiline/wrapped drafts return None. A match proves
+/// visible text only, not that Enter submits it: consumers must handle popups
+/// and refuse both Some(false) and None.
 #[must_use]
 pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
     if !matches!(input, ScreenInput::Styled(_))
         || expected.is_empty()
-        || expected.ends_with(' ')
+        || expected.ends_with(char::is_whitespace)
         || expected.chars().any(char::is_control)
     {
         return None;
     }
     let (_, draft) = inspect(input, None);
     let draft = draft?;
-    if draft == expected {
-        Some(true)
-    } else if draft.trim_end_matches(' ') == expected.trim_end_matches(' ') {
-        None
-    } else {
-        Some(false)
-    }
+    Some(draft.trim_end_matches(' ') == expected)
 }
 
 fn rule(line: &str) -> bool {
@@ -151,9 +149,28 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
     } else {
         return None;
     };
+    let faint_text = styled.is_some_and(|screen| {
+        let offset = screen
+            .text()
+            .split_inclusive('\n')
+            .take(top + 1)
+            .map(str::len)
+            .sum::<usize>();
+        let raw_body = screen
+            .text()
+            .lines()
+            .skip(top + 1)
+            .take(body.len())
+            .collect::<Vec<_>>()
+            .join("\n");
+        raw_body
+            .char_indices()
+            .any(|(i, c)| !c.is_whitespace() && screen.faint_at(offset + i) != Some(false))
+    });
     let input = match body {
         [""] => InputState::Empty,
         [] => return None,
+        _ if faint_text => InputState::Unknown,
         _ => InputState::Draft,
     };
     let fresh_editor = if input == InputState::Empty

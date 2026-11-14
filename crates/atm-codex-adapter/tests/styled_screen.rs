@@ -155,6 +155,64 @@ fn partial_faint_placeholder_and_missing_chrome_never_empty() {
     );
 }
 #[test]
+fn real_retained_padding_matches_staged_text() {
+    for (text, expected) in [
+        (capture!("p1_c03-draft-before-100x24"), "C_EXISTING_DRAFT:"),
+        (capture!("p1_b05-repeat-new-draft-100x32"), "/new"),
+        (capture!("p1_b09-valid-new-draft-100x32"), "/new"),
+        (
+            capture!("p1_b23-early-paste-landed-100x24"),
+            "B_EARLY_PASTE",
+        ),
+    ] {
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(text), expected),
+            Some(true)
+        );
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(text), "wrong"),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn faint_command_is_not_a_typed_draft() {
+    // Synthetic: non-placeholder faint text must not count as a staged command.
+    let text =
+        capture!("u5b_poor-different-draft").replace("baseline draft 123", "\x1b[2m/clear\x1b[22m");
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+        None
+    );
+    // Synthetic: slash-menu recognition must not bypass typed-text evidence.
+    let menu = capture!("p1_b09-valid-new-draft-100x32");
+    let faint = menu.replace("›\x1b[0m /new", "›\x1b[0;2m /new");
+    assert_ne!(faint, menu);
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(&faint), "/new"),
+        None
+    );
+}
+
+#[test]
+fn non_ascii_trailing_whitespace_is_not_padding() {
+    // Synthetic: only ASCII spaces are chrome; other trailing whitespace stays distinct.
+    for suffix in ["\u{a0}", "\u{2003}"] {
+        let expected = format!("/clear{suffix}");
+        let text = capture!("u5b_poor-different-draft").replace("baseline draft 123", &expected);
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(&text), &expected),
+            None
+        );
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+            Some(false)
+        );
+    }
+}
+
+#[test]
 fn expected_trailing_spaces_cannot_turn_padding_into_exactness() {
     // Synthetic: expected text could accidentally equal the renderer's padding.
     let padded = capture!("u5b_poor-different-draft").replace("baseline draft 123", "/clear   ");
@@ -187,7 +245,7 @@ fn leading_spaces_after_blank_draft_paste_never_match_command() {
     let padded = draft.replace("baseline draft 123", "/clear   ");
     assert_eq!(
         screen::staged_draft_matches(ScreenInput::Styled(&padded), "/clear"),
-        None
+        Some(true)
     );
     assert_eq!(
         screen::staged_draft_matches(ScreenInput::Plain(&exact), "/clear"),

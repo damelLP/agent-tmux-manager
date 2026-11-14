@@ -25,8 +25,13 @@
 //! Enter, refusing both false and unknown. Leading spaces are never normalized:
 //! ` /clear` is not `/clear` (the former can submit a plain prompt).
 //! `staged_draft_matches` supports a single visible row only, Styled only. It
-//! refuses multiline/wrapped reconstruction and trailing-padding ambiguity;
-//! even a cursor blank is not proof that subsequent spaces are unowned padding.
+//! refuses multiline/wrapped reconstruction. Trailing ASCII spaces are chrome:
+//! a sealed 2.1.325 probe confirmed `/clear   ` executes clear, not a prompt.
+//! The queued-message placeholder uses the same inverse-first-cell/faint-rest
+//! evidence as suggestions; other faint text is not a typed draft.
+//! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001),
+//! so that frame reads Unknown and the staged matcher returns None. Slash-menu
+//! and other permission-mode parsing belong to the control consumer's slice.
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
 //! Header, bordered input and footer are found by chrome, not absolute rows.
@@ -101,29 +106,24 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 
 /// Compare only a reconstructable active single-line draft, never history.
 ///
-/// Requires Styled. Preserves leading whitespace, refuses multiline/controls and
-/// expected trailing spaces. An exact unpadded row can match; trailing-padding
-/// differences return None. Consumers must refuse both Some(false) and None.
+/// Requires Styled and a nonempty expected string without controls or trailing
+/// whitespace. Compares after removing trailing ASCII spaces from the draft only;
+/// leading whitespace stays exact. Other differences return Some(false); unknown
+/// layouts, faint text and multiline/wrapped drafts return None. A match proves
+/// visible text only, not that Enter submits it: consumers must handle popups
+/// and refuse both Some(false) and None.
 #[must_use]
 pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
     if !matches!(input, ScreenInput::Styled(_))
         || expected.is_empty()
-        || expected.ends_with(' ')
+        || expected.ends_with(char::is_whitespace)
         || expected.chars().any(char::is_control)
     {
         return None;
     }
     let (_, draft) = inspect(input, None);
     let draft = draft?;
-    // Never remove leading whitespace. A trailing-space-only difference could
-    // be authored text or grid padding, so it cannot establish exact equality.
-    if draft == expected {
-        Some(true)
-    } else if draft.trim_end_matches(' ') == expected.trim_end_matches(' ') {
-        None
-    } else {
-        Some(false)
-    }
+    Some(draft.trim_end_matches(' ') == expected)
 }
 
 fn rule(line: &str, glyph: char) -> bool {
@@ -238,7 +238,9 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
         InputState::Draft
     } else if input.is_empty() {
         InputState::Empty
-    } else if input.starts_with("Try \"") && input.ends_with('"') {
+    } else if (input.starts_with("Try \"") && input.ends_with('"'))
+        || (styled.is_some() && input == "Press up to edit queued messages")
+    {
         match styled.zip(offset) {
             Some((screen, offset))
                 if screen.inverse_at(offset) == Some(true)
@@ -264,6 +266,12 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
             }
             _ => InputState::Unknown,
         }
+    } else if styled.zip(offset).is_some_and(|(screen, offset)| {
+        input
+            .char_indices()
+            .any(|(i, c)| c != ' ' && screen.faint_at(offset + i) != Some(false))
+    }) {
+        InputState::Unknown
     } else {
         InputState::Draft
     };

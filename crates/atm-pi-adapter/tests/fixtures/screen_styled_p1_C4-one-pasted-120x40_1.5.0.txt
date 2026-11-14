@@ -1,0 +1,41 @@
+Captured: pi 1.5.0, 2026-11-14, P1 sealed private tmux capture-pane -p -e -N; sanitized.
+[2m  pi-atm.ts[0m                   
+
+
+
+ [38;5;5m✓ New session started[39m        
+
+
+
+ B_SENTINEL_6_event           
+
+
+ SEALED_REPLY_14              
+
+
+ C1_SINGLE "double" 'single' café                           
+
+
+ SEALED_REPLY_15              
+
+
+ C1_FIRST "double"            
+
+ C1_THIRD 'single' café       
+
+
+ SEALED_REPLY_16              
+
+
+ C1_ATM_FIRST                 
+
+ "quoted" 'last' café         
+
+
+ SEALED_REPLY_17              
+
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[0mC4_DRAFT:C4_PASTED[7m [0m           
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/xxxxxxxxxxxxxxxxxxx/project[0m                            
+[2m↑400 ↓40 0.1%/200k (auto)                                                                                   sealed-model

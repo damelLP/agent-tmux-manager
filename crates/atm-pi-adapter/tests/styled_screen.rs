@@ -145,7 +145,7 @@ fn whitespace_only_draft_plus_paste_preserves_leading_spaces() {
             Some(false)
         );
     }
-    // Synthetic: unpadded visible row vs. padding ambiguity; leading spaces are never trimmed.
+    // Synthetic: trailing ASCII padding is chrome; leading spaces are never trimmed.
     let exact = blank
         .lines()
         .map(|line| {
@@ -166,7 +166,7 @@ fn whitespace_only_draft_plus_paste_preserves_leading_spaces() {
             ScreenInput::Styled(&exact.replace("/clear", "/clear   ")),
             "/clear"
         ),
-        None
+        Some(true)
     );
     assert_eq!(
         screen::staged_draft_matches(ScreenInput::Plain(&exact), "/clear"),
@@ -182,6 +182,59 @@ fn whitespace_only_draft_plus_paste_preserves_leading_spaces() {
         Some(false)
     );
 }
+#[test]
+fn real_retained_padding_matches_staged_text() {
+    for (text, expected) in [
+        (capture!("C4-one-draft-120x40"), "C4_DRAFT:"),
+        (capture!("B-0-event-pasted-120x40"), "B_SENTINEL_0_event"),
+        (capture!("C4-one-pasted-120x40"), "C4_DRAFT:C4_PASTED"),
+    ] {
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(text), expected),
+            Some(true)
+        );
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(text), "wrong"),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn faint_text_is_not_a_typed_draft() {
+    let blank = capture!("B-fresh-120x40");
+    // Synthetic: faint or partly faint command text is not typed input.
+    for command in ["\x1b[2m/clear", "/cl\x1b[2mear"] {
+        let text = blank.replace("\x1b[0;7m \x1b[0m", &format!("\x1b[0m{command}\x1b[0m"));
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+            None
+        );
+        assert_eq!(
+            screen::observe_screen(ScreenInput::Styled(&text), None).input,
+            InputState::Unknown
+        );
+    }
+}
+
+#[test]
+fn non_ascii_trailing_whitespace_is_not_padding() {
+    // Synthetic: only ASCII spaces are chrome; other trailing whitespace stays distinct.
+    for suffix in ["\u{a0}", "\u{2003}"] {
+        let expected = format!("/clear{suffix}");
+        let text =
+            capture!("B-fresh-120x40").replace("\x1b[0;7m \x1b[0m", &format!("\x1b[0m{expected}"));
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(&text), &expected),
+            None
+        );
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+            Some(false)
+        );
+    }
+}
+
 #[test]
 fn expected_trailing_spaces_cannot_turn_padding_into_exactness() {
     // Synthetic: expected text could accidentally equal the renderer's padding.

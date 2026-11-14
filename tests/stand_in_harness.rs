@@ -4,6 +4,8 @@
 
 #[path = "support/stand_in.rs"]
 mod stand_in;
+#[path = "support/stand_in/test_suite.rs"]
+mod support_tests;
 
 use atm_core::SessionStatus;
 use stand_in::{bounded, StandInConfig, StandInMode, StandInRig};

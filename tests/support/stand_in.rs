@@ -12,15 +12,15 @@ use serde_json::Value;
 #[path = "role.rs"]
 pub(crate) mod bounded;
 #[path = "stand_in/events.rs"]
-mod events;
+pub mod events;
 #[path = "stand_in/ownership.rs"]
 mod ownership;
 #[path = "stand_in/parent.rs"]
 pub mod parent;
 #[path = "stand_in/process.rs"]
-mod process;
+pub mod process;
 #[path = "stand_in/rows.rs"]
-mod rows;
+pub mod rows;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
@@ -816,4 +816,4 @@ pub fn protocol_request(
 
 #[cfg(test)]
 #[path = "stand_in/test_cleanup.rs"]
-mod test_cleanup;
+pub mod test_cleanup;

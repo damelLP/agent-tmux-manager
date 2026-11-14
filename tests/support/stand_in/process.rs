@@ -76,11 +76,10 @@ pub fn run(command: &mut Command) -> Output {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
-    #[test]
-    fn command_exit_returns_complete_large_output_without_pipe_deadlock() {
+    pub fn command_exit_returns_complete_large_output_without_pipe_deadlock() {
         let output = run(Command::new("/usr/bin/python3").args([
             "-c",
             "import sys; print('x'*131072); print('error text', file=sys.stderr)",

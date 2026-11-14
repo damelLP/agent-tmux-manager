@@ -156,20 +156,18 @@ impl Drop for Events {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn stale_start_identity_cannot_match_reused_pid() {
+    pub fn stale_start_identity_cannot_match_reused_pid() {
         let stale = json!({"kind": "ready", "pid": 123, "start_time": "old"});
         assert!(!matches_process(&stale, 123, "new"));
         assert!(!matches_process(&stale, 124, "old"));
         assert!(matches_process(&stale, 123, "old"));
     }
 
-    #[test]
-    fn events_replay_without_lost_wake_and_close_with_open_peer() {
+    pub fn events_replay_without_lost_wake_and_close_with_open_peer() {
         let dir = tempfile::tempdir().unwrap();
         let events = Events::bind(dir.path().join("events.sock"));
         let mut peer = UnixStream::connect(events.path()).unwrap();

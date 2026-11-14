@@ -20,8 +20,7 @@ fn stop_server(rig: &StandInRig) {
     process::wait_exit(pid, Duration::from_secs(30)).unwrap();
 }
 
-#[test]
-fn stopped_and_replaced_private_servers_clean_up_without_stale_pid() {
+pub fn stopped_and_replaced_private_servers_clean_up_without_stale_pid() {
     for replace in [false, true] {
         let mut rig = StandInRig::start();
         let old = server(&rig);
@@ -58,8 +57,7 @@ fn stopped_and_replaced_private_servers_clean_up_without_stale_pid() {
     }
 }
 
-#[test]
-fn vanished_or_reused_process_is_never_signalled() {
+pub fn vanished_or_reused_process_is_never_signalled() {
     let calls = std::cell::Cell::new(0);
     for current in [None, Some("replacement")] {
         let result = signal_if_unchanged("original", current, || {
@@ -77,8 +75,7 @@ fn vanished_or_reused_process_is_never_signalled() {
     assert_eq!(calls.get(), 1);
 }
 
-#[test]
-fn detached_daemon_log_provides_lost_handshake_diagnostics() {
+pub fn detached_daemon_log_provides_lost_handshake_diagnostics() {
     let mut rig = StandInRig::start();
     let log = rig.root().join("state/atm/atm.log");
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
@@ -89,8 +86,7 @@ fn detached_daemon_log_provides_lost_handshake_diagnostics() {
     rig.close();
 }
 
-#[test]
-fn foreign_socket_is_refused_without_affecting_either_server() {
+pub fn foreign_socket_is_refused_without_affecting_either_server() {
     let mut first = StandInRig::start();
     let mut second = StandInRig::start();
     let before = server(&second);
@@ -104,8 +100,7 @@ fn foreign_socket_is_refused_without_affecting_either_server() {
     second.close();
 }
 
-#[test]
-fn drop_retains_run_directory_when_cleanup_refuses_an_identity() {
+pub fn drop_retains_run_directory_when_cleanup_refuses_an_identity() {
     let mut rig = StandInRig::start();
     let mut foreign = StandInRig::start();
     let root = rig.root().to_owned();
@@ -126,8 +121,7 @@ fn drop_retains_run_directory_when_cleanup_refuses_an_identity() {
     );
 }
 
-#[test]
-fn daemon_error_still_cleans_tmux_and_returns_first_error() {
+pub fn daemon_error_still_cleans_tmux_and_returns_first_error() {
     let mut rig = StandInRig::start();
     let (_, pid) = server(&rig);
     let result = rig.cleanup_with(|_| Err("injected daemon error".into()));

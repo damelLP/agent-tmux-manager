@@ -135,15 +135,14 @@ impl Drop for Rows {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use atm_core::SessionId;
     use atm_protocol::{ClientMessage, DaemonMessage};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    #[test]
-    fn subscription_consumes_snapshot_before_returning_then_updates_and_removal() {
+    pub fn subscription_consumes_snapshot_before_returning_then_updates_and_removal() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("rows.sock");
         let listener = UnixListener::bind(&socket).unwrap();

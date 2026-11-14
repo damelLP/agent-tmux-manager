@@ -682,7 +682,7 @@ impl MessageHistory {
                     history.last_event_at = observation.session.as_ref().and_then(|row| {
                         self.activity
                             .get(&row.id)
-                            .filter(|(pane, _)| pane == &observation.pane)
+                            .filter(|(pane, _)| pane.is_none() || pane == &observation.pane)
                             .map(|(_, at)| *at)
                             .or(row.last_event_at)
                     });
@@ -741,8 +741,11 @@ impl MessageHistory {
                 // any entry is written.
                 let mut staged = vec![];
                 for (recipient, history) in &self.recipients {
+                    // No pane means "not reported": the session id alone
+                    // matches. A reported pane must be the observed one.
                     if history.observation.as_ref().is_some_and(|obs| {
-                        obs.pane == pane
+                        pane.as_ref()
+                            .is_none_or(|pane| obs.pane.as_ref() == Some(pane))
                             && obs.session.as_ref().is_some_and(|row| row.id == session_id)
                     }) {
                         let mut history = history.clone();
@@ -755,6 +758,8 @@ impl MessageHistory {
                     self.recipients.insert(recipient, history);
                     self.set_short_clocks(clocks);
                 }
+                // A pane-less event never erases the pane a session reported.
+                let pane = pane.or_else(|| self.activity.get(&session_id)?.0.clone());
                 self.activity.insert(session_id, (pane, at));
             }
             HistoryUpdate::Armed { scope } => {

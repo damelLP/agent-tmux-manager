@@ -1103,3 +1103,67 @@ fn failed_activity_changes_no_clock_and_is_not_remembered() {
     f.observe(observation(SessionStatus::Working), 3_000);
     assert_eq!(f.snapshot(3_000).live.session.unwrap().last_event_at, at(0));
 }
+
+fn activity(f: &mut Fixture, session: &str, pane: Option<PaneId>, at_ms: i64) {
+    f.record(
+        HistoryUpdate::Activity {
+            session_id: session.into(),
+            pane,
+            at: at(at_ms),
+        },
+        at_ms,
+    );
+}
+
+#[test]
+fn pane_less_activity_reaches_the_recipient_session() {
+    // A status line reports no pane. The observation already tied the session
+    // to the recipient, and a fresher event clock can only delay a paste.
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Working), 0);
+    activity(&mut f, "s1", None, 100_000);
+    assert_eq!(
+        f.snapshot(100_000).live.session.unwrap().last_event_at,
+        at(100_000)
+    );
+    wait(f.step(120_000), WaitReason::SessionBusy);
+    // Another session's pane-less activity is still not this recipient's.
+    activity(&mut f, "other", None, 150_000);
+    assert_eq!(
+        f.snapshot(150_000).live.session.unwrap().last_event_at,
+        at(100_000)
+    );
+}
+
+#[test]
+fn pane_less_activity_never_erases_the_stored_pane() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Working), 0);
+    activity(&mut f, "s1", Some(pane()), 50_000);
+    activity(&mut f, "s1", None, 60_000);
+    // A new source finds the session's latest event time under its pane.
+    f.record(
+        HistoryUpdate::ObservationLost { recipient: agent() },
+        70_000,
+    );
+    let mut obs = observation(SessionStatus::Working);
+    obs.session.as_mut().unwrap().last_event_at = None;
+    f.observe(obs, 80_000);
+    assert_eq!(
+        f.snapshot(80_000).live.session.unwrap().last_event_at,
+        at(60_000)
+    );
+}
+
+#[test]
+fn pane_less_activity_alone_gives_a_new_source_its_event_time() {
+    let mut f = Fixture::new(0);
+    activity(&mut f, "s1", None, 50_000);
+    let mut obs = observation(SessionStatus::Working);
+    obs.session.as_mut().unwrap().last_event_at = None;
+    f.observe(obs, 80_000);
+    assert_eq!(
+        f.snapshot(80_000).live.session.unwrap().last_event_at,
+        at(50_000)
+    );
+}

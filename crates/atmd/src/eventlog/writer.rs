@@ -32,6 +32,31 @@ fn create_segment(directory: &Path, seq: u64) -> Result<(File, PathBuf), EventLo
     Ok((file, path))
 }
 
+// Persist directory entries from the existing ancestor down to the stream.
+// Syncing only the stream leaves freshly created parents vulnerable to loss.
+fn create_directory(
+    directory: &Path,
+    sync: &mut impl FnMut(&Path) -> Result<(), EventLogError>,
+) -> Result<(), EventLogError> {
+    let parent = directory.parent().map(|parent| {
+        if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        }
+    });
+    if !directory.is_dir() {
+        if let Some(parent) = parent.filter(|parent| *parent != directory) {
+            create_directory(parent, sync)?;
+        }
+        fs::create_dir_all(directory).map_err(|e| io_error(directory, e))?;
+    }
+    if let Some(parent) = parent {
+        sync(parent)?;
+    }
+    Ok(())
+}
+
 fn sync_directory(directory: &Path) -> Result<(), EventLogError> {
     File::open(directory)
         .and_then(|dir| dir.sync_all())
@@ -51,7 +76,7 @@ pub(super) struct Writer {
 
 impl Writer {
     pub fn open(directory: &Path, stream: Stream) -> Result<Self, EventLogError> {
-        fs::create_dir_all(directory).map_err(|e| io_error(directory, e))?;
+        create_directory(directory, &mut sync_directory)?;
         let lock_path = directory.join(".lock");
         let lock = lock::try_lock(&lock_path)
             .map_err(|e| io_error(&lock_path, e))?
@@ -180,6 +205,36 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_directories_sync_their_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let directory = state.join("log/events");
+        let mut synced = Vec::new();
+        create_directory(&directory, &mut |path| {
+            sync_directory(path)?;
+            synced.push(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert!(directory.is_dir());
+        for path in [root.path().to_owned(), state.clone(), state.join("log")] {
+            assert!(
+                synced.contains(&path),
+                "parent {} was not synced: {synced:?}",
+                path.display()
+            );
+        }
+        let error = create_directory(&directory, &mut |path| {
+            Err(io_error(
+                path,
+                std::io::Error::other("injected parent sync failure"),
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("parent sync failure"));
+    }
 
     #[test]
     fn pruning_is_strictly_older_than_limit_and_ignores_future_times() {

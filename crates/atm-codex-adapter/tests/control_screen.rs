@@ -158,6 +158,62 @@ fn p2_every_real_page_and_complete_collections_preserve_p6() {
 }
 
 #[test]
+fn p2_synthetic_header_allocation_padding_does_not_set_the_clipping_edge() {
+    // Synthetic: re-pad real 120x40 top/bottom headers to 71/80/100 columns.
+    // The B0 tail review measured these half-width allocations with tmux 3.8
+    // replaying real Codex bytes at 142/160/200 columns, not live wide Codex.
+    let mut checked = 0;
+    for (name, text, _) in p2_frames() {
+        if !name.contains("120x40") || !(name.contains("-open-") || name.contains("-down13-")) {
+            continue;
+        }
+        let expected = observe(&text).dialog;
+        assert!(matches!(expected, ControlDialog::HookList { .. }), "{name}");
+        let text = plain(&text);
+        for width in [71, 80, 100] {
+            let mutated = text
+                .lines()
+                .map(|line| {
+                    if line.contains("Description") {
+                        format!("{:<width$}", line.trim_end())
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_ne!(mutated, text.trim_end_matches('\n'));
+            for input in [ScreenInput::Plain(&mutated), ScreenInput::Styled(&mutated)] {
+                assert_eq!(
+                    observe_control_screen(input, None).dialog,
+                    expected,
+                    "{name}: header width {width}"
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 4);
+}
+
+#[test]
+fn synthetic_plain_hook_page_without_trailing_padding_preserves_the_list() {
+    // Synthetic: trim a04 as capture-pane -p does without -N. The B0 tail
+    // review measured that header allocation padding is not the viewport edge.
+    let expected = observe(PENDING).dialog;
+    assert!(matches!(expected, ControlDialog::HookList { .. }));
+    let trimmed = plain(PENDING)
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        observe_control_screen(ScreenInput::Plain(&trimmed), None).dialog,
+        expected
+    );
+}
+
+#[test]
 fn p2_synthetic_page_damage_stays_unknown() {
     // Synthetic: mutate EVERY accepted real shape, including selected extras,
     // both layouts, all widths, all marker combinations and the 10-hook run.

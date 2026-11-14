@@ -161,13 +161,9 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
         _ => tail,
     };
     let (columns, tail) = tail.split_first()?;
-    // Retained capture padding gives the viewport edge; the header anchors the
-    // description column in both layouts. Never accept arbitrary text prefixes.
-    let header = text.lines().rev().find(|line| line.trim() == *columns)?;
-    let description_width = header
-        .chars()
-        .count()
-        .checked_sub(header.find("Description")?)?;
+    // Header padding is tmux allocation, not the viewport edge. The selected
+    // row spans the pane; a clipped description's visible text must reach it.
+    let width = text.lines().map(|line| line.chars().count()).max()?;
     let columns = columns.split_whitespace().collect::<Vec<_>>().join(" ");
     if columns
         != if pending {
@@ -205,6 +201,9 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
     let mut first = None;
     let mut selections = 0;
     for (offset, row) in rows.iter().enumerate() {
+        let reaches_edge = text
+            .lines()
+            .any(|line| line.trim() == *row && line.trim_end().chars().count() == width);
         let row = if let Some(row) = row.strip_prefix("› ") {
             selections += 1;
             row
@@ -223,19 +222,15 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
         let entry = HookListEntry::new(event.into(), installed, active, review);
         let position = HOOK_ROWS.iter().position(|(name, _)| *name == event)?;
         let first = *first.get_or_insert(position);
-        let expected: String = HOOK_ROWS
-            .get(position)?
-            .1
-            .chars()
-            .take(description_width)
-            .collect();
+        let expected = HOOK_ROWS.get(position)?.1;
+        let description = columns.collect::<Vec<_>>().join(" ");
         let required = CodexEventType::hook_names().any(|name| name == event);
         let uninstalled = entry.installed == 0
             && entry.active == 0
             && entry.review.is_none_or(|review| review == 0);
         if position != first + offset
             || !(uninstalled || (required && valid_counts(&entry)))
-            || expected.trim_end() != columns.collect::<Vec<_>>().join(" ")
+            || !(description == expected || (reaches_edge && expected.starts_with(&description)))
         {
             return None;
         }

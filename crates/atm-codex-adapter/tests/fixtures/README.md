@@ -49,10 +49,13 @@ bottom pages only an upper marker. Down at the bottom wraps to the top, not a
 no-op; consumers must not wait for a no-op to establish completeness.
 
 The parser validates contiguous UI order, exact edge markers and exactly one
-selection. Descriptions are exact, clipped only at the description column's
-available width from the retained header geometry (pending width-100 frames
-clip Interrupt and PostModelRequest). Zero-count rows parse even for missing
-ATM registrations. Only the known uninstalled Interrupt, PreModelRequest and
+selection. Descriptions are exact, or strict prefixes only when the row's
+visible text reaches the end of the widest captured line (pending width-100
+frames clip Interrupt and PostModelRequest). The selected row spans the pane;
+header padding is tmux allocation, not a clipping edge. Replays of real Codex
+bytes in tmux 3.8 show half-width header allocation from 142 columns and
+quarter-width from 284. A live Codex at 142 columns or wider remains unverified.
+Zero-count rows parse even for missing ATM registrations. Only the known uninstalled Interrupt, PreModelRequest and
 PostModelRequest rows are omitted from returned authorization entries: unknown
 events or installed extras refuse the entire page. Zero-count SubagentStop is
 retained, so the ten-hook collected sets fail P6. Returned rows never imply

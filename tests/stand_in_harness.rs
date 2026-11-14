@@ -369,6 +369,84 @@ fn stand_in_observes_restarted_process() {
 }
 
 #[test]
+fn startup_diagnostics_include_private_pane_errors() {
+    let mut rig = StandInRig::start();
+    let pane = success(rig.tmux(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "printf 'stand-in-startup-error\\n'; exec /bin/bash --noprofile --norc",
+    ]));
+    rig.wait("error marker", || {
+        success(rig.tmux(&["capture-pane", "-p", "-t", &pane])).contains("stand-in-startup-error")
+    });
+    assert!(rig.diagnostics().contains("stand-in-startup-error"));
+    // Synthetic: exercise the diagnostic for a lost real-forwarder handshake.
+    std::fs::write(rig.root().join("lost.log"), "Handshake failed: Broken pipe").unwrap();
+    assert!(rig.diagnostics().contains("Possible lost hook"));
+    rig.close();
+}
+
+#[test]
+fn protocol_request_is_bounded_when_listener_never_answers() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("silent.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let before = Instant::now();
+    let error = stand_in::protocol_request(
+        &socket,
+        atm_protocol::ClientMessage::list_sessions(),
+        Duration::from_millis(30),
+    )
+    .expect_err("a silent peer must time out");
+    assert!(error.to_string().contains("deadline"), "{error}");
+    assert!(before.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn stand_in_daemon_control_and_auto_start_cleanup() {
+    let mut rig = StandInRig::start();
+    let root = rig.root().to_owned();
+    let launcher = rig.launcher(StandInMode::Claude);
+    rig.set_daemon_env("ATM_SPAWN_BIN", &launcher);
+    rig.restart_daemon();
+    let pid = rig.daemon_pids()[0];
+    let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(env
+        .split(|b| *b == 0)
+        .any(|v| v == format!("ATM_SPAWN_BIN={}", launcher.display()).as_bytes()));
+    rig.stop_daemon();
+    assert!(rig.daemon_pids().is_empty());
+    // A real CLI auto-start, not a child inserted into the rig's bookkeeping.
+    success(rig.atm(&["list"]));
+    assert_eq!(rig.daemon_pids().len(), 1);
+    let auto = rig.daemon_pids()[0];
+    rig.close();
+    assert!(rig.daemon_pids().is_empty());
+    drop(rig);
+    assert!(!root.exists());
+    assert!(!std::fs::read(format!("/proc/{auto}/environ"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .any(|v| v.starts_with(b"ATM_SOCKET=")));
+}
+
+#[test]
+fn stand_in_readiness_does_not_require_tmux_paste_format() {
+    let mut rig = StandInRig::start();
+    let pane = rig.launch(&StandInConfig::new(StandInMode::Claude));
+    let row = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+    // Decouple readiness from the optional tmux format, even on tmux >= 3.7.
+    let tty = success(rig.tmux(&["display-message", "-p", "-t", &pane.pane_id, "#{pane_tty}"]));
+    std::fs::write(tty, b"\x1b[?2004l").unwrap();
+    rig.wait_ready(&pane, Some(row.id.as_str()));
+    rig.close();
+}
+
+#[test]
 fn stand_in_model_contract() {
     let output = bounded::run(
         std::process::Command::new("python3")

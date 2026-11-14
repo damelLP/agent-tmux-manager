@@ -62,8 +62,9 @@ pub struct StandInPane {
 pub struct StandInRig {
     dir: tempfile::TempDir,
     label: String,
-    tmux_identity: Option<(PathBuf, u32)>,
+    tmux_identity: Option<(PathBuf, Option<u32>)>,
     daemon: Option<Child>,
+    daemon_env: std::collections::BTreeMap<String, std::ffi::OsString>,
     serial: usize,
     path: std::ffi::OsString,
 }
@@ -114,6 +115,7 @@ impl StandInRig {
             label: "stand-in".into(),
             tmux_identity: None,
             daemon: None,
+            daemon_env: Default::default(),
             serial: 0,
             path,
         };
@@ -133,6 +135,13 @@ impl StandInRig {
             std::os::unix::fs::symlink(Path::new(SOURCE).join("harness.py"), rig.launcher(mode))
                 .unwrap();
         }
+        // Record the canonical private socket before new-session can create a server.
+        // This also owns cleanup if the subsequent identity query fails.
+        let tmux_dir = rig.root().join("tmux").canonicalize().unwrap();
+        let socket = tmux_dir
+            .join(format!("tmux-{}", unsafe { libc::getuid() }))
+            .join(&rig.label);
+        rig.tmux_identity = Some((socket, None));
         checked(rig.tmux(&[
             "-f",
             "/dev/null",
@@ -145,8 +154,8 @@ impl StandInRig {
         // Record the server before any subsequent fallible setup operation.
         let identity = checked(rig.tmux(&["display-message", "-p", "#{socket_path} #{pid}"]));
         let (socket, pid) = identity.rsplit_once(' ').expect("tmux identity");
-        rig.tmux_identity = Some((socket.into(), pid.parse().unwrap()));
-        assert!(Path::new(socket).starts_with(rig.dir.path().join("tmux")));
+        assert_eq!(Path::new(socket), rig.tmux_identity.as_ref().unwrap().0);
+        rig.tmux_identity = Some((socket.into(), Some(pid.parse().unwrap())));
         checked(rig.tmux(&["set-option", "-g", "default-shell", "/bin/bash"]));
         checked(rig.tmux(&[
             "set-option",
@@ -154,21 +163,121 @@ impl StandInRig {
             "default-command",
             "/bin/bash --noprofile --norc",
         ]));
-        let log = std::fs::File::create(rig.dir.path().join("daemon.log")).unwrap();
-        rig.daemon = Some(
-            rig.command(Path::new(env!("CARGO_BIN_EXE_atmd")))
+        rig.start_daemon();
+        rig
+    }
+
+    /// Extra environment survives restarts; sealing variables cannot be overridden.
+    pub fn set_daemon_env(&mut self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        assert!(
+            !self
+                .command(Path::new("true"))
+                .get_envs()
+                .any(|(k, _)| k == key),
+            "cannot override rig seal"
+        );
+        self.daemon_env.insert(key.into(), value.as_ref().into());
+    }
+
+    pub fn start_daemon(&mut self) {
+        assert!(
+            self.daemon_pids().is_empty(),
+            "private daemon already running"
+        );
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root().join("daemon.log"))
+            .unwrap();
+        self.daemon = Some(
+            self.command(Path::new(env!("CARGO_BIN_EXE_atmd")))
+                .envs(&self.daemon_env)
                 .arg("start")
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
                 .spawn()
                 .expect("start private atmd"),
         );
-        rig.wait("daemon socket", || {
-            rig.socket()
-                .metadata()
-                .is_ok_and(|m| m.file_type().is_socket())
+        self.wait("daemon request round trip", || {
+            matches!(
+                protocol_request(&self.socket(), ClientMessage::list_sessions(), DEADLINE),
+                Ok(DaemonMessage::SessionList { .. })
+            )
         });
-        rig
+    }
+
+    pub fn stop_daemon(&mut self) {
+        self.stop_daemons().expect("stop private daemons");
+    }
+
+    pub fn restart_daemon(&mut self) {
+        self.stop_daemon();
+        self.start_daemon();
+    }
+
+    pub fn daemon_pids(&self) -> Vec<u32> {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .filter(|pid| self.daemon_identity(*pid).is_some())
+            .collect()
+    }
+
+    fn daemon_identity(&self, pid: u32) -> Option<String> {
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        if std::fs::read_to_string(proc.join("comm")).ok()?.trim() != "atmd" {
+            return None;
+        }
+        let env = std::fs::read(proc.join("environ")).ok()?;
+        let owned = env
+            .split(|b| *b == 0)
+            .filter_map(|entry| {
+                let (_, value) = std::str::from_utf8(entry).ok()?.split_once('=')?;
+                Some(Path::new(value).starts_with(self.root()))
+            })
+            .any(|owned| owned);
+        if !owned {
+            return None;
+        }
+        let stat = std::fs::read_to_string(proc.join("stat")).ok()?;
+        Some(stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.into())
+    }
+
+    fn stop_daemons(&mut self) -> Result<(), String> {
+        for pid in self.daemon_pids() {
+            let identity = self
+                .daemon_identity(pid)
+                .ok_or("daemon identity vanished")?;
+            if self.daemon_identity(pid).as_ref() != Some(&identity) {
+                return Err("daemon identity changed".into());
+            }
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while self.daemon_identity(pid).as_ref() == Some(&identity) {
+                if Instant::now() >= deadline {
+                    // Rechecked environment + procfs start time immediately before signalling.
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+        if let Some(mut child) = self.daemon.take() {
+            child.wait().map_err(|e| e.to_string())?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !self.daemon_pids().is_empty() {
+            if Instant::now() >= deadline {
+                return Err("private daemon failed to exit".into());
+            }
+            std::thread::sleep(POLL);
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -182,7 +291,7 @@ impl StandInRig {
     }
     pub fn tmux_env(&self) -> String {
         let (socket, pid) = self.tmux_identity.as_ref().expect("private server");
-        format!("{},{pid},0", socket.display())
+        format!("{},{},0", socket.display(), pid.expect("server pid"))
     }
 
     pub fn command(&self, program: &Path) -> Command {
@@ -304,16 +413,17 @@ impl StandInRig {
                 .rev()
                 .find(|e| e["kind"] == "render")
                 .is_some_and(|e| {
-                    e["state"] == "idle" && session_id.is_none_or(|id| e["session_id"] == id)
+                    let Some(id) = e["session_id"].as_str() else {
+                        return false;
+                    };
+                    let mode = pane.launcher.file_name().unwrap().to_str().unwrap();
+                    e["state"] == "idle"
+                        && session_id.is_none_or(|wanted| id == wanted)
+                        && self
+                            .capture(pane)
+                            .lines()
+                            .any(|line| line == format!("stand-in {mode} {id}: idle"))
                 })
-                && self.capture(pane).contains(": idle")
-                && checked(self.tmux(&[
-                    "display-message",
-                    "-p",
-                    "-t",
-                    &pane.pane_id,
-                    "#{bracket_paste_flag}",
-                ])) == "1"
         });
     }
     pub fn wait_for_shell(&self, pane: &StandInPane) {
@@ -399,7 +509,7 @@ impl StandInRig {
             std::thread::sleep(POLL);
         }
     }
-    fn diagnostics(&self) -> String {
+    pub fn diagnostics(&self) -> String {
         let mut out = String::new();
         for entry in std::fs::read_dir(self.root()).unwrap().flatten() {
             if entry
@@ -413,6 +523,9 @@ impl StandInRig {
                     std::fs::read_to_string(entry.path()).unwrap_or_default()
                 ));
             }
+        }
+        if out.contains("Handshake failed") {
+            out.push_str("\nPossible lost hook: daemon logged Handshake failed; journal event entries are send attempts, not acknowledgments.\n");
         }
         if self.tmux_identity.is_some() {
             let panes = self.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]);
@@ -433,30 +546,7 @@ impl StandInRig {
         self.cleanup().expect("private rig cleanup");
     }
     fn cleanup(&mut self) -> Result<(), String> {
-        if let Some(child) = &mut self.daemon {
-            if child.try_wait().map_err(|e| e.to_string())?.is_none() {
-                // Child is unreaped: its PID cannot have been recycled.
-                let env = std::fs::read(format!("/proc/{}/environ", child.id()))
-                    .map_err(|e| e.to_string())?;
-                let expected = format!("ATM_SOCKET={}", self.dir.path().join("atm.sock").display());
-                if !env.split(|b| *b == 0).any(|s| s == expected.as_bytes()) {
-                    return Err("refusing to signal daemon with foreign environment".into());
-                }
-                unsafe {
-                    libc::kill(child.id() as i32, libc::SIGTERM);
-                }
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while child.try_wait().map_err(|e| e.to_string())?.is_none() {
-                    if Instant::now() >= deadline {
-                        child.kill().map_err(|e| e.to_string())?;
-                        break;
-                    }
-                    std::thread::sleep(POLL);
-                }
-                child.wait().map_err(|e| e.to_string())?;
-            }
-            self.daemon = None;
-        }
+        self.stop_daemons()?;
         if let Some((socket, pid)) = &self.tmux_identity {
             let mut cmd = self.command(Path::new("tmux"));
             cmd.args([
@@ -467,10 +557,25 @@ impl StandInRig {
                 "#{socket_path} #{pid}",
             ]);
             let output = bounded::run(&mut cmd);
-            let expected = format!("{} {pid}", socket.display());
+            if !socket.exists() && pid.is_none() {
+                self.tmux_identity = None;
+                return Ok(());
+            }
+            let identity = String::from_utf8_lossy(&output.stdout);
+            let actual = identity.trim().rsplit_once(' ');
             if !output.status.success()
-                || String::from_utf8_lossy(&output.stdout).trim() != expected
-                || !socket.starts_with(self.root().join("tmux"))
+                || !actual.is_some_and(|(path, actual_pid)| {
+                    Path::new(path) == socket
+                        && actual_pid.parse::<u32>().is_ok_and(|actual_pid| {
+                            pid.is_none_or(|expected| actual_pid == expected)
+                        })
+                })
+                || !socket.starts_with(
+                    self.root()
+                        .join("tmux")
+                        .canonicalize()
+                        .map_err(|e| e.to_string())?,
+                )
             {
                 return Err("refusing to kill tmux: server identity mismatch".into());
             }
@@ -502,7 +607,7 @@ impl Drop for StandInRig {
 }
 
 // A synchronous test API with one deadline covering connect, handshake and reply.
-fn protocol_request(
+pub fn protocol_request(
     path: &Path,
     request: ClientMessage,
     timeout: Duration,
@@ -543,39 +648,3 @@ fn protocol_request(
         .await?
     })
 }
-
-#[test]
-fn startup_diagnostics_include_private_pane_errors() {
-    let mut rig = StandInRig::start();
-    let pane = checked(rig.tmux(&[
-        "new-window",
-        "-d",
-        "-P",
-        "-F",
-        "#{pane_id}",
-        "printf 'stand-in-startup-error\\n'; exec /bin/bash --noprofile --norc",
-    ]));
-    rig.wait("error marker", || {
-        checked(rig.tmux(&["capture-pane", "-p", "-t", &pane])).contains("stand-in-startup-error")
-    });
-    assert!(rig.diagnostics().contains("stand-in-startup-error"));
-    rig.close();
-}
-
-#[test]
-fn protocol_request_is_bounded_when_listener_never_answers() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("silent.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let before = Instant::now();
-    let error = protocol_request(
-        &socket,
-        ClientMessage::list_sessions(),
-        Duration::from_millis(30),
-    )
-    .expect_err("a silent peer must time out");
-    assert!(error.to_string().contains("deadline"), "{error}");
-    assert!(before.elapsed() < Duration::from_secs(2));
-}
-
-use std::os::unix::fs::FileTypeExt;

@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"prepare","method":"session.spawn_prepare","params":false},"response":{"type":"response","id":"prepare","error":{"code":"invalid_params","message":"params must be an object or null"}},"ignore":[]}

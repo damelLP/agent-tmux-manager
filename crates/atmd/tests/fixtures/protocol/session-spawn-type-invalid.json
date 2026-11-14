@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"type","method":"session.spawn_type","params":{"pane":"%42"}},"response":{"type":"response","id":"type","error":{"code":"invalid_params","message":"missing field `command`"}},"ignore":[]}

@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"send","method":"session.send","params":{"target":"%7","text":"hello;"}},"response":{"type":"response","id":"send","result":{"pane":"%7"}},"ignore":[]}

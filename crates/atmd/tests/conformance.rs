@@ -28,7 +28,18 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
-        Self::with_services(MethodServices::new(spawn_registry())).await
+        let mut services = MethodServices::new(spawn_registry());
+        let mock = atm_tmux::MockTmuxClient::new();
+        mock.set_next_raw_output("0 1\n");
+        mock.set_next_pane_id("%42");
+        mock.set_pane_cwd("%7", "/from/pane");
+        let (control, _) = atmd::control::service::spawn_control(
+            Box::new(mock),
+            services.registry.clone(),
+            CancellationToken::new(),
+        );
+        services.control = Some(control);
+        Self::with_services(services).await
     }
 
     async fn with_services(services: MethodServices) -> Self {

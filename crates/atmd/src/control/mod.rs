@@ -2,6 +2,7 @@
 
 mod command;
 mod send;
+pub mod service;
 mod spawn;
 
 pub use command::{build_spawn_command, shell_quote};

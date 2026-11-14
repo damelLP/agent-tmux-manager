@@ -13,6 +13,22 @@ pub struct SpawnContext {
     caller_pane_missing: bool,
 }
 
+impl SpawnContext {
+    /// Reconstruct a prepared context supplied by a control client.
+    pub fn new(target_pane: String, cwd: Option<String>, caller_pane_missing: bool) -> Self {
+        Self {
+            target_pane,
+            cwd,
+            caller_pane_missing,
+        }
+    }
+
+    #[must_use]
+    pub fn caller_pane_missing(&self) -> bool {
+        self.caller_pane_missing
+    }
+}
+
 /// Prefer the explicit target, caller pane, first active pane, then `%0`.
 /// Cwd lookup failures fall back to the caller-supplied directory.
 pub async fn prepare_spawn(

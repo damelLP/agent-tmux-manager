@@ -22,6 +22,8 @@ use serde_json::Value;
 #[derive(Clone)]
 pub struct MethodServices {
     pub registry: RegistryHandle,
+    /// Supplied at server startup, or injected by tests/in-process clients.
+    pub control: Option<crate::control::service::ControlHandle>,
     /// Production resolves this before daemonization; tests can inject a path.
     /// daemon.info displays non-UTF-8 paths lossily; filesystem use stays exact.
     pub state_dir: PathBuf,
@@ -35,6 +37,7 @@ impl MethodServices {
     pub fn new(registry: RegistryHandle) -> Self {
         Self {
             registry,
+            control: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
             raw: crate::org::RawHandle::default(),
@@ -173,6 +176,8 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         }
     })?;
 
+    register_control(&mut router, services.control)?;
+
     // Add service-backed registrations above this finalization. The factory,
     // not callers, owns the complete capability snapshot used by daemon.info.
     let mut names = router.names();
@@ -192,6 +197,131 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         }
     })?;
     Ok(router)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendParams {
+    target: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareParams {
+    target_pane: Option<String>,
+    cwd: Option<String>,
+    fallback_cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitParams {
+    target_pane: String,
+    caller_pane_missing: bool,
+    direction: atm_tmux::PaneDirection,
+    size: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypeParams {
+    pane: String,
+    command: String,
+}
+
+fn control_error(error: crate::control::service::ServiceError) -> MethodError {
+    use crate::control::{service::ServiceError, ControlError};
+    use std::error::Error;
+    let code = match &error {
+        ServiceError::Timeout => error_code::TIMEOUT,
+        ServiceError::Unavailable => error_code::UNAVAILABLE,
+        ServiceError::Control(error) => match error {
+            ControlError::NoSession { .. } | ControlError::NoPane { .. } => error_code::NOT_FOUND,
+            ControlError::AmbiguousTarget { .. } => error_code::CONFLICT,
+            ControlError::SendRefused { .. } => error_code::REFUSED,
+            ControlError::Tmux {
+                source: atm_tmux::TmuxError::Timeout { .. },
+                ..
+            } => error_code::TIMEOUT,
+            ControlError::Tmux { .. } => error_code::INTERNAL,
+        },
+    };
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(&format!("\nCaused by: {cause}"));
+        source = cause.source();
+    }
+    MethodError::new(code, message)
+}
+
+fn require_control(
+    control: Option<crate::control::service::ControlHandle>,
+) -> Result<crate::control::service::ControlHandle, MethodError> {
+    control
+        .ok_or_else(|| MethodError::new(error_code::UNAVAILABLE, "control service is unavailable"))
+}
+
+fn register_control(
+    router: &mut MethodRouter,
+    control: Option<crate::control::service::ControlHandle>,
+) -> Result<(), MethodError> {
+    let send = control.clone();
+    router.register("session.send", Duration::from_secs(35), move |_, params| {
+        let control = send.clone();
+        async move {
+            let p: SendParams = parse_params(params)?;
+            let pane = require_control(control)?
+                .send(p.target, p.text)
+                .await
+                .map_err(control_error)?;
+            Ok(serde_json::json!({"pane": pane}))
+        }
+    })?;
+    let prepare = control.clone();
+    router.register("session.spawn_prepare", Duration::from_secs(35), move |caller, params| {
+        let control = prepare.clone();
+        async move {
+            let p: PrepareParams = parse_params(params)?;
+            let context = require_control(control)?.prepare_spawn(p.target_pane, p.cwd, caller.from_pane.map(|p| p.0), p.fallback_cwd).await.map_err(control_error)?;
+            Ok(serde_json::json!({"target_pane": context.target_pane, "cwd": context.cwd, "caller_pane_missing": context.caller_pane_missing()}))
+        }
+    })?;
+    let split = control.clone();
+    router.register(
+        "session.spawn",
+        Duration::from_secs(35),
+        move |_, params| {
+            let control = split.clone();
+            async move {
+                let p: SplitParams = parse_params(params)?;
+                let context =
+                    crate::control::SpawnContext::new(p.target_pane, None, p.caller_pane_missing);
+                let pane = require_control(control)?
+                    .split_spawn(context, p.direction, p.size)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"pane": pane}))
+            }
+        },
+    )?;
+    router.register(
+        "session.spawn_type",
+        Duration::from_secs(35),
+        move |_, params| {
+            let control = control.clone();
+            async move {
+                let p: TypeParams = parse_params(params)?;
+                require_control(control)?
+                    .type_spawn_command(p.pane, p.command)
+                    .await
+                    .map_err(control_error)?;
+                Ok(Value::Null)
+            }
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -151,7 +151,32 @@ impl DaemonServer {
     /// Listens for connections until the cancellation token is triggered.
     /// This method does not return until shutdown.
     pub async fn run(&self) -> Result<(), ServerError> {
-        let methods = Arc::new(methods::router(self.method_services.clone())?);
+        let mut services = self.method_services.clone();
+        let control_cancel = self.cancel_token.child_token();
+        let control_task = if services.control.is_none() {
+            let (control, task) = crate::control::service::spawn_control(
+                Box::new(atm_tmux::RealTmuxClient::new()),
+                self.registry.clone(),
+                control_cancel.clone(),
+            );
+            services.control = Some(control);
+            Some(task)
+        } else {
+            None
+        };
+        let result = self.run_with_services(services).await;
+        control_cancel.cancel();
+        if let Some(task) = control_task {
+            let _ = task.await;
+        }
+        result
+    }
+
+    async fn run_with_services(
+        &self,
+        services: methods::MethodServices,
+    ) -> Result<(), ServerError> {
+        let methods = Arc::new(methods::router(services)?);
         // Remove existing socket file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path).map_err(|e| ServerError::SocketSetup {

@@ -112,7 +112,6 @@ class Model:
         self.announced = False
         self.drop_next = None
         self.active_prompt = ""
-        self.approved_tool = False
         self.queue = []
         self.last_ctrl_c = None
         self.selection = 1
@@ -169,7 +168,6 @@ class Model:
         return ([] if self.mode == "codex" else self.announce()) + self.status() + self.render()
 
     def open_dialog(self, name):
-        self.approved_tool = False
         self.before_dialog = self.frame
         self.state, self.deadline, self.dialog, self.selection = "dialog", None, name, 1
         return self.render()
@@ -213,8 +211,8 @@ class Model:
             self.dialog = None
             selection = [{"kind": "selection", "text": text, "option": self.selection}] if enter else []
             if enter and self.selection <= (2 if self.mode == "codex" else 1):
-                self.approved_tool = True
                 self.state, self.deadline = "working", now_ms + self.work_ms
+                selection += self.emit("PostToolUse")
             else:
                 self.state, self.deadline = "idle", None
                 self.frame = "denied" if self.mode == "claude" else "interrupted"
@@ -226,9 +224,7 @@ class Model:
         self.frame = "interrupted" if aborted else "idle"
         if self.mode == "pi":
             return self.emit("turn_end") + self.emit("agent_end", "aborted" if aborted else "stop")
-        tool = self.emit("PostToolUse") if self.approved_tool and not aborted else []
-        self.approved_tool = False
-        return [] if aborted else tool + self.emit("Stop") + self.status()
+        return [] if aborted else self.emit("Stop") + self.status()
 
     def handle(self, action, now_ms, next_id=None):
         kind, text = action
@@ -304,7 +300,6 @@ class Model:
         return [{"kind": "accepted", "text": text}] + effects + self.render()
 
     def begin_clear(self, now_ms, next_id):
-        self.approved_tool = False
         effects = []
         if self.mode == "claude":
             effects = self.emit("SessionEnd", "clear")

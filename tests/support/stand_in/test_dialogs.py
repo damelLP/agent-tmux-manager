@@ -110,11 +110,11 @@ class DialogTests(unittest.TestCase):
                     for _ in range(selection - 1):
                         m.handle(("down", ""), 2)
                     approved = m.handle(("submit", ""), 3)
-                    self.assertEqual(events(approved), [])
+                    self.assertEqual(events(approved), ["PostToolUse"])
                     self.assertEqual(m.state, "working")
                     self.assertEqual(approved[-1]["frame"], "working")
                     self.assertEqual(m.tick(502), [])
-                    self.assertEqual(events(m.tick(503)), ["PostToolUse", "Stop"])
+                    self.assertEqual(events(m.tick(503)), ["Stop"])
                     self.assertEqual(m.state, "idle")
                     self.assertEqual(events(m.tick(1000)), [])
 

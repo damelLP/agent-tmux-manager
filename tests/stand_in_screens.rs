@@ -675,10 +675,12 @@ fn permission_yes_runs_before_completion_and_hooks_precede_the_modal() {
             observe(mode, &rig.capture_plain(&pane)).turn,
             TurnState::Running
         );
-        assert!(!rig
+        assert!(rig
             .journal(&pane)
             .iter()
             .any(|e| e["event"] == "PostToolUse"));
+        assert!(!rig.journal(&pane).iter().any(|e| e["event"] == "Stop"));
+        rig.wait_for_row(&pane, |row| row.status == atm_core::SessionStatus::Working);
         let after = rig.event_cursor(&pane);
         rig.control(
             &pane,

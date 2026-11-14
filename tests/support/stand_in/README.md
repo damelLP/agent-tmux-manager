@@ -251,8 +251,10 @@ render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
   Claude permission screen or optional Codex three-option modal appears (Codex
   requires `permission_dialog = true` and announces the generation if needed).
   Up/Down select; Enter records a 1-based `selection.option`. Claude option 1 and
-  Codex options 1/2 approve: show working, then at the work deadline replay
-  PostToolUse followed by Stop. Synthetic: tool execution is represented by its
+  Codex options 1/2 approve: replay PostToolUse immediately and show working;
+  Stop stays at the work deadline. P1 observed PostToolUse shortly after Enter,
+  before Stop, so the daemon row leaves attention_needed during that interval.
+  Synthetic: tool execution is represented by its
   captured completion, never by running arbitrary shell commands. No/Enter and
   Escape retain the denial/interruption screens and emit no completion hooks;
   the daemon may remain attention_needed. `atm reply --option 2` for Claude and

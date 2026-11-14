@@ -34,8 +34,10 @@ class HookTests(unittest.TestCase):
                 with socket.socket(socket.AF_UNIX) as listener, patch.dict(os.environ, {
                     "ATM_SOCKET": str(root / "hook.sock"), "BASH_ENV": str(barrier),
                     "HOOK_REPORT": str(report), "HOOK_RELEASE": str(release),
-                    "TMUX_PANE": "%fixture",
-                }):
+                    "TMUX_PANE": "%fixture", "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "HOME": str(root), "TMPDIR": str(root),
+                    "ATM_STATE_DIR": str(root / "state"),
+                }, clear=True):
                     listener.bind(str(root / "hook.sock"))
                     listener.listen()
                     def forward():

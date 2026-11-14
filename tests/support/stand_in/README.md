@@ -161,6 +161,10 @@ does not change daemon command construction.
 `pi`, suitable for `ATM_SPAWN_BIN` (or a per-harness override). It is not shipped
 as a binary. Arguments are validated **before** identity/session announcement.
 One positional initial prompt is supported; `--` makes a leading dash literal.
+It remains pending through startup dialogs and is submitted once after they
+finish, never interpreted as a trust/update selection. This is a synthetic safe
+composition of the stand-in's CLI and dialog controls; the combined real-CLI
+startup behavior has not been captured.
 Harness options such as `--model X` are ignored. Unknown options accept an
 optional following non-option value; `--name=value`, `--no-*`, `--offline` and
 `--dangerously-skip-permissions` need no following value. This is a test parser,
@@ -305,14 +309,18 @@ The runtime renders `screens.json`'s 74 source variants through the pure
 `screens.py` renderer and `scene.py` lifecycle mapping. Sources reuse adapter plain
 captures, 20 U5b SGR/cursor pairs, and 15 sanitized P1 captures (provenance in
 `fixtures/screens/README.md`). No runtime ID or diagnostic status text is visible.
-`frame` distinguishes fresh, working, idle after a turn, clearing, clear-complete,
-interrupted and modal scenes. Claude clear shows the real SessionEnd hook spinner;
+`frame` records the model's fresh, working, idle after a turn, clearing,
+clear-complete, interrupted and modal phases; `source` identifies the actual
+capture chosen, including draft/completion-menu substitutions. Claude clear shows the real SessionEnd hook spinner;
 pi retains a captured old conversation; Codex can show the captured blank
 transition. Completed clear uses genuine fresh captures, not the misleading
 post-turn `after-clear` fixtures. These scenes are snapshots, not transcript replay.
 
 Native output preserves rows, NBSP and padding. Trusted SGR is validated against
 plain text; styled cursor spaces survive even when plain capture drops them.
+Cursor sidecars retain evidence for a later cursor-aware renderer/observer, but
+hardware cursor coordinates are not restored to those captures; current adapter
+conformance passes `None` for cursor. No cursor-placement fidelity is claimed.
 Absolute row positioning avoids bottom-row newline scrolling. Synthetic runtime
 drafts replace only the active editor slot and render control bytes visibly.
 Capture-specific draft styling is preserved for an exact captured draft; other

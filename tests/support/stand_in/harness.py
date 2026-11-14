@@ -307,6 +307,13 @@ class Runtime:
         if self.model.dialog is None and action == ("submit", "/clear" if self.mode == "claude" else "/new"):
             self.generation += 1
         self.effects(self.model.handle(action, self.now_ms(), self.next_id()))
+        self.submit_initial_prompt()
+
+    def submit_initial_prompt(self):
+        # CLI text is editor input, never a startup dialog selection.
+        if self.prompt is not None and not self.model.startup_pending and self.model.state == "idle":
+            prompt, self.prompt = self.prompt, None
+            self.action(("submit", prompt))
 
     def run(self):
         saved = termios.tcgetattr(sys.stdin.fileno())
@@ -319,8 +326,7 @@ class Runtime:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, settings)
             print(("\x1b[?1049h" if self.mode != "pi" else "") + "\x1b[?2004h", end="", flush=True)
             self.effects(self.model.start())
-            if self.prompt is not None:
-                self.action(("submit", self.prompt))
+            self.submit_initial_prompt()
             while self.running:
                 sources = [sys.stdin]
                 if self.event_stream is not None:

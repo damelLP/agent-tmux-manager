@@ -19,6 +19,7 @@ def runtime():
     r.log = io.StringIO()
     r.generation = 1
     r.prefix = "test"
+    r.prompt = None
     r.pending_renders = []
     r.render_sequence = 0
     r.draft_dirty = False
@@ -196,6 +197,27 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("test-1", output.getvalue())
         self.assertNotIn("status sent", output.getvalue())
         self.assertIn("screen_claude-ready", journal(r)[-1]["source"])
+
+    def test_cli_prompt_waits_for_start_dialog_instead_of_answering_it(self):
+        for mode, options, key in [("claude", {"folder_trust": True}, b"\x1b[B\r"),
+                                   ("codex", {"update_prompt": True}, b"\x1b")]:
+            with self.subTest(mode=mode):
+                r = runtime()
+                r.mode, r.model, r.prompt = mode, make(mode, **options), "initial CLI prompt"
+                r.forward = lambda data: None
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.start())
+                    r.submit_initial_prompt()
+                    self.assertEqual(r.model.state, "dialog")
+                    self.assertEqual(r.prompt, "initial CLI prompt")
+                    r.input(key)
+                    for action in r.parser.flush_escape():
+                        r.action(action)
+                self.assertEqual(r.model.state, "working")
+                self.assertIsNone(r.prompt)
+                submitted = [e["data"].get("payload", e["data"])["prompt"]
+                             for e in journal(r) if e.get("event") == "UserPromptSubmit"]
+                self.assertEqual(submitted, ["initial CLI prompt"])
 
     def test_startup_modal_acknowledges_frame_but_never_ready(self):
         r = runtime()

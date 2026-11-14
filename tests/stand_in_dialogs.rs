@@ -75,6 +75,61 @@ fn claude_trust_first_frame_has_no_ready_until_accepted() {
 }
 
 #[test]
+fn initial_cli_prompt_waits_for_startup_dialog_acceptance() {
+    let mut rig = StandInRig::start();
+    for mode in [StandInMode::Claude, StandInMode::Codex] {
+        let log = rig.root().join(format!("{}-initial.jsonl", mode.name()));
+        let config = log.with_extension("json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "LOG": log, "ID_PREFIX": "initial", "MANUAL_CLOCK": 1,
+                "FOLDER_TRUST": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = rig.tmux(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            rig.launcher(mode).to_str().unwrap(),
+            "--atm-config",
+            config.to_str().unwrap(),
+            "initial prompt, not a dialog answer",
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        let pane = rig.observe_pane(
+            String::from_utf8(output.stdout).unwrap().trim().into(),
+            mode,
+            log,
+        );
+        frame(&rig, &pane, 0, "folder-trust");
+        assert!(!rig
+            .journal(&pane)
+            .iter()
+            .any(|e| e["kind"] == "accepted" || e["kind"] == "exit"));
+        let after = rig.event_cursor(&pane);
+        if mode == StandInMode::Claude {
+            rig.key(&pane, "Down");
+        }
+        rig.key(&pane, "Enter");
+        frame(&rig, &pane, after, "working");
+        let prompts: Vec<_> = rig
+            .journal(&pane)
+            .into_iter()
+            .filter(|e| e["kind"] == "accepted")
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["text"], "initial prompt, not a dialog answer");
+        rig.wait_for_row(&pane, |row| row.status == atm_core::SessionStatus::Working);
+    }
+    rig.close();
+}
+
+#[test]
 fn codex_start_dialogs_hook_list_and_worktree_default_are_real_frames() {
     let mut rig = StandInRig::start();
     let mut config = StandInConfig::new(StandInMode::Codex);

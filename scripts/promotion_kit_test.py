@@ -155,6 +155,17 @@ class ProtectedFiles(Sealed):
         self.assertEqual(changes, {'scripts/protected-files.txt': 'A',
                                   'crates/future/tests/fixtures/golden.jsonl': 'A'})
 
+    def test_hooks_and_clippy_config_changes_are_protected(self):
+        paths = ('.githooks/pre-commit', '.githooks/pre-push', 'clippy.toml')
+        (self.repo / '.githooks').mkdir()
+        for path in paths:
+            (self.repo / path).write_text('before')
+        before = self.commit(self.repo)
+        for path in paths:
+            (self.repo / path).write_text('after')
+        after = self.commit(self.repo)
+        self.assertEqual(self.report(before, after)[0], {path: 'M' for path in paths})
+
     def test_invalid_ref_and_invalid_manifest_fail(self):
         self.report('no-such-commit', ok=False)
         self.rules.write_text('../outside\n')
@@ -379,6 +390,58 @@ if mode == 'failure':
         self.assertIn('partial output', output.getvalue())
         self.assertIn('partial error', errors.getvalue())
 
+    def test_unexpected_exception_or_interrupt_restores_pair_and_runs_old_setup(self):
+        import atm_promotion
+        for error in (UnicodeEncodeError('ascii', 'é', 0, 1, 'injected'), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                for name, (data, mode) in self.old.items():
+                    (self.bin / name).write_bytes(data)
+                    (self.bin / name).chmod(mode)
+                real_replace = os.replace
+                fired = False
+                def replace(source, destination, *args, **kwargs):
+                    nonlocal fired
+                    if not fired and Path(destination) == self.bin / 'atmd':
+                        fired = True
+                        raise error
+                    return real_replace(source, destination, *args, **kwargs)
+                with patch.object(atm_promotion.os, 'replace', side_effect=replace):
+                    try:
+                        result = self.in_process()
+                    except (Exception, KeyboardInterrupt) as escaped:
+                        self.fail(f'{type(escaped).__name__} escaped without recovery')
+                self.assertNotEqual(result, 0)
+                self.assertTrue(fired)
+                self.assertEqual(self.pair_bytes(self.bin), self.old)
+                self.assertEqual(self.records()[-1]['label'], 'old')
+
+    def test_unexpected_recovery_exception_retains_backup_and_reports_both(self):
+        import atm_promotion
+        self.call()
+        self.make_pair(self.source, 'third')
+        real_run = subprocess.run
+        def run(*args, **kwargs):
+            if self.pair_bytes(self.bin) == self.new:
+                raise AttributeError('injected recovery error')
+            return real_run(*args, **kwargs)
+        self.modes.write_text('{"third":"failure"}')
+        errors = io.StringIO()
+        with patch.object(atm_promotion.subprocess, 'run', side_effect=run), \
+             patch.dict(os.environ, self.env, clear=True), \
+             patch.object(sys, 'argv', ['tool', *self.args('install')]), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            try:
+                result = atm_promotion.main('install')
+            except AttributeError:
+                self.fail('unexpected recovery error escaped without reporting both failures')
+        self.assertNotEqual(result, 0)
+        self.assertIn('promotion failed:', errors.getvalue())
+        self.assertIn('recovery failed: injected recovery error', errors.getvalue())
+        self.assertEqual(self.pair_bytes(self.previous()), self.new)
+        self.modes.write_text('{}')
+        self.call('rollback')
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+
     def test_timeout_restores_old_pair_and_runs_old_setup(self):
         import atm_promotion
         real_run = subprocess.run
@@ -447,6 +510,27 @@ if mode == 'failure':
             path.unlink(); path.write_bytes(data); path.chmod(0o600)
         self.assertEqual(self.pair_bytes(self.bin), self.new)
         self.assertEqual((self.bin / 'unrelated').read_text(), 'keep')
+
+    def test_symlinked_metadata_directory_refuses_without_writing_target(self):
+        target = self.root / 'metadata-target'
+        target.mkdir(mode=0o700)
+        (self.bin / '.atm-promotion').symlink_to(target, target_is_directory=True)
+        self.call(ok=False)
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.assertEqual(self.records(), [])
+
+    def test_wrappers_do_not_write_bytecode_without_environment_guard(self):
+        env = {k: v for k, v in self.env.items() if not k.startswith('PYTHON')}
+        for name in ('atm-promote', 'atm-rollback'):
+            with self.subTest(name=name):
+                kit = self.root / name
+                kit.mkdir()
+                shutil.copy2(SCRIPTS / 'atm_promotion.py', kit)
+                shutil.copy2(SCRIPTS / name, kit)
+                result = self.command([sys.executable, kit / name, '--help'], env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(list(kit.rglob('*.pyc')), [])
 
     def test_existing_socket_refuses_without_connecting(self):
         with socket.socket(socket.AF_UNIX) as listener:
@@ -613,21 +697,21 @@ class PromotionRealSetup(Sealed):
         self.assertEqual(json.loads((self.home / '.pi/agent/settings.json').read_text())['packages'],
                          ['keep-package', 'packages/pi-atm'])
 
-    def test_real_setup_refreshes_assets_on_promotion_and_rollback_without_connection(self):
-        # Decoy is inherited, explicit promotion endpoint is a different absent path.
+    def test_real_setup_does_not_connect_to_selected_listening_socket(self):
         with socket.socket(socket.AF_UNIX) as listener:
-            listener.bind(str(self.root / 'decoy.sock')); listener.listen(); listener.setblocking(False)
-            inherited = dict(self.env, ATM_SOCKET=str(self.root / 'decoy.sock'))
-            for script in ('atm-promote', 'atm-rollback'):
-                args = ['--bin-dir', self.bin, '--socket', self.env['ATM_SOCKET']]
-                if script == 'atm-promote': args += ['--from-bin', self.source]
-                result = self.command([sys.executable, SCRIPTS / script, *args], env=inherited)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_assets()
-                # Force rollback to demonstrate asset refresh, not merely presence.
-                if script == 'atm-promote':
-                    (self.home / '.pi/agent/packages/pi-atm/extensions/pi-atm.ts').write_text('stale')
-                with self.assertRaises(BlockingIOError): listener.accept()
+            listener.bind(self.env['ATM_SOCKET']); listener.listen(); listener.setblocking(False)
+            result = self.command([self.bin / 'atm', 'setup'])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assert_assets()
+            with self.assertRaises(BlockingIOError): listener.accept()
+
+    def test_real_setup_refreshes_assets_on_promotion_and_rollback(self):
+        self.call()
+        self.assert_assets()
+        # Force rollback to demonstrate asset refresh, not merely presence.
+        (self.home / '.pi/agent/packages/pi-atm/extensions/pi-atm.ts').write_text('stale')
+        self.call(rollback=True)
+        self.assert_assets()
         self.assertFalse(Path(self.env['ATM_SOCKET']).exists())
         self.assertFalse((self.root / 'state/atmd.pid').exists())
 

@@ -2,7 +2,8 @@
 
 ## Protected-file report
 
-From the repository root:
+Run the report from the checkout before the merge: a unit can edit the report script itself.
+From that repository root:
 
 ```sh
 python3 scripts/atm-protected-files.py                 # origin/main to HEAD
@@ -67,7 +68,7 @@ pre-promotion pair, not necessarily the build cargo most recently installed.
 Promotion refuses an already-installed pair (same bytes and modes), preserving
 its rollback target.
 
-The rename pair is deliberately **not atomic**. SIGKILL or power loss between
+The rename pair is deliberately **not atomic**. SIGHUP, SIGTERM, SIGKILL or power loss between
 renames can leave mixed binaries. With the daemon stopped and TUIs closed,
 nothing should execute them until the owner runs rollback, which restores both.
 A leftover `.atm-stage-*` file blocks further promotion: run rollback first.
@@ -93,7 +94,8 @@ machine-readable setup API; recheck it when promoting a version with changed
 setup diagnostics. Invalid output bytes are replaced for display, not allowed
 to bypass recovery. On install/copy/rename/setup failure after the backup was
 recorded, both saved files are copied/renamed back and old setup reruns. The
-command still exits nonzero and reports recovery success or failure. Failure
+command still exits nonzero and reports recovery success or failure. Recovery
+also runs for unexpected exceptions and KeyboardInterrupt (Ctrl-C). Failure
 before the complete backup is recorded leaves the installed pair and prior
 record alone. Successful recovery restores the prior previous record if one
 existed; otherwise the first backup remains selected. If recovery fails, the new

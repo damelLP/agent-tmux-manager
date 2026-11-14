@@ -196,13 +196,13 @@ def promote(bin_dir, source, socket_path, metadata):
     try:
         replace_pair(source, bin_dir)
         setup(bin_dir, socket_path)
-    except (OSError, Refused, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (Exception, KeyboardInterrupt) as error:
         try:
             replace_pair(saved, bin_dir)
             setup(bin_dir, socket_path)
             if old_previous is not None:
                 save_previous(metadata, old_previous)
-        except (OSError, Refused, subprocess.SubprocessError, KeyboardInterrupt) as recovery:
+        except (Exception, KeyboardInterrupt) as recovery:
             raise Refused(f'promotion failed: {error}; recovery failed: {recovery}; '
                           f'previous pair retained at {saved}; do not restart yet') from error
         raise Refused(f'promotion failed: {error}; old pair restored and setup rerun') from error

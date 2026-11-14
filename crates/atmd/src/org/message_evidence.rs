@@ -1,8 +1,12 @@
 //! Exact receipts and receive-order activity, never a prompt transcript.
 //!
-//! The connection tap must first apply the translated event and prove original
-//! parent/session/pane eligibility. Registry Ok alone is not that proof. In
-//! particular, never repair an old event with a new pane occupant's identity.
+//! Only already-translated neutral lifecycle events enter here. The connection
+//! tap must first apply the translated event, exclude child contexts, and prove
+//! original parent/session/pane eligibility. Registry Ok alone is not that
+//! proof. In particular, never repair an old event with a new pane occupant's
+//! identity. Accepted status-line activity is activity only; a poll is not
+//! activity. Activity/token visibility may latch probably-landed, never a
+//! receipt.
 //!
 //! A parent event whose proof is missing (the apply failed, the registry
 //! stalled or closed, the row is absent or ambiguous) is never dropped. It
@@ -11,9 +15,20 @@
 //! it latches probably-landed, and never binds a lazy scope or confirms. So a
 //! lost proof holds the messages that event could affect, until a new arm or
 //! the owner's retry, and leaves every other message alone.
+//!
 //! Register/arm/observe share one short synchronous lock. Coalesced wakeups do
-//! not discard retained facts; poisoned/exhausted retention fails closed.
-//! Earlier scopes survive retries and final failure for late exact receipts.
+//! not discard retained facts. No await or callback into the service on
+//! ingestion. Keep earlier attempt scopes for late receipts, including after
+//! final failure.
+//!
+//! Failures stay with their cause. A bad or unstorable register/arm is refused
+//! to its caller, and no input may follow it. Only a broken internal invariant
+//! (a poisoned lock, a clock outside its range, an Activity that history could
+//! not retain) disables evidence for everyone, which blocks input and retries.
+//!
+//! Known limit: nothing evicts the scopes of a finally failed message, since a
+//! late receipt may still confirm it. A daemon that retains 16384 scopes
+//! refuses new arms until it restarts; retained receipts keep working.
 //!
 //! Lock order: evidence, then history. The tap stamps an event's receive time
 //! and forwards its Activity to history under one evidence lock acquisition, so
@@ -38,7 +53,7 @@ use tokio::sync::watch;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptScope {
     pub message_id: MessageId,
-    /// Org log sequence of the applied DeliveryAttempted, not its attempt number.
+    /// Org log sequence of the applied DeliveryAttempted, not the attempt number.
     pub attempt_seq: u64,
     pub recipient: AgentId,
     pub pane: PaneId,
@@ -47,9 +62,11 @@ pub struct AttemptScope {
     pub session_id: Option<SessionId>,
     /// A lazy first prompt needs an eligible parent outside this baseline on the
     /// same owned pane/harness. The tap is responsible for parent eligibility.
+    /// Child/pending IDs never confirm.
     pub excluded_sessions: HashSet<SessionId>,
 }
 
+/// Small retained facts, not a transcript or a status-derived receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptEvidence {
     pub receipt: Option<DeliveryReceipt>,
@@ -153,7 +170,8 @@ impl MessageEvidence {
         MessageError::Unavailable(reason.into())
     }
 
-    /// Register the one shared reference, never the body or a token substring.
+    /// B registers the full exact inbox reference before any attempt, not a token
+    /// substring, body, first_prompt preview, prompt_id or turn_id.
     /// A wrong text or a full store refuses this caller only: nothing is stored
     /// or evicted, and no input may follow a failed registration.
     pub fn register(&self, id: MessageId, expected_prompt: String) -> Result<(), MessageError> {

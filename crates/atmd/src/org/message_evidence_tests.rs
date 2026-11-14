@@ -668,3 +668,68 @@ fn latest_lazy_scope_binds_after_an_unbound_earlier_one() {
     observe(&e, "occupant", "%7", Harness::Pi, REFERENCE);
     assert_eq!(e.receipt(id()).unwrap(), receipt);
 }
+
+#[test]
+fn activity_in_an_older_scope_does_not_latch() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    // The old attempt's session is still busy; that says nothing about the
+    // newer attempt, which resets the latch per reserved attempt.
+    e.observe(
+        &SessionId::new("session"),
+        Some("%7"),
+        Harness::Pi,
+        &LifecycleEvent::WorkingStart,
+    )
+    .unwrap();
+    e.observe_activity(&SessionId::new("session"), None)
+        .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    e.observe_activity(&SessionId::new("new"), None).unwrap();
+    assert!(e.snapshot(id()).unwrap().probably_landed);
+}
+
+#[test]
+fn status_activity_never_binds_a_lazy_scope() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    // Activity carries no harness identity, with or without a pane.
+    e.observe_activity(&SessionId::new("quiet"), Some("%7"))
+        .unwrap();
+    e.observe_activity(&SessionId::new("quiet"), None).unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // Had "quiet" bound the scope, "talker" could no longer confirm.
+    observe(&e, "talker", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "talker"
+    );
+}
+
+#[test]
+fn first_receipt_is_never_overwritten() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    exact(&e);
+    let first = e.receipt(id()).unwrap().unwrap();
+    assert_eq!(first.session_id.as_str(), "session");
+    observe(&e, "new", "%8", Harness::Pi, REFERENCE);
+    assert_eq!(e.receipt(id()).unwrap(), Some(first));
+}

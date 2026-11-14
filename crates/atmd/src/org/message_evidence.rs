@@ -22,6 +22,7 @@ use std::{collections::HashSet, sync::Arc};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptScope {
     pub message_id: MessageId,
+    /// Org log sequence of the applied DeliveryAttempted, not the attempt number.
     pub attempt_seq: u64,
     pub recipient: AgentId,
     pub pane: PaneId,
@@ -44,8 +45,8 @@ pub struct AttemptEvidence {
 /// receipt reads; Ok(None) could incorrectly authorize an automatic retry.
 #[derive(Debug, Clone)]
 pub struct MessageEvidence {
-    /// Inject the runtime's same origin; the connection never supplies Utc::now.
-    pub clock: MessageClock,
+    /// The runtime clones this origin; the connection never supplies Utc::now.
+    clock: MessageClock,
     disabled_reason: Arc<str>,
 }
 
@@ -56,6 +57,12 @@ impl MessageEvidence {
             clock,
             disabled_reason: Arc::from(reason.into()),
         }
+    }
+
+    /// The single injected origin shared by runtime, evidence and scheduler.
+    #[must_use]
+    pub fn clock(&self) -> &MessageClock {
+        &self.clock
     }
 
     fn unavailable(&self) -> MessageError {

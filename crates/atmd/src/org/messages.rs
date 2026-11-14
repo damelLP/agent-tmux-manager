@@ -11,9 +11,9 @@
 //! |---|---|
 //! | Wait, readiness observe, wake/FIFO scheduling | A2, with A1 clocks; no reservation held |
 //! | PasteNow admission | A2 recipient slot and one of eight permits; B reserves and rechecks |
-//! | AttemptCommitted, arm, guarded paste/Enter | B; apply Attempted before input; record consumed step/paste before release |
+//! | AttemptCommitted, arm, guarded paste/Enter | B persists Attempted, then awaits its fold before arm/input; record consumed step/paste before release |
 //! | AwaitConfirmation while reserved | B; no more keys |
-//! | Confirm while reserved | B persists/folds Delivered, then acknowledges evidence |
+//! | Confirm while reserved | B persists Delivered, then awaits its fold before acknowledging evidence |
 //! | Late receipt after release/failure/give-up | A2 persists/folds Delivered; same ID cancels pending retry |
 //! | RetryAt while Delivering | B while active; A2 alone after explicit handoff of non-active/recovered work |
 //! | RetryAt while Queued | A2 schedules only; no duplicate failure event |
@@ -33,6 +33,7 @@
 //! B waits for U8c focus/read-only observe and U8's single screen dispatch; this
 //! boundary neither adds vendor parsing nor implements a second input path.
 
+use super::message_history::{RecipientObservation, SessionObservation};
 pub use super::message_methods::register_message_methods;
 pub use super::message_types::*;
 use super::{
@@ -40,12 +41,19 @@ use super::{
     OrgServiceError,
 };
 use crate::{
-    control::service::ControlHandle, registry::RegistryHandle, server::methods::CallContext,
+    control::{
+        reservation::{PaneCapture, PaneId},
+        service::ControlHandle,
+    },
+    registry::RegistryHandle,
+    server::methods::CallContext,
 };
+use atm_core::ScreenFacts;
 use atm_org::delivery::DeliveryPolicy;
 use chrono::{DateTime, TimeDelta, Utc};
 use std::sync::Arc;
 use tokio::{sync::Semaphore, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessageError {
@@ -96,6 +104,21 @@ impl MessageClock {
             .ok_or_else(|| MessageError::Internal("message clock is outside its time range".into()))
     }
 
+    /// Convert a policy UTC deadline to the same monotonic origin. A time at or
+    /// before the UTC origin is already due and returns the monotonic origin.
+    pub fn deadline(&self, at: DateTime<Utc>) -> Result<Instant, MessageError> {
+        if at <= self.base_utc {
+            return Ok(self.base_instant);
+        }
+        at.signed_duration_since(self.base_utc)
+            .to_std()
+            .ok()
+            .and_then(|elapsed| self.base_instant.checked_add(elapsed))
+            .ok_or_else(|| {
+                MessageError::Internal("message deadline is outside its time range".into())
+            })
+    }
+
     /// Uses Tokio's clock so paused-time tests exercise the production time source.
     pub fn now(&self) -> Result<DateTime<Utc>, MessageError> {
         self.at(Instant::now())
@@ -106,7 +129,7 @@ impl MessageClock {
 pub const MESSAGE_ADMISSION_LIMIT: usize = 8;
 
 /// Cloned dependencies, not a second organisation writer or recipient scheduler.
-/// A2 owns construction and must supply evidence with the same clock origin.
+/// A2 builds once per daemon; clone to share the admission cap and evidence clock.
 #[derive(Clone)]
 pub struct MessageRuntime {
     pub org: OrgHandle,
@@ -116,6 +139,8 @@ pub struct MessageRuntime {
     pub history: MessageHistoryHandle,
     pub policy: DeliveryPolicy,
     pub clock: MessageClock,
+    /// A2 stops scheduling on cancellation; B settles cooperatively at safe points.
+    pub cancel: CancellationToken,
     /// A2 acquires before B's admission and retains the permit through cleanup.
     pub admissions: Arc<Semaphore>,
 }
@@ -130,8 +155,9 @@ impl MessageRuntime {
         evidence: MessageEvidence,
         history: MessageHistoryHandle,
         policy: DeliveryPolicy,
-        clock: MessageClock,
+        cancel: CancellationToken,
     ) -> Self {
+        let clock = evidence.clock().clone();
         Self {
             org,
             registry,
@@ -140,8 +166,55 @@ impl MessageRuntime {
             history,
             policy,
             clock,
+            cancel,
             admissions: Arc::new(Semaphore::new(MESSAGE_ADMISSION_LIMIT)),
         }
+    }
+}
+
+/// A2 owns the one capture converter; B calls it while reserved. Facts come
+/// from U8's single adapter dispatch and session is already uniquely eligible.
+/// Unknown focus stays unknown, failed capture uses ObservationLost instead.
+/// Unavailable until A2 integrates U8c's focus-bearing capture; never guess it.
+pub fn recipient_observation(
+    _capture: &PaneCapture,
+    _session: Option<SessionObservation>,
+    _facts: ScreenFacts,
+) -> Result<RecipientObservation, MessageError> {
+    Err(MessageError::Unavailable(
+        "message observation converter is not configured".into(),
+    ))
+}
+
+const FOCUS_NOTICE_SUFFIX: &str =
+    "; delivery will resume after focus moves and the editor is safely empty";
+
+/// A2 produces this inbox-only notice; C suppresses its external notification.
+#[must_use]
+pub fn focus_notice(id: MessageId, pane: &PaneId) -> MessageContent {
+    MessageContent {
+        from: Address::System,
+        to: Address::Owner,
+        kind: MessageKind::Note,
+        body: format!("{id} waiting: owner is focused on {pane}{FOCUS_NOTICE_SUFFIX}"),
+        attachments: vec![],
+        task: None,
+    }
+}
+
+/// Recognize only the complete canonical system focus notice, not a substring.
+#[must_use]
+pub fn is_focus_notice(content: &MessageContent) -> bool {
+    let Some((id, pane)) = content
+        .body
+        .strip_suffix(FOCUS_NOTICE_SUFFIX)
+        .and_then(|body| body.split_once(" waiting: owner is focused on "))
+    else {
+        return false;
+    };
+    match (id.parse::<MessageId>(), PaneId::parse(pane)) {
+        (Ok(id), Ok(pane)) => content == &focus_notice(id, &pane),
+        _ => false,
     }
 }
 

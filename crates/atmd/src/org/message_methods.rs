@@ -69,11 +69,13 @@ pub fn register_message_methods(
         p.recipient.as_ref()
     ));
     register!("msg.ack", 10, ack);
-    // Retry: 30 s active work + 10 s cleanup + 6 s org execute + 14 s margin = 60 s.
-    // The margin also covers a 5 s FIFO snapshot, leaving 9 s for service overhead.
+    // Retry: message_delivery::{ATTEMPT_WORK_BUDGET, ATTEMPT_CLEANUP_BUDGET}
+    // are 30 + 10 s; + 5 s snapshot + 6 s execute + 4 s overhead = 55 s
+    // MESSAGE_RESOLUTION_BUDGET, leaving 5 s before this 60 s router ceiling.
     register!("msg.retry", 60, retry);
-    // Give-up: 30 s active work + 10 s cleanup + 6 s org execute + 14 s margin = 60 s.
-    // The margin also covers a 5 s FIFO snapshot, leaving 9 s for service overhead.
+    // Give-up uses the same ATTEMPT_WORK_BUDGET + ATTEMPT_CLEANUP_BUDGET:
+    // 30 + 10 + 5 snapshot + 6 execute + 4 overhead = MESSAGE_RESOLUTION_BUDGET
+    // (55 s), plus 5 s router margin. See message_delivery's constants.
     register!("msg.give_up", 60, give_up);
     Ok(())
 }

@@ -2,19 +2,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::{
-    message_delivery::{deliver, AttemptPhase, EffectCertainty},
+    message_delivery::{deliver, inbox_reference, AttemptPhase},
     message_evidence::{AttemptScope, MessageEvidence},
     message_history::{
-        DeliverySnapshot, HistoryUpdate, MessageHistoryHandle, PanePresence, RecipientObservation,
-        SessionObservation,
+        DeliverySnapshot, EffectCertainty, ExecutorHold, HistoryUpdate, MessageHistoryHandle,
+        PanePresence, RecipientObservation, SessionObservation,
     },
-    messages::{MessageClock, MessageError, MessageRuntime},
+    messages::{focus_notice, is_focus_notice, MessageClock, MessageError, MessageRuntime},
     OrgHandle,
 };
 use atm_core::{Harness, LifecycleEvent, ScreenFacts, SessionId, SessionStatus};
 use atm_org::{delivery::DeliveryStep, DeliveryReceipt, MessageId};
 use chrono::{DateTime, TimeDelta, Utc};
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, future::Future, task::Poll, time::Duration};
 use tokio::time::Instant;
 
 fn utc() -> DateTime<Utc> {
@@ -79,8 +79,9 @@ fn message_history_seam_never_reports_a_snapshot_or_successful_record() {
             live,
             last_attempt_seq,
             blocked_by,
+            hold,
         } = snapshot;
-        (message, recipient, live, last_attempt_seq, blocked_by)
+        (message, recipient, live, last_attempt_seq, blocked_by, hold)
     });
     unavailable(snapshot, "A1/A2 pending");
     let observation = RecipientObservation {
@@ -110,6 +111,7 @@ fn message_history_seam_never_reports_a_snapshot_or_successful_record() {
             recipient: attempt.recipient.clone(),
         },
         HistoryUpdate::Activity {
+            at: utc(),
             session_id: SessionId::new("session"),
             pane: Some(attempt.pane.clone()),
         },
@@ -130,6 +132,11 @@ fn message_history_seam_never_reports_a_snapshot_or_successful_record() {
             pane: attempt.pane.clone(),
             certainty: EffectCertainty::Unknown,
         },
+        HistoryUpdate::Held {
+            id,
+            attempt_seq: attempt.attempt_seq,
+            hold: ExecutorHold::InputOutcomeUnknown,
+        },
         HistoryUpdate::OwnerRetry {
             id,
             attempt_seq: attempt.attempt_seq,
@@ -137,6 +144,23 @@ fn message_history_seam_never_reports_a_snapshot_or_successful_record() {
     ];
     for update in updates {
         unavailable(history.record(update, utc()), "A1/A2 pending");
+    }
+    for hold in [
+        ExecutorHold::StagedMismatch,
+        ExecutorHold::InputOutcomeUnknown,
+        ExecutorHold::TokenVisible,
+    ] {
+        unavailable(
+            history.record(
+                HistoryUpdate::Held {
+                    id,
+                    attempt_seq: 8,
+                    hold,
+                },
+                utc(),
+            ),
+            "A1/A2 pending",
+        );
     }
     // All raw liveness facts and effect/phase names are part of the compiled seam.
     for presence in [
@@ -231,8 +255,9 @@ async fn message_runtime_shares_eight_admissions_and_deliver_is_unavailable() {
         MessageEvidence::disabled(clock.clone(), "A2 pending"),
         MessageHistoryHandle::disabled("A1/A2 pending"),
         Default::default(),
-        clock,
+        cancel.clone(),
     );
+    assert_eq!(runtime.clock.now().unwrap(), clock.now().unwrap());
     let clone = runtime.clone();
     let permits: Vec<_> = (0..8)
         .map(|_| runtime.admissions.clone().try_acquire_owned().unwrap())
@@ -254,7 +279,111 @@ async fn message_runtime_shares_eight_admissions_and_deliver_is_unavailable() {
     );
     assert!(mock.calls().is_empty());
     cancel.cancel();
+    assert!(clone.cancel.is_cancelled());
     task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn message_clock_deadline_uses_the_same_origin_and_exact_boundary() {
+    let origin = Instant::now();
+    let clock = MessageClock::new(origin, utc());
+    assert_eq!(clock.deadline(utc()).unwrap(), origin);
+    assert_eq!(
+        clock.deadline(utc() - TimeDelta::seconds(1)).unwrap(),
+        origin
+    );
+    tokio::time::advance(Duration::from_secs(4)).await;
+    let sleep = tokio::time::sleep_until(
+        clock
+            .deadline(clock.now().unwrap() + TimeDelta::seconds(3))
+            .unwrap(),
+    );
+    tokio::pin!(sleep);
+    assert!(std::future::poll_fn(|cx| Poll::Ready(sleep.as_mut().poll(cx).is_pending())).await);
+    tokio::time::advance(Duration::from_millis(2999)).await;
+    assert!(std::future::poll_fn(|cx| Poll::Ready(sleep.as_mut().poll(cx).is_pending())).await);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    sleep.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn history_live_constructor_and_fold_barrier_are_unavailable_until_a1() {
+    unavailable(
+        MessageHistoryHandle::new(8, utc(), Default::default()),
+        "message history is not configured",
+    );
+    let history = MessageHistoryHandle::disabled("not folded");
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+    unavailable(assert_send(history.folded(8)).await, "not folded");
+}
+
+#[test]
+fn message_shared_handles_are_send_and_sync() {
+    fn assert_shared<T: Send + Sync>() {}
+    assert_shared::<MessageRuntime>();
+    assert_shared::<MessageEvidence>();
+    assert_shared::<MessageHistoryHandle>();
+}
+
+#[test]
+fn message_reference_and_focus_notice_have_one_shared_representation() {
+    assert_eq!(
+        inbox_reference(MessageId::new(123)),
+        "[m123] Read: atm inbox --id m123"
+    );
+    let pane = crate::control::reservation::PaneId::parse("%4").unwrap();
+    let notice = focus_notice(MessageId::new(123), &pane);
+    assert_eq!(notice.body, "m123 waiting: owner is focused on %4; delivery will resume after focus moves and the editor is safely empty");
+    assert!(is_focus_notice(&notice));
+    for changed in 0..11 {
+        let mut other = notice.clone();
+        match changed {
+            0 => other.from = atm_org::Address::Owner,
+            1 => other.to = atm_org::Address::Agent("p/worker".parse().unwrap()),
+            2 => other.kind = atm_org::MessageKind::Report,
+            3 => other.body.push(' '),
+            4 => other.body = other.body.replace("%4", "not-a-pane"),
+            5 => other.body = other.body.replace("m123", "not-a-message"),
+            6 => other.attachments.push("file".into()),
+            7 => other.task = Some("task".parse().unwrap()),
+            8 => other.body = other.body.replace("m123", "m0123"),
+            9 => other.body = other.body.replace("%4", "%04"),
+            _ => other.from = atm_org::Address::Agent("p/worker".parse().unwrap()),
+        }
+        assert!(!is_focus_notice(&other));
+    }
+}
+
+#[test]
+fn message_capture_converter_remains_unavailable() {
+    use crate::control::reservation::{CaptureFormat, PaneCapture, PaneInspection};
+    let capture = PaneCapture::new(
+        String::new(),
+        PaneInspection::new(
+            atm_tmux::PaneInfo {
+                pane_id: "%1".into(),
+                session_name: "private".into(),
+                window_index: 0,
+                pane_pid: 1,
+                width: 80,
+                height: 24,
+                is_active: false,
+            },
+            None,
+            false,
+            false,
+            None,
+            0,
+            0,
+        ),
+        CaptureFormat::Plain,
+    );
+    unavailable(
+        super::messages::recipient_observation(&capture, None, ScreenFacts::default()),
+        "message observation converter is not configured",
+    );
 }
 
 #[test]

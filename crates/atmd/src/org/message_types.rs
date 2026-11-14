@@ -1,8 +1,8 @@
 //! Confirmed-message schemas in the existing protocol 1.1 JSON envelope.
 //!
-//! Delivery is harness acceptance of the delivered prompt, not proof of reading
-//! or execution. Read acknowledgment is separate. The executor chooses the prompt
-//! representation; this contract does not prescribe inline text or a reference.
+//! Delivery is harness acceptance of the one-line inbox reference for every
+//! message, not proof of body retrieval, reading or execution. Read acknowledgment
+//! is separate. The exact reference is built by message_delivery::inbox_reference.
 
 use atm_core::SessionId;
 pub use atm_org::{
@@ -70,7 +70,7 @@ pub struct DeliveryView {
     pub attempt: u32,
     /// Last committed attempt's pane, not the current recipient pane; absent before any attempt.
     pub pane: Option<String>,
-    /// Committed receipt's attempted session, never the current binding; absent until confirmed.
+    /// Session named by the committed receipt, never the current binding; absent until confirmed.
     pub session_id: Option<SessionId>,
     /// Committed receipt's confirmation explanation only, absent until confirmed.
     pub confirmation: Option<String>,

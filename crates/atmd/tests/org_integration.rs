@@ -695,6 +695,84 @@ async fn restart_replays_full_org_and_summaries() {
     cancel.cancel();
 }
 
+#[tokio::test]
+async fn editor_ready_command_watch_and_replay_retain_clear_exclusion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().to_owned(), cancel.clone()).await;
+    org.execute(project(), now()).await.unwrap();
+    let agent_id: atm_org::AgentId = "demo/lead".parse().unwrap();
+    org.execute(
+        OrgCommand::Adopt {
+            agent_id: agent_id.clone(),
+            pane: "%1".into(),
+            session_id: Some("old".into()),
+        },
+        now(),
+    )
+    .await
+    .unwrap();
+    org.execute(
+        OrgCommand::Clear {
+            agent_id: agent_id.clone(),
+        },
+        now(),
+    )
+    .await
+    .unwrap();
+    let ready = org
+        .execute(
+            OrgCommand::EditorReady {
+                agent_id: agent_id.clone(),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].kind, "agent.editor_ready");
+    assert_eq!(ready[0].body, json!({"agent_id":"demo/lead"}));
+    assert!(org
+        .execute(
+            OrgCommand::SessionBound {
+                agent_id: agent_id.clone(),
+                session_id: "old".into()
+            },
+            now()
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    let before = org.snapshot().await.unwrap();
+    let agent = before.agent(&agent_id).unwrap();
+    assert_eq!(agent.status, atm_org::AgentStatus::Ready);
+    assert!(agent.session_id.is_none());
+    assert_eq!(agent.excluded_session_id, Some("old".into()));
+    let mut watch = org.watch(vec!["agent".into()], 3).unwrap();
+    assert_eq!(
+        watch.next().await.unwrap().unwrap().kind,
+        "agent.editor_ready"
+    );
+    drop(watch);
+    cancel.cancel();
+    drop(org);
+    let cancel = CancellationToken::new();
+    let restarted = reopen(dir.path(), cancel.clone()).await;
+    assert_eq!(restarted.snapshot().await.unwrap(), before);
+    assert_eq!(
+        restarted
+            .tail(atmd::org::TailParams {
+                after_seq: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap()[0]
+            .kind,
+        "agent.editor_ready"
+    );
+    cancel.cancel();
+}
+
 // Deciding on two snapshots outside the actor would log conflicting pane owners.
 #[tokio::test]
 async fn concurrent_pane_claims_have_one_winner() {

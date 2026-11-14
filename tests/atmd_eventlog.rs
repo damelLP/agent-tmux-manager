@@ -271,10 +271,12 @@ fn seed(daemon: &Daemon) -> Vec<Envelope> {
     runtime.block_on(async {
         for (kind, body) in [
             ("project.registered", json!({"project_id":"demo","root":"/fixture"})),
-            ("agent.adopted", json!({"agent_id":"demo/lead","pane":"%0","session_id":null})),
+            ("agent.adopted", json!({"agent_id":"demo/lead","pane":"%0","session_id":"pre-clear"})),
             ("msg.sent", json!({"from":"owner","to":"demo/lead","kind":"brief","body":"fixture task","attachments":[],"task":null})),
             ("msg.sent", json!({"from":"demo/lead","to":"owner","kind":"report","body":"fixture report","attachments":[],"task":null})),
             ("msg.read", json!({"message_ids":["m4"]})),
+            ("agent.clear_requested", json!({"agent_id":"demo/lead"})),
+            ("agent.editor_ready", json!({"agent_id":"demo/lead"})),
         ] {
             log.append(Utc::now(), kind, body).await.unwrap();
         }
@@ -355,6 +357,16 @@ fn real_daemon_restart_keeps_history_cost_prompt_and_org_state() {
         wait_for_log_close(&daemon);
         assert_eq!(before.projects().count(), 1);
         assert_eq!(before.agents().count(), 1);
+        let agent = before.agent(&"demo/lead".parse().unwrap()).unwrap();
+        assert_eq!(json!(agent.status), "ready");
+        assert!(agent.session_id.is_none());
+        assert_eq!(
+            agent
+                .excluded_session_id
+                .as_ref()
+                .map(atm_core::SessionId::as_str),
+            Some("pre-clear")
+        );
         assert_eq!(
             before.inbox(&"demo/lead".parse().unwrap())[0].content.body,
             "fixture task"

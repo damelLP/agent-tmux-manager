@@ -211,7 +211,8 @@ class Runtime:
                     self.draft_dirty = True
                     continue
                 self.render_sequence += 1
-                effect = dict(effect, sequence=self.render_sequence)
+                effect = dict(effect, sequence=self.render_sequence,
+                              draft=self.parser.draft.decode("utf-8", errors="replace"))
             self.record(effect)
             if effect["kind"] in ("event", "status"):
                 self.forward(effect["data"])

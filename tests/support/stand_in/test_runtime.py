@@ -157,6 +157,7 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(r.parser.draft, b"draft")
         self.assertEqual(journal(r)[-1]["sequence"], 2)
+        self.assertEqual(journal(r)[-1]["draft"], "draft")
 
     def test_fragmented_paste_defers_query_until_paste_end(self):
         r = runtime()

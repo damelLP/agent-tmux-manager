@@ -13,6 +13,10 @@ use serde_json::Value;
 pub(crate) mod bounded;
 #[path = "stand_in/events.rs"]
 mod events;
+#[path = "stand_in/process.rs"]
+mod process;
+#[path = "stand_in/rows.rs"]
+mod rows;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
@@ -67,6 +71,7 @@ pub struct StandInPane {
 pub struct StandInRig {
     // Drop the listener before deleting its socket directory.
     events: events::Events,
+    rows: Option<rows::Rows>,
     dir: tempfile::TempDir,
     label: String,
     tmux_identity: Option<(PathBuf, Option<u32>)>,
@@ -119,6 +124,7 @@ impl StandInRig {
         require_tools(&path);
         let mut rig = Self {
             events: events::Events::bind(root.join("events.sock")),
+            rows: None,
             dir,
             label: "stand-in".into(),
             tmux_identity: None,
@@ -135,7 +141,7 @@ impl StandInRig {
             ("timeout", "--version"),
             ("/bin/bash", "--version"),
         ] {
-            checked(bounded::run(rig.command(Path::new(tool)).arg(flag)));
+            checked(process::run(rig.command(Path::new(tool)).arg(flag)));
         }
         for mode in [StandInMode::Claude, StandInMode::Codex, StandInMode::Pi] {
             // A script path ending in the vendor name is visible to discovery;
@@ -216,6 +222,7 @@ impl StandInRig {
                 Ok(DaemonMessage::SessionList { .. })
             )
         });
+        self.rows = Some(rows::Rows::connect(&self.socket()));
     }
 
     pub fn stop_daemon(&mut self) {
@@ -257,6 +264,7 @@ impl StandInRig {
     }
 
     fn stop_daemons(&mut self) -> Result<(), String> {
+        self.rows = None;
         for pid in self.daemon_pids() {
             let identity = self
                 .daemon_identity(pid)
@@ -329,20 +337,20 @@ impl StandInRig {
         cmd
     }
     pub fn tmux(&self, args: &[&str]) -> Output {
-        bounded::run(
+        process::run(
             self.command(Path::new("tmux"))
                 .args(["-L", &self.label])
                 .args(args),
         )
     }
     pub fn atm(&self, args: &[&str]) -> Output {
-        bounded::run(
+        process::run(
             self.command(Path::new(env!("CARGO_BIN_EXE_atm")))
                 .args(args),
         )
     }
     pub fn run(&self, command: &mut Command) -> Output {
-        bounded::run(command)
+        process::run(command)
     }
 
     pub fn launch(&mut self, config: &StandInConfig) -> StandInPane {
@@ -468,16 +476,19 @@ impl StandInRig {
         });
     }
     pub fn wait_for_shell(&self, pane: &StandInPane) {
-        self.wait("stand-in exited to shell", || {
-            !Path::new(&format!("/proc/{}", pane.pid)).exists()
-                && checked(self.tmux(&[
-                    "display-message",
-                    "-p",
-                    "-t",
-                    &pane.pane_id,
-                    "#{pane_current_command}",
-                ])) == "bash"
-        });
+        self.owns(pane);
+        process::wait_exit(pane.pid, Duration::from_secs(30)).expect("stand-in process exit");
+        assert_eq!(
+            checked(self.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane.pane_id,
+                "#{pane_current_command}",
+            ])),
+            "bash",
+            "retained shell after stand-in exit"
+        );
     }
     pub fn key(&self, pane: &StandInPane, key: &str) {
         self.owns(pane);
@@ -527,17 +538,21 @@ impl StandInRig {
         pane: &StandInPane,
         predicate: impl Fn(&SessionView) -> bool,
     ) -> SessionView {
-        let mut result = None;
-        self.wait("session row", || {
-            result = self.pane_rows(pane).into_iter().find(|r| predicate(r));
-            result.is_some()
-        });
-        result.unwrap()
+        self.owns(pane);
+        self.rows
+            .as_ref()
+            .expect("daemon subscription")
+            .wait(|rows| {
+                rows.iter()
+                    .find(|r| r.tmux_pane.as_deref() == Some(&pane.pane_id) && predicate(r))
+                    .cloned()
+            })
     }
     pub fn wait_for_absent(&self, id: &SessionId) {
-        self.wait("session absent", || {
-            !self.rows().iter().any(|r| &r.id == id)
-        });
+        self.rows
+            .as_ref()
+            .expect("daemon subscription")
+            .wait(|rows| (!rows.iter().any(|r| &r.id == id)).then_some(()));
     }
     pub fn wait(&self, what: &str, mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + DEADLINE;
@@ -597,7 +612,7 @@ impl StandInRig {
                 "-p",
                 "#{socket_path} #{pid}",
             ]);
-            let output = bounded::run(&mut cmd);
+            let output = process::run(&mut cmd);
             if !socket.exists() && pid.is_none() {
                 self.tmux_identity = None;
                 return Ok(());
@@ -620,7 +635,7 @@ impl StandInRig {
             {
                 return Err("refusing to kill tmux: server identity mismatch".into());
             }
-            let result = bounded::run(self.command(Path::new("tmux")).args([
+            let result = process::run(self.command(Path::new("tmux")).args([
                 "-S",
                 socket.to_str().ok_or("socket utf8")?,
                 "kill-server",

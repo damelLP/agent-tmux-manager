@@ -27,16 +27,21 @@ use stand_in::{StandInConfig, StandInMode, StandInRig};
 
 let mut rig = StandInRig::start(); // real request round trip, not socket existence
 let mut config = StandInConfig::new(StandInMode::Claude);
-config.work_ms = 1200; // observation window, not a real-provider latency claim
+config.manual_clock = true; // hold phases until the test releases them
+config.work_ms = 1200;
 config.clear_gap_ms = 1200;
 let pane = rig.launch(&config); // current-process terminal-acknowledged first frame
 let old = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
 assert!(rig.atm(&["send", &pane.pane_id, "one\ntwo"]).status.success());
 rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
+rig.control(&pane, serde_json::json!({"command":"advance_to", "now_ms":1200}));
 rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
 rig.wait_ready(&pane, Some(old.id.as_str()));
+let after = rig.event_cursor(&pane);
 rig.paste(&pane, "/clear");
+rig.wait_event(&pane, after, |e| e["kind"] == "rendered" && e["state"] == "clearing");
 rig.wait_for_absent(&old.id);
+rig.control(&pane, serde_json::json!({"command":"advance_to", "now_ms":2400}));
 let new = rig.wait_for_row(&pane, |r| r.id != old.id);
 rig.wait_ready(&pane, Some(new.id.as_str()));
 rig.close();
@@ -54,7 +59,9 @@ rig.close();
   sequenced runtime events with a 30-second outer hang guard. The listener is
   bound before launch. Every record has `pid`, procfs `start_time`, `pane`, and
   `event_sequence`; respawn cannot reuse an old process's ready record.
-  `sequence` remains the separate per-process frame counter. Take a cursor
+  `sequence` remains the separate per-process frame counter. Frame records also
+  carry the draft, so fragmented input can be awaited before capture, without
+  polling for text. Take a cursor
   **before** an action, then await its `rendered` event before capture. A control
   barrier alone does not prove that earlier tmux key input has been consumed.
 - Set `config.manual_clock = true` to hold working/clearing phases without a
@@ -65,11 +72,11 @@ rig.close();
   effects already processed; controls never become editor input. Autonomous
   model completion is disabled, not delayed. The selector blocks on input,
   controls and actual deadlines (only lone Escape needs a 20ms ambiguity timer).
-- Legacy daemon-row/shell waits still poll at 20ms with 10-second guards; their
-  subscription/process-exit migration is separate. Existing automatic-clock
-  tests still use configured observation windows. New scenarios should hold
-  phases with manual time instead of relying on those windows.
-- `wait_for_row`, `wait_for_absent`, `pane_rows`, `rows` query the real daemon.
+- `wait_for_row` and `wait_for_absent` consume one persistent daemon subscription,
+  whose initial snapshot is received before actions. Updates/removals notify
+  waiters after the cached committed state changes; no list-sessions polling.
+  Restart creates a fresh subscription. `pane_rows` and `rows` make explicit
+  snapshot queries to the real daemon.
   SessionView has no PID: use owned panes/IDs, never total host row counts.
   `discover()` can see unrelated procfs processes. A pending row becoming one
   real-ID row proves discovery and the hook agree on PID.
@@ -80,6 +87,9 @@ rig.close();
   server only. For an unsubmitted paste use `tmux` load/set-buffer + paste-buffer
   without Enter; typed and pasted text are visible in the active input line.
 - `atm(args)` and `tmux(args)` return bounded command output, including refusals.
+  Commands and `wait_for_shell` wait on Linux pidfd exit notification with a
+  30-second hang guard, not repeated `try_wait`/procfs polling. Command output
+  goes through temporary files so large output cannot fill a pipe.
   `command(path)` supplies the same sealed environment to custom invocations;
   execute with `rig.run(&mut command)`. `tmux` supplies the private `-L` label.
   If also using role support, import `stand_in::bounded` rather than including

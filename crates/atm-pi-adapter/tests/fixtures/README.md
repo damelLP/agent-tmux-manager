@@ -1,5 +1,25 @@
 # Pi screen fixtures
 
+## Styled fixtures (U8d)
+
+Captured: pi 1.5.0, 2026-11-14, P1 private tmux 120x40
+`capture-pane -p -e -N`.
+`screen_styled_p1_<state>_1.5.0.txt` maps to `<state>.styled-N.txt`;
+`<state>.meta.json` holds source geometry/cursor metadata. Provenance headers
+are removed only at test load. Only the private run root outside composers was
+replaced by an equal-width `/tmp/xxx…` token. No SGR, rows, spaces or composer
+content was normalized. Tests cover blank startup/new session, one/multiline
+drafts, working/queued input, selector and retry countdown. The held retry
+request has a Working border; only the countdown is an unknown border.
+
+Styled coverage supersedes the plain-only limitations below. Blank/padding
+stays Empty with its accepted whitespace-only-draft collision. Tmux 3.8/3.6
+probes show -N keeps allocated padding as well as authored spaces. Safety
+requires exact staged-draft verification before Enter, refusing unknown.
+Leading spaces survive comparison; multiline reconstruction and differences
+only in trailing padding are unknown rather than inferred matches.
+Synthetic adversarial cases are labelled in `tests/styled_screen.rs`.
+
 Ten distinct frames cover all 15 raw U5 pi screens (40 rows, 120 columns).
 Existing JSONL fixtures retain the provenance in the crate docs. The screen
 parser's `captured_screens` table checks all four facts for every frame.

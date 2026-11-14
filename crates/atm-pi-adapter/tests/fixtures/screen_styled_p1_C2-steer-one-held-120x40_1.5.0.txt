@@ -1,0 +1,41 @@
+Captured: pi 1.5.0, 2026-11-14, P1 private tmux capture-pane -p -e -N; sanitized.
+
+
+ C1_FIRST "double"            
+
+ C1_THIRD 'single' café       
+
+
+ SEALED_REPLY_16              
+
+
+ C1_ATM_FIRST                 
+
+ "quoted" 'last' café         
+
+
+ SEALED_REPLY_17              
+
+
+ C4_DRAFT:C4_PASTED           
+
+
+ SEALED_REPLY_18              
+
+
+ C4_MULTI_DRAFT:C4_FIRST      
+
+ "last"                       
+
+
+ SEALED_REPLY_19              
+
+
+ C2-steer-one_RUNNING         
+
+
+[2m── ⠋[0m [2mWorking ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+[0;7m [0m                             
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/xxxxxxxxxxxxxxxxxxx/project[0m                            
+[2m↑600 ↓60 0.1%/200k (auto)                                                                                   sealed-model

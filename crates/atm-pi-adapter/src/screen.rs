@@ -9,16 +9,27 @@
 //! Pi has no native tool approvals, but extension/core dialogs replace the editor.
 //! Recognized select/input/editor hints and the reload box report Other with
 //! unknown input/turn. Ambiguous nested borders refuse observation.
-//! Free-text drafts have only synthetic safety coverage, not real captures.
 //! Plain capture drops trailing spaces: whitespace-only drafts can read Empty.
-//! Synthetic ASCII-space tests only check preservation of supplied text; styled
-//! capture with retained trailing spaces is a separate follow-up.
+//! Styled input requires `capture-pane -p -e -N`; strict decoding rejects unknown
+//! escapes, conceal and malformed input without fallback. Coordinates are ignored.
+//!
+//! Captured: pi 1.5.0, 2026-11-14, P1 private tmux 120x40 styled-N captures.
+//! One-line/multiline drafts, working/queued editors, model selector and retry
+//! countdown are covered. No textual placeholder proof is needed. Blank/padding
+//! stays Empty, with a known collision with whitespace-only drafts: tmux 3.8/3.6
+//! probes show -N retains allocated grid padding, not only authored spaces.
+//! This is safe ONLY when consumers verify the staged draft exactly before Enter
+//! and refuse unknown too. Leading whitespace is never stripped: ` /clear` is a
+//! different draft from `/clear`. `staged_draft_matches` accepts Styled only and
+//! refuses multiline/wrapped reconstruction and trailing-padding-only ambiguity;
+//! even the inverse cursor blank cannot prove which trailing spaces are authored.
 //! The active upper border, not startup's interrupt help, establishes turn state.
 //! Fresh layout requires zero usage and startup-only history: the new-session
 //! notice survives later turns and alone proves nothing. Present does not prove
 //! a particular clear completed. Consumers own viewport freshness, copy-mode,
 //! process/pane identity and temporal delivery checks.
 
+use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
     ScreenInput, ScreenTextFormat, TurnState,
@@ -38,24 +49,66 @@ pub const LAUNCH_POLICY: LaunchPolicy = LaunchPolicy {
 /// Recognize complete captured layouts only; unknown never authorizes input.
 #[must_use]
 pub fn observe_screen(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> ScreenFacts {
-    let ScreenInput::Plain(text) = input else {
-        return ScreenFacts::default();
+    inspect(input, cursor).0
+}
+
+fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts, Option<String>) {
+    let decoded;
+    let (text, styled) = match input {
+        ScreenInput::Plain(text) if cursor.is_none() => (text, None),
+        ScreenInput::Styled(text) => {
+            let Ok(screen) = StyledScreen::parse(text) else {
+                return Default::default();
+            };
+            decoded = screen;
+            (decoded.text(), Some(&decoded))
+        }
+        _ => return Default::default(),
     };
-    if cursor.is_some() || text.chars().any(|c| c.is_control() && c != '\n') {
-        return ScreenFacts::default();
+    if text.chars().any(|c| c.is_control() && c != '\n') {
+        return Default::default();
     }
-    let mut lines: Vec<_> = text.lines().collect();
+    let mut lines: Vec<_> = text
+        .lines()
+        .map(|line| {
+            if styled.is_some() {
+                line.trim_end_matches(' ')
+            } else {
+                line
+            }
+        })
+        .collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
-    editor(&lines).unwrap_or_default()
+    editor(&lines, styled).unwrap_or_default()
+}
+
+/// Compare only a reconstructable active single-line draft, never history.
+#[must_use]
+pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
+    if !matches!(input, ScreenInput::Styled(_))
+        || expected.is_empty()
+        || expected.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let (_, draft) = inspect(input, None);
+    let draft = draft?;
+    if draft == expected {
+        Some(true)
+    } else if draft.trim_end_matches(' ') == expected.trim_end_matches(' ') {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 fn rule(line: &str) -> bool {
     line.chars().count() >= 8 && line.chars().all(|c| c == '─')
 }
 
-fn editor(lines: &[&str]) -> Option<ScreenFacts> {
+fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {
     let (footer, before_footer) = lines.split_last()?;
     let zero_usage = usage_footer(footer)?;
     let (cwd, before_cwd) = before_footer.split_last()?;
@@ -70,7 +123,7 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     if editor_dialog(body) {
         let mut facts = ScreenFacts::default();
         facts.dialog = DialogState::Other;
-        return Some(facts);
+        return Some((facts, None));
     }
     // A pasted rule can masquerade as the last upper border. Without an editor
     // marker, earlier rules are ambiguous unless they belong to known startup UI.
@@ -112,7 +165,11 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     facts.turn = turn;
     facts.dialog = DialogState::None;
     facts.fresh_editor = fresh_editor;
-    Some(facts)
+    let draft = styled
+        .filter(|_| input == InputState::Draft && body.len() == 1)
+        .and_then(|screen| screen.text().lines().nth(top + 1))
+        .map(str::to_owned);
+    Some((facts, draft))
 }
 
 fn editor_dialog(body: &[&str]) -> bool {

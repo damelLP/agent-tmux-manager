@@ -219,7 +219,9 @@ fn exit_already_running(pid: Option<u32>) -> ! {
 }
 
 // Keep the candidate kit's process-exit policy aligned (scripts/atm_candidate.py).
-// 64 s of nominal drains plus margin, NOT a hard bound on daemon blocking I/O.
+// Keep in sync with STOP_WAIT_TIMEOUT in scripts/atm_candidate.py: 64 s of nominal
+// drains (2 connections + 30 control + 30 audits + 2 concurrent flushes) plus margin.
+// NOT a hard bound on daemon blocking I/O.
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
 const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(5);
 

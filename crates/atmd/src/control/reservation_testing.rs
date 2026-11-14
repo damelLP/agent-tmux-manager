@@ -229,9 +229,13 @@ fn metadata(inspection: &PaneInspection) -> Read {
         inspection.cursor_column,
         inspection.cursor_row,
     );
-    if inspection.foreground_pid.is_some() || inspection.foreground_command.is_some() {
+    if inspection.foreground_pid.is_some()
+        || inspection.foreground_command.is_some()
+        || inspection.synchronized
+        || inspection.input_off
+    {
         output = format!(
-            "{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             output
                 .trim_end_matches('\n')
                 .replacen("ATM-PANE-v1", "ATM-PANE-v2", 1),
@@ -239,7 +243,9 @@ fn metadata(inspection: &PaneInspection) -> Read {
                 .foreground_pid
                 .map(|pid| pid.to_string())
                 .unwrap_or_default(),
-            inspection.foreground_command.as_deref().unwrap_or_default()
+            inspection.foreground_command.as_deref().unwrap_or_default(),
+            u8::from(inspection.synchronized),
+            u8::from(inspection.input_off),
         );
     }
     Read {

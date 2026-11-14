@@ -159,6 +159,8 @@ fn send_refusal(
         false,
         bracketed_paste.map(|flag| flag != "0"),
         Some(text),
+        false,
+        false,
     )
 }
 
@@ -174,7 +176,15 @@ pub(super) fn input_refusal(
     dead: bool,
     bracketed_paste: Option<bool>,
     text: Option<&str>,
+    synchronized: bool,
+    input_off: bool,
 ) -> Option<&'static str> {
+    if synchronized {
+        return Some("the window has synchronize-panes on, so keys could reach sibling panes");
+    }
+    if input_off {
+        return Some("the pane has input off, so input would be lost");
+    }
     if in_mode {
         return Some("the pane is in copy mode (or another mode), so Enter would go to tmux");
     }

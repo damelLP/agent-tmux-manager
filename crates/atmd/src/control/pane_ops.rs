@@ -14,7 +14,7 @@ use atm_org::AgentId;
 use atm_tmux::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
 use tokio::time::Instant;
 
-pub(super) const FORMAT: &str = "ATM-PANE-v2\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}\t\t#{?#{m/r:[[:cntrl:]],#{pane_current_command}},,#{pane_current_command}}";
+pub(super) const FORMAT: &str = "ATM-PANE-v2\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}\t\t#{?#{m/r:[[:cntrl:]],#{pane_current_command}},,#{pane_current_command}}\t#{pane_synchronized}\t#{pane_input_off}";
 // tmux 3.6 prints argv[0] raw. Suppress control-bearing names inside tmux,
 // before they can escape the tab/newline record. Mutations omit this field.
 pub(super) const COMMAND: &str =
@@ -253,6 +253,8 @@ fn check_input(
         inspection.dead,
         inspection.bracketed_paste,
         text,
+        inspection.synchronized,
+        inspection.input_off,
     );
     match reason {
         Some(reason) => Err(ReservationError::PaneInputRefused {
@@ -487,6 +489,11 @@ fn decode_metadata_line(pane: &PaneId, line: &str) -> Result<PaneInspection, Res
     } else {
         (None, None)
     };
+    let (synchronized, input_off) = if let Some(flag) = fields.next() {
+        (boolean(Some(flag))?, boolean(fields.next())?)
+    } else {
+        (false, false) // Historical fixtures predate these formats.
+    };
     if fields.next().is_some()
         || width == 0
         || height == 0
@@ -495,7 +502,7 @@ fn decode_metadata_line(pane: &PaneId, line: &str) -> Result<PaneInspection, Res
     {
         return Err(fail());
     }
-    Ok(PaneInspection::new(
+    let mut inspection = PaneInspection::new(
         PaneInfo {
             pane_id: pane.to_string(),
             session_name,
@@ -512,7 +519,10 @@ fn decode_metadata_line(pane: &PaneId, line: &str) -> Result<PaneInspection, Res
         cursor_column,
         cursor_row,
     )
-    .with_foreground_process(foreground_pid, foreground_command))
+    .with_foreground_process(foreground_pid, foreground_command);
+    inspection.synchronized = synchronized;
+    inspection.input_off = input_off;
+    Ok(inspection)
 }
 fn decode_capture(
     pane: &PaneId,

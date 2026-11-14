@@ -89,7 +89,8 @@
 //! not whole-frame equality: harmless counters/spinners may change. This closes
 //! the actor-queue gap, not races with external harness redraws or tmux clients.
 //! Before either predicate or input, fresh metadata refuses dead panes, any mode,
-//! and multiline paste when bracketed paste is explicitly off (U7's rule).
+//! synchronize-panes, input-off, and multiline paste when bracketed paste is
+//! explicitly off (U7's rule). These are PaneInputRefused: nothing was sent.
 //! tmux before 3.7 reports no flag: unknown remains allowed, not a guarantee
 //! against line submission. Reserved paste rejects ASCII control bytes except
 //! tab, LF and CR, including injected bracketed-paste terminators: both tmux 3.6
@@ -284,6 +285,10 @@ pub struct PaneInspection {
     pub local_agent_tag: Option<String>,
     pub dead: bool,
     pub in_mode: bool,
+    /// Window synchronization would fan keys out to sibling panes.
+    pub synchronized: bool,
+    /// tmux would silently drop input to this pane.
+    pub input_off: bool,
     /// None means unknown (for example, a tmux version without this format).
     pub bracketed_paste: Option<bool>,
     /// Zero-based terminal-cell coordinates, not UTF-8 offsets.
@@ -319,6 +324,8 @@ impl PaneInspection {
             local_agent_tag,
             dead,
             in_mode,
+            synchronized: false,
+            input_off: false,
             bracketed_paste,
             cursor_column,
             cursor_row,

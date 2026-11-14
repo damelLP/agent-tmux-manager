@@ -348,6 +348,75 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
                         ));
                     }
                 }
+                let sibling = probe
+                    .raw_command(
+                        "split-window",
+                        &["-d", "-P", "-F", "#{pane_id}", "-t", "%0", "cat"],
+                    )
+                    .await
+                    .unwrap();
+                for synchronized in [true, false] {
+                    if synchronized {
+                        probe
+                            .raw_command(
+                                "set-window-option",
+                                &["-t", "%0", "synchronize-panes", "on"],
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        probe
+                            .raw_command("select-pane", &["-t", "%0", "-d"])
+                            .await
+                            .unwrap();
+                    }
+                    for paste in [true, false] {
+                        let result = if paste {
+                            r.paste_guarded(
+                                &pane,
+                                r.agent().clone(),
+                                "UNSAFE-STATE".into(),
+                                CaptureFormat::Plain,
+                                |_| true,
+                            )
+                            .await
+                        } else {
+                            r.keys_guarded(
+                                &pane,
+                                r.agent().clone(),
+                                PaneKey::Enter,
+                                CaptureFormat::Plain,
+                                |_| true,
+                            )
+                            .await
+                        };
+                        assert!(
+                            matches!(result, Err(ReservationError::PaneInputRefused { .. })),
+                            "{result:?}"
+                        );
+                    }
+                    if synchronized {
+                        probe
+                            .raw_command(
+                                "set-window-option",
+                                &["-t", "%0", "synchronize-panes", "off"],
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        probe
+                            .raw_command("select-pane", &["-t", "%0", "-e"])
+                            .await
+                            .unwrap();
+                    }
+                }
+                for target in ["%0", sibling.trim()] {
+                    let text = probe
+                        .raw_command("capture-pane", &["-p", "-t", target])
+                        .await
+                        .unwrap();
+                    assert!(!text.contains("UNSAFE-STATE"));
+                }
                 probe
                     .raw_command("clock-mode", &["-t", "%0"])
                     .await

@@ -70,11 +70,13 @@ async fn reserved_input_refuses_unsafe_state_before_any_guard_or_effect() {
         .run_reserved(
             request(ReservationKind::Delivery),
             move |r| async move {
-                for dead in [false, true] {
+                for state in 0..4 {
                     for operation in 0..4 {
                         let mut fresh = frame(Some("project/lead"), CaptureFormat::Plain);
-                        fresh.inspection.dead = dead;
-                        fresh.inspection.in_mode = !dead;
+                        fresh.inspection.dead = state == 0;
+                        fresh.inspection.in_mode = state == 1;
+                        fresh.inspection.synchronized = state == 2;
+                        fresh.inspection.input_off = state == 3;
                         if operation >= 2 {
                             scripts.script_capture(&fresh).unwrap();
                         } else {

@@ -739,6 +739,50 @@ fn arm_wakes_subscribers() {
 }
 
 #[test]
+fn lazy_scope_ignores_a_session_on_another_pane() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    // A proven session of the same harness, on a pane the attempt never used.
+    e.observe(
+        &SessionId::new("elsewhere"),
+        Some("%8"),
+        Harness::Pi,
+        &LifecycleEvent::WorkingStart,
+    )
+    .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // Had "elsewhere" bound the scope, the pane's own session could not confirm.
+    observe(&e, "started", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "started"
+    );
+}
+
+#[test]
+fn pending_id_is_no_activity_for_history() {
+    // A history that fails every write: a forwarded Activity would show as the
+    // evidence's disable.
+    let e = armed();
+    let history = crate::org::message_history::MessageHistoryHandle::disabled("synthetic");
+    e.tap(
+        &SessionId::new("pending-42"),
+        Some("%7"),
+        Some(Harness::Pi),
+        Some(&LifecycleEvent::WorkingStart),
+        true,
+        Some(&history),
+    )
+    .unwrap();
+    assert!(e.available());
+}
+
+#[test]
 fn unproven_event_never_binds_a_lazy_scope() {
     let e = evidence();
     e.register(id(), REFERENCE.into()).unwrap();

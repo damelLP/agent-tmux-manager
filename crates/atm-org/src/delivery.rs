@@ -1,20 +1,84 @@
 //! Pure delivery policy; observations and time belong to the executor.
 //!
-//! Consume each decision once, serially per message: decide/append/apply
-//! `DeliveryAttempted` before paste + Enter, never paste if append fails, and
-//! never treat a duplicate/no-event attempt command as another authorization.
-//! Recheck live guards immediately before I/O. If a reserved attempt cannot run,
-//! report its failure; do not silently put it back in the queue. Resolution,
+//! Consume each decision once, serialized per recipient pane: at most one
+//! message may be delivering to that pane. Decide/append/apply `DeliveryAttempted`
+//! before paste + Enter; never paste if append fails or the command produces no
+//! event. Recheck live guards immediately before I/O and update the pane's last
+//! paste/observation continuity before releasing serialization. If a reserved
+//! attempt cannot run, record `DeliveryFailed` with finality from
+//! [`DeliveryPolicy::is_final_attempt`], never silently requeue. Resolution,
 //! subagent targeting, bracketed-paste safety and token formatting stay outside
 //! this module. A pure decision cannot make a paste and a log append atomic.
 //!
 //! `Confirm` maps to `Delivered`. `RetryAt` while delivering requires nonfinal
 //! `DeliveryFailed`; once applied, recompute the deadline from logged failed_at.
-//! `RetryAt` while queued only schedules. `Fail` requires final `DeliveryFailed`.
-//! `Blocked` emits no message event: retain state, notify the owner once per
-//! reason, and reevaluate when observations change. Continue listening for late
-//! receipts even after a final failure. Wait/AwaitConfirmation/Complete emit no
-//! events. Deadlines are inclusive; events can wake a timer earlier.
+//! `RetryAt` while queued only schedules. `Fail` requires final `DeliveryFailed`
+//! (accepted from queued or delivering). `Blocked` emits no message event:
+//! retain state, notify the owner once per reason, and reevaluate on changes.
+//! `Wait(OwnerFocused)` also shows a deduplicated notice, with no timeout.
+//! An owner can give up on any held message via final `DeliveryFailed`.
+//! Continue listening for late receipts even after a final failure.
+//! Wait/AwaitConfirmation/Complete emit no events. Deadlines are inclusive;
+//! events can wake a timer earlier.
+//!
+//! # Restart and evidence
+//!
+//! The executor latches activity by receive order after applying the attempt,
+//! not by comparing event/attempt timestamps. Working-to-working activity counts.
+//! Evidence is not a receipt, but prevents automatic retries. On restart the
+//! receipt and evidence latches are lost: **every prior unconfirmed attempt**,
+//! queued or delivering, is held via `last_attempt_before_start`. Replay/process
+//! lifetime establishes this input even if the wall clock stepped backwards.
+//! Only a receipt or explicit owner resolution ends that hold (give up now;
+//! an explicit retry command belongs to the executor's later API). A changed
+//! budget or a newly empty screen must not release it. No attempt means no
+//! restart hold. Terminal messages stay terminal unless a late receipt arrives.
+//!
+//! # Decision table
+//!
+//! Earlier applicable rows win. Metadata/arithmetic errors return a typed error,
+//! never permission to paste; settings are validated before entering this policy.
+//!
+//! | State / condition | Step |
+//! |---|---|
+//! | Delivered, or addressed to owner | Complete |
+//! | Token receipt, including queued/delivering/failed | Confirm |
+//! | Failed without receipt | Complete |
+//! | Queued/delivering, last attempt predates daemon start | Blocked(Restarted) |
+//! | Attempts exceed new budget, or queued at exhausted budget | Fail(AttemptLimit) |
+//! | Delivering with landing evidence | AwaitConfirmation until deadline, then Blocked(ProbablyDelivered) |
+//! | Delivering, pane unknown | Bounded unknown hold |
+//! | Delivering, pane positively gone | Wait grace, then RetryAt if budget remains, else Fail |
+//! | Delivering without receipt/evidence, pane alive | AwaitConfirmation until deadline; then RetryAt or final Fail |
+//! | Queued retry with landing evidence | Blocked(ProbablyDelivered) |
+//! | Queued retry before logged failed_at + retry delay | RetryAt; no new failure event |
+//! | Queued, owner focused (unknown focus is focused) | Wait(OwnerFocused), notice, no timeout |
+//! | Queued, agent starting/clearing | Wait(AgentNotReady) |
+//! | Queued, agent stuck/down | Blocked(AgentUnavailable); ready resumes |
+//! | Queued, another message delivering to pane | Wait(OtherDelivery) |
+//! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
+//! | Queued, fresh non-idle row, no send_now | Wait(SessionBusy) until stale or new observation |
+//! | Copy mode, dialog, draft, unknown guards/input | Wait; Blocked after current hold + readiness_timeout |
+//! | No row, positive empty input | Wait until max(empty_since,last_paste) + stable_empty_input |
+//! | Idle row, no send_now | Wait until max(status_since,empty_since,last_paste) + stable_idle |
+//! | Stale non-idle row, or send_now with any row | Wait until max(empty_since,last_paste) + stable_idle |
+//! | All queued guards satisfied | PasteNow with increasing attempt |
+//!
+//! Unknown observations must persist for the whole readiness window; reset the
+//! current hold when its blocker/source changes or clears. A long preceding turn
+//! does not spend this budget. Missing hold history starts at now, not sent_at.
+//! The executor must retain subsequent continuity, or repeated missing history
+//! would keep extending the window. `EmptySince` means a positively recognized
+//! empty editor **and no running turn**, never a blank screen or an empty box
+//! during active work. `send_now` skips row status/stability, not input stability.
+//!
+//! # Defaults
+//!
+//! Stable idle/empty with row: 10 s; without row: 5 s; confirmation: 3 s;
+//! retry delays: [1, 2, 4] s (four attempts); stale/readiness: 120 s each;
+//! guard poll: 250 ms; positive pane-gone grace: 2 s. The idle default is not
+//! a measured maximum automatic-retry gap: the executor's real integration
+//! check must measure that gap and tune the setting.
 
 use crate::{Address, AgentStatus, DeliveryReceipt, DeliveryStatus, Message};
 use atm_core::SessionStatus;
@@ -148,9 +212,11 @@ pub struct RecipientLiveView {
     /// recovery, blocker/source change, focus, or a fresh busy-row wait. Unknown
     /// must persist for this whole window. None starts now, never at sent_at.
     pub hold_since: Option<DateTime<Utc>>,
-    /// Set when replay finds this message delivering: lost evidence cannot be
-    /// reconstructed from timestamps. Keep set until a receipt or owner action.
-    pub restarted_mid_delivery: bool,
+    /// The last attempt predates this daemon process, including queued retries.
+    /// Compute from replay/process lifetime, not wall-clock timestamp order.
+    /// Lost receipt/landing latches require a hold until receipt or explicit
+    /// owner resolution; new screen observations must not clear this input.
+    pub last_attempt_before_start: bool,
     /// Unknown guards block just as positive unsafe guards do.
     pub copy_mode: Option<bool>,
     pub dialog_open: Option<bool>,
@@ -169,8 +235,8 @@ pub struct RecipientLiveView {
     /// applied (receive order, NOT timestamp comparison), or token seen in pane.
     /// Includes working -> working activity. Not a receipt. Latch across polls
     /// and failure/retry scheduling; reset only on a new reserved attempt.
-    /// A restart loses the latch: set restarted_mid_delivery for replayed
-    /// delivering messages instead of silently assuming no activity occurred.
+    /// A restart loses the latch: set last_attempt_before_start for ALL replayed
+    /// messages with prior attempts, including queued ones with late evidence.
     pub probably_landed: bool,
 }
 
@@ -237,7 +303,7 @@ pub enum WaitReason {
 pub enum FailureReason {
     #[error("recipient agent is stuck or down")]
     AgentUnavailable,
-    #[error("daemon restarted mid-delivery; inspect before resending")]
+    #[error("daemon restarted after an unconfirmed attempt; owner resolution required")]
     Restarted,
     #[error("pane remained in copy mode")]
     CopyMode,
@@ -297,6 +363,11 @@ pub fn next_delivery(
     if live.probably_landed && attempt == 0 {
         return Err(DeliveryPolicyError::InvalidState);
     }
+    if live.last_attempt_before_start && attempt > 0 {
+        return Ok(DeliveryStep::Blocked {
+            reason: FailureReason::Restarted,
+        });
+    }
     let retry_delay = policy.retry_delay(attempt);
     let max_attempts = settings.retry_delays.len().saturating_add(1);
     if usize::try_from(attempt).map_or(true, |n| n > max_attempts)
@@ -350,11 +421,6 @@ pub fn next_delivery(
         let started = message
             .last_attempt_at
             .ok_or(DeliveryPolicyError::InvalidState)?;
-        if live.restarted_mid_delivery {
-            return Ok(DeliveryStep::Blocked {
-                reason: FailureReason::Restarted,
-            });
-        }
         let until = deadline(started, settings.confirmation_timeout)?;
         if live.probably_landed {
             return Ok(if now < until {
@@ -652,7 +718,7 @@ mod tests {
             other_delivery_in_flight: false,
             last_paste_at: None,
             hold_since: Some(time(0)),
-            restarted_mid_delivery: false,
+            last_attempt_before_start: false,
             copy_mode: Some(false),
             dialog_open: Some(false),
             owner_focused: false,
@@ -881,11 +947,59 @@ mod tests {
         h.state = replayed;
         live.probably_landed = false;
         live.confirmation = None;
-        live.restarted_mid_delivery = h.message().status == DeliveryStatus::Delivering;
+        live.last_attempt_before_start = h.message().last_attempt.is_some();
         live.last_paste_at = Some(time(5));
         live.input_line = InputLine::EmptySince(time(5));
         live.session.as_mut().unwrap().status_since = time(5);
-        assert!(!matches!(h.step(&live, 15), DeliveryStep::PasteNow { .. }));
+        assert_eq!(
+            h.step(&live, 15),
+            DeliveryStep::Blocked {
+                reason: FailureReason::Restarted
+            }
+        );
+        live.confirmation = Some(receipt());
+        assert_eq!(
+            h.step(&live, 15),
+            DeliveryStep::Confirm { receipt: receipt() }
+        );
+    }
+
+    #[test]
+    fn restart_hold_survives_budget_changes_until_owner_gives_up() {
+        for queued in [false, true] {
+            let mut h = History::new(false);
+            h.attempt(2, 0);
+            if queued {
+                h.failure(false, 3);
+            }
+            let mut live = ready();
+            live.last_attempt_before_start = true;
+            let policy = DeliveryPolicy::new(DeliverySettings {
+                retry_delays: vec![],
+                ..DeliverySettings::default()
+            })
+            .unwrap();
+            for now in [4, 10000] {
+                assert_eq!(
+                    next_delivery(h.message(), &live, time(now), &policy).unwrap(),
+                    DeliveryStep::Blocked {
+                        reason: FailureReason::Restarted
+                    }
+                );
+            }
+            h.failure(true, 10000); // explicit owner give-up, not a policy timeout
+            assert_eq!(h.step(&live, 10001), DeliveryStep::Complete);
+            live.confirmation = Some(receipt());
+            assert_eq!(
+                h.step(&live, 10002),
+                DeliveryStep::Confirm { receipt: receipt() }
+            );
+        }
+        // Never attempted messages are still eligible after recovery.
+        assert_eq!(
+            History::new(false).step(&ready(), 10000),
+            DeliveryStep::PasteNow { attempt: 1 }
+        );
     }
 
     #[test]
@@ -893,7 +1007,7 @@ mod tests {
         let mut h = History::new(false);
         h.attempt(1, 0);
         let mut live = ready();
-        live.restarted_mid_delivery = true;
+        live.last_attempt_before_start = true;
         for now in [1, 3, 10000] {
             assert_eq!(
                 h.step(&live, now),
@@ -1122,28 +1236,31 @@ mod tests {
             assert_eq!(h.step(&live, 120), DeliveryStep::PasteNow { attempt: 1 });
             for send_now in [false, true] {
                 live.send_now = send_now;
-                live.hold_since = Some(time(0));
+                live.hold_since = Some(time(120));
                 live.input_line = InputLine::NonEmpty;
+                wait(h.step(&live, 120), WaitReason::InputNotEmpty);
                 assert_eq!(
-                    h.step(&live, 120),
+                    h.step(&live, 240),
                     DeliveryStep::Blocked {
                         reason: FailureReason::DraftPresent
                     }
                 );
                 live.input_line = InputLine::EmptySince(time(0));
                 live.dialog_open = Some(true);
+                live.hold_since = Some(time(240));
+                wait(h.step(&live, 240), WaitReason::DialogOpen);
                 assert_eq!(
-                    h.step(&live, 120),
+                    h.step(&live, 360),
                     DeliveryStep::Blocked {
                         reason: FailureReason::DialogOpen
                     }
                 );
                 live.dialog_open = Some(false);
                 live.input_line = InputLine::Unknown;
-                live.hold_since = Some(time(120));
-                wait(h.step(&live, 239), WaitReason::InputUnknown);
+                live.hold_since = Some(time(360));
+                wait(h.step(&live, 479), WaitReason::InputUnknown);
                 assert_eq!(
-                    h.step(&live, 240),
+                    h.step(&live, 480),
                     DeliveryStep::Blocked {
                         reason: FailureReason::ReadinessTimeout
                     }
@@ -1434,6 +1551,27 @@ mod tests {
     }
 
     #[test]
+    fn reserved_attempts_that_cannot_run_fail_final_only_at_budget() {
+        let mut h = History::new(false);
+        let policy = DeliveryPolicy::default();
+        for attempt in 1..=4 {
+            let now = i64::from(attempt) * 20;
+            assert_eq!(h.step(&ready(), now), DeliveryStep::PasteNow { attempt });
+            h.attempt(attempt, now);
+            h.failure(policy.is_final_attempt(attempt), now);
+            assert_eq!(
+                h.message().status,
+                if attempt < 4 {
+                    DeliveryStatus::Queued
+                } else {
+                    DeliveryStatus::Failed
+                }
+            );
+        }
+        assert_eq!(h.step(&ready(), 1000), DeliveryStep::Complete);
+    }
+
+    #[test]
     fn configuration_controls_delays_and_budget_without_panics() {
         let mut h = History::new(false);
         let policy = DeliveryPolicy::new(DeliverySettings {
@@ -1590,7 +1728,7 @@ mod tests {
                     if let Some(row) = &mut live.session { row.last_event_at = time(now); }
                 }
                 if io < 30 && h.message().status == DeliveryStatus::Delivering
-                    && !live.probably_landed && !live.restarted_mid_delivery {
+                    && !live.probably_landed && !live.last_attempt_before_start {
                     h.failure(policy.is_final_attempt(previous_attempt), now);
                     failures.set(failures.get() + 1);
                     failure_since_paste = true;
@@ -1604,8 +1742,10 @@ mod tests {
                     h.state = replayed;
                     live.confirmation = None;
                     live.probably_landed = false;
-                    live.restarted_mid_delivery = h.message().status == DeliveryStatus::Delivering;
-                    if live.restarted_mid_delivery { restarts.set(restarts.get() + 1); }
+                    live.last_attempt_before_start = h.message().last_attempt.is_some();
+                    if matches!(h.message().status, DeliveryStatus::Delivering | DeliveryStatus::Queued) {
+                        restarts.set(restarts.get() + 1);
+                    }
                     if let Some(row) = &mut live.session { row.status_since = time(now); }
                     live.input_line = InputLine::Unknown;
                     live.last_paste_at = Some(time(now));
@@ -1625,13 +1765,13 @@ mod tests {
                         prop_assert!(attempt > previous_attempt);
                         h.attempt(attempt, now);
                         live.probably_landed = false; // reset per reserved attempt, not per tick
-                        live.restarted_mid_delivery = false;
+                        live.last_attempt_before_start = false;
                         live.last_paste_at = Some(time(now));
                         previous_attempt = attempt;
                         failure_since_paste = false;
                     }
                     DeliveryStep::RetryAt { .. } if h.message().status == DeliveryStatus::Delivering => {
-                        prop_assert!(!live.probably_landed && !live.restarted_mid_delivery);
+                        prop_assert!(!live.probably_landed && !live.last_attempt_before_start);
                         prop_assert!(!policy.is_final_attempt(previous_attempt));
                         h.failure(false, now);
                         failures.set(failures.get() + 1);
@@ -1658,7 +1798,7 @@ mod tests {
             if previous_attempt == 4 { four.set(four.get() + 1); }
             Ok(())
         }).unwrap();
-        println!("delivery coverage: cases={}, >=2 pastes={}, 4 pastes={}, in-flight restarts={}, evidence={}, receipts={}, failures={}",
+        println!("delivery coverage: cases={}, >=2 pastes={}, 4 pastes={}, unconfirmed restarts={}, evidence={}, receipts={}, failures={}",
             cases.get(), multiple.get(), four.get(), restarts.get(), evidence.get(), receipts.get(), failures.get());
         assert!(
             multiple.get() * 4 >= cases.get(),

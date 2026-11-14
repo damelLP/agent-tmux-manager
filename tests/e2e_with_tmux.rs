@@ -535,6 +535,63 @@ impl E2eEnv {
     }
 }
 
+/// Control must refuse a second real server even when both have pane %0.
+async fn scenario_control_server_identity_and_start_directory(env: &E2eEnv) {
+    let other = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "other",
+        [("ATM_SOCKET", env.daemon.socket_path.as_os_str())],
+    );
+    let before = env.tmux.list_panes().await.unwrap().len();
+    for args in [
+        vec!["send", "%0", "must not arrive"],
+        vec!["spawn", "-t", "%0"],
+    ] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(&env.atm_path)
+                .args(args)
+                .env("ATM_SOCKET", &env.daemon.socket_path)
+                .env("XDG_STATE_HOME", &env.daemon.state_dir)
+                .env("ATM_TMUX_SOCKET", other.label())
+                .env("TMUX", "private-test")
+                .env("ATM_SPAWN_BIN", "true")
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("atmd controls tmux server"),
+            "{output:?}"
+        );
+    }
+    assert_eq!(env.tmux.list_panes().await.unwrap().len(), before);
+
+    // Stop between split and type: pane_current_path must already be the
+    // caller directory, not a later typed `cd` or the daemon's working dir.
+    let cwd = tempfile::tempdir().unwrap();
+    let mut client = Client::connect(&env.daemon.socket_path);
+    client.send(ClientMessage::connect(Some("cwd-test".into())));
+    assert!(matches!(client.recv(), DaemonMessage::Connected { .. }));
+    client.send(ClientMessage::request("cwd".into(), "session.spawn".into(), json!({
+        "target_pane":"%0", "caller_pane_missing":false, "direction":"below", "size":"20%", "cwd":cwd.path()
+    }), None));
+    let pane = match client.recv() {
+        DaemonMessage::Response {
+            payload: atm_protocol::ResponsePayload::Result(result),
+            ..
+        } => result["pane"].as_str().unwrap().to_owned(),
+        other => panic!("split response: {other:?}"),
+    };
+    assert_eq!(
+        env.tmux.get_pane_cwd(&pane).await.unwrap().as_deref(),
+        cwd.path().to_str()
+    );
+    env.tmux.kill_pane(&pane).await.unwrap();
+}
+
 /// Scenario 1 — protocol-level e2e via a hand-rolled client.
 /// Returns the session id it registered, so scenario 2 can verify it
 /// shows up in the real `atm list` output.
@@ -2796,6 +2853,7 @@ async fn atm_atmd_tmux_end_to_end() {
     // monolithic test body.
     let session_id = scenario_protocol_e2e(&env).await;
     scenario_atm_list_client(&env, &session_id).await;
+    scenario_control_server_identity_and_start_directory(&env).await;
     scenario_role_json(&env, &session_id).await;
     scenario_real_tmux_lib(&env).await;
     scenario_paste_text_and_atm_send(&env).await;

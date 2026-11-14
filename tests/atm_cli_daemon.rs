@@ -137,7 +137,8 @@ fn autostart_control(args: &[&str], expected: &[u8]) {
 if [ "$1" = -L ]; then shift; shift; fi
 case $1 in
 list-panes) printf '%%7\tprobe\t0\t1\t80\t24\t1\n' ;;
-display-message) echo '0 1' ;;
+display-message)
+case "$*" in *'#{socket_path}'*) echo "$CONTROL_TEST_TMUX_SOCKET" ;; *) echo '0 1' ;; esac ;;
 split-window) echo %42 ;;
 esac
 "#,
@@ -227,21 +228,31 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
     let server = tokio::spawn(async move { server.run().await });
     control_support::wait_for_socket(&dir.path().join("atmd.sock")).await;
     let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
+    let tmux_socket = dir
+        .path()
+        .join(format!("tmux-{}/default", unsafe { libc::getuid() }));
+    std::fs::create_dir_all(tmux_socket.parent().unwrap()).unwrap();
+    std::fs::write(&tmux_socket, "").unwrap();
+    mock.set_next_raw_output(tmux_socket.to_str().unwrap());
     mock.set_next_raw_output("0 1");
     let out = atm(exe, dir.path(), &["send", "abc", "hello;"]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"Sent to %5 by tmux paste\n");
     assert!(
-        matches!(mock.calls().as_slice(), [MockCall::RawCommand { .. }, MockCall::PasteText { pane, text }, MockCall::SendKeys { keys, .. }] if pane == "%5" && text == "hello;" && keys == "Enter")
+        matches!(mock.calls().as_slice(), [MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::PasteText { pane, text }, MockCall::SendKeys { keys, .. }] if pane == "%5" && text == "hello;" && keys == "Enter")
     );
     mock.clear_calls();
+    mock.set_next_raw_output(tmux_socket.to_str().unwrap());
     let args = ["send", "nope", "hello"];
     assert_fails_with(
         &atm(exe, dir.path(), &args),
         &args,
         "Error: No session matching 'nope'",
     );
-    assert!(mock.calls().is_empty());
+    assert!(matches!(
+        mock.calls().as_slice(),
+        [MockCall::RawCommand { .. }]
+    ));
     for (state, text, reason) in [
         (
             "1 0",
@@ -254,6 +265,7 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
             "the program didn't ask for bracketed paste, so each line would submit alone",
         ),
     ] {
+        mock.set_next_raw_output(tmux_socket.to_str().unwrap());
         mock.set_next_raw_output(state);
         let args = ["send", "%5", text];
         assert_fails_with(
@@ -271,6 +283,7 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
         })
         .await
         .unwrap();
+    mock.set_next_raw_output(tmux_socket.to_str().unwrap());
     mock.set_next_raw_output("0 1");
     let args = ["send", "%5", "hi"];
     assert_fails_with(&atm(exe, dir.path(), &args), &args, "Error: Refusing to send to %5: the session is waiting on a dialog that Enter would answer; use `atm reply`, or, if the dialog is gone, type in the pane");

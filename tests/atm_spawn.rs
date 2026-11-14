@@ -26,6 +26,7 @@ case $1 in
   list-panes)
     printf '%%1\tother\t0\t100\t80\t24\t1\n%%7\tmine\t1\t101\t80\t24\t0\n%%9\tmine\t1\t102\t80\t24\t0\n' ;;
   display-message)
+    case "$*" in *'#{socket_path}'*) echo "$CONTROL_TEST_TMUX_SOCKET"; exit ;; esac
     # tmux 3.8 prints an empty line, rc 0, for a pane that is gone.
     case " $* " in
       *" -t %1 "*|*" -t %7 "*|*" -t %9 "*) echo /from/pane ;;
@@ -143,6 +144,9 @@ fn spawn_request_carries_callers_directory_separately_from_harness_cwd() {
     std::fs::create_dir(&caller).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(dir.path().join("atmd.sock")).unwrap();
     let expected = caller.clone();
+    let server_socket = dir
+        .path()
+        .join(format!("tmux-{}/control-test", unsafe { libc::getuid() }));
     let peer = std::thread::spawn(move || {
         for method in [
             "session.spawn_prepare",
@@ -176,6 +180,10 @@ fn spawn_request_carries_callers_directory_separately_from_harness_cwd() {
             read.read_line(&mut line).unwrap();
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(request["method"], method);
+            assert_eq!(
+                request["params"]["caller_server"],
+                server_socket.to_str().unwrap()
+            );
             let result = match method {
                 "session.spawn_prepare" => {
                     serde_json::json!({"target_pane":"%7","cwd":"/from/pane","caller_pane_missing":false})

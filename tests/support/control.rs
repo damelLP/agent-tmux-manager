@@ -52,8 +52,13 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub fn isolated<'a>(command: &'a mut Command, dir: &Path) -> &'a mut Command {
+    // Stand-in tmux has no real socket, but must report a canonical identity.
+    let socket = dir.join(format!("tmux-{}/control-test", unsafe { libc::getuid() }));
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::fs::write(&socket, "").unwrap();
     command
         .env_clear()
+        .env("CONTROL_TEST_TMUX_SOCKET", socket)
         .env("HOME", dir)
         .env("ATM_SOCKET", dir.join("atmd.sock"))
         .env("ATM_STATE_DIR", dir.join("events"))

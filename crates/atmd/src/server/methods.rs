@@ -202,6 +202,7 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendParams {
+    caller_server: Option<String>,
     target: String,
     text: String,
 }
@@ -209,6 +210,7 @@ struct SendParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrepareParams {
+    caller_server: Option<String>,
     target_pane: Option<String>,
     cwd: Option<String>,
     fallback_cwd: Option<String>,
@@ -217,6 +219,7 @@ struct PrepareParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SplitParams {
+    caller_server: Option<String>,
     cwd: Option<String>,
     target_pane: String,
     caller_pane_missing: bool,
@@ -227,6 +230,7 @@ struct SplitParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TypeParams {
+    caller_server: Option<String>,
     pane: String,
     command: String,
 }
@@ -237,6 +241,7 @@ fn control_error(error: crate::control::service::ServiceError) -> MethodError {
     let code = match &error {
         ServiceError::Timeout => error_code::TIMEOUT,
         ServiceError::Unavailable => error_code::UNAVAILABLE,
+        ServiceError::ServerRefused(_) => error_code::REFUSED,
         ServiceError::Control(error) => match error {
             ControlError::NoSession { .. } | ControlError::NoPane { .. } => error_code::NOT_FOUND,
             ControlError::AmbiguousTarget { .. } => error_code::CONFLICT,
@@ -260,9 +265,10 @@ fn control_error(error: crate::control::service::ServiceError) -> MethodError {
 fn require_control(
     control: Option<crate::control::service::ControlHandle>,
     caller: CallContext,
+    server: Option<String>,
 ) -> Result<crate::control::service::ControlHandle, MethodError> {
     control
-        .map(|control| control.with_caller(caller))
+        .map(|control| control.with_caller(caller).for_server(server))
         .ok_or_else(|| MethodError::new(error_code::UNAVAILABLE, "control service is unavailable"))
 }
 
@@ -278,7 +284,7 @@ fn register_control(
             let control = send.clone();
             async move {
                 let p: SendParams = parse_params(params)?;
-                let pane = require_control(control, caller)?
+                let pane = require_control(control, caller, p.caller_server)?
                     .send(p.target, p.text)
                     .await
                     .map_err(control_error)?;
@@ -291,7 +297,7 @@ fn register_control(
         let control = prepare.clone();
         async move {
             let p: PrepareParams = parse_params(params)?;
-            let context = require_control(control, caller.clone())?.prepare_spawn(p.target_pane, p.cwd, caller.from_pane.map(|p| p.0), p.fallback_cwd).await.map_err(control_error)?;
+            let context = require_control(control, caller.clone(), p.caller_server)?.prepare_spawn(p.target_pane, p.cwd, caller.from_pane.map(|p| p.0), p.fallback_cwd).await.map_err(control_error)?;
             Ok(serde_json::json!({"target_pane": context.target_pane, "cwd": context.cwd, "caller_pane_missing": context.caller_pane_missing()}))
         }
     })?;
@@ -305,7 +311,7 @@ fn register_control(
                 let p: SplitParams = parse_params(params)?;
                 let context =
                     crate::control::SpawnContext::new(p.target_pane, p.cwd, p.caller_pane_missing);
-                let pane = require_control(control, caller)?
+                let pane = require_control(control, caller, p.caller_server)?
                     .split_spawn(context, p.direction, p.size)
                     .await
                     .map_err(control_error)?;
@@ -320,7 +326,7 @@ fn register_control(
             let control = control.clone();
             async move {
                 let p: TypeParams = parse_params(params)?;
-                require_control(control, caller)?
+                require_control(control, caller, p.caller_server)?
                     .type_spawn_command(p.pane, p.command)
                     .await
                     .map_err(control_error)?;
@@ -444,6 +450,54 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         org_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn control_refuses_other_tmux_servers_but_accepts_aliases_and_legacy_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("own.sock");
+        let other = dir.path().join("other.sock");
+        let alias = dir.path().join("alias.sock");
+        std::fs::write(&own, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        std::os::unix::fs::symlink(&own, &alias).unwrap();
+        let (router, mock, cancel, task, _) =
+            control_router(crate::org::OrgHandle::disabled("test")).await;
+        for (method, params) in [
+            ("session.send", json!({"target":"%7","text":"hello"})),
+            ("session.spawn_prepare", json!({"target_pane":"%7"})),
+            (
+                "session.spawn",
+                json!({"target_pane":"%7","caller_pane_missing":false,"direction":"below","size":"50%"}),
+            ),
+            (
+                "session.spawn_type",
+                json!({"pane":"%42","command":"hello"}),
+            ),
+        ] {
+            for caller in [Some(&other), Some(&alias), None] {
+                mock.clear_calls();
+                let mut params = params.clone();
+                if let Some(caller) = caller {
+                    params["caller_server"] = json!(caller);
+                    mock.set_next_raw_output(own.to_str().unwrap());
+                }
+                if method == "session.send" && caller != Some(&other) {
+                    mock.set_next_raw_output("0 1");
+                }
+                let result = router.call(context(), method, params).await;
+                if caller == Some(&other) {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.0.code, "refused");
+                    assert!(error.0.message.contains("atmd controls tmux server"));
+                    assert_eq!(mock.call_count(), 1, "mismatch must not mutate");
+                } else {
+                    result.unwrap();
+                }
+            }
+        }
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test]

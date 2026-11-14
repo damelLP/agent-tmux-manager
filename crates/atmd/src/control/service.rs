@@ -101,6 +101,7 @@ mod tests {
             &mock,
             &crate::registry::spawn_registry(),
             Pending {
+                server: None,
                 deadline: Instant::now(),
                 caller: None,
                 request: Request::Type {
@@ -138,6 +139,7 @@ mod tests {
         control
             .sender
             .send(Pending {
+                server: None,
                 deadline: Instant::now() + ACTION_TIMEOUT,
                 caller: None,
                 request: Request::Type {
@@ -336,6 +338,7 @@ mod tests {
                 let (reply, _) = oneshot::channel();
                 sender
                     .try_send(Pending {
+                        server: None,
                         deadline: Instant::now() + ACTION_TIMEOUT,
                         caller: None,
                         request: Request::Type {
@@ -348,6 +351,7 @@ mod tests {
                     .unwrap();
             }
             let handle = ControlHandle {
+                server: None,
                 sender,
                 audits: AuditQueue {
                     sender: mpsc::channel(1).0,
@@ -420,6 +424,8 @@ pub enum ServiceError {
     Unavailable,
     #[error("control action timed out")]
     Timeout,
+    #[error("{0}")]
+    ServerRefused(String),
 }
 
 type Reply<T> = oneshot::Sender<Result<T, ServiceError>>;
@@ -453,6 +459,7 @@ enum Request {
 }
 
 struct Pending {
+    server: Option<String>,
     deadline: Instant,
     caller: Option<CallContext>,
     request: Request,
@@ -507,12 +514,20 @@ impl AuditQueue {
 /// A bounded queue shared by RPC and in-process control clients.
 #[derive(Debug, Clone)]
 pub struct ControlHandle {
+    server: Option<String>,
     sender: mpsc::Sender<Pending>,
     audits: AuditQueue,
     caller: Option<CallContext>,
 }
 
 impl ControlHandle {
+    /// Optional server identity supplied by a caller; absent retains legacy behavior.
+    #[must_use]
+    pub fn for_server(mut self, server: Option<String>) -> Self {
+        self.server = server;
+        self
+    }
+
     #[must_use]
     pub fn audit_queue(&self) -> AuditQueue {
         self.audits.clone()
@@ -536,6 +551,7 @@ impl ControlHandle {
         timeout_at(deadline, async {
             self.sender
                 .send(Pending {
+                    server: self.server.clone(),
                     deadline,
                     caller: self.caller.clone(),
                     request: make(reply),
@@ -692,6 +708,7 @@ where
     });
     (
         ControlHandle {
+            server: None,
             sender,
             audits: handle_audits,
             caller: None,
@@ -743,6 +760,56 @@ fn control_audit<T>(
     }
 }
 
+async fn verify_server(
+    client: &dyn TmuxClient,
+    caller: String,
+    operation: String,
+) -> Result<(), ServiceError> {
+    let own = client
+        .raw_command("display-message", &["-p", "#{socket_path}"])
+        .await
+        .map_err(|error| {
+            ServiceError::ServerRefused(format!(
+                "Refusing to {operation}: cannot identify atmd's tmux server: {error}"
+            ))
+        })?;
+    // Canonicalization can hang on a filesystem. One detached worker retains its
+    // permit even if the action expires, so timed-out requests cannot pile up threads.
+    static SLOT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let permit = SLOT
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ServiceError::Unavailable)?;
+    let (send, receive) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("control-server-identity".into())
+        .spawn(move || {
+            let _permit = permit;
+            let result = std::fs::canonicalize(own.trim())
+                .and_then(|own| std::fs::canonicalize(caller).map(|caller| (own, caller)));
+            let _ = send.send(result);
+        })
+        .map_err(|_| ServiceError::Unavailable)?;
+    let (own, caller) = receive
+        .await
+        .map_err(|_| ServiceError::Unavailable)?
+        .map_err(|error| {
+            ServiceError::ServerRefused(format!(
+                "Refusing to {operation}: cannot verify tmux server identity: {error}"
+            ))
+        })?;
+    if own != caller {
+        return Err(ServiceError::ServerRefused(format!(
+            "Refusing to {operation}: atmd controls tmux server {}, not this one ({})",
+            own.display(),
+            caller.display()
+        )));
+    }
+    Ok(())
+}
+
 async fn execute(
     client: &dyn TmuxClient,
     registry: &RegistryHandle,
@@ -751,6 +818,40 @@ async fn execute(
     let deadline = pending.deadline;
     let expired = Instant::now() >= deadline;
     let caller = pending.caller.as_ref();
+    if let Some(server) = pending.server {
+        let operation = match &pending.request {
+            Request::Send { target, .. } => format!("send to {target}"),
+            Request::Prepare { target, caller, .. } => format!(
+                "spawn from {}",
+                target
+                    .as_deref()
+                    .or(caller.as_deref())
+                    .unwrap_or("the active pane")
+            ),
+            Request::Split { context, .. } => format!("spawn from {}", context.target_pane),
+            Request::Type { pane, .. } => format!("spawn in {pane}"),
+            #[cfg(test)]
+            Request::FlushAudit(_) => "flush audits".into(),
+        };
+        if let Err(error) = outcome(deadline, verify_server(client, server, operation)).await {
+            match pending.request {
+                Request::Send { reply, .. } | Request::Split { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+                Request::Prepare { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+                Request::Type { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+                #[cfg(test)]
+                Request::FlushAudit(reply) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+            return None;
+        }
+    }
     let audit = match pending.request {
         #[cfg(test)]
         Request::FlushAudit(reply) => return Some(Audit::Barrier(reply)),

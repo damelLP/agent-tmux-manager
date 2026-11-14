@@ -35,7 +35,28 @@ pub enum RpcError {
 /// Connect, check capabilities, and issue exactly one request. Send uses one
 /// call; spawn uses separate prepare/split/type calls so it can print between
 /// split and type. Other session commands retain their legacy exchange.
-pub async fn call(method: &str, params: Value, budget: Duration) -> Result<Value, RpcError> {
+pub async fn call(method: &str, mut params: Value, budget: Duration) -> Result<Value, RpcError> {
+    if method.starts_with("session.") {
+        let path = caller_server_path(
+            std::env::var_os("ATM_TMUX_SOCKET").as_deref(),
+            std::env::var_os("TMUX").as_deref(),
+            std::env::var_os("TMUX_TMPDIR").as_deref(),
+            unsafe { libc::getuid() },
+        );
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map_err(connection_error)?
+                .join(path)
+        };
+        let path = path
+            .to_str()
+            .ok_or_else(|| connection_error("tmux socket path is not UTF-8"))?;
+        if let Some(params) = params.as_object_mut() {
+            params.insert("caller_server".into(), Value::String(path.into()));
+        }
+    }
     let socket = atm_tui::client::resolve_socket_path();
     let from_pane = super::spawn::non_empty_env("TMUX_PANE");
     call_with_startup(
@@ -48,6 +69,32 @@ pub async fn call(method: &str, params: Value, budget: Duration) -> Result<Value
         atm_tui::daemon::ensure_daemon_running,
     )
     .await
+}
+
+// Match the old RealTmuxClient: explicit -L overrides TMUX, otherwise tmux
+// uses the inherited socket before TMUX_TMPDIR's per-user default directory.
+fn caller_server_path(
+    label: Option<&std::ffi::OsStr>,
+    tmux: Option<&std::ffi::OsStr>,
+    temp: Option<&std::ffi::OsStr>,
+    uid: u32,
+) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let label = label.filter(|v| !v.is_empty());
+    if label.is_none() {
+        if let Some(socket) = tmux
+            .and_then(|v| v.as_bytes().split(|b| *b == b',').next())
+            .filter(|v| !v.is_empty())
+        {
+            return Path::new(std::ffi::OsStr::from_bytes(socket)).to_owned();
+        }
+    }
+    Path::new(
+        temp.filter(|v| !v.is_empty())
+            .unwrap_or_else(|| std::ffi::OsStr::new("/tmp")),
+    )
+    .join(format!("tmux-{uid}"))
+    .join(label.unwrap_or_else(|| std::ffi::OsStr::new("default")))
 }
 
 async fn call_with_startup<F>(
@@ -177,6 +224,32 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn caller_server_matches_tmux_environment_precedence() {
+        let inherited = Some(std::ffi::OsStr::new("/inherited/socket,123,0"));
+        assert_eq!(
+            caller_server_path(
+                Some("label".as_ref()),
+                inherited,
+                Some("/private".as_ref()),
+                42
+            ),
+            Path::new("/private/tmux-42/label")
+        );
+        assert_eq!(
+            caller_server_path(None, inherited, Some("/private".as_ref()), 42),
+            Path::new("/inherited/socket")
+        );
+        assert_eq!(
+            caller_server_path(None, None, None, 42),
+            Path::new("/tmp/tmux-42/default")
+        );
+        assert_eq!(
+            caller_server_path(Some("".as_ref()), None, Some("".as_ref()), 42),
+            Path::new("/tmp/tmux-42/default")
+        );
+    }
 
     fn assert_private_paths(run: &Path, socket: &Path, xdg: Option<&Path>) {
         let run = run.canonicalize().expect("run directory must exist");

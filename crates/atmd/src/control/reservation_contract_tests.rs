@@ -16,12 +16,6 @@ fn agent() -> AgentId {
     "project/lead".parse().unwrap()
 }
 
-fn not_implemented<T>(result: Result<T, ReservationError>, operation: &str) {
-    assert!(
-        matches!(result, Err(ReservationError::NotImplemented { operation: actual }) if actual == operation)
-    );
-}
-
 #[test]
 fn contract_pane_id_accepts_only_exact_ascii_targets() {
     for value in ["%0", "%42", "%1234567890"] {
@@ -43,12 +37,13 @@ fn contract_pane_id_accepts_only_exact_ascii_targets() {
 }
 
 #[tokio::test]
-async fn contract_operations_return_typed_not_implemented() {
-    // The real supervisor mints the capability; pane effects remain Task 3.
+async fn contract_adoption_cannot_send_launch_input() {
+    // The real supervisor mints the capability, but kind limits input.
     let cancel = CancellationToken::new();
     let (control, task) = spawn_control(
         Box::new(MockTmuxClient::new()),
         crate::registry::spawn_registry(),
+        crate::org::OrgHandle::disabled("contract test"),
         cancel.clone(),
     );
     control
@@ -63,44 +58,19 @@ async fn contract_operations_return_typed_not_implemented() {
             |reservation| async move {
                 assert_eq!(reservation.agent(), &agent());
                 let pane = PaneId::parse("%7").unwrap();
-                not_implemented(reservation.inspect(&pane).await, "inspect");
-                for expected in [ExpectedTag::Absent, ExpectedTag::Agent(agent())] {
-                    not_implemented(reservation.tag(&pane, expected).await, "tag");
-                }
-                not_implemented(reservation.untag(&pane, agent()).await, "untag");
+                assert!(reservation.inspect(&pane).await?.is_none());
                 for key in [PaneKey::Enter, PaneKey::Escape, PaneKey::Up, PaneKey::Down] {
-                    not_implemented(reservation.keys(&pane, agent(), key).await, "keys");
+                    assert!(matches!(
+                        reservation.keys(&pane, agent(), key).await,
+                        Err(ReservationError::InvalidRequest { .. })
+                    ));
                 }
-                not_implemented(
+                assert!(matches!(
                     reservation
                         .paste(&pane, agent(), "literal;\nEnter".into())
                         .await,
-                    "paste",
-                );
-                for format in [CaptureFormat::Plain, CaptureFormat::Ansi] {
-                    not_implemented(reservation.capture(&pane, format).await, "capture");
-                }
-                not_implemented(
-                    reservation
-                        .split(
-                            SpawnContext::new("%0".into(), None, false),
-                            PaneDirection::Below,
-                            "50%".into(),
-                        )
-                        .await,
-                    "split",
-                );
-                not_implemented(
-                    reservation
-                        .kill(
-                            &pane,
-                            agent(),
-                            serde_json::json!({"reason":"down"}),
-                            DateTime::from_timestamp(0, 0).unwrap(),
-                        )
-                        .await,
-                    "kill",
-                );
+                    Err(ReservationError::InvalidRequest { .. })
+                ));
                 Ok::<_, ReservationError>(())
             },
             |_, _| async { Ok(()) },
@@ -118,6 +88,7 @@ async fn contract_expired_job_is_not_admitted_and_never_invokes_callbacks() {
     let (control, task) = spawn_control(
         Box::new(mock.clone()),
         crate::registry::spawn_registry(),
+        crate::org::OrgHandle::disabled("contract test"),
         cancel.clone(),
     );
     for kind in [

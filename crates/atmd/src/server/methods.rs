@@ -248,6 +248,9 @@ fn control_error(error: crate::control::service::ServiceError) -> MethodError {
             ControlError::SendRefused { .. } | ControlError::AgentClearing { .. } => {
                 error_code::REFUSED
             }
+            ControlError::PaneQuarantined { .. } | ControlError::OrganisationUnavailable { .. } => {
+                error_code::UNAVAILABLE
+            }
             ControlError::Tmux {
                 source: atm_tmux::TmuxError::Timeout { .. },
                 ..
@@ -637,6 +640,28 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         org_cancel.cancel();
+    }
+
+    #[test]
+    fn contract_quarantine_and_org_failure_have_unavailable_code_and_human_messages() {
+        use crate::control::ControlError;
+        for (error, message) in [
+            (
+                ControlError::PaneQuarantined {
+                    pane: "%7".into(),
+                    agent: "project/lead".parse().unwrap(),
+                },
+                "pane %7: agent project/lead is quarantined; restart atmd and reconcile",
+            ),
+            (
+                ControlError::OrganisationUnavailable { pane: "%7".into() },
+                "organisation state is unavailable for pane %7; refusing input",
+            ),
+        ] {
+            let error = control_error(error.into());
+            assert_eq!(error.0.code, "unavailable");
+            assert_eq!(error.0.message, message);
+        }
     }
 
     #[tokio::test]

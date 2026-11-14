@@ -1,14 +1,12 @@
 //! Exclusive, fenced control for an agent's lifecycle or one delivery.
 //!
-//! # Implementation checkpoint — ownership and supervision
+//! # Implementation checkpoint — fenced pane effects
 //!
-//! `run_reserved` now admits bounded daemon-owned jobs, serializes conflicting
-//! ownership, rotates cleanup fences and quarantines failed cleanup. Pane methods
-//! validate the live fence, then return [`ReservationError::NotImplemented`];
-//! tmux effects, guarded input, org integration and legacy send/spawn isolation
-//! are still pending. The additive guarded methods are typed stubs too.
-//! The full effect/legacy-path guarantees below remain the implementation contract,
-//! **not guarantees provided by this checkpoint**. Existing send/spawn is unchanged.
+//! Ownership, supervision, pane effects and guarded input are implemented.
+//! Kill audit and legacy send/spawn isolation still await integration: **existing
+//! legacy send/spawn bypass reservations at this checkpoint**, and kill is not
+//! audited yet. The legacy-path/audit recipes below are the remaining contract,
+//! not guarantees provided by this checkpoint.
 //!
 //! # Ownership and ordering
 //!
@@ -25,6 +23,13 @@
 //! never authorizes a stale capability. Release and cleanup invalidate older
 //! capabilities; another actor cannot accept them. Arbitrary external tmux
 //! clients are not serialized by this actor: this is not an external-client CAS.
+//! Local `atm reply`, `interrupt`, `kill` and the TUI also bypass this actor.
+//! Pane IDs can be reused after a tmux server restart; restart/reconcile atmd too.
+//!
+//! Exactly one control actor serves a daemon. U8/U9b must clone the same handle
+//! installed in `MethodServices.control` for RPC, never start a second actor.
+//! Organisation reads for legacy gating must use a snapshot/watch mirror outside
+//! the tmux actor; never await an organisation snapshot during a tmux turn.
 //!
 //! Work has an absolute deadline (at most 120 seconds from admission), with
 //! each short action also bounded by the existing 30-second action budget.
@@ -33,7 +38,19 @@
 //! cleanup quarantines the agent/panes: mutations fail unavailable until daemon
 //! restart and lifecycle reconciliation. There is no unlock API here; quarantine
 //! state must remain distinct from released state for a future resolve operation.
-//! Active jobs, parked admissions and quarantines have bounded storage (32).
+//! Active jobs plus parked admissions have 32 slots; a full pool immediately
+//! returns Unavailable. Quarantines use a separate bounded 32-entry store, not
+//! live-job slots. Tombstone overflow fails all later control closed until restart
+//! rather than evicting uncertain ownership. A split returning an already-owned
+//! pane ID likewise fails closed: do not destroy an ambiguously identified pane.
+//!
+//! Acquisition is all-or-nothing for agent and pane, FIFO among overlapping
+//! requests. Independent keys proceed. At most one waiter of each kind may
+//! overlap an agent or pane (further requests return Busy). Consumers must coalesce
+//! triggers to one admitted-or-parked job per (consumer, agent). Lifecycle callers
+//! use Wait; U8 itself suppresses duplicate lifecycle jobs before admission.
+//! The maximum return budget is 120 s work + 10 s cleanup: U8's router ceiling
+//! must exceed 130 s (use 135 s), with a larger client deadline.
 //!
 //! # Lifecycle caller recipe
 //!
@@ -41,6 +58,8 @@
 //! work closure. Submit durable commands through the caller's sole
 //! [`crate::org::OrgHandle`], never by directly appending an event. On failure,
 //! its cleanup closure records the appropriate durable failure before release.
+//! Cleanup decides from a fresh organisation snapshot ordered after the aborted
+//! work's accepted commands: a missing acknowledgement does not mean no commit.
 //! A rejected precheck must not mark an otherwise unchanged ready agent stuck.
 //!
 //! | Operation | Calls, in order |
@@ -48,8 +67,8 @@
 //! | Up | Validate role and use [`ControlHandle::prepare_spawn`] before admission. Request Up with no pane; execute `OrgCommand::Up`; [`Reservation::split`]; [`Reservation::tag`] with Absent; execute `PaneCreated`; [`Reservation::paste_guarded`] launch text then [`Reservation::keys_guarded`] Enter, each with the caller's pure expected-screen check; guard trust/update-dialog keys too; [`Reservation::capture`] and registry observation; execute `SessionBound` or `EditorReady`; return, cleanup, release. |
 //! | Adopt | Request Adopt with its pane; [`Reservation::inspect`]; tag Absent only for explicitly untagged adoption, otherwise require this agent's tag; re-read eligible registry row; execute `Adopt`; return. Never send keys or restart. |
 //! | Clear | Request Clear before prechecks; inspect/capture exact ownership and editor; subscribe and take baseline; execute `Clear`; paste_guarded adapter clear command; observe the displayed draft, then keys_guarded Enter with the adapter-derived draft/dialog check; guard any subsequent dialog keys too; await post-command evidence outside actor; capture again; execute `SessionBound`/`EditorReady` before returning. |
-//! | Respawn | Validate role/placement first; request Respawn with old pane if any; inspect; [`Reservation::kill`] matching old pane (with audit); execute `Respawn`; split, tag Absent, `PaneCreated`, guarded launch paste/keys, observe, durable ready as Up. Old-pane ownership lasts until the whole job releases. |
-//! | Down | Request Down with current pane; inspect; kill with audit or [`Reservation::untag`]; execute `Down`; return. Never act on a foreign replacement pane. |
+//! | Respawn | Validate role/placement first; request Respawn with old pane if any. U8 chooses kill/split order so it never kills the placement target or last pane before splitting. Use matching-tag [`Reservation::kill`], durable `Respawn`, split/tag/`PaneCreated` and guarded launch/readiness as Up. Old/new pane ownership lasts until release. |
+//! | Down | Request Down with current pane, or no pane for a pane-less agent; inspect if present; kill with audit or [`Reservation::untag`]; execute `Down`; return. Never act on a foreign replacement pane. |
 //! | Binding observer | Request Observe; acquire before observing; re-read pane/registry and durable exclusion; observe then execute `SessionBound`/`EditorReady` in this same job. Never spawn a late report outside it. |
 //!
 //! Read-only list output needs no reservation, but applies the same
@@ -98,6 +117,8 @@ use super::{service::ControlHandle, ControlError, SpawnContext};
 
 #[path = "reserved_jobs.rs"]
 pub(super) mod jobs;
+#[path = "pane_ops.rs"]
+pub(super) mod pane_ops;
 #[path = "reservation_state.rs"]
 pub(super) mod state;
 
@@ -165,7 +186,7 @@ pub enum WaitPolicy {
 #[derive(Debug, Clone)]
 pub struct ReservationRequest {
     pub agent: AgentId,
-    /// None only for Up or Respawn creating a new pane without an old one.
+    /// None for agent-only Up, Respawn, Down or Observe; other kinds need a pane.
     pub pane: Option<PaneId>,
     pub kind: ReservationKind,
     pub wait: WaitPolicy,
@@ -195,9 +216,13 @@ impl ReservationRequest {
 /// Outcome of work, supplied to cleanup while ownership is still exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completion {
+    /// Work returned Ok, not a guarantee that cleanup will succeed.
     Succeeded,
+    /// Work returned its error value.
     Failed,
+    /// The absolute work deadline expired; accepted effects are not rolled back.
     TimedOut,
+    /// Work panicked/was cancelled, or daemon shutdown stopped it.
     WorkerStopped,
 }
 
@@ -205,9 +230,22 @@ pub enum Completion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedTag {
     /// Only explicit Adopt or a pane just created by this Up/Respawn may use it.
-    /// An empty-but-present tag and an inherited global tag are not a local tag.
+    /// Matches only an unset pane-local option. Empty is Some("") and mismatches;
+    /// inherited window/global values are ignored.
     Absent,
     Agent(AgentId),
+}
+
+impl fmt::Display for ExpectedTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => f.write_str("absent"),
+            Self::Agent(agent) => agent.fmt(f),
+        }
+    }
+}
+fn optional_pane(pane: &Option<PaneId>) -> &str {
+    pane.as_ref().map_or("no pane", PaneId::as_str)
 }
 
 /// The entire nonliteral-key surface. Text belongs in [`Reservation::paste`].
@@ -337,7 +375,9 @@ impl ControlHandle {
     /// after successful work is returned instead. Timeout/worker failure converts
     /// ReservationError through E. None of these failures rolls back effects.
     ///
-    /// Pane effects remain typed stubs at this checkpoint; ownership is live.
+    /// Cleanup must take a fresh organisation snapshot before deciding what failed;
+    /// work commands may have committed even when their reply was lost. E: Display
+    /// lets the supervisor log a cleanup error even when preserving the work error.
     pub async fn run_reserved<T, E, W, WF, C, CF>(
         &self,
         request: ReservationRequest,
@@ -370,15 +410,28 @@ impl ControlHandle {
 }
 
 impl Reservation {
-    async fn check(&self, pane: Option<&PaneId>) -> Result<(), ReservationError> {
+    async fn operation(
+        &self,
+        action: pane_ops::Action,
+    ) -> Result<pane_ops::Output, ReservationError> {
+        // The actor checks the phase fence before its work deadline, so old
+        // capabilities report StaleReservation even after their deadline.
         let deadline = Instant::now() + super::service::ACTION_TIMEOUT;
         self.control
-            .reservation_request(deadline, |reply| jobs::Command::Check {
+            .reservation_request(deadline, |reply| jobs::Command::Pane {
                 fence: self.fence.clone(),
-                pane: pane.cloned(),
+                action,
+                deadline,
                 reply,
             })
             .await
+    }
+
+    async fn effect(&self, action: pane_ops::Action) -> Result<(), ReservationError> {
+        match self.operation(action).await? {
+            pane_ops::Output::Done => Ok(()),
+            _ => Err(ReservationError::Unavailable),
+        }
     }
 
     async fn begin_cleanup(&self, deadline: Instant) -> Result<Self, ReservationError> {
@@ -402,60 +455,70 @@ impl Reservation {
         &self.agent
     }
 
-    /// Inspect an owned pane; None requires positively established absence.
+    /// Inspect any canonical pane, including an unowned placement pane. This
+    /// grants no mutation/capture permission. None requires positive absence.
     /// Transport failure or malformed output is an error, never absence.
-    pub async fn inspect(
-        &self,
-        _pane: &PaneId,
-    ) -> Result<Option<PaneInspection>, ReservationError> {
-        self.check(Some(_pane)).await?;
-        Err(ReservationError::NotImplemented {
-            operation: "inspect",
-        })
+    pub async fn inspect(&self, pane: &PaneId) -> Result<Option<PaneInspection>, ReservationError> {
+        match self
+            .operation(pane_ops::Action::Inspect(pane.clone()))
+            .await?
+        {
+            pane_ops::Output::Inspection(inspection) => Ok(inspection),
+            _ => Err(ReservationError::Unavailable),
+        }
     }
 
     /// Set this agent's local tag after checking expected at the actor boundary.
     /// Absent is allowed only for explicit adoption or this job's newly split pane;
     /// an Agent expectation must equal self.agent. Never steal a foreign tag.
-    pub async fn tag(
-        &self,
-        _pane: &PaneId,
-        _expected: ExpectedTag,
-    ) -> Result<(), ReservationError> {
-        self.check(Some(_pane)).await?;
-        Err(ReservationError::NotImplemented { operation: "tag" })
+    pub async fn tag(&self, pane: &PaneId, expected: ExpectedTag) -> Result<(), ReservationError> {
+        self.effect(pane_ops::Action::Tag(pane.clone(), expected))
+            .await
     }
 
-    /// Remove only this agent's matching local tag, without touching the process.
-    pub async fn untag(&self, _pane: &PaneId, _expected: AgentId) -> Result<(), ReservationError> {
-        self.check(Some(_pane)).await?;
-        Err(ReservationError::NotImplemented { operation: "untag" })
+    /// Down/Respawn: remove only this agent's matching local tag. Every mutating
+    /// method requires expected == self.agent(), otherwise InvalidRequest.
+    pub async fn untag(&self, pane: &PaneId, expected: AgentId) -> Result<(), ReservationError> {
+        self.effect(pane_ops::Action::Untag(pane.clone(), expected))
+            .await
     }
 
-    /// One allowed key, after checking the matching agent tag inside the actor.
+    /// Up/Respawn/Clear/Delivery: one allowed key. expected must equal self.agent();
+    /// the matching agent tag is checked again inside the actor.
     /// This unguarded form is retained for legacy callers, not U8/U9b input:
     /// an unguarded Enter after paste is never safe. Use [`Self::keys_guarded`].
     pub async fn keys(
         &self,
-        _pane: &PaneId,
-        _expected: AgentId,
-        _key: PaneKey,
+        pane: &PaneId,
+        expected: AgentId,
+        key: PaneKey,
     ) -> Result<(), ReservationError> {
-        self.check(Some(_pane)).await?;
-        Err(ReservationError::NotImplemented { operation: "keys" })
+        self.effect(pane_ops::Action::Input {
+            pane: pane.clone(),
+            expected,
+            input: pane_ops::Input::Key(key),
+            guard: None,
+        })
+        .await
     }
 
-    /// Literal text with no implicit Enter, after matching-tag/fence checks.
+    /// Up/Respawn/Clear/Delivery: literal text without Enter, after tag/fence checks.
+    /// expected must equal self.agent(), otherwise InvalidRequest.
     /// Reuses TmuxClient::paste_text; adapters/callers own editor safety policy.
     /// U8/U9b use [`Self::paste_guarded`], not a prior capture plus this call.
     pub async fn paste(
         &self,
-        _pane: &PaneId,
-        _expected: AgentId,
-        _text: String,
+        pane: &PaneId,
+        expected: AgentId,
+        text: String,
     ) -> Result<(), ReservationError> {
-        self.check(Some(_pane)).await?;
-        Err(ReservationError::NotImplemented { operation: "paste" })
+        self.effect(pane_ops::Action::Input {
+            pane: pane.clone(),
+            expected,
+            input: pane_ops::Input::Paste(text),
+            guard: None,
+        })
+        .await
     }
 
     /// Re-capture, run a caller-supplied pure screen check, then send one key.
@@ -473,22 +536,26 @@ impl Reservation {
     /// unguarded Enter after a paste is never safe for either consumer. This
     /// removes actor queue delay between approval and effect, not external races.
     ///
-    /// **Contract checkpoint:** typed NotImplemented; `check` is not invoked.
+    /// expected must equal self.agent(). A panicking predicate is rejected as
+    /// ScreenChanged; callers must still never block or perform I/O in it.
     pub async fn keys_guarded<P>(
         &self,
         pane: &PaneId,
-        _expected: AgentId,
-        _key: PaneKey,
-        _format: CaptureFormat,
-        _check: P,
+        expected: AgentId,
+        key: PaneKey,
+        format: CaptureFormat,
+        check: P,
     ) -> Result<(), ReservationError>
     where
         P: FnOnce(&PaneCapture) -> bool + Send + 'static,
     {
-        self.check(Some(pane)).await?;
-        Err(ReservationError::NotImplemented {
-            operation: "keys_guarded",
+        self.effect(pane_ops::Action::Input {
+            pane: pane.clone(),
+            expected,
+            input: pane_ops::Input::Key(key),
+            guard: Some((format, Box::new(check))),
         })
+        .await
     }
 
     /// Re-capture, run a caller-supplied pure screen check, then paste literal
@@ -498,64 +565,78 @@ impl Reservation {
     /// not merely recognize the harness's name or a still-matching pane tag.
     /// Observe the resulting draft and use keys_guarded to submit it.
     ///
-    /// **Contract checkpoint:** typed NotImplemented; `check` is not invoked.
+    /// expected must equal self.agent(); same kind restrictions as paste.
     pub async fn paste_guarded<P>(
         &self,
         pane: &PaneId,
-        _expected: AgentId,
-        _text: String,
-        _format: CaptureFormat,
-        _check: P,
+        expected: AgentId,
+        text: String,
+        format: CaptureFormat,
+        check: P,
     ) -> Result<(), ReservationError>
     where
         P: FnOnce(&PaneCapture) -> bool + Send + 'static,
     {
-        self.check(Some(pane)).await?;
-        Err(ReservationError::NotImplemented {
-            operation: "paste_guarded",
+        self.effect(pane_ops::Action::Input {
+            pane: pane.clone(),
+            expected,
+            input: pane_ops::Input::Paste(text),
+            guard: Some((format, Box::new(check))),
         })
+        .await
     }
 
     /// Capture only a pane owned by this reservation, with no vendor flags.
     /// Missing pane is PaneGone, invalid metadata is InvalidObservation.
     pub async fn capture(
         &self,
-        _pane: &PaneId,
-        _format: CaptureFormat,
+        pane: &PaneId,
+        format: CaptureFormat,
     ) -> Result<PaneCapture, ReservationError> {
-        self.check(Some(_pane)).await?;
-        Err(ReservationError::NotImplemented {
-            operation: "capture",
-        })
+        match self
+            .operation(pane_ops::Action::Capture(pane.clone(), format))
+            .await?
+        {
+            pane_ops::Output::Capture(capture) => Ok(capture),
+            _ => Err(ReservationError::Unavailable),
+        }
     }
 
     /// Up/Respawn: split and reserve the returned pane in the same actor turn.
     /// The placement pane may be unmanaged; this grants no input permission on it.
-    /// Before launch input, tag Absent then durably record PaneCreated.
+    /// Before launch input, tag Absent then durably record PaneCreated. At most
+    /// one new pane per job bounds ownership storage; old/new panes remain held.
     pub async fn split(
         &self,
-        _context: SpawnContext,
-        _direction: PaneDirection,
-        _size: String,
+        context: SpawnContext,
+        direction: PaneDirection,
+        size: String,
     ) -> Result<PaneId, ReservationError> {
-        self.check(None).await?;
-        Err(ReservationError::NotImplemented { operation: "split" })
+        match self
+            .operation(pane_ops::Action::Split(context, direction, size))
+            .await?
+        {
+            pane_ops::Output::Pane(pane) => Ok(pane),
+            _ => Err(ReservationError::Unavailable),
+        }
     }
 
-    /// Kill once after fence/tag checks, then submit ControlKilled through the
+    /// Down/Respawn: kill once after fence/tag checks; expected must equal
+    /// self.agent(). **Checkpoint: kill works but audit is not wired yet.**
+    /// The integration contract is to submit ControlKilled through the
     /// configured OrgHandle using the supplied action/time. Audit failure never
     /// fails/repeats a successful kill. The owned continuation attempts audit even
     /// if the reply future disappears; persistence does not block the tmux actor.
     /// No success audit is invented for a failed or outcome-unknown kill.
     pub async fn kill(
         &self,
-        _pane: &PaneId,
-        _expected: AgentId,
+        pane: &PaneId,
+        expected: AgentId,
         _action: serde_json::Value,
         _now: DateTime<Utc>,
     ) -> Result<(), ReservationError> {
-        self.check(Some(_pane)).await?;
-        Err(ReservationError::NotImplemented { operation: "kill" })
+        self.effect(pane_ops::Action::Kill(pane.clone(), expected))
+            .await
     }
 }
 
@@ -566,7 +647,7 @@ pub enum ReservationError {
     NotImplemented { operation: &'static str },
     #[error("invalid reservation request: {reason}")]
     InvalidRequest { reason: String },
-    #[error("agent {agent} or pane {pane:?} is reserved")]
+    #[error("agent {agent} or pane {} is reserved", optional_pane(.pane))]
     Busy {
         agent: AgentId,
         pane: Option<PaneId>,
@@ -575,7 +656,7 @@ pub enum ReservationError {
     StaleReservation,
     #[error("pane {pane} no longer passes the approved screen check; nothing was sent")]
     ScreenChanged { pane: PaneId },
-    #[error("pane {pane} tag mismatch: expected {expected:?}, found {actual:?}")]
+    #[error("pane {pane} tag mismatch: expected {expected}, found {}", actual.as_deref().unwrap_or("absent"))]
     TagMismatch {
         pane: PaneId,
         expected: ExpectedTag,
@@ -585,6 +666,11 @@ pub enum ReservationError {
     PaneGone { pane: PaneId },
     #[error("invalid observation of pane {pane}: {reason}")]
     InvalidObservation { pane: PaneId, reason: String },
+    #[error("agent {agent} (pane {}) is quarantined; restart atmd and reconcile", optional_pane(.pane))]
+    Quarantined {
+        agent: AgentId,
+        pane: Option<PaneId>,
+    },
     #[error("reserved control service is unavailable")]
     Unavailable,
     #[error("reserved control operation timed out; admitted effects may have completed")]

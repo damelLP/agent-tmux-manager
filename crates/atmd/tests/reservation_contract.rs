@@ -1,7 +1,7 @@
 //! Public consumer contract, compiled without the library's cfg(test).
 //! Probe fixtures: tmux 3.8, 2026-11-14, private shell/option capture.
 #![allow(clippy::unwrap_used)] // Test helpers, as in the existing integration suites.
-use atm_tmux::{mock::MockCall, MockTmuxClient, PaneInfo, TmuxClient};
+use atm_tmux::{mock::MockCall, PaneInfo, TmuxClient};
 use atmd::control::{
     reservation::{
         testing::ScriptedTmuxClient, CaptureFormat, PaneCapture, PaneId, PaneInspection, PaneKey,
@@ -85,12 +85,23 @@ async fn frame(client: &dyn TmuxClient, pane: &str, format: CaptureFormat) -> St
 }
 
 #[tokio::test]
-async fn guarded_input_contract_is_additive_and_does_not_run_a_predicate_at_checkpoint() {
-    let mock = MockTmuxClient::new();
+async fn guarded_input_contract_runs_predicates_against_fresh_scripted_captures() {
+    let client = ScriptedTmuxClient::new();
+    let mock = client.mock();
+    for format in [CaptureFormat::Ansi, CaptureFormat::Plain] {
+        client
+            .script_capture(&PaneCapture::new(
+                "probe     \nready     \n\n\n\n\n\n\n".into(),
+                inspection("%0", Some("project/lead")),
+                format,
+            ))
+            .unwrap();
+    }
     let cancel = CancellationToken::new();
     let (control, task) = spawn_control(
-        Box::new(mock.clone()),
+        Box::new(client),
         atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("consumer test"),
         cancel.clone(),
     );
     let called = Arc::new(AtomicBool::new(false));
@@ -115,13 +126,12 @@ async fn guarded_input_contract_is_additive_and_does_not_run_a_predicate_at_chec
                         CaptureFormat::Ansi,
                         move |capture: &PaneCapture| {
                             key_called.store(true, Ordering::SeqCst);
-                            !capture.inspection.in_mode
+                            assert!(!capture.inspection.in_mode);
+                            false
                         }
                     )
                     .await,
-                    Err(ReservationError::NotImplemented {
-                        operation: "keys_guarded"
-                    })
+                    Err(ReservationError::ScreenChanged { .. })
                 ));
                 assert!(matches!(
                     r.paste_guarded(
@@ -131,13 +141,12 @@ async fn guarded_input_contract_is_additive_and_does_not_run_a_predicate_at_chec
                         CaptureFormat::Plain,
                         move |capture: &PaneCapture| {
                             called.store(true, Ordering::SeqCst);
-                            !capture.inspection.dead
+                            assert!(!capture.inspection.dead);
+                            false
                         }
                     )
                     .await,
-                    Err(ReservationError::NotImplemented {
-                        operation: "paste_guarded"
-                    })
+                    Err(ReservationError::ScreenChanged { .. })
                 ));
                 assert_eq!(
                     ReservationError::ScreenChanged { pane }.to_string(),
@@ -149,8 +158,11 @@ async fn guarded_input_contract_is_additive_and_does_not_run_a_predicate_at_chec
         )
         .await
         .unwrap();
-    assert!(!observed.load(Ordering::SeqCst));
-    assert!(mock.calls().is_empty());
+    assert!(observed.load(Ordering::SeqCst));
+    assert!(mock
+        .calls()
+        .iter()
+        .all(|call| matches!(call, MockCall::RawCommand { .. })));
     cancel.cancel();
     task.await.unwrap();
 }
@@ -283,6 +295,7 @@ async fn consumer_scripted_client_works_with_real_control_handle() {
     let (control, task) = spawn_control(
         Box::new(client),
         atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("consumer test"),
         cancel.clone(),
     );
     let pane = control

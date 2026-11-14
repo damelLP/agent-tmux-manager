@@ -392,7 +392,13 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::{reservation::{jobs::{Command, Jobs}, ReservationError}, ControlError, SpawnContext};
+use super::{
+    reservation::{
+        jobs::{Command, Jobs},
+        ReservationError,
+    },
+    ControlError, SpawnContext,
+};
 use crate::{org::OrgHandle, registry::RegistryHandle, server::methods::CallContext};
 
 const CAPACITY: usize = 32;
@@ -652,8 +658,10 @@ impl ControlHandle {
     }
 }
 
-/// Start only at the daemon's I/O boundary, not when constructing services.
+/// Start exactly one actor at the daemon's I/O boundary, not when constructing
+/// services. Inject clones of the same handle into RPC, U8 and U9b consumers.
 /// The owner cancels and joins this task before dropping its registry.
+/// This compatibility constructor does not audit kills.
 pub fn spawn_control(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
@@ -730,7 +738,7 @@ where
                     let Some(pending) = pending else { break };
                     match pending {
                         self::Pending { request: Request::Reserved(command), .. } => {
-                            jobs.dispatch(command, Instant::now(), stopping);
+                            jobs.dispatch(command, Instant::now(), stopping, &*client).await;
                         }
                         pending => {
                             // Keep U7's drain: never cancel admitted paste before Enter.
@@ -777,8 +785,10 @@ where
 ///
 /// **Contract checkpoint:** organisation-aware behavior is not wired yet. This
 /// starts the reservation-capable actor; the org argument is not used yet.
-/// Reserved pane effects remain typed NotImplemented; ownership and cleanup run.
+/// Reserved pane effects and cleanup run, but kills are not audited yet.
 /// Production startup continues using spawn_control until org integration lands.
+/// Legacy gating must consume an org snapshot/watch mirror outside the tmux
+/// actor, never await org snapshots inside a short pane operation.
 pub fn spawn_control_with_org(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
@@ -928,7 +938,10 @@ async fn execute(
     let audit = match pending.request {
         #[cfg(test)]
         Request::FlushAudit(reply) => return Some(Audit::Barrier(reply)),
-        Request::Reserved(command) => { command.reject(); return None; },
+        Request::Reserved(command) => {
+            command.reject();
+            return None;
+        }
         Request::Send {
             target,
             text,

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     state::{self, Fence, OperationId, State},
-    Completion, ControlHandle, PaneId, Reservation, ReservationError, ReservationRequest,
+    Completion, ControlHandle, Reservation, ReservationError, ReservationRequest,
 };
 
 type JobFuture = Pin<Box<dyn Future<Output = Finished> + Send>>;
@@ -151,10 +151,11 @@ pub(in crate::control) struct Admission {
 
 pub(in crate::control) enum Command {
     Acquire(Admission),
-    Check {
+    Pane {
         fence: Fence,
-        pane: Option<PaneId>,
-        reply: oneshot::Sender<Result<(), ReservationError>>,
+        action: super::pane_ops::Action,
+        deadline: Instant,
+        reply: oneshot::Sender<Result<super::pane_ops::Output, ReservationError>>,
     },
     Cleanup {
         fence: Fence,
@@ -167,7 +168,7 @@ impl Command {
     pub(in crate::control) fn reject(self) {
         match self {
             Self::Acquire(admission) => admission.job.reject(ReservationError::Unavailable),
-            Self::Check { reply, .. } => {
+            Self::Pane { reply, .. } => {
                 let _ = reply.send(Err(ReservationError::Unavailable));
             }
             Self::Cleanup { reply, .. } => {
@@ -196,7 +197,13 @@ impl Jobs {
         }
     }
 
-    pub(in crate::control) fn dispatch(&mut self, command: Command, now: Instant, stopping: bool) {
+    pub(in crate::control) async fn dispatch(
+        &mut self,
+        command: Command,
+        now: Instant,
+        stopping: bool,
+        client: &dyn atm_tmux::TmuxClient,
+    ) {
         match command {
             Command::Acquire(admission) => {
                 let result = if stopping {
@@ -211,8 +218,27 @@ impl Jobs {
                     Err(error) => admission.job.reject(error),
                 }
             }
-            Command::Check { fence, pane, reply } => {
-                let _ = reply.send(self.state.check(&fence, pane.as_ref(), now));
+            Command::Pane {
+                fence,
+                action,
+                deadline,
+                reply,
+            } => {
+                let result = match self
+                    .state
+                    .check(&fence, None, now)
+                    .and_then(|()| self.state.deadline(&fence))
+                {
+                    Err(error) => Err(error),
+                    Ok(_) if now >= deadline => Err(ReservationError::Timeout),
+                    Ok(work_deadline) => tokio::time::timeout_at(
+                        deadline.min(work_deadline),
+                        super::pane_ops::execute(client, &mut self.state, &fence, action, now),
+                    )
+                    .await
+                    .unwrap_or(Err(ReservationError::Timeout)),
+                };
+                let _ = reply.send(result);
             }
             Command::Cleanup {
                 fence,
@@ -307,6 +333,7 @@ mod tests {
         let (control, actor) = spawn_control(
             Box::new(MockTmuxClient::new()),
             crate::registry::spawn_registry(),
+            crate::org::OrgHandle::disabled("supervisor test"),
             cancel.clone(),
         );
         let mut jobs = Jobs::new(cancel.clone());
@@ -329,7 +356,9 @@ mod tests {
             }),
             now,
             false,
-        );
+            &MockTmuxClient::new(),
+        )
+        .await;
         cancel.cancel();
         jobs.ready(now);
         assert!(

@@ -31,6 +31,7 @@ struct Entry {
     request: ReservationRequest,
     phase: Phase,
     deadline: Instant,
+    created: Option<PaneId>,
 }
 
 #[derive(Debug, Default)]
@@ -38,6 +39,7 @@ pub(super) struct State {
     actor: Arc<()>,
     issued: u64,
     entries: Vec<Entry>,
+    quarantine_overflow: bool,
 }
 
 pub(super) fn validate(request: &ReservationRequest, now: Instant) -> Result<(), ReservationError> {
@@ -50,7 +52,10 @@ pub(super) fn validate(request: &ReservationRequest, now: Instant) -> Result<(),
         });
     }
     if request.pane.is_none()
-        && !matches!(request.kind, ReservationKind::Up | ReservationKind::Respawn)
+        && matches!(
+            request.kind,
+            ReservationKind::Clear | ReservationKind::Delivery | ReservationKind::Adopt
+        )
     {
         return Err(ReservationError::InvalidRequest {
             reason: "this operation requires an initial pane".into(),
@@ -59,11 +64,17 @@ pub(super) fn validate(request: &ReservationRequest, now: Instant) -> Result<(),
     Ok(())
 }
 
-fn conflicts(a: &ReservationRequest, b: &ReservationRequest) -> bool {
-    a.agent == b.agent
-        || a.pane
-            .as_ref()
-            .is_some_and(|pane| b.pane.as_ref() == Some(pane))
+fn conflicts(a: &Entry, b: &ReservationRequest) -> bool {
+    a.request.agent == b.agent || b.pane.as_ref().is_some_and(|pane| owns(a, pane))
+}
+fn owns(entry: &Entry, pane: &PaneId) -> bool {
+    entry.request.pane.as_ref() == Some(pane) || entry.created.as_ref() == Some(pane)
+}
+fn quarantined(entry: &Entry) -> ReservationError {
+    ReservationError::Quarantined {
+        agent: entry.request.agent.clone(),
+        pane: entry.request.pane.clone().or_else(|| entry.created.clone()),
+    }
 }
 
 impl State {
@@ -73,22 +84,35 @@ impl State {
         now: Instant,
     ) -> Result<OperationId, ReservationError> {
         validate(&request, now)?;
-        if self
+        if let Some(entry) = self
             .entries
             .iter()
-            .any(|e| e.phase == Phase::Quarantined && conflicts(&e.request, &request))
+            .find(|e| e.phase == Phase::Quarantined && conflicts(e, &request))
         {
+            return Err(quarantined(entry));
+        }
+        if self.quarantine_overflow {
             return Err(ReservationError::Unavailable);
         }
-        if request.wait == WaitPolicy::Refuse
-            && self.entries.iter().any(|e| conflicts(&e.request, &request))
-        {
+        // One parked job per overlapping kind prevents event storms on one pane
+        // from consuming the shared pool. Consumers coalesce before admission.
+        if self.entries.iter().any(|e| {
+            conflicts(e, &request)
+                && (request.wait == WaitPolicy::Refuse
+                    || (e.phase == Phase::Waiting && e.request.kind == request.kind))
+        }) {
             return Err(ReservationError::Busy {
                 agent: request.agent,
                 pane: request.pane,
             });
         }
-        if self.entries.len() >= CAPACITY {
+        if self
+            .entries
+            .iter()
+            .filter(|e| e.phase != Phase::Quarantined)
+            .count()
+            >= CAPACITY
+        {
             return Err(ReservationError::Unavailable);
         }
         self.issued = self
@@ -102,6 +126,7 @@ impl State {
             request,
             phase: Phase::Waiting,
             deadline,
+            created: None,
         });
         Ok(id)
     }
@@ -120,17 +145,17 @@ impl State {
         let mut ready = Vec::new();
         for (id, request) in waiting {
             let blocked = self.entries.iter().any(|e| {
-                e.id != id
-                    && conflicts(&e.request, &request)
-                    && (e.phase != Phase::Waiting || e.id.0 < id.0)
+                e.id != id && conflicts(e, &request) && (e.phase != Phase::Waiting || e.id.0 < id.0)
             });
-            let quarantined = self
+            let quarantine = self
                 .entries
                 .iter()
-                .any(|e| e.phase == Phase::Quarantined && conflicts(&e.request, &request));
+                .find(|e| e.phase == Phase::Quarantined && conflicts(e, &request));
             let error = if now >= request.deadline {
                 Some(ReservationError::Timeout)
-            } else if quarantined {
+            } else if let Some(entry) = quarantine {
+                Some(quarantined(entry))
+            } else if self.quarantine_overflow {
                 Some(ReservationError::Unavailable)
             } else {
                 None
@@ -188,11 +213,49 @@ impl State {
         now: Instant,
     ) -> Result<(), ReservationError> {
         let entry = self.entry(fence)?;
-        if pane.is_some_and(|pane| entry.request.pane.as_ref() != Some(pane)) {
+        if self.quarantine_overflow {
+            return Err(ReservationError::Unavailable);
+        }
+        if pane.is_some_and(|pane| !owns(entry, pane)) {
             return Err(ReservationError::StaleReservation);
         }
         if now >= entry.deadline {
             return Err(ReservationError::Timeout);
+        }
+        Ok(())
+    }
+
+    pub(super) fn deadline(&self, fence: &Fence) -> Result<Instant, ReservationError> {
+        Ok(self.entry(fence)?.deadline)
+    }
+    pub(super) fn owner(
+        &self,
+        fence: &Fence,
+    ) -> Result<(atm_org::AgentId, ReservationKind), ReservationError> {
+        let entry = self.entry(fence)?;
+        Ok((entry.request.agent.clone(), entry.request.kind))
+    }
+    pub(super) fn created(&self, fence: &Fence, pane: &PaneId) -> Result<bool, ReservationError> {
+        Ok(self.entry(fence)?.created.as_ref() == Some(pane))
+    }
+    pub(super) fn can_split(&self, fence: &Fence) -> Result<(), ReservationError> {
+        if self.entry(fence)?.created.is_some() {
+            return Err(ReservationError::InvalidRequest {
+                reason: "one new pane per reservation".into(),
+            });
+        }
+        Ok(())
+    }
+    pub(super) fn claim(&mut self, fence: &Fence, pane: PaneId) -> Result<(), ReservationError> {
+        self.can_split(fence)?;
+        if self.entries.iter().any(|entry| owns(entry, &pane)) {
+            // A server restart or faulty tmux result can reuse an ID. Do not
+            // destroy a pane whose identity is uncertain; fail closed globally.
+            self.quarantine_overflow = true;
+            return Err(ReservationError::Unavailable);
+        }
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == fence.operation) {
+            entry.created = Some(pane);
         }
         Ok(())
     }
@@ -222,11 +285,26 @@ impl State {
     pub(super) fn finish(&mut self, id: OperationId, reusable: bool) {
         if reusable {
             self.entries.retain(|e| e.id != id);
+        } else if self
+            .entries
+            .iter()
+            .filter(|e| e.phase == Phase::Quarantined)
+            .count()
+            >= CAPACITY
+        {
+            // Keep tombstones bounded independently of the 32 live-job slots.
+            // Overflow must never evict a fence and make uncertain input safe.
+            self.quarantine_overflow = true;
+            self.entries.retain(|e| e.id != id);
         } else if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             entry.phase = Phase::Quarantined;
         }
     }
 }
+
+#[cfg(test)]
+#[path = "reservation_policy_tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -296,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn reservation_state_epoch_exhaustion_never_wraps_and_quarantines_consume_slots() {
+    fn reservation_state_epoch_exhaustion_and_quarantine_overflow_fail_closed() {
         let now = Instant::now();
         let mut state = State {
             issued: u64::MAX,
@@ -318,6 +396,10 @@ mod tests {
         let mut req = request(now);
         req.agent = "p/extra".parse().unwrap();
         req.pane = Some(PaneId::parse("%99").unwrap());
+        let fence = grant(&mut state, req.clone(), now);
+        state.finish(fence.operation, false);
+        assert!(state.quarantine_overflow);
+        assert_eq!(state.entries.len(), 32);
         assert!(matches!(
             state.admit(req, now),
             Err(ReservationError::Unavailable)

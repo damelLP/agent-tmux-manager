@@ -30,6 +30,13 @@ pub enum ControlError {
         pane: String,
         agent: atm_org::AgentId,
     },
+    #[error("pane {pane}: agent {agent} is quarantined; restart atmd and reconcile")]
+    PaneQuarantined {
+        pane: String,
+        agent: atm_org::AgentId,
+    },
+    #[error("organisation state is unavailable for pane {pane}; refusing input")]
+    OrganisationUnavailable { pane: String },
     #[error("{context}")]
     Tmux {
         context: String,

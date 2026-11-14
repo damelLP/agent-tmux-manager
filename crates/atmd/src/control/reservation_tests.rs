@@ -28,6 +28,7 @@ fn actor() -> (
     let (control, task) = spawn_control(
         Box::new(mock.clone()),
         crate::registry::spawn_registry(),
+        crate::org::OrgHandle::disabled("ownership test"),
         cancel.clone(),
     );
     (control, cancel, task, mock)
@@ -183,23 +184,21 @@ async fn reservation_clear_blocks_delivery_and_other_pane_completes() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     // A's stalled readiness does not occupy the actor or B's supervisor.
+    for n in 0..3 {
+        mock.set_next_raw_output("ATM-PANE-v1\t%2\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+        mock.set_next_raw_output("p/b\n");
+        if n == 1 {
+            mock.set_next_raw_output("");
+        } // set-option reply
+    }
     control
         .run_reserved(
-            request("p/b", Some("%2"), ReservationKind::Adopt),
+            request("p/b", Some("%2"), ReservationKind::Respawn),
             |r| async move {
                 let pane = PaneId::parse("%2")?;
-                assert!(matches!(
-                    r.inspect(&pane).await,
-                    Err(ReservationError::NotImplemented { .. })
-                ));
-                assert!(matches!(
-                    r.tag(&pane, ExpectedTag::Absent).await,
-                    Err(ReservationError::NotImplemented { .. })
-                ));
-                assert!(matches!(
-                    r.paste(&pane, r.agent().clone(), "probe".into()).await,
-                    Err(ReservationError::NotImplemented { .. })
-                ));
+                assert!(r.inspect(&pane).await?.is_some());
+                r.tag(&pane, ExpectedTag::Agent(r.agent().clone())).await?;
+                r.paste(&pane, r.agent().clone(), "probe".into()).await?;
                 Ok::<_, ReservationError>(())
             },
             noop,
@@ -213,11 +212,125 @@ async fn reservation_clear_blocks_delivery_and_other_pane_completes() {
     assert!(!mock
         .calls()
         .iter()
-        .any(|c| matches!(c, atm_tmux::mock::MockCall::PasteText { .. })));
+        .any(|c| matches!(c, atm_tmux::mock::MockCall::PasteText { pane, .. } if pane == "%1")));
     editor.send(()).unwrap();
     clear.await.unwrap().unwrap();
     entry.await.unwrap();
     delivery.await.unwrap().unwrap();
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reservation_split_claim_holds_delivery_until_recorded_and_released() {
+    let client = testing::ScriptedTmuxClient::new();
+    client.mock().set_next_pane_id("%99");
+    let cancel = CancellationToken::new();
+    let (control, task) = spawn_control(
+        Box::new(client.clone()),
+        crate::registry::spawn_registry(),
+        crate::org::OrgHandle::disabled("ownership test"),
+        cancel.clone(),
+    );
+    let (created, creation) = oneshot::channel();
+    let (recorded, record) = oneshot::channel();
+    let (finished, finish) = oneshot::channel();
+    let scripts = client.clone();
+    let up = queued(
+        &control,
+        request("p/a", None, ReservationKind::Up),
+        move |r| async move {
+            let pane = r
+                .split(
+                    SpawnContext::new("%0".into(), None, false),
+                    PaneDirection::Below,
+                    "50%".into(),
+                )
+                .await?;
+            let mut info = PaneInspection::new(
+                atm_tmux::PaneInfo {
+                    pane_id: "%99".into(),
+                    session_name: "private".into(),
+                    window_index: 0,
+                    pane_pid: 1,
+                    width: 80,
+                    height: 24,
+                    is_active: true,
+                },
+                None,
+                false,
+                false,
+                Some(true),
+                0,
+                0,
+            );
+            scripts.script_tag_check(&info).unwrap();
+            r.tag(&pane, ExpectedTag::Absent).await?;
+            created.send(()).unwrap();
+            record.await.unwrap(); // consumer's durable PaneCreated acknowledgement
+            info.local_agent_tag = Some("p/a".into());
+            scripts.script_tag_check(&info).unwrap();
+            r.paste(&pane, r.agent().clone(), "launch".into()).await?;
+            scripts.script_tag_check(&info).unwrap();
+            r.keys(&pane, r.agent().clone(), PaneKey::Enter).await?;
+            finish.await.unwrap();
+            Ok(())
+        },
+        noop,
+    )
+    .await;
+    creation.await.unwrap();
+    let (entered, mut entry) = oneshot::channel();
+    let delivery = queued(
+        &control,
+        request("p/b", Some("%99"), ReservationKind::Delivery),
+        move |_| async move {
+            entered.send(()).unwrap();
+            Ok(())
+        },
+        noop,
+    )
+    .await;
+    barrier(&control).await;
+    assert!(matches!(
+        entry.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(!client
+        .mock()
+        .calls()
+        .iter()
+        .any(|c| matches!(c, atm_tmux::mock::MockCall::PasteText { .. })));
+    recorded.send(()).unwrap();
+    finished.send(()).unwrap();
+    up.await.unwrap().unwrap();
+    delivery.await.unwrap().unwrap();
+    entry.await.unwrap();
+    let input: Vec<_> = client
+        .mock()
+        .calls()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c,
+                atm_tmux::mock::MockCall::PasteText { .. }
+                    | atm_tmux::mock::MockCall::SendKeys { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        input,
+        vec![
+            atm_tmux::mock::MockCall::PasteText {
+                pane: "%99".into(),
+                text: "launch".into()
+            },
+            atm_tmux::mock::MockCall::SendKeys {
+                pane: "%99".into(),
+                keys: "Enter".into()
+            }
+        ]
+    );
     cancel.cancel();
     task.await.unwrap();
 }
@@ -372,10 +485,7 @@ async fn reservation_stale_epochs_rejected_after_release_and_during_cleanup() {
             .await,
         Err(ReservationError::StaleReservation)
     ));
-    assert!(matches!(
-        cleanup.inspect(&pane).await,
-        Err(ReservationError::NotImplemented { .. })
-    ));
+    assert!(cleanup.inspect(&pane).await.unwrap().is_none());
     released.send(()).unwrap();
     job.await.unwrap().unwrap();
     let (new_job, _, release) = held(
@@ -395,7 +505,11 @@ async fn reservation_stale_epochs_rejected_after_release_and_during_cleanup() {
             Err(ReservationError::StaleReservation)
         ));
     }
-    assert_eq!(mock.call_count(), 0);
+    assert_eq!(
+        mock.call_count(),
+        1,
+        "only the valid cleanup inspection reads tmux"
+    );
     release.send(()).unwrap();
     new_job.await.unwrap().unwrap();
     cancel.cancel();
@@ -513,7 +627,7 @@ async fn reservation_cleanup_failure_and_timeout_quarantine_waiters() {
         });
         assert!(matches!(
             delivery.await.unwrap(),
-            Err(ReservationError::Unavailable)
+            Err(ReservationError::Quarantined { .. })
         ));
         for (agent, pane) in [("p/a", Some("%2")), ("p/c", Some("%1"))] {
             assert!(matches!(
@@ -524,7 +638,7 @@ async fn reservation_cleanup_failure_and_timeout_quarantine_waiters() {
                         noop
                     )
                     .await,
-                Err(ReservationError::Unavailable)
+                Err(ReservationError::Quarantined { .. })
             ));
         }
         // Unrelated panes remain usable despite a failed cleanup.
@@ -574,10 +688,11 @@ async fn reservation_shutdown_stops_admission_and_joins_cleanup() {
     cancel.cancel();
     let cleanup = clean.await.unwrap();
     assert!(!task.is_finished());
-    assert!(matches!(
-        cleanup.inspect(&PaneId::parse("%1").unwrap()).await,
-        Err(ReservationError::NotImplemented { .. })
-    ));
+    assert!(cleanup
+        .inspect(&PaneId::parse("%1").unwrap())
+        .await
+        .unwrap()
+        .is_none());
     assert!(matches!(
         waiter.await.unwrap(),
         Err(ReservationError::Unavailable)
@@ -605,8 +720,22 @@ async fn reservation_admission_bounded_and_expired_waiter_never_runs() {
     let (control, cancel, task, _) = actor();
     let (owner, _, release) =
         held(&control, request("p/a", Some("%1"), ReservationKind::Clear)).await;
+    let mut others = Vec::new();
+    for n in 2..32 {
+        others.push(
+            held(
+                &control,
+                request(
+                    &format!("p/a{n}"),
+                    Some(&format!("%{n}")),
+                    ReservationKind::Observe,
+                ),
+            )
+            .await,
+        );
+    }
     let mut waiters = Vec::new();
-    for _ in 0..31 {
+    for _ in 0..1 {
         let mut req = request("p/a", Some("%1"), ReservationKind::Delivery);
         req.deadline = Instant::now() + Duration::from_secs(5);
         waiters.push(
@@ -639,6 +768,10 @@ async fn reservation_admission_bounded_and_expired_waiter_never_runs() {
     }
     release.send(()).unwrap();
     owner.await.unwrap().unwrap();
+    for (job, _, release) in others {
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+    }
     control
         .run_reserved(
             request("p/b", Some("%2"), ReservationKind::Observe),

@@ -8,9 +8,8 @@
 //!
 //! # Read contract
 //!
-//! The table describes the pane implementation contract. At the contract
-//! checkpoint, reserved pane/guarded methods still return NotImplemented and
-//! consume **zero** scripted reads. Task 3 will consume these sequences:
+//! Implemented reserved operations consume these sequences. Fixed tag writes
+//! are recorded in mock() and need no extra observation script:
 //!
 //! | Operation | Ordered reads before any effect | Script |
 //! |---|---|---|
@@ -272,11 +271,18 @@ impl TmuxClient for ScriptedTmuxClient {
     {
         Box::pin(async move {
             // Keep mock fault injection and call recording, but not its raw FIFO.
-            self.mock.raw_command(subcommand, args).await?;
+            let output = self.mock.raw_command(subcommand, args).await?;
+            if matches!(
+                (subcommand, args),
+                ("set-option", ["-p", "-t", _, "@atm-agent", _])
+                    | ("set-option", ["-p", "-u", "-t", _, "@atm-agent"])
+            ) {
+                return Ok(output);
+            }
             self.read(subcommand, args)
         })
     }
-    forward!(split_window<'a, 'b, 'c>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>) -> String);
+    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>) -> String);
     forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
     forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
     forward!(kill_pane<'a>(pane: &'a str) -> ());

@@ -8,8 +8,8 @@
 //! pre-clear exclusion is derived while folding `agent.clear_requested`, before
 //! removing its session; no existing event body changed. Newer readers accept
 //! older logs, including committed session bindings today's policy would ignore.
-//! Older readers skip editor-ready facts and may remain clearing/starting: they
-//! cannot reconstruct the newer semantics. Compatibility is newer reads older,
+//! Older readers skip editor-ready facts and may remain clearing, starting or
+//! stuck: they cannot reconstruct the newer semantics. Compatibility is newer reads older,
 //! not a guarantee of safe downgrade or equivalent state in older readers.
 
 use crate::{Address, AgentId, MessageId, ProjectId, RoleSpec, TaskId};

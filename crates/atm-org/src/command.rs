@@ -45,7 +45,11 @@ pub enum OrgCommand {
     SessionLost {
         agent_id: AgentId,
     },
-    /// The caller positively observed a fresh editor in the recorded pane.
+    /// The caller must observe the fresh editor after the operation this report
+    /// completes (clear, up or respawn), and submit it in the same serialized
+    /// step owning the agent. An observation queued across a later clear or
+    /// respawn can complete the wrong readiness: this command carries no pane
+    /// or generation to reject it. See the crate's command-policy limits.
     EditorReady {
         agent_id: AgentId,
     },

@@ -31,6 +31,19 @@
 //! | Respawn | unknown project/agent; mismatched role | — | down unless already down, then up |
 //!
 //! EditorReady reports a positively observed fresh editor in the recorded pane.
+//! The caller must observe it after the operation it completes (clear, up or
+//! respawn) and submit the report in the same serialized step owning the agent.
+//! Serializing decide/append/apply alone does not protect an earlier observation.
+//! Known limits, confirmed with command sequences:
+//! - Clear → observe editor → Respawn → PaneCreated on a replacement pane →
+//!   queued EditorReady incorrectly completes readiness on the replacement.
+//! - Clear → EditorReady → Clear again → late EditorReady from the first clear
+//!   incorrectly completes the second clear.
+//!
+//! The command carries no pane/generation check. One can be added later without
+//! changing the log, because commands are not logged; today callers must prevent
+//! these interleavings by serializing observation with the report.
+//!
 //! Starting/clearing agents reached through commands have no session: Up and
 //! session-less Adopt start without one; Clear and SessionLost remove it. Thus
 //! EditorReady makes these agents ready without a session. Stuck recovery keeps
@@ -45,9 +58,17 @@
 //! that exclusion; EditorReady, SessionLost and Stuck retain it. A new binding,
 //! Down or fresh Up resets it. Adopt with a session explicitly overrides the
 //! exclusion; session-less Adopt repairs status to starting while retaining it.
-//! Routine session observations must use SessionBound, not Adopt. This is not
-//! a permanent blacklist of historical IDs. Committed binding facts still fold
-//! regardless of today's exclusion policy, so older logs remain replayable.
+//! Routine session observations must use SessionBound, not Adopt. Two known
+//! limits follow from a single pending exclusion:
+//! - A genuine later report of the pre-clear ID (an in-process resume) is also
+//!   ignored until a new ID binds, Adopt explicitly binds a session, or Down
+//!   releases the agent. An Adopt naming the resumed session is the override.
+//! - Clear → SessionBound(new ID) → SessionBound(old ID) binds the old ID again:
+//!   the new binding has already cleared the exclusion. This is not a permanent
+//!   blacklist; callers must avoid replaying stale observations after a binding.
+//!
+//! Committed binding facts still fold regardless of today's exclusion policy,
+//! so older logs remain replayable.
 //!
 //! Project registration is a no-op for the same root, but a different root is a
 //! conflict unless `move_root: true`: the daemon must first check that the old

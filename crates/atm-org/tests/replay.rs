@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test generators/helpers only
+#[path = "support/history.rs"]
+mod history;
 mod support;
 use atm_core::Money;
 use atm_org::*;
@@ -304,6 +306,22 @@ fn case_generators_cover_every_event_and_command_variant() {
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
     assert_eq!(commands, (0..19).collect::<Vec<_>>());
+    let history = history::History::seeded();
+    let wide_commands: Vec<_> = (0..19)
+        .map(|slot| {
+            let seed = history::Seed {
+                slot,
+                agent: slot % 3,
+                pane: slot % 4,
+                from: slot % 6,
+                to: slot % 6,
+                value: slot as u32,
+                flag: true,
+            };
+            command_slot(&seed.command(&history.state))
+        })
+        .collect();
+    assert_eq!(wide_commands, (0..19).collect::<Vec<_>>());
 }
 
 // Synthetic: a restart-style history exercising clear, retry, owner delivery
@@ -361,6 +379,7 @@ proptest! {
     #[test]
     fn event_parts_roundtrip(slot in 0usize..18, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
+        prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
     }
 
@@ -409,6 +428,39 @@ proptest! {
         prop_assert_eq!(whole, partial);
         prop_assert_eq!(whole_stats, partial_stats);
         prop_assert_eq!(repeat_stats.skipped_unknown, 2);
+    }
+
+    #[test]
+    fn multi_project_history_is_serial_deterministic_and_prefix_composes(
+        actions in prop::collection::vec(history::arb_seed(), 0..100),
+        split in any::<usize>(),
+    ) {
+        let mut history = history::History::seeded();
+        for input in actions {
+            let command = input.command(&history.state);
+            // step checks nonmutation, then applies every returned event before
+            // the next decision. Retrying a report happens after that apply.
+            let _ = history.step(command.clone());
+            if input.flag { let _ = history.step(command); }
+            if input.value == 0 { history.unknown(); }
+        }
+        history.unknown();
+        prop_assert!(history.records.windows(2).all(|pair| pair[0].seq < pair[1].seq && pair[0].ts < pair[1].ts));
+        let mut whole = OrgState::default(); let mut stats = ReplayStats::default();
+        history::fold(&history.records, &mut whole, &mut stats);
+        prop_assert_eq!(&whole, &history.state);
+        prop_assert_eq!(stats.skipped_unknown, history.unknown);
+        let mut repeated = OrgState::default(); let mut repeated_stats = ReplayStats::default();
+        history::fold(&history.records, &mut repeated, &mut repeated_stats);
+        prop_assert_eq!(&whole, &repeated);
+        prop_assert_eq!(&stats, &repeated_stats);
+        for cut in [0, history.records.len(), split % (history.records.len() + 1)] {
+            let mut partial = OrgState::default(); let mut partial_stats = ReplayStats::default();
+            history::fold(&history.records[..cut], &mut partial, &mut partial_stats);
+            history::fold(&history.records[cut..], &mut partial, &mut partial_stats);
+            prop_assert_eq!(&whole, &partial);
+            prop_assert_eq!(&stats, &partial_stats);
+        }
     }
 
     #[test]

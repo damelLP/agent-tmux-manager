@@ -127,8 +127,9 @@ half-width header allocation from 142 columns and quarter-width from 284.
 A live Codex at 142 columns or wider and layouts below 100 columns are
 unverified. A combining mark on a full-width line widens the inferred edge
 by one character: only pending 100-column pages with clipped descriptions
-refuse in the captured corpus (a fail-closed limit). Trimmed captures and
-pages without clipped descriptions still parse.
+refuse in the captured corpus (a fail-closed limit). With the mark on the
+hooks path or intro line, trimmed captures and pages without clipped
+descriptions still parse.
 Zero-count rows parse even for missing ATM registrations. Only the known
 uninstalled Interrupt, PreModelRequest and PostModelRequest rows are omitted
 from returned authorization entries: unknown events or installed extras refuse

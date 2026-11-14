@@ -77,6 +77,7 @@ fn captured_running_status_with_trailing_tip_remains_unknown() {
             .split_once('\n')
             .unwrap()
             .1;
+    assert!(text.contains("Working") && text.contains("Tip:"));
     assert_conversation_facts(text, TurnState::Unknown);
 }
 

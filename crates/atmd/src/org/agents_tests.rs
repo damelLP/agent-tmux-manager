@@ -204,6 +204,299 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn review_restart_ready_unbound_is_not_a_lifecycle_change() {
+        for text in [
+            IDLE,
+            "unknown\n",
+            include_str!(
+                "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
+            ),
+        ] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), None).await;
+            rig.row("pending-100", "%1", false).await;
+            rig.frame("%1", "p/lead", text);
+            let before = rig.org.status().unwrap();
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+            assert_eq!(rig.org.status().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn review_safe_restart_ready_has_zero_writes() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let before = rig.org.status().unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("recorded"))
+        );
+    }
+
+    // Adapted from the A1 review probes: assertions describe the desired behavior.
+    async fn progress(
+        events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+        phase: &str,
+        agent: Option<&str>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.phase == phase
+                    && event.agent.as_ref().map(ToString::to_string).as_deref() == agent
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn update(rig: &Rig, id: &str) {
+        let row = rig.registry.get_session(SessionId::new(id)).await.unwrap();
+        rig.events
+            .send(crate::registry::SessionEvent::Updated {
+                session: Box::new(row),
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_runtime_updates_leave_ready_without_writes() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("recorded", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        for text in [
+            IDLE,
+            include_str!(
+                "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
+            ),
+        ] {
+            let before = rig.org.status().unwrap();
+            rig.frame("%1", "p/lead", text);
+            update(&rig, "recorded").await;
+            progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+            assert_eq!(rig.org.status().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn review_other_agent_adopt_does_not_touch_ready_unbound() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("recorded", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.command(OrgCommand::EditorReady {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        let before = rig.org.status().unwrap();
+        let mut events = agents.observation_events();
+        rig.frame("%1", "p/lead", IDLE);
+        rig.frame("%2", "p/other", IDLE);
+        rig.command(OrgCommand::Adopt {
+            agent_id: "p/other".parse().unwrap(),
+            pane: "%2".into(),
+            session_id: Some(SessionId::new("other-row")),
+        })
+        .await;
+        progress(&mut events, "committed_scheduled", None).await;
+        progress(&mut events, "idle", None).await;
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert_eq!(rig.state("lead").await.session_id, None);
+        assert_eq!(rig.org.status().unwrap(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn review_busy_registration_binds_without_idle() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        let running = include_str!(
+            "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
+        );
+        rig.frame("%1", "p/lead", running);
+        rig.row("fresh", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("fresh"))
+        );
+        rig.frame("%1", "p/lead", running);
+        update(&rig, "fresh").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn review_initial_observation_failure_is_agent_local() {
+        let rig = Rig::new().await;
+        for (name, pane) in [("good", "%1"), ("bad", "%2")] {
+            rig.agent(name, Some(pane), Some(name)).await;
+            rig.row(name, pane, false).await;
+        }
+        rig.frame("%1", "p/good", IDLE);
+        rig.client
+            .script_inspect(
+                &PaneId::parse("%2").unwrap(),
+                Some(&Rig::inspection("%2", "p/bad", false)),
+            )
+            .unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let rows = agents.list(ListParams::default()).await.unwrap();
+        assert!(rows
+            .iter()
+            .find(|a| a.agent_id.to_string() == "p/bad")
+            .unwrap()
+            .reason
+            .is_some());
+        assert_eq!(rig.state("bad").await.status, AgentStatus::Ready);
+        assert!(matches!(
+            agents
+                .down(DownParams {
+                    agent: "p/good".parse().unwrap(),
+                    kill: false,
+                })
+                .await,
+            Err(AgentError::NotImplemented { .. })
+        ));
+        assert!(matches!(
+            agents
+                .down(DownParams {
+                    agent: "p/bad".parse().unwrap(),
+                    kill: false,
+                })
+                .await,
+            Err(AgentError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_transient_schedule_failure_does_not_stop_service() {
+        let (gate, mut entered) = mpsc::channel(1);
+        let rig = Rig::gated(Some(("agent.session_lost", gate))).await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("recorded", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        let org = rig.org.clone();
+        let held = tokio::spawn(async move {
+            org.execute(
+                OrgCommand::SessionLost {
+                    agent_id: "p/lead".parse().unwrap(),
+                },
+                chrono::Utc::now(),
+            )
+            .await
+        });
+        let release = entered.recv().await.unwrap();
+        update(&rig, "recorded").await;
+        progress(&mut events, "scheduling", None).await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        progress(&mut events, "schedule_failed", None).await;
+        release.send(()).unwrap();
+        let _ = held.await.unwrap();
+        rig.org.snapshot().await.unwrap();
+        assert!(agents.list(ListParams::default()).await.is_ok());
+        agents
+            .lifecycle(
+                request(
+                    "p/other",
+                    None,
+                    crate::control::reservation::ReservationKind::Down,
+                ),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_unbound_clear_invalidates_parked_binding() {
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.command(OrgCommand::EditorReady {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = rig.control.clone();
+        let held = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Clear),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok(())
+                    },
+                    cleanup,
+                )
+                .await
+                .unwrap();
+        });
+        entry.await.unwrap();
+        rig.row("r2", "%1", false).await;
+        progress(&mut events, "started", Some("p/lead")).await;
+        // Same pane/binding/exclusion before and after this clear.
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.command(OrgCommand::EditorReady {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.frame("%1", "p/lead", IDLE);
+        release.send(()).unwrap();
+        held.await.unwrap();
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(rig.state("lead").await.session_id, None);
+        assert_eq!(
+            rig.state("lead").await.excluded_session_id,
+            Some(SessionId::new("s1"))
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_wires_agents_without_waiting_for_initial_reconciliation() {
         use std::{
             future::{poll_fn, Future},
@@ -416,7 +709,14 @@ mod reconciliation {
             rig.frame("%1", "p/lead", IDLE);
             let (agents, _) = rig.start();
             let rows = agents.list(ListParams::default()).await.unwrap();
-            assert_eq!(rows[0].state, AgentStatus::Starting);
+            assert_eq!(
+                rows[0].state,
+                if child {
+                    AgentStatus::Starting
+                } else {
+                    AgentStatus::Ready
+                }
+            );
             assert!(rows[0].activity.is_none());
         }
     }
@@ -462,6 +762,10 @@ mod reconciliation {
         let (gate, mut entered) = mpsc::channel(1);
         let rig = Rig::gated(Some(("agent.editor_ready", gate))).await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.command(OrgCommand::Revalidate {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
         rig.row("pending-100", "%1", false).await;
         rig.frame("%1", "p/lead", IDLE);
         let (agents, _) = rig.start();

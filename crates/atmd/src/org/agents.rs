@@ -1,7 +1,9 @@
 //! Named-agent projection and reservation-serialized reconciliation.
 //!
-//! Readiness is durable, never a list-only overlay. Unknown screens and absent
-//! registry evidence suspend readiness without erasing the recorded binding.
+//! Readiness is durable, never a list-only overlay. Restart checks may suspend
+//! bound Ready agents, preserving their binding; ordinary wakes never do. A
+//! session-less Ready agent retains its lifecycle state even on an unsafe screen.
+//! Delivery must independently check the screen before input.
 //! Lifecycle effects remain unavailable until the flow slice is installed.
 
 pub use super::agent_methods::register_agent_methods;
@@ -71,6 +73,22 @@ pub(super) struct AgentRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
+    #[cfg(test)]
+    progress: broadcast::Sender<ObservationProgress>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(super) struct ObservationProgress {
+    pub phase: &'static str,
+    pub agent: Option<AgentId>,
+}
+
+#[cfg(test)]
+impl AgentRuntime {
+    fn progress(&self, phase: &'static str, agent: Option<AgentId>) {
+        let _ = self.progress.send(ObservationProgress { phase, agent });
+    }
 }
 
 struct AgentService {
@@ -104,6 +122,11 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
+    #[cfg(test)]
+    pub(super) fn observation_events(&self) -> broadcast::Receiver<ObservationProgress> {
+        self.inner.runtime.as_ref().unwrap().progress.subscribe()
+    }
+
     #[must_use]
     pub fn disabled(reason: impl Into<String>) -> Self {
         let (_, ready) = watch::channel(None);
@@ -370,7 +393,12 @@ impl AgentRuntime {
         Ok(rows)
     }
 
-    async fn observe(&self, id: AgentId, bind: Option<BindingCandidate>) -> Result<(), AgentError> {
+    async fn observe(
+        &self,
+        id: AgentId,
+        bind: Option<BindingCandidate>,
+        initial: bool,
+    ) -> Result<(), AgentError> {
         let state = self.org.snapshot().await?;
         let Some(agent) = state.agent(&id) else {
             return Ok(());
@@ -392,6 +420,8 @@ impl AgentRuntime {
             .run_reserved(
                 request,
                 move |r| async move {
+                    #[cfg(test)]
+                    rt.progress("entered", Some(id.clone()));
                     // A queued observation never retains a ready decision across clear or
                     // respawn. A changed pane needs a newly acquired reservation.
                     let state = rt.org.snapshot().await?;
@@ -407,7 +437,7 @@ impl AgentRuntime {
                             && agent.excluded_session_id == candidate.excluded)
                             .then_some(candidate.session)
                     });
-                    rt.inspect(&r, &state, agent, bind).await
+                    rt.inspect(&r, &state, agent, bind, initial).await
                 },
                 move |_, _| async move {
                     // FIFO behind accepted commands, including ones whose reply was lost.
@@ -425,6 +455,7 @@ impl AgentRuntime {
         state: &OrgState,
         agent: &Agent,
         bind: Option<SessionId>,
+        initial: bool,
     ) -> Result<(), AgentError> {
         // Registry failure is never evidence that every agent is gone.
         let rows = self.rows().await?;
@@ -449,16 +480,6 @@ impl AgentRuntime {
         }
         if matches!(agent.status, AgentStatus::Clearing | AgentStatus::Stuck) {
             return Ok(());
-        }
-        if agent.status == AgentStatus::Ready {
-            self.org
-                .execute(
-                    OrgCommand::Revalidate {
-                        agent_id: agent.id.clone(),
-                    },
-                    chrono::Utc::now(),
-                )
-                .await?;
         }
         let Some(pane) = &agent.pane else {
             return Ok(());
@@ -486,6 +507,7 @@ impl AgentRuntime {
             && facts.turn == TurnState::NotRunning
             && facts.dialog == DialogState::None
         {
+            let binding = bind.is_some();
             let command = match bind {
                 Some(session_id) => OrgCommand::SessionBound {
                     agent_id: agent.id.clone(),
@@ -495,7 +517,18 @@ impl AgentRuntime {
                     agent_id: agent.id.clone(),
                 },
             };
-            self.org.execute(command, chrono::Utc::now()).await?;
+            if binding || agent.status != AgentStatus::Ready {
+                self.org.execute(command, chrono::Utc::now()).await?;
+            }
+        } else if initial && agent.status == AgentStatus::Ready && agent.session_id.is_some() {
+            self.org
+                .execute(
+                    OrgCommand::Revalidate {
+                        agent_id: agent.id.clone(),
+                    },
+                    chrono::Utc::now(),
+                )
+                .await?;
         }
         Ok(())
     }
@@ -595,6 +628,8 @@ pub fn spawn_agents(
         org,
         registry,
         control,
+        #[cfg(test)]
+        progress: broadcast::channel(4096).0,
     };
     let (projects, project_task) = AgentProjects::spawn(rt.org.clone(), cancel.child_token());
     let (send, ready) = watch::channel(None);
@@ -688,13 +723,20 @@ async fn observer(
                 break;
             };
             let bind = pending.remove(&id).flatten();
-            let bind = if initial.contains(&id) { None } else { bind };
+            let first = initial.contains(&id);
+            let bind = if first { None } else { bind };
             active.insert(id.clone());
+            #[cfg(test)]
+            rt.progress("started", Some(id.clone()));
             let rt = rt.clone();
             jobs.spawn(async move {
-                let result = rt.observe(id.clone(), bind).await;
+                let result = rt.observe(id.clone(), bind, first).await;
                 (id, result)
             });
+        }
+        #[cfg(test)]
+        if active.is_empty() && pending.is_empty() {
+            rt.progress("idle", None);
         }
         tokio::select! {
             biased;
@@ -703,6 +745,8 @@ async fn observer(
                 match result {
                     Some(Ok((id, result))) => {
                         active.remove(&id);
+                        #[cfg(test)]
+                        rt.progress("finished", Some(id.clone()));
                         let first = initial.remove(&id);
                         if let Err(error) = result {
                             if first && failure.is_none() { failure = Some(error.to_string()); }
@@ -721,11 +765,20 @@ async fn observer(
                     Err(broadcast::error::RecvError::Lagged(_)) => (None, true),
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                schedule(&rt, &mut pending, id, bind).await?;
+                #[cfg(test)]
+                rt.progress("scheduling", None);
+                let result = schedule(&rt, &mut pending, id, bind).await;
+                #[cfg(test)]
+                rt.progress(if result.is_ok() { "scheduled" } else { "schedule_failed" }, None);
+                result?;
             }
             event = committed.recv() => {
                 match event {
-                    Ok(event) if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") => schedule(&rt, &mut pending, None, false).await?,
+                    Ok(event) if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") => {
+                        schedule(&rt, &mut pending, None, false).await?;
+                        #[cfg(test)]
+                        rt.progress("committed_scheduled", None);
+                    },
                     Ok(_) => {},
                     Err(broadcast::error::RecvError::Lagged(_)) => schedule(&rt, &mut pending, None, false).await?,
                     Err(broadcast::error::RecvError::Closed) => break,

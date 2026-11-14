@@ -220,6 +220,7 @@ class Model:
         return [{"kind": "rejected", "text": text, "reason": name}]
 
     def end_turn(self, aborted=False):
+        self.active_prompt = ""
         self.state, self.deadline = "idle", None
         self.frame = "interrupted" if aborted else "idle"
         if self.mode == "pi":
@@ -255,9 +256,10 @@ class Model:
             return [{"kind": "draft", "text": ""}] + self.render("draft cleared")
         if kind in ("escape", "ctrl_c"):
             working = self.state == "working"
+            prompt = self.active_prompt
             effects = self.end_turn(aborted=True) if working else []
             if working and self.mode == "claude":
-                effects += [{"kind": "draft", "text": self.active_prompt}]
+                effects += [{"kind": "draft", "text": prompt}]
             return effects + self.render("interrupted")
         self.last_ctrl_c = None
         if text == "/atm/status" or (text.startswith("/atm/status ") and not any(c in text for c in "\r\n")):

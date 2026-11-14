@@ -118,6 +118,20 @@ class DialogTests(unittest.TestCase):
                     self.assertEqual(m.state, "idle")
                     self.assertEqual(events(m.tick(1000)), [])
 
+    def test_approval_from_idle_cannot_restore_a_completed_prompt(self):
+        for mode in ["claude", "codex"]:
+            with self.subTest(mode=mode):
+                m = make(mode, permission_dialog=True)
+                m.start()
+                m.handle(("submit", "earlier prompt A"), 0)
+                m.tick(500)
+                m.handle(("submit", "/atm/dialog"), 501)
+                m.handle(("submit", ""), 502)
+                effects = m.handle(("escape", ""), 503)
+                self.assertEqual(m.state, "idle")
+                self.assertEqual(m.render()[0]["frame"], "interrupted")
+                self.assertFalse(any(e["kind"] == "draft" and e["text"] for e in effects))
+
     def test_abandoned_approval_cannot_complete_in_a_later_turn(self):
         for mode, clear in [("claude", "/clear"), ("codex", "/new")]:
             for cancel in ["clear", "escape", "deny-next-modal"]:

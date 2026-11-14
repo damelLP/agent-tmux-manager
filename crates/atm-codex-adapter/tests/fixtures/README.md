@@ -62,11 +62,18 @@ on the substituted quota/account/session values.
 - Captures contain no cursor or attributes (`capture-pane -p`). Tests pass
   None; supplied cursor metadata refuses observation even at the prompt's Home
   position. Cursor/control/truncation mutations are explicitly Synthetic.
-- Only captured version/model/effort/footer/title, elapsed status values and
-  update/warning selections are supported. Other times, models, titles,
-  versions, themes, wrapping, statuses and dialogs fail conservatively until
-  evidence-backed support is added. A missing shortcut footer is not accepted
-  as a regular editor; only the captured completion menu has that variant.
+- Fixed footer/dialog labels, separators, option wording and prompt glyphs
+  remain exact. Versions, model/effort, cwd/branch/title, elapsed times, clock
+  values and warning counts match their shapes, not captured literals. A
+  scrolled-off header does not invalidate a complete ordinary bottom layout;
+  fresh logo evidence still requires the header. Changed structure (unknown
+  UI, damaged border/footer, unsupported dialog) remains Unknown. A missing
+  shortcut footer is not a regular editor; only the captured completion menu
+  has that variant.
+- No additional real Codex screen was supplied for value generalization.
+  `value_variations_preserve_facts` changes values in each named U5 fixture,
+  explicitly labelled Synthetic; malformed-value and structural-damage tests
+  retain conservative refusals. All original real fixture assertions remain.
 - The status capture has a clipped old update banner but a complete current
   header/status/composer/footer. Truncated current UI is not an idle signal.
 - Fresh evidence requires the complete captured logo without conversation.

@@ -28,7 +28,7 @@ pub const LAUNCH_POLICY: LaunchPolicy = LaunchPolicy {
     model_flag: "-m",
 };
 
-const HEADER: &str = "  >_ OpenAI Codex (v0.167.0)";
+const HEADER_PREFIX: &str = "  >_ OpenAI Codex (v";
 const REVIEW_HELP: &str = "/review - review any changes and find issues";
 const LOGO: &[&str] = &[
     "⣀⣤⣤⣤⣀⣀",
@@ -78,23 +78,35 @@ fn nonblank<'a>(lines: &[&'a str]) -> Vec<&'a str> {
 }
 
 fn header<'a>(lines: &[&'a str]) -> Option<(usize, &'a str)> {
-    let index = lines.iter().position(|line| *line == HEADER)?;
+    let index = lines.iter().position(|line| {
+        line.strip_prefix(HEADER_PREFIX)
+            .and_then(|s| s.strip_suffix(')'))
+            .is_some_and(version)
+    })?;
     let cwd = lines.get(index + 1)?.strip_prefix("     ")?.trim_end();
-    cwd.starts_with('/').then_some((index, cwd))
+    (cwd.starts_with('/') || cwd.starts_with("~/")).then_some((index, cwd))
 }
 
 fn known_dialog(lines: &[&str]) -> bool {
     let body = nonblank(lines);
     match body.as_slice() {
-        ["Update available · 0.167.0 → 0.167.1" | "Update available · 0.167.0 → 0.169.0", "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"] => {
+        [update, "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
+            if update
+                .strip_prefix("Update available · ")
+                .and_then(|s| s.split_once(" → "))
+                .is_some_and(|(old, new)| version(old) && version(new)) =>
+        {
             true
         }
-        [.., help, "Warnings · 1 of 1 · Startup", message, "k keep & next · esc dismiss & close · ^o copy · ←/→ warning"]
-            if header(lines).is_some()
-                && *help == REVIEW_HELP
-                && message
-                    .strip_prefix("clamping SessionEnd hook timeout to 3s in /")
-                    .is_some_and(|path| path.ends_with("/.codex/hooks.json")) =>
+        [.., title, message, "k keep & next · esc dismiss & close · ^o copy · ←/→ warning"]
+            if !message.is_empty()
+                && title
+                    .strip_prefix("Warnings · ")
+                    .and_then(|s| s.strip_suffix(" · Startup"))
+                    .and_then(|s| s.split_once(" of "))
+                    .is_some_and(|(index, total)| {
+                        positive_integer(index) && positive_integer(total)
+                    }) =>
         {
             true
         }
@@ -103,21 +115,29 @@ fn known_dialog(lines: &[&str]) -> bool {
 }
 
 fn editor(lines: &[&str]) -> Option<ScreenFacts> {
-    let (header_index, cwd) = header(lines)?;
+    let header_index = header(lines).map(|(index, _)| index);
     let (last, before_last) = lines.split_last()?;
     let shortcuts = last.split_whitespace().collect::<Vec<_>>().join(" ");
-    let regular = matches!(
-        shortcuts.as_str(),
-        "← for agents · ? for shortcuts"
-            | "← for agents · ? for shortcuts ⚠ 1 warning · f2 to view"
-    );
+    let regular = shortcuts == "← for agents · ? for shortcuts"
+        || shortcuts
+            .strip_prefix("← for agents · ? for shortcuts ⚠ ")
+            .and_then(|s| s.strip_suffix(" · f2 to view"))
+            .and_then(|s| s.split_once(' '))
+            .is_some_and(|(count, label)| {
+                positive_integer(count) && matches!(label, "warning" | "warnings")
+            });
     let (model, before_model) = if regular {
         before_last.split_last()?
     } else {
         (last, before_last)
     };
-    let location = model.trim_end().strip_prefix("  GPT-6-Luna low · ")?;
-    if location != cwd && location.strip_suffix(" · Reply ok") != Some(cwd) {
+    let (model, location) = model.strip_prefix("  ")?.trim_end().split_once(" · ")?;
+    let (name, effort) = model.rsplit_once(' ')?;
+    if name.is_empty()
+        || effort.is_empty()
+        || !effort.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+        || !(location.starts_with('/') || location.starts_with("~/"))
+    {
         return None;
     }
     let (separator, before_separator) = before_model.split_last()?;
@@ -137,10 +157,14 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     } else {
         return None;
     };
-    let body = nonblank(history.get(header_index + 2..)?);
-    let fresh = header_index == 1 && body == LOGO && input == InputState::Unknown;
+    let body = nonblank(history.get(header_index.map_or(0, |index| index + 2)..)?);
+    let fresh = header_index == Some(1) && body == LOGO && input == InputState::Unknown;
     let last_history = body.last().copied().unwrap_or_default();
-    let turn = if last_history == "• Working (0s • esc to interrupt)" {
+    let turn = if last_history
+        .strip_prefix("• Working (")
+        .and_then(|s| s.strip_suffix(" • esc to interrupt)"))
+        .is_some_and(duration)
+    {
         // The captured active status is exactly three rows above the composer.
         if history.get(history.len().saturating_sub(3)) == Some(&last_history) {
             TurnState::Running
@@ -148,12 +172,8 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
             TurnState::Unknown
         }
     } else if fresh
-        || matches!(
-            last_history,
-            "Worked for 1s • 11:31 AM"
-                | "Worked for 2s • 11:32 AM"
-                | "■ Conversation interrupted - use /feedback if something went wrong"
-        )
+        || worked_status(last_history)
+        || last_history == "■ Conversation interrupted - use /feedback if something went wrong"
         || last_history == REVIEW_HELP
         || status_output(&body)
     {
@@ -171,6 +191,47 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
             FreshEditorEvidence::Unknown
         },
     })
+}
+
+fn positive_integer(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| c.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|n| n > 0)
+}
+
+fn version(value: &str) -> bool {
+    value.split('.').count() >= 2
+        && value
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn duration(value: &str) -> bool {
+    !value.is_empty()
+        && value.split(' ').all(|part| {
+            part.strip_suffix(['h', 'm', 's']).is_some_and(|number| {
+                !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+            })
+        })
+}
+
+fn worked_status(line: &str) -> bool {
+    let Some((elapsed, clock)) = line
+        .strip_prefix("Worked for ")
+        .and_then(|s| s.split_once(" • "))
+    else {
+        return false;
+    };
+    let Some((clock, period)) = clock.split_once(' ') else {
+        return false;
+    };
+    duration(elapsed)
+        && matches!(period, "AM" | "PM")
+        && clock.split_once(':').is_some_and(|(hour, minute)| {
+            positive_integer(hour)
+                && minute.len() == 2
+                && minute.chars().all(|c| c.is_ascii_digit())
+        })
 }
 
 fn status_output(body: &[&str]) -> bool {
@@ -269,6 +330,58 @@ mod tests {
     }
 
     #[test]
+    fn value_variations_preserve_facts() {
+        for (name, text, expected) in cases() {
+            // Synthetic: value variation of each named U5 fixture; no new real Codex capture.
+            let varied = text
+                .replace("0.167.0", "12.34.567")
+                .replace("0.167.1", "12.35.0")
+                .replace("0.169.0", "13.0.0")
+                .replace("GPT-6-Luna low", "Different-Model xhigh")
+                .replace(
+                    "/tmp/u8a-fixture/cwd/codex",
+                    "~/another/project (feature/topic)",
+                )
+                .replace("Reply ok", "A different conversation title")
+                .replace("Worked for 1s • 11:31 AM", "Worked for 12m 3s • 09:45 PM")
+                .replace(
+                    "Worked for 2s • 11:32 AM",
+                    "Worked for 1h 2m 30s • 10:59 AM",
+                )
+                .replace("Working (0s •", "Working (4m 15s •")
+                .replace("⚠ 1 warning", "⚠ 12 warnings")
+                .replace(
+                    "Warnings · 1 of 1 · Startup",
+                    "Warnings · 2 of 12 · Startup",
+                )
+                .replace("timeout to 3s", "timeout to 17s");
+            assert_eq!(observe_screen(&varied, None), expected, "{name}");
+        }
+        // Synthetic: value/layout variation of after-clear and before-escape: a long
+        // conversation scrolls the old header off, but retains the complete active suffix.
+        for text in [IDLE, RUNNING] {
+            let cropped = text.lines().skip(3).collect::<Vec<_>>().join("\n");
+            assert_eq!(observe_screen(&cropped, None), observe_screen(text, None));
+        }
+    }
+
+    #[test]
+    fn malformed_value_shapes_remain_unknown() {
+        // Synthetic: structural damage of before-escape's elapsed-status grammar.
+        for elapsed in ["", "yesterday", "NaNs", "12qq"] {
+            let text = RUNNING.replace("Working (0s •", &format!("Working ({elapsed} •"));
+            assert_eq!(observe_screen(&text, None).turn, TurnState::Unknown);
+        }
+        // Synthetic: malformed update version/choice grammar is not a recognized modal.
+        for text in [
+            UPDATE.replace("0.167.0", "unknown"),
+            UPDATE.replace("3. Skip until next version", "3. Something else"),
+        ] {
+            assert_eq!(observe_screen(&text, None), ScreenFacts::default());
+        }
+    }
+
+    #[test]
     fn control_policy_uses_captured_commands() {
         assert_eq!(CLEAR_COMMAND, "/new");
         assert_eq!(LAUNCH_POLICY.required_args, &["--no-daemon"]);
@@ -313,8 +426,8 @@ mod tests {
         let lines: Vec<_> = IDLE.lines().collect();
         for text in [
             lines[..39].join("\n"),
-            lines[3..].join("\n"),
-            IDLE.replace("GPT-6-Luna low", "Novel footer"),
+            lines[..37].join("\n"),
+            IDLE.replace("  GPT-6-Luna low ·", "Novel footer without separator"),
             IDLE.replace("› Ask Codex to do anything", ""),
             format!("{IDLE}shell$ "),
             format!("{IDLE}Approve?\nYes\nNo"),

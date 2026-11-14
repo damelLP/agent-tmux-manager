@@ -4,6 +4,131 @@ use atm_tmux::{mock::MockCall, MockTmuxClient};
 use std::{future::Future, task::Poll, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+// A transient snapshot error must not terminate the worker or misclassify a
+// healthy organisation. The source controls completion, not the org's health.
+type SnapshotResult = Result<OrgState, crate::org::OrgServiceError>;
+type SnapshotFuture = std::pin::Pin<Box<dyn Future<Output = SnapshotResult> + Send>>;
+type SnapshotRequests =
+    tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<SnapshotResult>>;
+fn snapshot_source() -> (
+    impl FnMut(OrgHandle) -> SnapshotFuture + Send,
+    SnapshotRequests,
+) {
+    let (requests, receive) = tokio::sync::mpsc::unbounded_channel();
+    (
+        move |_| {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            requests.send(reply).unwrap();
+            Box::pin(async move { response.await.unwrap() })
+        },
+        receive,
+    )
+}
+
+#[tokio::test]
+async fn reservation_mirror_recovers_from_transient_snapshot_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let (source, mut snapshots) = snapshot_source();
+    let mut mirror = Mirror::start_with_snapshot(org.clone(), source);
+    snapshots
+        .recv()
+        .await
+        .unwrap()
+        .send(Ok(OrgState::default()))
+        .unwrap();
+    while !matches!(mirror.view(), View::Ready(_)) {
+        mirror.changed().await;
+    }
+    org.execute(
+        atm_org::OrgCommand::RegisterProject {
+            project_id: "p".parse().unwrap(),
+            root: "/private".into(),
+            move_root: false,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let snapshot = org.snapshot().await.unwrap();
+    let failed = snapshots.recv().await.unwrap();
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
+    failed
+        .send(Err(crate::org::OrgServiceError::Timeout))
+        .unwrap();
+    let retry = snapshots.recv().await.expect("healthy mirror must retry");
+    assert!(tokio::time::Instant::now() > before, "retry must be paced");
+    assert_eq!(org.status().unwrap(), 1);
+    assert!(matches!(mirror.view(), View::Loading));
+    retry.send(Ok(snapshot)).unwrap();
+    while !matches!(mirror.view(), View::Ready(_)) {
+        mirror.changed().await;
+    }
+    mirror.stop().await;
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn reservation_transient_snapshot_failure_keeps_send_parked_until_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let (source, mut snapshots) = snapshot_source();
+    let mirror = Mirror::start_with_snapshot(org.clone(), source);
+    let mock = MockTmuxClient::new();
+    let (control, actor) = super::super::spawn_control_with_audit(
+        Box::new(mock.clone()),
+        crate::registry::spawn_registry(),
+        mirror,
+        cancel.clone(),
+        |_, _| async { Ok(Vec::new()) },
+    );
+    let first = snapshots.recv().await.unwrap();
+    tokio::time::pause();
+    let c = control.clone();
+    let mut send = Box::pin(async move { c.send("%1".into(), "recovered".into()).await });
+    std::future::poll_fn(|cx| {
+        assert!(send.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let send = tokio::spawn(send);
+    control
+        .prepare_spawn(Some("%999".into()), Some("/private".into()), None, None)
+        .await
+        .unwrap();
+    first
+        .send(Err(crate::org::OrgServiceError::Unavailable(
+            "organisation queue: full".into(),
+        )))
+        .unwrap();
+    let retry = snapshots.recv().await.expect("healthy mirror must retry");
+    control
+        .prepare_spawn(Some("%999".into()), Some("/private".into()), None, None)
+        .await
+        .unwrap();
+    assert_eq!(org.status().unwrap(), 0);
+    assert!(!send.is_finished());
+    assert!(!mock
+        .calls()
+        .iter()
+        .any(|c| matches!(c, MockCall::PasteText { .. } | MockCall::SendKeys { .. })));
+    mock.set_next_raw_output("0 1");
+    retry.send(Ok(OrgState::default())).unwrap();
+    assert_eq!(send.await.unwrap().unwrap(), "%1");
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|c| matches!(c, MockCall::PasteText { .. } | MockCall::SendKeys { .. }))
+            .count(),
+        2
+    );
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
 #[tokio::test]
 async fn reservation_mirror_stall_parks_input_not_the_actor() {
     tokio::time::timeout(Duration::from_secs(30), async {

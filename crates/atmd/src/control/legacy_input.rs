@@ -1,4 +1,8 @@
 //! Legacy input joins the same actor ordering as reserved pane effects.
+//! Parked input yields to reservation waiters on its pane, including later
+//! arrivals. A steady stream of reservations can starve it until its deadline.
+//! Dropping a caller does not cancel admitted parked input: it can still start
+//! within that deadline. Once input starts, finish Enter under tmux's timeout.
 use super::org_mirror::{Mirror, View};
 use super::*;
 use crate::control::reservation::{pane_ops, state::InputGate, PaneId};
@@ -72,17 +76,30 @@ pub(super) async fn dispatch(
             text,
             reply,
         } => {
-            let result = outcome(pending.deadline, async {
-                let ready = prepared?;
-                Ok(crate::control::send::send_resolved(
-                    client,
-                    &ready.sessions,
-                    &target,
-                    ready.pane.as_str(),
-                    &text,
+            let result = async {
+                let ready = outcome(pending.deadline, async {
+                    let ready = prepared?;
+                    crate::control::send::check_send(
+                        client,
+                        &ready.sessions,
+                        &target,
+                        ready.pane.as_str(),
+                        &text,
+                    )
+                    .await?;
+                    Ok(ready)
+                })
+                .await?;
+                if Instant::now() >= pending.deadline {
+                    return Err(ServiceError::Timeout);
+                }
+                // Admission expires before the first effect, never between paste
+                // and Enter. Each tmux call retains its own bounded timeout.
+                Ok(
+                    crate::control::send::paste_and_submit(client, ready.pane.as_str(), &text)
+                        .await?,
                 )
-                .await?)
-            })
+            }
             .await;
             respond(reply, result, |result| {
                 pane.as_deref().map(|pane| {
@@ -91,13 +108,16 @@ pub(super) async fn dispatch(
             })
         }
         Request::Type { command, reply, .. } => {
-            let result = outcome(pending.deadline, async {
+            let result = async {
                 let ready = prepared?;
+                if Instant::now() >= pending.deadline {
+                    return Err(ServiceError::Timeout);
+                }
                 Ok(
                     crate::control::type_spawn_command(client, ready.pane.as_str(), &command)
                         .await?,
                 )
-            })
+            }
             .await;
             respond(reply, result, |result| {
                 pane.as_deref().map(|pane| {

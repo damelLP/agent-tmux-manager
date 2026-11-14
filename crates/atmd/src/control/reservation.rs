@@ -103,7 +103,12 @@
 //! before every gate; an empty/invalid result never authorizes input. The parked
 //! legacy queue has 32 slots independent of reservation jobs; overflow returns
 //! unavailable. Org projection catch-up also parks outside tmux turns, within the
-//! same deadline. An excluded old session
+//! same deadline. Parked legacy input yields to reservation waiters on its pane,
+//! even later arrivals; a steady stream of them can starve it until Timeout.
+//! A dropped caller does not cancel admitted parked input: it can still start
+//! within its original deadline. After the first effect, Enter is completed under
+//! the tmux client's timeout, even if the caller's response budget has expired.
+//! An excluded old session
 //! prefix becomes NoSession after clear, never input redirected to the new editor.
 //! Quarantine and unavailable org state on tagged/unknown-ownership panes fail
 //! unavailable; positively untagged legacy panes retain their existing behavior.

@@ -103,9 +103,21 @@ mod tests {
         let mock = MockTmuxClient::new();
         let (reply, response) = oneshot::channel();
         drop(response);
-        execute(
+        let mut mirror = org_mirror::Mirror::start(org.clone());
+        while matches!(mirror.view(), org_mirror::View::Loading) {
+            mirror.changed().await;
+        }
+        let (sender, mut receive) = mpsc::channel(AUDIT_CAPACITY);
+        let audits = AuditQueue {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        let mut jobs = Jobs::new(cancel.clone(), audits.clone());
+        let pending = legacy_input::dispatch(
             &mock,
             &crate::registry::spawn_registry(),
+            &mut jobs,
+            &mirror,
             Pending {
                 server: None,
                 deadline: Instant::now(),
@@ -116,14 +128,22 @@ mod tests {
                     reply,
                 },
             },
+            &audits,
+            true,
         )
         .await;
+        assert!(pending.is_none());
+        assert!(matches!(
+            receive.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         assert_eq!(mock.call_count(), 0);
         assert_eq!(
             org.status().unwrap(),
             0,
             "expired queued work is not an action"
         );
+        mirror.stop().await;
         cancel.cancel();
     }
 
@@ -864,7 +884,7 @@ where
                         }
                         pending => {
                             // Keep U7's drain: never cancel admitted paste before Enter.
-                            match execute(&*client, &registry, pending).await {
+                            match execute(&*client, pending).await {
                                 #[cfg(test)]
                                 Some(Audit::Barrier(reply)) => { let _ = audits.sender.send(Audit::Barrier(reply)).await; }
                                 Some(audit) => audits.enqueue(audit),
@@ -1013,18 +1033,13 @@ async fn verify_server(
     Ok(())
 }
 
-async fn execute(
-    client: &dyn TmuxClient,
-    _registry: &RegistryHandle,
-    pending: Pending,
-) -> Option<Audit> {
+// Reserved commands and legacy input are dispatched before this non-input path.
+async fn execute(client: &dyn TmuxClient, pending: Pending) -> Option<Audit> {
     let deadline = pending.deadline;
     let expired = Instant::now() >= deadline;
     let caller = pending.caller.as_ref();
     if let Some(server) = pending.server {
         let operation = match &pending.request {
-            Request::Reserved(_) => "reserved pane control".into(),
-            Request::Send { target, .. } => format!("send to {target}"),
             Request::Prepare { target, caller, .. } => format!(
                 "spawn from {}",
                 target
@@ -1033,26 +1048,23 @@ async fn execute(
                     .unwrap_or("the active pane")
             ),
             Request::Split { context, .. } => format!("spawn from {}", context.target_pane),
-            Request::Type { pane, .. } => format!("spawn in {pane}"),
             #[cfg(test)]
             Request::FlushAudit(_) => "flush audits".into(),
+            _ => return None,
         };
         if let Err(error) = outcome(deadline, verify_server(client, server, operation)).await {
             match pending.request {
-                Request::Reserved(command) => command.reject(),
-                Request::Send { reply, .. } | Request::Split { reply, .. } => {
+                Request::Split { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
                 Request::Prepare { reply, .. } => {
-                    let _ = reply.send(Err(error));
-                }
-                Request::Type { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
                 #[cfg(test)]
                 Request::FlushAudit(reply) => {
                     let _ = reply.send(Err(error));
                 }
+                _ => {}
             }
             return None;
         }
@@ -1060,19 +1072,6 @@ async fn execute(
     let audit = match pending.request {
         #[cfg(test)]
         Request::FlushAudit(reply) => return Some(Audit::Barrier(reply)),
-        Request::Reserved(command) => {
-            command.reject();
-            return None;
-        }
-        // Inputs must pass legacy_input's gate, never this non-input dispatcher.
-        Request::Send { reply, .. } => {
-            let _ = reply.send(Err(if expired {
-                ServiceError::Timeout
-            } else {
-                ServiceError::Unavailable
-            }));
-            None
-        }
         Request::Prepare {
             target,
             cwd,
@@ -1113,14 +1112,7 @@ async fn execute(
                 )))
             })
         }
-        Request::Type { reply, .. } => {
-            let _ = reply.send(Err(if expired {
-                ServiceError::Timeout
-            } else {
-                ServiceError::Unavailable
-            }));
-            None
-        }
+        _ => return None,
     };
     audit.filter(|_| !expired).map(|command| Audit::Record {
         command: Box::new(command),

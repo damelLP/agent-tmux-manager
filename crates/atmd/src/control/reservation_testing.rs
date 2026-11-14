@@ -8,7 +8,7 @@
 //!
 //! # Read contract
 //!
-//! Implemented reserved operations consume these sequences. Fixed tag writes
+//! Implemented operations consume these sequences. Fixed tag writes
 //! are recorded in mock() and need no extra observation script:
 //!
 //! | Operation | Ordered reads before any effect | Script |
@@ -19,6 +19,7 @@
 //! | capture / observe | filtered metadata; single metadata/capture/clients/end command list; pane-local tag (3) | script_capture / script_observe |
 //! | keys_guarded / paste_guarded | same 3 reads as capture, pure check, then effect if approved | script_capture |
 //! | split | no observation reads; SplitWindow, then claim before replying | mock().set_next_pane_id |
+//! | legacy send / spawn_type, unavailable org | ownership: filtered metadata; pane-local tag (2), before input | script_tag_check |
 //!
 //! A missing pane stops after the first read. Fence, kind or expected-agent
 //! rejection can stop before any read. Metadata/capture framing matches the
@@ -32,6 +33,14 @@
 //! unsupported raw command returns TmuxError, never a plausible empty answer.
 //! Non-raw effects delegate to mock(); use its calls/errors/unique split IDs,
 //! not set_next_raw_output, which cannot script these reserved reads.
+//!
+//! Legacy ownership is the only legacy read this client serves. It cannot serve
+//! U7 send's `#{pane_in_mode} #{bracket_paste_flag}` state read or a noncanonical
+//! target's `#{pane_id}` resolution read: both are rejected, not answered by the
+//! mock's raw-output FIFO. Of legacy input, only canonical-target spawn_type is
+//! supported end-to-end (script an
+//! untagged ownership check when the org is unavailable); use MockTmuxClient for
+//! legacy sends or alias resolution.
 use super::{
     pane_ops::{CLIENTS, CLIENTS_MARKER, FORMAT},
     CaptureFormat, PaneCapture, PaneId, PaneInspection,

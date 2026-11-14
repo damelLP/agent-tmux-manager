@@ -747,6 +747,7 @@ mod reconciliation {
                 UpParams {
                     project_root: dir.path().into(),
                     name: "lead".into(),
+                    caller_server: None,
                 },
                 caller(),
             )

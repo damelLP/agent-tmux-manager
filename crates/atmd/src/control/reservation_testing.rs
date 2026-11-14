@@ -35,7 +35,7 @@
 //! not set_next_raw_output, which cannot script these reserved reads.
 //!
 //! Legacy ownership is the only legacy read this client serves. It cannot serve
-//! U7 send's `#{pane_in_mode} #{bracket_paste_flag}` state read or a noncanonical
+//! send's mode/bracket/synchronize-panes/input-off state read or a noncanonical
 //! target's `#{pane_id}` resolution read: both are rejected, not answered by the
 //! mock's raw-output FIFO. Of legacy input, only canonical-target spawn_type is
 //! supported end-to-end (script an

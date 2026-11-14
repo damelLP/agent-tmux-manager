@@ -310,6 +310,70 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
         atmd::org::OrgHandle::disabled("input safety probe"),
         cancel.clone(),
     );
+    let legacy_client = client.clone();
+    let legacy_control = control.clone();
+    let legacy = tokio::spawn(async move {
+        let sibling = legacy_client
+            .raw_command(
+                "split-window",
+                &["-d", "-P", "-F", "#{pane_id}", "-t", "%0", "cat"],
+            )
+            .await
+            .unwrap();
+        for case in 0..3 {
+            if case == 0 {
+                legacy_client
+                    .raw_command(
+                        "set-window-option",
+                        &["-t", "%0", "synchronize-panes", "on"],
+                    )
+                    .await
+                    .unwrap();
+            } else if case == 1 {
+                legacy_client
+                    .raw_command("select-pane", &["-t", "%0", "-d"])
+                    .await
+                    .unwrap();
+            }
+            let text = if case == 2 {
+                "UNSAFE-LEGACY\u{1b}[201~"
+            } else {
+                "UNSAFE-LEGACY"
+            };
+            let result = legacy_control.send("%0".into(), text.into()).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(atmd::control::service::ServiceError::Control(
+                        atmd::control::ControlError::SendRefused { .. }
+                    ))
+                ),
+                "{result:?}"
+            );
+            if case == 0 {
+                legacy_client
+                    .raw_command(
+                        "set-window-option",
+                        &["-t", "%0", "synchronize-panes", "off"],
+                    )
+                    .await
+                    .unwrap();
+            } else if case == 1 {
+                legacy_client
+                    .raw_command("select-pane", &["-t", "%0", "-e"])
+                    .await
+                    .unwrap();
+            }
+        }
+        for target in ["%0", sibling.trim()] {
+            assert!(!legacy_client
+                .raw_command("capture-pane", &["-p", "-t", target])
+                .await
+                .unwrap()
+                .contains("UNSAFE-LEGACY"));
+        }
+    })
+    .await;
     control
         .run_reserved(
             reservation(ReservationKind::Adopt),
@@ -476,6 +540,7 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
     client.raw_command("kill-server", &[]).await.unwrap();
     result.unwrap();
     names.unwrap();
+    legacy.unwrap();
 }
 
 async fn check_control_byte_process_names(

@@ -74,7 +74,7 @@ async fn send_reads_state_then_pastes_and_submits_separately() {
                         "-p".into(),
                         "-t".into(),
                         "%7".into(),
-                        "#{pane_in_mode} #{bracket_paste_flag}".into()
+                        "#{pane_in_mode} #{bracket_paste_flag}\t#{pane_synchronized}\t#{pane_input_off}".into()
                     ],
                 },
                 MockCall::PasteText {

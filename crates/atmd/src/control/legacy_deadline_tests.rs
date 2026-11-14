@@ -54,7 +54,7 @@ impl TmuxClient for DelayedClient {
         Box::pin(async move {
             let result = self.mock.raw_command(command, args).await;
             if matches!(self.at, DelayAt::State)
-                && args.contains(&"#{pane_in_mode} #{bracket_paste_flag}")
+                && args.contains(&crate::control::send::STATE_FORMAT)
             {
                 self.delay().await;
             }

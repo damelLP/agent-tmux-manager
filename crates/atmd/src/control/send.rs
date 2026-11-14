@@ -5,6 +5,9 @@ use atm_tmux::TmuxClient;
 
 use super::ControlError;
 
+pub(super) const STATE_FORMAT: &str =
+    "#{pane_in_mode} #{bracket_paste_flag}\t#{pane_synchronized}\t#{pane_input_off}";
+
 /// Resolves a target (session ID prefix or pane ID) to a tmux pane ID.
 pub fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String, ControlError> {
     // If it starts with %, it's already a pane ID
@@ -71,10 +74,7 @@ pub(super) async fn check_send(
     text: &str,
 ) -> Result<(), ControlError> {
     let pane_state = client
-        .raw_command(
-            "display-message",
-            &["-p", "-t", pane_id, "#{pane_in_mode} #{bracket_paste_flag}"],
-        )
+        .raw_command("display-message", &["-p", "-t", pane_id, STATE_FORMAT])
         .await
         .map_err(|source| ControlError::Tmux {
             context: format!("Failed to read the state of pane {pane_id}"),
@@ -114,7 +114,8 @@ pub(super) async fn paste_and_submit(
 }
 
 /// Why `atm send` must not paste `text` into `pane` for `target`, if it
-/// must not (#116). `pane_state` is `#{pane_in_mode} #{bracket_paste_flag}`;
+/// must not (#116). `pane_state` is mode/bracket flag, then tab-separated
+/// synchronize-panes and input-off flags;
 /// tmux before 3.7 has no `bracket_paste_flag` and leaves it empty, which
 /// counts as unknown.
 #[must_use]
@@ -125,7 +126,13 @@ fn send_refusal(
     pane_state: &str,
     text: &str,
 ) -> Option<&'static str> {
-    let mut fields = pane_state.split_whitespace();
+    let mut segments = pane_state.trim_end_matches('\n').split('\t');
+    let mut fields = segments.next().unwrap_or_default().split_whitespace();
+    let synchronized = segments.next().is_some_and(|flag| flag != "0");
+    let input_off = segments.next().is_some_and(|flag| flag != "0");
+    if unsafe_paste(text) {
+        return Some("paste text contains unsafe control bytes");
+    }
     let in_mode = fields.next().is_some_and(|modes| modes != "0");
     let bracketed_paste = fields.next();
     let in_pane = || {
@@ -159,8 +166,8 @@ fn send_refusal(
         false,
         bracketed_paste.map(|flag| flag != "0"),
         Some(text),
-        false,
-        false,
+        synchronized,
+        input_off,
     )
 }
 
@@ -215,6 +222,25 @@ mod send_tests {
     fn needs_input(mut session: SessionView) -> SessionView {
         session.status = SessionStatus::AttentionNeeded;
         session
+    }
+
+    #[test]
+    fn legacy_send_refuses_fanout_disabled_input_and_unsafe_control_bytes() {
+        for (state, reason) in [
+            ("0 1\t1\t0\n", "synchronize-panes"),
+            ("0 1\t0\t1\n", "input off"),
+        ] {
+            assert!(
+                send_refusal(&[], "%5", "%5", state, "text").is_some_and(|r| r.contains(reason))
+            );
+        }
+        for text in ["a\u{1b}[201~b", "a\0b", "a\u{3}b", "a\u{7f}b"] {
+            assert!(send_refusal(&[], "%5", "%5", "0 1\t0\t0\n", text)
+                .is_some_and(|r| r.contains("control bytes")));
+        }
+        for state in ["0 1\t0\t0\n", "0 \t0\t0\n"] {
+            assert_eq!(send_refusal(&[], "%5", "%5", state, "a\nb\tc"), None);
+        }
     }
 
     #[test]

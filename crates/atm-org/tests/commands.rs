@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test helpers may panic
 mod support;
 use atm_org::*;
 use support::*;

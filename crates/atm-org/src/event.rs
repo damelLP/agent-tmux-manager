@@ -12,6 +12,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum OrgError {
+    #[error(transparent)]
+    Apply(#[from] crate::ApplyError),
+    #[error("replay counter overflow")]
+    CounterOverflow,
     #[error("invalid body for {kind}: {source}")]
     Body {
         kind: String,

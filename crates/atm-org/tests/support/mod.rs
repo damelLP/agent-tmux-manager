@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)] // test builders only
 use atm_core::{Harness, Money, SessionId};
 use atm_org::*;
 use chrono::{DateTime, Utc};

@@ -93,8 +93,9 @@ def identity(pid):
         require(len(values) >= 20, 'short proc stat')
         if values[0] == 'Z':
             return None
-        return dict(pid=int(pid), start=values[19], exe=str((root / 'exe').resolve(strict=True)))
-    except (FileNotFoundError, ProcessLookupError):
+        return dict(pid=int(pid), start=values[19],
+                    exe=os.readlink(root / 'exe').removesuffix(' (deleted)'))
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
         return None
 
 
@@ -295,6 +296,9 @@ class Kit:
 
     def verify_server(self, a):
         expected = a.get('server')
+        actual = identity(expected.get('pid')) if expected else None
+        if expected and (actual is None or actual['start'] != expected.get('start')):
+            a['server'] = expected = None  # the recorded process is gone, not foreign
         if not expected:
             if not self.tmux_listening(a):
                 return False
@@ -311,7 +315,8 @@ class Kit:
         if actual is None:
             require(not self.tmux_listening(a), 'stale server record with a live listener')
             return False
-        require(actual == expected and self.owns(a, actual['pid']), 'foreign server identity')
+        require(actual['start'] == expected['start'] and self.owns(a, actual['pid']),
+                'foreign server identity')
         observed = self.tm(a, 'display-message', '-p', '#{socket_path} #{pid}')
         require(observed == a['tmux_socket'] + ' ' + str(actual['pid']), 'tmux socket/PID mismatch')
         return True
@@ -326,11 +331,10 @@ class Kit:
             return
         try:
             current = identity(pid)
-            if current is None:
-                return
+            if current is None or current['start'] != proc['start']:
+                return  # exited or reused; never signal the replacement
             # Shell descendants can exec between enumeration and signaling;
             # starttime + pidfd pin the process, the token pins this run.
-            require(current['start'] == proc['start'], 'process identity changed; refusing signal')
             if not self.owns(a, pid):
                 # Exit can clear environ after the stat read. Wait on the pinned
                 # process, never signal without ownership or mistake exit for reuse.
@@ -346,10 +350,6 @@ class Kit:
             os.close(fd)
 
     def daemon_processes(self, a):
-        expected = a.get('daemon')
-        if expected and identity(expected['pid']) is not None:
-            require(identity(expected['pid']) == expected and self.owns(a, expected['pid']),
-                    'foreign daemon identity')
         return [p for p in self.processes(a) if p['exe'] == str(Path(a['bin']) / 'atmd')]
 
     def ready(self, a):

@@ -8,13 +8,16 @@ import socket
 import subprocess
 import tempfile
 import unittest
+import sys
+
+sys.dont_write_bytecode = True
 
 SCRIPT = Path(__file__).with_name('atm-candidate')
 
 
 class CandidateKit(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='kit-', dir='/tmp')
+        self.temp = tempfile.TemporaryDirectory(prefix='kit-')
         self.root = Path(self.temp.name)
         self.env = dict(os.environ)
         for key in ('TMUX', 'TMUX_PANE'):
@@ -25,6 +28,9 @@ class CandidateKit(unittest.TestCase):
         # No user configuration/plugins in repeatable tests; production keeps HOME.
         (self.root / 'home').mkdir()
         self.env.update(HOME=str(self.root / 'home'), SHELL='/bin/sh',
+                        ATM_SOCKET=str(self.root / 'decoy.sock'),
+                        ATM_STATE_DIR=str(self.root / 'decoy-state'),
+                        ATM_TMUX_SOCKET='decoy', TMUX_TMPDIR=str(self.root / 'decoy-tmux'),
                         PATH='/usr/local/bin:/usr/bin:/bin')
         self.bin = self.root / 'prebuilt'
         self.bin.mkdir()
@@ -113,7 +119,7 @@ class CandidateKit(unittest.TestCase):
     def test_lifecycle_environment_restart_and_state_retention(self):
         install = self.install()
         inherited = dict(self.env, TMUX='/foreign,123,0', TMUX_PANE='%123',
-                         ATM_SOCKET='/tmp/atm.sock', ATM_TMUX_SOCKET='default',
+                         ATM_SOCKET=self.env['ATM_SOCKET'], ATM_TMUX_SOCKET='decoy',
                          ATM_STATE_DIR='/forbidden')
         self.call('start', install, env=inherited)
         status = self.status()
@@ -267,19 +273,65 @@ class CandidateKit(unittest.TestCase):
         self.assertTrue(self.call('atm', '--version').stdout.startswith('atm '))
         self.assertIn('Usage: atm [OPTIONS]', self.call('atm', '--help').stdout)
 
-    # PID reuse/manifest corruption must refuse signals, not kill an arbitrary process.
-    def test_foreign_identity_refuses_stop(self):
+    # A reused PID is gone; recover the real server through its private socket.
+    def test_reused_records_do_not_block_stop_or_signal_decoy(self):
         self.call('start', self.install())
         active = self.root / 'kit/active.json'
         original = active.read_text()
         value = json.loads(original)
-        value['server']['pid'] = os.getpid()
+        for kind in ('server', 'daemon'):
+            value[kind].update(pid=os.getpid(), start='0')
         active.write_text(json.dumps(value))
         try:
-            self.call('stop', ok=False)
+            self.assertTrue(self.status()['running'])
+            self.call('restart-daemon')
+            self.call('stop')
+            self.assertFalse(active.exists())
             os.kill(os.getpid(), 0)
         finally:
-            active.write_text(original)
+            if active.exists():
+                active.write_text(original)
+
+    # Deleted binaries remain identifiable and included in the token scan.
+    def test_stop_finds_deleted_executables(self):
+        import shutil
+        import atm_candidate
+        tools = self.root / 'tools'
+        tools.mkdir()
+        shutil.copy2('/usr/bin/tmux', tools / 'tmux')
+        env = dict(self.env, PATH=str(tools) + ':' + self.env['PATH'])
+        self.call('start', self.install(), env=env)
+        status = self.status()
+        (tools / 'tmux').unlink()
+        binary = tools / 'cat'
+        shutil.copy2('/bin/cat', binary)
+        child = subprocess.Popen([str(binary)], stdin=subprocess.PIPE,
+                                 env=dict(self.env, ATM_SOCKET=status['socket'],
+                                          TMUX_TMPDIR=str(Path(status['run']) / 't'),
+                                          ATM_CANDIDATE_RUN=status['token']))
+        try:
+            binary.unlink()
+            self.assertEqual(os.readlink(f'/proc/{child.pid}/exe'), str(binary) + ' (deleted)')
+            self.assertIsNotNone(atm_candidate.identity(child.pid))
+            self.call('stop')
+            child.wait(timeout=30)
+        finally:
+            child.stdin.close()
+            child.wait(timeout=30)
+            # RED cleanup: the old strict exe lookup cannot see this live tmux.
+            if (self.root / 'kit/active.json').exists():
+                self.assertEqual(self.tm(status, 'display-message', '-p', '#{socket_path} #{pid}'),
+                                 status['tmux_socket'] + ' ' + str(status['server']['pid']))
+                self.tm(status, 'kill-server')
+
+    # Enumeration followed by PID reuse must not signal the replacement.
+    def test_signal_treats_reused_process_as_gone(self):
+        import atm_candidate
+        kit = object.__new__(atm_candidate.Kit)
+        proc = atm_candidate.identity(os.getpid())
+        proc['start'] = '0'
+        kit.signal_process({}, proc)
+        os.kill(os.getpid(), 0)
 
     # Attach must reach this server without importing the caller's routing.
     def test_attach_on_a_real_terminal(self):

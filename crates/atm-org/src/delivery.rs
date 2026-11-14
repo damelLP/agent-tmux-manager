@@ -139,6 +139,9 @@ pub struct DeliverySettings {
 }
 
 /// Immutable, validated settings; deserialization uses the same validation.
+/// Durations must be positive and fit when added to `9999-12-31T23:59:59Z`,
+/// including three guard polls for stale-editor confirmation. Later caller
+/// timestamps can still return [`DeliveryPolicyError::TimeOverflow`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct DeliveryPolicy {
@@ -377,8 +380,12 @@ pub enum FailureReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DeliveryPolicyError {
-    #[error("delivery durations must be positive, representable, and retry delays nondecreasing")]
+    #[error("delivery retry delays must be nondecreasing and attempt count representable")]
     InvalidConfiguration,
+    #[error(
+        "delivery duration {setting} must be positive and fit a deadline from 9999-12-31T23:59:59Z"
+    )]
+    InvalidDuration { setting: &'static str },
     #[error("delivery state lacks consistent attempt/failure metadata")]
     InvalidState,
     #[error("delivery deadline is outside the timestamp range")]
@@ -660,31 +667,50 @@ fn failed_attempt(
 }
 
 fn deadline(at: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>, DeliveryPolicyError> {
-    let delta =
-        TimeDelta::from_std(duration).map_err(|_| DeliveryPolicyError::InvalidConfiguration)?;
+    let delta = TimeDelta::from_std(duration).map_err(|_| DeliveryPolicyError::TimeOverflow)?;
     at.checked_add_signed(delta)
         .ok_or(DeliveryPolicyError::TimeOverflow)
 }
 
 fn validate_settings(policy: &DeliverySettings) -> Result<u32, DeliveryPolicyError> {
-    let durations = [
-        policy.stable_idle,
-        policy.stable_empty_input,
-        policy.confirmation_timeout,
-        policy.stale_after,
-        policy.readiness_timeout,
-        policy.guard_poll_interval,
-        policy.pane_gone_grace,
-    ];
-    if durations
+    // 9999-12-31T23:59:59Z: the supported reference for configuration checks.
+    let reference =
+        DateTime::from_timestamp(253_402_300_799, 0).ok_or(DeliveryPolicyError::TimeOverflow)?;
+    let validate = |setting, duration: Duration| {
+        if duration.is_zero() || deadline(reference, duration).is_err() {
+            Err(DeliveryPolicyError::InvalidDuration { setting })
+        } else {
+            Ok(())
+        }
+    };
+    for (setting, duration) in [
+        ("stable_idle", policy.stable_idle),
+        ("stable_empty_input", policy.stable_empty_input),
+        ("confirmation_timeout", policy.confirmation_timeout),
+        ("stale_after", policy.stale_after),
+        ("readiness_timeout", policy.readiness_timeout),
+        ("guard_poll_interval", policy.guard_poll_interval),
+        ("pane_gone_grace", policy.pane_gone_grace),
+    ]
+    .into_iter()
+    .chain(policy.retry_delays.iter().map(|d| ("retry_delays", *d)))
+    {
+        validate(setting, duration)?;
+    }
+    validate(
+        "guard_poll_interval",
+        policy
+            .guard_poll_interval
+            .checked_mul(3)
+            .ok_or(DeliveryPolicyError::InvalidDuration {
+                setting: "guard_poll_interval",
+            })?,
+    )?;
+    if policy
+        .retry_delays
         .iter()
-        .chain(&policy.retry_delays)
-        .any(|d| d.is_zero() || TimeDelta::from_std(*d).is_err())
-        || policy
-            .retry_delays
-            .iter()
-            .zip(policy.retry_delays.iter().skip(1))
-            .any(|(a, b)| a > b)
+        .zip(policy.retry_delays.iter().skip(1))
+        .any(|(a, b)| a > b)
     {
         return Err(DeliveryPolicyError::InvalidConfiguration);
     }
@@ -1502,28 +1528,43 @@ mod tests {
                 .unwrap(),
             policy
         );
-        for bad in [
-            DeliverySettings {
-                stable_idle: Duration::ZERO,
-                ..settings.clone()
-            },
-            DeliverySettings {
-                confirmation_timeout: Duration::MAX,
-                ..settings.clone()
-            },
-            DeliverySettings {
-                retry_delays: vec![Duration::from_secs(2), Duration::from_secs(1)],
-                ..settings.clone()
-            },
-            DeliverySettings {
-                pane_gone_grace: Duration::ZERO,
-                ..settings.clone()
-            },
+        for (bad, error) in [
+            (
+                DeliverySettings {
+                    stable_idle: Duration::ZERO,
+                    ..settings.clone()
+                },
+                DeliveryPolicyError::InvalidDuration {
+                    setting: "stable_idle",
+                },
+            ),
+            (
+                DeliverySettings {
+                    confirmation_timeout: Duration::MAX,
+                    ..settings.clone()
+                },
+                DeliveryPolicyError::InvalidDuration {
+                    setting: "confirmation_timeout",
+                },
+            ),
+            (
+                DeliverySettings {
+                    retry_delays: vec![Duration::from_secs(2), Duration::from_secs(1)],
+                    ..settings.clone()
+                },
+                DeliveryPolicyError::InvalidConfiguration,
+            ),
+            (
+                DeliverySettings {
+                    pane_gone_grace: Duration::ZERO,
+                    ..settings.clone()
+                },
+                DeliveryPolicyError::InvalidDuration {
+                    setting: "pane_gone_grace",
+                },
+            ),
         ] {
-            assert_eq!(
-                DeliveryPolicy::new(bad.clone()),
-                Err(DeliveryPolicyError::InvalidConfiguration)
-            );
+            assert_eq!(DeliveryPolicy::new(bad.clone()), Err(error));
             assert!(
                 serde_json::from_str::<DeliveryPolicy>(&serde_json::to_string(&bad).unwrap())
                     .is_err()
@@ -1532,6 +1573,145 @@ mod tests {
         assert!(serde_json::from_str::<DeliveryPolicy>(r#"{"stable_idel": 3}"#).is_err());
         let minimal: DeliveryPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(minimal, policy);
+    }
+
+    fn settings_with_duration(duration: Duration) -> [(&'static str, DeliverySettings); 8] {
+        [
+            (
+                "stable_idle",
+                DeliverySettings {
+                    stable_idle: duration,
+                    ..DeliverySettings::default()
+                },
+            ),
+            (
+                "stable_empty_input",
+                DeliverySettings {
+                    stable_empty_input: duration,
+                    ..DeliverySettings::default()
+                },
+            ),
+            (
+                "confirmation_timeout",
+                DeliverySettings {
+                    confirmation_timeout: duration,
+                    ..DeliverySettings::default()
+                },
+            ),
+            (
+                "retry_delays",
+                DeliverySettings {
+                    retry_delays: vec![duration],
+                    ..DeliverySettings::default()
+                },
+            ),
+            (
+                "stale_after",
+                DeliverySettings {
+                    stale_after: duration,
+                    ..DeliverySettings::default()
+                },
+            ),
+            (
+                "readiness_timeout",
+                DeliverySettings {
+                    readiness_timeout: duration,
+                    ..DeliverySettings::default()
+                },
+            ),
+            (
+                "guard_poll_interval",
+                DeliverySettings {
+                    guard_poll_interval: duration,
+                    ..DeliverySettings::default()
+                },
+            ),
+            (
+                "pane_gone_grace",
+                DeliverySettings {
+                    pane_gone_grace: duration,
+                    ..DeliverySettings::default()
+                },
+            ),
+        ]
+    }
+
+    fn assert_invalid_duration(setting: &'static str, settings: DeliverySettings) {
+        let error = DeliveryPolicy::new(settings.clone()).unwrap_err();
+        assert_eq!(error, DeliveryPolicyError::InvalidDuration { setting });
+        assert!(error.to_string().contains(setting), "{setting}: {error}");
+        let error =
+            serde_json::from_str::<DeliveryPolicy>(&serde_json::to_string(&settings).unwrap())
+                .unwrap_err();
+        assert!(error.to_string().contains(setting), "{setting}: {error}");
+    }
+
+    #[test]
+    fn overflowing_settings_are_rejected_with_their_names() {
+        // A TimeDelta can represent 9e12 seconds, but a delivery deadline cannot.
+        for duration in [
+            Duration::from_secs(9_000_000_000_000),
+            Duration::ZERO,
+            Duration::MAX,
+        ] {
+            for (setting, settings) in settings_with_duration(duration) {
+                assert_invalid_duration(setting, settings);
+            }
+        }
+    }
+
+    #[test]
+    fn duration_validation_checks_the_reference_boundary() {
+        let reference = "9999-12-31T23:59:59Z".parse::<DateTime<Utc>>().unwrap();
+        let maximum = DateTime::<Utc>::MAX_UTC
+            .signed_duration_since(reference)
+            .to_std()
+            .unwrap();
+        for (setting, settings) in settings_with_duration(maximum) {
+            if setting == "guard_poll_interval" {
+                continue; // The derived three-poll boundary is checked separately.
+            }
+            let policy = DeliveryPolicy::new(settings).unwrap();
+            assert_eq!(
+                serde_json::from_str::<DeliveryPolicy>(&serde_json::to_string(&policy).unwrap())
+                    .unwrap(),
+                policy,
+            );
+        }
+        for (setting, settings) in settings_with_duration(maximum + Duration::from_nanos(1)) {
+            assert_invalid_duration(setting, settings);
+        }
+    }
+
+    #[test]
+    fn three_poll_confirmation_must_also_fit() {
+        let reference = "9999-12-31T23:59:59Z".parse::<DateTime<Utc>>().unwrap();
+        let maximum = DateTime::<Utc>::MAX_UTC
+            .signed_duration_since(reference)
+            .to_std()
+            .unwrap();
+        let poll = maximum / 3;
+        let settings = DeliverySettings {
+            guard_poll_interval: poll,
+            ..DeliverySettings::default()
+        };
+        let policy = DeliveryPolicy::new(settings.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DeliveryPolicy>(&serde_json::to_string(&policy).unwrap())
+                .unwrap(),
+            policy,
+        );
+        let too_large = poll + Duration::from_nanos(1);
+        assert!(reference
+            .checked_add_signed(TimeDelta::from_std(too_large).unwrap())
+            .is_some());
+        assert_invalid_duration(
+            "guard_poll_interval",
+            DeliverySettings {
+                guard_poll_interval: too_large,
+                ..settings
+            },
+        );
     }
 
     #[test]
@@ -2363,6 +2543,9 @@ mod tests {
         let evidence = Cell::new(0usize);
         let receipts = Cell::new(0usize);
         let failures = Cell::new(0usize);
+        let evidence_vetoes = Cell::new(0usize);
+        let restart_vetoes = Cell::new(0usize);
+        let last_paste_vetoes = Cell::new(0usize);
         let mut runner = TestRunner::new(Config {
             cases: 512,
             rng_seed: RngSeed::Fixed(0x9a02),
@@ -2467,6 +2650,19 @@ mod tests {
                     live.confirmation = Some(receipt());
                 }
                 let step = h.step(&live, now);
+                // Count only counterfactuals where removing this one veto
+                // would actually paste; merely generating the flag is not coverage.
+                if !matches!(step, DeliveryStep::PasteNow { .. }) {
+                    for (counter, without_veto) in [
+                        (&evidence_vetoes, RecipientLiveView { probably_landed: false, ..live.clone() }),
+                        (&restart_vetoes, RecipientLiveView { last_attempt_before_start: false, ..live.clone() }),
+                        (&last_paste_vetoes, RecipientLiveView { last_paste_at: None, ..live.clone() }),
+                    ] {
+                        if matches!(h.step(&without_veto, now), DeliveryStep::PasteNow { .. }) {
+                            counter.set(counter.get() + 1);
+                        }
+                    }
+                }
                 track_hold(&mut live, &step, time(now));
                 match step {
                     DeliveryStep::PasteNow { attempt } => {
@@ -2520,6 +2716,15 @@ mod tests {
             "retry assertions must run in at least 25% of histories"
         );
         assert!(four.get() > 0 && restarts.get() > 0 && evidence.get() > 0 && receipts.get() > 0);
+        println!(
+            "counterfactual veto coverage: evidence={}, restart={}, last_paste={}",
+            evidence_vetoes.get(),
+            restart_vetoes.get(),
+            last_paste_vetoes.get()
+        );
+        assert!(
+            evidence_vetoes.get() > 0 && restart_vetoes.get() > 0 && last_paste_vetoes.get() > 0
+        );
     }
 
     proptest! {

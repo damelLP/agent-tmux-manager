@@ -59,7 +59,7 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
     let socket = std::path::PathBuf::from(std::env::var("ATM_SOCKET").unwrap());
     assert!(socket.starts_with(std::path::Path::new(&root).parent().unwrap()));
     assert_ne!(socket, std::path::Path::new("/tmp/atm.sock"));
-    let label = std::env::var("ATM_TMUX_SOCKET").unwrap();
+    let label = format!("{}-rpc", std::env::var("ATM_TMUX_SOCKET").unwrap());
     assert!(label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     let client = RealTmuxClient::with_socket(label.clone());
     client.raw_command("new-session", &["-d", "-s", "private-clear", "-x", "80", "-y", "24",
@@ -297,7 +297,10 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
     let root = std::env::var("TMUX_TMPDIR").unwrap();
     assert!(std::path::Path::new(&root).is_absolute());
     assert_ne!(std::env::var("ATM_SOCKET").unwrap(), "/tmp/atm.sock");
-    let client = RealTmuxClient::with_socket(std::env::var("ATM_TMUX_SOCKET").unwrap());
+    let client = RealTmuxClient::with_socket(format!(
+        "{}-input",
+        std::env::var("ATM_TMUX_SOCKET").unwrap()
+    ));
     client
         .raw_command("new-session", &["-d", "-s", "input-refusal", "cat"])
         .await
@@ -629,7 +632,7 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
     let root = std::env::var("TMUX_TMPDIR").unwrap();
     assert!(std::path::Path::new(&root).is_absolute());
     assert_ne!(std::env::var("ATM_SOCKET").unwrap(), "/tmp/atm.sock");
-    let label = std::env::var("ATM_TMUX_SOCKET").unwrap();
+    let label = format!("{}-effects", std::env::var("ATM_TMUX_SOCKET").unwrap());
     let client = RealTmuxClient::with_socket(label);
     client
         .raw_command(

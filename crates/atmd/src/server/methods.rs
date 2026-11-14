@@ -245,7 +245,12 @@ fn control_error(error: crate::control::service::ServiceError) -> MethodError {
         ServiceError::Control(error) => match error {
             ControlError::NoSession { .. } | ControlError::NoPane { .. } => error_code::NOT_FOUND,
             ControlError::AmbiguousTarget { .. } => error_code::CONFLICT,
-            ControlError::SendRefused { .. } => error_code::REFUSED,
+            ControlError::SendRefused { .. } | ControlError::AgentClearing { .. } => {
+                error_code::REFUSED
+            }
+            ControlError::PaneQuarantined { .. } | ControlError::OrganisationUnavailable { .. } => {
+                error_code::UNAVAILABLE
+            }
             ControlError::Tmux {
                 source: atm_tmux::TmuxError::Timeout { .. },
                 ..
@@ -461,8 +466,9 @@ mod tests {
         std::fs::write(&own, "").unwrap();
         std::fs::write(&other, "").unwrap();
         std::os::unix::fs::symlink(&own, &alias).unwrap();
-        let (router, mock, cancel, task, _) =
-            control_router(crate::org::OrgHandle::disabled("test")).await;
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().join("state"), org_cancel.clone()).await;
+        let (router, mock, cancel, task, _) = control_router(org).await;
         for (method, params) in [
             ("session.send", json!({"target":"%7","text":"hello"})),
             ("session.spawn_prepare", json!({"target_pane":"%7"})),
@@ -498,6 +504,7 @@ mod tests {
         }
         cancel.cancel();
         task.await.unwrap();
+        org_cancel.cancel();
     }
 
     #[tokio::test]
@@ -518,6 +525,11 @@ mod tests {
     async fn disabled_organisation_does_not_change_or_repeat_control_actions() {
         let (router, mock, cancel, task, control) =
             control_router(crate::org::OrgHandle::disabled("test disabled")).await;
+        mock.set_next_raw_output("ATM-PANE-v1\t%7\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+        mock.set_next_raw_output(""); // untagged send pane
+        mock.set_next_raw_output("0 1");
+        mock.set_next_raw_output("ATM-PANE-v1\t%42\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+        mock.set_next_raw_output(""); // untagged spawn_type pane
         successful_control_actions(&router).await;
         control.flush_audits().await;
         assert_eq!(
@@ -635,6 +647,53 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         org_cancel.cancel();
+    }
+
+    #[test]
+    fn contract_quarantine_and_org_failure_have_unavailable_code_and_human_messages() {
+        use crate::control::ControlError;
+        for (error, message) in [
+            (
+                ControlError::PaneQuarantined {
+                    pane: "%7".into(),
+                    agent: "project/lead".parse().unwrap(),
+                },
+                "pane %7: agent project/lead is quarantined; restart atmd and reconcile",
+            ),
+            (
+                ControlError::OrganisationUnavailable { pane: "%7".into() },
+                "organisation state is unavailable for pane %7; refusing input",
+            ),
+        ] {
+            let error = control_error(error.into());
+            assert_eq!(error.0.code, "unavailable");
+            assert_eq!(error.0.message, message);
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_clearing_error_reaches_method_response_unchanged() {
+        let mut router = MethodRouter::default();
+        router
+            .register("test.clearing", Duration::from_secs(1), |_, _| async {
+                Err(control_error(
+                    crate::control::ControlError::AgentClearing {
+                        pane: "%7".into(),
+                        agent: "project/lead".parse().unwrap(),
+                    }
+                    .into(),
+                ))
+            })
+            .unwrap();
+        let error = router
+            .call(context(), "test.clearing", Value::Null)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "refused");
+        assert_eq!(
+            error.0.message,
+            "Refusing to send to %7: agent project/lead is clearing; try again in a moment"
+        );
     }
 
     #[tokio::test]

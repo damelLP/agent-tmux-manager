@@ -234,12 +234,14 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
     std::fs::create_dir_all(tmux_socket.parent().unwrap()).unwrap();
     std::fs::write(&tmux_socket, "").unwrap();
     mock.set_next_raw_output(tmux_socket.to_str().unwrap());
+    mock.set_next_raw_output("ATM-PANE-v1\t%5\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+    mock.set_next_raw_output(""); // disabled org, positively untagged pane
     mock.set_next_raw_output("0 1");
     let out = atm(exe, dir.path(), &["send", "abc", "hello;"]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"Sent to %5 by tmux paste\n");
     assert!(
-        matches!(mock.calls().as_slice(), [MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::PasteText { pane, text }, MockCall::SendKeys { keys, .. }] if pane == "%5" && text == "hello;" && keys == "Enter")
+        matches!(mock.calls().as_slice(), [MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::PasteText { pane, text }, MockCall::SendKeys { keys, .. }] if pane == "%5" && text == "hello;" && keys == "Enter")
     );
     mock.clear_calls();
     mock.set_next_raw_output(tmux_socket.to_str().unwrap());
@@ -266,6 +268,8 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
         ),
     ] {
         mock.set_next_raw_output(tmux_socket.to_str().unwrap());
+        mock.set_next_raw_output("ATM-PANE-v1\t%5\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+        mock.set_next_raw_output(""); // ownership read precedes the original safety check
         mock.set_next_raw_output(state);
         let args = ["send", "%5", text];
         assert_fails_with(
@@ -284,6 +288,8 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
         .await
         .unwrap();
     mock.set_next_raw_output(tmux_socket.to_str().unwrap());
+    mock.set_next_raw_output("ATM-PANE-v1\t%5\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+    mock.set_next_raw_output("");
     mock.set_next_raw_output("0 1");
     let args = ["send", "%5", "hi"];
     assert_fails_with(&atm(exe, dir.path(), &args), &args, "Error: Refusing to send to %5: the session is waiting on a dialog that Enter would answer; use `atm reply`, or, if the dialog is gone, type in the pane");

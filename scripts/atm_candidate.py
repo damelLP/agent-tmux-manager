@@ -238,7 +238,7 @@ class Kit:
             if stage.exists():
                 shutil.rmtree(stage)
 
-    def active(self, optional=False):
+    def active(self, optional=False, missing_runtime=False):
         if optional and not self.active_file.exists():
             return None
         a = load(self.active_file)
@@ -246,14 +246,17 @@ class Kit:
         path = checked_path(a.get('run', ''))
         require(path.parent == self.runtime and path.name.startswith(f'atmc-{os.getuid()}-'),
                 'foreign runtime directory')
-        private_dir(path)
-        require(load(path / 'owner.json') == {'root': str(self.root), 'token': a.get('token')},
-                'runtime owner mismatch')
+        if path.exists() or not missing_runtime:
+            private_dir(path)
+            require(load(path / 'owner.json') == {'root': str(self.root), 'token': a.get('token')},
+                    'runtime owner mismatch')
         require(a.get('socket') == str(path / 'a.sock')
                 and a.get('tmux_socket') == str(path / 't' / f'tmux-{os.getuid()}' / 'candidate')
                 and a.get('state') == str(self.state / a['id'])
                 and a.get('bin') == str(self.installs / a['id'] / 'bin'), 'foreign endpoint in manifest')
         private_dir(Path(a['state']))
+        if not path.exists():
+            require(not self.processes(a), 'runtime missing but candidate processes remain')
         return a
 
     def environment(self, a):
@@ -414,8 +417,11 @@ class Kit:
             raise
 
     def stop(self):
-        a = self.active(optional=True)
+        a = self.active(optional=True, missing_runtime=True)
         if a is None:
+            return
+        if not Path(a['run']).exists():
+            self.active_file.unlink()  # active() proved there are no owned processes
             return
         has_server = self.verify_server(a)
         daemons = self.daemon_processes(a)  # validate everything before the first signal
@@ -449,7 +455,7 @@ class Kit:
         elif command == 'stop':
             self.stop()
         elif command == 'status':
-            a = self.active(optional=True)
+            a = self.active(optional=True, missing_runtime=True)
             if a is None:
                 print(json.dumps({'running': False}))
             else:

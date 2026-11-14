@@ -236,6 +236,35 @@ class CandidateKit(unittest.TestCase):
             if active.exists():
                 active.write_text(original)
 
+    # Reboot removes the runtime, not persistent manifests: permit recovery only
+    # after a token scan proves no candidate process remains.
+    def test_missing_runtime_recovers_after_processes_exit(self):
+        install = self.install()
+        self.call('start', install)
+        active = self.root / 'kit/active.json'
+        original = active.read_text()
+        status = self.status()
+        runtime = Path(status['run'])
+        saved = runtime.with_name('saved-runtime')
+        runtime.rename(saved)
+        try:
+            for command in ('status', 'stop'):
+                self.call(command, ok=False)
+            self.assertEqual(active.read_text(), original)
+        finally:
+            saved.rename(runtime)
+        self.call('stop')  # actual exit of all owned processes, then runtime removal
+        active.write_text(original)  # persistent manifest surviving a reboot
+        try:
+            self.assertFalse(self.status()['running'])
+            self.assertEqual(active.read_text(), original, 'status must not mutate')
+            self.call('stop')
+            self.assertFalse(active.exists())
+        finally:
+            if active.exists():
+                active.unlink()  # RED cleanup: all recorded processes already exited
+        self.call('start', install)
+
     # Runtime length rejection must not leave a manifest that can never be stopped.
     def test_long_runtime_path_fails_cleanly(self):
         install = self.install()

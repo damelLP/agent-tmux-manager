@@ -12,6 +12,11 @@
 //! its filesystem worker may still hold the stream lock. Restart to recover.
 
 mod actor;
+// Pure decisions first; the flows that call them follow in their own commits.
+#[cfg_attr(not(test), allow(dead_code))]
+mod agent_flow;
+#[cfg(test)]
+mod agent_flow_tests;
 mod agent_methods;
 mod agent_project;
 mod agent_screen;

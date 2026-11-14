@@ -71,6 +71,12 @@ impl PaneBaseline {
         self.harness_command = Some(command);
         Some(self)
     }
+
+    /// The pinned harness command name, if any.
+    #[must_use]
+    pub fn harness_command(&self) -> Option<&str> {
+        self.harness_command.as_deref()
+    }
 }
 
 /// Which recorded program is in the pane's foreground.

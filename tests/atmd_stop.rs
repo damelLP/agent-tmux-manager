@@ -65,11 +65,12 @@ fn held_daemon_stop(remove_files: bool) {
         .arg("start")
         .stdout(log.try_clone().unwrap())
         .stderr(log);
-    // SAFETY: setsid is async-signal-safe; do not allocate or lock after fork.
-    // tmux resumes stopped members of pane process groups; isolate this child.
+    // SAFETY: setsid/prctl do not allocate or lock after fork.
+    // Isolate from tmux's resume signals, but kill even a stopped daemon if the
+    // test thread dies before ChildGuard can run (e.g. an interrupted test run).
     unsafe {
         start.pre_exec(|| {
-            if libc::setsid() < 0 {
+            if libc::setsid() < 0 || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())

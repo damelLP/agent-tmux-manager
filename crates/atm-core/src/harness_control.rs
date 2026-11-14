@@ -5,6 +5,24 @@
 //! and no dialog, plus their own live-pane/copy-mode and continuity checks. Unknown
 //! (including future enum variants) never authorizes input. There is no wire format.
 
+/// Explicit capture provenance, not escape-sequence auto-detection.
+///
+/// Styled requires the complete live `capture-pane -p -e -N` viewport: no
+/// joining, scrollback or caller trimming. Plain is the legacy lossy capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenInput<'a> {
+    Plain(&'a str),
+    Styled(&'a str),
+}
+
+/// Adapter-requested capture representation. Capture boundaries map Styled to
+/// ANSI capture with retained trailing spaces, and verify the returned format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenTextFormat {
+    Plain,
+    Styled,
+}
+
 /// Contents of the active editor, not a prompt echoed in conversation history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]

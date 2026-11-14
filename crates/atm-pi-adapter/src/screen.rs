@@ -21,8 +21,11 @@
 
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
-    TurnState,
+    ScreenInput, ScreenTextFormat, TurnState,
 };
+
+/// Requires attributes and retained grid spaces (`capture-pane -p -e -N`).
+pub const SCREEN_TEXT_FORMAT: ScreenTextFormat = ScreenTextFormat::Styled;
 
 /// Submit only after the caller has established a safe active input.
 pub const CLEAR_COMMAND: &str = "/new";
@@ -34,7 +37,10 @@ pub const LAUNCH_POLICY: LaunchPolicy = LaunchPolicy {
 
 /// Recognize complete captured layouts only; unknown never authorizes input.
 #[must_use]
-pub fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
+pub fn observe_screen(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> ScreenFacts {
+    let ScreenInput::Plain(text) = input else {
+        return ScreenFacts::default();
+    };
     if cursor.is_some() || text.chars().any(|c| c.is_control() && c != '\n') {
         return ScreenFacts::default();
     }
@@ -270,6 +276,10 @@ fn startup_only(history: &[&str]) -> bool {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
+        super::observe_screen(ScreenInput::Plain(text), cursor)
+    }
 
     macro_rules! facts {
         ($($field:ident: $value:expr),* $(,)?) => {{

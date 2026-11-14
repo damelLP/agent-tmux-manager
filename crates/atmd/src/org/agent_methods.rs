@@ -346,6 +346,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn caller_server_is_optional_and_preserved_by_agent_schemas() {
+        for (method, params) in [
+            ("agent.up", json!({"project_root":"/project","name":"lead"})),
+            (
+                "agent.adopt",
+                json!({"project_root":"/project","name":"lead","pane":"%7"}),
+            ),
+            ("agent.respawn", json!({"agent":"project/lead"})),
+        ] {
+            for caller in [None, Some(Value::Null), Some(json!("/private/tmux.sock"))] {
+                let mut params = params.clone();
+                if let Some(caller) = &caller {
+                    params["caller_server"] = caller.clone();
+                }
+                assert_eq!(
+                    code(method, params.clone()).await,
+                    "unavailable",
+                    "{method}: {caller:?}"
+                );
+                let retained = match method {
+                    "agent.up" => {
+                        serde_json::to_value(serde_json::from_value::<UpParams>(params).unwrap())
+                            .unwrap()
+                    }
+                    "agent.adopt" => {
+                        serde_json::to_value(serde_json::from_value::<AdoptParams>(params).unwrap())
+                            .unwrap()
+                    }
+                    _ => serde_json::to_value(
+                        serde_json::from_value::<RespawnParams>(params).unwrap(),
+                    )
+                    .unwrap(),
+                };
+                assert_eq!(retained["caller_server"], caller.unwrap_or(Value::Null));
+            }
+            for caller in [json!(true), json!(17), json!([]), json!({})] {
+                let mut params = params.clone();
+                params["caller_server"] = caller;
+                assert_eq!(code(method, params).await, "invalid_params");
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn typed_non_utf8_root_is_invalid() {

@@ -74,7 +74,14 @@ async fn scripted(
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("rpc.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let params = params(dir.path());
+    let mut params = params(dir.path());
+    if matches!(method, "agent.up" | "agent.adopt" | "agent.respawn") && response.is_some() {
+        params["caller_server"] = json!(dir
+            .path()
+            .join(format!("tmux/tmux-{}/agent-cli-test", unsafe {
+                libc::getuid()
+            })));
+    }
     let mut command = command(args, dir.path(), &socket);
     if broken_stdout {
         // Shutdown is shared by even a briefly inherited reader in a concurrently

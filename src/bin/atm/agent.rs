@@ -130,6 +130,7 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
                 UpParams {
                     name,
                     project_root: absolute_root(project_root)?,
+                    caller_server: None,
                 },
                 85,
             )
@@ -150,6 +151,7 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
                     name,
                     pane,
                     project_root: absolute_root(project_root)?,
+                    caller_server: None,
                 },
                 55,
             )
@@ -174,7 +176,15 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
             false,
         ),
         AgentAction::Respawn { agent, format } => (
-            request::<_, RespawnResult>("agent.respawn", RespawnParams { agent }, 85).await?,
+            request::<_, RespawnResult>(
+                "agent.respawn",
+                RespawnParams {
+                    agent,
+                    caller_server: None,
+                },
+                85,
+            )
+            .await?,
             matches!(format, AgentFormat::Json),
             &["agent_id", "pane"][..],
             false,

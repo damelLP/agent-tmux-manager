@@ -56,7 +56,7 @@ fn create_directory(
     Ok(())
 }
 
-fn sync_directory(directory: &Path) -> Result<(), EventLogError> {
+pub(super) fn sync_directory(directory: &Path) -> Result<(), EventLogError> {
     File::open(directory)
         .and_then(|dir| dir.sync_all())
         .map_err(|e| io_error(directory, e))

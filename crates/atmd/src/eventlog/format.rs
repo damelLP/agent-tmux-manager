@@ -1,7 +1,7 @@
 //! Atomic publication of the shared disk-format marker.
 
 use super::{io_error, reader::open_file, EventLogError};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,7 +55,5 @@ fn publish(directory: &Path, marker: &Path) -> Result<(), EventLogError> {
         tracing::warn!(path = %temporary.display(), %error, "Cannot remove format temporary file");
     }
     result?;
-    File::open(directory)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| io_error(directory, e))
+    super::writer::sync_directory(directory)
 }

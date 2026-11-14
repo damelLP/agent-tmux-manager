@@ -169,7 +169,7 @@ async fn reservation_parked_legacy_queue_is_bounded_and_shutdown_never_inputs() 
 }
 
 #[tokio::test]
-async fn reservation_dropped_raw_caller_does_not_cancel_admitted_input() {
+async fn reservation_dropped_send_caller_cancels_parked_input() {
     let (_dir, org, cancel) = healthy().await;
     let mock = MockTmuxClient::new();
     let (control, actor) = spawn_control(
@@ -189,19 +189,7 @@ async fn reservation_dropped_raw_caller_does_not_cancel_admitted_input() {
     release.send(()).unwrap();
     job.await.unwrap().unwrap();
     control.flush_audits().await;
-    assert_eq!(
-        input_calls(&mock),
-        vec![
-            MockCall::PasteText {
-                pane: "%1".into(),
-                text: "once".into()
-            },
-            MockCall::SendKeys {
-                pane: "%1".into(),
-                keys: "Enter".into()
-            }
-        ]
-    );
+    assert!(input_calls(&mock).is_empty());
     cancel.cancel();
     actor.await.unwrap();
 }

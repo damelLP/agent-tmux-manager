@@ -59,7 +59,7 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
     let socket = std::path::PathBuf::from(std::env::var("ATM_SOCKET").unwrap());
     assert!(socket.starts_with(std::path::Path::new(&root).parent().unwrap()));
     assert_ne!(socket, std::path::Path::new("/tmp/atm.sock"));
-    let label = std::env::var("ATM_TMUX_SOCKET").unwrap();
+    let label = format!("{}-rpc", std::env::var("ATM_TMUX_SOCKET").unwrap());
     assert!(label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     let client = RealTmuxClient::with_socket(label.clone());
     client.raw_command("new-session", &["-d", "-s", "private-clear", "-x", "80", "-y", "24",
@@ -297,7 +297,10 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
     let root = std::env::var("TMUX_TMPDIR").unwrap();
     assert!(std::path::Path::new(&root).is_absolute());
     assert_ne!(std::env::var("ATM_SOCKET").unwrap(), "/tmp/atm.sock");
-    let client = RealTmuxClient::with_socket(std::env::var("ATM_TMUX_SOCKET").unwrap());
+    let client = RealTmuxClient::with_socket(format!(
+        "{}-input",
+        std::env::var("ATM_TMUX_SOCKET").unwrap()
+    ));
     client
         .raw_command("new-session", &["-d", "-s", "input-refusal", "cat"])
         .await
@@ -310,6 +313,70 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
         atmd::org::OrgHandle::disabled("input safety probe"),
         cancel.clone(),
     );
+    let legacy_client = client.clone();
+    let legacy_control = control.clone();
+    let legacy = tokio::spawn(async move {
+        let sibling = legacy_client
+            .raw_command(
+                "split-window",
+                &["-d", "-P", "-F", "#{pane_id}", "-t", "%0", "cat"],
+            )
+            .await
+            .unwrap();
+        for case in 0..3 {
+            if case == 0 {
+                legacy_client
+                    .raw_command(
+                        "set-window-option",
+                        &["-t", "%0", "synchronize-panes", "on"],
+                    )
+                    .await
+                    .unwrap();
+            } else if case == 1 {
+                legacy_client
+                    .raw_command("select-pane", &["-t", "%0", "-d"])
+                    .await
+                    .unwrap();
+            }
+            let text = if case == 2 {
+                "UNSAFE-LEGACY\u{1b}[201~"
+            } else {
+                "UNSAFE-LEGACY"
+            };
+            let result = legacy_control.send("%0".into(), text.into()).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(atmd::control::service::ServiceError::Control(
+                        atmd::control::ControlError::SendRefused { .. }
+                    ))
+                ),
+                "{result:?}"
+            );
+            if case == 0 {
+                legacy_client
+                    .raw_command(
+                        "set-window-option",
+                        &["-t", "%0", "synchronize-panes", "off"],
+                    )
+                    .await
+                    .unwrap();
+            } else if case == 1 {
+                legacy_client
+                    .raw_command("select-pane", &["-t", "%0", "-e"])
+                    .await
+                    .unwrap();
+            }
+        }
+        for target in ["%0", sibling.trim()] {
+            assert!(!legacy_client
+                .raw_command("capture-pane", &["-p", "-t", target])
+                .await
+                .unwrap()
+                .contains("UNSAFE-LEGACY"));
+        }
+    })
+    .await;
     control
         .run_reserved(
             reservation(ReservationKind::Adopt),
@@ -344,11 +411,78 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
                         };
                         assert!(matches!(
                             result,
-                            Err(ReservationError::Control(
-                                atmd::control::ControlError::SendRefused { .. }
-                            ))
+                            Err(ReservationError::PaneInputRefused { .. })
                         ));
                     }
+                }
+                let sibling = probe
+                    .raw_command(
+                        "split-window",
+                        &["-d", "-P", "-F", "#{pane_id}", "-t", "%0", "cat"],
+                    )
+                    .await
+                    .unwrap();
+                for synchronized in [true, false] {
+                    if synchronized {
+                        probe
+                            .raw_command(
+                                "set-window-option",
+                                &["-t", "%0", "synchronize-panes", "on"],
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        probe
+                            .raw_command("select-pane", &["-t", "%0", "-d"])
+                            .await
+                            .unwrap();
+                    }
+                    for paste in [true, false] {
+                        let result = if paste {
+                            r.paste_guarded(
+                                &pane,
+                                r.agent().clone(),
+                                "UNSAFE-STATE".into(),
+                                CaptureFormat::Plain,
+                                |_| true,
+                            )
+                            .await
+                        } else {
+                            r.keys_guarded(
+                                &pane,
+                                r.agent().clone(),
+                                PaneKey::Enter,
+                                CaptureFormat::Plain,
+                                |_| true,
+                            )
+                            .await
+                        };
+                        assert!(
+                            matches!(result, Err(ReservationError::PaneInputRefused { .. })),
+                            "{result:?}"
+                        );
+                    }
+                    if synchronized {
+                        probe
+                            .raw_command(
+                                "set-window-option",
+                                &["-t", "%0", "synchronize-panes", "off"],
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        probe
+                            .raw_command("select-pane", &["-t", "%0", "-e"])
+                            .await
+                            .unwrap();
+                    }
+                }
+                for target in ["%0", sibling.trim()] {
+                    let text = probe
+                        .raw_command("capture-pane", &["-p", "-t", target])
+                        .await
+                        .unwrap();
+                    assert!(!text.contains("UNSAFE-STATE"));
                 }
                 probe
                     .raw_command("clock-mode", &["-t", "%0"])
@@ -385,9 +519,7 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
                     };
                     assert!(matches!(
                         result,
-                        Err(ReservationError::Control(
-                            atmd::control::ControlError::SendRefused { .. }
-                        ))
+                        Err(ReservationError::PaneInputRefused { .. })
                     ));
                 }
                 assert!(!r
@@ -400,11 +532,86 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
             |_, _| async { Ok(()) },
         )
         .await;
+    let names = tokio::spawn(check_control_byte_process_names(
+        client.clone(),
+        control.clone(),
+    ))
+    .await;
     cancel.cancel();
     actor.await.unwrap();
     verify_private(&client, &root).await;
     client.raw_command("kill-server", &[]).await.unwrap();
     result.unwrap();
+    names.unwrap();
+    legacy.unwrap();
+}
+
+async fn check_control_byte_process_names(
+    client: RealTmuxClient,
+    control: atmd::control::service::ControlHandle,
+) {
+    for name in ["A\nB", "tab\there", "esc\u{1b}[31mred"] {
+        let command = format!("exec /bin/bash -c 'exec -a \"{name}\" sleep 300'");
+        let created = client
+            .raw_command("new-window", &["-d", "-P", "-F", "#{pane_id}", &command])
+            .await
+            .unwrap();
+        let pane = PaneId::parse(created.trim()).unwrap();
+        let pid = client
+            .raw_command(
+                "display-message",
+                &["-p", "-t", pane.as_str(), "#{pane_pid}"],
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let args = tokio::fs::read(format!("/proc/{}/cmdline", pid.trim()))
+                    .await
+                    .unwrap();
+                if args.split(|byte| *byte == 0).next() == Some(name.as_bytes()) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        client
+            .raw_command(
+                "set-option",
+                &["-p", "-t", pane.as_str(), "@atm-agent", "project/lead"],
+            )
+            .await
+            .unwrap();
+        let mut request = reservation(ReservationKind::Down);
+        request.pane = Some(pane.clone());
+        control
+            .run_reserved(
+                request,
+                move |r| async move {
+                    assert_eq!(r.inspect(&pane).await?.unwrap().foreground_command, None);
+                    assert_eq!(
+                        r.capture(&pane, CaptureFormat::Plain)
+                            .await?
+                            .inspection
+                            .foreground_command,
+                        None
+                    );
+                    r.kill(
+                        &pane,
+                        r.agent().clone(),
+                        serde_json::json!({"test":"control-byte-name"}),
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                    assert!(r.inspect(&pane).await?.is_none());
+                    Ok::<_, ReservationError>(())
+                },
+                |_, _| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+    }
 }
 
 async fn verify_private(client: &RealTmuxClient, root: &str) {
@@ -425,7 +632,7 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
     let root = std::env::var("TMUX_TMPDIR").unwrap();
     assert!(std::path::Path::new(&root).is_absolute());
     assert_ne!(std::env::var("ATM_SOCKET").unwrap(), "/tmp/atm.sock");
-    let label = std::env::var("ATM_TMUX_SOCKET").unwrap();
+    let label = format!("{}-effects", std::env::var("ATM_TMUX_SOCKET").unwrap());
     let client = RealTmuxClient::with_socket(label);
     client
         .raw_command(
@@ -449,6 +656,34 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
         .raw_command("new-session", &["-d", "-s", "linked", "-t", "private"])
         .await
         .unwrap();
+    let socket = client
+        .raw_command("display-message", &["-p", "#{socket_path}"])
+        .await
+        .unwrap();
+    let mut attached = tokio::process::Command::new("tmux")
+        .args(["-S", socket.trim(), "-C", "attach-session", "-t", "private"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while client
+            .raw_command("list-clients", &["-F", "#{client_flags}"])
+            .await
+            .unwrap()
+            .is_empty()
+        {}
+    })
+    .await
+    .unwrap();
+    let baseline = control
+        .observe(&PaneId::parse("%0").unwrap(), CaptureFormat::Plain)
+        .await
+        .unwrap();
+    assert!(baseline.inspection.pane.is_active);
+    assert_eq!(baseline.focused, Some(true));
     let observer = control.clone();
     let verifier = client.clone();
     let private_root = root.clone();
@@ -466,11 +701,17 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
                 assert!(r.inspect(&placement).await?.is_some());
                 let pane = r
                     .split(
-                        SpawnContext::new("%0".into(), None, false),
+                        SpawnContext::new("%0".into(), None, false).with_detached(true),
                         PaneDirection::Below,
                         "50%".into(),
                     )
                     .await?;
+                let after = observer.observe(&placement, CaptureFormat::Plain).await?;
+                assert!(
+                    after.inspection.pane.is_active,
+                    "detached split moved keyboard selection"
+                );
+                assert_eq!(after.focused, baseline.focused);
                 r.tag(&pane, ExpectedTag::Absent).await?;
                 assert_eq!(
                     r.inspect(&pane).await?.unwrap().local_agent_tag.as_deref(),
@@ -545,6 +786,11 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
     actor.await.unwrap();
     verify_private(&client, &root).await;
     client.raw_command("kill-server", &[]).await.unwrap();
+    drop(attached.stdin.take());
+    tokio::time::timeout(Duration::from_secs(30), attached.wait())
+        .await
+        .unwrap()
+        .unwrap();
     result.unwrap();
     let records = org.tail(atmd::org::TailParams::default()).await.unwrap();
     assert_eq!(records.len(), 1);

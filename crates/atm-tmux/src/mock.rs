@@ -22,6 +22,7 @@ pub enum MockCall {
         direction: PaneDirection,
         command: Option<String>,
         cwd: Option<String>,
+        detached: bool,
     },
     NewWindow {
         session: String,
@@ -78,7 +79,7 @@ pub enum MockCall {
 /// let mock = MockTmuxClient::new();
 /// mock.set_next_pane_id("%10");
 ///
-/// let pane_id = mock.split_window("%5", "30%", PaneDirection::Below, None, None).await.unwrap();
+/// let pane_id = mock.split_window("%5", "30%", PaneDirection::Below, None, None, false).await.unwrap();
 /// assert_eq!(pane_id, "%10");
 ///
 /// let calls = mock.calls();
@@ -250,6 +251,7 @@ impl TmuxClient for MockTmuxClient {
         direction: PaneDirection,
         command: Option<&str>,
         cwd: Option<&str>,
+        detached: bool,
     ) -> Result<String, TmuxError> {
         let pane_id = self.next_pane_id();
         self.record(MockCall::SplitWindow {
@@ -258,6 +260,7 @@ impl TmuxClient for MockTmuxClient {
             direction,
             command: command.map(|s| s.to_string()),
             cwd: cwd.map(str::to_string),
+            detached,
         })?;
         Ok(pane_id)
     }
@@ -383,6 +386,7 @@ mod tests {
                 PaneDirection::Below,
                 Some("claude"),
                 Some("/caller"),
+                false,
             )
             .await
             .unwrap();
@@ -410,7 +414,7 @@ mod tests {
     async fn test_mock_default_pane_id() {
         let mock = MockTmuxClient::new();
         let pane_id = mock
-            .split_window("%1", "50%", PaneDirection::Right, None, None)
+            .split_window("%1", "50%", PaneDirection::Right, None, None, false)
             .await
             .unwrap();
         assert_eq!(pane_id, "%99");
@@ -423,12 +427,12 @@ mod tests {
         mock.set_next_pane_id("%11");
 
         let p1 = mock
-            .split_window("%1", "50%", PaneDirection::Right, None, None)
+            .split_window("%1", "50%", PaneDirection::Right, None, None, false)
             .await
             .unwrap();
         let p2 = mock.new_window("sess", None).await.unwrap();
         let p3 = mock
-            .split_window("%1", "50%", PaneDirection::Right, None, None)
+            .split_window("%1", "50%", PaneDirection::Right, None, None, false)
             .await
             .unwrap();
 

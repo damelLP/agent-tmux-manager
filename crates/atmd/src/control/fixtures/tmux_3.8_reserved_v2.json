@@ -1,0 +1,47 @@
+{
+  "capture": "Captured: tmux 3.8, 2026-11-14, private fixed-format command list and control client; root PIDs sanitized to 123.",
+  "samples": [
+    {
+      "label": "unattached",
+      "argv0": "neutral-program",
+      "raw_command": "neutral-program\n",
+      "metadata": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\tneutral-program\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\tneutral-program\t0\t0\n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n"
+    },
+    {
+      "label": "attached",
+      "argv0": "neutral-program",
+      "raw_command": "neutral-program\n",
+      "metadata": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\tneutral-program\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\tneutral-program\t0\t0\n\n\n\n\n\n\nATM-CLIENTS-v1\nattached,focused,control-mode,UTF-8\t%0\nATM-END\t%0\n"
+    },
+    {
+      "label": "paused",
+      "argv0": "neutral-program",
+      "raw_command": "neutral-program\n",
+      "metadata": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\tneutral-program\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\tneutral-program\t0\t0\n\n\n\n\n\n\nATM-CLIENTS-v1\nattached,focused,control-mode,pause-after=5,UTF-8\t%0\nATM-END\t%0\n"
+    },
+    {
+      "label": "unattached",
+      "argv0": "A\nB",
+      "raw_command": "\n",
+      "metadata": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\t\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\t\t0\t0\n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n"
+    },
+    {
+      "label": "unattached",
+      "argv0": "tab\there",
+      "raw_command": "\n",
+      "metadata": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\t\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\t\t0\t0\n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n"
+    },
+    {
+      "label": "unattached",
+      "argv0": "esc\u001b[31mred",
+      "raw_command": "\n",
+      "metadata": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\t\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\tprobe\t0\t123\t40\t6\t1\t0\t0\t0\t0\t0\t\t\t0\t0\n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n"
+    }
+  ]
+}

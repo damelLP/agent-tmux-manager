@@ -281,15 +281,78 @@ async fn observe_queue_is_bounded_and_shutdown_refuses_parked_reads() {
         let _ = control.prepare_spawn(None, None, None, None).await; // enqueue acknowledgement
         queued.push(read);
     }
-    assert!(matches!(
-        control.observe(&target, CaptureFormat::Ansi).await,
-        Err(ReservationError::Unavailable)
-    ));
+    let overflow = control
+        .observe(&target, CaptureFormat::Ansi)
+        .await
+        .unwrap_err();
+    assert!(overflow.to_string().contains("nothing was sent"));
+    assert!(matches!(overflow, ReservationError::PacingRefused { pane } if pane == target));
     // Each barrier may read placement, but none may consume another pane frame.
     assert_eq!(client.mock().calls().iter().skip(calls).filter(|call| matches!(call, MockCall::RawCommand { subcommand, args } if subcommand == "list-panes" && args.iter().any(|arg| arg == "-f"))).count(), 0);
     cancel.cancel();
     for read in queued {
         assert!(matches!(read.await, Err(ReservationError::Unavailable)));
+    }
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn observer_burst_cannot_refuse_another_panes_guarded_paste() {
+    let client = testing::ScriptedTmuxClient::new();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(client.clone()),
+        atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("pacing isolation"),
+        cancel.clone(),
+    );
+    let busy = pane("%9");
+    client.script_observe(&frame("%9", Some(false))).unwrap();
+    control.observe(&busy, CaptureFormat::Ansi).await.unwrap();
+    let mut queued = Vec::new();
+    for _ in 0..32 {
+        let mut read = Box::pin(control.observe(&busy, CaptureFormat::Ansi));
+        std::future::poll_fn(|cx| {
+            assert!(read.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let _ = control.prepare_spawn(None, None, None, None).await;
+        queued.push(read);
+    }
+    for _ in 0..2 {
+        client.script_capture(&frame("%1", Some(false))).unwrap();
+    }
+    let result = control
+        .run_reserved(
+            request(),
+            |r| async move {
+                r.capture(&pane("%1"), CaptureFormat::Ansi).await?;
+                r.paste_guarded(
+                    &pane("%1"),
+                    r.agent().clone(),
+                    "hello".into(),
+                    CaptureFormat::Ansi,
+                    |_| true,
+                )
+                .await
+            },
+            cleanup,
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        client
+            .mock()
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, MockCall::PasteText { .. }))
+            .count(),
+        1
+    );
+    cancel.cancel();
+    for read in queued {
+        let _ = read.await;
     }
     actor.await.unwrap();
 }

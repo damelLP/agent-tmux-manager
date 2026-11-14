@@ -182,6 +182,8 @@ fn contract_transport_observations_reuse_pane_info() {
             bracketed_paste: None,
             cursor_column: 7,
             cursor_row: 0,
+            synchronized: false,
+            input_off: false,
             foreground_pid: None,
             foreground_command: None,
         },

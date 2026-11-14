@@ -89,6 +89,15 @@ atm layout pair                    # two agents + ATM sidebar
 
 `atm role` stores the tag on the pane, so it survives a clear or harness restart there. With no target or a `%N` target it needs only tmux, not atmd; without `$TMUX_PANE`, pass `-t`. A session-id target uses the daemon. `atm list -f json` adds `role: "coordinator"` when a session's pane is tagged and its parent does not share that pane, or `role: null` otherwise (also on failed tmux lookups). No parent, or a parent missing from the full session list, passes: a separate-process teammate on its own tagged pane can coordinate, but an in-process subagent sharing its parent's pane stays null, even when filters hide the parent. Table and ids formats are unchanged. `/atm-coordinate` tags its pane during setup. The TUI shows a bold cyan `C` on coordinator rows and puts them first within each agent group, keeping newest-first order within each band. Nested teammates stay in place. Press `c` to toggle the selected row's pane; group rows, rows without a pane and children sharing their parent's pane are unchanged. External tag changes appear on the next three-second poll; `c` updates the display immediately.
 
+### Sending text
+
+`atm send` refuses input when the window has `synchronize-panes` on (Enter could
+reach sibling panes), when the pane has input off (tmux would silently drop it),
+or when the text contains ASCII control bytes other than tab, LF and CR (including
+ESC, NUL and DEL). These refusals send nothing. Newlines remain allowed unless
+bracketed paste is explicitly off; the existing copy-mode and dialog checks also
+apply.
+
 ## Confirmed messages and inbox
 
 The message CLI is distinct from the immediate `atm send` command. It calls the daemon's `msg.*` service, with no direct-tmux fallback. **The runtime on this branch is not enabled yet:** valid calls return `unavailable`; the commands and contracts below are ready for runtime integration, not evidence of working delivery.

@@ -110,9 +110,11 @@ pub struct ConnectionHandler {
     /// Counter for generating client IDs
     connection_number: u64,
 
-    /// Cancelled on server shutdown, or by the forwarder when this client
-    /// can't keep up with events
+    /// Cancelled on server shutdown; aborts even accepted requests.
     cancel: CancellationToken,
+
+    /// A broken peer stops input/replies, but accepted handlers still finish.
+    peer_failed: CancellationToken,
 
     /// Forwards registry events while subscribed
     forwarder: Option<Forwarder>,
@@ -151,6 +153,7 @@ impl ConnectionHandler {
             subscription_filter: None,
             connection_number,
             cancel,
+            peer_failed: CancellationToken::new(),
             forwarder: None,
             methods,
         }
@@ -269,10 +272,40 @@ impl ConnectionHandler {
     /// Reads and processes messages until the connection closes or an
     /// unrecoverable error occurs.
     async fn process_messages(&mut self) -> Result<(), ConnectionError> {
+        let mut requests = JoinSet::new();
+        let result = self.process_message_loop(&mut requests).await;
+        self.stop_forwarder().await;
+        let mut writable = result.is_ok() && !self.peer_failed.is_cancelled();
+        // EOF/disconnect closes only input. Finish accepted work up to its own
+        // deadline, even if the peer can no longer receive replies. Only daemon
+        // shutdown aborts the remaining jobs by dropping this JoinSet.
+        while !requests.is_empty() {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
+                done = requests.join_next() => match done {
+                    Some(Ok(response)) if writable => {
+                        if let Err(error) = self.send_message(response).await {
+                            debug!(%error, "Stopped replying while draining requests");
+                            writable = false;
+                        }
+                    }
+                    Some(Err(error)) => warn!(%error, "Request task failed while draining"),
+                    Some(Ok(_)) => {},
+                    None => break,
+                }
+            }
+        }
+        result
+    }
+
+    async fn process_message_loop(
+        &mut self,
+        requests: &mut JoinSet<DaemonMessage>,
+    ) -> Result<(), ConnectionError> {
         let cancel = self.cancel.clone();
-        // Own the jobs: any disconnect, error or server cancellation drops and
-        // aborts them, including jobs waiting to write their response.
-        let mut requests: JoinSet<Result<(), ConnectionError>> = JoinSet::new();
+        let peer_failed = self.peer_failed.clone();
+        let writer = Arc::clone(&self.writer);
         loop {
             let subscribed = self.subscribed;
             let mut idle_at = tokio::time::Instant::now() + READ_TIMEOUT;
@@ -285,8 +318,10 @@ impl ConnectionHandler {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return Ok(()),
+                        _ = peer_failed.cancelled() => return Err(ConnectionError::WriteTimeout),
                         Some(done) = requests.join_next(), if !requests.is_empty() => {
-                            done.map_err(|e| ConnectionError::RequestTask(e.to_string()))??;
+                            let response = done.map_err(|e| ConnectionError::RequestTask(e.to_string()))?;
+                            write_message(&writer, &response).await?;
                             idle_at = tokio::time::Instant::now() + READ_TIMEOUT;
                         }
                         read = &mut read => break read,
@@ -303,7 +338,7 @@ impl ConnectionHandler {
             };
 
             // Process the message
-            if let Err(e) = self.handle_message(msg, &mut requests).await {
+            if let Err(e) = self.handle_message(msg, requests).await {
                 // Disconnect: the client is done, which is no error
                 if matches!(e, ConnectionError::Eof) {
                     return Ok(());
@@ -336,7 +371,7 @@ impl ConnectionHandler {
     async fn handle_message(
         &mut self,
         msg: ClientMessage,
-        requests: &mut JoinSet<Result<(), ConnectionError>>,
+        requests: &mut JoinSet<DaemonMessage>,
     ) -> Result<(), ConnectionError> {
         match msg.message {
             MessageType::Connect { .. } => {
@@ -352,7 +387,8 @@ impl ConnectionHandler {
                 from_pane,
             } => {
                 while let Some(done) = requests.try_join_next() {
-                    done.map_err(|e| ConnectionError::RequestTask(e.to_string()))??;
+                    let response = done.map_err(|e| ConnectionError::RequestTask(e.to_string()))?;
+                    self.send_message(response).await?;
                 }
                 if requests.len() >= 64 {
                     self.send_message(DaemonMessage::response_err(
@@ -370,20 +406,13 @@ impl ConnectionHandler {
                     from_pane: from_pane.map(CallerPane),
                 };
                 let methods = Arc::clone(&self.methods);
-                let writer = Arc::clone(&self.writer);
-                let cancel = self.cancel.clone();
                 requests.spawn(async move {
-                    let response = match methods.call(context, &method, params).await {
+                    match methods.call(context, &method, params).await {
                         Ok(value) => DaemonMessage::response_ok(id, value),
                         Err(error) => {
                             DaemonMessage::response_err(id, &error.0.code, &error.0.message)
                         }
-                    };
-                    let sent = write_message(&writer, &response).await;
-                    if sent.is_err() {
-                        cancel.cancel();
                     }
-                    sent
                 });
             }
             MessageType::Watch { .. } => {
@@ -478,7 +507,7 @@ impl ConnectionHandler {
                     events,
                     Arc::clone(&self.writer),
                     self.subscription_filter.clone(),
-                    &self.cancel,
+                    &self.peer_failed,
                 ));
             }
 
@@ -1247,8 +1276,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_and_cancel_drop_pending_request_futures() {
-        for disconnect in [true, false] {
+    async fn shutdown_cancels_pending_requests_even_while_draining() {
+        for half_close in [true, false] {
             let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             struct Guard(tokio::sync::mpsc::UnboundedSender<()>);
@@ -1275,17 +1304,80 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            if disconnect {
+            if half_close {
                 write.shutdown().await.unwrap();
-            } else {
-                cancel.cancel();
             }
+            cancel.cancel();
             timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
             timeout(Duration::from_secs(5), dropped_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_close_and_disconnect_drain_accepted_replies() {
+        for half_close in [true, false] {
+            let (mut read, mut write, _cancel, run) = request_connection(request_router()).await;
+            send_client(&mut write, request("accepted", 1)).await;
+            if half_close {
+                write.shutdown().await.unwrap();
+            } else {
+                send_client(&mut write, ClientMessage::disconnect()).await;
+            }
+            assert!(
+                matches!(receive(&mut read).await, DaemonMessage::Response { id, .. } if id == "accepted")
+            );
+            let mut line = String::new();
+            assert_eq!(
+                timeout(Duration::from_secs(5), read.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            run.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_reply_finishes_remaining_handlers_without_more_writes() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = finished.clone();
+        let mut router = super::super::methods::MethodRouter::default();
+        router
+            .register("wait", Duration::from_secs(100), move |_, params| {
+                let completed = completed.clone();
+                async move {
+                    if params == serde_json::json!(20) {
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::json!("must not write after failed reply"))
+                    } else {
+                        Ok(serde_json::json!("x".repeat(2_000_000)))
+                    }
+                }
+            })
+            .unwrap();
+        let (mut read, mut write, _cancel, run) = request_connection(Arc::new(router)).await;
+        send_client(&mut write, request("blocked", 0)).await;
+        send_client(&mut write, request("mutation", 20)).await;
+        write.shutdown().await.unwrap();
+        timeout(Duration::from_secs(40), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "accepted handler was aborted"
+        );
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            !bytes.contains(&b'\n'),
+            "a second reply followed a partial line"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1318,12 +1410,12 @@ mod tests {
                 Ok(serde_json::Value::String("x".repeat(2_000_000)))
             })
             .unwrap();
-        let (mut read, mut write, cancel, run) = request_connection(Arc::new(router)).await;
+        let (mut read, mut write, _cancel, run) = request_connection(Arc::new(router)).await;
         send_client(&mut write, request("large", 0)).await;
-        timeout(Duration::from_secs(20), cancel.cancelled())
+        timeout(Duration::from_secs(20), run)
             .await
-            .expect("blocked response must cancel connection");
-        timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         let mut bytes = Vec::new();
         timeout(Duration::from_secs(5), read.read_to_end(&mut bytes))
             .await

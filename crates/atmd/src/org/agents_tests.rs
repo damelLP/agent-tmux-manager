@@ -306,7 +306,7 @@ mod reconciliation {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unknown_or_missing_row_stays_starting_without_erasing_binding() {
         for (row, text) in [(true, "unknown\n"), (false, IDLE)] {
             let rig = Rig::new().await;
@@ -320,6 +320,13 @@ mod reconciliation {
             let agent = rig.state("lead").await;
             assert_eq!(agent.status, AgentStatus::Starting);
             assert_eq!(agent.session_id, Some(SessionId::new("recorded")));
+            let cursor = rig.org.status().unwrap();
+            tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+            assert_eq!(
+                agents.list(ListParams::default()).await.unwrap()[0].state,
+                AgentStatus::Starting
+            );
+            assert_eq!(rig.org.status().unwrap(), cursor);
         }
     }
 
@@ -391,11 +398,42 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn excluded_and_child_rows_are_not_liveness() {
+        for child in [false, true] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("recorded")).await;
+            if !child {
+                rig.command(OrgCommand::Clear {
+                    agent_id: "p/lead".parse().unwrap(),
+                })
+                .await;
+                rig.command(OrgCommand::EditorReady {
+                    agent_id: "p/lead".parse().unwrap(),
+                })
+                .await;
+            }
+            rig.row("recorded", "%1", child).await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            let rows = agents.list(ListParams::default()).await.unwrap();
+            assert_eq!(rows[0].state, AgentStatus::Starting);
+            assert!(rows[0].activity.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn busy_restart_recovers_on_event_and_new_real_row_binds() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
         rig.row("pending-100", "%1", false).await;
-        rig.frame("%1", "p/lead", "unknown\n");
+        let running = include_str!(
+            "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
+        );
+        assert_eq!(
+            atm_pi_adapter::screen::observe_screen(running, None).turn,
+            atm_core::TurnState::Running
+        );
+        rig.frame("%1", "p/lead", running);
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
         assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
@@ -619,6 +657,161 @@ mod reconciliation {
             0
         );
         assert_eq!(rig.state("other").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn lagged_events_reread_current_registry_instead_of_replaying_old_rows() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("current", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("recorded"))
+        );
+        rig.frame("%1", "p/lead", IDLE);
+        let mut committed = rig.org.committed.subscribe();
+        // No await: overflow the subscription before it can consume any wake.
+        for _ in 0..2050 {
+            rig.events
+                .send(crate::registry::SessionEvent::Removed {
+                    session_id: SessionId::new("unrelated"),
+                    reason: crate::registry::RemovalReason::Explicit,
+                })
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if committed.recv().await.unwrap().kind == "agent.session_bound" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("current"))
+        );
+    }
+
+    #[tokio::test]
+    async fn coalesced_binding_candidate_cannot_cross_a_completed_clear() {
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.agent("other", Some("%2"), Some("other-row")).await;
+        rig.row("pending-100", "%1", false).await;
+        rig.row("other-row", "%2", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        rig.frame("%2", "p/other", "unknown\n");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = rig.control.clone();
+        let held = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Clear),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok(())
+                    },
+                    cleanup,
+                )
+                .await
+                .unwrap();
+        });
+        entry.await.unwrap();
+        // One Observe parks, another wake becomes its coalesced dirty candidate.
+        rig.row("early", "%1", false).await;
+        for _ in 0..5 {
+            rig.events
+                .send(crate::registry::SessionEvent::Registered {
+                    session_id: SessionId::new("early"),
+                    agent_type: AgentType::GeneralPurpose,
+                })
+                .unwrap();
+        }
+        rig.frame("%2", "p/other", IDLE);
+        let mut committed = rig.org.committed.subscribe();
+        let other = rig
+            .registry
+            .get_session(SessionId::new("other-row"))
+            .await
+            .unwrap();
+        rig.events
+            .send(crate::registry::SessionEvent::Updated {
+                session: Box::new(other),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = committed.recv().await.unwrap();
+                if event.kind == "agent.editor_ready" && event.body["agent_id"] == "p/other" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.command(OrgCommand::EditorReady {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        let mut committed = rig.org.committed.subscribe();
+        rig.frame("%1", "p/lead", IDLE);
+        rig.frame("%1", "p/lead", IDLE);
+        release.send(()).unwrap();
+        held.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut reports = 0;
+            while reports < 2 {
+                let event = committed.recv().await.unwrap();
+                if event.body["agent_id"] == "p/lead"
+                    && matches!(
+                        event.kind.as_str(),
+                        "agent.editor_ready" | "agent.session_bound"
+                    )
+                {
+                    reports += 1;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rig.state("lead").await.session_id, None);
+        assert_eq!(
+            rig.state("lead").await.excluded_session_id,
+            Some(SessionId::new("recorded"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_service_reconciled_is_unavailable() {
+        let rig = Rig::new().await;
+        let cancel = CancellationToken::new();
+        let (agents, task) = spawn_agents(
+            rig.org.clone(),
+            rig.registry.clone(),
+            rig.control.clone(),
+            cancel.clone(),
+        );
+        agents.reconciled().await.unwrap();
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(matches!(
+            agents.reconciled().await,
+            Err(AgentError::Unavailable(_))
+        ));
     }
 
     #[tokio::test]

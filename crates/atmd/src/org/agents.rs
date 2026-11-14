@@ -32,6 +32,16 @@ use tokio_util::sync::CancellationToken;
 const LIST_BUDGET: Duration = Duration::from_secs(5);
 const OBSERVE_BUDGET: Duration = Duration::from_secs(30);
 
+// A wake may wait both in the coalescer and in control admission. Retain only
+// its identity context, never a readiness decision or an event-history mirror.
+#[derive(Clone, Debug)]
+struct BindingCandidate {
+    session: SessionId,
+    pane: Option<String>,
+    binding: Option<SessionId>,
+    excluded: Option<SessionId>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("agent operation '{operation}' is not implemented")]
@@ -360,7 +370,7 @@ impl AgentRuntime {
         Ok(rows)
     }
 
-    async fn observe(&self, id: AgentId, bind: Option<SessionId>) -> Result<(), AgentError> {
+    async fn observe(&self, id: AgentId, bind: Option<BindingCandidate>) -> Result<(), AgentError> {
         let state = self.org.snapshot().await?;
         let Some(agent) = state.agent(&id) else {
             return Ok(());
@@ -369,8 +379,6 @@ impl AgentRuntime {
             return Ok(());
         }
         let pane = agent.pane.clone();
-        let binding = agent.session_id.clone();
-        let exclusion = agent.excluded_session_id.clone();
         let request = ReservationRequest::new(
             id.clone(),
             pane.as_ref().map(PaneId::parse).transpose()?,
@@ -393,12 +401,12 @@ impl AgentRuntime {
                     if agent.status == AgentStatus::Down || agent.pane != pane {
                         return Ok(());
                     }
-                    let bind =
-                        if agent.session_id == binding && agent.excluded_session_id == exclusion {
-                            bind
-                        } else {
-                            None
-                        };
+                    let bind = bind.and_then(|candidate| {
+                        (agent.pane == candidate.pane
+                            && agent.session_id == candidate.binding
+                            && agent.excluded_session_id == candidate.excluded)
+                            .then_some(candidate.session)
+                    });
                     rt.inspect(&r, &state, agent, bind).await
                 },
                 move |_, _| async move {
@@ -606,9 +614,11 @@ pub fn spawn_agents(
     let events = rt.registry.subscribe();
     let committed = rt.org.committed.subscribe();
     let task = tokio::spawn(async move {
-        if let Err(error) = observer(rt, events, committed, &send, &cancel).await {
-            send.send_replace(Some(Err(error.to_string())));
-        }
+        let result = observer(rt, events, committed, &send, &cancel).await;
+        let reason = result
+            .err()
+            .map_or_else(|| "agent service stopped".into(), |error| error.to_string());
+        send.send_replace(Some(Err(reason)));
         cancel.cancel();
         let _ = project_task.await;
         let _ = dispatcher.await;
@@ -663,7 +673,7 @@ async fn observer(
         .filter(|a| a.status != AgentStatus::Down)
         .map(|a| a.id.clone())
         .collect();
-    let mut pending: BTreeMap<_, Option<SessionId>> =
+    let mut pending: BTreeMap<_, Option<BindingCandidate>> =
         initial.iter().cloned().map(|id| (id, None)).collect();
     let mut active = BTreeSet::new();
     let mut jobs = JoinSet::new();
@@ -730,7 +740,7 @@ async fn observer(
 
 async fn schedule(
     rt: &AgentRuntime,
-    pending: &mut BTreeMap<AgentId, Option<SessionId>>,
+    pending: &mut BTreeMap<AgentId, Option<BindingCandidate>>,
     event: Option<SessionId>,
     bind: bool,
 ) -> Result<(), AgentError> {
@@ -750,7 +760,12 @@ async fn schedule(
             .filter(|row| matches_agent(agent, row) && !row.id.is_pending())
             .collect();
         let candidate = if bind && eligible.len() == 1 {
-            eligible.first().map(|row| row.id.clone())
+            eligible.first().map(|row| BindingCandidate {
+                session: row.id.clone(),
+                pane: agent.pane.clone(),
+                binding: agent.session_id.clone(),
+                excluded: agent.excluded_session_id.clone(),
+            })
         } else {
             None
         };

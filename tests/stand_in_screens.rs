@@ -347,6 +347,33 @@ fn lifecycle_facts_survive_documented_and_split_height_viewports() {
 }
 
 #[test]
+fn claude_effort_footer_keeps_facts_at_clipped_token_widths() {
+    let mut rig = StandInRig::start();
+    for columns in [100, 101, 110, 117, 118, 120] {
+        let mut config = StandInConfig::new(StandInMode::Claude);
+        config.manual_clock = true;
+        config.columns = columns;
+        let pane = rig.launch(&config);
+        for frame in ["fresh", "denied"] {
+            if frame == "denied" {
+                let after = rig.event_cursor(&pane);
+                rig.paste(&pane, "/atm/dialog");
+                rendered(&rig, &pane, after, "permission");
+                let after = rig.event_cursor(&pane);
+                rig.key(&pane, "Escape");
+                rendered(&rig, &pane, after, "denied");
+            }
+            assert_eq!(
+                observe(StandInMode::Claude, &rig.capture_plain(&pane)),
+                expected(&format!("claude.{frame}.u5")),
+                "{frame} at {columns} columns"
+            );
+        }
+    }
+    rig.close();
+}
+
+#[test]
 fn value_only_variants_keep_lifecycle_facts_without_pinning_literals() {
     let mut rig = StandInRig::start();
     for (mode, version, model) in [

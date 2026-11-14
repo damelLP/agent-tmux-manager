@@ -132,7 +132,9 @@ def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, se
     # rules. Never clip a right-aligned footer through a warning/model label.
     for i, line in enumerate(lines):
         fitted = line
-        if mode == "pi" and re.fullmatch(r"─+(?: [\u2800-\u28ff] Working ─+)?", line):
+        if mode == "claude" and re.fullmatch(r" +◐ \w+ · /effort *", line) and cell_width(line.rstrip()) > columns:
+            fitted = ""
+        elif mode == "pi" and re.fullmatch(r"─+(?: [\u2800-\u28ff] Working ─+)?", line):
             label = line.rstrip("─")
             fitted = label + "─" * (columns - cell_width(label))
         elif mode == "pi" and i == len(lines) - 1 and cell_width(line) > columns:

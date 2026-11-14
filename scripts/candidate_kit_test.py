@@ -966,6 +966,7 @@ class CandidateKit(unittest.TestCase):
     # Removing progress or treating TERM/file cleanup as exit breaks this gate.
     def test_stop_reports_progress_before_removing_runtime(self):
         import select
+        import time
         import atm_candidate
         self.call('start', self.install())
         status = self.status()
@@ -985,18 +986,26 @@ class CandidateKit(unittest.TestCase):
                              signal.SIGSTOP)
             stopper = subprocess.Popen(['bash', str(self.script), 'stop'], env=self.env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True)
-            self.assertTrue(select.select([stopper.stderr], [], [], 60)[0],
-                            'stop never reported progress')
-            line = stopper.stderr.readline()
-            self.assertIn(f'Process {child.pid} is still stopping', line)
+                                       bufsize=0)
+            progress = f'Process {child.pid} is still stopping'.encode()
+            deadline = time.monotonic() + 120  # outer hang guard, not an exit-duration assertion
+            while True:
+                # Other owned processes may report progress before their exit events.
+                # Unbuffered bytes keep readline from hiding lines from select.
+                remaining = max(0, deadline - time.monotonic())
+                self.assertTrue(select.select([stopper.stderr], [], [], remaining)[0],
+                                'stop never reported held-child progress')
+                line = stopper.stderr.readline()
+                self.assertTrue(line, 'stop exited before held-child progress')
+                if progress in line:
+                    break
             self.assertTrue(Path(status['run']).exists(), 'removed runtime before exit')
             self.assertTrue((self.root / 'kit/active.json').exists())
             self.assertFalse(select.select([fd], [], [], 0)[0])
             signal.pidfd_send_signal(fd, signal.SIGCONT)
-            out, err = stopper.communicate(timeout=30)
+            out, err = stopper.communicate(timeout=120)  # wait for all remaining process exits
             self.assertEqual(stopper.returncode, 0, out + err)
-            self.assertNotIn('is still stopping', err, 'duplicate progress')
+            self.assertNotIn(progress, err, 'duplicate held-child progress')
             self.assertTrue(select.select([fd], [], [], 0)[0], 'stop returned before exit')
             child.wait(timeout=30)
             self.assertFalse(Path(status['run']).exists())

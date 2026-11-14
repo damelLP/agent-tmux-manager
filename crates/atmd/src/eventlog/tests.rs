@@ -457,7 +457,8 @@ fn format_marker_is_created_and_rejects_every_other_value() {
     drop(log);
     for contents in [b"2\n".as_slice(), b"1", b"1\n\n", b"", b"\xff"] {
         fs::write(&marker, contents).unwrap();
-        let error = EventLog::open(dir.path(), Stream::Raw).unwrap_err();
+        // A parallel fork can briefly retain the previous failed open's lock.
+        let error = reopen_result(dir.path(), Stream::Raw).unwrap_err();
         let text = error.to_string();
         assert!(text.contains("unsupported log format"), "{text}");
         assert!(text.contains(&marker.display().to_string()), "{text}");
@@ -514,14 +515,17 @@ fn record(seq: u64) -> Vec<u8> {
 }
 
 fn reopen(root: &Path, stream: Stream) -> EventLog {
+    reopen_result(root, stream).unwrap_or_else(|e| panic!("reopen: {e}"))
+}
+
+fn reopen_result(root: &Path, stream: Stream) -> Result<EventLog, EventLogError> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match EventLog::open(root, stream) {
-            Ok(log) => return log,
             Err(EventLogError::Locked(_)) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5))
             }
-            Err(e) => panic!("reopen: {e}"),
+            result => return result,
         }
     }
 }

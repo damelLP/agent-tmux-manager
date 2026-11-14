@@ -38,6 +38,9 @@ macro_rules! forward {
         }
     };
 }
+#[path = "legacy_disconnect_tests.rs"]
+mod disconnect_tests;
+
 impl TmuxClient for DelayedClient {
     fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
         &'s self,

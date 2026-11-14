@@ -888,6 +888,7 @@ struct AgentRoute {
     binding: Option<SessionId>,
     excluded: Option<SessionId>,
     harness: Option<Harness>,
+    ready: bool,
 }
 
 impl AgentRoute {
@@ -920,6 +921,7 @@ impl AgentRoutes {
                         binding: a.session_id.clone(),
                         excluded: a.excluded_session_id.clone(),
                         harness: a.role.as_ref().map(|r| r.config.harness),
+                        ready: a.status == AgentStatus::Ready,
                     },
                 )
             })
@@ -954,6 +956,22 @@ impl AgentRoutes {
         affected
     }
 
+    /// A Ready agent's own session reporting in from its own pane has nothing to
+    /// bind and is plainly alive: no observation. Its removal, a pane move, any
+    /// other row, and agents in every other state (Stuck included) still wake.
+    fn own_ready_session(&self, ids: &mut BTreeSet<AgentId>, row: Option<&SessionView>) {
+        let Some(row) = row else {
+            return;
+        };
+        ids.retain(|id| {
+            !self.agents.get(id).is_some_and(|route| {
+                route.ready
+                    && route.binding.as_ref() == Some(&row.id)
+                    && route.pane == row.tmux_pane
+            })
+        });
+    }
+
     async fn rebuild(&mut self, rt: &AgentRuntime) -> Result<BTreeSet<AgentId>, AgentError> {
         self.dirty = true;
         let state = rt.org.snapshot().await?;
@@ -975,7 +993,11 @@ impl AgentRoutes {
             return self.rebuild(rt).await;
         }
         match event {
-            Ok(SessionEvent::Updated { session }) => Ok(self.affected(&session.id, Some(&session))),
+            Ok(SessionEvent::Updated { session }) => {
+                let mut ids = self.affected(&session.id, Some(&session));
+                self.own_ready_session(&mut ids, Some(&session));
+                Ok(ids)
+            }
             Ok(SessionEvent::Removed { session_id, .. }) => Ok(self.affected(&session_id, None)),
             Ok(SessionEvent::Registered { session_id, .. }) => {
                 if self.agents.values().all(|a| a.pane.is_none()) {
@@ -986,7 +1008,9 @@ impl AgentRoutes {
                 let row = timeout(LIST_BUDGET, rt.registry.get_session(session_id.clone()))
                     .await
                     .map_err(|_| AgentError::Timeout)?;
-                Ok(self.affected(&session_id, row.as_ref()))
+                let mut ids = self.affected(&session_id, row.as_ref());
+                self.own_ready_session(&mut ids, row.as_ref());
+                Ok(ids)
             }
             Err(_) => Ok(BTreeSet::new()),
         }
@@ -1111,20 +1135,8 @@ async fn observer(
                 }
             }
             _ = async { if let Some(at) = next_wake { tokio::time::sleep_until(at).await; } }, if next_wake.is_some() => {},
-            event = events.recv() => {
-                if matches!(event, Err(broadcast::error::RecvError::Closed)) { break; }
-                #[cfg(test)]
-                rt.progress("scheduling", None);
-                let result = match routes.wake(&rt, event).await {
-                    Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
-                    Err(error) => Err(error),
-                };
-                #[cfg(test)]
-                rt.progress(if result.is_ok() { "scheduled" } else { "schedule_failed" }, None);
-                if let Err(error) = result {
-                    tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
-                }
-            }
+            // Before registry events: routing must reflect a committed lifecycle change
+            // (an agent that just left Ready) before a later row event is filtered by it.
             event = committed.recv() => {
                 match event {
                     Ok(event) if event.kind.starts_with("agent.") => {
@@ -1152,6 +1164,20 @@ async fn observer(
                         if let Err(error) = result { tracing::warn!(%error, "Agent rescan deferred until next wake"); }
                     },
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            event = events.recv() => {
+                if matches!(event, Err(broadcast::error::RecvError::Closed)) { break; }
+                #[cfg(test)]
+                rt.progress("scheduling", None);
+                let result = match routes.wake(&rt, event).await {
+                    Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
+                    Err(error) => Err(error),
+                };
+                #[cfg(test)]
+                rt.progress(if result.is_ok() { "scheduled" } else { "schedule_failed" }, None);
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
                 }
             }
         }

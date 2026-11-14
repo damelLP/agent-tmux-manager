@@ -334,6 +334,42 @@ mod reconciliation {
 
     #[tokio::test]
     async fn review_runtime_updates_leave_ready_without_writes() {
+        let running = include_str!(
+            "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
+        );
+        for text in [IDLE, running, "unknown\n"] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("recorded")).await;
+            rig.row("recorded", "%1", false).await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let mut events = agents.observation_events();
+            let before = rig.org.status().unwrap();
+            // A whole frame is scripted, so a screen read or a restart-style check
+            // on this ordinary wake would consume it, and could write.
+            rig.frame("%1", "p/lead", text);
+            // Another row on the pane reports in: the agent is observed.
+            rig.row("pending-200", "%1", false).await;
+            progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+            assert_eq!(rig.org.status().unwrap(), before);
+            // The inspection (2 reads) is consumed, the capture (3) is not.
+            assert_eq!(
+                rig.client
+                    .pending_reads(&PaneId::parse("%1").unwrap())
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                agents.list(ListParams::default()).await.unwrap()[0].reason,
+                None
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_ready_agents_own_session_events_start_no_observation() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
         rig.row("recorded", "%1", false).await;
@@ -341,15 +377,53 @@ mod reconciliation {
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
         let mut events = agents.observation_events();
-        for _ in 0..2 {
-            let before = rig.org.status().unwrap();
-            // No screen read: neither idle nor busy activity changes readiness.
-            rig.inspect_only("%1", "p/lead");
-            update(&rig, "recorded").await;
-            progress(&mut events, "finished", Some("p/lead")).await;
-            assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
-            assert_eq!(rig.org.status().unwrap(), before);
+        let before = rig.org.status().unwrap();
+        let calls = rig.client.mock().calls().len();
+        rig.inspect_only("%1", "p/lead");
+        let row = rig
+            .registry
+            .get_session(SessionId::new("recorded"))
+            .await
+            .unwrap();
+        // A hook or status line of the bound session, and its re-registration:
+        // nothing to bind, and the agent is plainly alive.
+        for event in [
+            crate::registry::SessionEvent::Updated {
+                session: Box::new(row.clone()),
+            },
+            crate::registry::SessionEvent::Registered {
+                session_id: row.id.clone(),
+                agent_type: AgentType::GeneralPurpose,
+            },
+        ] {
+            rig.events.send(event).unwrap();
+            progress(&mut events, "scheduled", None).await;
         }
+        // Paused clock: this lets any queued or paced observation run.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.phase, "started", "{event:?}");
+        }
+        assert_eq!(rig.client.mock().calls().len(), calls);
+        assert_eq!(rig.org.status().unwrap(), before);
+        // The same session leaving its pane, or ending, still wakes the agent.
+        let mut moved = row.clone();
+        moved.tmux_pane = Some("%9".into());
+        for event in [
+            crate::registry::SessionEvent::Updated {
+                session: Box::new(moved),
+            },
+            crate::registry::SessionEvent::Removed {
+                session_id: row.id.clone(),
+                reason: crate::registry::RemovalReason::Explicit,
+            },
+        ] {
+            rig.events.send(event).unwrap();
+            progress(&mut events, "finished", Some("p/lead")).await;
+            rig.inspect_only("%1", "p/lead");
+        }
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert_eq!(rig.org.status().unwrap(), before);
     }
 
     #[tokio::test]
@@ -383,6 +457,14 @@ mod reconciliation {
         assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
         assert_eq!(rig.state("lead").await.session_id, None);
         assert_eq!(rig.org.status().unwrap(), before + 1);
+        // Only the adopted agent was observed: the other pane's scripted
+        // inspection and capture are all still unread.
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            5
+        );
     }
 
     #[tokio::test]
@@ -403,9 +485,6 @@ mod reconciliation {
             rig.state("lead").await.session_id,
             Some(SessionId::new("fresh"))
         );
-        rig.inspect_only("%1", "p/lead");
-        update(&rig, "fresh").await;
-        progress(&mut events, "finished", Some("p/lead")).await;
         assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
     }
 
@@ -923,6 +1002,8 @@ mod reconciliation {
         let rig = Rig::gated(Some(("agent.session_lost", gate))).await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
         rig.row("recorded", "%1", false).await;
+        // A Ready agent's own session no longer wakes it; another row on its pane does.
+        rig.row("pending-100", "%1", false).await;
         rig.frame("%1", "p/lead", IDLE);
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
@@ -938,7 +1019,7 @@ mod reconciliation {
             .await
         });
         let release = entered.recv().await.unwrap();
-        update(&rig, "recorded").await;
+        update(&rig, "pending-100").await;
         progress(&mut events, "scheduling", None).await;
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
         progress(&mut events, "schedule_failed", None).await;
@@ -1837,6 +1918,8 @@ mod reconciliation {
         rig.agent("lead", Some("%1"), Some("lead-row")).await;
         rig.agent("other", Some("%2"), Some("other-row")).await;
         rig.row("lead-row", "%1", false).await;
+        // A Ready agent's own session no longer wakes it; another row on its pane does.
+        rig.row("pending-300", "%1", false).await;
         rig.row("other-row", "%2", false).await;
         rig.frame("%1", "p/lead", IDLE);
         rig.frame("%2", "p/other", "unknown\n");
@@ -1870,7 +1953,7 @@ mod reconciliation {
         rig.frame("%2", "p/other", IDLE);
         let row = rig
             .registry
-            .get_session(SessionId::new("lead-row"))
+            .get_session(SessionId::new("pending-300"))
             .await
             .unwrap();
         let mut committed = rig.org.committed.subscribe();

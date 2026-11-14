@@ -974,14 +974,14 @@ async fn observer(
         if initial.is_empty() && ready.borrow().is_none() {
             ready.send_replace(Some(Ok(())));
         }
+        // One clock read per pass: an agent due between two reads would be
+        // neither started nor timed, and wait for an unrelated event.
+        let now = Instant::now();
         while active.len() < OBSERVER_CONCURRENCY {
             let next = pending
                 .keys()
                 .find(|id| {
-                    !active.contains(*id)
-                        && next_observation
-                            .get(*id)
-                            .is_none_or(|at| *at <= Instant::now())
+                    !active.contains(*id) && next_observation.get(*id).is_none_or(|at| *at <= now)
                 })
                 .cloned();
             let Some(id) = next else {
@@ -1003,7 +1003,7 @@ async fn observer(
             .keys()
             .filter(|id| !active.contains(*id))
             .filter_map(|id| next_observation.get(id).copied())
-            .filter(|at| *at > Instant::now())
+            .filter(|at| *at > now)
             .min();
         #[cfg(test)]
         rt.progress("dispatched", None);

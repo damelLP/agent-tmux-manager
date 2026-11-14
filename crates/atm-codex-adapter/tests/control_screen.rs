@@ -458,6 +458,56 @@ fn real_hook_pages_are_partial_never_complete() {
 }
 
 #[test]
+fn synthetic_noncanonical_hook_counts_refuse_in_every_column() {
+    let mut pages = vec![plain(PENDING), plain(TRUSTED)];
+    for (name, text, _) in p2_frames() {
+        if name.contains("11-pending-sweep-down13-120x40")
+            || name.contains("11-trusted-down13-120x40")
+        {
+            pages.push(plain(&text));
+        }
+    }
+    assert_eq!(pages.len(), 4);
+    for text in pages {
+        assert!(matches!(
+            observe(&text).dialog,
+            ControlDialog::HookList { .. }
+        ));
+        let event = if text.contains("Interrupt") {
+            "Interrupt"
+        } else {
+            "PermissionRequest"
+        };
+        let row = text.lines().find(|line| line.contains(event)).unwrap();
+        let tokens: Vec<_> = row.split_whitespace().collect();
+        let event_index = tokens.iter().position(|token| *token == event).unwrap();
+        let count_columns = if text.contains("t trust all") { 3 } else { 2 };
+        for index in event_index + 1..=event_index + count_columns {
+            // Synthetic: preserve the numeric value where possible but damage
+            // its decimal spelling, including zero counts on omitted extra rows.
+            for count in [
+                format!("+{}", tokens[index]),
+                format!("0{}", tokens[index]),
+                "-0".into(),
+                "١".into(),
+                "4294967296".into(),
+            ] {
+                let mut damaged = tokens.clone();
+                damaged[index] = &count;
+                let mutated = text.replace(row, &damaged.join(" "));
+                for input in [ScreenInput::Plain(&mutated), ScreenInput::Styled(&mutated)] {
+                    assert_eq!(
+                        observe_control_screen(input, None).dialog,
+                        ControlDialog::Unknown,
+                        "{event} column {index}: {count}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn synthetic_complete_sets_follow_p6_exactly() {
     // Synthetic: validator data exercise mixed active counts, not an invented
     // accepted screen. Real complete collections are covered by the P2 replay.

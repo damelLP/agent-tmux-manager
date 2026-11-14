@@ -35,6 +35,16 @@ pub fn validate_hook_list(entries: &[HookListEntry]) -> bool {
             || entries.iter().all(|e| e.review.is_none()))
 }
 
+fn hook_count(value: &str) -> Option<u32> {
+    if value.is_empty()
+        || !value.bytes().all(|c| c.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn valid_counts(entry: &HookListEntry) -> bool {
     entry.installed == 1
         && match entry.review {
@@ -203,10 +213,10 @@ fn hook_list(body: &[&str], text: &str) -> Option<ControlDialog> {
         };
         let mut columns = row.split_whitespace();
         let event = columns.next()?;
-        let installed = columns.next()?.parse().ok()?;
-        let active = columns.next()?.parse().ok()?;
+        let installed = hook_count(columns.next()?)?;
+        let active = hook_count(columns.next()?)?;
         let review = if pending {
-            Some(columns.next()?.parse().ok()?)
+            Some(hook_count(columns.next()?)?)
         } else {
             None
         };

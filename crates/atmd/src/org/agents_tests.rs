@@ -769,7 +769,7 @@ mod reconciliation {
         rig.row("pending-100", "%1", false).await;
         rig.frame("%1", "p/lead", IDLE);
         let (agents, _) = rig.start();
-        let _held = entered.recv().await.unwrap();
+        let release = entered.recv().await.unwrap();
         tokio::time::advance(std::time::Duration::from_secs(7)).await;
         let result = rig
             .control
@@ -785,10 +785,23 @@ mod reconciliation {
                 ReservationError::Quarantined { .. }
             ))
         ));
-        assert!(matches!(
-            agents.reconciled().await,
-            Err(AgentError::Unavailable(_))
-        ));
+        agents.reconciled().await.unwrap();
+        release.send(()).unwrap();
+        rig.org.snapshot().await.unwrap();
+        let rows = agents.list(ListParams::default()).await.unwrap();
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("observation unavailable"));
+        agents
+            .lifecycle(
+                request("p/healthy", None, ReservationKind::Down),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
         rig.control
             .run_reserved(
                 request("p/other", None, ReservationKind::Observe),

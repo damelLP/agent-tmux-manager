@@ -96,6 +96,7 @@ struct AgentService {
     runtime: Option<AgentRuntime>,
     projects: Option<AgentProjects>,
     ready: watch::Receiver<Option<Result<(), String>>>,
+    errors: watch::Receiver<BTreeMap<AgentId, String>>,
     lifecycle: Option<mpsc::Sender<LifecycleJob>>,
 }
 
@@ -136,6 +137,7 @@ impl AgentHandle {
                 runtime: None,
                 projects: None,
                 ready,
+                errors: watch::channel(BTreeMap::new()).1,
                 lifecycle: None,
             }),
         }
@@ -182,6 +184,12 @@ impl AgentHandle {
             .lifecycle
             .as_ref()
             .ok_or_else(|| self.unavailable("lifecycle admission"))?;
+        if let Some(reason) = self.inner.errors.borrow().get(&request.agent) {
+            return Err(AgentError::Unavailable(format!(
+                "{}: {reason}",
+                request.agent
+            )));
+        }
         let control = rt.control.clone();
         let (admitted, admission) = oneshot::channel();
         let (reply, response) = oneshot::channel();
@@ -352,7 +360,16 @@ impl AgentHandle {
             Ok(state
                 .agents()
                 .filter(|a| filter.as_ref().is_none_or(|id| &a.id.project == id))
-                .map(|a| list_entry(&state, a, &rows))
+                .map(|a| {
+                    let mut entry = list_entry(&state, a, &rows);
+                    if let Some(error) = self.inner.errors.borrow().get(&a.id) {
+                        entry.reason = Some(match entry.reason {
+                            Some(reason) => format!("{reason}; observation unavailable: {error}"),
+                            None => format!("observation unavailable: {error}"),
+                        });
+                    }
+                    entry
+                })
                 .collect())
         })
         .await
@@ -633,6 +650,7 @@ pub fn spawn_agents(
     };
     let (projects, project_task) = AgentProjects::spawn(rt.org.clone(), cancel.child_token());
     let (send, ready) = watch::channel(None);
+    let (errors, error_state) = watch::channel(BTreeMap::new());
     let (lifecycle, receive) = mpsc::channel(32);
     let dispatcher = tokio::spawn(dispatch_lifecycle(receive, cancel.child_token()));
     let handle = AgentHandle {
@@ -641,6 +659,7 @@ pub fn spawn_agents(
             runtime: Some(rt.clone()),
             projects: Some(projects),
             ready,
+            errors: error_state,
             lifecycle: Some(lifecycle),
         }),
     };
@@ -649,7 +668,7 @@ pub fn spawn_agents(
     let events = rt.registry.subscribe();
     let committed = rt.org.committed.subscribe();
     let task = tokio::spawn(async move {
-        let result = observer(rt, events, committed, &send, &cancel).await;
+        let result = observer(rt, events, committed, &send, &errors, &cancel).await;
         let reason = result
             .err()
             .map_or_else(|| "agent service stopped".into(), |error| error.to_string());
@@ -700,9 +719,20 @@ async fn observer(
     mut events: broadcast::Receiver<SessionEvent>,
     mut committed: broadcast::Receiver<Arc<crate::eventlog::Envelope>>,
     ready: &watch::Sender<Option<Result<(), String>>>,
+    errors: &watch::Sender<BTreeMap<AgentId, String>>,
     cancel: &CancellationToken,
 ) -> Result<(), AgentError> {
-    let state = rt.org.snapshot().await?;
+    let state = loop {
+        match rt.org.snapshot().await {
+            Ok(state) => break state,
+            Err(error) => tracing::warn!(%error, "Agent initialization deferred until next wake"),
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            event = events.recv() => if matches!(event, Err(broadcast::error::RecvError::Closed)) { return Ok(()); },
+            event = committed.recv() => if matches!(event, Err(broadcast::error::RecvError::Closed)) { return Ok(()); },
+        }
+    };
     let mut initial: BTreeSet<_> = state
         .agents()
         .filter(|a| a.status != AgentStatus::Down)
@@ -712,10 +742,10 @@ async fn observer(
         initial.iter().cloned().map(|id| (id, None)).collect();
     let mut active = BTreeSet::new();
     let mut jobs = JoinSet::new();
-    let mut failure = None;
+    let mut restart = initial.clone();
     loop {
         if initial.is_empty() && ready.borrow().is_none() {
-            ready.send_replace(Some(failure.take().map_or(Ok(()), Err)));
+            ready.send_replace(Some(Ok(())));
         }
         while active.len() < 32 {
             let next = pending.keys().find(|id| !active.contains(*id)).cloned();
@@ -723,7 +753,7 @@ async fn observer(
                 break;
             };
             let bind = pending.remove(&id).flatten();
-            let first = initial.contains(&id);
+            let first = restart.contains(&id);
             let bind = if first { None } else { bind };
             active.insert(id.clone());
             #[cfg(test)]
@@ -747,10 +777,16 @@ async fn observer(
                         active.remove(&id);
                         #[cfg(test)]
                         rt.progress("finished", Some(id.clone()));
-                        let first = initial.remove(&id);
-                        if let Err(error) = result {
-                            if first && failure.is_none() { failure = Some(error.to_string()); }
-                            tracing::warn!(agent = %id, %error, "Agent observation failed");
+                        initial.remove(&id);
+                        match result {
+                            Err(error) => {
+                                errors.send_modify(|errors| { errors.insert(id.clone(), error.to_string()); });
+                                tracing::warn!(agent = %id, %error, "Agent observation failed");
+                            }
+                            Ok(()) => {
+                                restart.remove(&id);
+                                errors.send_modify(|errors| { errors.remove(&id); });
+                            }
                         }
                     }
                     Some(Err(error)) => return Err(AgentError::Internal(format!("agent observer: {error}"))),
@@ -770,17 +806,25 @@ async fn observer(
                 let result = schedule(&rt, &mut pending, id, bind).await;
                 #[cfg(test)]
                 rt.progress(if result.is_ok() { "scheduled" } else { "schedule_failed" }, None);
-                result?;
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
+                }
             }
             event = committed.recv() => {
                 match event {
                     Ok(event) if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") => {
-                        schedule(&rt, &mut pending, None, false).await?;
+                        if let Err(error) = schedule(&rt, &mut pending, None, false).await {
+                            tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
+                        }
                         #[cfg(test)]
                         rt.progress("committed_scheduled", None);
                     },
                     Ok(_) => {},
-                    Err(broadcast::error::RecvError::Lagged(_)) => schedule(&rt, &mut pending, None, false).await?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Err(error) = schedule(&rt, &mut pending, None, false).await {
+                            tracing::warn!(%error, "Agent rescan deferred until next wake");
+                        }
+                    },
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

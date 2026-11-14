@@ -57,26 +57,28 @@ on the substituted quota/account/session values.
 
 - No real permission/trust dialog was captured. Those shapes remain Unknown;
   the misleading permission filename cannot supply positive approval evidence.
-- No free-text/multiline/whitespace draft was captured. Synthetic mutations
-  test refusal, not claims about real UI rendering.
-- Captures contain no cursor or attributes (`capture-pane -p`). Tests pass
+- U5b adds real free-text drafts, which remain all Unknown because they lack
+  the regular shortcut footer. Multiline/whitespace drafts remain synthetic.
+- U5 has no cursor/attributes; U5b has sidecars, deferred to U8d. Tests pass
   None; supplied cursor metadata refuses observation even at the prompt's Home
   position. Cursor/control/truncation mutations are explicitly Synthetic.
 - Fixed footer/dialog labels, separators, option wording and prompt glyphs
   remain exact. Versions, model/effort, cwd/branch/title, elapsed times, clock
   values and warning counts match their shapes, not captured literals. A
   scrolled-off header does not invalidate a complete ordinary bottom layout;
-  fresh logo evidence still requires the header. Changed structure (unknown
+  fresh evidence still requires the header. Changed structure (unknown
   UI, damaged border/footer, unsupported dialog) remains Unknown. A missing
   shortcut footer is not a regular editor; only the captured completion menu
   has that variant.
-- No additional real Codex screen was supplied for value generalization.
+- The original value generalization used only U5; U5b now extends real coverage.
   `value_variations_preserve_facts` changes values in each named U5 fixture,
   explicitly labelled Synthetic; malformed-value and structural-damage tests
   retain conservative refusals. All original real fixture assertions remain.
 - The status capture has a clipped old update banner but a complete current
   header/status/composer/footer. Truncated current UI is not an idle signal.
-- Fresh evidence requires the complete captured logo without conversation.
+- Fresh evidence requires the header, regular composer/footer and no conversation;
+  getting-started help and the complete logo are optional. Neither a partial
+  logo nor arbitrary content is fresh.
   `new-picker` and `clear-poll-01` are identical but came from different
   operations: Present is not proof a particular clear completed or a new
   generation began. Already-fresh/Git-worktree clears are unverified.
@@ -85,6 +87,32 @@ on the substituted quota/account/session values.
 - Launch policy exports `/new`, required `--no-daemon`, model flag `-m`.
   Legacy registry/spawn behavior is unchanged; daemon/role argv wiring is
   later work, not exercised here.
+
+## U5b captures and anchor regressions
+
+**Captured: codex-cli 0.167.0, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.**
+
+All 24 `codex-<state>.plain.txt` sources map one-to-one to
+`screen_u5b_codex-<state>_0.167.0.txt`. Files retain their individual provenance
+first line; tests remove only that label. The producer already replaced paths
+with `~`; copies are byte-identical, including blank rows. Each of rich, poor,
+and the supplementary screen-with-colorterm modes has eight states:
+
+| States in each mode | Input / Turn / Dialog / Fresh |
+|---|---|
+| fresh, erased, after-clear | Unknown / NotRunning / None / Present |
+| same-text-draft, same-text-draft-cursor-start, different-draft, after-clear-same-text-draft, after-clear-different-draft | Unknown / Unknown / Unknown / Unknown |
+
+`u5b_captured_screens` asserts all four facts for all 24 names. Fresh/erased
+have startup help; after-clear has neither help nor logo. All use cwd `~`.
+The placeholder remains Unknown in plain text. Synthetic vertical relocations
+check that a first-nonblank header and trailing Working status use their chrome,
+not row numbers. F12's renamed fresh-layout test checks determinism and rejection
+of conversation/partial logos, not generation tracking.
+
+**F9 known limit:** update dialogs still require the captured first selection
+and npm-install wording; the warning viewer requires a one-line message.
+Other configurations safely refuse as Unknown, pending real captures.
 
 No RPC method is added. Captures and synthetic refusals are parser conformance
 coverage; static policies have exact-value tests.

@@ -7,11 +7,14 @@
 //!
 //! The placeholder may also be an identical draft: it always remains Unknown.
 //! **Consumers cannot deliver into Codex under this plain-text contract yet.**
-//! Cursor/attribute inference is deferred until backed by real captures. Only the
-//! captured `/new` completion is a known draft. Permission/trust dialogs and
-//! free-text draft layouts were not captured; no speculative recognizer is added.
+//! U5b captured cursor/attribute collisions; styled inference remains a follow-up.
+//! Only the captured `/new` completion is a known draft; U5b's real free-text
+//! drafts lack shortcut chrome and remain Unknown. No permission/trust dialog
+//! was captured; no speculative recognizer is added.
 //!
-//! Fresh logo layout is not evidence that a particular clear completed: two U5
+//! Captured: codex-cli 0.167.0, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
+//! Fresh means a header and otherwise blank history, with optional startup help
+//! and logo. It is not evidence that a particular clear completed: two U5
 //! captures from different operations are byte-identical. Consumers own operation
 //! transitions, pane/process identity, live viewport, copy-mode and temporal checks.
 
@@ -30,6 +33,14 @@ pub const LAUNCH_POLICY: LaunchPolicy = LaunchPolicy {
 
 const HEADER_PREFIX: &str = "  >_ OpenAI Codex (v";
 const REVIEW_HELP: &str = "/review - review any changes and find issues";
+const STARTUP_HELP: &[&str] = &[
+    "To get started, describe a task or try one of these commands:",
+    "/init - create an AGENTS.md file with instructions for Codex",
+    "/status - show current session configuration",
+    "/permissions - choose what Codex is allowed to do",
+    "/model - choose what model and reasoning effort to use",
+    REVIEW_HELP,
+];
 const LOGO: &[&str] = &[
     "⣀⣤⣤⣤⣀⣀",
     "⣠⣶⣿⣿⣿⣿⣿⣿⣿⣿⣦⣤⣤⣤⣤⣤⣤⡀",
@@ -84,7 +95,7 @@ fn header<'a>(lines: &[&'a str]) -> Option<(usize, &'a str)> {
             .is_some_and(version)
     })?;
     let cwd = lines.get(index + 1)?.strip_prefix("     ")?.trim_end();
-    (cwd.starts_with('/') || cwd.starts_with("~/")).then_some((index, cwd))
+    (cwd == "~" || cwd.starts_with('/') || cwd.starts_with("~/")).then_some((index, cwd))
 }
 
 fn known_dialog(lines: &[&str]) -> bool {
@@ -136,7 +147,7 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     if name.is_empty()
         || effort.is_empty()
         || !effort.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
-        || !(location.starts_with('/') || location.starts_with("~/"))
+        || !(location == "~" || location.starts_with('/') || location.starts_with("~/"))
     {
         return None;
     }
@@ -158,19 +169,20 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
         return None;
     };
     let body = nonblank(history.get(header_index.map_or(0, |index| index + 2)..)?);
-    let fresh = header_index == Some(1) && body == LOGO && input == InputState::Unknown;
+    let fresh_body = body.strip_prefix(STARTUP_HELP).unwrap_or(&body);
+    let fresh = header_index.is_some_and(|index| {
+        history
+            .get(..index)
+            .is_some_and(|prefix| prefix.iter().all(|line| line.trim().is_empty()))
+    }) && (fresh_body.is_empty() || fresh_body == LOGO)
+        && dialog == DialogState::None;
     let last_history = body.last().copied().unwrap_or_default();
     let turn = if last_history
         .strip_prefix("• Working (")
         .and_then(|s| s.strip_suffix(" • esc to interrupt)"))
         .is_some_and(duration)
     {
-        // The captured active status is exactly three rows above the composer.
-        if history.get(history.len().saturating_sub(3)) == Some(&last_history) {
-            TurnState::Running
-        } else {
-            TurnState::Unknown
-        }
+        TurnState::Running
     } else if fresh
         || worked_status(last_history)
         || last_history == "■ Conversation interrupted - use /feedback if something went wrong"
@@ -330,6 +342,82 @@ mod tests {
     }
 
     #[test]
+    fn u5b_captured_screens() {
+        let fresh = ScreenFacts {
+            input: InputState::Unknown,
+            turn: TurnState::NotRunning,
+            dialog: DialogState::None,
+            fresh_editor: FreshEditorEvidence::Present,
+        };
+        let mut cases = Vec::new();
+        macro_rules! case {
+            ($mode:literal, $state:literal, $want:expr) => {
+                cases.push((
+                    concat!($mode, "-", $state),
+                    include_str!(concat!(
+                        "../tests/fixtures/screen_u5b_codex-",
+                        $mode,
+                        "-",
+                        $state,
+                        "_0.167.0.txt"
+                    ))
+                    .split_once('\n')
+                    .unwrap()
+                    .1,
+                    $want,
+                ));
+            };
+        }
+        macro_rules! mode {
+            ($mode:literal) => {
+                case!($mode, "fresh", fresh.clone());
+                case!($mode, "erased", fresh.clone());
+                case!($mode, "after-clear", fresh.clone());
+                case!($mode, "same-text-draft", ScreenFacts::default());
+                case!(
+                    $mode,
+                    "same-text-draft-cursor-start",
+                    ScreenFacts::default()
+                );
+                case!($mode, "different-draft", ScreenFacts::default());
+                case!($mode, "after-clear-same-text-draft", ScreenFacts::default());
+                case!($mode, "after-clear-different-draft", ScreenFacts::default());
+            };
+        }
+        // Captured: codex-cli 0.167.0, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
+        mode!("rich");
+        mode!("poor");
+        mode!("screen-with-colorterm");
+        assert_eq!(cases.len(), 24);
+        for (name, text, expected) in cases {
+            assert_eq!(observe_screen(text, None), expected, "{name}");
+            assert_eq!(
+                observe_screen(text.trim_end_matches('\n'), None),
+                expected,
+                "{name} trimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_header_and_running_status_have_no_absolute_rows() {
+        // Synthetic: relocate U5 header/status by changing only blank spacing and cwd.
+        for blanks in [0, 1, 6] {
+            let text = format!("{}{}", "\n".repeat(blanks), FRESH.trim_start_matches('\n'))
+                .replace("/tmp/u8a-fixture/cwd/codex", "~");
+            assert_eq!(
+                observe_screen(&text, None).fresh_editor,
+                FreshEditorEvidence::Present
+            );
+        }
+        let text = RUNNING.replace(
+            "• Working (0s • esc to interrupt)",
+            "• Working (0s • esc to interrupt)\n\n\n\n",
+        );
+        assert_eq!(observe_screen(&text, None).turn, TurnState::Running);
+    }
+
+    #[test]
     fn value_variations_preserve_facts() {
         for (name, text, expected) in cases() {
             // Synthetic: value variation of each named U5 fixture; no new real Codex capture.
@@ -454,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_fresh_frames_do_not_prove_new_generation() {
+    fn fresh_layout_is_deterministic_and_rejects_conversation() {
         // The raw new-picker and clear-poll-01 captures are byte-identical (README).
         // Present is a snapshot fact; calling again cannot prove a transition occurred.
         assert_eq!(
@@ -502,10 +590,6 @@ mod tests {
             RUNNING.replace(
                 "• Working (0s • esc to interrupt)",
                 "• Unrecognized progress",
-            ),
-            RUNNING.replace(
-                "• Working (0s • esc to interrupt)",
-                "• Working (0s • esc to interrupt)\n\n\n\n",
             ),
             IDLE.replace("Worked for 1s • 11:31 AM", "Unrecognized operation"),
         ] {

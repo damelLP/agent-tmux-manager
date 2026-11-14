@@ -1,0 +1,31 @@
+Captured: codex-cli 0.167.0, 2026-11-14, capture-pane -p; private tmux, 100x30; poor.
+
+  >_ OpenAI Codex (v0.167.0)
+     ~
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · ~
+

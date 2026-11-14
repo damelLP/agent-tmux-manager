@@ -1,5 +1,8 @@
 //! Synthetic multi-project histories: no harness, clock, daemon or tmux.
-use super::support::{content, editor_ready_cycle, role, summary, time};
+use super::support::{
+    assert_agent_invariants, assert_decided_bindings, assert_editor_ready_preserves, content,
+    editor_ready_cycle, role, summary, time,
+};
 use atm_core::Money;
 use atm_org::*;
 use chrono::{DateTime, Duration, Utc};
@@ -197,12 +200,14 @@ impl History {
     /// Deliberately serialize every decision and application, never deciding two
     /// potentially conflicting commands from the same snapshot.
     pub fn step(&mut self, command: OrgCommand) -> Result<Vec<OrgEvent>, Refusal> {
+        assert_agent_invariants(&self.state);
         let before = self.state.clone();
         let result = self
             .state
             .decide(&command, time() + Duration::milliseconds(self.seq as i64));
         assert_eq!(self.state, before, "decide mutated state for {command:?}");
         let events = result?;
+        assert_decided_bindings(&self.state, &events);
         for event in &events {
             self.seq += 3; // sparse sequence numbers remain the actual message IDs
             let ts = time() + Duration::milliseconds(self.seq as i64);
@@ -211,6 +216,8 @@ impl History {
                 result.is_ok(),
                 "decide returned an inapplicable event: {command:?}, {event:?}: {result:?}"
             );
+            assert_agent_invariants(&self.state);
+            assert_editor_ready_preserves(&before, &self.state, event);
             self.kinds.insert(event.kind().into());
             self.records.push(Record {
                 seq: self.seq,
@@ -500,8 +507,10 @@ impl History {
         ] {
             history.step(command).unwrap();
         }
-        for command in editor_ready_cycle(agent(0), "lead-3", "lead-4") {
-            history.step(command).unwrap();
+        for (index, old) in ["lead-3", "worker-1", "other-2"].into_iter().enumerate() {
+            for command in editor_ready_cycle(agent(index), old, &format!("session-{index}-1")) {
+                history.step(command).unwrap();
+            }
         }
         assert_eq!(history.kinds.len(), 19);
         assert_eq!(history.state.agents().count(), 3);
@@ -515,5 +524,6 @@ pub fn fold(records: &[Record], state: &mut OrgState, stats: &mut ReplayStats) {
         stats
             .apply_parts(state, record.seq, record.ts, &record.kind, &record.body)
             .unwrap();
+        assert_agent_invariants(state);
     }
 }

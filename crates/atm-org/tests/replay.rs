@@ -5,7 +5,9 @@ mod support;
 use atm_core::Money;
 use atm_org::*;
 use proptest::prelude::*;
+use proptest::test_runner::{Config, RngSeed, TestRunner};
 use serde_json::{json, Value};
+use std::{cell::RefCell, collections::BTreeMap};
 use support::*;
 
 #[test]
@@ -354,7 +356,7 @@ fn seeded_log() -> Vec<OrgEvent> {
         command_case(15, 5, false),
     ];
     commands.extend((16..19).map(|slot| command_case(slot, 1, true)));
-    commands.extend(editor_ready_cycle(id(), "s2", "s3"));
+    commands.extend(editor_ready_cycle(id(), "s2", "s1"));
     for command in commands {
         for event in state.decide(&command, time()).unwrap() {
             state.apply(log.len() as u64 + 1, time(), &event).unwrap();
@@ -430,6 +432,54 @@ fn editor_ready_replay_retains_unbound_readiness_and_exclusion() {
     }
 }
 
+// Count only the generated suffix, not the mandatory prefix. Separate advancing
+// steps from probes/retries so the coverage report cannot hide rare transitions.
+#[derive(Default)]
+struct ExcludedReach(RefCell<BTreeMap<(&'static str, &'static str), usize>>);
+impl ExcludedReach {
+    fn record(
+        &self,
+        phase: &'static str,
+        state: &OrgState,
+        command: &OrgCommand,
+        result: &Result<Vec<OrgEvent>, Refusal>,
+    ) {
+        if let OrgCommand::SessionBound {
+            agent_id,
+            session_id,
+        } = command
+        {
+            if let Some(agent) = state.agent(agent_id).filter(|agent| {
+                agent.pane.is_some()
+                    && agent.status != AgentStatus::Down
+                    && agent.excluded_session_id.as_ref() == Some(session_id)
+            }) {
+                assert!(result.as_ref().unwrap().is_empty());
+                let status = match agent.status {
+                    AgentStatus::Starting => "starting",
+                    AgentStatus::Clearing => "clearing",
+                    AgentStatus::Ready => "ready",
+                    AgentStatus::Stuck => "stuck",
+                    AgentStatus::Down => unreachable!(), // filtered above, test-only
+                };
+                *self.0.borrow_mut().entry((phase, status)).or_default() += 1;
+            }
+        }
+    }
+    fn assert_coverage(&self, name: &str) {
+        let counts = self.0.borrow();
+        println!("{name} excluded-id reach (256 cases): {counts:?}");
+        for status in ["starting", "clearing", "ready", "stuck"] {
+            assert!(
+                counts
+                    .iter()
+                    .any(|((_, observed), count)| *observed == status && *count > 0),
+                "{name}: no excluded-id report in {status}"
+            );
+        }
+    }
+}
+
 proptest! {
     #[test]
     fn event_parts_roundtrip(slot in 0usize..19, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
@@ -438,86 +488,191 @@ proptest! {
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
     }
 
-    #[test]
-    fn applying_a_log_is_deterministic_and_prefix_composes(actions in prop::collection::vec((0usize..20, 0u64..50, any::<bool>()), 0..80), split in any::<usize>()) {
-        let mut events = seeded_log();
-        let mut reachable = OrgState::default();
-        for (index, event) in events.iter().enumerate() { reachable.apply(index as u64 + 1, time(), event).unwrap(); }
-        for (slot, n, flag) in actions {
-            let command = command_case(slot, n, flag);
-            let before = reachable.clone();
-            let result = reachable.decide(&command, time());
-            prop_assert_eq!(&reachable, &before);
-            if let Ok(next) = result {
-                for event in next {
-                    prop_assert!(reachable.apply(events.len() as u64 + 1, time(), &event).is_ok());
-                    events.push(event);
-                }
+}
+
+#[test]
+fn applying_a_log_is_deterministic_and_prefix_composes() {
+    let reach = ExcludedReach::default();
+    let mut runner = TestRunner::new(Config {
+        cases: 256,
+        rng_seed: RngSeed::Fixed(0x8b02),
+        failure_persistence: None, // the fixed seed reproduces the complete coverage run
+        ..Config::default()
+    });
+    let inputs = (
+        prop::collection::vec((0usize..20, 0u64..50, any::<bool>()), 0..80),
+        any::<usize>(),
+    );
+    runner
+        .run(&inputs, |(actions, split)| {
+            let mut events = seeded_log();
+            let mut reachable = OrgState::default();
+            for (index, event) in events.iter().enumerate() {
+                reachable.apply(index as u64 + 1, time(), event).unwrap();
+                assert_agent_invariants(&reachable);
             }
-            // Every command is tried at every generated reachable state, not
-            // only the randomly selected command that advanced the history.
-            for candidate in 0..20 {
-                let mut probe = reachable.clone();
-                if let Ok(next) = probe.decide(&command_case(candidate, n, flag), time()) {
-                    for (index, event) in next.iter().enumerate() {
-                        prop_assert!(probe.apply((events.len() + index + 1) as u64, time(), event).is_ok());
+            for (slot, n, flag) in actions {
+                let command = command_case(slot, n, flag);
+                let before = reachable.clone();
+                let result = reachable.decide(&command, time());
+                prop_assert_eq!(&reachable, &before);
+                reach.record("step", &before, &command, &result);
+                if let Ok(next) = result {
+                    assert_decided_bindings(&before, &next);
+                    for event in next {
+                        prop_assert!(reachable
+                            .apply(events.len() as u64 + 1, time(), &event)
+                            .is_ok());
+                        assert_agent_invariants(&reachable);
+                        assert_editor_ready_preserves(&before, &reachable, &event);
+                        events.push(event);
+                    }
+                }
+                // Every command is tried at every generated reachable state, not
+                // only the randomly selected command that advanced the history.
+                for candidate in 0..20 {
+                    let mut probe = reachable.clone();
+                    let command = command_case(candidate, n, flag);
+                    let result = probe.decide(&command, time());
+                    prop_assert_eq!(&probe, &reachable);
+                    reach.record("probe", &probe, &command, &result);
+                    if let Ok(next) = result {
+                        assert_decided_bindings(&probe, &next);
+                        for (index, event) in next.iter().enumerate() {
+                            prop_assert!(probe
+                                .apply((events.len() + index + 1) as u64, time(), event)
+                                .is_ok());
+                            assert_agent_invariants(&probe);
+                            assert_editor_ready_preserves(&reachable, &probe, event);
+                        }
                     }
                 }
             }
-        }
-        let mut log: Vec<_> = events.iter().map(|e| (e.kind().to_owned(), e.to_body())).collect();
-        // Unknown events inserted only at the end preserve the literal message
-        // IDs in the generated history; seq gaps are valid, not renumbered IDs.
-        log.extend([("future.kind".into(), json!(null)), ("future.kind".into(), json!([1,2]))]);
-        let mut whole = OrgState::default(); let mut whole_stats = ReplayStats::default();
-        fold(&log, &mut whole, &mut whole_stats, 0);
-        prop_assert_eq!(&whole, &reachable);
-        let mut repeat = OrgState::default(); let mut repeat_stats = ReplayStats::default();
-        fold(&log, &mut repeat, &mut repeat_stats, 0);
-        prop_assert_eq!(&whole, &repeat);
-        prop_assert_eq!(&whole_stats, &repeat_stats);
-        let split = split % (log.len() + 1);
-        let mut partial = OrgState::default(); let mut partial_stats = ReplayStats::default();
-        fold(&log[..split], &mut partial, &mut partial_stats, 0);
-        fold(&log[split..], &mut partial, &mut partial_stats, split);
-        prop_assert_eq!(whole, partial);
-        prop_assert_eq!(whole_stats, partial_stats);
-        prop_assert_eq!(repeat_stats.skipped_unknown, 2);
-    }
+            let mut log: Vec<_> = events
+                .iter()
+                .map(|e| (e.kind().to_owned(), e.to_body()))
+                .collect();
+            // Unknown events inserted only at the end preserve the literal message
+            // IDs in the generated history; seq gaps are valid, not renumbered IDs.
+            log.extend([
+                ("future.kind".into(), json!(null)),
+                ("future.kind".into(), json!([1, 2])),
+            ]);
+            let mut whole = OrgState::default();
+            let mut whole_stats = ReplayStats::default();
+            fold(&log, &mut whole, &mut whole_stats, 0);
+            prop_assert_eq!(&whole, &reachable);
+            let mut repeat = OrgState::default();
+            let mut repeat_stats = ReplayStats::default();
+            fold(&log, &mut repeat, &mut repeat_stats, 0);
+            prop_assert_eq!(&whole, &repeat);
+            prop_assert_eq!(&whole_stats, &repeat_stats);
+            let split = split % (log.len() + 1);
+            let mut partial = OrgState::default();
+            let mut partial_stats = ReplayStats::default();
+            fold(&log[..split], &mut partial, &mut partial_stats, 0);
+            fold(&log[split..], &mut partial, &mut partial_stats, split);
+            prop_assert_eq!(whole, partial);
+            prop_assert_eq!(whole_stats, partial_stats);
+            prop_assert_eq!(repeat_stats.skipped_unknown, 2);
+            Ok(())
+        })
+        .unwrap();
+    reach.assert_coverage("single-agent");
+}
 
-    #[test]
-    fn multi_project_history_is_serial_deterministic_and_prefix_composes(
-        actions in prop::collection::vec(history::arb_seed(), 0..100),
-        split in any::<usize>(),
-    ) {
-        let mut history = history::History::seeded();
-        for input in actions {
-            let command = input.command(&history.state);
-            // step checks nonmutation, then applies every returned event before
-            // the next decision. Retrying a report happens after that apply.
-            let _ = history.step(command.clone());
-            if input.flag { let _ = history.step(command); }
-            if input.value == 0 { history.unknown(); }
-        }
-        history.unknown();
-        prop_assert!(history.records.windows(2).all(|pair| pair[0].seq < pair[1].seq && pair[0].ts < pair[1].ts));
-        let mut whole = OrgState::default(); let mut stats = ReplayStats::default();
-        history::fold(&history.records, &mut whole, &mut stats);
-        prop_assert_eq!(&whole, &history.state);
-        prop_assert_eq!(stats.skipped_unknown, history.unknown);
-        let mut repeated = OrgState::default(); let mut repeated_stats = ReplayStats::default();
-        history::fold(&history.records, &mut repeated, &mut repeated_stats);
-        prop_assert_eq!(&whole, &repeated);
-        prop_assert_eq!(&stats, &repeated_stats);
-        for cut in [0, history.records.len(), split % (history.records.len() + 1)] {
-            let mut partial = OrgState::default(); let mut partial_stats = ReplayStats::default();
-            history::fold(&history.records[..cut], &mut partial, &mut partial_stats);
-            history::fold(&history.records[cut..], &mut partial, &mut partial_stats);
-            prop_assert_eq!(&whole, &partial);
-            prop_assert_eq!(&stats, &partial_stats);
-        }
-    }
+#[test]
+fn multi_project_history_is_serial_deterministic_and_prefix_composes() {
+    let reach = ExcludedReach::default();
+    let mut runner = TestRunner::new(Config {
+        cases: 256,
+        rng_seed: RngSeed::Fixed(0x8b03),
+        failure_persistence: None, // the fixed seed reproduces the complete coverage run
+        ..Config::default()
+    });
+    let inputs = (
+        prop::collection::vec(history::arb_seed(), 0..100),
+        any::<usize>(),
+    );
+    runner
+        .run(&inputs, |(actions, split)| {
+            let mut history = history::History::seeded();
+            for input in actions {
+                let command = input.command(&history.state);
+                // step checks nonmutation, then applies every returned event before
+                // the next decision. Retrying a report happens after that apply.
+                let before = history.state.clone();
+                let result = history.step(command.clone());
+                reach.record("step", &before, &command, &result);
+                if input.flag {
+                    let before = history.state.clone();
+                    let result = history.step(command.clone());
+                    reach.record("retry", &before, &command, &result);
+                }
+                if input.value == 0 {
+                    history.unknown();
+                }
+                // Probe the generator's session-ID alphabet at each randomly reached
+                // state, including short-lived Starting after a session-less repair.
+                // These probes do not advance or bias the random history.
+                for agent in 0..3 {
+                    for value in 0..4 {
+                        let command = history::Seed {
+                            slot: 7,
+                            agent,
+                            value,
+                            ..input.clone()
+                        }
+                        .command(&history.state);
+                        let mut probe = history.state.clone();
+                        let result = probe.decide(&command, time());
+                        prop_assert_eq!(&probe, &history.state);
+                        reach.record("probe", &probe, &command, &result);
+                        if let Ok(events) = result {
+                            assert_decided_bindings(&probe, &events);
+                            for event in events {
+                                prop_assert!(probe.apply(1, time(), &event).is_ok());
+                                assert_agent_invariants(&probe);
+                                assert_editor_ready_preserves(&history.state, &probe, &event);
+                            }
+                        }
+                    }
+                }
+            }
+            history.unknown();
+            prop_assert!(history
+                .records
+                .windows(2)
+                .all(|pair| pair[0].seq < pair[1].seq && pair[0].ts < pair[1].ts));
+            let mut whole = OrgState::default();
+            let mut stats = ReplayStats::default();
+            history::fold(&history.records, &mut whole, &mut stats);
+            prop_assert_eq!(&whole, &history.state);
+            prop_assert_eq!(stats.skipped_unknown, history.unknown);
+            let mut repeated = OrgState::default();
+            let mut repeated_stats = ReplayStats::default();
+            history::fold(&history.records, &mut repeated, &mut repeated_stats);
+            prop_assert_eq!(&whole, &repeated);
+            prop_assert_eq!(&stats, &repeated_stats);
+            for cut in [
+                0,
+                history.records.len(),
+                split % (history.records.len() + 1),
+            ] {
+                let mut partial = OrgState::default();
+                let mut partial_stats = ReplayStats::default();
+                history::fold(&history.records[..cut], &mut partial, &mut partial_stats);
+                history::fold(&history.records[cut..], &mut partial, &mut partial_stats);
+                prop_assert_eq!(&whole, &partial);
+                prop_assert_eq!(&stats, &partial_stats);
+            }
+            Ok(())
+        })
+        .unwrap();
+    reach.assert_coverage("multi-project");
+}
 
+proptest! {
     #[test]
     fn arbitrary_config_and_event_text_never_panics(text in any::<String>()) {
         let _ = parse_project(&text);

@@ -36,6 +36,55 @@ pub fn summary() -> SessionSummary {
         ended: None,
     }
 }
+// Invariants of histories produced by serialized decide/apply, not arbitrary
+// historical facts. Session-less adoption can retain an exclusion in Starting.
+pub fn assert_agent_invariants(state: &OrgState) {
+    for agent in state.agents() {
+        if matches!(agent.status, AgentStatus::Starting | AgentStatus::Clearing) {
+            assert_eq!(agent.session_id, None, "{agent:?}");
+        }
+        if agent.excluded_session_id.is_some() {
+            assert_eq!(agent.session_id, None, "{agent:?}");
+            assert!(agent.pane.is_some(), "{agent:?}");
+            assert!(
+                matches!(
+                    agent.status,
+                    AgentStatus::Starting
+                        | AgentStatus::Clearing
+                        | AgentStatus::Ready
+                        | AgentStatus::Stuck
+                ),
+                "{agent:?}"
+            );
+        }
+    }
+}
+
+pub fn assert_decided_bindings(state: &OrgState, events: &[OrgEvent]) {
+    for event in events {
+        if let OrgEvent::AgentSessionBound {
+            agent_id,
+            session_id,
+        } = event
+        {
+            assert_ne!(
+                state.agent(agent_id).unwrap().excluded_session_id.as_ref(),
+                Some(session_id)
+            );
+        }
+    }
+}
+
+pub fn assert_editor_ready_preserves(before: &OrgState, after: &OrgState, event: &OrgEvent) {
+    if let OrgEvent::AgentEditorReady { agent_id } = event {
+        let before = before.agent(agent_id).unwrap();
+        let after = after.agent(agent_id).unwrap();
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.pane, before.pane);
+        assert_eq!(after.excluded_session_id, before.excluded_session_id);
+    }
+}
+
 // Synthetic: required replay prefix includes stuck recovery both without and
 // with a session, plus repeated observations of the excluded pre-clear ID.
 pub fn editor_ready_cycle(agent_id: AgentId, old: &str, new: &str) -> Vec<OrgCommand> {

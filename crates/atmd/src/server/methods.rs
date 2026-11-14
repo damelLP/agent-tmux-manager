@@ -245,7 +245,9 @@ fn control_error(error: crate::control::service::ServiceError) -> MethodError {
         ServiceError::Control(error) => match error {
             ControlError::NoSession { .. } | ControlError::NoPane { .. } => error_code::NOT_FOUND,
             ControlError::AmbiguousTarget { .. } => error_code::CONFLICT,
-            ControlError::SendRefused { .. } => error_code::REFUSED,
+            ControlError::SendRefused { .. } | ControlError::AgentClearing { .. } => {
+                error_code::REFUSED
+            }
             ControlError::Tmux {
                 source: atm_tmux::TmuxError::Timeout { .. },
                 ..
@@ -635,6 +637,31 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         org_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn contract_clearing_error_reaches_method_response_unchanged() {
+        let mut router = MethodRouter::default();
+        router
+            .register("test.clearing", Duration::from_secs(1), |_, _| async {
+                Err(control_error(
+                    crate::control::ControlError::AgentClearing {
+                        pane: "%7".into(),
+                        agent: "project/lead".parse().unwrap(),
+                    }
+                    .into(),
+                ))
+            })
+            .unwrap();
+        let error = router
+            .call(context(), "test.clearing", Value::Null)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "refused");
+        assert_eq!(
+            error.0.message,
+            "Refusing to send to %7: agent project/lead is clearing; try again in a moment"
+        );
     }
 
     #[tokio::test]

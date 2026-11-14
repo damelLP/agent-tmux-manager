@@ -717,6 +717,26 @@ where
     )
 }
 
+/// Organisation-aware constructor for reserved lifecycle/delivery clients.
+///
+/// Same startup/shutdown ownership as [`spawn_control`]. The supplied handle is
+/// the sole writer for post-kill audits and source for durable clearing/exclusion.
+/// Inject it from MethodServices at the daemon's I/O boundary; tests may use the
+/// real control actor over MockTmuxClient, with a private or disabled OrgHandle.
+///
+/// **Contract checkpoint:** organisation-aware behavior is not wired yet. This
+/// starts the unchanged legacy actor; the org argument is not used. Every new
+/// reserved operation returns a typed NotImplemented without admitting work.
+/// Production startup continues using spawn_control until implementation lands.
+pub fn spawn_control_with_org(
+    client: Box<dyn TmuxClient>,
+    registry: RegistryHandle,
+    _org: crate::org::OrgHandle,
+    cancel: CancellationToken,
+) -> (ControlHandle, JoinHandle<()>) {
+    spawn_control(client, registry, _org, cancel)
+}
+
 async fn outcome<T>(
     deadline: Instant,
     work: impl std::future::Future<Output = Result<T, ServiceError>>,

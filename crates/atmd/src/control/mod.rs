@@ -1,6 +1,7 @@
 //! Reusable send and spawn operations, independent of CLI environment and output.
 
 mod command;
+pub mod reservation;
 mod send;
 pub mod service;
 mod spawn;
@@ -24,6 +25,11 @@ pub enum ControlError {
     },
     #[error("Refusing to send to {pane}: {reason}")]
     SendRefused { pane: String, reason: &'static str },
+    #[error("Refusing to send to {pane}: agent {agent} is clearing; try again in a moment")]
+    AgentClearing {
+        pane: String,
+        agent: atm_org::AgentId,
+    },
     #[error("{context}")]
     Tmux {
         context: String,

@@ -147,6 +147,87 @@ fn every_agent_event_applies_its_effect() {
 }
 
 #[test]
+fn editor_ready_is_effect_only_and_preserves_binding_facts() {
+    for bound in [false, true] {
+        let mut state = started();
+        apply(
+            &mut state,
+            3,
+            OrgEvent::AgentPaneCreated {
+                agent_id: id(),
+                pane: "%1".into(),
+            },
+        );
+        apply(
+            &mut state,
+            4,
+            OrgEvent::AgentSessionBound {
+                agent_id: id(),
+                session_id: "old".into(),
+            },
+        );
+        if !bound {
+            apply(
+                &mut state,
+                5,
+                OrgEvent::AgentClearRequested { agent_id: id() },
+            );
+        }
+        apply(
+            &mut state,
+            6,
+            OrgEvent::AgentStuck {
+                agent_id: id(),
+                reason: "dialog".into(),
+            },
+        );
+        let before = state.agent(&id()).unwrap().clone();
+        apply(&mut state, 7, OrgEvent::AgentEditorReady { agent_id: id() });
+        let agent = state.agent(&id()).unwrap();
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.reason, None);
+        assert_eq!(agent.updated_at, time() + Duration::seconds(7));
+        assert_eq!(agent.session_id, before.session_id);
+        assert_eq!(agent.excluded_session_id, before.excluded_session_id);
+        assert_eq!(agent.pane, before.pane);
+        // A committed obsolete binding is a fact, not a command to revalidate.
+        apply(
+            &mut state,
+            8,
+            OrgEvent::AgentSessionBound {
+                agent_id: id(),
+                session_id: "old".into(),
+            },
+        );
+        assert_eq!(state.agent(&id()).unwrap().session_id, Some("old".into()));
+        assert_eq!(state.agent(&id()).unwrap().excluded_session_id, None);
+    }
+    let mut state = started();
+    apply(
+        &mut state,
+        3,
+        OrgEvent::AgentDown {
+            agent_id: id(),
+            reason: "gone".into(),
+        },
+    );
+    apply(&mut state, 4, OrgEvent::AgentEditorReady { agent_id: id() });
+    assert_eq!(state.agent(&id()).unwrap().status, AgentStatus::Ready);
+    assert_eq!(state.agent(&id()).unwrap().pane, None);
+    let before = state.clone();
+    assert!(state
+        .apply(
+            5,
+            time(),
+            &OrgEvent::AgentEditorReady {
+                agent_id: "p/missing".parse().unwrap()
+            }
+        )
+        .is_err());
+    assert_eq!(state, before);
+}
+
+#[test]
 fn message_effects_keep_delivery_timestamps_and_sequence_identity() {
     let mut state = started();
     let mid = MessageId::new(40);

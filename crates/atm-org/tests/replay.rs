@@ -102,6 +102,7 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::ControlSent(_) => 15,
         OrgEvent::ControlSpawned(_) => 16,
         OrgEvent::ControlKilled(_) => 17,
+        OrgEvent::AgentEditorReady { .. } => 18,
     }
 }
 
@@ -185,7 +186,8 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
         }
         15 => OrgEvent::ControlSent(audit),
         16 => OrgEvent::ControlSpawned(audit),
-        _ => OrgEvent::ControlKilled(audit),
+        17 => OrgEvent::ControlKilled(audit),
+        _ => OrgEvent::AgentEditorReady { agent_id },
     }
 }
 
@@ -210,6 +212,7 @@ fn command_slot(command: &OrgCommand) -> usize {
         OrgCommand::ControlSent(_) => 16,
         OrgCommand::ControlSpawned(_) => 17,
         OrgCommand::ControlKilled(_) => 18,
+        OrgCommand::EditorReady { .. } => 19,
     }
 }
 
@@ -292,22 +295,23 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
         }
         16 => OrgCommand::ControlSent(audit),
         17 => OrgCommand::ControlSpawned(audit),
-        _ => OrgCommand::ControlKilled(audit),
+        18 => OrgCommand::ControlKilled(audit),
+        _ => OrgCommand::EditorReady { agent_id },
     }
 }
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..18)
+    let events: Vec<_> = (0..19)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..18).collect::<Vec<_>>());
-    let commands: Vec<_> = (0..19)
+    assert_eq!(events, (0..19).collect::<Vec<_>>());
+    let commands: Vec<_> = (0..20)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
-    assert_eq!(commands, (0..19).collect::<Vec<_>>());
+    assert_eq!(commands, (0..20).collect::<Vec<_>>());
     let history = history::History::seeded();
-    let wide_commands: Vec<_> = (0..19)
+    let wide_commands: Vec<_> = (0..20)
         .map(|slot| {
             let seed = history::Seed {
                 slot,
@@ -321,7 +325,7 @@ fn case_generators_cover_every_event_and_command_variant() {
             command_slot(&seed.command(&history.state))
         })
         .collect();
-    assert_eq!(wide_commands, (0..19).collect::<Vec<_>>());
+    assert_eq!(wide_commands, (0..20).collect::<Vec<_>>());
 }
 
 // Synthetic: a restart-style history exercising clear, retry, owner delivery
@@ -350,6 +354,7 @@ fn seeded_log() -> Vec<OrgEvent> {
         command_case(15, 5, false),
     ];
     commands.extend((16..19).map(|slot| command_case(slot, 1, true)));
+    commands.extend(editor_ready_cycle(id(), "s2", "s3"));
     for command in commands {
         for event in state.decide(&command, time()).unwrap() {
             state.apply(log.len() as u64 + 1, time(), &event).unwrap();
@@ -375,16 +380,66 @@ fn fold(log: &[(String, Value)], state: &mut OrgState, stats: &mut ReplayStats, 
     }
 }
 
+#[test]
+fn editor_ready_replay_retains_unbound_readiness_and_exclusion() {
+    let mut reachable = OrgState::default();
+    let mut log = vec![];
+    let mut commands = vec![
+        command_case(0, 1, false),
+        command_case(1, 1, false),
+        command_case(6, 1, false),
+        command_case(7, 1, false),
+    ];
+    commands.extend(editor_ready_cycle(id(), "s1", "s2").into_iter().take(3));
+    for command in commands {
+        for event in reachable.decide(&command, time()).unwrap() {
+            reachable
+                .apply(log.len() as u64 + 1, time(), &event)
+                .unwrap();
+            log.push((event.kind().to_owned(), event.to_body()));
+        }
+    }
+    assert_eq!(log.len(), 6); // obsolete session report emitted no fact
+    assert_eq!(log.last().unwrap().0, "agent.editor_ready");
+    let agent = reachable.agent(&id()).unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, None);
+    assert_eq!(agent.excluded_session_id, Some("s1".into()));
+    for cut in 0..=log.len() {
+        let mut replayed = OrgState::default();
+        let mut stats = ReplayStats::default();
+        fold(&log[..cut], &mut replayed, &mut stats, 0);
+        fold(&log[cut..], &mut replayed, &mut stats, cut);
+        assert_eq!(replayed, reachable);
+        assert_eq!(stats.applied, 6);
+        assert!(replayed
+            .decide(&command_case(7, 1, false), time())
+            .unwrap()
+            .is_empty());
+        let next = replayed.decide(&command_case(7, 2, false), time()).unwrap();
+        assert_eq!(
+            next,
+            vec![OrgEvent::AgentSessionBound {
+                agent_id: id(),
+                session_id: "s2".into()
+            }]
+        );
+        replayed.apply(7, time(), &next[0]).unwrap();
+        assert_eq!(replayed.agent(&id()).unwrap().session_id, Some("s2".into()));
+        assert_eq!(replayed.agent(&id()).unwrap().excluded_session_id, None);
+    }
+}
+
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..18, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..19, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
     }
 
     #[test]
-    fn applying_a_log_is_deterministic_and_prefix_composes(actions in prop::collection::vec((0usize..19, 0u64..50, any::<bool>()), 0..80), split in any::<usize>()) {
+    fn applying_a_log_is_deterministic_and_prefix_composes(actions in prop::collection::vec((0usize..20, 0u64..50, any::<bool>()), 0..80), split in any::<usize>()) {
         let mut events = seeded_log();
         let mut reachable = OrgState::default();
         for (index, event) in events.iter().enumerate() { reachable.apply(index as u64 + 1, time(), event).unwrap(); }
@@ -401,7 +456,7 @@ proptest! {
             }
             // Every command is tried at every generated reachable state, not
             // only the randomly selected command that advanced the history.
-            for candidate in 0..19 {
+            for candidate in 0..20 {
                 let mut probe = reachable.clone();
                 if let Ok(next) = probe.decide(&command_case(candidate, n, flag), time()) {
                     for (index, event) in next.iter().enumerate() {

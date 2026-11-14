@@ -2,6 +2,15 @@
 //! is flat, timestamps are RFC3339, and summary cost is an exact microdollar
 //! object (not core Money's floating-point USD encoding). Known JSON bodies
 //! tolerate additive fields; unknown kinds are skipped before decoding a body.
+//!
+//! `agent.editor_ready` is an additive kind with body `{ "agent_id": "p/lead" }`.
+//! It records readiness without altering the session, pane or exclusion. The
+//! pre-clear exclusion is derived while folding `agent.clear_requested`, before
+//! removing its session; no existing event body changed. Newer readers accept
+//! older logs, including committed session bindings today's policy would ignore.
+//! Older readers skip editor-ready facts and may remain clearing/starting: they
+//! cannot reconstruct the newer semantics. Compatibility is newer reads older,
+//! not a guarantee of safe downgrade or equivalent state in older readers.
 
 use crate::{Address, AgentId, MessageId, ProjectId, RoleSpec, TaskId};
 use atm_core::{Harness, Money, SessionId};
@@ -113,6 +122,8 @@ pub enum OrgEvent {
     },
     #[serde(rename = "agent.session_lost")]
     AgentSessionLost { agent_id: AgentId },
+    #[serde(rename = "agent.editor_ready")]
+    AgentEditorReady { agent_id: AgentId },
     #[serde(rename = "agent.clear_requested")]
     AgentClearRequested { agent_id: AgentId },
     #[serde(rename = "agent.stuck")]
@@ -162,6 +173,7 @@ impl OrgEvent {
             Self::AgentAdopted { .. } => "agent.adopted",
             Self::AgentSessionBound { .. } => "agent.session_bound",
             Self::AgentSessionLost { .. } => "agent.session_lost",
+            Self::AgentEditorReady { .. } => "agent.editor_ready",
             Self::AgentClearRequested { .. } => "agent.clear_requested",
             Self::AgentStuck { .. } => "agent.stuck",
             Self::AgentDown { .. } => "agent.down",
@@ -199,6 +211,7 @@ impl OrgEvent {
                 | "agent.adopted"
                 | "agent.session_bound"
                 | "agent.session_lost"
+                | "agent.editor_ready"
                 | "agent.clear_requested"
                 | "agent.stuck"
                 | "agent.down"

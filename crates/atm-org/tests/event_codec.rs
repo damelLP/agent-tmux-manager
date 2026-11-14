@@ -4,9 +4,9 @@ use atm_org::*;
 use serde_json::json;
 
 #[test]
-fn all_eighteen_golden_event_bodies() {
+fn all_nineteen_golden_event_bodies() {
     let cases = support::bodies();
-    assert_eq!(cases.len(), 18);
+    assert_eq!(cases.len(), 19);
     for (kind, body) in cases {
         let event = OrgEvent::from_parts(kind, &body).unwrap().unwrap();
         assert_eq!(event.kind(), kind);
@@ -63,6 +63,21 @@ fn event_json_tolerates_additive_fields_even_in_roles() {
         Some(event)
     );
     assert!(parse_role("lead", "+++\nharness='pi'\nfuture=1\n+++").is_err());
+}
+
+#[test]
+fn editor_ready_body_validates_identity_and_tolerates_additions() {
+    assert!(OrgEvent::from_parts("agent.editor_ready", &json!({"agent_id":"p/bad name"})).is_err());
+    assert_eq!(
+        OrgEvent::from_parts(
+            "agent.editor_ready",
+            &json!({"agent_id":"p/lead", "future":true})
+        )
+        .unwrap(),
+        Some(OrgEvent::AgentEditorReady {
+            agent_id: support::id()
+        })
+    );
 }
 
 #[test]

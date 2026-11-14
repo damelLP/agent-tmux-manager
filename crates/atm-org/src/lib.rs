@@ -20,14 +20,33 @@
 //! | Command | Refusal | No event | Otherwise |
 //! |---|---|---|---|
 //! | Up | unknown project, mismatched role; starting/ready/clearing; stuck with pane | — | starting, fresh role snapshot |
-//! | Adopt | unknown project; another holder; own different pane | same pane/session and resulting status | ready with session, else starting |
+//! | Adopt | unknown project; another holder; own different pane | same pane/session and resulting status, no exclusion | ready with session, else starting; reset exclusion |
 //! | PaneCreated | unknown agent; another holder; own different pane; new pane while not starting | same recorded pane, in any status | record pane |
-//! | SessionBound | unknown agent; down; no pane | ready with same session | ready, including stuck recovery/manual clear |
-//! | SessionLost | unknown agent | starting or stuck without session; clearing; down | starting, session removed |
-//! | Clear | unknown agent; not ready | — | clearing, session removed |
+//! | SessionBound | unknown agent; down; no pane | excluded session; ready with same session | ready, including stuck recovery/manual clear; reset exclusion |
+//! | EditorReady | unknown agent; down; no pane | ready, with or without session | starting/clearing/stuck → ready; session unchanged, reason cleared |
+//! | SessionLost | unknown agent | starting, stuck or ready without session; clearing; down | starting, session removed; exclusion retained |
+//! | Clear | unknown agent; not ready | — | clearing, session removed and excluded; retain exclusion if no session |
 //! | Stuck | unknown agent; down | stuck with identical reason | stuck with reason |
-//! | Down | unknown agent | already down | down, release pane/session |
+//! | Down | unknown agent | already down | down, release pane/session/exclusion |
 //! | Respawn | unknown project/agent; mismatched role | — | down unless already down, then up |
+//!
+//! EditorReady reports a positively observed fresh editor in the recorded pane.
+//! Starting/clearing agents reached through commands have no session: Up and
+//! session-less Adopt start without one; Clear and SessionLost remove it. Thus
+//! EditorReady makes these agents ready without a session. Stuck recovery keeps
+//! any session already bound, and a late report on ready is a no-op. Applying
+//! the fact preserves session, pane and exclusion; replay does not revalidate
+//! the screen. The caller must revalidate it on startup. A ready agent without
+//! a session ignores SessionLost: callers must detect a harness exiting from
+//! the pane itself, not from a missing registry row.
+//!
+//! Clear retains one pre-clear session ID to ignore obsolete SessionBound
+//! reports, even before EditorReady. Repeated clears without a new binding keep
+//! that exclusion; EditorReady, SessionLost and Stuck retain it. A new binding,
+//! Down or fresh Up resets it. Explicit Adopt also overrides the exclusion;
+//! routine session observations must use SessionBound, not Adopt. This is not
+//! a permanent blacklist of historical IDs. Committed binding facts still fold
+//! regardless of today's exclusion policy, so older logs remain replayable.
 //!
 //! Project registration is a no-op for the same root, but a different root is a
 //! conflict unless `move_root: true`: the daemon must first check that the old

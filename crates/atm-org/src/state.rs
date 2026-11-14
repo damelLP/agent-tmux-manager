@@ -39,6 +39,8 @@ pub struct Agent {
     pub status: AgentStatus,
     pub pane: Option<String>,
     pub session_id: Option<SessionId>,
+    /// Pre-clear binding ignored by session reports until a new binding or reset.
+    pub excluded_session_id: Option<SessionId>,
     pub reason: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
@@ -50,6 +52,7 @@ impl Agent {
             status: AgentStatus::Starting,
             pane: None,
             session_id: None,
+            excluded_session_id: None,
             reason: None,
             updated_at: ts,
         }
@@ -249,6 +252,7 @@ impl OrgState {
                 valid_external_id("session id", session_id.as_str())?;
             }
             OrgEvent::AgentSessionLost { agent_id }
+            | OrgEvent::AgentEditorReady { agent_id }
             | OrgEvent::AgentClearRequested { agent_id }
             | OrgEvent::AgentStuck { agent_id, .. }
             | OrgEvent::AgentDown { agent_id, .. } => {
@@ -343,6 +347,7 @@ impl OrgState {
                 );
                 agent.pane = Some(pane.clone());
                 agent.session_id.clone_from(session_id);
+                agent.excluded_session_id = None;
             }
             OrgEvent::AgentPaneCreated { agent_id, pane } => {
                 let agent = self.agent_mut(agent_id)?;
@@ -356,6 +361,10 @@ impl OrgState {
                 let agent = self.agent_mut(agent_id)?;
                 agent.transition(AgentStatus::Ready, ts);
                 agent.session_id = Some(session_id.clone());
+                agent.excluded_session_id = None;
+            }
+            OrgEvent::AgentEditorReady { agent_id } => {
+                self.agent_mut(agent_id)?.transition(AgentStatus::Ready, ts);
             }
             OrgEvent::AgentSessionLost { agent_id }
             | OrgEvent::AgentClearRequested { agent_id } => {
@@ -368,6 +377,11 @@ impl OrgState {
                     },
                     ts,
                 );
+                if matches!(event, OrgEvent::AgentClearRequested { .. }) {
+                    if let Some(session_id) = agent.session_id.take() {
+                        agent.excluded_session_id = Some(session_id);
+                    }
+                }
                 agent.session_id = None;
             }
             OrgEvent::AgentStuck { agent_id, reason }
@@ -386,6 +400,7 @@ impl OrgState {
                 if down {
                     agent.pane = None;
                     agent.session_id = None;
+                    agent.excluded_session_id = None;
                 }
             }
             OrgEvent::MessageSent(content) => {

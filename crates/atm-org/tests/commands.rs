@@ -39,11 +39,317 @@ fn pane() -> OrgCommand {
         pane: "%1".into(),
     }
 }
+fn editor_ready() -> OrgCommand {
+    OrgCommand::EditorReady { agent_id: id() }
+}
+fn clearing() -> (OrgState, u64) {
+    let (mut state, mut seq) = setup();
+    for command in [
+        up(),
+        pane(),
+        bound("old"),
+        OrgCommand::Clear { agent_id: id() },
+    ] {
+        run(&mut state, command, &mut seq);
+    }
+    (state, seq)
+}
+fn assert_noop(state: &mut OrgState, command: OrgCommand, seq: &mut u64) {
+    let before = state.clone();
+    assert!(run(state, command, seq).is_empty());
+    assert_eq!(*state, before);
+}
 fn bound(session: &str) -> OrgCommand {
     OrgCommand::SessionBound {
         agent_id: id(),
         session_id: session.into(),
     }
+}
+
+#[test]
+fn editor_ready_from_starting_with_pane() {
+    let (mut state, mut seq) = setup();
+    run(&mut state, up(), &mut seq);
+    run(&mut state, pane(), &mut seq);
+    assert_eq!(
+        run(&mut state, editor_ready(), &mut seq),
+        vec![OrgEvent::AgentEditorReady { agent_id: id() }]
+    );
+    let agent = state.agent(&id()).unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, None);
+    assert_eq!(agent.excluded_session_id, None);
+    assert_eq!(agent.pane.as_deref(), Some("%1"));
+}
+
+#[test]
+fn editor_ready_from_clearing_with_pane() {
+    let (mut state, mut seq) = clearing();
+    assert_eq!(
+        state.agent(&id()).unwrap().excluded_session_id,
+        Some("old".into())
+    );
+    assert_eq!(
+        run(&mut state, editor_ready(), &mut seq),
+        vec![OrgEvent::AgentEditorReady { agent_id: id() }]
+    );
+    let agent = state.agent(&id()).unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, None);
+    assert_eq!(agent.excluded_session_id, Some("old".into()));
+}
+
+#[test]
+fn editor_ready_on_ready_agent_is_noop() {
+    let (mut state, mut seq) = clearing();
+    run(&mut state, editor_ready(), &mut seq);
+    assert_noop(&mut state, editor_ready(), &mut seq);
+    run(&mut state, bound("new"), &mut seq);
+    assert_noop(&mut state, editor_ready(), &mut seq);
+    assert_eq!(state.agent(&id()).unwrap().session_id, Some("new".into()));
+}
+
+#[test]
+fn editor_ready_from_stuck_keeps_session() {
+    for session in [None, Some("new")] {
+        let (mut state, mut seq) = clearing();
+        run(&mut state, editor_ready(), &mut seq);
+        if let Some(session) = session {
+            run(&mut state, bound(session), &mut seq);
+        }
+        let before = state.agent(&id()).unwrap().clone();
+        run(
+            &mut state,
+            OrgCommand::Stuck {
+                agent_id: id(),
+                reason: "dialog".into(),
+            },
+            &mut seq,
+        );
+        let stuck = state.agent(&id()).unwrap();
+        assert_eq!(stuck.status, AgentStatus::Stuck);
+        assert_eq!(stuck.reason.as_deref(), Some("dialog"));
+        assert_eq!(stuck.excluded_session_id, before.excluded_session_id);
+        assert_eq!(run(&mut state, editor_ready(), &mut seq).len(), 1);
+        let agent = state.agent(&id()).unwrap();
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.reason, None);
+        assert_eq!(agent.session_id, before.session_id);
+        assert_eq!(agent.pane, before.pane);
+        assert_eq!(agent.excluded_session_id, before.excluded_session_id);
+    }
+}
+
+#[test]
+fn editor_ready_refuses_unknown_and_invalid_agent() {
+    let (state, _) = setup();
+    assert_eq!(
+        state.decide(&editor_ready(), time()),
+        Err(Refusal::Invariant(ApplyError::UnknownAgent(id())))
+    );
+    let bad = AgentId {
+        project: "p".parse().unwrap(),
+        name: "BAD".into(),
+    };
+    assert!(matches!(
+        state.decide(&OrgCommand::EditorReady { agent_id: bad }, time()),
+        Err(Refusal::Invariant(ApplyError::InvalidId(_)))
+    ));
+}
+
+#[test]
+fn editor_ready_refuses_missing_pane_and_down() {
+    for status in [
+        AgentStatus::Starting,
+        AgentStatus::Clearing,
+        AgentStatus::Stuck,
+        AgentStatus::Ready,
+        AgentStatus::Down,
+    ] {
+        let (mut state, mut seq) = setup();
+        run(&mut state, up(), &mut seq);
+        // Effect-only facts let the fixture cover no-pane states policy cannot create.
+        let event = match status {
+            AgentStatus::Starting => None,
+            AgentStatus::Clearing => Some(OrgEvent::AgentClearRequested { agent_id: id() }),
+            AgentStatus::Stuck => Some(OrgEvent::AgentStuck {
+                agent_id: id(),
+                reason: "late".into(),
+            }),
+            AgentStatus::Ready => Some(OrgEvent::AgentSessionBound {
+                agent_id: id(),
+                session_id: "s".into(),
+            }),
+            AgentStatus::Down => Some(OrgEvent::AgentDown {
+                agent_id: id(),
+                reason: "gone".into(),
+            }),
+        };
+        if let Some(event) = event {
+            state.apply(seq + 1, time(), &event).unwrap();
+        }
+        let before = state.clone();
+        assert_eq!(
+            state.decide(&editor_ready(), time()),
+            Err(Refusal::InvalidAgentState {
+                agent_id: id(),
+                state: status,
+                operation: "record editor ready"
+            })
+        );
+        assert_eq!(state, before);
+    }
+    let (mut state, mut seq) = clearing();
+    run(
+        &mut state,
+        OrgCommand::Down {
+            agent_id: id(),
+            reason: "gone".into(),
+        },
+        &mut seq,
+    );
+    state
+        .apply(
+            seq + 1,
+            time(),
+            &OrgEvent::AgentPaneCreated {
+                agent_id: id(),
+                pane: "%1".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        state.decide(&editor_ready(), time()),
+        Err(Refusal::InvalidAgentState {
+            state: AgentStatus::Down,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn excluded_session_is_ignored_during_clear_and_after_editor_ready() {
+    let (mut state, mut seq) = clearing();
+    assert_noop(&mut state, bound("old"), &mut seq);
+    run(&mut state, editor_ready(), &mut seq);
+    assert_noop(&mut state, bound("old"), &mut seq);
+    assert_noop(
+        &mut state,
+        OrgCommand::SessionLost { agent_id: id() },
+        &mut seq,
+    );
+    assert_noop(&mut state, bound("old"), &mut seq);
+    run(
+        &mut state,
+        OrgCommand::Stuck {
+            agent_id: id(),
+            reason: "late".into(),
+        },
+        &mut seq,
+    );
+    assert_noop(&mut state, bound("old"), &mut seq);
+    // A committed session-lost fact still folds to Starting with the exclusion.
+    seq += 1;
+    state
+        .apply(seq, time(), &OrgEvent::AgentSessionLost { agent_id: id() })
+        .unwrap();
+    assert_eq!(state.agent(&id()).unwrap().status, AgentStatus::Starting);
+    assert_noop(&mut state, bound("old"), &mut seq);
+    run(&mut state, editor_ready(), &mut seq);
+    assert_eq!(run(&mut state, bound("new"), &mut seq).len(), 1);
+    let agent = state.agent(&id()).unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, Some("new".into()));
+    assert_eq!(agent.excluded_session_id, None);
+    assert!(state.decide(&bound(""), time()).is_err());
+}
+
+#[test]
+fn clearing_an_unbound_ready_editor_preserves_exclusion() {
+    let (mut state, mut seq) = clearing();
+    for _ in 0..2 {
+        run(&mut state, editor_ready(), &mut seq);
+        assert_eq!(
+            run(&mut state, OrgCommand::Clear { agent_id: id() }, &mut seq).len(),
+            1
+        );
+        assert_eq!(state.agent(&id()).unwrap().status, AgentStatus::Clearing);
+        assert_eq!(
+            state.agent(&id()).unwrap().excluded_session_id,
+            Some("old".into())
+        );
+        assert_noop(&mut state, bound("old"), &mut seq);
+    }
+    run(&mut state, bound("new"), &mut seq);
+    run(&mut state, OrgCommand::Clear { agent_id: id() }, &mut seq);
+    assert_eq!(
+        state.agent(&id()).unwrap().excluded_session_id,
+        Some("new".into())
+    );
+    assert_noop(&mut state, bound("new"), &mut seq);
+}
+
+#[test]
+fn session_lost_preserves_ready_without_session() {
+    let (mut state, mut seq) = clearing();
+    run(&mut state, editor_ready(), &mut seq);
+    assert_noop(
+        &mut state,
+        OrgCommand::SessionLost { agent_id: id() },
+        &mut seq,
+    );
+    assert_eq!(state.agent(&id()).unwrap().status, AgentStatus::Ready);
+}
+
+#[test]
+fn explicit_binding_and_lifecycle_reset_exclusion() {
+    for command in [
+        OrgCommand::Adopt {
+            agent_id: id(),
+            pane: "%1".into(),
+            session_id: None,
+        },
+        OrgCommand::Adopt {
+            agent_id: id(),
+            pane: "%1".into(),
+            session_id: Some("old".into()),
+        },
+        OrgCommand::Down {
+            agent_id: id(),
+            reason: "stop".into(),
+        },
+        OrgCommand::Respawn {
+            agent_id: id(),
+            role: role(),
+            reason: "restart".into(),
+        },
+    ] {
+        let (mut state, mut seq) = clearing();
+        run(&mut state, editor_ready(), &mut seq);
+        assert!(!run(&mut state, command, &mut seq).is_empty());
+        let agent = state.agent(&id()).unwrap();
+        assert_eq!(agent.excluded_session_id, None);
+        if agent.status == AgentStatus::Down {
+            assert_eq!(agent.session_id, None);
+            assert_eq!(agent.pane, None);
+            run(&mut state, up(), &mut seq);
+            assert_eq!(state.agent(&id()).unwrap().excluded_session_id, None);
+        }
+    }
+    // Adopt must clear exclusion even when pane/session/status already match.
+    let (mut state, mut seq) = clearing();
+    seq += 1;
+    state
+        .apply(seq, time(), &OrgEvent::AgentSessionLost { agent_id: id() })
+        .unwrap();
+    let adopt = OrgCommand::Adopt {
+        agent_id: id(),
+        pane: "%1".into(),
+        session_id: None,
+    };
+    assert_eq!(run(&mut state, adopt.clone(), &mut seq).len(), 1);
+    assert_eq!(state.agent(&id()).unwrap().excluded_session_id, None);
+    assert_noop(&mut state, adopt, &mut seq);
 }
 
 #[test]

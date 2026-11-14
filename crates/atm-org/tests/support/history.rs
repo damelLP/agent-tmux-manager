@@ -1,5 +1,5 @@
 //! Synthetic multi-project histories: no harness, clock, daemon or tmux.
-use super::support::{content, role, summary, time};
+use super::support::{content, editor_ready_cycle, role, summary, time};
 use atm_core::Money;
 use atm_org::*;
 use chrono::{DateTime, Duration, Utc};
@@ -38,7 +38,7 @@ pub struct Seed {
 }
 pub fn arb_seed() -> impl Strategy<Value = Seed> {
     (
-        0usize..19,
+        0usize..20,
         0usize..3,
         0usize..4,
         0usize..6,
@@ -172,7 +172,8 @@ impl Seed {
             }
             16 => OrgCommand::ControlSent(audit),
             17 => OrgCommand::ControlSpawned(audit),
-            _ => OrgCommand::ControlKilled(audit),
+            18 => OrgCommand::ControlKilled(audit),
+            _ => OrgCommand::EditorReady { agent_id },
         }
     }
 }
@@ -499,7 +500,10 @@ impl History {
         ] {
             history.step(command).unwrap();
         }
-        assert_eq!(history.kinds.len(), 18);
+        for command in editor_ready_cycle(agent(0), "lead-3", "lead-4") {
+            history.step(command).unwrap();
+        }
+        assert_eq!(history.kinds.len(), 19);
         assert_eq!(history.state.agents().count(), 3);
         assert_eq!(history.state.projects().count(), 2);
         history

@@ -36,6 +36,48 @@ pub fn summary() -> SessionSummary {
         ended: None,
     }
 }
+// Synthetic: required replay prefix includes stuck recovery both without and
+// with a session, plus repeated observations of the excluded pre-clear ID.
+pub fn editor_ready_cycle(agent_id: AgentId, old: &str, new: &str) -> Vec<OrgCommand> {
+    vec![
+        OrgCommand::Clear {
+            agent_id: agent_id.clone(),
+        },
+        OrgCommand::SessionBound {
+            agent_id: agent_id.clone(),
+            session_id: old.into(),
+        },
+        OrgCommand::EditorReady {
+            agent_id: agent_id.clone(),
+        },
+        OrgCommand::EditorReady {
+            agent_id: agent_id.clone(),
+        },
+        OrgCommand::SessionLost {
+            agent_id: agent_id.clone(),
+        },
+        OrgCommand::SessionBound {
+            agent_id: agent_id.clone(),
+            session_id: old.into(),
+        },
+        OrgCommand::Stuck {
+            agent_id: agent_id.clone(),
+            reason: "dialog without session".into(),
+        },
+        OrgCommand::EditorReady {
+            agent_id: agent_id.clone(),
+        },
+        OrgCommand::SessionBound {
+            agent_id: agent_id.clone(),
+            session_id: new.into(),
+        },
+        OrgCommand::Stuck {
+            agent_id: agent_id.clone(),
+            reason: "dialog with session".into(),
+        },
+        OrgCommand::EditorReady { agent_id },
+    ]
+}
 pub fn bodies() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -62,6 +104,7 @@ pub fn bodies() -> Vec<(&'static str, Value)> {
             json!({"agent_id":"p/lead","session_id":"s1"}),
         ),
         ("agent.session_lost", json!({"agent_id":"p/lead"})),
+        ("agent.editor_ready", json!({"agent_id":"p/lead"})),
         ("agent.clear_requested", json!({"agent_id":"p/lead"})),
         (
             "agent.stuck",

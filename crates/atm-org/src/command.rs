@@ -45,6 +45,10 @@ pub enum OrgCommand {
     SessionLost {
         agent_id: AgentId,
     },
+    /// The caller positively observed a fresh editor in the recorded pane.
+    EditorReady {
+        agent_id: AgentId,
+    },
     Stuck {
         agent_id: AgentId,
         reason: String,
@@ -142,6 +146,7 @@ impl OrgCommand {
                 session_id,
             },
             Self::SessionLost { agent_id } => OrgEvent::AgentSessionLost { agent_id },
+            Self::EditorReady { agent_id } => OrgEvent::AgentEditorReady { agent_id },
             Self::Stuck { agent_id, reason } => OrgEvent::AgentStuck { agent_id, reason },
             Self::SendMessage(content) => OrgEvent::MessageSent(content),
             Self::DeliveryAttempted {
@@ -237,6 +242,7 @@ impl OrgState {
                     agent.pane.as_ref() != Some(pane)
                         || &agent.session_id != session_id
                         || agent.status != status
+                        || agent.excluded_session_id.is_some()
                 } else {
                     true
                 }
@@ -261,13 +267,24 @@ impl OrgState {
                 if agent.status == AgentStatus::Down || agent.pane.is_none() {
                     return Err(agent_refusal(agent, "bind session"));
                 }
-                agent.status != AgentStatus::Ready || agent.session_id.as_ref() != Some(session_id)
+                agent.excluded_session_id.as_ref() != Some(session_id)
+                    && (agent.status != AgentStatus::Ready
+                        || agent.session_id.as_ref() != Some(session_id))
+            }
+            OrgCommand::EditorReady { agent_id } => {
+                let agent = self.require_agent(agent_id)?;
+                if agent.status == AgentStatus::Down || agent.pane.is_none() {
+                    return Err(agent_refusal(agent, "record editor ready"));
+                }
+                agent.status != AgentStatus::Ready
             }
             OrgCommand::SessionLost { agent_id } => {
                 let agent = self.require_agent(agent_id)?;
                 !matches!(agent.status, AgentStatus::Clearing | AgentStatus::Down)
-                    && !(matches!(agent.status, AgentStatus::Starting | AgentStatus::Stuck)
-                        && agent.session_id.is_none())
+                    && !(matches!(
+                        agent.status,
+                        AgentStatus::Starting | AgentStatus::Stuck | AgentStatus::Ready
+                    ) && agent.session_id.is_none())
             }
             OrgCommand::Clear { agent_id } => {
                 let agent = self.require_agent(agent_id)?;

@@ -128,13 +128,6 @@ fn agent_contract_error_codes_preserve_actionable_messages() {
         (AgentError::Refused("unsafe editor".into()), "refused"),
         (AgentError::Timeout, "timeout"),
         (AgentError::Internal("storage".into()), "internal"),
-        (
-            ReservationError::ScreenChanged {
-                pane: PaneId::parse("%7").unwrap(),
-            }
-            .into(),
-            "refused",
-        ),
         (ReservationError::Unavailable.into(), "unavailable"),
         (OrgServiceError::Timeout.into(), "timeout"),
         (
@@ -155,6 +148,14 @@ fn agent_contract_error_codes_preserve_actionable_messages() {
         assert_eq!(mapped.0.code, code);
         assert_eq!(mapped.0.message, message);
     }
+    let error = MethodError::from(AgentError::from(ReservationError::ScreenChanged {
+        pane: PaneId::parse("%7").unwrap(),
+    }));
+    assert_eq!(error.0.code, "refused");
+    assert_eq!(
+        error.0.message,
+        "Refusing input to %7: screen changed or is no longer safe; nothing was sent by this action"
+    );
     let error = MethodError::from(AgentError::from(ReservationError::Control(
         ControlError::AgentClearing {
             pane: "%7".into(),

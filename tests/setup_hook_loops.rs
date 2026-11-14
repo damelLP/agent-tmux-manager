@@ -139,7 +139,7 @@ impl Harness {
     fn entry(&self, home: &Path, event: &str) -> Value {
         let mut command = json!({"type": "command", "command": self.script_path(home)});
         if let Some(timeout) = self.timeout {
-            command["timeout"] = json!(timeout);
+            command["timeout"] = json!(if event == "SessionEnd" { 3 } else { timeout });
         }
         let mut entry = json!({"hooks": [command]});
         if self.matcher_events.contains(&event) {
@@ -335,6 +335,58 @@ fn claude_second_install_changes_nothing() {
 #[test]
 fn codex_second_install_changes_nothing() {
     assert_second_install(&CODEX);
+}
+
+/// Old installs have a 5s SessionEnd timeout. Updating only new entries,
+/// or forgetting to persist a migration when nothing was added, leaves
+/// Codex's startup warning in place.
+#[test]
+fn codex_setup_upgrades_existing_session_end_timeouts() {
+    let home = CODEX.home();
+    let home = home.path();
+    let mut seed = CODEX.first_install(home);
+    seed["hooks"]["SessionEnd"] = json!([
+        {"matcher": "kept", "hooks": [
+            {"type": "command", "command": "/usr/bin/my-own-hook", "timeout": 5},
+            {"type": "command", "command": CODEX.script_path(home), "timeout": 5},
+            {"type": "command", "command": "/elsewhere/atm-codex-hook-wrapper", "timeout": 5}
+        ]},
+        {"hooks": [{"type": "command", "command": "bash '/moved path/atm-codex-hook'", "timeout": 9}]},
+        {"hooks": [{"type": "command", "command": "/elsewhere/atm-codex-hook", "timeout": 2}]}
+    ]);
+    seed["userKey"] = json!("kept");
+    fs::write(CODEX.path(home), pretty(&seed)).unwrap();
+
+    let stdout = run_atm_ok(home, "setup");
+
+    let mut expected = seed;
+    expected["hooks"]["SessionEnd"][0]["hooks"][1]["timeout"] = json!(3);
+    expected["hooks"]["SessionEnd"][1]["hooks"][0]["timeout"] = json!(3);
+    assert_eq!(
+        fs::read_to_string(CODEX.path(home)).unwrap(),
+        pretty(&expected)
+    );
+    assert!(stdout.contains("Codex configuration written."), "{stdout}");
+
+    // The migration is idempotent, including an existing shorter timeout.
+    let bytes = unwritable_by_atm(&expected);
+    fs::write(CODEX.path(home), &bytes).unwrap();
+    let stdout = run_atm_ok(home, "setup");
+    assert!(stdout.contains("Codex already configured."), "{stdout}");
+    assert_eq!(fs::read_to_string(CODEX.path(home)).unwrap(), bytes);
+
+    // Uninstall still identifies the updated commands and leaves the user's
+    // shared entry, its matcher and the similarly named wrapper alone.
+    run_atm_ok(home, "uninstall");
+    assert_eq!(
+        fs::read_to_string(CODEX.path(home)).unwrap(),
+        pretty(&json!({"userKey": "kept", "hooks": {"SessionEnd": [
+            {"matcher": "kept", "hooks": [
+                {"type": "command", "command": "/usr/bin/my-own-hook", "timeout": 5},
+                {"type": "command", "command": "/elsewhere/atm-codex-hook-wrapper", "timeout": 5}
+            ]}
+        ]}}))
+    );
 }
 
 /// Setup over a file with some of the entries already there: it appends

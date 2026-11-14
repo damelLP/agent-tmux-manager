@@ -1,5 +1,27 @@
 # Claude screen fixtures
 
+## Lifecycle control observations (B0)
+
+Captured: Claude Code 2.1.325, 2026-11-14, sealed P1 private-tmux
+`capture-pane -p -e -N`. `screen_control_p1_<stem>_2.1.325.txt` maps to
+`<stem>.styled-N.txt`; corresponding `.plain.txt` and `.meta.json` contain
+wording and cursor/geometry evidence. Only private run roots are replaced by
+equal-width `/tmp/xxx…` paths. Attributes, rows, spaces and composer text are
+unchanged; the first provenance line is removed at test load.
+
+`tests/control_screen.rs` covers A80/A120/A200 default, selected, reset and
+ready frames; A-race-0/1-yes; A-auto-ready; B-clear-007;
+B-baseline-conversation; C1-auto-settled; B-auto-submitted; and C3-dialog.
+The new control observer recognizes both trust selections and captured manual/
+auto launch chrome. Lines above the first complete header are uninterpreted;
+a later copied header cannot erase earlier history. The legacy observer and
+its existing Unknown assertions are unchanged. Mutations are marked Synthetic.
+
+Full trust paths are not filesystem authorization; long/wrapped paths and
+unseeded onboarding remain unverified. Retry count is policy, not a key sender.
+Conversation=false is not proof of freshness. The four-option permission
+capture remains Unknown. Older limitations below describe the legacy observer.
+
 ## Styled fixtures (U8d)
 
 Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30

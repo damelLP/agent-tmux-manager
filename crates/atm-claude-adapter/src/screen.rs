@@ -44,6 +44,9 @@
 //! process/pane identity and copy-mode checks; identical historical text cannot
 //! prove that it came from a currently live editor.
 
+mod control;
+pub use control::{observe_control_screen, CONTROL_POLICY};
+
 use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,

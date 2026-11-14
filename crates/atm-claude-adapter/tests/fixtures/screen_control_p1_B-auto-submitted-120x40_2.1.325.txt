@@ -1,0 +1,41 @@
+Captured: claude 2.1.325, 2026-11-14, sealed private-tmux retained-space styled capture; paths sanitized.
+probe$ bash "$RUN/launch-auto.sh"                           
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude[0m [1mCode[0m [38;5;246mv2.1.325[39m                             
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus[39m [38;5;246m5.5[39m [38;5;246m·[39m [38;5;246mAPI[39m [38;5;246mUsage[39m [38;5;246mBilling[39m                     
+[38;5;174m ▝▝[39m   [38;5;174m▝▝[39m   [38;5;246m/tmp/xxxxxxxxxxxxxxxxxxxxxxx/cwd[39m                 
+
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/clear[39m                                                                                                                
+
+[38;5;246m❯ [38;5;231mB_AUTO_EVENT_SENTINEL[39m                                                                                                 
+
+[38;5;231m[49m●[39m SEALED_REPLY_46                                                                                                       
+
+[38;5;174m✢[39m [38;5;216mProcessing…[38;5;174m [38;5;246m(running Stop hook · 0s)[39m                      
+[38;5;246m  ⎿  Tip: Start with small features or bug fixes, tell Claude to propose a plan, and verify its suggested edits[39m         
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [7m[39m [0m                                                                                                                     
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;220m⏵⏵[39m [38;5;220mauto[39m [38;5;220mmode[39m [38;5;220mon[38;5;246m (shift+tab[39m [38;5;246mto[39m [38;5;246mcycle)[39m [38;5;246m·[39m [38;5;246m←[39m [38;5;246mfor[39m [38;5;246magents[39m                                               [38;5;246m◐[39m [38;5;246mmedium[39m [38;5;246m·[39m [38;5;246m/effort[39m  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

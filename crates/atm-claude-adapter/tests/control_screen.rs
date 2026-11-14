@@ -1,0 +1,191 @@
+use atm_claude_adapter::screen::{self, observe_control_screen, CONTROL_POLICY};
+use atm_core::harness_control::{ClearProof, ControlDialog, ControlKey, SessionArrival};
+use atm_core::styled_screen::StyledScreen;
+use atm_core::{FreshEditorEvidence, InputState, ScreenInput, TurnState};
+
+macro_rules! capture {
+    ($name:literal) => {
+        include_str!(concat!(
+            "fixtures/screen_control_p1_",
+            $name,
+            "_2.1.325.txt"
+        ))
+    };
+}
+const NO: &str = capture!("A80-default-80x40");
+const YES: &str = capture!("A80-selected-80x40");
+const AUTO: &str = capture!("A-auto-ready-120x40");
+fn observe(text: &str) -> atm_core::harness_control::ControlScreen {
+    observe_control_screen(ScreenInput::Styled(body(text)), None)
+}
+fn body(text: &str) -> &str {
+    if text.starts_with("Captured:") {
+        text.split_once('\n').unwrap().1
+    } else {
+        text
+    }
+}
+fn plain(text: &str) -> String {
+    StyledScreen::parse(body(text)).unwrap().text().to_owned()
+}
+
+#[test]
+fn policy_reuses_existing_constants() {
+    assert_eq!(CONTROL_POLICY.capture, screen::SCREEN_TEXT_FORMAT);
+    assert_eq!(CONTROL_POLICY.clear_command, screen::CLEAR_COMMAND);
+    assert_eq!(CONTROL_POLICY.session_arrival, SessionArrival::AtStart);
+    assert_eq!(
+        CONTROL_POLICY.clear_proof,
+        ClearProof::ChangedSession {
+            start_source: Some("clear")
+        }
+    );
+    assert_eq!(CONTROL_POLICY.trust_selection_retries, 1);
+}
+
+#[test]
+fn real_trust_selection_and_first_frame_reset() {
+    for (text, selected) in [
+        (NO, false),
+        (capture!("A120-default-120x40"), false),
+        (capture!("A200-default-200x40"), false),
+        (YES, true),
+        (capture!("A120-selected-120x40"), true),
+        (capture!("A200-selected-200x40"), true),
+        (capture!("A80-reset-after-enter-80x40"), false),
+        (capture!("A120-reset-after-enter-120x40"), false),
+        (capture!("A200-reset-after-enter-200x40"), false),
+        (capture!("A-race-0-yes-120x40"), true),
+        (capture!("A-race-1-yes-120x40"), true),
+    ] {
+        let expected = ControlDialog::FolderTrust {
+            folder: "/tmp/xxxxxxxxxxxxxxxxxxxxxxx/cwd".into(),
+            selected_accept: selected,
+            select_accept: (!selected).then_some(ControlKey::Down),
+            accept: ControlKey::Enter,
+        };
+        assert_eq!(observe(text).dialog, expected);
+        assert_eq!(
+            observe_control_screen(ScreenInput::Plain(&plain(text)), None).dialog,
+            expected
+        );
+    }
+}
+
+#[test]
+fn captured_launch_and_clear_are_fresh_without_conversation() {
+    for text in [
+        AUTO,
+        capture!("A80-ready-80x40"),
+        capture!("A120-ready-120x40"),
+        capture!("A200-ready-200x40"),
+        capture!("B-clear-007-120x40"),
+    ] {
+        let observed = observe(text);
+        assert_eq!(observed.dialog, ControlDialog::None);
+        assert_eq!(observed.facts.input, InputState::Empty);
+        assert_eq!(observed.facts.turn, TurnState::NotRunning);
+        assert_eq!(observed.facts.fresh_editor, FreshEditorEvidence::Present);
+        assert!(!observed.conversation);
+    }
+    // Synthetic: production U8e launch syntax, not the probe's shell command.
+    let launched = AUTO.replace(
+        "probe$ bash \"$RUN/launch-auto.sh\"",
+        "shell$ cd '/tmp/project' && claude --model example",
+    );
+    assert_ne!(launched, AUTO);
+    assert_eq!(observe(&launched), observe(AUTO));
+    // Legacy facts remain unchanged.
+    assert_eq!(
+        screen::observe_screen(ScreenInput::Styled(body(AUTO)), None).turn,
+        TurnState::Unknown
+    );
+    assert_eq!(
+        screen::observe_screen(ScreenInput::Styled(body(YES)), None).dialog,
+        atm_core::DialogState::Unknown
+    );
+}
+
+#[test]
+fn conversation_is_not_a_draft_or_clear_echo() {
+    for text in [
+        capture!("B-baseline-conversation-120x40"),
+        capture!("C1-auto-settled-120x40"),
+        capture!("B-auto-submitted-120x40"),
+    ] {
+        assert!(observe(text).conversation);
+        assert_eq!(observe(text).dialog, ControlDialog::None);
+        assert_eq!(
+            observe(text).facts.fresh_editor,
+            FreshEditorEvidence::Unknown
+        );
+    }
+    // Synthetic: typed composer and lone slash echo are not a transcript.
+    let draft = plain(AUTO).replace("❯\u{a0}", "❯\u{a0}draft");
+    assert!(!observe(&draft).conversation);
+    let old = plain(capture!("B-clear-007-120x40"))
+        .replace("❯ /clear", "❯ previous prompt\n● previous reply\n❯ /clear");
+    assert!(observe(&old).conversation);
+    assert_eq!(
+        observe(&old).facts.fresh_editor,
+        FreshEditorEvidence::Unknown
+    );
+}
+
+#[test]
+fn synthetic_damaged_trust_or_active_suffix_never_authorizes_keys() {
+    let no = plain(NO);
+    for text in [
+        no.replace("Quick safety check:", "Safety?"),
+        no.replace("Security guide", "Guide"),
+        no.replace("Enter to confirm", "Enter to delete"),
+        no.replace("❯ No, exit", "No, exit"),
+        no.replace("Yes, I trust", "❯ Yes, I trust"),
+        no.replace("/cwd", "/..."),
+        no.replace("/cwd", "/long\n wrapped"),
+        no.replace("No, exit", "No, continue"),
+        format!("{NO}\x1b[8m"),
+        format!("{NO}\x1b["),
+        format!("{NO}\nunknown footer"),
+    ] {
+        assert_eq!(observe(&text).dialog, ControlDialog::Unknown, "{text}");
+    }
+    for text in [NO, YES] {
+        // Synthetic: historical dialog above a current editor or a shell.
+        assert_eq!(
+            observe(&format!("{text}\n{AUTO}")).dialog,
+            ControlDialog::None
+        );
+        assert_eq!(
+            observe(&format!("{text}\nshell$ ")).dialog,
+            ControlDialog::Unknown
+        );
+    }
+}
+
+#[test]
+fn synthetic_headers_and_footer_damage_do_not_manufacture_freshness() {
+    let auto = plain(AUTO);
+    for text in [
+        auto.replace("Claude Code v", "Not a header v"),
+        auto.replace("cycle)", "changed)"),
+        format!("{AUTO}\nunknown footer"),
+        format!("{AUTO}\x1b[8m"),
+    ] {
+        assert_eq!(observe(&text).dialog, ControlDialog::Unknown);
+        assert_eq!(
+            observe(&text).facts.fresh_editor,
+            FreshEditorEvidence::Unknown
+        );
+    }
+    // Synthetic: first complete header is the boundary; a second copy is history, not a restart.
+    let copied = format!("{auto}\n{auto}");
+    assert_eq!(
+        observe(&copied).facts.fresh_editor,
+        FreshEditorEvidence::Unknown
+    );
+    assert_eq!(
+        observe(capture!("C3-dialog-120x40")).dialog,
+        ControlDialog::Unknown
+    );
+}

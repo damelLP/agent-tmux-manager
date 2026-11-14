@@ -405,6 +405,61 @@ async fn failed_append_has_no_notification() {
 }
 
 #[tokio::test]
+async fn notification_failure_does_not_retry_or_generate_another_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let committed = org
+        .execute(OrgCommand::SendMessage(content()), now())
+        .await
+        .unwrap();
+    let cursor = org.status().unwrap();
+    let (tx, rx) = mpsc::channel(32);
+    enqueue(&committed[0], &mut 0, &tx, Duration::ZERO, Instant::now()).unwrap();
+    drop(tx);
+    let launches = AtomicUsize::new(0);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_queue(
+            rx,
+            cancel.clone(),
+            |id| {
+                let org = org.clone();
+                async move {
+                    Ok(org
+                        .snapshot()
+                        .await?
+                        .message(&id)
+                        .is_some_and(|m| m.read_at.is_none()))
+                }
+            },
+            |_| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let result = run_notify(
+                        &["python3".into(), "-c".into(), "raise SystemExit(7)".into()],
+                        NOTIFY_TIMEOUT,
+                    )
+                    .await;
+                    assert!(matches!(result, Err(NotifyError::Failed { .. })));
+                    result
+                }
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        org.status().unwrap(),
+        cursor,
+        "notification failure must not write events"
+    );
+    assert_eq!(org.snapshot().await.unwrap().messages().count(), 1);
+    cancel.cancel();
+}
+
+#[tokio::test]
 async fn committed_message_reaches_existing_runner_as_one_literal_argument() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();

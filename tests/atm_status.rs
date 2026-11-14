@@ -17,6 +17,16 @@ use tokio::{
 };
 
 async fn status(result: Value, supported: bool, expected: &str, diagnostic: Option<&str>) {
+    status_with_stdout(result, supported, expected, diagnostic, false).await;
+}
+
+async fn status_with_stdout(
+    result: Value,
+    supported: bool,
+    expected: &str,
+    diagnostic: Option<&str>,
+    fail_stdout: bool,
+) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("rpc.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -90,18 +100,35 @@ async fn status(result: Value, supported: bool, expected: &str, diagnostic: Opti
         Duration::from_secs(30),
         Command::new(env!("CARGO_BIN_EXE_atm"))
             .arg("status")
+            .stdout(if fail_stdout {
+                std::process::Stdio::from(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/dev/full")
+                        .unwrap(),
+                )
+            } else {
+                std::process::Stdio::piped()
+            })
             .env_remove("TMUX")
             .env("TMUX_PANE", "%7")
             .env("ATM_SOCKET", socket)
             .env("ATM_STATE_DIR", dir.path().join("state"))
             .env("XDG_STATE_HOME", dir.path().join("xdg"))
             .kill_on_drop(true)
-            .output(),
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output(),
     )
     .await
     .unwrap()
     .unwrap();
-    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(if fail_stdout { 1 } else { 0 }),
+        "{out:?}"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     assert_eq!(
         seen.load(Ordering::SeqCst),
@@ -121,6 +148,20 @@ async fn status(result: Value, supported: bool, expected: &str, diagnostic: Opti
         .unwrap()
         .unwrap();
 }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn status_output_failure_is_error() {
+    // Dropping writeln!'s error would incorrectly turn ENOSPC into exit 0.
+    status_with_stdout(
+        json!({"result":{"messages":[],"unread_count":0,"next_after":null}}),
+        true,
+        "",
+        Some("No space left on device"),
+        true,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn status_zero_preserves_existing_bytes() {
     status(

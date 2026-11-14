@@ -34,6 +34,7 @@
 //! - All fallible operations return `Result` or `Option`
 //! - Channel operations handle closure gracefully
 
+pub mod control;
 pub mod discovery;
 pub mod monitor;
 pub mod notify;

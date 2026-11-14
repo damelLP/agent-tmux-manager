@@ -407,18 +407,47 @@ async fn tail_id_with_no_room_for_even_an_error_closes_without_partial_frame() {
     cancel.cancel();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn watch_unwatch_keeps_frame_boundaries_but_shutdown_cancels_blocked_write() {
     let logs = tempfile::tempdir().unwrap();
     let log = logs.path().join("shutdown.log");
-    tracing::subscriber::set_global_default(
+    // All server/connection tasks run on this test's current-thread runtime.
+    // Keep the collector local so parallel tests cannot write into this trace.
+    // Keep two dispatchers alive: tracing-core's single-dispatch fast path can
+    // cache `never` when another test first registers a callsite without tracing.
+    let _fallback = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+    let _trace = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
             .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
             .finish(),
+    );
+    // Model a parallel test's server on a separate runtime thread. Its cleanup
+    // must neither satisfy our capture sanity check nor contaminate abort checks.
+    timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    SocketServer::start(MethodServices::new(atmd::registry::spawn_registry()))
+                        .await
+                        .stop()
+                        .await;
+                });
+        }),
     )
+    .await
+    .unwrap()
     .unwrap();
+    let trace = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !trace.contains("Server cleanup complete"),
+        "foreign server captured: {trace}"
+    );
     for shutdown in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
@@ -445,7 +474,11 @@ async fn watch_unwatch_keeps_frame_boundaries_but_shutdown_cancels_blocked_write
                 .unwrap()
                 .unwrap();
             let trace = std::fs::read_to_string(&log).unwrap();
-            assert!(trace.contains("Server cleanup complete"));
+            assert_eq!(
+                trace.matches("Server cleanup complete").count(),
+                2,
+                "{trace}"
+            );
             assert!(!trace.contains("Aborting connection handlers"), "{trace}");
         } else {
             server.send(ClientMessage::unwatch()).await;

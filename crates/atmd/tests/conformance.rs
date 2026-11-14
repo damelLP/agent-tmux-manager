@@ -273,18 +273,21 @@ async fn fixture_barrier_rejects_an_extra_response() {
     client.require_next_pong().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn server_shutdown_does_not_wait_for_stuck_subscriber_drain_limit() {
     let logs = tempfile::tempdir().unwrap();
     let log = logs.path().join("shutdown.log");
-    tracing::subscriber::set_global_default(
+    // Only this runtime thread's servers belong in the trace. A second live
+    // dispatcher avoids tracing-core's single-dispatch callsite-interest race
+    // when parallel tests first hit a callsite with no subscriber installed.
+    let _fallback = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+    let _trace = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
             .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
             .finish(),
-    )
-    .unwrap();
+    );
     let registry = spawn_registry();
     let mut server = Server::with_services(MethodServices::new(registry.clone())).await;
     let mut client = server.client().await;
@@ -328,7 +331,11 @@ async fn server_shutdown_does_not_wait_for_stuck_subscriber_drain_limit() {
     // Completion alone could hide the fallback abort after the drain deadline.
     // Observe that branch directly instead of asserting elapsed wall time.
     let trace = std::fs::read_to_string(log).unwrap();
-    assert!(trace.contains("Server cleanup complete"), "{trace}");
+    assert_eq!(
+        trace.matches("Server cleanup complete").count(),
+        1,
+        "{trace}"
+    );
     assert!(!trace.contains("Aborting connection handlers"), "{trace}");
 }
 

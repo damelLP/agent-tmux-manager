@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-adopt-noncanonical-pane","method":"agent.adopt","params":{"project_root":"/project","name":"lead","pane":"%07"}},
+  "response": {"type":"response","id":"agent-adopt-noncanonical-pane","error":{"code":"invalid_params","message":"invalid reservation request: pane must be % followed by canonical ASCII digits"}},
+  "ignore": []
+}

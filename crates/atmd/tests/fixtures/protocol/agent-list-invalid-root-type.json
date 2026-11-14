@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-list-invalid-root-type","method":"agent.list","params":{"project_root":17}},
+  "response": {"type":"response","id":"agent-list-invalid-root-type","error":{"code":"invalid_params","message":"invalid type: integer `17`, expected path string"}},
+  "ignore": []
+}

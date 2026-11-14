@@ -154,6 +154,198 @@ mod tests {
             .code
     }
 
+    #[test]
+    fn reservation_errors_keep_codes_and_actionable_display_text() {
+        use crate::control::{
+            reservation::{ExpectedTag, ReservationError as R},
+            ControlError,
+        };
+        let pane = || PaneId::parse("%7").unwrap();
+        let agent = || "project/lead".parse().unwrap();
+        for (error, code, message) in [
+            (
+                R::ScreenChanged { pane: pane() },
+                "refused",
+                "pane %7 no longer passes the approved screen check; nothing was sent",
+            ),
+            (
+                R::Quarantined {
+                    agent: agent(),
+                    pane: Some(pane()),
+                },
+                "unavailable",
+                "agent project/lead (pane %7) is quarantined; restart atmd and reconcile",
+            ),
+            (
+                R::Quarantined {
+                    agent: agent(),
+                    pane: None,
+                },
+                "unavailable",
+                "agent project/lead (pane no pane) is quarantined; restart atmd and reconcile",
+            ),
+            (
+                R::Control(ControlError::PaneQuarantined {
+                    pane: "%7".into(),
+                    agent: agent(),
+                }),
+                "unavailable",
+                "pane %7: agent project/lead is quarantined; restart atmd and reconcile",
+            ),
+            (
+                R::Control(ControlError::OrganisationUnavailable { pane: "%7".into() }),
+                "unavailable",
+                "organisation state is unavailable for pane %7; refusing input",
+            ),
+            (
+                R::Busy {
+                    agent: agent(),
+                    pane: Some(pane()),
+                },
+                "conflict",
+                "agent project/lead or pane %7 is reserved",
+            ),
+            (
+                R::TagMismatch {
+                    pane: pane(),
+                    expected: ExpectedTag::Agent(agent()),
+                    actual: Some("project/other".into()),
+                },
+                "refused",
+                "pane %7 tag mismatch: expected project/lead, found project/other",
+            ),
+            (R::StaleReservation, "refused", "stale pane reservation"),
+            (R::PaneGone { pane: pane() }, "not_found", "pane %7 is gone"),
+            (
+                R::InvalidRequest {
+                    reason: "bad pane".into(),
+                },
+                "invalid_params",
+                "invalid reservation request: bad pane",
+            ),
+            (
+                R::InvalidObservation {
+                    pane: pane(),
+                    reason: "ambiguous".into(),
+                },
+                "refused",
+                "invalid observation of pane %7: ambiguous",
+            ),
+            (
+                R::Unavailable,
+                "unavailable",
+                "reserved control service is unavailable",
+            ),
+            (
+                R::NotImplemented {
+                    operation: "capture",
+                },
+                "unavailable",
+                "reserved control operation 'capture' is not implemented",
+            ),
+            (
+                R::Timeout,
+                "timeout",
+                "reserved control operation timed out; admitted effects may have completed",
+            ),
+            (
+                R::Control(ControlError::AgentClearing {
+                    pane: "%7".into(),
+                    agent: agent(),
+                }),
+                "refused",
+                "Refusing to send to %7: agent project/lead is clearing; try again in a moment",
+            ),
+        ] {
+            let mapped = MethodError::from(AgentError::from(error));
+            assert_eq!(mapped.0.code, code, "{message}");
+            assert_eq!(mapped.0.message, message);
+            for wrapper in ["PaneId(", "AgentId {", "ProjectId(", "Some("] {
+                assert!(!mapped.0.message.contains(wrapper), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn organisation_refusals_preserve_error_classification() {
+        use super::super::OrgServiceError as O;
+        use atm_org::{ApplyError as A, Refusal as R};
+        let agent = || "project/lead".parse().unwrap();
+        let project = || "project".parse().unwrap();
+        for (error, code) in [
+            (O::Unavailable("offline".into()), "unavailable"),
+            (O::Timeout, "timeout"),
+            (O::InvalidParams("bad cursor".into()), "invalid_params"),
+            (O::Oversized(1), "refused"),
+            (
+                O::Refused(R::Invariant(A::UnknownProject(project()))),
+                "not_found",
+            ),
+            (
+                O::Refused(R::Invariant(A::UnknownAgent(agent()))),
+                "not_found",
+            ),
+            (
+                O::Refused(R::Invariant(A::UnknownMessage(atm_org::MessageId::new(1)))),
+                "not_found",
+            ),
+            (
+                O::Refused(R::Invariant(A::InvalidId(
+                    "bad/id/extra".parse::<atm_org::AgentId>().unwrap_err(),
+                ))),
+                "invalid_params",
+            ),
+            (
+                O::Refused(R::InvalidValue {
+                    field: "root",
+                    reason: "relative".into(),
+                }),
+                "invalid_params",
+            ),
+            (
+                O::Refused(R::Invariant(A::PaneOccupied {
+                    pane: "%7".into(),
+                    holder: agent(),
+                })),
+                "conflict",
+            ),
+            (
+                O::Refused(R::Invariant(A::DuplicateMessage(atm_org::MessageId::new(
+                    1,
+                )))),
+                "conflict",
+            ),
+            (
+                O::Refused(R::AgentAlreadyBound {
+                    agent_id: agent(),
+                    pane: "%7".into(),
+                }),
+                "conflict",
+            ),
+            (
+                O::Refused(R::ProjectRootConflict {
+                    project_id: project(),
+                    registered: "/old".into(),
+                    requested: "/new".into(),
+                }),
+                "conflict",
+            ),
+            (
+                O::Refused(R::InvalidAgentState {
+                    agent_id: agent(),
+                    state: atm_org::AgentStatus::Down,
+                    operation: "clear",
+                }),
+                "refused",
+            ),
+        ] {
+            let message = error.to_string();
+            let mapped = MethodError::from(AgentError::from(error));
+            assert_eq!(mapped.0.code, code, "{message}");
+            assert_eq!(mapped.0.message, message);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn typed_non_utf8_root_is_invalid() {

@@ -270,6 +270,59 @@ async fn info_methods_match_handshake_and_registered_names_with_default_and_inje
 }
 
 #[tokio::test]
+async fn agent_methods_are_advertised_and_disabled_with_one_terminal_response() {
+    use atmd::org::agents::AgentHandle;
+    for injected in [false, true] {
+        let mut services = MethodServices::new(spawn_registry());
+        if injected {
+            services.agents = Some(AgentHandle::disabled("maintenance"));
+        }
+        let server = Server::with_services(services).await;
+        let mut client = server.client().await;
+        let connected = client.connect().await;
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"info","method":"daemon.info","params":{}})).await;
+        let info = client.recv().await;
+        assert_eq!(info["result"]["methods"], connected["methods"]);
+        client.require_next_pong().await;
+        for (method, params) in [
+            ("agent.up", json!({"project_root":"/project","name":"lead"})),
+            (
+                "agent.adopt",
+                json!({"project_root":"/project","name":"lead","pane":"%7"}),
+            ),
+            ("agent.clear", json!({"agent":"project/lead"})),
+            ("agent.respawn", json!({"agent":"project/lead"})),
+            ("agent.down", json!({"agent":"project/lead"})),
+            ("agent.list", Value::Null),
+        ] {
+            assert!(connected["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(method)));
+            client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":method,"method":method,"params":params})).await;
+            let message = if injected {
+                "agent service unavailable: maintenance"
+            } else {
+                "agent service unavailable: named-agent operations are not configured"
+            };
+            assert_eq!(
+                client.recv().await,
+                json!({"type":"response","id":method,"error":{"code":"unavailable","message":message}})
+            );
+            client.require_next_pong().await;
+        }
+        // Semantic errors win even over an explicitly injected disabled reason.
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"invalid","method":"agent.clear","params":{"agent":"project/lead","timeout_ms":0}})).await;
+        assert_eq!(
+            client.recv().await,
+            json!({"type":"response","id":"invalid","error":{"code":"invalid_params","message":"invalid agent parameters: timeout_ms must be in 1..=120000"}})
+        );
+        client.require_next_pong().await;
+        server.stop().await;
+    }
+}
+
+#[tokio::test]
 #[should_panic(expected = "fixture emitted an extra reply")]
 async fn fixture_barrier_rejects_an_extra_response() {
     let (ours, mut peer) = UnixStream::pair().unwrap();

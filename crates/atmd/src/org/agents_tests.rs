@@ -404,6 +404,70 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn review_updated_only_wake_binds_current_row() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        // Registered before the service subscribes: no Registered wake exists.
+        rig.row("fresh", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.session_id, None);
+        let mut events = agents.observation_events();
+        rig.inspect_only("%1", "p/lead");
+        update(&rig, "fresh").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("fresh"))
+        );
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn review_removed_or_moved_unbound_rows_wake_their_former_agent() {
+        for moved in [false, true] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), None).await;
+            rig.row("pending-100", "%1", false).await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let before = rig.org.status().unwrap();
+            let mut events = agents.observation_events();
+            rig.inspect_only("%1", "p/lead");
+            let mut row = rig
+                .registry
+                .get_session(SessionId::new("pending-100"))
+                .await
+                .unwrap();
+            // Neither payload names the agent's pane or a bound session: only the
+            // routing index's memory of the row's former pane can wake the agent.
+            let event = if moved {
+                row.tmux_pane = Some("%9".into());
+                crate::registry::SessionEvent::Updated {
+                    session: Box::new(row),
+                }
+            } else {
+                crate::registry::SessionEvent::Removed {
+                    session_id: row.id,
+                    reason: crate::registry::RemovalReason::Explicit,
+                }
+            };
+            rig.events.send(event).unwrap();
+            progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+            assert_eq!(rig.org.status().unwrap(), before);
+            assert_eq!(
+                rig.client
+                    .pending_reads(&PaneId::parse("%1").unwrap())
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn review_initial_observation_failure_is_agent_local() {
         let rig = Rig::new().await;
         for (name, pane) in [("good", "%1"), ("bad", "%2")] {

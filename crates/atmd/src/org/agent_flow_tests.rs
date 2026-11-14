@@ -885,3 +885,371 @@ fn start_view_refuses_what_it_cannot_place() {
         StartView::Wait("the pane's processes could not be read")
     );
 }
+
+// --- the launch line (section 3.4) ---
+
+/// One staged launch line as tmux showed it, from the rows around the prompt.
+struct Staged {
+    shell: &'static str,
+    tmux: &'static str,
+    case: &'static str,
+    width: u16,
+    /// (column, row) of the cursor, the row counted within `rows`.
+    cursor: (u32, u32),
+    /// The row the prompt and the pasted text start on.
+    prompt_row: usize,
+    rows: &'static [&'static str],
+    text: &'static str,
+}
+
+// Captured: tmux 3.8 (bash 5.3, zsh 5.9, bash as sh) and tmux 3.6 (bash, dash
+// as sh), 2026-11-14, private-server probe: a launch line pasted at the prompt
+// `pb> ` of a 49-column pane with `paste-buffer -p`, read with
+// `capture-pane -p -N` before any Enter. Six rows around the line; run
+// directories replaced by same-length placeholders. The probe's other cases
+// did not keep the prompt's row and are not used.
+const STAGED: &[Staged] = &[
+    Staged {
+        shell: "bash",
+        tmux: "tmux 3.8",
+        case: "staged_wrapped",
+        width: 49,
+        cursor: (46, 4),
+        prompt_row: 1,
+        rows: &["pb> ^C      ", "pb> cd '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxx/cwd dir' && ATM_AGENT='p/lead' pbharness '/t", "mp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/h' 'n", "ever-run' --model 'example model' --flag 'a;b'   ", ""],
+        text: "cd '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/h' 'never-run' --model 'example model' --flag 'a;b'",
+    },
+    Staged {
+        shell: "zsh",
+        tmux: "tmux 3.8",
+        case: "staged_wrapped",
+        width: 49,
+        cursor: (44, 4),
+        prompt_row: 1,
+        rows: &["pb>         ", "pb> cd '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxx/cwd dir' && ATM_AGENT='p/lead' pbharness '/tm", "p/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/h' 'nev", "er-run' --model 'example model' --flag 'a;b'     ", ""],
+        text: "cd '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/h' 'never-run' --model 'example model' --flag 'a;b'",
+    },
+    Staged {
+        shell: "sh",
+        tmux: "tmux 3.8",
+        case: "staged_wrapped",
+        width: 49,
+        cursor: (42, 4),
+        prompt_row: 1,
+        rows: &["pb> ^C      ", "pb> cd '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xx/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp", "/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/h' 'never", "-run' --model 'example model' --flag 'a;b'       ", ""],
+        text: "cd '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/h' 'never-run' --model 'example model' --flag 'a;b'",
+    },
+    Staged {
+        shell: "bash",
+        tmux: "tmux 3.6",
+        case: "staged_wrapped",
+        width: 49,
+        cursor: (47, 4),
+        prompt_row: 2,
+        rows: &["PB-BACK-alias           ", "pb> ^C      ", "pb> cd '/tmp/yyyyyyyyyyyyyyyy/cwd dir' && ATM_AGE", "NT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyyyy/h' '", "never-run' --model 'example model' --flag 'a;b'  ", ""],
+        text: "cd '/tmp/yyyyyyyyyyyyyyyy/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyyyy/h' 'never-run' --model 'example model' --flag 'a;b'",
+    },
+    Staged {
+        shell: "bash",
+        tmux: "tmux 3.6",
+        case: "staged_exact_fit",
+        width: 49,
+        cursor: (0, 4),
+        prompt_row: 0,
+        rows: &["pb> cd '/tmp/yyyyyyyyyyyyyyyy/cwd dir' && ATM_AGE", "NT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyyyy/h' '", "never-run' --model 'example model' --flag 'a;b' -", "-pad 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'", "            ", ""],
+        text: "cd '/tmp/yyyyyyyyyyyyyyyy/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyyyy/h' 'never-run' --model 'example model' --flag 'a;b' --pad 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
+    },
+    Staged {
+        shell: "bash",
+        tmux: "tmux 3.6",
+        case: "staged_exact_fit_plus_one",
+        width: 49,
+        cursor: (1, 4),
+        prompt_row: 0,
+        rows: &["pb> cd '/tmp/yyyyyyyyyyyyyyyy/cwd dir' && ATM_AGE", "NT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyyyy/h' '", "never-run' --model 'example model' --flag 'a;b' -", "-pad 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "'           ", ""],
+        text: "cd '/tmp/yyyyyyyyyyyyyyyy/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyyyy/h' 'never-run' --model 'example model' --flag 'a;b' --pad 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
+    },
+    Staged {
+        shell: "sh",
+        tmux: "tmux 3.6",
+        case: "staged_wrapped",
+        width: 49,
+        cursor: (43, 4),
+        prompt_row: 2,
+        rows: &["PB-BACK-alias           ", "pb> ^C      ", "pb> cd '/tmp/yyyyyyyyyyyyyy/cwd dir' && ATM_AGENT", "='p/lead' pbharness '/tmp/yyyyyyyyyyyyyy/h' 'neve", "r-run' --model 'example model' --flag 'a;b'      ", ""],
+        text: "cd '/tmp/yyyyyyyyyyyyyy/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyy/h' 'never-run' --model 'example model' --flag 'a;b'",
+    },
+    Staged {
+        shell: "sh",
+        tmux: "tmux 3.6",
+        case: "staged_exact_fit",
+        width: 49,
+        cursor: (49, 4),
+        prompt_row: 1,
+        rows: &["r-run' --model 'example model' --flag 'a;b'^C    ", "pb> cd '/tmp/yyyyyyyyyyyyyy/cwd dir' && ATM_AGENT", "='p/lead' pbharness '/tmp/yyyyyyyyyyyyyy/h' 'neve", "r-run' --model 'example model' --flag 'a;b' --pad", " 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'", ""],
+        text: "cd '/tmp/yyyyyyyyyyyyyy/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyy/h' 'never-run' --model 'example model' --flag 'a;b' --pad 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
+    },
+    Staged {
+        shell: "sh",
+        tmux: "tmux 3.6",
+        case: "staged_exact_fit_plus_one",
+        width: 49,
+        cursor: (1, 4),
+        prompt_row: 0,
+        rows: &["pb> cd '/tmp/yyyyyyyyyyyyyy/cwd dir' && ATM_AGENT", "='p/lead' pbharness '/tmp/yyyyyyyyyyyyyy/h' 'neve", "r-run' --model 'example model' --flag 'a;b' --pad", " 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "'           ", ""],
+        text: "cd '/tmp/yyyyyyyyyyyyyy/cwd dir' && ATM_AGENT='p/lead' pbharness '/tmp/yyyyyyyyyyyyyy/h' 'never-run' --model 'example model' --flag 'a;b' --pad 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
+    },
+];
+
+fn shell_capture(
+    rows: &[&str],
+    width: u16,
+    cursor: (u32, u32),
+    format: CaptureFormat,
+) -> crate::control::reservation::PaneCapture {
+    let mut text = rows.join("\n");
+    text.push('\n');
+    let inspection = crate::control::reservation::PaneInspection::new(
+        atm_tmux::PaneInfo {
+            pane_id: "%1".into(),
+            session_name: "private".into(),
+            window_index: 0,
+            pane_pid: ROOT,
+            width,
+            height: rows.len() as u16,
+            is_active: false,
+        },
+        Some("p/lead".into()),
+        false,
+        false,
+        Some(true),
+        cursor.0,
+        cursor.1,
+    )
+    .with_foreground_process(None, Some("zsh".into()));
+    crate::control::reservation::PaneCapture::new(text, inspection, format)
+}
+
+impl Staged {
+    fn after(&self, format: CaptureFormat) -> crate::control::reservation::PaneCapture {
+        shell_capture(self.rows, self.width, self.cursor, format)
+    }
+    /// The pane as it was before the paste: the same rows down to the prompt,
+    /// with the cursor after the prompt.
+    fn before(&self) -> crate::control::reservation::PaneCapture {
+        let mut rows = self.rows[..self.prompt_row].to_vec();
+        rows.push("pb> ");
+        rows.resize(self.rows.len(), "");
+        shell_capture(
+            &rows,
+            self.width,
+            (4, self.prompt_row as u32),
+            CaptureFormat::Plain,
+        )
+    }
+    fn label(&self) -> String {
+        format!("{} on {}, {}", self.shell, self.tmux, self.case)
+    }
+}
+
+#[test]
+fn launch_line_equals_prompt_plus_text() {
+    let mut exact_fits = 0;
+    for staged in STAGED {
+        assert!(launch_text_is_safe(staged.text), "{}", staged.label());
+        let before = launch_line(&staged.before()).unwrap();
+        assert!(before.ends_with("pb> "), "{}", staged.label());
+        for format in [CaptureFormat::Plain, CaptureFormat::Ansi] {
+            let after = staged.after(format);
+            assert_eq!(
+                launch_line(&after),
+                Some(format!("{before}{}", staged.text)),
+                "{}",
+                staged.label()
+            );
+            assert!(launch_line_is_staged(&after, &before, staged.text));
+        }
+        exact_fits +=
+            usize::from(staged.cursor.0 == 0 || staged.cursor.0 == u32::from(staged.width));
+    }
+    assert_eq!(STAGED.len(), 9);
+    assert!(
+        exact_fits >= 2,
+        "both exact-fit cursor shapes are among the captures"
+    );
+}
+
+#[test]
+fn launch_line_cursor_at_width_is_row_end() {
+    // dash after an exact fit: the cursor stays on the full row, at column 49.
+    let staged = STAGED
+        .iter()
+        .find(|staged| staged.cursor.0 == u32::from(staged.width))
+        .expect("the dash exact-fit capture");
+    assert_eq!(staged.shell, "sh");
+    let line = launch_line(&staged.after(CaptureFormat::Plain)).unwrap();
+    assert!(line.ends_with(staged.text));
+    // bash after the same fit: column 0 of the next row, the full row joined in.
+    let staged = STAGED
+        .iter()
+        .find(|staged| staged.cursor.0 == 0)
+        .expect("the bash exact-fit capture");
+    let line = launch_line(&staged.after(CaptureFormat::Plain)).unwrap();
+    assert!(line.ends_with(staged.text));
+    // Synthetic: a column past the width is not a cursor.
+    let mut capture = staged.after(CaptureFormat::Plain);
+    capture.inspection.cursor_column = u32::from(staged.width) + 1;
+    assert_eq!(launch_line(&capture), None);
+}
+
+#[test]
+fn launch_line_ignores_cells_at_or_after_cursor() {
+    // The exact-fit-plus-one captures keep eleven stale cells after the cursor.
+    let staged = STAGED
+        .iter()
+        .find(|staged| staged.case == "staged_exact_fit_plus_one")
+        .unwrap();
+    let cursor_row = staged.rows[staged.cursor.1 as usize];
+    assert!(
+        cursor_row.len() > staged.cursor.0 as usize,
+        "{cursor_row:?}"
+    );
+    let before = launch_line(&staged.before()).unwrap();
+    assert!(launch_line_is_staged(
+        &staged.after(CaptureFormat::Plain),
+        &before,
+        staged.text
+    ));
+    // Synthetic: a shell's suggestion drawn after the cursor changes nothing.
+    let mut rows = staged.rows.to_vec();
+    let suggested = format!("{} --resume last", &cursor_row[..staged.cursor.0 as usize]);
+    rows[staged.cursor.1 as usize] = &suggested;
+    let capture = shell_capture(&rows, staged.width, staged.cursor, CaptureFormat::Plain);
+    assert!(launch_line_is_staged(&capture, &before, staged.text));
+}
+
+#[test]
+fn launch_line_with_typed_prefix_refuses() {
+    // Synthetic: the review's scenario. Someone typed `rm -rf ~; ` into the new
+    // shell before the paste landed. The line ends with the launch text, but it
+    // is not the prompt plus the launch text.
+    let before = shell_capture(&["pb> ", ""], 80, (4, 0), CaptureFormat::Plain);
+    let p0 = launch_line(&before).unwrap();
+    assert_eq!(p0, "pb> ");
+    let text = "cd '/proj' && ATM_AGENT='p/lead' claude";
+    let typed = format!("pb> rm -rf ~; {text}");
+    let capture = shell_capture(
+        &[&typed, ""],
+        80,
+        (typed.len() as u32, 0),
+        CaptureFormat::Plain,
+    );
+    assert!(launch_line(&capture).unwrap().ends_with(text));
+    assert!(!launch_line_is_staged(&capture, &p0, text));
+    // The twin: the same pane without the typed text.
+    let clean = format!("pb> {text}");
+    let capture = shell_capture(
+        &[&clean, ""],
+        80,
+        (clean.len() as u32, 0),
+        CaptureFormat::Plain,
+    );
+    assert!(launch_line_is_staged(&capture, &p0, text));
+    // Text typed after the paste is before the cursor too.
+    let after = format!("pb> {text} --dangerously");
+    let capture = shell_capture(
+        &[&after, ""],
+        80,
+        (after.len() as u32, 0),
+        CaptureFormat::Plain,
+    );
+    assert!(!launch_line_is_staged(&capture, &p0, text));
+}
+
+#[test]
+fn launch_line_with_changed_prompt_refuses() {
+    // Synthetic: an asynchronous prompt redraw between the paste and the Enter.
+    let text = "cd '/proj' && ATM_AGENT='p/lead' claude";
+    let p0 = "pb> ";
+    for prompt in ["pb (main)> ", "pb>", "> ", ""] {
+        let line = format!("{prompt}{text}");
+        let capture = shell_capture(
+            &[&line, ""],
+            80,
+            (line.len() as u32, 0),
+            CaptureFormat::Plain,
+        );
+        assert!(!launch_line_is_staged(&capture, p0, text), "{prompt:?}");
+    }
+    // The cursor moved back into the text: the line before it is shorter.
+    let line = format!("{p0}{text}");
+    let capture = shell_capture(
+        &[&line, ""],
+        80,
+        (line.len() as u32 - 3, 0),
+        CaptureFormat::Plain,
+    );
+    assert!(!launch_line_is_staged(&capture, p0, text));
+    // The cursor sits after cells that were never written: they read as blanks.
+    let capture = shell_capture(&["pb>", ""], 80, (6, 0), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture).as_deref(), Some("pb>   "));
+}
+
+#[test]
+fn launch_line_refuses_what_it_cannot_measure() {
+    // Synthetic. A character before the cursor that is not printable ASCII may
+    // be wider than one cell: the cut at the cursor is then unknown.
+    for prompt in ["\u{276f} ", "\u{1f680} ", "caf\u{e9}> "] {
+        let capture = shell_capture(
+            &[prompt, ""],
+            80,
+            (prompt.chars().count() as u32, 0),
+            CaptureFormat::Plain,
+        );
+        assert_eq!(launch_line(&capture), None, "{prompt:?}");
+    }
+    // A row above that may or may not fill the width: unknown, so refuse.
+    let wide = "\u{1f680}".repeat(40);
+    let capture = shell_capture(&[&wide, "pb> "], 80, (4, 1), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture), None);
+    // The twin: a row above too short to fill the width under any widths.
+    let capture = shell_capture(&["\u{276f} done", "pb> "], 80, (4, 1), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture).as_deref(), Some("pb> "));
+    // An undecodable styled capture and a cursor below the capture.
+    let capture = shell_capture(&["pb> \u{1b}[5n", ""], 80, (4, 0), CaptureFormat::Ansi);
+    assert_eq!(launch_line(&capture), None);
+    let mut capture = shell_capture(&["pb> ", ""], 80, (4, 0), CaptureFormat::Plain);
+    capture.inspection.cursor_row = 2;
+    assert_eq!(launch_line(&capture), None);
+    // Styles are not cells: a coloured prompt reads as its text.
+    let capture = shell_capture(
+        &["\u{1b}[1;32mpb>\u{1b}[0m ", ""],
+        80,
+        (4, 0),
+        CaptureFormat::Ansi,
+    );
+    assert_eq!(launch_line(&capture).as_deref(), Some("pb> "));
+}
+
+#[test]
+fn launch_text_refuses_non_ascii() {
+    for text in [
+        "cd '/proj' && ATM_AGENT='p/lead' claude --model 'opus'",
+        "x",
+        "a b~!",
+    ] {
+        assert!(launch_text_is_safe(text), "{text:?}");
+    }
+    for text in [
+        "",
+        "cd '/home/caf\u{e9}' && claude",
+        "claude --name '\u{1f680}'",
+        "claude\n",
+        "claude\trm",
+        "claude\u{1b}[31m",
+        "claude\u{7f}",
+        "claude\u{a0}--x",
+    ] {
+        assert!(!launch_text_is_safe(text), "{text:?}");
+    }
+}

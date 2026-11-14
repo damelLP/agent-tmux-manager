@@ -177,14 +177,18 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
                 )
                 .await
             });
-            let held = entry.await.unwrap(); // real shell consumed clear's Enter
-            let (delivered, mut delivery_entered) = oneshot::channel();
+            let _ = entry.await.unwrap(); // real shell consumed clear's Enter
             let c = control.clone();
+            let o = org.clone();
             let mut delivery = Box::pin(async move {
                 c.run_reserved(
                     reservation(ReservationKind::Delivery),
                     move |r| async move {
-                        delivered.send(()).unwrap();
+                        assert_eq!(
+                            o.snapshot().await.unwrap().agent(r.agent()).unwrap().status,
+                            atm_org::AgentStatus::Ready,
+                            "delivery must enter only after durable EditorReady"
+                        );
                         let pane = PaneId::parse("%0")?;
                         r.paste_guarded(
                             &pane,
@@ -217,10 +221,6 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
                 .prepare_spawn(Some("%0".into()), Some("/private".into()), None, None)
                 .await
                 .unwrap();
-            assert!(matches!(
-                delivery_entered.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
             for (method, params) in [
                 (
                     "session.send",
@@ -238,19 +238,8 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
                     "Refusing to send to %0: agent project/lead is clearing; try again in a moment"
                 );
             }
-            assert!(matches!(
-                delivery_entered.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
-            assert!(!held
-                .capture(&PaneId::parse("%0").unwrap(), CaptureFormat::Plain)
-                .await
-                .unwrap()
-                .text
-                .contains("UNSAFE"));
             editor.send(()).unwrap();
             clearing.await.unwrap().unwrap();
-            delivery_entered.await.unwrap();
             delivery.await.unwrap().unwrap();
             let reply = rpc(
                 &socket,
@@ -259,6 +248,24 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
             )
             .await;
             assert_eq!(reply["result"]["pane"], "%0");
+            // The pty echoes input asynchronously. Observe until the later
+            // sentinel is visible before asserting absence of earlier input.
+            // Observe's actor pacing bounds the polls; the outer timeout is
+            // solely a hang guard, not a delay used as evidence.
+            loop {
+                let frame = control
+                    .observe(&PaneId::parse("%0").unwrap(), CaptureFormat::Plain)
+                    .await
+                    .unwrap();
+                if frame
+                    .text
+                    .lines()
+                    .any(|line| line.trim_end() == "after-ready")
+                {
+                    assert!(!frame.text.contains("UNSAFE"));
+                    break;
+                }
+            }
             assert_eq!(
                 org.snapshot()
                     .await

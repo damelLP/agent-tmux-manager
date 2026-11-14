@@ -217,18 +217,19 @@ fn older_attempt_receipt_survives_new_arm_and_failure() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn coalesced_wake_retains_receipt_and_receive_time() {
+async fn coalesced_wake_retains_receipt() {
     let e = armed();
-    let received = e.clock().now().unwrap();
+    let mut wake = e.subscribe();
     exact(&e);
     exact(&e);
     tokio::time::advance(std::time::Duration::from_secs(10)).await;
-    e.wake.notified().await;
+    // Two observations, one wake: the fact is in the store, not in the wake.
+    tokio::time::timeout(std::time::Duration::from_secs(60), wake.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!wake.has_changed().unwrap());
     assert!(e.receipt(id()).unwrap().is_some());
-    let state = e.state().unwrap();
-    let activity = state.sessions.get(&SessionId::new("session")).unwrap();
-    assert_eq!(activity.0, received);
-    assert_eq!(activity.1.as_ref().unwrap().as_str(), "%7");
 }
 
 #[test]
@@ -429,4 +430,41 @@ fn evidence_unavailable_blocks_retry() {
         Err(MessageError::Unavailable(_))
     ));
     assert!(matches!(e.receipt(id()), Err(MessageError::Unavailable(_))));
+}
+
+#[test]
+fn session_churn_never_disables_evidence() {
+    // Sessions that are not recipients come and go for the daemon's whole life.
+    let e = armed();
+    for n in 0..5000 {
+        let session = SessionId::new(format!("ended-{n}"));
+        e.observe(
+            &session,
+            Some("%9"),
+            Harness::Pi,
+            &LifecycleEvent::WorkingStart,
+        )
+        .unwrap();
+        e.observe_activity(&session, None).unwrap();
+    }
+    exact(&e);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "session"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_wake_subscribers_both_see_an_observation() {
+    // The scheduler and the executor's confirmation wait each hold a receiver.
+    let e = armed();
+    let (mut scheduler, mut executor) = (e.subscribe(), e.subscribe());
+    exact(&e);
+    for wake in [&mut scheduler, &mut executor] {
+        tokio::time::timeout(std::time::Duration::from_secs(60), wake.changed())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(e.receipt(id()).unwrap().is_some());
 }

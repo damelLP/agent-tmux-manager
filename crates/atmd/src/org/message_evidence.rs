@@ -6,17 +6,25 @@
 //! Register/arm/observe share one short synchronous lock. Coalesced wakeups do
 //! not discard retained facts; poisoned/exhausted retention fails closed.
 //! Earlier scopes survive retries and final failure for late exact receipts.
+//!
+//! Lock order: evidence, then history. The tap stamps an event's receive time
+//! and forwards its Activity to history under one evidence lock acquisition, so
+//! each event keeps its own time and nothing is retained per session. History
+//! never calls evidence.
+//!
+//! Wakes are a `watch` counter: every consumer (A2's scheduler, B's confirmation
+//! wait) holds its own receiver from `subscribe`, so none misses a change.
 
+use super::message_history::{HistoryUpdate, MessageHistoryHandle};
 use super::messages::{MessageClock, MessageError};
 use crate::control::reservation::PaneId;
 use atm_core::{Harness, LifecycleEvent, SessionId};
 use atm_org::{AgentId, DeliveryReceipt, MessageId};
-use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
 };
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// Scope recorded after Attempted is applied, before paste can be dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +50,7 @@ pub struct AttemptEvidence {
 
 const MAX_MESSAGES: usize = 4096;
 const MAX_SCOPES: usize = 16384;
+/// Bounds one scope's excluded baseline, not the sessions the daemon sees.
 const MAX_SESSIONS: usize = 4096;
 
 #[derive(Debug)]
@@ -62,8 +71,6 @@ struct Entry {
 struct State {
     disabled: Option<String>,
     messages: HashMap<MessageId, Entry>,
-    // Accepted receive time and original pane, never poll timestamps.
-    sessions: HashMap<SessionId, (DateTime<Utc>, Option<PaneId>)>,
     scopes: usize,
 }
 
@@ -72,7 +79,7 @@ struct State {
 pub struct MessageEvidence {
     clock: MessageClock,
     state: Arc<Mutex<State>>,
-    wake: Arc<Notify>,
+    wake: watch::Sender<u64>,
 }
 
 impl MessageEvidence {
@@ -81,7 +88,7 @@ impl MessageEvidence {
         Self {
             clock,
             state: Arc::new(Mutex::new(State::default())),
-            wake: Arc::new(Notify::new()),
+            wake: watch::Sender::new(0),
         }
     }
 
@@ -93,7 +100,7 @@ impl MessageEvidence {
                 disabled: Some(reason.into()),
                 ..State::default()
             })),
-            wake: Arc::new(Notify::new()),
+            wake: watch::Sender::new(0),
         }
     }
 
@@ -113,9 +120,28 @@ impl MessageEvidence {
         Ok(state)
     }
 
+    /// One wake per consumer for every change; see the module docs.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.wake.subscribe()
+    }
+
+    fn wake(&self) {
+        self.wake
+            .send_modify(|changes| *changes = changes.wrapping_add(1));
+    }
+
+    /// Cheap check for the tap: a disabled store needs no registry proof.
+    pub(crate) fn available(&self) -> bool {
+        self.state().is_ok()
+    }
+
+    /// Only for a broken internal invariant, never for one caller or event.
+    /// Reached at most once: `state` refuses a disabled store.
     fn disable(&self, state: &mut State, reason: &str) -> MessageError {
+        tracing::error!(reason, "Message evidence disabled until restart");
         state.disabled = Some(reason.into());
-        self.wake.notify_one();
+        self.wake();
         MessageError::Unavailable(reason.into())
     }
 
@@ -192,7 +218,7 @@ impl MessageEvidence {
             entry.probably_landed = false;
             state.scopes += 1;
         }
-        self.wake.notify_one();
+        self.wake();
         Ok(())
     }
 
@@ -242,33 +268,21 @@ impl MessageEvidence {
         harness: Harness,
         event: &LifecycleEvent,
     ) -> Result<(), MessageError> {
-        let prompt = match event {
-            LifecycleEvent::PromptSubmit { prompt } => prompt.as_deref(),
-            _ => None,
-        };
-        self.observe_inner(session, pane, Some(harness), prompt)
+        self.credit(session, pane, Some(harness), prompt(event), None)
     }
 
-    /// The tap forwards retained receive-time provenance through the same short
-    /// ordering lock. A coalesced/newer observation may subsume an earlier one;
-    /// never substitute the later drain time for its receive timestamp.
-    pub(crate) fn record_activity(
+    /// The connection tap's entry. A status line has no event and no harness.
+    /// Stamps the receive time, credits the scopes and forwards the Activity
+    /// to history under one lock acquisition; never substitute a later time.
+    pub(crate) fn tap(
         &self,
         session: &SessionId,
-        history: &super::message_history::MessageHistoryHandle,
+        pane: Option<&str>,
+        harness: Option<Harness>,
+        event: Option<&LifecycleEvent>,
+        history: Option<&MessageHistoryHandle>,
     ) -> Result<(), MessageError> {
-        let mut state = self.state()?;
-        if let Some((at, pane)) = state.sessions.get(session) {
-            let update = super::message_history::HistoryUpdate::Activity {
-                at: *at,
-                session_id: session.clone(),
-                pane: pane.clone(),
-            };
-            if history.record(update, *at).is_err() {
-                return Err(self.disable(&mut state, "message activity history unavailable"));
-            }
-        }
-        Ok(())
+        self.credit(session, pane, harness, event.and_then(prompt), history)
     }
 
     pub(crate) fn invalidate(&self, reason: &str) -> MessageError {
@@ -285,15 +299,16 @@ impl MessageEvidence {
         session: &SessionId,
         pane: Option<&str>,
     ) -> Result<(), MessageError> {
-        self.observe_inner(session, pane, None, None)
+        self.credit(session, pane, None, None, None)
     }
 
-    fn observe_inner(
+    fn credit(
         &self,
         session: &SessionId,
         pane: Option<&str>,
         harness: Option<Harness>,
         prompt: Option<&str>,
+        history: Option<&MessageHistoryHandle>,
     ) -> Result<(), MessageError> {
         let mut state = self.state()?;
         if session.is_pending() {
@@ -304,10 +319,6 @@ impl MessageEvidence {
             .clock
             .now()
             .map_err(|_| self.disable(&mut state, "message evidence clock unavailable"))?;
-        if !state.sessions.contains_key(session) && state.sessions.len() >= MAX_SESSIONS {
-            return Err(self.disable(&mut state, "message evidence activity capacity exhausted"));
-        }
-        state.sessions.insert(session.clone(), (at, pane.clone()));
         for entry in state.messages.values_mut() {
             let last_seq = entry.scopes.last().map(|s| s.identity.attempt_seq);
             for scope in &mut entry.scopes {
@@ -343,8 +354,25 @@ impl MessageEvidence {
                 }
             }
         }
-        self.wake.notify_one();
+        self.wake();
+        if let Some(history) = history {
+            let update = HistoryUpdate::Activity {
+                at,
+                session_id: session.clone(),
+                pane,
+            };
+            if history.record(update, at).is_err() {
+                return Err(self.disable(&mut state, "message activity history unavailable"));
+            }
+        }
         Ok(())
+    }
+}
+
+fn prompt(event: &LifecycleEvent) -> Option<&str> {
+    match event {
+        LifecycleEvent::PromptSubmit { prompt } => prompt.as_deref(),
+        _ => None,
     }
 }
 

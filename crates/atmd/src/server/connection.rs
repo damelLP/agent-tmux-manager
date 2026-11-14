@@ -810,6 +810,9 @@ where
         let Some(evidence) = &self.message_evidence else {
             return false;
         };
+        if !evidence.available() {
+            return false;
+        }
         if session.is_pending()
             || pane.is_some_and(|p| crate::control::reservation::PaneId::parse(p).is_err())
         {
@@ -850,16 +853,17 @@ where
         let Some(evidence) = &self.message_evidence else {
             return;
         };
-        let observed = match event {
-            Some(event) => evidence.observe(session, pane, harness, event),
-            None => evidence.observe_activity(session, pane),
-        };
-        let observed = observed.and_then(|()| match &self.message_history {
-            Some(history) => evidence.record_activity(session, history),
-            None => Ok(()),
-        });
+        // A status line carries no event: activity only, without a harness.
+        let observed = evidence.tap(
+            session,
+            pane,
+            event.map(|_| harness),
+            event,
+            self.message_history.as_ref(),
+        );
         if let Err(error) = observed {
-            warn!(%error, "Message evidence unavailable; registry event remains applied");
+            // Evidence logs its own disable once; the registry event stays applied.
+            debug!(%error, "Message evidence did not take the event");
         }
     }
 
@@ -2215,6 +2219,65 @@ mod tests {
         let facts = evidence.snapshot("m123".parse().unwrap()).unwrap();
         assert!(facts.probably_landed);
         assert!(facts.receipt.is_none());
+    }
+
+    /// What the fake registry answers to the tap's one snapshot request.
+    enum FakeSnapshot {
+        Rows(Vec<atm_core::SessionView>),
+    }
+
+    /// Replaces the handler's registry with a scripted actor. Returns the
+    /// number of snapshots it was asked for.
+    fn fake_registry(
+        handler: &mut EvidenceHandler,
+        apply: Result<(), crate::registry::RegistryError>,
+        snapshot: FakeSnapshot,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        use crate::registry::RegistryCommand;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        handler.registry = RegistryHandle::new(sender, events);
+        let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = snapshots.clone();
+        tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    RegistryCommand::ApplyLifecycleEvent { respond_to, .. }
+                    | RegistryCommand::UpdateFromStatusLine { respond_to, .. } => {
+                        let _ = respond_to.send(apply.clone());
+                    }
+                    RegistryCommand::GetAllSessions { respond_to } => {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        match &snapshot {
+                            FakeSnapshot::Rows(rows) => {
+                                let _ = respond_to.send(rows.clone());
+                            }
+                        }
+                    }
+                    _ => panic!("unexpected registry operation"),
+                }
+            }
+        });
+        snapshots
+    }
+
+    #[tokio::test]
+    async fn message_evidence_disabled_takes_no_registry_snapshot() {
+        let (handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let disabled = crate::org::message_evidence::MessageEvidence::disabled(
+            evidence.clock().clone(),
+            "synthetic broken invariant",
+        );
+        let mut handler = handler.with_message_evidence(Some(disabled), None);
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![]));
+        for _ in 0..3 {
+            handler
+                .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+                .await
+                .unwrap();
+        }
+        // The hook is still applied; a disabled evidence costs it nothing more.
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     fn request_router() -> Arc<super::super::methods::MethodRouter> {

@@ -98,7 +98,8 @@ fn expected(key: &str) -> ScreenFacts {
             (Unknown, TurnUnknown, DialogState::FolderTrust { folder: "/fixture/xxxxxxxxxxxxxxxxxxx/cwd".into() }, NotFresh),
         "codex.fresh.rich" | "codex.fresh.poor" | "codex.fresh.u5"
         | "codex.erased.rich" | "codex.erased.poor" | "codex.clear-complete.rich"
-        | "codex.clear-complete.poor" | "codex.clear-complete.u5" => (Unknown, NotRunning, None, Present),
+        | "codex.clear-complete.poor" | "codex.clear-complete.u5"
+        | "codex.fresh.p1-compact" | "codex.clear-complete.p1-compact" => (Unknown, NotRunning, None, Present),
         "codex.working.u5" => (Unknown, Running, None, NotFresh),
         "codex.idle.u5" | "codex.idle.after-turn" | "codex.interrupted.u5" => (Unknown, NotRunning, None, NotFresh),
         "codex.clear-menu.u5" => (Draft, NotRunning, Other, NotFresh),
@@ -285,7 +286,13 @@ fn lifecycle_facts_survive_documented_and_split_height_viewports() {
     let mut rig = StandInRig::start();
     for mode in [StandInMode::Codex, StandInMode::Pi] {
         let minimum_width = if mode == StandInMode::Pi { 86 } else { 80 };
-        for (columns, rows) in [(100, 30), (120, 19), (minimum_width, 19)] {
+        for (columns, rows) in [
+            (100, 30),
+            (120, 19),
+            (minimum_width, 19),
+            (minimum_width, 24),
+            (100, 24),
+        ] {
             let mut config = StandInConfig::new(mode);
             config.manual_clock = true;
             config.columns = columns;
@@ -811,7 +818,7 @@ fn every_native_source_replayed_through_tmux_matches_real_fixture_and_pinned_fac
     let sources = sources();
     assert_eq!(
         sources.len(),
-        74,
+        76,
         "review expectations when the catalog grows"
     );
     for mode in [StandInMode::Claude, StandInMode::Codex, StandInMode::Pi] {

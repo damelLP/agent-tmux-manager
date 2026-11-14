@@ -17,10 +17,10 @@ def select_screen(catalog, mode, frame, variant, columns, rows):
     candidates = [s for s in catalog if s["mode"] == mode and s["state"] == frame]
     if not candidates:
         raise ValueError(f"no captured scene: {mode}/{frame}")
-    if mode == "codex" and frame in ("fresh", "clear-complete") and rows < 24:
-        # The captured U5 logo alone needs 17 rows. Use the captured compact
-        # startup-help layout, not a truncated logo masquerading as fresh.
-        candidates = [s for s in candidates if s["variant"] in ("rich", "poor")]
+    if mode == "codex" and frame in ("fresh", "clear-complete") and rows < 25:
+        # U5's logo needs 25 rows with its header/editor/footer. P1's compact
+        # fresh layout keeps those anchors without the logo or startup help.
+        candidates = [s for s in candidates if s["variant"] == "p1-compact"]
     # A native viewport wins over a requested variant at another size. Within
     # it prefer that variant, then the original U5 source, then catalog order.
     return min(candidates, key=lambda s: (

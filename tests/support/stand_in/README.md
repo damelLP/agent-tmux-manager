@@ -310,9 +310,9 @@ are synthetic, not a complete vendor TUI.
 
 ## Captured screens and optional dialogs
 
-The runtime renders `screens.json`'s 74 source variants through the pure
+The runtime renders `screens.json`'s 76 source variants through the pure
 `screens.py` renderer and `scene.py` lifecycle mapping. Sources reuse adapter plain
-captures, 20 U5b SGR/cursor pairs, and 15 sanitized P1 captures (provenance in
+captures, 20 U5b SGR/cursor pairs, and 16 sanitized P1 captures (provenance in
 `fixtures/screens/README.md`). No runtime ID or diagnostic status text is visible.
 `frame` records the model's fresh, working, idle after a turn, clearing,
 clear-complete, interrupted and modal phases; `source` identifies the actual
@@ -345,9 +345,11 @@ P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
 Uncaptured combinations are explicitly synthetic: redundant blank padding is
 removed before old transcript, preserving editor blanks and history separators.
 Pi rules reflow to equal widths and aligned usage/model and Codex shortcut/warning
-footers retain complete tokens. Short Codex fresh panes use the captured compact
-startup-help source instead of cropping the tall logo. The adapter contract pins
-all lifecycle facts at 100x30, 120x19 and the supported minima: **Codex 80x19,
+footers retain complete tokens. Codex fresh panes below 25 rows use P1's compact
+100x24 header/editor/footer capture (a18), not the tall logo, which needs 25 rows.
+This is a source splice from P1's gpt-5.4 session into the U5 lifecycle; resizing
+that capture to other compact sizes is Synthetic. The adapter contract pins
+all lifecycle facts at 100x30, 80x24 (Codex), 100x24, 120x19 and the supported minima: **Codex 80x19,
 pi 86x19**. A 60x40 split is too narrow for their captured interrupt/startup chrome:
 scene rendering explicitly refuses it, and the rig immediately reports the minimum
 rather than waiting for a misleading ready frame. Use a wider pane for these modes.
@@ -385,7 +387,7 @@ No frame/ready event is emitted after exit. Codex hook-review Esc and permission
 Pure source/scene/key tests run through the Cargo Python contract; private tmux
 integration tests cover native fresh replay, modal keys and retained shells.
 `stand_in_screens` calls all three real adapters, not copied parsers. It compares
-all 74 sources through private tmux with independent source text and pinned U8a
+all 76 sources through private tmux with independent source text and pinned U8a
 facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
 allowing tmux to normalize SGR encodings. Separate key-driven tests cover drafts,
 working/idle, each clear phase, repeated identical clear snapshots, interruptions,

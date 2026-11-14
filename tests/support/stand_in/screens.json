@@ -355,6 +355,24 @@
     "rows": 40
   },
   {
+    "key": "codex.fresh.p1-compact",
+    "mode": "codex",
+    "state": "fresh",
+    "variant": "p1-compact",
+    "source": "tests/support/stand_in/fixtures/screens/codex-fresh-100x24_0.167.0.txt",
+    "columns": 100,
+    "rows": 24
+  },
+  {
+    "key": "codex.clear-complete.p1-compact",
+    "mode": "codex",
+    "state": "clear-complete",
+    "variant": "p1-compact",
+    "source": "tests/support/stand_in/fixtures/screens/codex-fresh-100x24_0.167.0.txt",
+    "columns": 100,
+    "rows": 24
+  },
+  {
     "key": "codex.working.u5",
     "mode": "codex",
     "state": "working",

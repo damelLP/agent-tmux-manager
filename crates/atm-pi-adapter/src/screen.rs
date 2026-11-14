@@ -10,6 +10,9 @@
 //! Recognized select/input/editor hints and the reload box report Other with
 //! unknown input/turn. Ambiguous nested borders refuse observation.
 //! Free-text drafts have only synthetic safety coverage, not real captures.
+//! Plain capture drops trailing spaces: whitespace-only drafts can read Empty.
+//! Synthetic ASCII-space tests only check preservation of supplied text; styled
+//! capture with retained trailing spaces is a separate follow-up.
 //! The active upper border, not startup's interrupt help, establishes turn state.
 //! Fresh layout requires zero usage and startup-only history: the new-session
 //! notice survives later turns and alone proves nothing. Present does not prove
@@ -51,7 +54,7 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     let zero_usage = usage_footer(footer)?;
     let (cwd, before_cwd) = before_footer.split_last()?;
     let (lower, before_lower) = before_cwd.split_last()?;
-    if !(cwd.starts_with('/') || cwd.starts_with("~/")) || !rule(lower) {
+    if !(cwd.trim_end() == "~" || cwd.starts_with('/') || cwd.starts_with("~/")) || !rule(lower) {
         return None;
     }
     let top = before_lower
@@ -142,40 +145,26 @@ fn count(value: &str) -> Option<f64> {
 
 fn usage_footer(line: &str) -> Option<bool> {
     let tokens: Vec<_> = line.split_whitespace().collect();
-    let auto = tokens.iter().position(|token| *token == "(auto)")?;
-    let (effort, model) = tokens.get(auto + 1..)?.split_last()?;
-    // Model and effort are values, but their separator and nonempty positions are chrome.
-    if !effort.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
-        || model.len() < 2
-        || model.last() != Some(&"•")
-    {
-        return None;
-    }
-    let prefix = tokens.get(..auto)?;
-    let (context, before_context) = prefix.split_last()?;
-    let (sub, before_sub) = before_context.split_last()?;
-    let (cost, counters) = before_sub.split_last()?;
-    if *sub != "(sub)" {
-        return None;
-    }
-    let cost = decimal(cost.strip_prefix('$')?)?;
-    let (percent, window) = context.split_once("%/")?;
-    let percent = decimal(percent)?;
-    if percent > 100.0 || count(window)? <= 0.0 {
-        return None;
-    }
-    let mut zero = cost == 0.0 && percent == 0.0;
-    let mut rest = counters;
-    if let [up, down, tail @ ..] = rest {
-        if up.starts_with('↑') {
-            zero &= count(up.strip_prefix('↑')?)? == 0.0;
-            zero &= count(down.strip_prefix('↓')?)? == 0.0;
+    let context_index = tokens
+        .iter()
+        .position(|token| token.contains("%/") || token.starts_with("?/"))?;
+    let (percent, window) = tokens.get(context_index)?.split_once('/')?;
+    count(window)?;
+    let mut zero = if percent == "?" {
+        false
+    } else {
+        decimal(percent.strip_suffix('%')?)? == 0.0
+    };
+    let mut rest = tokens.get(..context_index)?;
+    // Each counter is emitted independently, in this fixed order, only when nonzero.
+    for prefix in ["↑", "↓", "R", "W"] {
+        if let Some((token, tail)) = rest
+            .split_first()
+            .filter(|(token, _)| token.starts_with(prefix))
+        {
+            zero &= count(token.strip_prefix(prefix)?)? == 0.0;
             rest = tail;
         }
-    }
-    if let Some((cache, tail)) = rest.split_first().filter(|(s, _)| s.starts_with('R')) {
-        zero &= count(cache.strip_prefix('R')?)? == 0.0;
-        rest = tail;
     }
     if let Some((hit, tail)) = rest.split_first().filter(|(s, _)| s.starts_with("CH")) {
         let hit = decimal(hit.strip_prefix("CH")?.strip_suffix('%')?)?;
@@ -185,24 +174,76 @@ fn usage_footer(line: &str) -> Option<bool> {
         zero &= hit == 0.0;
         rest = tail;
     }
-    // Unlike model/counter spelling, zero usage is necessary fresh-layout evidence.
-    rest.is_empty().then_some(zero)
+    if let Some((cost, tail)) = rest.split_first().filter(|(s, _)| s.starts_with('$')) {
+        zero &= decimal(cost.strip_prefix('$')?)? == 0.0;
+        rest = tail.strip_prefix(&["(sub)"]).unwrap_or(tail);
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    let model = tokens.get(context_index + 1..)?;
+    let model = model.strip_prefix(&["(auto)"]).unwrap_or(model);
+    let model = model.strip_prefix(&["•", "xp"]).unwrap_or(model);
+    // footer.js separates the right-aligned model with at least two spaces.
+    // Do not mistake an unknown left-side marker for a provider prefix.
+    let aligned: Vec<_> = line
+        .trim()
+        .split_once("  ")
+        .map(|(_, right)| right.split_whitespace().collect())
+        .unwrap_or_default();
+    if model != aligned {
+        return None;
+    }
+    // Narrow panes may omit the entire right side, but never the context anchor.
+    if model.is_empty() {
+        return Some(zero);
+    }
+    let model = match model {
+        [provider, tail @ ..] if provider.starts_with('(') && provider.ends_with(')') => tail,
+        _ => model,
+    };
+    let models: Vec<_> = model.split(|token| *token == "→").collect();
+    (models.len() <= 2 && models.iter().all(|part| model_label(part))).then_some(zero)
+}
+
+fn model_label(tokens: &[&str]) -> bool {
+    let (name, rest) = match tokens.split_first() {
+        Some(parts) => parts,
+        None => return false,
+    };
+    !name.is_empty()
+        && !name.contains(['(', ')', '•', '→'])
+        && match rest {
+            [] | ["•", "thinking", "off"] => true,
+            ["•", effort] => {
+                !effort.is_empty() && effort.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+            }
+            _ => false,
+        }
 }
 
 fn startup_only(history: &[&str]) -> bool {
-    let Some(version) = history.get(1).and_then(|s| s.strip_prefix(" ▀▀█  v")) else {
+    let rows: Vec<_> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .collect();
+    let [(.., title), (.., help), (.., resources), (end, description), ..] = rows.as_slice() else {
+        return false;
+    };
+    let Some(version) = title.strip_prefix(" ▀▀█  v") else {
         return false;
     };
     if !version.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-        || history.get(2) != Some(&" █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more")
-        || history.get(3) != Some(&" Press ctrl+o to show full startup help and loaded resources.")
-        || history.get(5) != Some(&" Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.") {
+        || **help != " █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more"
+        || **resources != " Press ctrl+o to show full startup help and loaded resources."
+        || **description != " Pi can explain its own features and look up its docs. Ask it how to use or extend Pi." {
         return false;
     }
     // Only fresh evidence needs history. Ordinary editor facts work with a scrolled-off header.
     // Startup resources/notices are optional; conversation after them is not startup chrome.
     history
-        .get(6..)
+        .get(end + 1..)
         .unwrap_or_default()
         .split(|line| line.trim().is_empty())
         .all(|block| {
@@ -355,7 +396,6 @@ mod tests {
             "$2 (sub) bad%/272k (auto) model • high",
             "$NaN (sub) 0%/272k (auto) model • high",
             "$2 (sub) 3%/272k (auto) • high",
-            "$2 (sub) 3%/272k (auto) model",
         ] {
             let mut lines: Vec<_> = IDLE.lines().collect();
             *lines.last_mut().unwrap() = footer;
@@ -374,6 +414,77 @@ mod tests {
             assert_eq!(
                 observe_screen(&text, None).fresh_editor,
                 FreshEditorEvidence::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_footer_variants_preserve_editor_facts() {
+        // Synthetic: rendered from pi 1.5.0's footer.js; no real capture.
+        // Order: default, W, up-only, down-only, unknown context, thinking off,
+        // non-reasoning, no cost, API cost, no auto, provider, routed, no model,
+        // truncated stats (refuse), stats-only, overfull context, experimental, zero window.
+        let expected_zero = [
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(true),
+        ];
+        let footers: Vec<_> = capture!("footers").lines().skip(1).collect();
+        assert_eq!(footers.len(), expected_zero.len());
+        for (footer, zero) in footers.into_iter().zip(expected_zero) {
+            let mut lines: Vec<_> = FRESH.lines().collect();
+            *lines.last_mut().unwrap() = footer;
+            let text = lines.join("\n").replace("/tmp/u8a-fixture/cwd/pi", "~");
+            let facts = observe_screen(&text, None);
+            if let Some(zero) = zero {
+                assert_eq!(facts.input, InputState::Empty, "{footer}");
+                assert_eq!(facts.turn, TurnState::NotRunning, "{footer}");
+                assert_eq!(facts.dialog, DialogState::None, "{footer}");
+                assert_eq!(
+                    facts.fresh_editor,
+                    if zero {
+                        FreshEditorEvidence::Present
+                    } else {
+                        FreshEditorEvidence::Unknown
+                    },
+                    "{footer}"
+                );
+            } else {
+                assert_eq!(facts, ScreenFacts::default(), "{footer}");
+            }
+        }
+    }
+
+    #[test]
+    fn startup_header_is_located_by_its_chrome() {
+        // Synthetic: move U5 startup header and remove only its blank spacing.
+        let compact = FRESH
+            .lines()
+            .take(6)
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = FRESH.lines().skip(6).collect::<Vec<_>>().join("\n");
+        for blanks in [0, 1, 6] {
+            let text = format!("{}{compact}\n{tail}", "\n".repeat(blanks));
+            assert_eq!(
+                observe_screen(&text, None).fresh_editor,
+                FreshEditorEvidence::Present
             );
         }
     }
@@ -495,7 +606,9 @@ mod tests {
 
     #[test]
     fn whitespace_unicode_and_multiline_drafts_are_not_empty() {
-        // Synthetic: no real free-text pi draft was captured. Do not erase user content.
+        // Synthetic: no real free-text pi draft was captured. Do not erase supplied content.
+        // capture-pane -p removes trailing ASCII spaces: these cases do not prove
+        // end-to-end protection for real whitespace-only drafts.
         let border = "─".repeat(120);
         for draft in [
             " ",

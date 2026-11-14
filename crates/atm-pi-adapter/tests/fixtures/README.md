@@ -47,14 +47,20 @@ and footer columns are unchanged. No real IDs or original local paths remain.
   produce Other, with input/turn Unknown. Unrecognized extension UI is not
   generally distinguishable from a draft; arbitrary custom editors remain
   outside this parser's supported contract.
-- Free-text, whitespace-only and multiline drafts have synthetic nonempty
-  safety tests only, not positive real-harness evidence.
+- Free-text and multiline drafts have synthetic tests only, not real captures.
+  **F2:** plain capture drops trailing ASCII spaces, so whitespace-only drafts
+  can read Empty. Space-preservation tests do not establish end-to-end safety;
+  styled capture with `-N` is deferred to U8d.
 - No cursor or attributes were captured (`capture-pane -p`). Real replays use
   None; supplying cursor metadata currently returns all Unknown. Cursor,
   control, truncation and draft mutations are explicitly Synthetic tests.
 - Fixed borders, labels and separators are exact; versions, model/effort,
   numeric cost/counters/context, cwd/branch and resource lists are values.
-  Optional cache tokens `R<count>` and `CH<pct>%` are accepted. All ten frames
+  `↑`, `↓`, `R`, `W` counters are independently optional, as is `CH<pct>%`.
+  Cost may be absent; `(sub)` and `(auto)` are optional values, not chrome.
+  Context may be unknown (`?`), in which case freshness is Unknown. The model
+  may lack effort, use `thinking off`, include a provider or routed model,
+  or be omitted when the pane fits only the complete left stats. All ten frames
   of the braille spinner are recognized in the Working upper border.
   Unknown structure, rather than a new value, refuses observation. Zero cost,
   context and counters remain required for fresh-layout evidence.
@@ -94,6 +100,23 @@ text, commit IDs and local paths are not retained. These changes remove no
 structure used for ordinary editor facts; no fresh evidence is inferred from
 redacted history. Synthetic value-variation and structural-damage tests are
 labelled as such and supplement, not replace, the real replays.
+
+## Rendered footer variants (not real captures)
+
+`screen_pi-footers_1.5.0.txt` has 18 rows produced by pi 1.5.0's `footer.js`,
+labelled Synthetic. It covers default, cache-write, independent arrows, unknown
+context, thinking off, non-reasoning, no cost, API cost without subscription,
+no auto, provider prefix, routed model, no model, truncated stats (Unknown),
+stats-only narrow pane, context over 100%, experimental marker and zero context
+window. Rendering used supplied plain session data, no CLI or model; SGR was
+removed and trailing spaces trimmed. Tests replace only the footer/cwd in the
+real fresh screen and assert the four facts and conservative zero-usage rule.
+
+All source-rendered listed forms are supported; a clipped context anchor,
+partial effort/route, unknown left marker or extension-status row still refuses.
+The fixed two-space minimum alignment distinguishes provider prefixes from
+unknown left markers. Startup chrome is located by the first nonblank title
+and help lines, not row numbers. A cwd of exactly `~` is supported.
 
 ## Rendered dialog regressions (not real captures)
 

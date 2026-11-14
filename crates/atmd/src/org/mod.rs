@@ -21,6 +21,7 @@ pub mod message_delivery;
 pub mod message_evidence;
 pub mod message_history;
 mod message_methods;
+pub mod message_notify;
 #[cfg(test)]
 mod message_seam_tests;
 pub mod message_types;

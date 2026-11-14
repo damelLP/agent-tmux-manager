@@ -364,22 +364,34 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     let summaries = atmd::org::SummaryObserver::spawn(registry.clone(), org.clone());
 
     // Subscribed before discovery, so the notifier sees every session.
-    let _notify_handle = notify_config().await.map(|config| {
-        // Only the program: the arguments may hold a webhook URL or topic.
-        let program = config.command.first().cloned().unwrap_or_default();
-        let delay_secs = config.delay_secs;
-        info!(
-            program,
-            delay_secs, "Running [notify] when a session needs input"
-        );
-        let delay = std::time::Duration::from_secs(delay_secs);
-        spawn_notifier(
-            registry.subscribe(),
-            config.command,
-            delay,
-            cancel_token.clone(),
-        )
-    });
+    let message_notify_cancel = cancel_token.child_token();
+    let (_notify_handle, message_notify_handle) = notify_config()
+        .await
+        .map(|config| {
+            // Only the program: the arguments may hold a webhook URL or topic.
+            let program = config.command.first().cloned().unwrap_or_default();
+            let delay_secs = config.delay_secs;
+            info!(
+                program,
+                delay_secs, "Running [notify] when a session needs input"
+            );
+            let delay = std::time::Duration::from_secs(delay_secs);
+            let attention = spawn_notifier(
+                registry.subscribe(),
+                config.command.clone(),
+                delay,
+                cancel_token.clone(),
+            );
+            let messages = atmd::org::message_notify::spawn_message_notifier(
+                org.clone(),
+                config,
+                message_notify_cancel.clone(),
+            )
+            .map_err(|error| warn!(%error, "Owner message notifications unavailable"))
+            .ok();
+            (Some(attention), messages)
+        })
+        .unwrap_or((None, None));
 
     let discovery = DiscoveryService::new(registry.clone());
     let discovery_result = discovery.discover().await;
@@ -407,6 +419,12 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     let (server_result, registry_result) = tokio::join!(
         async {
             let result = server.run().await;
+            message_notify_cancel.cancel();
+            if let Some(task) = message_notify_handle {
+                if let Err(error) = task.await {
+                    warn!(%error, "Owner message notifier stopped unexpectedly");
+                }
+            }
             // Connections drained: preserve exact last live cost before
             // cancelling either actor. Flush failures never hold shutdown.
             let (_, raw_result) = tokio::join!(summaries.finish(), raw.flush());

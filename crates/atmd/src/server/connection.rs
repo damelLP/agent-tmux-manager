@@ -776,18 +776,15 @@ where
             )
             .await;
         if tapped {
+            // An unparsable pane is an unknown pane. Without a pane no event
+            // can bind or confirm, so there is nothing to prove.
+            let pane = pane
+                .as_deref()
+                .filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
             let proven = applied.is_ok()
                 && !ends
-                && self
-                    .message_parent_proven(&session, pane.as_deref(), harness)
-                    .await;
-            self.record_message_event(
-                &session,
-                pane.as_deref(),
-                Some(harness),
-                Some(&event),
-                proven,
-            );
+                && self.message_parent_proven(&session, pane, harness).await;
+            self.record_message_event(&session, pane, Some(harness), Some(&event), proven);
         }
         applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
     }
@@ -838,9 +835,6 @@ where
         let Some(evidence) = &self.message_evidence else {
             return;
         };
-        // An unparsable pane is an unknown pane. Without a pane no event can
-        // bind or confirm, whatever its proof.
-        let pane = pane.filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
         let observed = evidence.tap(
             session,
             pane,
@@ -2561,6 +2555,17 @@ mod tests {
         payload["tmux_pane"] = serde_json::json!("7");
         handler.handle_pi_event(payload).await.unwrap();
         assert_held_without_receipt(&evidence);
+
+        // It costs no registry snapshot either, like an event without a pane.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut row = evidence_row(&handler).await;
+        row.tmux_pane = Some("7".into());
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![row]));
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload["tmux_pane"] = serde_json::json!("7");
+        handler.handle_pi_event(payload).await.unwrap();
+        assert_held_without_receipt(&evidence);
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -224,7 +224,6 @@ async fn coalesced_wake_retains_receipt() {
     let mut wake = e.subscribe();
     exact(&e);
     exact(&e);
-    tokio::time::advance(std::time::Duration::from_secs(10)).await;
     // Two observations, one wake: the fact is in the store, not in the wake.
     tokio::time::timeout(std::time::Duration::from_secs(60), wake.changed())
         .await
@@ -701,6 +700,32 @@ fn reference_on_another_pane_never_confirms_even_when_proven() {
     let e = armed();
     named(&e, "session", Some("%8"), Harness::Pi, true);
     assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn wake_fires_only_when_a_fact_changed() {
+    let e = armed();
+    let other = other_armed(&e);
+    let mut wake = e.subscribe();
+    // Activity that reaches no scope changes nothing.
+    unproven(&e, "stranger", Some("%9"), None);
+    e.observe_activity(&SessionId::new("stranger"), None)
+        .unwrap();
+    assert!(!wake.has_changed().unwrap());
+    // A latch, then a receipt: each changes a fact once.
+    e.observe_activity(&SessionId::new("session"), None)
+        .unwrap();
+    assert!(wake.has_changed().unwrap());
+    wake.mark_unchanged();
+    e.observe_activity(&SessionId::new("session"), None)
+        .unwrap();
+    assert!(!wake.has_changed().unwrap());
+    exact(&e);
+    assert!(wake.has_changed().unwrap());
+    wake.mark_unchanged();
+    exact(&e);
+    assert!(!wake.has_changed().unwrap());
+    assert!(!e.snapshot(other).unwrap().probably_landed);
 }
 
 #[test]

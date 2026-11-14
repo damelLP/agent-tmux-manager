@@ -41,7 +41,7 @@
 //! each event keeps its own time and nothing is retained per session. History
 //! never calls evidence.
 //!
-//! Wakes are a `watch` counter: every consumer (A2's scheduler, B's confirmation
+//! Wakes are a `watch` counter, moved when a fact changes: every consumer (A2's scheduler, B's confirmation
 //! wait) holds its own receiver from `subscribe`, so none misses a change.
 
 use super::message_history::{HistoryUpdate, MessageHistoryHandle};
@@ -151,7 +151,8 @@ impl MessageEvidence {
         Ok(state)
     }
 
-    /// One wake per consumer for every change; see the module docs.
+    /// One wake per consumer for every changed fact (a latch, a receipt, an
+    /// arm, a disable), not for every event; see the module docs.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.wake.subscribe()
@@ -354,7 +355,9 @@ impl MessageEvidence {
             .map_err(|_| self.disable(&mut state, "message evidence clock unavailable"))?;
         // A pending ID is no session: it is never bound and is no activity.
         let pending = session.is_pending();
+        let mut changed = false;
         for entry in state.messages.values_mut() {
+            let before = (entry.probably_landed, entry.receipt.is_some());
             let named = prompt == Some(entry.expected.as_str());
             let last_seq = entry.scopes.last().map(|s| s.identity.attempt_seq);
             for scope in entry.scopes.iter_mut().filter(|_| !pending) {
@@ -408,8 +411,11 @@ impl MessageEvidence {
             if named && entry.receipt.is_none() && !entry.scopes.is_empty() {
                 entry.probably_landed = true;
             }
+            changed |= before != (entry.probably_landed, entry.receipt.is_some());
         }
-        self.wake();
+        if changed {
+            self.wake();
+        }
         if pending {
             return Ok(());
         }

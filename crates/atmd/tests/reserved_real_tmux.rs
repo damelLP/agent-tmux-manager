@@ -438,6 +438,11 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
         org.clone(),
         cancel.clone(),
     );
+    client
+        .raw_command("new-session", &["-d", "-s", "linked", "-t", "private"])
+        .await
+        .unwrap();
+    let observer = control.clone();
     let verifier = client.clone();
     let private_root = root.clone();
     let result = control
@@ -469,6 +474,20 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
                     assert_eq!(
                         capture.text.split_terminator('\n').count(),
                         usize::from(capture.inspection.pane.height)
+                    );
+                    assert_eq!(capture.focused, Some(false));
+                    assert!(capture.inspection.pane_root_pid().is_some());
+                    assert_eq!(capture.inspection.foreground_pid, None);
+                    assert!(capture.inspection.foreground_command.is_some());
+                    let observed = observer.observe(&pane, format).await?;
+                    assert_eq!(observed.focused, Some(false));
+                    assert_eq!(
+                        observed.inspection.pane_root_pid(),
+                        capture.inspection.pane_root_pid()
+                    );
+                    assert_eq!(
+                        observed.inspection.local_agent_tag.as_deref(),
+                        Some("project/lead")
                     );
                 }
                 assert!(matches!(

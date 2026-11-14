@@ -51,7 +51,7 @@ fn effects(mock: &atm_tmux::MockTmuxClient) -> Vec<MockCall> {
     mock.calls().into_iter().filter(|call| !matches!(call, MockCall::RawCommand { subcommand, .. } if subcommand != "set-option")).collect()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reserved_input_refuses_unsafe_state_before_any_guard_or_effect() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -133,7 +133,7 @@ async fn reserved_input_refuses_unsafe_state_before_any_guard_or_effect() {
     actor.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reserved_paste_preserves_unknown_flag_policy_but_refuses_control_bytes() {
     let client = testing::ScriptedTmuxClient::new();
     let cancel = CancellationToken::new();
@@ -200,7 +200,7 @@ async fn reserved_paste_preserves_unknown_flag_policy_but_refuses_control_bytes(
     actor.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reserved_guard_uses_fresh_capture_and_refuses_changed_screen() {
     let client = testing::ScriptedTmuxClient::new();
     let cancel = CancellationToken::new();
@@ -284,7 +284,7 @@ async fn reserved_guard_uses_fresh_capture_and_refuses_changed_screen() {
     actor.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reserved_every_effect_rechecks_local_tag_and_expected_agent() {
     let client = testing::ScriptedTmuxClient::new();
     let cancel = CancellationToken::new();

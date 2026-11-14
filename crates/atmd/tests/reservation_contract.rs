@@ -84,7 +84,7 @@ async fn frame(client: &dyn TmuxClient, pane: &str, format: CaptureFormat) -> St
     client.raw_command("display-message", &args).await.unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn guarded_input_contract_runs_predicates_against_fresh_scripted_captures() {
     let client = ScriptedTmuxClient::new();
     let mock = client.mock();
@@ -233,6 +233,7 @@ async fn consumer_capture_scripts_match_real_plain_and_ansi_probe_framing() {
                 text: text.into(),
                 inspection: inspection("%0", Some("project/lead")),
                 format,
+                focused: None,
             })
             .unwrap();
         assert_eq!(client.pending_reads(&pane).unwrap(), 3);
@@ -287,7 +288,8 @@ async fn consumer_missing_scripts_fail_closed_and_missing_pane_is_explicit() {
         .script_capture(&PaneCapture {
             text: "truncated".into(),
             inspection: inspection("%0", None),
-            format: CaptureFormat::Plain
+            format: CaptureFormat::Plain,
+            focused: None,
         })
         .is_err());
 }

@@ -182,8 +182,11 @@ fn contract_transport_observations_reuse_pane_info() {
             bracketed_paste: None,
             cursor_column: 7,
             cursor_row: 0,
+            foreground_pid: None,
+            foreground_command: None,
         },
         format: CaptureFormat::Plain,
+        focused: None,
     };
     // Consumer-facing construction and ownership: no duplicate cursor/core type.
     let cloned = capture.clone();

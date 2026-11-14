@@ -790,10 +790,11 @@ where
         let mut stopping = false;
         let mut input_closed = false;
         loop {
-            if stopping && jobs.is_empty() {
+            if stopping && jobs.idle() {
                 requests.close();
             }
             jobs.ready(Instant::now());
+            jobs.capture_ready(&*client, stopping).await;
             // One pass per wake, not a busy retry loop. Re-resolve original targets
             // against current registry, org projection and reservation ownership.
             for _ in 0..parked.len() {
@@ -813,7 +814,7 @@ where
                     let _ = audits.sender.send(Audit::Barrier(reply)).await;
                 }
             }
-            if input_closed && parked.is_empty() && jobs.is_empty() {
+            if input_closed && parked.is_empty() && jobs.idle() {
                 break;
             }
             let deadline = jobs
@@ -845,7 +846,7 @@ where
                         self::Pending { request: Request::Reserved(command), server, deadline, .. } => {
                             // A capability is minted only after U7's server-identity
                             // guard; later operations carry its same actor fence.
-                            if !stopping && matches!(command, Command::Acquire(_)) {
+                            if !stopping && matches!(command, Command::Acquire(_) | Command::Observe { .. }) {
                                 if let Some(server) = server {
                                     let budget = deadline.min(Instant::now() + ACTION_TIMEOUT);
                                     if let Err(error) = outcome(budget, verify_server(&*client, server, "reserve pane control".into())).await {

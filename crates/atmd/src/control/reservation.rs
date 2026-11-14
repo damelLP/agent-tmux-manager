@@ -283,6 +283,12 @@ pub struct PaneInspection {
     /// Zero-based terminal-cell coordinates, not UTF-8 offsets.
     pub cursor_column: u32,
     pub cursor_row: u32,
+    /// Foreground PID, not a process group. tmux 3.6/3.8 do not expose it:
+    /// None must not be replaced by pane_pid or inferred from a command name.
+    pub foreground_pid: Option<u32>,
+    /// Raw pane_current_command, not proof of shell/editor identity. With job
+    /// control disabled tmux can report the root command while a child runs.
+    pub foreground_command: Option<String>,
 }
 
 impl PaneInspection {
@@ -305,7 +311,23 @@ impl PaneInspection {
             bracketed_paste,
             cursor_column,
             cursor_row,
+            foreground_pid: None,
+            foreground_command: None,
         }
+    }
+
+    /// The tmux pane's root process, not necessarily its interactive shell.
+    #[must_use]
+    pub fn pane_root_pid(&self) -> Option<u32> {
+        (self.pane.pane_pid != 0).then_some(self.pane.pane_pid)
+    }
+
+    /// Builder for neutral observations/consumer fixtures; no classification.
+    #[must_use]
+    pub fn with_foreground_process(mut self, pid: Option<u32>, command: Option<String>) -> Self {
+        self.foreground_pid = pid;
+        self.foreground_command = command;
+        self
     }
 }
 
@@ -333,11 +355,26 @@ impl PaneInspection {
 /// Preserve meaningful whitespace and rows. A consumer may construct its
 /// shared ScreenCursor from the inspection's coordinates when its adapter
 /// supports them; otherwise pass None, and request Plain for text-only parsers.
+///
+/// Current v2 frames include `inspection.pane_root_pid()`, `foreground_pid` and
+/// `foreground_command` from the same command list as the screen, including
+/// captures supplied to both guard predicates. These are neutral observations,
+/// never shell/harness classifications. Verified tmux 3.6/3.8 expose the root PID
+/// and command but no foreground PID (None). U8 owns the spawn/adopt shell
+/// baseline; a command-name match cannot substitute for unknown PID identity.
+/// `focused` is sampled by list-clients in that command list. Malformed/unknown
+/// client data gives None; a command/transport failure fails the whole capture
+/// rather than inventing a frame or unfocused state. Clients/processes may move
+/// between the read and effect, even within one actor turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneCapture {
     pub text: String,
     pub inspection: PaneInspection,
     pub format: CaptureFormat,
+    /// Any client with the exact focused flag showing this canonical pane.
+    /// Some(false) is observed absence; None is unknown, never permission.
+    /// Sampled in the frame's command list. A client may move before an effect.
+    pub focused: Option<bool>,
 }
 
 impl PaneCapture {
@@ -348,7 +385,14 @@ impl PaneCapture {
             text,
             inspection,
             format,
+            focused: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_focus(mut self, focused: Option<bool>) -> Self {
+        self.focused = focused;
+        self
     }
 }
 
@@ -367,6 +411,30 @@ pub struct Reservation {
 }
 
 impl ControlHandle {
+    /// Read through the sole actor without acquiring ownership or changing a pane.
+    /// Includes metadata, local tag, viewport (-N, optionally styled), focus and
+    /// neutral process facts. Captures of one pane are paced at least 250ms apart,
+    /// including guarded input, without blocking other panes. No cached frame is
+    /// returned. The scheduler bounds pending captures and recent pane keys to
+    /// 32 each; overflow is Unavailable. The original 30-second deadline includes
+    /// pacing/queue time.
+    /// U8 owns any spawn/adopt shell identity baseline and its interpretation;
+    /// a command-name match alone is not positive process identity evidence.
+    pub async fn observe(
+        &self,
+        pane: &PaneId,
+        format: CaptureFormat,
+    ) -> Result<PaneCapture, ReservationError> {
+        let deadline = Instant::now() + super::service::ACTION_TIMEOUT;
+        self.reservation_request(deadline, |reply| jobs::Command::Observe {
+            pane: pane.clone(),
+            format,
+            deadline,
+            reply,
+        })
+        .await
+    }
+
     /// Run one daemon-owned job with exclusive agent/pane ownership.
     ///
     /// Admission is bounded (32); no task is spawned per unadmitted waiter.
@@ -685,41 +753,93 @@ impl Reservation {
     }
 }
 
-/// Expected failures are values; no effect may be retried merely on timeout.
+/// Expected failures are values; never retry merely because a reply failed.
+///
+/// # Effect certainty for consumers (U8 / U9b)
+///
+/// The variant docs describe **one pane-operation call**, especially paste/keys
+/// and their guarded forms. "Before effect" permits read-only tmux queries, but
+/// guarantees this call sent no input and made no pane mutation. It says nothing
+/// about earlier calls. An error returned by `run_reserved` can follow successful
+/// earlier work or cleanup effects, even when that error's variant is normally
+/// pre-effect. Caller-created errors likewise carry no actor guarantee.
+///
+/// | Variant | One guarded paste/key call | General pane operation |
+/// |---|---|---|
+/// | NotImplemented | Before effect | Before effect |
+/// | InvalidRequest | Before effect | May follow a split effect |
+/// | Busy | Before effect (admission) | Before effect (admission) |
+/// | StaleReservation | Before effect | Before effect |
+/// | ScreenChanged | Before effect | Before effect |
+/// | TagMismatch | Before effect | Before effect |
+/// | PaneGone | Before effect | Before effect |
+/// | InvalidObservation | Before effect | Before effect |
+/// | Quarantined | Before effect (admission) | Before effect (admission) |
+/// | Unavailable | May follow an effect | May follow an effect |
+/// | Timeout | May follow an effect | May follow an effect |
+/// | Control(SendRefused) | Before effect | Before effect |
+/// | Control(other) | May follow an effect | May follow an effect |
+///
+/// A generic match on `Control` must therefore treat it as uncertain unless it
+/// distinguishes `ControlError::SendRefused`. In particular, a tmux error can be
+/// returned after load/paste or key execution; a timeout/closed reply does not
+/// cancel an admitted action. None of these errors proves that a previous paste
+/// was undone or that retrying cannot duplicate input.
 #[derive(Debug, thiserror::Error)]
 pub enum ReservationError {
+    /// Before effect: the unsupported operation was not executed.
     #[error("reserved control operation '{operation}' is not implemented")]
     NotImplemented { operation: &'static str },
+    /// Before effect for paste/keys (including guarded forms): invalid kind,
+    /// expected agent, or request. For a general operation, may follow a split
+    /// whose returned pane ID could not be validated. Do not classify an
+    /// arbitrary run_reserved/split error as no-effect from this variant alone.
     #[error("invalid reservation request: {reason}")]
     InvalidRequest { reason: String },
+    /// Before effect: admission refused ownership; callbacks did not run.
     #[error("agent {agent} or pane {} is reserved", optional_pane(.pane))]
     Busy {
         agent: AgentId,
         pane: Option<PaneId>,
     },
+    /// Before effect: actor/operation/phase or owned-pane fence did not match.
     #[error("stale pane reservation")]
     StaleReservation,
+    /// Before effect: the fresh predicate rejected (or panicked); no input sent.
     #[error("pane {pane} no longer passes the approved screen check; nothing was sent")]
     ScreenChanged { pane: PaneId },
+    /// Before effect: mutation-time local tag did not match the expectation.
     #[error("pane {pane} tag mismatch: expected {expected}, found {}", actual.as_deref().unwrap_or("absent"))]
     TagMismatch {
         pane: PaneId,
         expected: ExpectedTag,
         actual: Option<String>,
     },
+    /// Before effect: the read-only precheck positively found no such pane.
     #[error("pane {pane} is gone")]
     PaneGone { pane: PaneId },
+    /// Before effect: pre-effect metadata/frame decoding failed. No input sent.
     #[error("invalid observation of pane {pane}: {reason}")]
     InvalidObservation { pane: PaneId, reason: String },
+    /// Before effect: admission refused uncertain ownership; callbacks did not run.
     #[error("agent {agent} (pane {}) is quarantined; restart atmd and reconcile", optional_pane(.pane))]
     Quarantined {
         agent: AgentId,
         pane: Option<PaneId>,
     },
+    /// Uncertain: may be pre-effect queue refusal (including no kill-audit slot),
+    /// but may follow execution with a lost reply or split-claim failure.
     #[error("reserved control service is unavailable")]
     Unavailable,
+    /// Uncertain: admission, pacing, action or reply may have timed out. Already
+    /// admitted input may have executed, or may still execute; never infer rollback.
     #[error("reserved control operation timed out; admitted effects may have completed")]
     Timeout,
+    /// Uncertain in general: tmux failure may follow a partial or complete effect.
+    /// Exception: SendRefused is before effect. Mode/dead-pane, explicit-off
+    /// multiline and unsafe-control-byte refusals all run before the predicate
+    /// and before any input; they send nothing. Other Control variants must not
+    /// be assumed pre-effect without a more specific caller contract.
     #[error(transparent)]
     Control(#[from] ControlError),
 }

@@ -79,7 +79,7 @@ fn captured_modes_placeholders_and_home_drafts() {
     }
     check(
         capture!("p1_c03-draft-before-100x24"),
-        facts(Draft, TurnState::Unknown, DialogState::None, Unknown),
+        facts(Draft, NotRunning, DialogState::None, Unknown),
     );
     check(
         capture!("p1_c07-working-held-100x24"),
@@ -92,7 +92,7 @@ fn captured_modes_placeholders_and_home_drafts() {
     // Captured multiline text is already history, not the active composer.
     check(
         capture!("p1_c02-multiline-100x24"),
-        facts(Empty, TurnState::Unknown, DialogState::None, Unknown),
+        facts(Empty, NotRunning, DialogState::None, Unknown),
     );
 }
 #[test]

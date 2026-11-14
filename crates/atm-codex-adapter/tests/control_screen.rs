@@ -667,7 +667,7 @@ fn synthetic_hook_table_damage_never_creates_complete_or_actionable_list() {
 }
 
 #[test]
-fn conversation_evidence_does_not_change_worked_line_parser() {
+fn conversation_evidence_and_finished_turn_are_independent_facts() {
     let completed = capture!("b12-completed-before-new-100x32");
     for text in [
         completed,
@@ -681,7 +681,7 @@ fn conversation_evidence_does_not_change_worked_line_parser() {
             FreshEditorEvidence::Unknown
         );
     }
-    assert_eq!(observe(completed).facts.turn, TurnState::Unknown); // U8g owns this.
+    assert_eq!(observe(completed).facts.turn, TurnState::NotRunning);
     for text in [FRESH, styled!("b37-poor-baseline-100x24")] {
         assert!(!observe(text).conversation);
         assert_eq!(

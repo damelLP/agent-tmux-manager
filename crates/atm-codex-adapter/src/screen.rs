@@ -348,15 +348,21 @@ fn worked_status(line: &str) -> bool {
     else {
         return false;
     };
-    let Some((clock, period)) = clock.split_once(' ') else {
-        return false;
+    let (clock, hours) = match clock.split_once(' ') {
+        Some((clock, "AM" | "PM")) => (clock, 1..=12),
+        None if clock.len() == 5 => (clock, 0..=23),
+        _ => return false,
     };
-    duration(elapsed)
-        && matches!(period, "AM" | "PM")
+    // Only seconds and <1s occur in the captured finished-turn lines. Do not
+    // borrow the broader running-duration grammar for unverified finished forms.
+    (elapsed == "<1s" || elapsed.strip_suffix('s').is_some_and(positive_integer))
         && clock.split_once(':').is_some_and(|(hour, minute)| {
-            positive_integer(hour)
+            (1..=2).contains(&hour.len())
+                && hour.chars().all(|c| c.is_ascii_digit())
+                && hour.parse::<u8>().is_ok_and(|n| hours.contains(&n))
                 && minute.len() == 2
                 && minute.chars().all(|c| c.is_ascii_digit())
+                && minute.parse::<u8>().is_ok_and(|n| n < 60)
         })
 }
 
@@ -557,11 +563,8 @@ mod tests {
                     "~/another/project (feature/topic)",
                 )
                 .replace("Reply ok", "A different conversation title")
-                .replace("Worked for 1s • 11:31 AM", "Worked for 12m 3s • 09:45 PM")
-                .replace(
-                    "Worked for 2s • 11:32 AM",
-                    "Worked for 1h 2m 30s • 10:59 AM",
-                )
+                .replace("Worked for 1s • 11:31 AM", "Worked for 12s • 09:45 PM")
+                .replace("Worked for 2s • 11:32 AM", "Worked for 30s • 10:59 AM")
                 .replace("Working (0s •", "Working (4m 15s •")
                 .replace("⚠ 1 warning", "⚠ 12 warnings")
                 .replace(

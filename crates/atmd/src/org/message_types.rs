@@ -62,13 +62,21 @@ pub enum DeliveryPhase {
 /// Ephemeral progress, not a new durable message state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryView {
+    /// Current ephemeral delivery phase, not an additional durable status.
     pub phase: DeliveryPhase,
+    /// Current hold or failure diagnostic, absent when there is none.
     pub reason: Option<String>,
+    /// Last committed attempt number; zero before any attempt.
     pub attempt: u32,
+    /// Last committed attempt's pane, not the current recipient pane; absent before any attempt.
     pub pane: Option<String>,
+    /// Committed receipt's attempted session, never the current binding; absent until confirmed.
     pub session_id: Option<SessionId>,
+    /// Committed receipt's confirmation explanation only, absent until confirmed.
     pub confirmation: Option<String>,
+    /// Next scheduled retry's UTC deadline, absent when no retry is scheduled.
     pub retry_at: Option<DateTime<Utc>>,
+    /// Predecessor in the recipient FIFO blocking this message, not its followers.
     pub blocked_by: Option<MessageId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

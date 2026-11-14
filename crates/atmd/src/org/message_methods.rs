@@ -61,6 +61,7 @@ pub fn register_message_methods(
             })?;
         }};
     }
+    // Each ordinary call: 8 s service budget + 2 s router margin = 10 s.
     register!("msg.send", 10, send, |p: &SendParams| recipient(Some(
         &p.to
     )));
@@ -68,7 +69,11 @@ pub fn register_message_methods(
         p.recipient.as_ref()
     ));
     register!("msg.ack", 10, ack);
-    register!("msg.retry", 45, retry);
-    register!("msg.give_up", 45, give_up);
+    // Retry: 30 s active work + 10 s cleanup + 6 s org execute + 14 s margin = 60 s.
+    // The margin also covers a 5 s FIFO snapshot, leaving 9 s for service overhead.
+    register!("msg.retry", 60, retry);
+    // Give-up: 30 s active work + 10 s cleanup + 6 s org execute + 14 s margin = 60 s.
+    // The margin also covers a 5 s FIFO snapshot, leaving 9 s for service overhead.
+    register!("msg.give_up", 60, give_up);
     Ok(())
 }

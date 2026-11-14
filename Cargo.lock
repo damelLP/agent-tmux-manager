@@ -248,6 +248,7 @@ dependencies = [
  "atm-tmux",
  "chrono",
  "clap",
+ "libc",
  "procfs",
  "serde",
  "serde_json",

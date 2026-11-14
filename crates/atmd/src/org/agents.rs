@@ -128,6 +128,8 @@ pub(super) struct AgentRuntime {
     /// Each agent's pane and what was recorded about its processes. In memory
     /// only; written under the agent's reservation.
     baselines: Arc<std::sync::Mutex<HashMap<AgentId, (String, PaneBaseline)>>>,
+    /// Reads a pane's root process from procfs; scripted in tests.
+    pub proc: super::agent_proc::ProcReader,
     #[cfg(test)]
     progress: broadcast::Sender<ObservationProgress>,
 }
@@ -144,12 +146,12 @@ impl AgentRuntime {
             .map_or_else(PaneBaseline::unproven, |(_, baseline)| baseline)
     }
 
-    #[cfg(test)]
+    /// Record what was established about an agent's pane. A poisoned store
+    /// records nothing, and reads then refuse.
     pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
-        self.baselines
-            .lock()
-            .unwrap()
-            .insert(agent, (pane.into(), baseline));
+        if let Ok(mut baselines) = self.baselines.lock() {
+            baselines.insert(agent, (pane.into(), baseline));
+        }
     }
 
     /// Drop what was recorded about an agent's pane; it has left that pane.
@@ -290,6 +292,26 @@ impl AgentHandle {
         C: FnOnce(Reservation, crate::control::reservation::Completion) -> CF + Send + 'static,
         CF: std::future::Future<Output = Result<(), AgentError>> + Send + 'static,
     {
+        self.lifecycle_for(None, request, work, cleanup).await
+    }
+
+    /// As [`Self::lifecycle`], for a pane id that came from a caller: when the
+    /// caller named its tmux server, the reservation is refused unless that is
+    /// the server atmd controls.
+    pub(super) async fn lifecycle_for<T, W, WF, C, CF>(
+        &self,
+        server: Option<String>,
+        request: ReservationRequest,
+        work: W,
+        cleanup: C,
+    ) -> Result<T, AgentError>
+    where
+        T: Send + 'static,
+        W: FnOnce(Reservation) -> WF + Send + 'static,
+        WF: std::future::Future<Output = Result<T, AgentError>> + Send + 'static,
+        C: FnOnce(Reservation, crate::control::reservation::Completion) -> CF + Send + 'static,
+        CF: std::future::Future<Output = Result<(), AgentError>> + Send + 'static,
+    {
         match self.inner.ready.borrow().clone() {
             Some(Ok(())) => {}
             Some(Err(reason)) => return Err(AgentError::Unavailable(reason)),
@@ -325,7 +347,7 @@ impl AgentHandle {
                 )));
             }
         }
-        let control = rt.control.clone();
+        let control = rt.control.clone().for_server(server);
         let (admitted, admission) = oneshot::channel();
         let (reply, response) = oneshot::channel();
         queue
@@ -372,19 +394,31 @@ impl AgentHandle {
         .await
     }
     pub async fn adopt(&self, p: AdoptParams) -> Result<AdoptResult, AgentError> {
+        const OPERATION: &str = "agent.adopt";
         let deadline = Instant::now() + OBSERVE_BUDGET;
-        let projects = self.projects("agent.adopt")?;
+        let projects = self.projects(OPERATION)?;
         let pane = PaneId::parse(p.pane)?;
         let id = projects.identify(p.project_root, p.name).await?;
-        self.unimplemented(
-            ReservationRequest::new(
-                id,
-                Some(pane),
-                ReservationKind::Adopt,
-                WaitPolicy::Wait,
-                deadline,
-            ),
-            "agent.adopt",
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let request = ReservationRequest::new(
+            id.clone(),
+            Some(pane.clone()),
+            ReservationKind::Adopt,
+            WaitPolicy::Wait,
+            deadline,
+        );
+        let effect = super::agent_lifecycle::Effect::default();
+        let (work, cleanup) = (rt.clone(), rt.clone());
+        let (agent, held, changed) = (id.clone(), pane.clone(), effect.clone());
+        self.lifecycle_for(
+            p.caller_server,
+            request,
+            move |r| async move { work.adopt(&r, &id, &pane, &effect).await },
+            move |_, _| async move { cleanup.settle_adopt(&agent, &held, &changed).await },
         )
         .await
     }
@@ -978,11 +1012,24 @@ pub fn spawn_agents(
     control: ControlHandle,
     cancel: CancellationToken,
 ) -> (AgentHandle, JoinHandle<()>) {
+    let proc = super::agent_proc::procfs_reader();
+    spawn_agents_with(org, registry, control, cancel, proc)
+}
+
+/// [`spawn_agents`] with the procfs reader given, so tests can script it.
+pub(super) fn spawn_agents_with(
+    org: OrgHandle,
+    registry: RegistryHandle,
+    control: ControlHandle,
+    cancel: CancellationToken,
+    proc: super::agent_proc::ProcReader,
+) -> (AgentHandle, JoinHandle<()>) {
     let rt = AgentRuntime {
         org,
         registry,
         control,
         baselines: Arc::default(),
+        proc,
         #[cfg(test)]
         progress: broadcast::channel(4096).0,
     };

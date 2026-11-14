@@ -47,6 +47,8 @@ mod reconciliation {
         client: ScriptedTmuxClient,
         control: crate::control::service::ControlHandle,
         cancel: CancellationToken,
+        /// What the scripted procfs reader answers for any process; none by default.
+        proc: std::sync::Arc<std::sync::Mutex<Option<super::super::agent_flow::ProcFacts>>>,
     }
     impl Rig {
         async fn new() -> Self {
@@ -135,6 +137,7 @@ mod reconciliation {
                 client,
                 control,
                 cancel,
+                proc: Default::default(),
             }
         }
         async fn command(&self, command: OrgCommand) {
@@ -241,11 +244,16 @@ mod reconciliation {
                 .unwrap();
         }
         fn start(&self) -> (AgentHandle, tokio::task::JoinHandle<()>) {
-            spawn_agents(
+            let proc = self.proc.clone();
+            spawn_agents_with(
                 self.org.clone(),
                 self.registry.clone(),
                 self.control.clone(),
                 self.cancel.child_token(),
+                std::sync::Arc::new(move |_| {
+                    let facts = proc.lock().unwrap().clone();
+                    Box::pin(async move { facts })
+                }),
             )
         }
         async fn state(&self, name: &str) -> atm_org::Agent {

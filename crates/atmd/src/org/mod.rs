@@ -19,6 +19,7 @@ mod agent_flow;
 mod agent_flow_tests;
 mod agent_lifecycle;
 mod agent_methods;
+mod agent_proc;
 mod agent_project;
 mod agent_screen;
 #[cfg(test)]

@@ -134,9 +134,12 @@ Known operational limits:
   Shared validation can recover a server identity in memory but never writes it.
 - Direct binary calls bypass the lock as well as the mutation guard: they can
   autostart a daemon during restart or stop. A dying harness can also briefly
-  leave a hook process in the final token scan. The runtime/manifest is retained
-  on failure; close direct candidate TUIs and re-run from outside. These race
-  schedules are unverified; ordinary autostart cleanup has a real-process test.
+  leave a hook process in the final token scan. An in-pane caller that starts
+  during `stop` now waits for the kit lock and can make `stop` fail with
+  "descendants remain"; re-run `stop` once that caller exits.
+  The runtime/manifest is retained on failure; close direct candidate TUIs and
+  re-run from outside. These race schedules are unverified; ordinary autostart
+  cleanup has a real-process test.
 
 ## Checks
 

@@ -414,14 +414,15 @@ No frame/ready event is emitted after exit. Codex hook-review Esc and permission
 Pure source/scene/key tests run through the Cargo Python contract; private tmux
 integration tests cover native fresh replay, modal keys and retained shells.
 `stand_in_screens` calls all three real adapters, not copied parsers. It compares
-all 76 sources through private tmux with independent source text and pinned U8a
-facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
+all 76 sources through private tmux with independent source text and pinned legacy
+`observe_screen` facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
 allowing tmux to normalize SGR encodings. Separate key-driven tests cover drafts,
 working/idle, each clear phase, repeated identical clear snapshots, interruptions,
 actual retained shells, trust, update, hook review/list, worktree and permission.
-P1 Codex dialogs and selected Claude trust remain Unknown under unchanged U8a.
+P1 Codex dialogs and selected Claude trust remain Unknown to legacy `observe_screen`.
+In chunk A, B0's `observe_control_screen` recognises these modals; the stand-in tests do not pin it.
 Claude's rich identical-draft source has a separate warning footer and is wholly
-Unknown, not merely unknown input. No parser special cases are added.
+Unknown to legacy `observe_screen`, not merely unknown input. No parser special cases are added.
 
 For supplementary source-only conformance, `control(pane, json!({"command":
 "render_source", "key": "claude.permission.u5"}))` replays a catalog entry for
@@ -433,8 +434,12 @@ This diagnostic control never proves a lifecycle
 transition; the key-driven tests are the independent transition evidence.
 
 A real-looking placeholder, selected trust option or Codex draft may still be
-Unknown to the current parsers. Neither the journal nor a rendered frame is
+Unknown to legacy `observe_screen`. Neither the journal nor a rendered frame is
 permission to deliver a prompt.
+A rig daemon discovers every harness process on the host (private sockets do not
+isolate `/proc`), so concurrent runs can fill its registry (`Registry is full`,
+max 100) and failure output can name the host's real sessions; a separate unit
+addresses discovery scope.
 
 ## Captured templates
 

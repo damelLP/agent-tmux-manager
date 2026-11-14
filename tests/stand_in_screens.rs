@@ -75,7 +75,7 @@ fn expected(key: &str) -> ScreenFacts {
     use InputState::{Draft, Empty, Unknown};
     use TurnState::{NotRunning, Running, Unknown as TurnUnknown};
     // U5/U5b expectations transcribed from the adapters' captured_screens tests.
-    // P1 modal expectations are deliberately conservative under unchanged U8a.
+    // P1 modal expectations deliberately pin the conservative legacy observe_screen API.
     let (input, turn, dialog, fresh) = match key {
         "claude.fresh.rich-enabled" | "claude.fresh.u5" | "claude.fresh.restart"
         | "claude.draft-identical.poor"

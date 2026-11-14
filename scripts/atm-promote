@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Promote an owner-selected pair; close TUIs and stop the daemon first."""
+import sys
+from atm_promotion import main
+
+sys.exit(main('install'))

@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Sealed promotion contracts; Cargo supplies binaries for real setup tests."""
+import contextlib
+import fcntl
+import io
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 SCRIPTS = Path(__file__).resolve().parent
@@ -172,6 +178,419 @@ class ProtectedFiles(Sealed):
         after = {str(p.relative_to(decoy)): p.read_bytes()
                  for p in (decoy / '.git').rglob('*') if p.is_file()}
         self.assertEqual(after, before)
+
+
+class Promotion(Sealed):
+    def setUp(self):
+        super().setUp()
+        self.bin = self.root / 'bin'
+        self.source = self.root / 'source'
+        self.bin.mkdir()
+        self.source.mkdir()
+        self.log = self.root / 'setup.jsonl'
+        self.modes = self.root / 'modes.json'
+        self.modes.write_text('{}')
+        self.env.update(PROMOTION_LOG=str(self.log), PROMOTION_MODES=str(self.modes))
+        self.old = self.make_pair(self.bin, 'old')
+        self.new = self.make_pair(self.source, 'new')
+        (self.bin / 'unrelated').write_text('keep')
+
+    def make_pair(self, directory, label):
+        atm = '''#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+label = LABEL
+assert sys.argv[1:] == ['setup'], sys.argv
+with Path(os.environ['PROMOTION_LOG']).open('a') as log:
+    log.write(json.dumps(dict(label=label, sibling=Path(__file__).with_name('atmd').read_text(),
+                              home=os.environ['HOME'], socket=os.environ['ATM_SOCKET'],
+                              tmux=os.environ.get('TMUX'), pane=os.environ.get('TMUX_PANE'))) + '\\n')
+mode = json.loads(Path(os.environ['PROMOTION_MODES']).read_text()).get(label)
+if mode == 'warning': print('Installing atm skills... failed: blocked')
+if mode == 'invalid':
+    sys.stdout.buffer.write(bytes([255]))
+    sys.exit(7)
+if mode == 'failure':
+    print('setup refused', file=sys.stderr)
+    sys.exit(7)
+'''.replace('LABEL', repr(label))
+        (directory / 'atm').write_text(atm)
+        (directory / 'atmd').write_text('#!/bin/sh\n# ' + label + '\nexit 0\n')
+        (directory / 'atm').chmod(0o751)
+        (directory / 'atmd').chmod(0o755)
+        return self.pair_bytes(directory)
+
+    def pair_bytes(self, directory):
+        return {name: ((directory / name).read_bytes(), (directory / name).stat().st_mode & 0o777)
+                for name in ('atm', 'atmd')}
+
+    def args(self, operation):
+        args = ['--bin-dir', str(self.bin), '--socket', self.env['ATM_SOCKET']]
+        if operation == 'install':
+            args += ['--from-bin', str(self.source)]
+        return args
+
+    def call(self, operation='install', ok=True, env=None, args=None):
+        script = 'atm-promote' if operation == 'install' else 'atm-rollback'
+        result = self.command([sys.executable, SCRIPTS / script,
+                               *(self.args(operation) if args is None else args)], env=env)
+        self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
+        return result
+
+    def records(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def previous(self):
+        metadata = self.bin / '.atm-promotion'
+        name = json.loads((metadata / 'previous.json').read_text())['pair']
+        return metadata / 'pairs' / name
+
+    def in_process(self, operation='install'):
+        import atm_promotion
+        with patch.dict(os.environ, self.env, clear=True), patch.object(sys, 'argv', ['tool', *self.args(operation)]):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return atm_promotion.main(operation)
+
+    # Missing either rename or setup's exact destination invocation breaks this.
+    def test_promote_and_idempotent_rollback_keep_regular_pairs_and_setup_routing(self):
+        self.call(env=dict(self.env, TMUX='foreign', TMUX_PANE='%99'))
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+        self.assertEqual(self.pair_bytes(self.previous()), self.old)
+        self.assertFalse((self.bin / 'atm').is_symlink())
+        self.assertFalse((self.bin / 'atmd').is_symlink())
+        self.call('rollback')
+        archives = list((self.bin / '.atm-promotion/pairs').iterdir())
+        self.assertIn(self.new, [self.pair_bytes(path) for path in archives])
+        self.call('rollback')
+        self.assertEqual(list((self.bin / '.atm-promotion/pairs').iterdir()), archives)
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        records = self.records()
+        self.assertEqual([r['label'] for r in records], ['new', 'old', 'old'])
+        for record, pair in zip(records, (self.new, self.old, self.old)):
+            self.assertEqual(record['sibling'], pair['atmd'][0].decode())
+            self.assertEqual(record['home'], str(self.home))
+            self.assertEqual(record['socket'], self.env['ATM_SOCKET'])
+            self.assertIsNone(record['tmux'])
+            self.assertIsNone(record['pane'])
+        self.assertEqual((self.bin / 'unrelated').read_text(), 'keep')
+
+    def test_second_promotion_remembers_immediate_previous_pair(self):
+        self.call()
+        third = self.make_pair(self.source, 'third')
+        self.call()
+        self.assertEqual(self.pair_bytes(self.bin), third)
+        self.assertEqual(self.pair_bytes(self.previous()), self.new)
+        self.call('rollback')
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+
+    def test_setup_errors_and_zero_exit_skill_failure_restore_old_pair(self):
+        for mode in ('failure', 'warning'):
+            with self.subTest(mode=mode):
+                self.modes.write_text(json.dumps({'new': mode}))
+                result = self.call(ok=False)
+                self.assertIn('restored', result.stderr)
+                self.assertEqual(self.pair_bytes(self.bin), self.old)
+                self.assertEqual(self.pair_bytes(self.previous()), self.old)
+                self.assertEqual([r['label'] for r in self.records()][-2:], ['new', 'old'])
+
+    def test_recovery_setup_failure_keeps_old_pair_and_reports_both_outcomes(self):
+        self.modes.write_text('{"new":"failure","old":"failure"}')
+        result = self.call(ok=False)
+        self.assertIn('recovery failed', result.stderr)
+        self.assertIn('setup', result.stderr)
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.assertEqual([r['label'] for r in self.records()], ['new', 'old'])
+
+    def test_rollback_setup_failure_keeps_requested_old_pair(self):
+        self.call()
+        self.modes.write_text('{"old":"failure"}')
+        self.call('rollback', ok=False)
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.modes.write_text('{}')
+        self.call('rollback')
+
+    def test_invalid_setup_output_still_restores_pair(self):
+        self.modes.write_text('{"new":"invalid"}')
+        self.call(ok=False)
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.assertEqual([r['label'] for r in self.records()], ['new', 'old'])
+
+    def test_timeout_prints_partial_setup_output(self):
+        import atm_promotion
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(atm_promotion.subprocess, 'run', side_effect=subprocess.TimeoutExpired(
+                ['atm', 'setup'], 60, output=b'partial output\\n', stderr=b'partial error\\n')):
+            with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    atm_promotion.setup(self.bin, Path(self.env['ATM_SOCKET']))
+        self.assertIn('partial output', output.getvalue())
+        self.assertIn('partial error', errors.getvalue())
+
+    def test_timeout_restores_old_pair_and_runs_old_setup(self):
+        import atm_promotion
+        real_run = subprocess.run
+        def timeout_once(*args, **kwargs):
+            if self.pair_bytes(self.bin) == self.new:
+                raise subprocess.TimeoutExpired(args[0], 60)
+            return real_run(*args, **kwargs)
+        with patch.object(atm_promotion.subprocess, 'run', side_effect=timeout_once):
+            self.assertNotEqual(self.in_process(), 0)
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.assertEqual([r['label'] for r in self.records()], ['old'])
+
+    def test_missing_nonexecutable_or_symlinked_input_refuses_before_setup(self):
+        for directory in (self.bin, self.source):
+            for name in ('atm', 'atmd'):
+                for damage in ('missing', 'mode', 'symlink'):
+                    with self.subTest(directory=directory.name, name=name, damage=damage):
+                        path = directory / name
+                        original = path.read_bytes(), path.stat().st_mode
+                        if damage == 'mode':
+                            path.chmod(0o600)
+                        else:
+                            path.unlink()
+                            if damage == 'symlink':
+                                path.symlink_to(self.bin / 'unrelated')
+                        self.call(ok=False)
+                        self.assertEqual(self.records(), [])
+                        if path.is_symlink(): path.unlink()
+                        path.write_bytes(original[0]); path.chmod(original[1])
+
+    def test_required_arguments_overlap_and_noncanonical_directories_refuse(self):
+        for args in ([], ['--socket', self.env['ATM_SOCKET']], ['--bin-dir', str(self.bin)],
+                     ['--bin-dir', str(self.bin), '--socket', self.env['ATM_SOCKET'], '--from-bin', str(self.bin)]):
+            self.call(args=args, ok=False)
+        alias = self.root / 'alias'
+        alias.symlink_to(self.bin, target_is_directory=True)
+        self.call(args=['--bin-dir', str(alias), '--socket', self.env['ATM_SOCKET'],
+                        '--from-bin', str(self.source)], ok=False)
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.assertEqual(self.records(), [])
+
+    def test_missing_incomplete_or_malformed_previous_refuses(self):
+        self.call('rollback', ok=False)
+        self.call()
+        previous = self.previous()
+        (previous / 'atmd').unlink()
+        self.call('rollback', ok=False)
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+        marker = self.bin / '.atm-promotion/previous.json'
+        for content in ('not json', '{"pair":"../../source"}'):
+            marker.write_text(content)
+            self.call('rollback', ok=False)
+        self.assertEqual([r['label'] for r in self.records()], ['new'])
+
+    def test_lock_and_metadata_symlinks_refuse_without_changes(self):
+        self.call()
+        meta = self.bin / '.atm-promotion'
+        with (meta / 'lock').open('r') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.call('rollback', ok=False)
+        for relative in ('lock', 'previous.json'):
+            path = meta / relative
+            data = path.read_bytes()
+            path.unlink(); path.symlink_to(self.bin / 'unrelated')
+            self.call('rollback', ok=False)
+            path.unlink(); path.write_bytes(data); path.chmod(0o600)
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+        self.assertEqual((self.bin / 'unrelated').read_text(), 'keep')
+
+    def test_existing_socket_refuses_without_connecting(self):
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(self.env['ATM_SOCKET']); listener.listen(); listener.setblocking(False)
+            self.call(ok=False)
+            with self.assertRaises(BlockingIOError): listener.accept()
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.assertEqual(self.records(), [])
+
+    def child(self, executable, env):
+        # cat blocks on a pipe, not a timing guess. /proc/exe identifies our copy.
+        process = subprocess.Popen([str(executable)], env=env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        def cleanup():
+            process.stdin.close()
+            process.wait(timeout=30)
+            process.stdout.close(); process.stderr.close()
+        self.addCleanup(cleanup)
+        process.stdin.write(b'ready\n'); process.stdin.flush()
+        self.assertEqual(process.stdout.readline(), b'ready\n')
+        return process
+
+    def test_running_installed_binary_refuses_but_foreign_process_does_not(self):
+        shutil.copy2('/bin/cat', self.bin / 'atmd')
+        process = self.child(self.bin / 'atmd', dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
+        self.call(ok=False)
+        self.assertIsNone(process.poll())
+        process.stdin.close(); process.wait(timeout=30)
+        (self.bin / 'atmd').write_bytes(self.old['atmd'][0]); (self.bin / 'atmd').chmod(0o755)
+        foreign = self.child('/bin/cat', dict(self.env, ATM_SOCKET=str(self.root / 'foreign.sock')))
+        self.call()
+        self.assertIsNone(foreign.poll())
+
+    def test_inaccessible_unrelated_process_is_ignored_but_possible_atm_refuses(self):
+        import atm_promotion
+        foreign = self.child('/bin/cat', dict(self.env, ATM_SOCKET=str(self.root / 'foreign.sock')))
+        real_readlink = os.readlink
+        denied = Path(f'/proc/{foreign.pid}/exe')
+        def readlink(path, *args, **kwargs):
+            if Path(path) == denied:
+                raise PermissionError('procfs hidden')
+            return real_readlink(path, *args, **kwargs)
+        with patch.object(atm_promotion.os, 'readlink', side_effect=readlink):
+            self.assertEqual(self.in_process(), 0)
+        shutil.copy2('/bin/cat', self.bin / 'atmd')
+        relevant = self.child(self.bin / 'atmd', dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
+        denied = Path(f'/proc/{relevant.pid}/exe')
+        with patch.object(atm_promotion.os, 'readlink', side_effect=readlink):
+            self.assertNotEqual(self.in_process(), 0)
+        self.assertIsNone(relevant.poll())
+
+    def test_matching_socket_environment_refuses_without_signaling_process(self):
+        process = self.child('/bin/cat', self.env)
+        self.call(ok=False)
+        self.assertIsNone(process.poll())
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+
+    def test_copy_or_second_rename_failure_restores_both_and_reruns_setup(self):
+        import atm_promotion
+        for fault in ('copy', 'rename'):
+            with self.subTest(fault=fault):
+                real_copy, real_replace = shutil.copy2, os.replace
+                fired = False
+                def copy(source, destination, *args, **kwargs):
+                    nonlocal fired
+                    if not fired and Path(source) == self.source / 'atmd':
+                        fired = True
+                        raise OSError('injected source copy failure')
+                    return real_copy(source, destination, *args, **kwargs)
+                def replace(source, destination, *args, **kwargs):
+                    nonlocal fired
+                    if not fired and Path(destination) == self.bin / 'atmd':
+                        fired = True
+                        raise OSError('injected second rename failure')
+                    return real_replace(source, destination, *args, **kwargs)
+                with patch.object(atm_promotion.shutil, 'copy2', side_effect=copy if fault == 'copy' else real_copy), \
+                     patch.object(atm_promotion.os, 'replace', side_effect=replace if fault == 'rename' else real_replace):
+                    self.assertNotEqual(self.in_process(), 0)
+                self.assertTrue(fired)
+                self.assertEqual(self.pair_bytes(self.bin), self.old)
+                self.assertEqual(self.pair_bytes(self.previous()), self.old)
+                self.assertEqual(self.records()[-1]['label'], 'old')
+                self.assertEqual(list(self.bin.glob('.atm-stage-*')), [])
+
+    def test_failed_backup_does_not_replace_previous_or_installed_files(self):
+        import atm_promotion
+        self.call()
+        previous = (self.bin / '.atm-promotion/previous.json').read_bytes()
+        real_copy = shutil.copy2
+        def copy(source, destination, *args, **kwargs):
+            if Path(source) == self.bin / 'atmd':
+                raise OSError('injected backup failure')
+            return real_copy(source, destination, *args, **kwargs)
+        with patch.object(atm_promotion.shutil, 'copy2', side_effect=copy):
+            self.assertNotEqual(self.in_process(), 0)
+        self.assertEqual((self.bin / '.atm-promotion/previous.json').read_bytes(), previous)
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+        self.assertEqual([r['label'] for r in self.records()], ['new'])
+
+    def test_rollback_repairs_accepted_interrupted_rename_window(self):
+        self.call()
+        # Model SIGKILL after only atm was replaced: previous remains complete.
+        (self.bin / 'atmd').write_bytes(self.old['atmd'][0])
+        self.call('rollback')
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+        self.assertEqual(self.pair_bytes(self.previous()), self.old)
+
+
+class PromotionRealSetup(Sealed):
+    def setUp(self):
+        super().setUp()
+        self.bin = self.root / 'bin'
+        self.source = self.root / 'source'
+        self.bin.mkdir(); self.source.mkdir()
+        for name in ('atm', 'atmd'):
+            binary = os.environ.get('CANDIDATE_TEST_' + name.upper())
+            self.assertTrue(binary and Path(binary).is_file(), 'Cargo-built CANDIDATE_TEST_' + name.upper() + ' required')
+            for directory in (self.bin, self.source):
+                shutil.copy2(binary, directory / name)
+        for harness in ('.claude', '.codex', '.pi/agent'):
+            (self.home / harness).mkdir(parents=True)
+        (self.home / '.claude/settings.json').write_text('{"keep":"claude"}')
+        (self.home / '.codex/hooks.json').write_text('{"keep":"codex"}')
+        (self.home / '.pi/agent/settings.json').write_text('{"packages":["keep-package"]}')
+
+    def call(self, rollback=False, ok=True):
+        script = 'atm-rollback' if rollback else 'atm-promote'
+        args = ['--bin-dir', self.bin, '--socket', self.env['ATM_SOCKET']]
+        if not rollback: args += ['--from-bin', self.source]
+        result = self.command([sys.executable, SCRIPTS / script, *args])
+        self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
+        return result
+
+    def assert_assets(self):
+        repo = SCRIPTS.parent
+        for name in ('atm-hook', 'atm-codex-hook'):
+            self.assertEqual((self.home / '.local/bin' / name).read_bytes(),
+                             (repo / 'crates/atm/scripts' / name).read_bytes())
+        for name in ('package.json', 'extensions/pi-atm.ts'):
+            self.assertEqual((self.home / '.pi/agent/packages/pi-atm' / name).read_bytes(),
+                             (repo / 'crates/atm/assets/pi-atm' / name).read_bytes())
+        for harness in ('.claude', '.codex', '.pi/agent'):
+            for skill in ('atm-implement', 'atm-coordinate'):
+                self.assertEqual((self.home / harness / 'skills' / skill / 'SKILL.md').read_bytes(),
+                                 (repo / 'crates/atm/assets/atm-skills' / skill / 'SKILL.md').read_bytes())
+        self.assertEqual(json.loads((self.home / '.claude/settings.json').read_text())['keep'], 'claude')
+        self.assertEqual(json.loads((self.home / '.codex/hooks.json').read_text())['keep'], 'codex')
+        self.assertEqual(json.loads((self.home / '.pi/agent/settings.json').read_text())['packages'],
+                         ['keep-package', 'packages/pi-atm'])
+
+    def test_real_setup_refreshes_assets_on_promotion_and_rollback_without_connection(self):
+        # Decoy is inherited, explicit promotion endpoint is a different absent path.
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(self.root / 'decoy.sock')); listener.listen(); listener.setblocking(False)
+            inherited = dict(self.env, ATM_SOCKET=str(self.root / 'decoy.sock'))
+            for script in ('atm-promote', 'atm-rollback'):
+                args = ['--bin-dir', self.bin, '--socket', self.env['ATM_SOCKET']]
+                if script == 'atm-promote': args += ['--from-bin', self.source]
+                result = self.command([sys.executable, SCRIPTS / script, *args], env=inherited)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_assets()
+                # Force rollback to demonstrate asset refresh, not merely presence.
+                if script == 'atm-promote':
+                    (self.home / '.pi/agent/packages/pi-atm/extensions/pi-atm.ts').write_text('stale')
+                with self.assertRaises(BlockingIOError): listener.accept()
+        self.assertFalse(Path(self.env['ATM_SOCKET']).exists())
+        self.assertFalse((self.root / 'state/atmd.pid').exists())
+
+    def test_real_skill_failure_is_not_reported_as_success(self):
+        skills = self.home / '.claude/skills'
+        skills.mkdir(); (skills / '.atm-staging').write_text('block')
+        result = self.call(ok=False)
+        self.assertIn('failed:', result.stdout)
+        self.assertIn('recovery failed', result.stderr)
+
+    def test_running_real_installed_daemon_refuses_without_signaling(self):
+        endpoint = self.root / 'running.sock'
+        env = dict(self.env, ATM_SOCKET=str(endpoint))
+        Path(env['TMUX_TMPDIR']).mkdir()
+        with (self.root / 'daemon.log').open('w+') as log:
+            process = subprocess.Popen([str(self.bin / 'atmd'), 'start'], env=env, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 30
+                while not endpoint.exists():
+                    self.assertIsNone(process.poll(), 'daemon exited before ready')
+                    self.assertLess(time.monotonic(), deadline, 'daemon socket readiness timed out')
+                    time.sleep(.02)  # bounded readiness condition, not a settling delay
+                result = self.call(ok=False)
+                self.assertIn('running', result.stderr)
+                self.assertIsNone(process.poll())
+            finally:
+                if process.poll() is None:
+                    self.assertEqual(Path(f'/proc/{process.pid}/exe').resolve(), self.bin / 'atmd')
+                    self.assertIn(('ATM_SOCKET=' + str(endpoint)).encode(),
+                                  Path(f'/proc/{process.pid}/environ').read_bytes().split(b'\0'))
+                    process.terminate()
+                    process.wait(timeout=30)
 
 
 if __name__ == '__main__':

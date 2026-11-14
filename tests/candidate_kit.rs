@@ -3,8 +3,17 @@
 
 #[test]
 fn candidate_kit_contract() {
+    run_contract("scripts/candidate_kit_test.py");
+}
+
+#[test]
+fn promotion_kit_contract() {
+    run_contract("scripts/promotion_kit_test.py");
+}
+
+fn run_contract(script: &str) {
     let output = std::process::Command::new("timeout")
-        .args(["240", "python3", "scripts/candidate_kit_test.py"])
+        .args(["240", "python3", script])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")

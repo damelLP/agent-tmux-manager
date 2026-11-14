@@ -1,6 +1,7 @@
 //! Fixed reserved tmux operations. The owner actor supplies the checked fence.
 //! Framing/focus/process formats verified on private tmux 3.6 and 3.8. The v1
-//! captures remain in fixtures/tmux_3.8_reserved_observations.json.
+//! captures remain in fixtures/tmux_3.8_reserved_observations.json; current v2
+//! frames and real clients are in fixtures/tmux_{3.6,3.8}_reserved_v2.json.
 //! Captured: tmux 3.6 and 3.8, 2026-11-14, private PTY focus/shell probes.
 //! Neither version exposes a foreground PID: the v2 PID slot is deliberately empty,
 //! never substituted with pane_pid (the root may be a shell wrapper).

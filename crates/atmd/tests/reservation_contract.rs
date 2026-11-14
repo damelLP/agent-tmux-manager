@@ -42,10 +42,24 @@ fn inspection(pane: &str, tag: Option<&str>) -> PaneInspection {
 }
 
 fn fixtures() -> serde_json::Value {
-    serde_json::from_str(include_str!(
+    let mut data: serde_json::Value = serde_json::from_str(include_str!(
         "../src/control/fixtures/tmux_3.8_reserved_observations.json"
     ))
-    .unwrap()
+    .unwrap();
+    // Synthetic framing upgrade around the historical real whitespace/style
+    // bytes. Current real v2 frames are pinned separately by the library tests.
+    for key in ["filtered_list", "plain", "ansi"] {
+        let mut frame = data[key]
+            .as_str()
+            .unwrap()
+            .replacen("ATM-PANE-v1", "ATM-PANE-v2", 1)
+            .replacen('\n', "\t\t\t0\t0\n", 1);
+        if key != "filtered_list" {
+            frame = frame.replace("ATM-END", "ATM-CLIENTS-v1\n\t%0\nATM-END");
+        }
+        data[key] = frame.into();
+    }
+    data
 }
 
 async fn metadata(client: &dyn TmuxClient, pane: &str) -> String {

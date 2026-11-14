@@ -3,17 +3,19 @@
 
 #[test]
 fn candidate_kit_contract() -> std::io::Result<()> {
-    run_contract("scripts/candidate_kit_test.py")
+    // Outer hang guard: allow three 120 s inner guards (including cleanup)
+    // plus normal suite work, so a failure can report and stop owned resources.
+    run_contract("420", "scripts/candidate_kit_test.py")
 }
 
 #[test]
 fn promotion_kit_contract() -> std::io::Result<()> {
-    run_contract("scripts/promotion_kit_test.py")
+    run_contract("240", "scripts/promotion_kit_test.py")
 }
 
-fn run_contract(script: &str) -> std::io::Result<()> {
+fn run_contract(limit: &str, script: &str) -> std::io::Result<()> {
     let output = std::process::Command::new("timeout")
-        .args(["240", "python3", script])
+        .args([limit, "python3", script])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")

@@ -97,6 +97,14 @@ Stop validates server socket/PID and process identity before signaling. Linux
 pidfds prevent PID-reuse signals. It finds run-tagged descendants, including
 sibling-atmd CLI autostarts, kills the private tmux server, stops owned processes
 and removes the runtime only after exit. Failed startup follows the same cleanup.
+Like `atmd stop`, each pinned process gets up to 75 seconds from signaling to exit,
+with one progress line on stderr after 5 seconds. This also applies when waiting
+without signaling after an ownership change, and to the private tmux server's
+exit. The bound is per process, not a total kit-stop deadline; processes are stopped
+in sequence. Nominal daemon drains can take 64 seconds, but blocked filesystem or
+Tokio blocking-pool work can last indefinitely. A timeout names the PID that may
+still be shutting down and retains the runtime/manifest; it does not force exit
+or claim that every pending write was persisted.
 PID plus procfs starttime identifies a process; a reused/dead recorded PID is
 gone, not foreign. Deleted/replaced executables remain visible during cleanup.
 After a reboot removes the runtime directory, status/stop accept the stale

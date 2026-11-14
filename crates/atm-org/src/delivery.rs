@@ -60,7 +60,7 @@
 //! | Queued retry with landing evidence | Blocked(ProbablyDelivered) |
 //! | Queued retry before logged failed_at + retry delay | RetryAt; no new failure event |
 //! | Queued, owner focused (unknown focus is focused) | Wait(OwnerFocused), notice, no timeout |
-//! | Queued, agent starting/clearing | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after continuous non-ready + readiness_timeout |
+//! | Queued, agent starting/clearing | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after the current not-ready window + readiness_timeout |
 //! | Queued, agent stuck/down | Blocked(AgentUnavailable); ready resumes |
 //! | Queued, another message delivering or retry-pending for recipient | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
@@ -96,8 +96,9 @@
 //! Missing hold history starts at now, not sent_at. The executor must retain
 //! subsequent continuity, or repeated missing history would extend the window.
 //! After restart, never-attempted messages start at recovery; prior attempts keep
-//! the restart veto. The independent agent-not-ready clock survives non-ready
-//! status changes and focus waits; see [`RecipientLiveView::agent_not_ready_since`].
+//! the restart veto. The independent agent-not-ready clock survives Starting /
+//! Clearing transitions and focus waits, but restarts when Starting or Clearing
+//! follows Stuck or Down; see [`RecipientLiveView::agent_not_ready_since`].
 //! `EmptySince` means a positively recognized
 //! empty editor **and no running turn**, never a blank screen or an empty box
 //! during active work. `send_now` skips row status/stability only once the editor
@@ -242,11 +243,13 @@ pub struct RecipientLiveView {
     pub session: Option<LiveSession>,
     pub pane: PaneLiveness,
     pub agent_status: AgentStatus,
-    /// Start of the continuous non-Ready interval, independent of message holds.
+    /// Start of the current not-ready window, independent of message holds.
     /// Reconstruct from applied transitions in log order: set when leaving Ready
-    /// or first creating a non-ready agent; clear on Ready. Preserve across all
-    /// non-ready status changes and metadata events. Agent.updated_at is NOT this
-    /// clock (even recording a pane changes it). Without history, start at the
+    /// or first creating a non-ready agent; clear on Ready. Preserve across
+    /// Starting/Clearing transitions and metadata events. Entering Starting or
+    /// Clearing from Stuck/Down starts a new window: the outage already notified
+    /// the owner, and a restart gets its own readiness budget. Agent.updated_at
+    /// is NOT this clock (even recording a pane changes it). Without history, start at the
     /// first observation; None starts now and must be retained on later polls.
     pub agent_not_ready_since: Option<DateTime<Utc>>,
     /// Another message has an unconfirmed attempt for this recipient agent,
@@ -1074,6 +1077,74 @@ mod tests {
         }
     }
 
+    // Synthetic executor transition model, not policy-owned state.
+    fn track_agent_not_ready(
+        since: &mut Option<DateTime<Utc>>,
+        before: Option<AgentStatus>,
+        after: AgentStatus,
+        now: DateTime<Utc>,
+    ) {
+        if after == AgentStatus::Ready {
+            *since = None;
+        } else if before.is_none_or(|status| status == AgentStatus::Ready)
+            || (matches!(before, Some(AgentStatus::Stuck | AgentStatus::Down))
+                && matches!(after, AgentStatus::Starting | AgentStatus::Clearing))
+        {
+            *since = Some(now);
+        }
+    }
+
+    #[test]
+    fn restarting_an_unavailable_agent_gets_a_new_readiness_window() {
+        for down in [false, true] {
+            let mut h = History::new(false);
+            let id: AgentId = "p/worker".parse().unwrap();
+            h.command(
+                if down {
+                    OrgCommand::Down {
+                        agent_id: id.clone(),
+                        reason: "outage".into(),
+                    }
+                } else {
+                    OrgCommand::Stuck {
+                        agent_id: id.clone(),
+                        reason: "outage".into(),
+                    }
+                },
+                time(10),
+            );
+            h.command(
+                OrgCommand::Adopt {
+                    agent_id: id.clone(),
+                    pane: "%1".into(),
+                    session_id: None,
+                },
+                time(1000),
+            );
+            let mut state = OrgState::default();
+            let mut since = None;
+            for (index, (ts, event)) in h.log.iter().enumerate() {
+                let before = state.agent(&id).map(|agent| agent.status);
+                state.apply(index as u64 + 1, *ts, event).unwrap();
+                if let Some(agent) = state.agent(&id) {
+                    track_agent_not_ready(&mut since, before, agent.status, *ts);
+                }
+            }
+            let mut live = ready();
+            live.agent_status = state.agent(&id).unwrap().status;
+            live.agent_not_ready_since = since;
+            wait(h.step(&live, 1000), WaitReason::AgentNotReady);
+            assert_eq!(since, Some(time(1000)));
+            wait(h.step(&live, 1119), WaitReason::AgentNotReady);
+            assert_eq!(
+                h.step(&live, 1120),
+                DeliveryStep::Blocked {
+                    reason: FailureReason::AgentNotReadyTimeout
+                }
+            );
+        }
+    }
+
     #[test]
     fn agent_non_ready_time_survives_status_and_metadata_changes() {
         let mut h = History::new(false);
@@ -1122,30 +1193,36 @@ mod tests {
             let before = state.agent(&id).map(|agent| agent.status);
             state.apply(index as u64 + 1, *ts, event).unwrap();
             if let Some(agent) = state.agent(&id) {
-                if agent.status == AgentStatus::Ready {
-                    since = None;
-                } else if before.is_none_or(|status| status == AgentStatus::Ready) {
-                    since = Some(*ts);
+                track_agent_not_ready(&mut since, before, agent.status, *ts);
+                if *ts == time(10) || *ts == time(20) {
+                    assert_eq!(since, Some(time(0))); // Clearing -> Starting and outage retain it.
                 }
             }
         }
         let agent = state.agent(&id).unwrap();
         assert_eq!(agent.updated_at, time(90));
-        assert_eq!(since, Some(time(0)));
+        assert_eq!(since, Some(time(30))); // Stuck -> Starting opens a new window.
         let mut live = ready();
         live.agent_status = agent.status;
         live.agent_not_ready_since = since;
         // Recent message holds and metadata do not buy a new agent window.
-        live.hold_since = Some(time(119));
+        live.hold_since = Some(time(149));
         assert_eq!(
-            h.step(&live, 120),
+            h.step(&live, 150),
             DeliveryStep::Blocked {
                 reason: FailureReason::AgentNotReadyTimeout
             }
         );
+        track_agent_not_ready(
+            &mut live.agent_not_ready_since,
+            Some(live.agent_status),
+            AgentStatus::Clearing,
+            time(151),
+        );
         live.agent_status = AgentStatus::Clearing;
+        assert_eq!(live.agent_not_ready_since, Some(time(30)));
         assert_eq!(
-            h.step(&live, 121),
+            h.step(&live, 151),
             DeliveryStep::Blocked {
                 reason: FailureReason::AgentNotReadyTimeout
             }
@@ -2653,7 +2730,7 @@ mod tests {
                     5..25 => PaneLiveness::Unknown,
                     _ => PaneLiveness::Alive,
                 };
-                let was_ready = live.agent_status == AgentStatus::Ready;
+                let previous_agent_status = live.agent_status;
                 live.agent_status = match agent {
                     0..10 => AgentStatus::Starting,
                     10..20 => AgentStatus::Clearing,
@@ -2661,11 +2738,7 @@ mod tests {
                     30..40 => AgentStatus::Down,
                     _ => AgentStatus::Ready,
                 };
-                if live.agent_status == AgentStatus::Ready {
-                    live.agent_not_ready_since = None;
-                } else if was_ready {
-                    live.agent_not_ready_since = Some(time(now));
-                }
+                track_agent_not_ready(&mut live.agent_not_ready_since, Some(previous_agent_status), live.agent_status, time(now));
                 live.other_delivery_in_flight = other < 30;
                 if other < 10 { live.last_paste_at = Some(time(now)); }
                 live.send_now = send < 100;

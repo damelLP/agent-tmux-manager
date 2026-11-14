@@ -374,6 +374,40 @@ fn claude_effort_footer_keeps_facts_at_clipped_token_widths() {
 }
 
 #[test]
+fn claude_deleted_text_hint_keeps_clear_facts_at_clipped_widths() {
+    let mut rig = StandInRig::start();
+    for rows in [19, 24, 30, 40] {
+        for columns in (71..=97).chain([100, 120]) {
+            let mut config = StandInConfig::new(StandInMode::Claude);
+            config.manual_clock = true;
+            config.screen_variant = "poor".into();
+            config.columns = columns;
+            config.rows = rows;
+            let pane = rig.launch(&config);
+            let after = rig.event_cursor(&pane);
+            rig.paste(&pane, "/clear");
+            rendered(&rig, &pane, after, "clearing");
+            let after = rig.event_cursor(&pane);
+            rig.control(
+                &pane,
+                serde_json::json!({"command":"advance_to", "now_ms":100}),
+            );
+            rendered(&rig, &pane, after, "clear-complete");
+            assert_eq!(
+                observe(StandInMode::Claude, &rig.capture_plain(&pane)),
+                expected("claude.clear-complete.poor"),
+                "poor clear-complete at {columns}x{rows}"
+            );
+            assert!(rig
+                .tmux(&["kill-window", "-t", &pane.pane_id])
+                .status
+                .success());
+        }
+    }
+    rig.close();
+}
+
+#[test]
 fn value_only_variants_keep_lifecycle_facts_without_pinning_literals() {
     let mut rig = StandInRig::start();
     for (mode, version, model) in [

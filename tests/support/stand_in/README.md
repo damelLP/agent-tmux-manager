@@ -349,7 +349,8 @@ P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
 Uncaptured combinations are explicitly synthetic: redundant blank padding is
 removed before old transcript, preserving editor blanks and history separators.
 Pi rules reflow to equal widths and aligned usage/model and Codex shortcut/warning
-footers retain complete tokens. Codex fresh panes below 25 rows use P1's compact
+footers retain complete tokens. Claude's standalone effort and `Ctrl+Y to paste
+deleted text` lines are dropped whole if they would be clipped. Codex fresh panes below 25 rows use P1's compact
 100x24 header/editor/footer capture (a18), not the tall logo, which needs 25 rows.
 This is a source splice from P1's gpt-5.4 session into the U5 lifecycle; resizing
 that capture to other compact sizes is Synthetic. The adapter contract pins

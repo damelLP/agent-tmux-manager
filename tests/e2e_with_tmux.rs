@@ -1700,18 +1700,46 @@ async fn scenario_atm_spawn_defaults_to_tmux_pane(env: &E2eEnv, probe_pane: &str
         "precondition: the old fallback must pick another pane, or 4b proves nothing"
     );
 
-    let out = command_output(
-        Command::new(&env.atm_path)
-            .args(["spawn", "--direction", "below", "--size", "1"])
-            .env("PATH", env._shim_dir_guard.path())
-            .env("TMUX", "atm-e2e-fixture-no-real-tmux-here")
-            .env("TMUX_PANE", probe_pane)
-            .env("ATM_TMUX_SOCKET", env.tmux_server.label())
-            // A command that ends at once: the split is what 4b checks.
-            .env("ATM_SPAWN_BIN", "true")
-            .env("ATM_SOCKET", &env.daemon.socket_path)
-            .env("XDG_STATE_HOME", &env.daemon.state_dir),
+    let config_home = env.daemon.state_dir.join("config");
+    let mut spawn = Command::new(&env.atm_path);
+    spawn
+        .args(["spawn", "--direction", "below", "--size", "1"])
+        .env("PATH", env._shim_dir_guard.path())
+        .env("TMUX", "atm-e2e-fixture-no-real-tmux-here")
+        .env("TMUX_PANE", probe_pane)
+        .env("ATM_TMUX_SOCKET", env.tmux_server.label())
+        // A command that ends at once: the split is what 4b checks.
+        .env("ATM_SPAWN_BIN", "true")
+        .env("ATM_SOCKET", &env.daemon.socket_path)
+        .env("XDG_STATE_HOME", &env.daemon.state_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env_remove("ATM_SPAWN_ARGS")
+        .env_remove("ATM_SPAWN_CLAUDE_BIN")
+        .env_remove("ATM_SPAWN_CLAUDE_ARGS");
+    // Check the launch boundary before executing: missing removals would let
+    // inherited per-harness overrides supersede the harmless generic binary.
+    let command_env = |key: &str| {
+        spawn
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value)
+    };
+    assert_eq!(
+        command_env("XDG_CONFIG_HOME"),
+        Some(Some(config_home.as_os_str()))
     );
+    assert_eq!(
+        command_env("ATM_SPAWN_BIN"),
+        Some(Some(std::ffi::OsStr::new("true")))
+    );
+    for key in [
+        "ATM_SPAWN_ARGS",
+        "ATM_SPAWN_CLAUDE_BIN",
+        "ATM_SPAWN_CLAUDE_ARGS",
+    ] {
+        assert_eq!(command_env(key), Some(None), "must remove {key}");
+    }
+    let out = command_output(&mut spawn);
     assert!(
         out.status.success(),
         "atm spawn (4b) exited with {:?}\nstdout: {}\nstderr: {}\npanes before: {before:?}",

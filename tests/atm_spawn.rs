@@ -74,7 +74,8 @@ fn rig() -> Rig {
     )
     .unwrap();
     std::fs::set_permissions(&forbidden, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let daemon = control_support::Daemon::start(dir.path(), &path);
+    let daemon =
+        control_support::Daemon::start(dir.path(), &path, Path::new(env!("CARGO_BIN_EXE_atmd")));
     std::fs::write(dir.path().join("tmux.log"), "").unwrap();
     Rig {
         _daemon: daemon,

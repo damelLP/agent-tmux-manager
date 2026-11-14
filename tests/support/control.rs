@@ -75,10 +75,9 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn start(dir: &Path, path: &Path) -> Self {
+    pub fn start(dir: &Path, path: &Path, binary: &Path) -> Self {
         let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
-        let mut command =
-            Command::new(option_env!("CARGO_BIN_EXE_atmd").expect("root test binary"));
+        let mut command = Command::new(binary);
         isolated(&mut command, dir)
             .env("PATH", path)
             .args(["start"])

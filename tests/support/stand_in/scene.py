@@ -73,7 +73,7 @@ def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, se
         variant = f"p1-{columns}"
     if mode == "codex" and draft == "/new" and frame not in MODALS:
         frame, draft = "clear-menu", ""
-    elif draft and frame in ("fresh", "clear-complete"):
+    elif mode != "pi" and draft and frame in ("fresh", "clear-complete"):
         drafts = [s for s in catalog if s["mode"] == mode and s["state"] == "draft"
                   and (s["columns"], s["rows"]) == (columns, rows)]
         if drafts:

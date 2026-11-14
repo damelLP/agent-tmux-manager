@@ -69,6 +69,17 @@ class SceneTests(unittest.TestCase):
         active = [line for line in result.lines if line.startswith("❯")][-1]
         self.assertEqual(active, "❯\u00a0")
 
+    def test_pi_draft_keeps_current_session_history_and_footer(self):
+        for frame in ["fresh", "clear-complete", "idle"]:
+            original = render("pi", frame)
+            drafted = render("pi", frame, "my draft")
+            start, end, _ = scene.editor_slot(list(original.lines), "pi")
+            self.assertEqual(drafted.source, original.source)
+            self.assertEqual(drafted.lines[:start], original.lines[:start])
+            self.assertEqual(drafted.lines[start:end], ("my draft",))
+            self.assertEqual(drafted.lines[end:], original.lines[end:])
+            self.assertEqual(render("pi", frame).lines, original.lines)
+
     def test_real_draft_value_replays_captured_styling(self):
         for mode, variant in [("claude", "rich-enabled"), ("codex", "rich")]:
             result = render(mode, "fresh", "baseline draft 123", variant, 100, 30)

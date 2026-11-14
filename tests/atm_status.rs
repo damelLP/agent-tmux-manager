@@ -210,8 +210,9 @@ async fn status_unavailable_or_bad_result_preserves_session_summary() {
 }
 #[tokio::test]
 async fn status_does_not_render_owner_bodies() {
+    // A valid entry must reach the aggregate guard, not fail decoding first.
     status(
-        json!({"result":{"messages":[{"body":"SECRET"}],"unread_count":1,"next_after":null}}),
+        json!({"result":{"messages":[{"message_id":"m3","content":{"from":"p/lead","to":"owner","kind":"report","body":"SECRET","attachments":[],"task":null},"sent_at":"2026-11-14T00:00:00Z","status":"delivered","read_at":null,"delivery":{"phase":"delivered","reason":null,"attempt":1,"pane":"%7","session_id":null,"confirmation":null,"retry_at":null,"blocked_by":null}}],"unread_count":1,"next_after":null}}),
         true,
         "2↑ 1! $3.50 ? unread\n",
         Some("unread count unavailable"),

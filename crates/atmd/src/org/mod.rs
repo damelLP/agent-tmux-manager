@@ -13,11 +13,6 @@
 
 mod actor;
 mod agent_methods;
-// The project lane is implemented separately from next slice's service wiring.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired by the reconciliation slice")
-)]
 mod agent_project;
 mod agent_types;
 pub mod agents;

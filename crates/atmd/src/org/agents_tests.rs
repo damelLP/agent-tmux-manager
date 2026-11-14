@@ -2,6 +2,921 @@ use super::agents::*;
 use crate::server::methods::{router, CallContext, CallerId, MethodServices};
 use serde_json::{json, Value};
 
+mod reconciliation {
+    use super::*;
+    use crate::{
+        control::{
+            reservation::{
+                testing::ScriptedTmuxClient, CaptureFormat, PaneCapture, PaneId, PaneInspection,
+            },
+            service::spawn_control_with_org,
+        },
+        registry::{RegistryActor, RegistryHandle},
+    };
+    use atm_core::{AgentType, Harness, Model, SessionDomain, SessionId};
+    use atm_org::OrgCommand;
+    use tokio::sync::{broadcast, mpsc, watch};
+    use tokio_util::sync::CancellationToken;
+
+    const IDLE: &str =
+        include_str!("../../../atm-pi-adapter/tests/fixtures/screen_pi-after-clear_1.5.0.txt");
+    struct Rig {
+        org: super::super::OrgHandle,
+        registry: RegistryHandle,
+        events: broadcast::Sender<crate::registry::SessionEvent>,
+        client: ScriptedTmuxClient,
+        control: crate::control::service::ControlHandle,
+        cancel: CancellationToken,
+    }
+    impl Rig {
+        async fn new() -> Self {
+            Self::gated(None).await
+        }
+        async fn gated(
+            gate: Option<(&'static str, mpsc::Sender<tokio::sync::oneshot::Sender<()>>)>,
+        ) -> Self {
+            let cancel = CancellationToken::new();
+            let (requests, receive) = mpsc::channel(64);
+            let (health, status) = watch::channel(Ok(0));
+            let (committed, _) = broadcast::channel(1024);
+            tokio::spawn(super::super::actor::run(
+                Default::default(),
+                receive,
+                health,
+                committed.clone(),
+                cancel.clone(),
+                {
+                    let mut seq = 0;
+                    move |envelope: crate::eventlog::Envelope| {
+                        seq += 1;
+                        let gate = gate.clone();
+                        async move {
+                            if let Some((kind, gate)) = gate {
+                                if envelope.kind == kind {
+                                    let (release, released) = tokio::sync::oneshot::channel();
+                                    gate.send(release).await.unwrap();
+                                    released.await.unwrap();
+                                }
+                            }
+                            Ok(seq)
+                        }
+                    }
+                },
+            ));
+            let org = super::super::OrgHandle {
+                requests,
+                health: status,
+                committed,
+                reads: None,
+            };
+            let (send, receive) = mpsc::channel(100);
+            let (events, _) = broadcast::channel(2048);
+            let actor = RegistryActor::new(receive, events.clone());
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! { _ = token.cancelled() => {}, _ = actor.run() => {} }
+            });
+            let registry = RegistryHandle::new(send, events.clone());
+            let client = ScriptedTmuxClient::new();
+            let (control, _) = spawn_control_with_org(
+                Box::new(client.clone()),
+                registry.clone(),
+                org.clone(),
+                cancel.clone(),
+            );
+            org.execute(
+                OrgCommand::RegisterProject {
+                    project_id: "p".parse().unwrap(),
+                    root: "/private/project".into(),
+                    move_root: false,
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            Self {
+                org,
+                registry,
+                events,
+                client,
+                control,
+                cancel,
+            }
+        }
+        async fn command(&self, command: OrgCommand) {
+            self.org.execute(command, chrono::Utc::now()).await.unwrap();
+        }
+        async fn agent(&self, name: &str, pane: Option<&str>, session: Option<&str>) {
+            let id = format!("p/{name}").parse().unwrap();
+            self.command(OrgCommand::Up {
+                agent_id: id,
+                role: atm_org::parse_role(name, "+++\nharness='pi'\n+++\n").unwrap(),
+            })
+            .await;
+            if let Some(pane) = pane {
+                self.command(OrgCommand::PaneCreated {
+                    agent_id: format!("p/{name}").parse().unwrap(),
+                    pane: pane.into(),
+                })
+                .await;
+                if let Some(session) = session {
+                    self.command(OrgCommand::SessionBound {
+                        agent_id: format!("p/{name}").parse().unwrap(),
+                        session_id: SessionId::new(session),
+                    })
+                    .await;
+                } else {
+                    self.command(OrgCommand::EditorReady {
+                        agent_id: format!("p/{name}").parse().unwrap(),
+                    })
+                    .await;
+                }
+            }
+        }
+        async fn row(&self, id: &str, pane: &str, child: bool) {
+            let mut row = SessionDomain::new(
+                SessionId::new(id),
+                AgentType::GeneralPurpose,
+                Model::default(),
+            );
+            row.harness = Harness::Pi;
+            row.tmux_pane = Some(pane.into());
+            if child {
+                row.parent_session_id = Some(SessionId::new("parent"));
+            }
+            self.registry.register(row).await.unwrap();
+        }
+        fn inspection(pane: &str, tag: &str, dead: bool) -> PaneInspection {
+            PaneInspection::new(
+                atm_tmux::PaneInfo {
+                    pane_id: pane.into(),
+                    session_name: "private".into(),
+                    window_index: 0,
+                    pane_pid: 100,
+                    width: 120,
+                    height: IDLE.lines().count() as u16,
+                    is_active: true,
+                },
+                Some(tag.into()),
+                dead,
+                false,
+                Some(true),
+                0,
+                0,
+            )
+        }
+        fn frame(&self, pane: &str, tag: &str, text: &str) {
+            let mut inspection = Self::inspection(pane, tag, false);
+            inspection.pane.height = text.lines().count() as u16;
+            self.client
+                .script_inspect(&PaneId::parse(pane).unwrap(), Some(&inspection))
+                .unwrap();
+            self.client
+                .script_capture(&PaneCapture::new(
+                    text.into(),
+                    inspection,
+                    CaptureFormat::Plain,
+                ))
+                .unwrap();
+        }
+        fn start(&self) -> (AgentHandle, tokio::task::JoinHandle<()>) {
+            spawn_agents(
+                self.org.clone(),
+                self.registry.clone(),
+                self.control.clone(),
+                self.cancel.child_token(),
+            )
+        }
+        async fn state(&self, name: &str) -> atm_org::Agent {
+            self.org
+                .snapshot()
+                .await
+                .unwrap()
+                .agent(&format!("p/{name}").parse().unwrap())
+                .unwrap()
+                .clone()
+        }
+    }
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_wires_agents_without_waiting_for_initial_reconciliation() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.client
+            .script_inspect(&PaneId::parse("%1").unwrap(), None)
+            .unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = rig.control.clone();
+        let delivery = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    request(
+                        "p/lead",
+                        Some("%1"),
+                        crate::control::reservation::ReservationKind::Delivery,
+                    ),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok(())
+                    },
+                    cleanup,
+                )
+                .await
+                .unwrap();
+        });
+        entry.await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agents.sock");
+        let cancel = CancellationToken::new();
+        let mut services = MethodServices::new(rig.registry.clone());
+        services.org = rig.org.clone();
+        services.control = Some(rig.control.clone());
+        let server = crate::server::DaemonServer::with_services(&socket, services, cancel.clone());
+        let mut run = Box::pin(async move { server.run().await });
+        poll_fn(|cx| {
+            assert!(run.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let task = tokio::spawn(run);
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        write.write_all(b"{\"protocol_version\":{\"major\":1,\"minor\":0},\"type\":\"connect\",\"client_id\":\"agents-test\"}\n").await.unwrap();
+        let mut line = String::new();
+        read.read_line(&mut line).await.unwrap();
+        write.write_all(b"{\"protocol_version\":{\"major\":1,\"minor\":1},\"type\":\"request\",\"id\":\"list\",\"method\":\"agent.list\",\"params\":{}}\n{\"protocol_version\":{\"major\":1,\"minor\":0},\"type\":\"ping\",\"seq\":1}\n").await.unwrap();
+        line.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["type"],
+            "pong"
+        );
+        release.send(()).unwrap();
+        delivery.await.unwrap();
+        line.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let result: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(result["result"][0]["state"], "down", "{result}");
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_list_waits_for_initial_inspection_and_preserves_pending_binding() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        let rows = agents.list(ListParams::default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, AgentStatus::Ready);
+        assert_eq!(rows[0].session_id, Some(SessionId::new("recorded")));
+        assert!(rows[0].activity.is_none());
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_or_missing_row_stays_starting_without_erasing_binding() {
+        for (row, text) in [(true, "unknown\n"), (false, IDLE)] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("recorded")).await;
+            if row {
+                rig.row("recorded", "%1", false).await;
+            }
+            rig.frame("%1", "p/lead", text);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let agent = rig.state("lead").await;
+            assert_eq!(agent.status, AgentStatus::Starting);
+            assert_eq!(agent.session_id, Some(SessionId::new("recorded")));
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_dead_and_reused_panes_are_down_without_input() {
+        let rig = Rig::new().await;
+        for (name, pane) in [("absent", "%1"), ("dead", "%2"), ("reused", "%3")] {
+            rig.agent(name, Some(pane), None).await;
+        }
+        rig.agent("nopane", None, None).await;
+        rig.client
+            .script_inspect(&PaneId::parse("%1").unwrap(), None)
+            .unwrap();
+        rig.client
+            .script_inspect(
+                &PaneId::parse("%2").unwrap(),
+                Some(&Rig::inspection("%2", "p/dead", true)),
+            )
+            .unwrap();
+        rig.client
+            .script_inspect(
+                &PaneId::parse("%3").unwrap(),
+                Some(&Rig::inspection("%3", "foreign/agent", false)),
+            )
+            .unwrap();
+        let (agents, _) = rig.start();
+        let rows = agents.list(ListParams::default()).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.agent_id.to_string())
+                .collect::<Vec<_>>(),
+            ["p/absent", "p/dead", "p/nopane", "p/reused"]
+        );
+        assert!(rows.iter().all(|r| r.state == AgentStatus::Down));
+        assert!(rig
+            .client
+            .mock()
+            .calls()
+            .iter()
+            .all(|call| matches!(call, atm_tmux::mock::MockCall::RawCommand { .. })));
+    }
+
+    #[tokio::test]
+    async fn clearing_excludes_old_child_and_pending_rows() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        for (id, child) in [("old", false), ("child", true), ("pending-100", false)] {
+            rig.row(id, "%1", child).await;
+        }
+        rig.client
+            .script_inspect(
+                &PaneId::parse("%1").unwrap(),
+                Some(&Rig::inspection("%1", "p/lead", false)),
+            )
+            .unwrap();
+        let (agents, _) = rig.start();
+        let rows = agents.list(ListParams::default()).await.unwrap();
+        assert_eq!(rows[0].state, AgentStatus::Clearing);
+        assert!(rows[0].session_id.is_none());
+        assert!(rows[0].activity.is_none());
+        assert_eq!(
+            rig.state("lead").await.excluded_session_id,
+            Some(SessionId::new("old"))
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_restart_recovers_on_event_and_new_real_row_binds() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", "unknown\n");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        let mut events = rig.org.committed.subscribe();
+        rig.frame("%1", "p/lead", IDLE);
+        rig.row("new-real", "%1", false).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if events.recv().await.unwrap().kind == "agent.session_bound" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("new-real"))
+        );
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_append_unknown_quarantines_before_release() {
+        use crate::control::reservation::{ReservationError, ReservationKind};
+        let (gate, mut entered) = mpsc::channel(1);
+        let rig = Rig::gated(Some(("agent.editor_ready", gate))).await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        let _held = entered.recv().await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(7)).await;
+        let result = rig
+            .control
+            .run_reserved(
+                request("p/lead", Some("%1"), ReservationKind::Observe),
+                |_| async { Ok::<_, AgentError>(()) },
+                cleanup,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AgentError::Reservation(
+                ReservationError::Quarantined { .. }
+            ))
+        ));
+        assert!(matches!(
+            agents.reconciled().await,
+            Err(AgentError::Unavailable(_))
+        ));
+        rig.control
+            .run_reserved(
+                request("p/other", None, ReservationKind::Observe),
+                |_| async { Ok::<_, AgentError>(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_reply_lost_cleanup_sees_committed_clear() {
+        use crate::control::reservation::ReservationKind;
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let (gate, mut entered) = mpsc::channel(1);
+        let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("recorded", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let org = rig.org.clone();
+        let cleanup_org = org.clone();
+        let (read, reading) = tokio::sync::oneshot::channel();
+        let job = tokio::spawn(async move {
+            agents
+                .lifecycle(
+                    request("p/lead", Some("%1"), ReservationKind::Clear),
+                    move |_| async move {
+                        let mut execute = Box::pin(org.execute(
+                            OrgCommand::Clear {
+                                agent_id: "p/lead".parse().unwrap(),
+                            },
+                            chrono::Utc::now(),
+                        ));
+                        poll_fn(|cx| {
+                            assert!(execute.as_mut().poll(cx).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
+                        drop(execute);
+                        Err::<(), _>(AgentError::Refused("lost reply".into()))
+                    },
+                    move |_, _| async move {
+                        let mut snapshot = Box::pin(cleanup_org.snapshot());
+                        poll_fn(|cx| {
+                            assert!(snapshot.as_mut().poll(cx).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
+                        read.send(()).unwrap();
+                        let state = snapshot.await?;
+                        assert_eq!(
+                            state.agent(&"p/lead".parse().unwrap()).unwrap().status,
+                            AgentStatus::Clearing
+                        );
+                        cleanup_org
+                            .execute(
+                                OrgCommand::Stuck {
+                                    agent_id: "p/lead".parse().unwrap(),
+                                    reason: "clear outcome was not acknowledged".into(),
+                                },
+                                chrono::Utc::now(),
+                            )
+                            .await?;
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        let release = entered.recv().await.unwrap();
+        reading.await.unwrap();
+        release.send(()).unwrap();
+        assert!(matches!(job.await.unwrap(), Err(AgentError::Refused(_))));
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+        rig.control
+            .run_reserved(
+                request("p/lead", Some("%1"), ReservationKind::Observe),
+                |_| async { Ok::<_, AgentError>(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observer_flood_has_one_waiter_and_other_agent_completes() {
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("lead-row")).await;
+        rig.agent("other", Some("%2"), Some("other-row")).await;
+        rig.row("lead-row", "%1", false).await;
+        rig.row("other-row", "%2", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        rig.frame("%2", "p/other", "unknown\n");
+        let cancel = CancellationToken::new();
+        let (agents, task) = spawn_agents(
+            rig.org.clone(),
+            rig.registry.clone(),
+            rig.control.clone(),
+            cancel.clone(),
+        );
+        agents.reconciled().await.unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = rig.control.clone();
+        let delivery = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Delivery),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok(())
+                    },
+                    cleanup,
+                )
+                .await
+                .unwrap();
+        });
+        entry.await.unwrap();
+        rig.frame("%1", "p/lead", IDLE);
+        rig.frame("%2", "p/other", IDLE);
+        let row = rig
+            .registry
+            .get_session(SessionId::new("lead-row"))
+            .await
+            .unwrap();
+        let mut committed = rig.org.committed.subscribe();
+        for _ in 0..80 {
+            rig.events
+                .send(crate::registry::SessionEvent::Updated {
+                    session: Box::new(row.clone()),
+                })
+                .unwrap();
+        }
+        let row = rig
+            .registry
+            .get_session(SessionId::new("other-row"))
+            .await
+            .unwrap();
+        rig.events
+            .send(crate::registry::SessionEvent::Updated {
+                session: Box::new(row),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = committed.recv().await.unwrap();
+                if event.kind == "agent.editor_ready" && event.body["agent_id"] == "p/other" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // The FIFO event receiver consumed the entire flood before this other
+        // agent's ready report; the held delivery is still unreleased.
+        cancel.cancel();
+        release.send(()).unwrap();
+        delivery.await.unwrap();
+        task.await.unwrap();
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+        assert_eq!(rig.state("other").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn interrupted_start_without_binding_is_not_idle_revalidation() {
+        let rig = Rig::new().await;
+        rig.command(OrgCommand::Up {
+            agent_id: "p/lead".parse().unwrap(),
+            role: atm_org::parse_role("lead", "+++\nharness='pi'\n+++\n").unwrap(),
+        })
+        .await;
+        rig.command(OrgCommand::PaneCreated {
+            agent_id: "p/lead".parse().unwrap(),
+            pane: "%1".into(),
+        })
+        .await;
+        rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        assert!(rig.state("lead").await.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_harness_is_not_liveness_or_list_activity() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        let mut row = SessionDomain::new(
+            SessionId::new("recorded"),
+            AgentType::GeneralPurpose,
+            Model::default(),
+        );
+        row.harness = Harness::ClaudeCode;
+        row.tmux_pane = Some("%1".into());
+        rig.registry.register(row).await.unwrap();
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        let rows = agents.list(ListParams::default()).await.unwrap();
+        assert_eq!(rows[0].state, AgentStatus::Starting);
+        assert!(rows[0].activity.is_none());
+        assert_eq!(rows[0].harness.as_deref(), Some("pi"));
+    }
+
+    #[tokio::test]
+    async fn registry_failure_is_unavailable_not_all_down() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        let (send, receive) = mpsc::channel(1);
+        drop(receive);
+        let (events, _) = broadcast::channel(1);
+        let dead = RegistryHandle::new(send, events);
+        let (agents, task) = spawn_agents(
+            rig.org.clone(),
+            dead,
+            rig.control.clone(),
+            rig.cancel.child_token(),
+        );
+        assert!(matches!(
+            agents.reconciled().await,
+            Err(AgentError::Unavailable(_))
+        ));
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert!(rig.client.mock().calls().is_empty());
+        rig.cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_is_sorted_read_only_uses_committed_cost_and_does_not_create_filter() {
+        let rig = Rig::new().await;
+        rig.agent("z", None, None).await;
+        rig.agent("a", None, None).await;
+        for (id, amount) in [("one", 4), ("one", 7), ("two", 2)] {
+            rig.command(OrgCommand::RecordSummary(atm_org::SessionSummary {
+                session_id: SessionId::new(id),
+                pane: None,
+                agent_id: Some("p/a".parse().unwrap()),
+                harness: Harness::Pi,
+                model: Some("summary-model".into()),
+                cost: Some(atm_core::Money::from_microdollars(amount)),
+                first_prompt: None,
+                started: chrono::Utc::now(),
+                ended: None,
+            }))
+            .await;
+        }
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let cursor = rig.org.status().unwrap();
+        let rows = agents.list(ListParams::default()).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.agent_id.to_string())
+                .collect::<Vec<_>>(),
+            ["p/a", "p/z"]
+        );
+        assert_eq!(rows[0].cost_usd, Some(0.000009));
+        assert_eq!(rows[0].model.as_deref(), Some("summary-model"));
+        assert_eq!(rig.org.status().unwrap(), cursor);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(agents
+            .list(ListParams {
+                project_root: Some(dir.path().into())
+            })
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!dir.path().join(".atm").exists());
+        assert_eq!(rig.org.status().unwrap(), cursor);
+    }
+
+    #[tokio::test]
+    async fn up_prepares_config_but_no_lifecycle_effects_until_flow_exists() {
+        let rig = Rig::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".atm/roles")).unwrap();
+        std::fs::write(
+            dir.path().join(".atm/roles/lead.md"),
+            "+++\nharness='pi'\n+++\n",
+        )
+        .unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let result = agents
+            .up(
+                UpParams {
+                    project_root: dir.path().into(),
+                    name: "lead".into(),
+                },
+                caller(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AgentError::NotImplemented {
+                operation: "agent.up"
+            })
+        ));
+        assert!(dir.path().join(".atm/project.toml").is_file());
+        assert!(rig.org.snapshot().await.unwrap().agents().next().is_none());
+        assert!(rig.client.mock().calls().is_empty());
+    }
+
+    fn request(
+        id: &str,
+        pane: Option<&str>,
+        kind: crate::control::reservation::ReservationKind,
+    ) -> crate::control::reservation::ReservationRequest {
+        crate::control::reservation::ReservationRequest::new(
+            id.parse().unwrap(),
+            pane.map(|p| PaneId::parse(p).unwrap()),
+            kind,
+            crate::control::reservation::WaitPolicy::Wait,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+    }
+    async fn cleanup(
+        _: crate::control::reservation::Reservation,
+        _: crate::control::reservation::Completion,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_clear_conflicts_and_slot_survives_disconnect_through_cleanup() {
+        use crate::control::reservation::ReservationKind;
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        let rig = Rig::new().await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = rig.control.clone();
+        let delivery = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Delivery),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok::<_, AgentError>(())
+                    },
+                    cleanup,
+                )
+                .await
+                .unwrap();
+        });
+        entry.await.unwrap();
+        let (worked, work) = tokio::sync::oneshot::channel();
+        let (cleaning, in_cleanup) = tokio::sync::oneshot::channel();
+        let (clean, cleaned) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(agents.lifecycle(
+            request("p/lead", Some("%1"), ReservationKind::Clear),
+            move |_| async move {
+                worked.send(()).unwrap();
+                Ok(())
+            },
+            move |_, _| async move {
+                cleaning.send(()).unwrap();
+                cleaned.await.unwrap();
+                Ok(())
+            },
+        ));
+        poll_fn(|cx| match caller.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(r) => panic!("must admit and park: {r:?}"),
+        })
+        .await;
+        // A later unrelated job acknowledges the FIFO dispatcher has seen the first.
+        agents
+            .lifecycle(
+                request("p/other", None, ReservationKind::Down),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            agents
+                .lifecycle(
+                    request("p/lead", Some("%1"), ReservationKind::Clear),
+                    |_| async { Ok(()) },
+                    cleanup
+                )
+                .await,
+            Err(AgentError::Conflict(_))
+        ));
+        drop(caller);
+        release.send(()).unwrap();
+        delivery.await.unwrap();
+        work.await.unwrap();
+        in_cleanup.await.unwrap();
+        assert!(matches!(
+            agents
+                .lifecycle(
+                    request("p/lead", Some("%1"), ReservationKind::Clear),
+                    |_| async { Ok(()) },
+                    cleanup
+                )
+                .await,
+            Err(AgentError::Conflict(_))
+        ));
+        clean.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn down_without_pane_serializes_with_up() {
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let handle = agents.clone();
+        let down = tokio::spawn(async move {
+            handle
+                .lifecycle(
+                    request("p/lead", None, ReservationKind::Down),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok(())
+                    },
+                    cleanup,
+                )
+                .await
+        });
+        entry.await.unwrap();
+        assert!(matches!(
+            agents
+                .lifecycle(
+                    request("p/lead", None, ReservationKind::Up),
+                    |_| async { Ok(()) },
+                    cleanup
+                )
+                .await,
+            Err(AgentError::Conflict(_))
+        ));
+        release.send(()).unwrap();
+        down.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_parents_do_not_restore_ready() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        rig.row("old", "%1", false).await;
+        rig.row("other", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+    }
+}
+
 mod agent_project {
     use super::super::{agent_project::AgentProjects, agents::AgentError, OrgHandle};
     use std::{
@@ -431,26 +1346,23 @@ async fn agent_contract_disabled_has_no_effects() {
         cancel.clone(),
     );
     let before = org.status().unwrap();
-    let (agents, task) = spawn_agents(org.clone(), registry, control, cancel.clone());
+    let agents = AgentHandle::disabled("off");
+    drop((registry, control));
     let mut services = MethodServices::new(crate::registry::spawn_registry());
     services.agents = Some(agents.clone());
     let router = router(services).unwrap();
     for (method, params) in requests() {
         let error = router.call(caller(), method, params).await.unwrap_err();
         assert_eq!(error.0.code, "unavailable");
-        assert_eq!(
-            error.0.message,
-            format!("agent operation '{method}' is not implemented")
-        );
+        assert_eq!(error.0.message, "agent service unavailable: off");
     }
     assert!(matches!(
         agents.reconciled().await,
-        Err(AgentError::NotImplemented { .. })
+        Err(AgentError::Unavailable(_))
     ));
     assert!(
         matches!(AgentHandle::disabled("off").reconciled().await, Err(AgentError::Unavailable(reason)) if reason == "off")
     );
-    task.await.unwrap();
     assert!(mock.calls().is_empty());
     assert_eq!(org.status().unwrap(), before);
     assert!(org.snapshot().await.unwrap().agents().next().is_none());

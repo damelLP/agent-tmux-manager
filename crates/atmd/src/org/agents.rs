@@ -151,6 +151,13 @@ impl AgentRuntime {
             .unwrap()
             .insert(agent, (pane.into(), baseline));
     }
+
+    /// Drop what was recorded about an agent's pane; it has left that pane.
+    pub(super) fn forget_baseline(&self, agent: &AgentId) {
+        if let Ok(mut baselines) = self.baselines.lock() {
+            baselines.remove(agent);
+        }
+    }
 }
 
 /// What a delivery needs to know about its recipient, read in one call.
@@ -235,6 +242,11 @@ impl AgentHandle {
     pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
         let rt = self.inner.runtime.as_ref().unwrap();
         rt.record_baseline(agent, pane, baseline);
+    }
+
+    #[cfg(test)]
+    pub(super) fn baseline_of(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
+        self.inner.runtime.as_ref().unwrap().baseline(agent, pane)
     }
 
     #[must_use]
@@ -429,8 +441,39 @@ impl AgentHandle {
         .await
     }
     pub async fn down(&self, p: DownParams) -> Result<DownResult, AgentError> {
-        self.checkpoint(p.agent, ReservationKind::Down, "agent.down", OBSERVE_BUDGET)
-            .await
+        const OPERATION: &str = "agent.down";
+        if !matches!(*self.inner.ready.borrow(), Some(Ok(()))) {
+            return Err(self.unavailable(OPERATION));
+        }
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let state = rt.org.snapshot().await?;
+        let agent = state
+            .agent(&p.agent)
+            .ok_or_else(|| AgentError::NotFound(format!("agent {} was not found", p.agent)))?;
+        let pane = agent.pane.as_ref().map(PaneId::parse).transpose()?;
+        let request = ReservationRequest::new(
+            p.agent.clone(),
+            pane.clone(),
+            ReservationKind::Down,
+            WaitPolicy::Wait,
+            Instant::now() + OBSERVE_BUDGET,
+        );
+        let effect = super::agent_lifecycle::Effect::default();
+        let (work, cleanup) = (rt.clone(), rt.clone());
+        let (id, changed) = (p.agent.clone(), effect.clone());
+        self.lifecycle(
+            request,
+            move |r| async move {
+                work.down(&r, &p.agent, pane.as_ref(), p.kill, &effect)
+                    .await
+            },
+            move |_, _| async move { cleanup.settle_down(&id, &changed).await },
+        )
+        .await
     }
     async fn checkpoint<T: Send + 'static>(
         &self,

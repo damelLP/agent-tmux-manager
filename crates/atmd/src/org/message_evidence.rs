@@ -16,6 +16,12 @@
 //! lost proof holds the messages that event could affect, until a new arm or
 //! the owner's retry, and leaves every other message alone.
 //!
+//! Two facts hold a message whatever else fails to match, and neither can
+//! confirm. An event of the attempted (bound) session holds its latest scope
+//! on whatever pane its hook reports. And an event whose prompt is a
+//! message's exact reference, when it confirms nothing, holds that message
+//! from any session, pane or harness: only the paste produces that text.
+//!
 //! Register/arm/observe share one short synchronous lock. Coalesced wakeups do
 //! not discard retained facts. No await or callback into the service on
 //! ingestion. Keep earlier attempt scopes for late receipts, including after
@@ -35,7 +41,7 @@
 //! each event keeps its own time and nothing is retained per session. History
 //! never calls evidence.
 //!
-//! Wakes are a `watch` counter: every consumer (A2's scheduler, B's confirmation
+//! Wakes are a `watch` counter, moved when a fact changes: every consumer (A2's scheduler, B's confirmation
 //! wait) holds its own receiver from `subscribe`, so none misses a change.
 
 use super::message_history::{HistoryUpdate, MessageHistoryHandle};
@@ -145,7 +151,8 @@ impl MessageEvidence {
         Ok(state)
     }
 
-    /// One wake per consumer for every change; see the module docs.
+    /// One wake per consumer for every changed fact (a latch, a receipt, an
+    /// arm, a disable), not for every event; see the module docs.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.wake.subscribe()
@@ -341,34 +348,41 @@ impl MessageEvidence {
         history: Option<&MessageHistoryHandle>,
     ) -> Result<(), MessageError> {
         let mut state = self.state()?;
-        if session.is_pending() {
-            return Ok(());
-        }
         let pane = pane.map(PaneId::parse).transpose()?;
         let at = self
             .clock
             .now()
             .map_err(|_| self.disable(&mut state, "message evidence clock unavailable"))?;
+        // A pending ID is no session: it is never bound and is no activity.
+        let pending = session.is_pending();
+        let mut changed = false;
         for entry in state.messages.values_mut() {
+            let before = (entry.probably_landed, entry.receipt.is_some());
+            let named = prompt == Some(entry.expected.as_str());
             let last_seq = entry.scopes.last().map(|s| s.identity.attempt_seq);
-            for scope in &mut entry.scopes {
+            for scope in entry.scopes.iter_mut().filter(|_| !pending) {
                 let identity = &scope.identity;
-                if harness.is_some_and(|h| h != identity.harness)
-                    || pane.as_ref().is_some_and(|p| p != &identity.pane)
-                    || identity.excluded_sessions.contains(session)
-                {
+                if harness.is_some_and(|h| h != identity.harness) {
                     continue;
                 }
+                let on_pane = pane.as_ref().is_none_or(|p| p == &identity.pane);
                 let latest = Some(identity.attempt_seq) == last_seq;
                 let bound = identity.session_id.as_ref().or(scope.lazy_session.as_ref());
-                // Whether this scope may bind or confirm from the event.
-                let mut trusted = proven;
+                // Whether this scope may bind or confirm from the event. A
+                // proof is about the pane the event names, never another one.
+                let mut trusted = proven && on_pane;
                 if let Some(bound) = bound {
+                    // The attempted session's own event counts whatever pane
+                    // its hook reports: a hook can name its forwarder's pane.
                     if bound != session {
                         continue;
                     }
                 } else {
-                    if pane.is_none() || harness.is_none() {
+                    if !on_pane
+                        || pane.is_none()
+                        || harness.is_none()
+                        || identity.excluded_sessions.contains(session)
+                    {
                         continue;
                     }
                     // Only the latest scope binds lazily. Once a newer attempt
@@ -379,22 +393,32 @@ impl MessageEvidence {
                         scope.lazy_session = Some(session.clone());
                     }
                 }
-                let exact = pane.is_some() && prompt == Some(entry.expected.as_str());
-                // An exact reference this scope cannot trust may be a lost late
-                // receipt, or the paste submitted by someone else: hold the
-                // message rather than lose the fact or confirm from it.
-                if latest || (exact && !trusted) {
+                if latest {
                     entry.probably_landed = true;
                 }
-                if trusted && exact && entry.receipt.is_none() {
+                if trusted && named && pane.is_some() && entry.receipt.is_none() {
                     entry.receipt = Some(DeliveryReceipt {
                         session_id: session.clone(),
                         confirmation: "prompt_submit_exact_reference".into(),
                     });
                 }
             }
+            // The text names the message, and nothing but its paste produces
+            // it. When no scope could confirm from it, it may be a lost late
+            // receipt or the paste submitted elsewhere: hold the message, from
+            // whatever session, pane or harness, rather than lose the fact.
+            // A message that was never attempted has no paste to have landed.
+            if named && entry.receipt.is_none() && !entry.scopes.is_empty() {
+                entry.probably_landed = true;
+            }
+            changed |= before != (entry.probably_landed, entry.receipt.is_some());
         }
-        self.wake();
+        if changed {
+            self.wake();
+        }
+        if pending {
+            return Ok(());
+        }
         if let Some(history) = history {
             let update = HistoryUpdate::Activity {
                 at,

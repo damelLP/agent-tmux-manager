@@ -776,18 +776,15 @@ where
             )
             .await;
         if tapped {
+            // An unparsable pane is an unknown pane. Without a pane no event
+            // can bind or confirm, so there is nothing to prove.
+            let pane = pane
+                .as_deref()
+                .filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
             let proven = applied.is_ok()
                 && !ends
-                && self
-                    .message_parent_proven(&session, pane.as_deref(), harness)
-                    .await;
-            self.record_message_event(
-                &session,
-                pane.as_deref(),
-                Some(harness),
-                Some(&event),
-                proven,
-            );
+                && self.message_parent_proven(&session, pane, harness).await;
+            self.record_message_event(&session, pane, Some(harness), Some(&event), proven);
         }
         applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
     }
@@ -838,9 +835,6 @@ where
         let Some(evidence) = &self.message_evidence else {
             return;
         };
-        // An unparsable pane is an unknown pane. Without a pane no event can
-        // bind or confirm, whatever its proof.
-        let pane = pane.filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
         let observed = evidence.tap(
             session,
             pane,
@@ -2203,16 +2197,31 @@ mod tests {
 
     #[tokio::test]
     async fn message_evidence_wrong_original_pane_does_not_borrow_row_pane() {
+        // The attempted session's hook names another pane than its row and its
+        // scope (%7). The tap never repairs the event from the row, so it
+        // cannot confirm; it is still that session's reference, so it holds.
         let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let other = arm_other_message(&evidence);
         let mut payload = captured_prompt(atm_core::Harness::Pi);
         payload["tmux_pane"] = serde_json::json!("%8");
         handler.handle_pi_event(payload).await.unwrap();
-        assert!(
-            !evidence
-                .snapshot("m123".parse().unwrap())
-                .unwrap()
-                .probably_landed
-        );
+        assert_held_without_receipt(&evidence);
+        // m200 is armed on %8 for another session: the pane alone is no claim.
+        assert_untouched(&evidence, other);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_attempted_session_activity_on_another_pane_holds() {
+        // Synthetic: the shape atm-codex-adapter's crate docs record for
+        // codex-cli 0.163.0 ("Known gaps"): a second TUI's hooks carry the
+        // pane of the TUI that started the shared daemon. The session runs in
+        // %7 and every hook of it says %8.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Codex).await;
+        let mut payload = captured_prompt(atm_core::Harness::Codex);
+        payload["tmux_pane"] = serde_json::json!("%8");
+        payload["prompt"] = serde_json::json!("an ordinary prompt");
+        handler.handle_codex_event(payload).await.unwrap();
+        assert_held_without_receipt(&evidence);
     }
 
     #[tokio::test]
@@ -2559,6 +2568,17 @@ mod tests {
         payload["tmux_pane"] = serde_json::json!("7");
         handler.handle_pi_event(payload).await.unwrap();
         assert_held_without_receipt(&evidence);
+
+        // It costs no registry snapshot either, like an event without a pane.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut row = evidence_row(&handler).await;
+        row.tmux_pane = Some("7".into());
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![row]));
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload["tmux_pane"] = serde_json::json!("7");
+        handler.handle_pi_event(payload).await.unwrap();
+        assert_held_without_receipt(&evidence);
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2580,6 +2600,7 @@ mod tests {
         payload["session_id"] = serde_json::json!("unrelated-session");
         payload["tmux_pane"] = serde_json::json!("%9");
         payload["pid"] = serde_json::json!(4_000_000_000_u32);
+        payload["payload"]["text"] = serde_json::json!("an unrelated prompt");
         assert!(matches!(
             handler.handle_pi_event(payload).await,
             Err(ConnectionError::RegistryError(_))
@@ -2594,7 +2615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_evidence_old_session_with_occupant_pid_credits_nothing() {
+    async fn message_evidence_old_session_with_occupant_pid_holds_but_never_confirms() {
         let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
         // The occupant's row, keyed by a pid no process has.
         let pid = 4_000_000_000_u32;
@@ -2620,8 +2641,9 @@ mod tests {
             evidence_row(&handler).await.first_prompt.as_deref(),
             Some("[m123] Read: atm inbox --id m123")
         );
-        // ...and the tap credited the occupant with nothing.
-        assert_untouched(&evidence, m123());
+        // ...and the tap credited the occupant with no receipt. The reference
+        // itself was submitted by someone, so its message is held.
+        assert_held_without_receipt(&evidence);
         handler
             .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
             .await
@@ -2635,6 +2657,103 @@ mod tests {
                 .as_str(),
             "evidence-session"
         );
+    }
+
+    /// A history that fails every write, so a forwarded Activity shows as the
+    /// evidence's disable. Any Activity that is not forwarded leaves it on.
+    fn with_failing_history(
+        handler: EvidenceHandler,
+        evidence: &crate::org::message_evidence::MessageEvidence,
+    ) -> EvidenceHandler {
+        handler.with_message_evidence(
+            Some(evidence.clone()),
+            Some(crate::org::message_history::MessageHistoryHandle::disabled(
+                "synthetic history loss",
+            )),
+        )
+    }
+
+    #[tokio::test]
+    async fn message_evidence_unproven_event_still_forwards_activity() {
+        // The receive fact is real whatever the proof says, and history can
+        // only delay a paste with it.
+        let (handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut handler = with_failing_history(handler, &evidence);
+        handler
+            .registry
+            .remove(SessionId::new("evidence-session"))
+            .await
+            .unwrap();
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert!(!evidence.available());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_status_line_and_pane_less_event_forward_activity() {
+        // A status line of a session no message knows: no harness, no pane.
+        let (handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let mut handler = with_failing_history(handler, &evidence);
+        let mut data: serde_json::Value = serde_json::from_str(
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_status_line_2.1.310.jsonl"
+            )
+            .lines()
+            .next()
+            .unwrap(),
+        )
+        .unwrap();
+        data["session_id"] = serde_json::json!("some-other-session");
+        handler.handle_status_update(data).await.unwrap();
+        assert!(!evidence.available());
+
+        // A lifecycle event without a pane.
+        let (handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut handler = with_failing_history(handler, &evidence);
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload.as_object_mut().unwrap().remove("tmux_pane");
+        handler.handle_pi_event(payload).await.unwrap();
+        assert!(!evidence.available());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_child_session_start_is_not_parent_activity() {
+        // Synthetic: the captured prompt's identity on a SubagentStart. It is
+        // a child lifecycle event of the bound parent, not parent activity.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let mut payload = captured_prompt(atm_core::Harness::ClaudeCode);
+        payload["hook_event_name"] = serde_json::json!("SubagentStart");
+        payload["agent_id"] = serde_json::json!("child-agent");
+        payload["agent_type"] = serde_json::json!("general-purpose");
+        handler.handle_hook_event(payload).await.unwrap();
+        assert_untouched(&evidence, m123());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_pending_row_on_the_pane_holds() {
+        // The rule, pinned: a discovered `pending-<pid>` row is an occupant of
+        // its pane like any other parent row, so the session beside it cannot
+        // be proven and its reference holds instead of confirming.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let pid = 4_000_000_001_u32;
+        handler
+            .registry
+            .register_discovered(
+                SessionId::pending_from_pid(pid),
+                pid,
+                "/".into(),
+                Some("%7".into()),
+                atm_core::Harness::Pi,
+            )
+            .await
+            .unwrap();
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
     }
 
     fn request_router() -> Arc<super::super::methods::MethodRouter> {

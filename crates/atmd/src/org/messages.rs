@@ -1,9 +1,21 @@
 //! Confirmed-message facade and the reviewed A/B/C runtime boundary.
 //!
-//! Only disabled handles and unavailable runtime operations exist at this stage.
-//! The clock and dependency assembly are real; neither starts work. All callers
-//! share one injected monotonic/base-UTC clock. A1 owns pure history, A2 the
-//! service/evidence/wiring, B one reserved attempt, and C the CLI/notifications.
+//! All callers share one injected monotonic/base-UTC clock. A1 owns pure
+//! history, A2 the service/evidence/wiring, B one reserved attempt, and C the
+//! CLI/notifications.
+//!
+//! # The service
+//!
+//! `spawn_messages` starts one fold loop over every committed organisation
+//! event. It is the only writer of `HistoryUpdate::Applied` and of the
+//! service's own committed projection, in sequence order, unknown kinds
+//! included; a gap or an event it cannot apply stops the service (typed
+//! unavailable) rather than skipping. Requests never run on that loop: they
+//! read the projection under a short lock and submit commands to the one
+//! organisation writer, so a stalled append blocks neither the fold nor an
+//! inbox read. A reply to a write waits until its committed sequence is folded.
+//! At most 64 requests are in flight; one more is refused, never parked.
+//! A caller that goes away does not cancel a command the writer accepted.
 //!
 //! # Policy-step ownership
 //!
@@ -33,26 +45,37 @@
 //! B waits for U8c focus/read-only observe and U8's single screen dispatch; this
 //! boundary neither adds vendor parsing nor implements a second input path.
 
-use super::message_history::{RecipientObservation, SessionObservation};
+use super::message_history::{HistoryUpdate, RecipientObservation, SessionObservation};
+use super::message_inbox::{caller_address, inbox, Progress};
 pub use super::message_methods::register_message_methods;
 pub use super::message_types::*;
 use super::{
-    message_evidence::MessageEvidence, message_history::MessageHistoryHandle, OrgHandle,
-    OrgServiceError,
+    message_delivery::inbox_reference, message_evidence::MessageEvidence,
+    message_history::MessageHistoryHandle, EventWatch, OrgHandle, OrgServiceError,
 };
 use crate::{
     control::{
         reservation::{PaneCapture, PaneId},
         service::ControlHandle,
     },
+    eventlog::Envelope,
     registry::RegistryHandle,
     server::methods::CallContext,
 };
 use atm_core::ScreenFacts;
-use atm_org::delivery::DeliveryPolicy;
+use atm_org::{delivery::DeliveryPolicy, OrgCommand, OrgEvent, OrgState};
 use chrono::{DateTime, TimeDelta, Utc};
-use std::sync::Arc;
-use tokio::{sync::Semaphore, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+use tokio::{
+    sync::{watch, Semaphore},
+    task::JoinHandle,
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
@@ -218,48 +241,403 @@ pub fn is_focus_notice(content: &MessageContent) -> bool {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Send, inbox and ack answer within 8 s, queue wait and organisation work
+/// included; the router allows 10 s (see `message_methods`).
+const ORDINARY_BUDGET: Duration = Duration::from_secs(8);
+/// Requests in flight. A full service refuses the next one; nothing is parked.
+const MAX_REQUESTS: usize = 64;
+/// Read-transition counts kept for acknowledgements that await their fold.
+const MAX_READ_COUNTS: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Startup {
+    Replaying,
+    Ready,
+    Failed(String),
+}
+
+/// The committed projection: every applied event, in order, exactly once.
+#[derive(Debug, Default)]
+struct View {
+    state: OrgState,
+    cursor: u64,
+    /// For each recent MessageRead event, how many messages it marked read.
+    /// Counted against the state just before that event, so a batch that
+    /// repeats already-read IDs counts only its transitions.
+    reads: BTreeMap<u64, usize>,
+}
+
+struct Service {
+    rt: MessageRuntime,
+    view: Mutex<View>,
+    startup: watch::Sender<Startup>,
+    requests: Semaphore,
+}
+
+/// Committed events in sequence order: the organisation's own watch, which
+/// replays from the log and fills gaps from disk.
+enum Events {
+    Watch(Box<EventWatch>),
+    /// Test-only: envelopes handed over in memory, with no log to replay.
+    #[cfg(test)]
+    Memory(tokio::sync::broadcast::Receiver<Arc<Envelope>>),
+}
+
+impl Events {
+    async fn next(&mut self) -> Result<Option<Arc<Envelope>>, OrgServiceError> {
+        match self {
+            Self::Watch(watch) => watch.next().await,
+            #[cfg(test)]
+            Self::Memory(live) => match live.recv().await {
+                Ok(envelope) => Ok(Some(envelope)),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => Ok(None),
+                Err(error) => Err(OrgServiceError::Unavailable(error.to_string())),
+            },
+        }
+    }
+}
+
+impl Service {
+    fn view(&self) -> Result<MutexGuard<'_, View>, MessageError> {
+        self.view
+            .lock()
+            .map_err(|_| MessageError::Unavailable("message projection lock poisoned".into()))
+    }
+
+    /// Replay complete, or the reason the service cannot be used.
+    async fn ready(&self) -> Result<(), MessageError> {
+        let mut startup = self.startup.subscribe();
+        let state = startup
+            .wait_for(|state| *state != Startup::Replaying)
+            .await
+            .map_err(|_| MessageError::Unavailable("message service stopped".into()))?;
+        match &*state {
+            Startup::Failed(reason) => Err(MessageError::Unavailable(reason.clone())),
+            _ => Ok(()),
+        }
+    }
+
+    /// One bounded request: admission without a waiter, then a deadline that
+    /// covers the startup wait and all organisation work. A timeout does not
+    /// roll back a command the writer already accepted.
+    async fn call<T>(
+        &self,
+        budget: Duration,
+        work: impl Future<Output = Result<T, MessageError>>,
+    ) -> Result<T, MessageError> {
+        let _admitted = self
+            .requests
+            .try_acquire()
+            .map_err(|_| MessageError::Unavailable("message service is busy".into()))?;
+        tokio::time::timeout(budget, async {
+            self.ready().await?;
+            work.await
+        })
+        .await
+        .map_err(|_| MessageError::Timeout)?
+    }
+
+    /// Submit to the one organisation writer, then wait until the fold loop
+    /// has accounted for what it committed, so the caller reads its own write.
+    async fn execute(&self, command: OrgCommand) -> Result<Vec<Envelope>, MessageError> {
+        let committed = self.rt.org.execute(command, self.rt.clock.now()?).await?;
+        if let Some(last) = committed.last() {
+            self.rt.history.folded(last.seq).await?;
+        }
+        Ok(committed)
+    }
+
+    /// Apply one committed envelope to the projection, then to history.
+    /// Sequences are contiguous: a duplicate is skipped, a gap is an error.
+    fn fold(&self, envelope: &Envelope) -> Result<(), MessageError> {
+        let failed = |what: &str, error: &dyn std::fmt::Display| {
+            MessageError::Internal(format!("{what} at sequence {}: {error}", envelope.seq))
+        };
+        let mut view = self.view()?;
+        if envelope.seq <= view.cursor {
+            return Ok(());
+        }
+        if view.cursor.checked_add(1) != Some(envelope.seq) {
+            return Err(failed("organisation event gap", &view.cursor));
+        }
+        let event = OrgEvent::from_parts(&envelope.kind, &envelope.body)
+            .map_err(|error| failed("unreadable organisation event", &error))?;
+        if let Some(event) = &event {
+            let marked = match event {
+                OrgEvent::MessageRead { message_ids } => Some(
+                    message_ids
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .filter(|id| view.state.message(id).is_some_and(|m| m.read_at.is_none()))
+                        .count(),
+                ),
+                _ => None,
+            };
+            view.state
+                .apply(envelope.seq, envelope.ts, event)
+                .map_err(|error| failed("inapplicable organisation event", &error))?;
+            if let Some(marked) = marked {
+                view.reads.insert(envelope.seq, marked);
+                if view.reads.len() > MAX_READ_COUNTS {
+                    view.reads.pop_first();
+                }
+            }
+        }
+        view.cursor = envelope.seq;
+        drop(view);
+        // The projection is ahead of history's cursor, never behind it: a
+        // caller woken by `folded(seq)` finds its write in the projection.
+        self.rt.history.record(
+            HistoryUpdate::Applied {
+                seq: envelope.seq,
+                at: envelope.ts,
+                event: event.clone(),
+            },
+            envelope.ts,
+        )?;
+        if let Some(OrgEvent::MessageSent(content)) = &event {
+            if *self.startup.borrow() == Startup::Ready {
+                self.expect(MessageId::new(envelope.seq), &content.to);
+            }
+        }
+        Ok(())
+    }
+
+    /// Evidence must know a message's reference before any decision about it:
+    /// an unknown ID is unavailable there, never "no receipt".
+    fn expect(&self, id: MessageId, to: &Address) {
+        if !matches!(to, Address::Agent(_)) {
+            return;
+        }
+        if let Err(error) = self.rt.evidence.register(id, inbox_reference(id)) {
+            tracing::warn!(%id, %error, "Message stays held: evidence cannot expect its reference");
+        }
+    }
+
+    /// The startup replay reached its fence: undelivered agent messages
+    /// become known to evidence, and requests are admitted.
+    fn replayed(&self) -> Result<(), MessageError> {
+        if *self.startup.borrow() != Startup::Replaying {
+            return Ok(());
+        }
+        let view = self.view()?;
+        for message in view.state.messages() {
+            if message.status != DeliveryStatus::Delivered {
+                self.expect(message.id, &message.content.to);
+            }
+        }
+        drop(view);
+        self.startup.send_replace(Startup::Ready);
+        Ok(())
+    }
+
+    async fn run(&self, mut events: Events, fence: u64) {
+        let stopped = async {
+            if fence == 0 {
+                self.replayed()?;
+            }
+            loop {
+                let Some(envelope) = events.next().await? else {
+                    return Err(MessageError::Unavailable(
+                        "organisation event stream closed".into(),
+                    ));
+                };
+                self.fold(&envelope)?;
+                if envelope.seq >= fence {
+                    self.replayed()?;
+                }
+            }
+        };
+        let reason = tokio::select! {
+            biased;
+            () = self.rt.cancel.cancelled() => "message service stopped".to_string(),
+            Err::<(), MessageError>(error) = stopped => {
+                tracing::error!(%error, "Message service stopped; restart to recover");
+                error.to_string()
+            }
+        };
+        self.startup.send_replace(Startup::Failed(reason));
+    }
+}
+
+/// Start the message service: one fold loop, and a handle that serves send,
+/// inbox and ack. `startup_high_water` is the committed cursor the runtime's
+/// history was built with; requests are admitted once the replay reaches it.
+/// Build the runtime once per daemon, after the organisation service is open.
+#[must_use]
+pub fn spawn_messages(
+    runtime: MessageRuntime,
+    startup_high_water: u64,
+) -> (MessageHandle, JoinHandle<()>) {
+    match runtime.org.watch(Vec::new(), 0) {
+        Ok(events) => spawn_service(runtime, Events::Watch(Box::new(events)), startup_high_water),
+        Err(error) => (
+            MessageHandle::disabled(error.to_string()),
+            tokio::spawn(async {}),
+        ),
+    }
+}
+
+fn spawn_service(
+    runtime: MessageRuntime,
+    events: Events,
+    startup_high_water: u64,
+) -> (MessageHandle, JoinHandle<()>) {
+    let service = Arc::new(Service {
+        rt: runtime,
+        view: Mutex::new(View::default()),
+        startup: watch::Sender::new(Startup::Replaying),
+        requests: Semaphore::new(MAX_REQUESTS),
+    });
+    let task = tokio::spawn({
+        let service = service.clone();
+        async move { service.run(events, startup_high_water).await }
+    });
+    (
+        MessageHandle {
+            inner: Backend::Live(service),
+        },
+        task,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn spawn_service_for_test(
+    runtime: MessageRuntime,
+    events: tokio::sync::broadcast::Receiver<Arc<Envelope>>,
+    startup_high_water: u64,
+) -> (MessageHandle, JoinHandle<()>) {
+    spawn_service(runtime, Events::Memory(events), startup_high_water)
+}
+
+#[derive(Clone)]
+enum Backend {
+    Disabled(Arc<str>),
+    Live(Arc<Service>),
+}
+
+#[derive(Clone)]
 pub struct MessageHandle {
-    disabled_reason: Arc<str>,
+    inner: Backend,
+}
+
+impl std::fmt::Debug for MessageHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.inner {
+            Backend::Disabled(reason) => f.debug_tuple("Disabled").field(reason).finish(),
+            Backend::Live(_) => f.write_str("Live"),
+        }
+    }
 }
 
 impl MessageHandle {
     #[must_use]
     pub fn disabled(reason: impl Into<String>) -> Self {
         Self {
-            disabled_reason: Arc::from(reason.into()),
+            inner: Backend::Disabled(Arc::from(reason.into())),
         }
     }
 
     fn unavailable(&self) -> MessageError {
-        MessageError::Unavailable(self.disabled_reason.to_string())
+        match &self.inner {
+            Backend::Disabled(reason) => MessageError::Unavailable(reason.to_string()),
+            Backend::Live(_) => {
+                MessageError::Unavailable("message delivery resolution is not configured".into())
+            }
+        }
+    }
+
+    fn live(&self) -> Result<&Service, MessageError> {
+        match &self.inner {
+            Backend::Disabled(reason) => Err(MessageError::Unavailable(reason.to_string())),
+            Backend::Live(service) => Ok(service),
+        }
     }
 
     /// Durable enqueue, not delivery. Caller identity is attribution, not authentication.
+    /// Answers once the message is committed and folded. The sender is the
+    /// agent bound to the caller's pane, else the owner.
     pub async fn send(
         &self,
-        _p: SendParams,
-        _caller: CallContext,
+        p: SendParams,
+        caller: CallContext,
     ) -> Result<SendResult, MessageError> {
-        Err(self.unavailable())
+        let service = self.live()?;
+        service
+            .call(ORDINARY_BUDGET, async {
+                if p.to == Address::System {
+                    return Err(MessageError::Refused(
+                        "system is not a message recipient or inbox".into(),
+                    ));
+                }
+                let from = caller_address(&service.view()?.state, &caller)?;
+                let content = MessageContent {
+                    from,
+                    to: p.to,
+                    kind: p.kind,
+                    body: p.body,
+                    attachments: p.attachments,
+                    task: p.task,
+                };
+                let committed = service.execute(OrgCommand::SendMessage(content)).await?;
+                let sent = committed.first().ok_or_else(|| {
+                    MessageError::Internal("message send committed no event".into())
+                })?;
+                Ok(SendResult {
+                    message_id: MessageId::new(sent.seq),
+                })
+            })
+            .await
     }
 
     /// Read-only inbox projection; fetching does not acknowledge reading.
     pub async fn inbox(
         &self,
-        _p: InboxParams,
-        _caller: CallContext,
+        p: InboxParams,
+        caller: CallContext,
     ) -> Result<InboxResult, MessageError> {
-        Err(self.unavailable())
+        let service = self.live()?;
+        service
+            .call(ORDINARY_BUDGET, async {
+                let now = service.rt.clock.now()?;
+                let view = service.view()?;
+                let caller = caller_address(&view.state, &caller)?;
+                // The FIFO predecessor is history's: one definition of the
+                // queue for the policy and for what the owner is shown.
+                inbox(&view.state, &caller, &p, |message| Progress {
+                    blocked_by: (service.rt.history.snapshot(message.id, now).ok())
+                        .and_then(|snapshot| snapshot.blocked_by),
+                    ..Progress::default()
+                })
+            })
+            .await
     }
 
     /// Acknowledge a fully validated batch of delivered messages in the caller's inbox.
-    pub async fn ack(
-        &self,
-        _p: AckParams,
-        _caller: CallContext,
-    ) -> Result<AckResult, MessageError> {
-        Err(self.unavailable())
+    /// The count is the number of messages this call marked read, taken at the
+    /// ordered fold of its committed event; already-read IDs add nothing.
+    pub async fn ack(&self, p: AckParams, caller: CallContext) -> Result<AckResult, MessageError> {
+        let service = self.live()?;
+        service
+            .call(ORDINARY_BUDGET, async {
+                let who = caller_address(&service.view()?.state, &caller)?;
+                let committed = service
+                    .execute(OrgCommand::ReadMessages {
+                        who,
+                        message_ids: p.ids,
+                    })
+                    .await?;
+                let view = service.view()?;
+                let mut count = 0;
+                for envelope in &committed {
+                    count += view.reads.get(&envelope.seq).ok_or_else(|| {
+                        MessageError::Internal("acknowledgement fold was not retained".into())
+                    })?;
+                }
+                Ok(AckResult { count })
+            })
+            .await
     }
 
     /// Owner release of a latched hold on this same ID, accepting duplicate risk.
@@ -284,7 +662,8 @@ impl MessageHandle {
         Err(self.unavailable())
     }
 
+    /// The startup replay is complete, or the reason the service cannot be used.
     pub async fn initialized(&self) -> Result<(), MessageError> {
-        Err(self.unavailable())
+        self.live()?.ready().await
     }
 }

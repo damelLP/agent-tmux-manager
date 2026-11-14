@@ -147,6 +147,8 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     methods: Arc<MethodRouter>,
     raw: crate::org::RawHandle,
     org: crate::org::OrgHandle,
+    message_evidence: Option<crate::org::message_evidence::MessageEvidence>,
+    message_history: Option<crate::org::message_history::MessageHistoryHandle>,
     watcher: Option<Forwarder>,
 }
 
@@ -191,6 +193,8 @@ where
             methods,
             raw: crate::org::RawHandle::default(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
+            message_evidence: None,
+            message_history: None,
             watcher: None,
         }
     }
@@ -202,6 +206,18 @@ where
 
     pub fn with_org(mut self, org: crate::org::OrgHandle) -> Self {
         self.org = org;
+        self
+    }
+
+    /// Inject the daemon's shared evidence and optional initialized history.
+    /// The tap never waits for the message service or organisation writer.
+    pub fn with_message_evidence(
+        mut self,
+        evidence: Option<crate::org::message_evidence::MessageEvidence>,
+        history: Option<crate::org::message_history::MessageHistoryHandle>,
+    ) -> Self {
+        self.message_evidence = evidence;
+        self.message_history = history;
         self
     }
 
@@ -701,12 +717,142 @@ where
         let session_id = SessionId::new(status.session_id.clone());
 
         // Send to registry for processing
-        self.registry
-            .update_from_status_line(session_id, pid, status, atm_core::Harness::ClaudeCode)
-            .await
-            .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        let applied = self
+            .registry
+            .update_from_status_line(
+                session_id.clone(),
+                pid,
+                status,
+                atm_core::Harness::ClaudeCode,
+            )
+            .await;
+        // Status lines have no original pane: activity only, never repair one
+        // from the current row to manufacture prompt evidence. Activity can
+        // neither bind nor confirm, so it needs no parent proof.
+        if self.message_tapped() {
+            self.record_message_event(&session_id, None, None, None, false);
+        }
+        applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
+    }
 
-        Ok(())
+    /// Evidence is installed and usable. A disabled one costs a hook nothing.
+    fn message_tapped(&self) -> bool {
+        self.message_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.available())
+    }
+
+    /// Apply once and tap only parent events. Generated metadata never uses
+    /// this entry point. A tapped event is never dropped: when its apply fails
+    /// or its parent cannot be proven, evidence takes it as unproven.
+    async fn apply_message_lifecycle(
+        &self,
+        session: SessionId,
+        event: atm_core::LifecycleEvent,
+        harness: atm_core::Harness,
+        pid: Option<u32>,
+        pane: Option<String>,
+        context: atm_core::LifecycleContext,
+    ) -> Result<(), ConnectionError> {
+        let tapped = context.child.is_none()
+            && !matches!(
+                event,
+                atm_core::LifecycleEvent::ChildSessionStart { .. }
+                    | atm_core::LifecycleEvent::ChildSessionEnd { .. }
+            )
+            && self.message_tapped();
+        // A SessionEnd removes its row, so no snapshot can prove it afterwards.
+        // It needs none: it is activity of a session that can bind no more.
+        let ends = matches!(event, atm_core::LifecycleEvent::SessionEnd { .. });
+        let applied = self
+            .registry
+            .apply_lifecycle_event_with_context(
+                session.clone(),
+                event.clone(),
+                harness,
+                pid,
+                pane.clone(),
+                context,
+            )
+            .await;
+        if tapped {
+            let proven = applied.is_ok()
+                && !ends
+                && self
+                    .message_parent_proven(&session, pane.as_deref(), harness)
+                    .await;
+            self.record_message_event(
+                &session,
+                pane.as_deref(),
+                Some(harness),
+                Some(&event),
+                proven,
+            );
+        }
+        applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
+    }
+
+    /// The proof a receipt or a lazy binding needs: one healthy snapshot shows
+    /// exactly one parent row for the event's own session, harness and pane,
+    /// and no other parent row on that pane. An Ok from the registry can mean
+    /// an ignored event or PID routing into another row, and an empty snapshot
+    /// can come from a dying actor, so anything else proves nothing. Never use
+    /// first_prompt, and never borrow the row's identity for the event.
+    async fn message_parent_proven(
+        &self,
+        session: &SessionId,
+        pane: Option<&str>,
+        harness: atm_core::Harness,
+    ) -> bool {
+        // Without a pane no event binds or confirms: there is nothing to prove.
+        let Some(pane) = pane else {
+            return false;
+        };
+        let Ok(rows) = timeout(Duration::from_secs(1), self.registry.get_all_sessions()).await
+        else {
+            warn!(session_id = %session, "Registry snapshot timed out; message event is unproven");
+            return false;
+        };
+        let on_pane = |row: &&atm_core::SessionView| {
+            row.parent_session_id.is_none() && row.tmux_pane.as_deref() == Some(pane)
+        };
+        let mut own = rows
+            .iter()
+            .filter(on_pane)
+            .filter(|row| row.id == *session && row.harness == harness.short_tag());
+        own.next().is_some()
+            && own.next().is_none()
+            && !rows.iter().filter(on_pane).any(|row| row.id != *session)
+    }
+
+    /// The one neutral tap, after the registry's answer. A status line passes
+    /// no harness and no event: activity only.
+    fn record_message_event(
+        &self,
+        session: &SessionId,
+        pane: Option<&str>,
+        harness: Option<atm_core::Harness>,
+        event: Option<&atm_core::LifecycleEvent>,
+        proven: bool,
+    ) {
+        let Some(evidence) = &self.message_evidence else {
+            return;
+        };
+        // An unparsable pane is an unknown pane. Without a pane no event can
+        // bind or confirm, whatever its proof.
+        let pane = pane.filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
+        let observed = evidence.tap(
+            session,
+            pane,
+            harness,
+            event,
+            proven,
+            self.message_history.as_ref(),
+        );
+        if let Err(error) = observed {
+            // Evidence logs its own disable once; the registry event stays applied.
+            debug!(%error, "Message evidence did not take the event");
+        }
     }
 
     /// Handles a hook event from Claude Code.
@@ -751,18 +897,15 @@ where
         let session_id = raw_event.session_id();
         let pid = raw_event.pid;
         let tmux_pane = raw_event.tmux_pane.clone();
-
-        self.registry
-            .apply_lifecycle_event_with_context(
-                session_id,
-                lifecycle,
-                atm_core::Harness::ClaudeCode,
-                pid,
-                tmux_pane,
-                raw_event.lifecycle_context(),
-            )
-            .await
-            .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        self.apply_message_lifecycle(
+            session_id,
+            lifecycle,
+            atm_core::Harness::ClaudeCode,
+            pid,
+            tmux_pane,
+            raw_event.lifecycle_context(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -815,16 +958,15 @@ where
                 })?,
         };
 
-        self.registry
-            .apply_lifecycle_event(
-                session_id,
-                lifecycle,
-                atm_core::Harness::Pi,
-                raw_event.pid,
-                raw_event.tmux_pane,
-            )
-            .await
-            .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        self.apply_message_lifecycle(
+            session_id,
+            lifecycle,
+            atm_core::Harness::Pi,
+            raw_event.pid,
+            raw_event.tmux_pane,
+            Default::default(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -876,16 +1018,15 @@ where
         let transcript_path = raw_event.transcript_path.clone();
         let ends_session = matches!(lifecycle, atm_core::LifecycleEvent::SessionEnd { .. });
 
-        self.registry
-            .apply_lifecycle_event(
-                session_id.clone(),
-                lifecycle,
-                atm_core::Harness::Codex,
-                pid,
-                tmux_pane.clone(),
-            )
-            .await
-            .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        self.apply_message_lifecycle(
+            session_id.clone(),
+            lifecycle,
+            atm_core::Harness::Codex,
+            pid,
+            tmux_pane.clone(),
+            Default::default(),
+        )
+        .await?;
 
         if !ends_session && model.is_some() {
             self.registry
@@ -1763,6 +1904,737 @@ mod tests {
             .get_session(SessionId::new("closed-hook"))
             .await
             .is_some());
+    }
+
+    // Synthetic: identity/reference mutations of the captured transport shapes.
+    // Captured: Claude Code 2.1.310, 2026-10-24, TUI hook/status capture.
+    // Captured: pi 0.73.1, 2026-10-24, TUI extension frames.
+    // Captured: Codex 0.163.0, 2026-10-24, TUI hook stdin.
+    // Each adapter's crate docs record the source fixture and capture method.
+    type EvidenceHandler = ConnectionHandler<
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    >;
+    async fn evidence_handler(
+        harness: atm_core::Harness,
+    ) -> (
+        EvidenceHandler,
+        crate::org::message_evidence::MessageEvidence,
+    ) {
+        use crate::org::{
+            message_evidence::{AttemptScope, MessageEvidence},
+            messages::MessageClock,
+        };
+        let evidence = MessageEvidence::new(MessageClock::new(
+            tokio::time::Instant::now(),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        ));
+        let id = "m123".parse().unwrap();
+        evidence
+            .register(id, "[m123] Read: atm inbox --id m123".into())
+            .unwrap();
+        evidence
+            .arm(AttemptScope {
+                message_id: id,
+                attempt_seq: 124,
+                recipient: "demo/worker".parse().unwrap(),
+                pane: crate::control::reservation::PaneId::parse("%7").unwrap(),
+                harness,
+                session_id: Some(SessionId::new("evidence-session")),
+                excluded_sessions: Default::default(),
+            })
+            .unwrap();
+        let registry = crate::registry::spawn_registry();
+        let mut session = SessionDomain::new(
+            SessionId::new("evidence-session"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+        session.harness = harness;
+        session.tmux_pane = Some("%7".into());
+        registry.register(session).await.unwrap();
+        let (ours, _peer) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(ours);
+        let handler = ConnectionHandler::new(
+            read,
+            write,
+            registry,
+            Arc::new(RwLock::new(HashMap::new())),
+            1,
+            CancellationToken::new(),
+            request_router(),
+        )
+        .with_message_evidence(Some(evidence.clone()), None);
+        (handler, evidence)
+    }
+
+    fn captured_prompt(harness: atm_core::Harness) -> serde_json::Value {
+        use atm_core::Harness;
+        let text = match harness {
+            Harness::ClaudeCode => include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_tui_session_2.1.310.jsonl"
+            ),
+            Harness::Pi => {
+                include_str!("../../../atm-pi-adapter/tests/fixtures/pi_tool_run_0.73.1.jsonl")
+            }
+            Harness::Codex => include_str!(
+                "../../../atm-codex-adapter/tests/fixtures/codex_tui_session_0.163.0.jsonl"
+            ),
+            _ => unreachable!(),
+        };
+        let mut payload = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|value| value.get("data").cloned().unwrap_or(value))
+            .find(|value| {
+                value.get("hook_event_name").and_then(|v| v.as_str()) == Some("UserPromptSubmit")
+                    || value.get("event").and_then(|v| v.as_str()) == Some("input")
+            })
+            .unwrap();
+        payload["session_id"] = serde_json::json!("evidence-session");
+        payload["tmux_pane"] = serde_json::json!("%7");
+        payload.as_object_mut().unwrap().remove("pid");
+        if harness == Harness::Pi {
+            payload["payload"]["text"] = serde_json::json!("[m123] Read: atm inbox --id m123");
+        } else {
+            payload["prompt"] = serde_json::json!("[m123] Read: atm inbox --id m123");
+        }
+        payload
+    }
+
+    #[tokio::test]
+    async fn message_evidence_tap_receives_all_three_captured_prompt_shapes() {
+        use atm_core::Harness;
+        for harness in [Harness::ClaudeCode, Harness::Pi, Harness::Codex] {
+            let (mut handler, evidence) = evidence_handler(harness).await;
+            let payload = captured_prompt(harness);
+            match harness {
+                Harness::ClaudeCode => handler.handle_hook_event(payload).await.unwrap(),
+                Harness::Pi => handler.handle_pi_event(payload).await.unwrap(),
+                Harness::Codex => handler.handle_codex_event(payload).await.unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                evidence
+                    .receipt("m123".parse().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .as_str(),
+                "evidence-session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn message_evidence_later_prompt_does_not_use_first_prompt_preview() {
+        let harness = atm_core::Harness::Pi;
+        let (mut handler, evidence) = evidence_handler(harness).await;
+        let mut first = captured_prompt(harness);
+        first["payload"]["text"] = serde_json::json!("earlier unrelated preview");
+        handler.handle_pi_event(first).await.unwrap();
+        assert!(evidence.receipt("m123".parse().unwrap()).unwrap().is_none());
+        // There is deliberately no wake consumer: ingestion must complete even
+        // with the service stalled, retaining the exact later receipt.
+        handler
+            .handle_pi_event(captured_prompt(harness))
+            .await
+            .unwrap();
+        let row = handler
+            .registry
+            .get_session(SessionId::new("evidence-session"))
+            .await
+            .unwrap();
+        assert_eq!(
+            row.first_prompt.as_deref(),
+            Some("earlier unrelated preview")
+        );
+        assert!(evidence.receipt("m123".parse().unwrap()).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_lost_history_fails_closed_without_rolling_back_hook() {
+        let (handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut handler = handler.with_message_evidence(
+            Some(evidence.clone()),
+            Some(crate::org::message_history::MessageHistoryHandle::disabled(
+                "synthetic history loss",
+            )),
+        );
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert!(matches!(
+            evidence.receipt("m123".parse().unwrap()),
+            Err(crate::org::messages::MessageError::Unavailable(_))
+        ));
+        assert_eq!(
+            handler
+                .registry
+                .get_session(SessionId::new("evidence-session"))
+                .await
+                .unwrap()
+                .first_prompt
+                .as_deref(),
+            Some("[m123] Read: atm inbox --id m123")
+        );
+    }
+
+    #[tokio::test]
+    async fn message_evidence_apply_error_holds_the_event_session() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let other = arm_other_message(&evidence);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        handler.registry = RegistryHandle::new(sender, events);
+        drop(receiver);
+        assert!(handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .is_err());
+        // The lost event was this session's exact reference: hold, never
+        // confirm, and leave every other message alone.
+        assert_held_without_receipt(&evidence);
+        assert_untouched(&evidence, other);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_status_line_error_holds_the_event_session() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let other = arm_other_message(&evidence);
+        let snapshots = fake_registry(
+            &mut handler,
+            Err(crate::registry::RegistryError::RegistryFull { max: 100 }),
+            FakeSnapshot::Rows(vec![]),
+        );
+        let mut data: serde_json::Value = serde_json::from_str(
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_status_line_2.1.310.jsonl"
+            )
+            .lines()
+            .next()
+            .unwrap(),
+        )
+        .unwrap();
+        data["session_id"] = serde_json::json!("evidence-session");
+        assert!(handler.handle_status_update(data).await.is_err());
+        assert_held_without_receipt(&evidence);
+        assert_untouched(&evidence, other);
+        // A failed apply needs no snapshot to be unproven.
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_codex_derived_metadata_has_no_second_tap() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Codex).await;
+        let row = handler
+            .registry
+            .get_session(SessionId::new("evidence-session"))
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        handler.registry = RegistryHandle::new(sender, events);
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_by_actor = observed.clone();
+        let actor = tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    crate::registry::RegistryCommand::ApplyLifecycleEvent {
+                        respond_to, ..
+                    } => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    crate::registry::RegistryCommand::GetAllSessions { respond_to } => {
+                        observed_by_actor.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = respond_to.send(vec![row.clone()]);
+                    }
+                    _ => panic!("unexpected registry operation"),
+                }
+            }
+        });
+        let mut payload = captured_prompt(atm_core::Harness::Codex);
+        payload["model"] = serde_json::json!("synthetic-model");
+        payload.as_object_mut().unwrap().remove("transcript_path");
+        handler.handle_codex_event(payload).await.unwrap();
+        assert!(evidence.receipt("m123".parse().unwrap()).unwrap().is_some());
+        // A second tap on synthesized model metadata would request another
+        // eligibility observation and fabricate another genuine event clock.
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(handler);
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_evidence_child_context_never_confirms_parent() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let mut payload = captured_prompt(atm_core::Harness::ClaudeCode);
+        payload["agent_id"] = serde_json::json!("child-agent");
+        payload["agent_type"] = serde_json::json!("general-purpose");
+        handler.handle_hook_event(payload).await.unwrap();
+        let facts = evidence.snapshot("m123".parse().unwrap()).unwrap();
+        assert!(facts.receipt.is_none());
+        assert!(!facts.probably_landed);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_ignored_event_holds_but_never_confirms() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let other = arm_other_message(&evidence);
+        handler
+            .registry
+            .remove(SessionId::new("evidence-session"))
+            .await
+            .unwrap();
+        // The registry answers Ok and ignores it: no pid, no row.
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert!(handler
+            .registry
+            .get_session(SessionId::new("evidence-session"))
+            .await
+            .is_none());
+        assert_held_without_receipt(&evidence);
+        assert_untouched(&evidence, other);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_wrong_original_pane_does_not_borrow_row_pane() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload["tmux_pane"] = serde_json::json!("%8");
+        handler.handle_pi_event(payload).await.unwrap();
+        assert!(
+            !evidence
+                .snapshot("m123".parse().unwrap())
+                .unwrap()
+                .probably_landed
+        );
+    }
+
+    #[tokio::test]
+    async fn message_evidence_session_end_is_activity_after_parent_removal() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload["event"] = serde_json::json!("session_shutdown");
+        payload["payload"] = serde_json::json!({"type":"session_shutdown"});
+        handler.handle_pi_event(payload).await.unwrap();
+        assert!(handler
+            .registry
+            .get_session(SessionId::new("evidence-session"))
+            .await
+            .is_none());
+        assert!(
+            evidence
+                .snapshot("m123".parse().unwrap())
+                .unwrap()
+                .probably_landed
+        );
+        assert!(evidence.receipt("m123".parse().unwrap()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_accepted_status_is_activity_not_receipt() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let mut data: serde_json::Value = serde_json::from_str(
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_status_line_2.1.310.jsonl"
+            )
+            .lines()
+            .next()
+            .unwrap(),
+        )
+        .unwrap();
+        data["session_id"] = serde_json::json!("evidence-session");
+        handler.handle_status_update(data).await.unwrap();
+        let facts = evidence.snapshot("m123".parse().unwrap()).unwrap();
+        assert!(facts.probably_landed);
+        assert!(facts.receipt.is_none());
+    }
+
+    /// What the fake registry answers to the tap's one snapshot request.
+    enum FakeSnapshot {
+        Rows(Vec<atm_core::SessionView>),
+        /// The actor stays up but drops the reply, as a dying actor does.
+        DropReply,
+        /// A stalled registry: the reply is held until the handler is gone.
+        Hold,
+    }
+
+    /// Replaces the handler's registry with a scripted actor. Returns the
+    /// number of snapshots it was asked for.
+    fn fake_registry(
+        handler: &mut EvidenceHandler,
+        apply: Result<(), crate::registry::RegistryError>,
+        snapshot: FakeSnapshot,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        use crate::registry::RegistryCommand;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        handler.registry = RegistryHandle::new(sender, events);
+        let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = snapshots.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    RegistryCommand::ApplyLifecycleEvent { respond_to, .. }
+                    | RegistryCommand::UpdateFromStatusLine { respond_to, .. } => {
+                        let _ = respond_to.send(apply.clone());
+                    }
+                    RegistryCommand::GetAllSessions { respond_to } => {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        match &snapshot {
+                            FakeSnapshot::Rows(rows) => {
+                                let _ = respond_to.send(rows.clone());
+                            }
+                            FakeSnapshot::DropReply => drop(respond_to),
+                            FakeSnapshot::Hold => held.push(respond_to),
+                        }
+                    }
+                    _ => panic!("unexpected registry operation"),
+                }
+            }
+        });
+        snapshots
+    }
+
+    #[tokio::test]
+    async fn message_evidence_disabled_takes_no_registry_snapshot() {
+        let (handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let disabled = crate::org::message_evidence::MessageEvidence::disabled(
+            evidence.clock().clone(),
+            "synthetic broken invariant",
+        );
+        let mut handler = handler.with_message_evidence(Some(disabled), None);
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![]));
+        for _ in 0..3 {
+            handler
+                .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+                .await
+                .unwrap();
+        }
+        // The hook is still applied; a disabled evidence costs it nothing more.
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    fn m123() -> atm_org::MessageId {
+        "m123".parse().unwrap()
+    }
+
+    /// A second armed message, for another session on another pane.
+    fn arm_other_message(
+        evidence: &crate::org::message_evidence::MessageEvidence,
+    ) -> atm_org::MessageId {
+        let id = "m200".parse().unwrap();
+        evidence
+            .register(id, "[m200] Read: atm inbox --id m200".into())
+            .unwrap();
+        evidence
+            .arm(crate::org::message_evidence::AttemptScope {
+                message_id: id,
+                attempt_seq: 201,
+                recipient: "demo/other".parse().unwrap(),
+                pane: crate::control::reservation::PaneId::parse("%8").unwrap(),
+                harness: atm_core::Harness::Pi,
+                session_id: Some(SessionId::new("other-session")),
+                excluded_sessions: Default::default(),
+            })
+            .unwrap();
+        id
+    }
+
+    /// The outcome of an unproven event for m123: held, and evidence still on.
+    fn assert_held_without_receipt(evidence: &crate::org::message_evidence::MessageEvidence) {
+        let facts = evidence.snapshot(m123()).unwrap();
+        assert!(facts.receipt.is_none());
+        assert!(facts.probably_landed);
+    }
+
+    fn assert_untouched(
+        evidence: &crate::org::message_evidence::MessageEvidence,
+        id: atm_org::MessageId,
+    ) {
+        let facts = evidence.snapshot(id).unwrap();
+        assert!(facts.receipt.is_none());
+        assert!(!facts.probably_landed);
+    }
+
+    async fn evidence_row(handler: &EvidenceHandler) -> atm_core::SessionView {
+        handler
+            .registry
+            .get_session(SessionId::new("evidence-session"))
+            .await
+            .unwrap()
+    }
+
+    /// Replaces the registered row with a changed copy, in the real registry.
+    async fn replace_evidence_row(
+        handler: &EvidenceHandler,
+        change: impl FnOnce(&mut SessionDomain),
+    ) {
+        let id = SessionId::new("evidence-session");
+        handler.registry.remove(id.clone()).await.unwrap();
+        let mut session = SessionDomain::new(id, AgentType::GeneralPurpose, Model::Unknown);
+        session.harness = atm_core::Harness::Pi;
+        session.tmux_pane = Some("%7".into());
+        change(&mut session);
+        handler.registry.register(session).await.unwrap();
+    }
+
+    // No tracing subscriber is installed here, so a reaction that lives in a
+    // log macro's arguments would not run.
+    #[tokio::test]
+    async fn message_evidence_registry_reply_dropped_after_apply_holds() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let other = arm_other_message(&evidence);
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::DropReply);
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(handler.registry.is_connected());
+        assert_held_without_receipt(&evidence);
+        assert_untouched(&evidence, other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn message_evidence_registry_snapshot_stall_holds() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let other = arm_other_message(&evidence);
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Hold);
+        // The paused clock runs the snapshot's bound out; nothing waits for real.
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_held_without_receipt(&evidence);
+        assert_untouched(&evidence, other);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_failed_apply_is_never_proven() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        // The snapshot would prove the parent, but the event was not applied.
+        let row = evidence_row(&handler).await;
+        let snapshots = fake_registry(
+            &mut handler,
+            Err(crate::registry::RegistryError::RegistryFull { max: 100 }),
+            FakeSnapshot::Rows(vec![row]),
+        );
+        assert!(handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .is_err());
+        assert_held_without_receipt(&evidence);
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_pane_less_event_takes_no_snapshot() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let row = evidence_row(&handler).await;
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![row]));
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload.as_object_mut().unwrap().remove("tmux_pane");
+        handler.handle_pi_event(payload).await.unwrap();
+        // Its session is the bound one, so it is activity; it cannot confirm.
+        assert_held_without_receipt(&evidence);
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_activity_only_events_take_no_snapshot() {
+        // A status line and a SessionEnd can neither bind nor confirm.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![]));
+        let mut end = captured_prompt(atm_core::Harness::Pi);
+        end["event"] = serde_json::json!("session_shutdown");
+        end["payload"] = serde_json::json!({"type":"session_shutdown"});
+        handler.handle_pi_event(end).await.unwrap();
+        assert_held_without_receipt(&evidence);
+
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let status_snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![]));
+        let mut data: serde_json::Value = serde_json::from_str(
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_status_line_2.1.310.jsonl"
+            )
+            .lines()
+            .next()
+            .unwrap(),
+        )
+        .unwrap();
+        data["session_id"] = serde_json::json!("evidence-session");
+        handler.handle_status_update(data).await.unwrap();
+        assert_held_without_receipt(&evidence);
+        for count in [snapshots, status_snapshots] {
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn message_evidence_shared_pane_holds_never_drops() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        // Another parent row on the same pane: a nested run, or a previous
+        // occupant not yet cleaned up.
+        let mut nested = SessionDomain::new(
+            SessionId::new("nested-session"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+        nested.harness = atm_core::Harness::Pi;
+        nested.tmux_pane = Some("%7".into());
+        handler.registry.register(nested).await.unwrap();
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_duplicate_session_rows_hold() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let row = evidence_row(&handler).await;
+        fake_registry(
+            &mut handler,
+            Ok(()),
+            FakeSnapshot::Rows(vec![row.clone(), row]),
+        );
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_child_row_never_confirms() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        replace_evidence_row(&handler, |row| {
+            row.parent_session_id = Some(SessionId::new("lead-session"));
+        })
+        .await;
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_row_of_another_harness_never_confirms() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        replace_evidence_row(&handler, |row| row.harness = atm_core::Harness::Codex).await;
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_row_on_another_pane_never_confirms() {
+        // The event names the scope's pane, but the registry knows the
+        // session on another one: the row does not prove the event.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        replace_evidence_row(&handler, |row| row.tmux_pane = Some("%8".into())).await;
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_unparsable_pane_is_an_unknown_pane() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload["tmux_pane"] = serde_json::json!("7");
+        handler.handle_pi_event(payload).await.unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_registry_full_from_unrelated_process_leaves_evidence_on() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        for n in 1..crate::registry::MAX_SESSIONS {
+            handler
+                .registry
+                .register(SessionDomain::new(
+                    SessionId::new(format!("filler-{n}")),
+                    AgentType::GeneralPurpose,
+                    Model::Unknown,
+                ))
+                .await
+                .unwrap();
+        }
+        // An unrelated new process on another pane; no such pid exists.
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload["session_id"] = serde_json::json!("unrelated-session");
+        payload["tmux_pane"] = serde_json::json!("%9");
+        payload["pid"] = serde_json::json!(4_000_000_000_u32);
+        assert!(matches!(
+            handler.handle_pi_event(payload).await,
+            Err(ConnectionError::RegistryError(_))
+        ));
+        assert_untouched(&evidence, m123());
+        // The armed session's own receipt still confirms afterwards.
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert!(evidence.receipt(m123()).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_old_session_with_occupant_pid_credits_nothing() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        // The occupant's row, keyed by a pid no process has.
+        let pid = 4_000_000_000_u32;
+        let occupant = SessionId::new("evidence-session");
+        handler.registry.remove(occupant.clone()).await.unwrap();
+        handler
+            .registry
+            .register_discovered(
+                occupant,
+                pid,
+                "/".into(),
+                Some("%7".into()),
+                atm_core::Harness::Pi,
+            )
+            .await
+            .unwrap();
+        let mut old = captured_prompt(atm_core::Harness::Pi);
+        old["session_id"] = serde_json::json!("old-session");
+        old["pid"] = serde_json::json!(pid);
+        handler.handle_pi_event(old).await.unwrap();
+        // The registry routed the old session's prompt into the occupant's row...
+        assert_eq!(
+            evidence_row(&handler).await.first_prompt.as_deref(),
+            Some("[m123] Read: atm inbox --id m123")
+        );
+        // ...and the tap credited the occupant with nothing.
+        assert_untouched(&evidence, m123());
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence
+                .receipt(m123())
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_str(),
+            "evidence-session"
+        );
     }
 
     fn request_router() -> Arc<super::super::methods::MethodRouter> {

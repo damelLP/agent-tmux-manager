@@ -78,6 +78,26 @@ const CODEX_TRANSCRIPT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// Unique identifier for this connection
 type ClientId = String;
 
+/// Exhaustive so new envelopes must explicitly choose whether they need a reply.
+fn is_one_way(message: &MessageType) -> bool {
+    match message {
+        MessageType::HookEvent { .. }
+        | MessageType::StatusUpdate { .. }
+        | MessageType::PiEvent { .. }
+        | MessageType::CodexEvent { .. } => true,
+        MessageType::Connect { .. }
+        | MessageType::ListSessions
+        | MessageType::Subscribe { .. }
+        | MessageType::Unsubscribe
+        | MessageType::Ping { .. }
+        | MessageType::Disconnect
+        | MessageType::Discover
+        | MessageType::Request { .. }
+        | MessageType::Watch { .. }
+        | MessageType::Unwatch => false,
+    }
+}
+
 /// Connection handler for a single client.
 ///
 /// Manages the lifecycle of a client connection including:
@@ -268,6 +288,9 @@ impl ConnectionHandler {
                         return Err(error);
                     }
                     debug!(client_id = ?self.client_id, %error, "Handshake reply failed; draining one-way events");
+                    // Safe because Connect is fully validated before its reply;
+                    // revisit if the handshake ever requires a round trip.
+                    // New writes outside handle_message must also check this flag.
                     self.one_way_only = true;
                 }
 
@@ -393,15 +416,7 @@ impl ConnectionHandler {
         msg: ClientMessage,
         requests: &mut JoinSet<DaemonMessage>,
     ) -> Result<(), ConnectionError> {
-        if self.one_way_only
-            && !matches!(
-                msg.message,
-                MessageType::HookEvent { .. }
-                    | MessageType::StatusUpdate { .. }
-                    | MessageType::PiEvent { .. }
-                    | MessageType::CodexEvent { .. }
-            )
-        {
+        if self.one_way_only && !is_one_way(&msg.message) {
             debug!(client_id = ?self.client_id, message_type = ?std::mem::discriminant(&msg.message), "Skipping message after failed handshake reply");
             return Ok(());
         }

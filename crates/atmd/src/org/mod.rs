@@ -17,7 +17,12 @@ mod agent_types;
 pub mod agents;
 #[cfg(test)]
 mod agents_tests;
+pub mod message_delivery;
+pub mod message_evidence;
+pub mod message_history;
 mod message_methods;
+#[cfg(test)]
+mod message_seam_tests;
 pub mod message_types;
 pub mod messages;
 mod raw;

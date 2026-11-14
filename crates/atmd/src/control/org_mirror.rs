@@ -2,6 +2,8 @@
 //! A snapshot has no cursor, so its pre-read high-water mark is a conservative
 //! lower bound. Never authorize from it while the writer's cursor is newer.
 //! Watch subscribes before snapshot; refresh (not re-apply) on later commits.
+//! Transient read failures retain the projection and retry with a capped backoff;
+//! only failed organisation health marks the mirror unavailable.
 #[cfg(test)]
 #[path = "org_mirror_tests.rs"]
 mod tests;
@@ -30,11 +32,29 @@ pub(super) struct Mirror {
 }
 impl Mirror {
     pub(super) fn start(org: OrgHandle) -> Self {
+        Self::start_with_snapshot(org, |org| async move { org.snapshot().await })
+    }
+    fn start_with_snapshot<F, Fut>(org: OrgHandle, mut snapshot: F) -> Self
+    where
+        F: FnMut(OrgHandle) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<OrgState, crate::org::OrgServiceError>> + Send,
+    {
         let (updates, projection) = watch::channel(Projection::Loading);
         let source = org.clone();
         let worker = tokio::spawn(async move {
-            if refresh(source, &updates).await.is_err() {
-                updates.send_replace(Projection::Unavailable);
+            let mut backoff = std::time::Duration::from_millis(100);
+            while refresh_with_snapshot(&source, &updates, &mut snapshot)
+                .await
+                .is_err()
+            {
+                if source.status().is_err() {
+                    updates.send_replace(Projection::Unavailable);
+                    break;
+                }
+                // Queue pressure, snapshot timeouts and replay read failures do
+                // not change org health. Retain the last conservative cursor.
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
             }
         });
         Self {
@@ -69,14 +89,29 @@ impl Mirror {
         let _ = self.worker.await;
     }
 }
+#[cfg(test)]
 async fn refresh(
     org: OrgHandle,
     updates: &watch::Sender<Projection>,
 ) -> Result<(), crate::org::OrgServiceError> {
+    refresh_with_snapshot(&org, updates, &mut |org: OrgHandle| async move {
+        org.snapshot().await
+    })
+    .await
+}
+async fn refresh_with_snapshot<F, Fut>(
+    org: &OrgHandle,
+    updates: &watch::Sender<Projection>,
+    snapshot: &mut F,
+) -> Result<(), crate::org::OrgServiceError>
+where
+    F: FnMut(OrgHandle) -> Fut,
+    Fut: std::future::Future<Output = Result<OrgState, crate::org::OrgServiceError>>,
+{
     let mut events = org.watch(Vec::new(), org.status()?)?;
     loop {
         let through = org.status()?;
-        let state = org.snapshot().await?;
+        let state = snapshot(org.clone()).await?;
         if updates
             .send(Projection::Ready {
                 through,

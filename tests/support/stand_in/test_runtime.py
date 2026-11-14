@@ -41,6 +41,26 @@ def journal(r):
 
 
 class ControlTests(unittest.TestCase):
+    def test_source_replay_uses_terminal_barrier_without_model_readiness(self):
+        r = runtime()
+        with redirect_stdout(io.StringIO()) as output:
+            r.control({"id": 1, "command": "render_source", "key": "claude.permission.u5"})
+            r.input(b"\x1b[1;1R")
+        self.assertIn("Do you want to proceed?", output.getvalue())
+        self.assertEqual(r.model.state, "idle")
+        self.assertEqual(journal(r)[-1]["kind"], "rendered")
+        self.assertEqual(journal(r)[-1]["state"], "source-replay")
+        self.assertFalse(any(e["kind"] == "ready" for e in journal(r)))
+
+    def test_source_replay_rejects_unknown_and_foreign_mode_without_output(self):
+        r = runtime()
+        for key in ["missing", "pi.fresh.u5", None, {}]:
+            with redirect_stdout(io.StringIO()) as output:
+                r.control({"id": 1, "command": "render_source", "key": key})
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("error", journal(r)[-1])
+            self.assertEqual(r.render_sequence, 0)
+
     def test_event_stream_carries_identity_and_total_order(self):
         import json
         import socket

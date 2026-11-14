@@ -82,6 +82,8 @@ rig.close();
   real-ID row proves discovery and the hook agree on PID.
 - `capture(pane)` joins wrapped screen lines; `capture_plain(pane)` preserves
   viewport line structure and trailing newlines (`capture-pane -p`, no `-J`).
+  `capture_styled(pane)` uses `capture-pane -e -N -p`, retaining SGR and trailing
+  cells. This is a renderer test seam, not a styled observer API.
   `paste(pane, text)` uses bracketed
   paste plus a separate Enter. `key(pane, "Escape")` sends a key to the private
   server only. For an unsubmitted paste use `tmux` load/set-buffer + paste-buffer
@@ -291,9 +293,27 @@ frame/ready event is emitted after exit.
 
 Pure source/scene/key tests run through the Cargo Python contract; private tmux
 integration tests cover native fresh replay, modal keys and retained shells.
-Adapter conformance is a separate contract: a real-looking placeholder, selected
-trust option or Codex draft may still be Unknown to the current parsers. Neither
-the journal nor a rendered frame is permission to deliver a prompt.
+`stand_in_screens` calls all three real adapters, not copied parsers. It compares
+all 74 sources through private tmux with independent source text and pinned U8a
+facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
+allowing tmux to normalize SGR encodings. Separate key-driven tests cover drafts,
+working/idle, each clear phase, repeated identical clear snapshots, interruptions,
+actual retained shells, trust, update, hook review/list, worktree and permission.
+P1 Codex dialogs and selected Claude trust remain Unknown under unchanged U8a.
+Claude's rich identical-draft source has a separate warning footer and is wholly
+Unknown, not merely unknown input. No parser special cases are added.
+
+For supplementary source-only conformance, `control(pane, json!({"command":
+"render_source", "key": "claude.permission.u5"}))` replays a catalog entry for
+that pane's mode. Set the private window to its catalog geometry first and hold
+model time. Await `rendered` with `state == "source-replay"`; this uses the same
+renderer and terminal barrier but does not change the model or emit `ready`.
+Unknown/cross-mode keys refuse. This diagnostic control never proves a lifecycle
+transition; the key-driven tests are the independent transition evidence.
+
+A real-looking placeholder, selected trust option or Codex draft may still be
+Unknown to the current parsers. Neither the journal nor a rendered frame is
+permission to deliver a prompt.
 
 ## Captured templates
 

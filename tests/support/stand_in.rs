@@ -476,6 +476,12 @@ impl StandInRig {
         assert!(output.status.success(), "{output:?}");
         String::from_utf8(output.stdout).expect("utf8 pane")
     }
+    pub fn capture_styled(&self, pane: &StandInPane) -> String {
+        self.owns(pane);
+        let output = self.tmux(&["capture-pane", "-e", "-N", "-p", "-t", &pane.pane_id]);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).expect("utf8 styled pane")
+    }
     pub fn event_cursor(&self, pane: &StandInPane) -> u64 {
         self.owns(pane);
         self.events.cursor(pane.pid, &pane.start_time)

@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from model import InputParser, Model, parse_args
 from scene import render_state
+from screens import render_screen
 
 VERSIONS = {"claude": "2.1.325", "codex": "0.167.0", "pi": "1.5.0"}
 
@@ -133,6 +134,16 @@ class Runtime:
             else:
                 self.clock_ms = value
                 self.effects(self.model.tick(value))
+        elif message.get("command") == "render_source":
+            spec = next((s for s in self.screen_catalog if s["key"] == message.get("key")
+                         and s["mode"] == self.mode), None)
+            if spec is None:
+                reply["error"] = "unknown source for this mode"
+            else:
+                # Supplementary exact source conformance, not a lifecycle or
+                # readiness claim. The ordinary editor state remains unchanged.
+                self.effects([dict(self.model.render()[0], state="source-replay",
+                                   frame="source-replay", replay_spec=spec)])
         elif message.get("command") != "barrier":
             reply["error"] = "unknown control"
         self.record(dict(reply, state=self.model.state, now_ms=self.now_ms(),
@@ -224,9 +235,12 @@ class Runtime:
                     continue
                 self.render_sequence += 1
                 draft = self.parser.draft.decode("utf-8", errors="replace")
-                screen = render_state(self.screen_catalog, self.screen_assets, self.mode,
-                                      effect["frame"], draft, self.screen_variant,
-                                      self.columns, self.rows, effect["selection"], self.screen_folder)
+                if "replay_spec" in effect:
+                    screen = render_screen(effect["replay_spec"], self.screen_assets)
+                else:
+                    screen = render_state(self.screen_catalog, self.screen_assets, self.mode,
+                                          effect["frame"], draft, self.screen_variant,
+                                          self.columns, self.rows, effect["selection"], self.screen_folder)
                 effect = dict(effect, sequence=self.render_sequence, draft=draft,
                               source=screen.source)
             self.record(effect)
@@ -235,7 +249,8 @@ class Runtime:
             elif effect["kind"] == "draft":
                 self.parser.draft = bytearray(effect["text"].encode())
             elif effect["kind"] == "render":
-                self.last_render = effect
+                if "replay_spec" not in effect:
+                    self.last_render = effect
                 self.draft_dirty = False
                 # DSR is answered after tmux parses the preceding frame. A flush
                 # alone only proves bytes reached the tty, not the captured pane.

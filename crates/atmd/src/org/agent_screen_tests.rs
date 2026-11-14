@@ -60,12 +60,21 @@ const CASES: [(Harness, &str, &str, &str, &str, Observe); 3] = [
     ),
 ];
 
+/// A fixture without its leading `Captured:` provenance line: what tmux returned.
+pub(super) fn body(fixture: &str) -> &str {
+    match fixture.split_once('\n') {
+        Some((first, rest)) if first.starts_with("Captured:") => rest,
+        _ => fixture,
+    }
+}
+
 fn capture(
     text: &str,
     format: CaptureFormat,
     root: Option<u32>,
     command: Option<&str>,
 ) -> PaneCapture {
+    let text = body(text);
     let inspection = PaneInspection::new(
         atm_tmux::PaneInfo {
             pane_id: "%1".into(),
@@ -103,6 +112,19 @@ fn refusals() -> [(Option<u32>, Option<&'static str>, Option<Foreground>); 5] {
         (Some(ROOT), Some("zsh"), Some(Foreground::Shell)),
         (Some(ROOT), Some("node"), None),
     ]
+}
+
+#[test]
+fn fixtures_are_read_without_their_provenance_line() {
+    for (_, _, fresh, draft, _, _) in CASES {
+        for fixture in [fresh, draft] {
+            assert!(fixture.starts_with("Captured:"));
+            assert!(!body(fixture).starts_with("Captured:"));
+            assert_eq!(body(body(fixture)), body(fixture));
+        }
+        // The staged-draft fixtures are full `-N` captures with tmux's padding.
+        assert!(body(draft).lines().any(|line| line.ends_with(' ')));
+    }
 }
 
 #[test]
@@ -259,7 +281,7 @@ fn facts_are_unknown_unless_harness_is_foreground() {
         // fresh screen; its control read, below, does not.)
         assert_eq!(
             facts,
-            observe(ScreenInput::Styled(fresh), None),
+            observe(ScreenInput::Styled(body(fresh)), None),
             "{harness:?}"
         );
         assert_eq!(facts.input, InputState::Empty, "{harness:?}");

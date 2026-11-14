@@ -876,7 +876,9 @@ fn unchecked_facts(screen: &AgentScreen, capture: &PaneCapture) -> ScreenFacts {
         .pane_root_pid()
         .zip(inspection.foreground_command.clone())
         .and_then(|(root, command)| PaneBaseline::adopted(root).with_harness(command))
-        .map(|baseline| screen.facts(capture, &baseline))
+        // The control observer's facts: it is the adapters' complete read of an
+        // editor (Claude's legacy observer knows fewer real idle footers).
+        .map(|baseline| screen.control(capture, &baseline).facts)
         .unwrap_or_default()
 }
 

@@ -585,6 +585,81 @@ mod reconciliation {
                     break;
                 }
             }
+            for registered in [true, false] {
+                if registered {
+                    rig.row("unrelated", "%99", false).await;
+                } else {
+                    update(&rig, "unrelated").await;
+                }
+                loop {
+                    let event = events.recv().await.unwrap();
+                    assert_ne!(
+                        event.phase, "schedule_failed",
+                        "unrelated registration/update read stalled org"
+                    );
+                    if event.phase == "scheduled" {
+                        break;
+                    }
+                }
+            }
+            release.send(()).unwrap();
+            held.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_ineligible_owned_pane_rows_do_not_read_busy_org() {
+        for (id, child, harness) in [
+            ("child", true, Harness::Pi),
+            ("old", false, Harness::Pi),
+            ("foreign", false, Harness::ClaudeCode),
+        ] {
+            let (gate, mut entered) = mpsc::channel(1);
+            let rig = Rig::gated(Some(("control.sent", gate))).await;
+            rig.agent("lead", Some("%1"), Some("old")).await;
+            rig.command(OrgCommand::Clear {
+                agent_id: "p/lead".parse().unwrap(),
+            })
+            .await;
+            rig.command(OrgCommand::EditorReady {
+                agent_id: "p/lead".parse().unwrap(),
+            })
+            .await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let mut events = agents.observation_events();
+            let org = rig.org.clone();
+            let held = tokio::spawn(async move {
+                org.execute(
+                    OrgCommand::ControlSent(atm_org::ControlAudit {
+                        pane: "%99".into(),
+                        action: json!({}),
+                    }),
+                    chrono::Utc::now(),
+                )
+                .await
+            });
+            let release = entered.recv().await.unwrap();
+            let mut row = SessionDomain::new(
+                SessionId::new(id),
+                AgentType::GeneralPurpose,
+                Model::default(),
+            );
+            row.harness = harness;
+            row.tmux_pane = Some("%1".into());
+            row.parent_session_id = child.then(|| SessionId::new("parent"));
+            rig.registry.register(row).await.unwrap();
+            loop {
+                let event = events.recv().await.unwrap();
+                assert_ne!(
+                    event.phase, "schedule_failed",
+                    "ineligible {id} row read stalled org"
+                );
+                if event.phase == "scheduled" {
+                    break;
+                }
+            }
             release.send(()).unwrap();
             held.await.unwrap().unwrap();
         }
@@ -924,6 +999,26 @@ mod reconciliation {
                 task.await.unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn review_runtime_clearing_is_not_restart_failure() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        rig.row("old", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.inspect_only("%1", "p/lead");
+        rig.row("fresh", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Clearing);
+        assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 0);
     }
 
     #[tokio::test]

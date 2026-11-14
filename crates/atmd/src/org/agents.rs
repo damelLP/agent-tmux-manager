@@ -684,7 +684,9 @@ fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> Harness {
         })
 }
 
-// One adapter dispatch boundary; all recognition stays in the adapter.
+// One adapter dispatch boundary; future lifecycle flows reuse this rather than
+// adding vendor branches. This base's adapters accept Plain/None; consuming their
+// styled capture policy waits for the adapter contract, not a local guess.
 fn screen(harness: Harness, text: &str) -> ScreenFacts {
     match harness {
         Harness::ClaudeCode => atm_claude_adapter::screen::observe_screen(text, None),
@@ -821,9 +823,26 @@ async fn dispatch_lifecycle(mut requests: mpsc::Receiver<LifecycleJob>, cancel: 
 }
 
 // Routing only: no OrgState/message history or cached readiness authority.
+struct AgentRoute {
+    pane: Option<String>,
+    binding: Option<SessionId>,
+    excluded: Option<SessionId>,
+    harness: Option<Harness>,
+}
+
+impl AgentRoute {
+    fn eligible(&self, row: &SessionView) -> bool {
+        self.pane.is_some()
+            && self.pane == row.tmux_pane
+            && row.parent_session_id.is_none()
+            && self.excluded.as_ref() != Some(&row.id)
+            && self.harness.is_none_or(|h| row.harness == h.short_tag())
+    }
+}
+
 #[derive(Default)]
 struct AgentRoutes {
-    agents: BTreeMap<AgentId, (Option<String>, Vec<SessionId>)>,
+    agents: BTreeMap<AgentId, AgentRoute>,
     rows: HashMap<SessionId, String>,
     dirty: bool,
 }
@@ -836,19 +855,20 @@ impl AgentRoutes {
             .map(|a| {
                 (
                     a.id.clone(),
-                    (
-                        a.pane.clone(),
-                        a.session_id
-                            .iter()
-                            .chain(a.excluded_session_id.iter())
-                            .cloned()
-                            .collect(),
-                    ),
+                    AgentRoute {
+                        pane: a.pane.clone(),
+                        binding: a.session_id.clone(),
+                        excluded: a.excluded_session_id.clone(),
+                        harness: a.role.as_ref().map(|r| r.config.harness),
+                    },
                 )
             })
             .collect();
-        self.rows
-            .retain(|_, pane| self.agents.values().any(|(p, _)| p.as_ref() == Some(pane)));
+        self.rows.retain(|id, pane| {
+            self.agents
+                .values()
+                .any(|a| a.pane.as_ref() == Some(pane) && a.excluded.as_ref() != Some(id))
+        });
         self.dirty = false;
     }
 
@@ -858,16 +878,17 @@ impl AgentRoutes {
         let affected = self
             .agents
             .iter()
-            .filter(|(_, (p, ids))| {
-                ids.contains(id)
-                    || p.as_ref()
-                        .is_some_and(|p| Some(p) == old.as_ref() || Some(p) == pane)
+            .filter(|(_, route)| {
+                route.excluded.as_ref() != Some(id)
+                    && (route.binding.as_ref() == Some(id)
+                        || route.pane.as_ref().is_some_and(|p| Some(p) == old.as_ref())
+                        || row.is_some_and(|row| route.eligible(row)))
             })
             .map(|(id, _)| id.clone())
             .collect();
-        if let Some(pane) =
-            pane.filter(|pane| self.agents.values().any(|(p, _)| p.as_ref() == Some(pane)))
-        {
+        if let Some(pane) = pane.filter(|_| {
+            row.is_some_and(|row| self.agents.values().any(|route| route.eligible(row)))
+        }) {
             self.rows.insert(id.clone(), pane.clone());
         }
         affected
@@ -897,7 +918,7 @@ impl AgentRoutes {
             Ok(SessionEvent::Updated { session }) => Ok(self.affected(&session.id, Some(&session))),
             Ok(SessionEvent::Removed { session_id, .. }) => Ok(self.affected(&session_id, None)),
             Ok(SessionEvent::Registered { session_id, .. }) => {
-                if self.agents.is_empty() {
+                if self.agents.values().all(|a| a.pane.is_none()) {
                     return Ok(BTreeSet::new());
                 }
                 // Registered has no pane. Look up only this row, before cloning
@@ -1121,4 +1142,55 @@ async fn schedule(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_fence_uses_commits_not_timestamps_and_refuses_lag() {
+        let agent = Agent {
+            id: "p/lead".parse().unwrap(),
+            role: None,
+            status: AgentStatus::Ready,
+            pane: Some("%1".into()),
+            session_id: None,
+            excluded_session_id: Some(SessionId::new("old")),
+            reason: None,
+            updated_at: chrono::Utc::now(),
+        };
+        for (kind, id, seq, valid) in [
+            ("agent.clear_requested", "p/lead", 11, false),
+            ("agent.down", "p/lead", 11, false),
+            ("agent.up_requested", "p/lead", 11, false),
+            ("agent.adopted", "p/lead", 11, false),
+            ("agent.editor_ready", "p/lead", 11, false),
+            ("agent.clear_requested", "p/other", 11, true),
+            ("msg.sent", "p/lead", 11, true),
+            ("agent.clear_requested", "p/lead", 10, true),
+        ] {
+            let (send, events) = broadcast::channel(1);
+            let mut candidate = BindingCandidate {
+                session: SessionId::new("fresh"),
+                pane: agent.pane.clone(),
+                binding: None,
+                excluded: agent.excluded_session_id.clone(),
+                cursor: 10,
+                events,
+            };
+            let event = Arc::new(crate::eventlog::Envelope {
+                seq,
+                ts: agent.updated_at,
+                kind: kind.into(),
+                body: serde_json::json!({"agent_id": id}),
+            });
+            send.send(event.clone()).unwrap();
+            assert_eq!(candidate.valid(&agent), valid, "{kind}/{id}/{seq}");
+            // Even unrelated events overflowing the bounded fence must refuse.
+            send.send(event.clone()).unwrap();
+            send.send(event).unwrap();
+            assert!(!candidate.valid(&agent));
+        }
+    }
 }

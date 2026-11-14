@@ -125,7 +125,7 @@ fn duplicate_exact_hooks_are_idempotent() {
     assert_eq!(e.receipt(id()).unwrap(), Some(receipt.clone()));
     e.acknowledge(id(), &receipt).unwrap();
     e.acknowledge(id(), &receipt).unwrap();
-    assert!(e.receipt(id()).unwrap().is_none());
+    assert!(matches!(e.receipt(id()), Err(MessageError::Unavailable(_))));
 }
 
 #[test]
@@ -232,59 +232,42 @@ async fn coalesced_wake_retains_receipt_and_receive_time() {
 }
 
 #[test]
-fn retention_caps_disable_instead_of_evicting_receipts() {
-    for resource in ["messages", "scopes", "sessions"] {
+fn capacity_refuses_without_evicting_or_disabling() {
+    for resource in ["messages", "scopes", "baseline"] {
         let e = armed();
         exact(&e);
-        let failure = match resource {
-            "messages" => {
-                for n in 1..=MAX_MESSAGES {
+        let refused = match resource {
+            "messages" => (1..=MAX_MESSAGES)
+                .map(|n| {
                     let id: MessageId = format!("m{}", n + 1000).parse().unwrap();
-                    let result = e.register(id, crate::org::message_delivery::inbox_reference(id));
-                    if result.is_err() {
-                        break;
-                    }
-                }
-                e.snapshot(id())
-            }
-            "scopes" => {
-                for n in 1..=MAX_SCOPES {
-                    let result = e.arm(AttemptScope {
+                    e.register(id, crate::org::message_delivery::inbox_reference(id))
+                })
+                .find_map(Result::err),
+            "scopes" => (1..=MAX_SCOPES)
+                .map(|n| {
+                    e.arm(AttemptScope {
                         attempt_seq: 124 + n as u64,
                         ..scope()
-                    });
-                    if result.is_err() {
-                        break;
-                    }
-                }
-                e.snapshot(id())
-            }
-            _ => {
-                for n in 0..MAX_SESSIONS {
-                    if e.observe_activity(&SessionId::new(format!("extra-{n}")), None)
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                e.snapshot(id())
-            }
+                    })
+                })
+                .find_map(Result::err),
+            _ => e
+                .arm(AttemptScope {
+                    attempt_seq: 125,
+                    excluded_sessions: (0..=MAX_SESSIONS)
+                        .map(|n| SessionId::new(format!("old-{n}")))
+                        .collect(),
+                    ..scope()
+                })
+                .err(),
         };
         assert!(
-            matches!(failure, Err(MessageError::Unavailable(_))),
+            matches!(refused, Some(MessageError::Unavailable(_))),
             "{resource}"
         );
-        assert!(matches!(e.receipt(id()), Err(MessageError::Unavailable(_))));
-        // A full store must not silently evict the retained confirmation.
-        assert!(e
-            .state
-            .lock()
-            .unwrap()
-            .messages
-            .get(&id())
-            .unwrap()
-            .receipt
-            .is_some());
+        // The refusal is the caller's alone: nothing is evicted, and the
+        // retained confirmation stays readable.
+        assert!(e.receipt(id()).unwrap().is_some(), "{resource}");
     }
 }
 
@@ -310,14 +293,116 @@ fn poisoning_disables_even_previously_retained_receipts() {
 fn stale_or_conflicting_arm_cannot_clear_landing() {
     let e = armed();
     exact(&e);
-    assert!(e
-        .arm(AttemptScope {
+    let before = e.snapshot(id()).unwrap();
+    for bad in [
+        // Same applied attempt, another pane.
+        AttemptScope {
             pane: PaneId::parse("%8").unwrap(),
             ..scope()
-        })
-        .is_err());
+        },
+        // An older attempt sequence.
+        AttemptScope {
+            attempt_seq: 100,
+            ..scope()
+        },
+        // Another recipient.
+        AttemptScope {
+            attempt_seq: 130,
+            recipient: "demo/other".parse().unwrap(),
+            ..scope()
+        },
+    ] {
+        assert!(matches!(e.arm(bad), Err(MessageError::Refused(_))));
+        assert_eq!(e.snapshot(id()).unwrap(), before);
+    }
+    assert!(before.probably_landed && before.receipt.is_some());
+}
+
+#[test]
+fn bad_arm_refuses_only_its_caller() {
+    let e = armed();
+    exact(&e);
+    let before = e.snapshot(id()).unwrap();
+    let other: MessageId = "m200".parse().unwrap();
+    e.register(other, "[m200] Read: atm inbox --id m200".into())
+        .unwrap();
+    for bad in [
+        // No applied DeliveryAttempted has sequence 0.
+        AttemptScope {
+            message_id: other,
+            attempt_seq: 0,
+            ..scope()
+        },
+        // A pending ID can never confirm.
+        AttemptScope {
+            message_id: other,
+            session_id: Some(SessionId::new("pending-42")),
+            ..scope()
+        },
+        // The bound session is in its own excluded baseline.
+        AttemptScope {
+            message_id: other,
+            excluded_sessions: HashSet::from([SessionId::new("session")]),
+            ..scope()
+        },
+    ] {
+        assert!(matches!(e.arm(bad), Err(MessageError::Refused(_))));
+    }
+    // m123 keeps its evidence, and m200 can still be armed properly.
+    assert_eq!(e.snapshot(id()).unwrap(), before);
+    let facts = e.snapshot(other).unwrap();
+    assert!(facts.receipt.is_none() && !facts.probably_landed);
+    e.arm(AttemptScope {
+        message_id: other,
+        ..scope()
+    })
+    .unwrap();
+}
+
+#[test]
+fn bad_register_refuses_only_its_caller() {
+    let e = armed();
+    exact(&e);
+    let other: MessageId = "m200".parse().unwrap();
+    for text in [
+        "[m123] Read: atm inbox --id m123",
+        "[m200]",
+        "[m200] Read: atm inbox --id m200\n",
+        "",
+    ] {
+        assert!(
+            matches!(
+                e.register(other, text.into()),
+                Err(MessageError::Refused(_))
+            ),
+            "{text:?}"
+        );
+    }
+    // Nothing was stored for m200, and m123 is untouched.
     assert!(matches!(
-        e.snapshot(id()),
+        e.arm(AttemptScope {
+            message_id: other,
+            ..scope()
+        }),
+        Err(MessageError::Unavailable(_))
+    ));
+    assert!(e.receipt(id()).unwrap().is_some());
+    e.register(other, "[m200] Read: atm inbox --id m200".into())
+        .unwrap();
+}
+
+#[test]
+fn receipt_of_unknown_id_is_unavailable() {
+    // Ok(None) would say "no receipt" about an attempt evidence knows nothing of.
+    let e = armed();
+    assert!(e.receipt(id()).unwrap().is_none());
+    let unknown: MessageId = "m999".parse().unwrap();
+    assert!(matches!(
+        e.receipt(unknown),
+        Err(MessageError::Unavailable(_))
+    ));
+    assert!(matches!(
+        e.snapshot(unknown),
         Err(MessageError::Unavailable(_))
     ));
 }

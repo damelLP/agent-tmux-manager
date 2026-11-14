@@ -120,16 +120,22 @@ impl MessageEvidence {
     }
 
     /// Register the one shared reference, never the body or a token substring.
+    /// A wrong text or a full store refuses this caller only: nothing is stored
+    /// or evicted, and no input may follow a failed registration.
     pub fn register(&self, id: MessageId, expected_prompt: String) -> Result<(), MessageError> {
         let mut state = self.state()?;
         if expected_prompt != super::message_delivery::inbox_reference(id) {
-            return Err(self.disable(&mut state, "message reference does not match its ID"));
+            return Err(MessageError::Refused(
+                "message reference does not match its ID".into(),
+            ));
         }
         if state.messages.contains_key(&id) {
             return Ok(());
         }
         if state.messages.len() >= MAX_MESSAGES {
-            return Err(self.disable(&mut state, "message evidence reference capacity exhausted"));
+            return Err(MessageError::Unavailable(
+                "message evidence reference capacity exhausted".into(),
+            ));
         }
         state.messages.insert(
             id,
@@ -143,6 +149,8 @@ impl MessageEvidence {
         Ok(())
     }
 
+    /// A stale, inconsistent or ineligible scope, or a full store, refuses this
+    /// caller only and leaves every retained scope, latch and receipt as it was.
     pub fn arm(&self, scope: AttemptScope) -> Result<(), MessageError> {
         let mut state = self.state()?;
         let entry = state
@@ -156,7 +164,9 @@ impl MessageEvidence {
             if scope.attempt_seq <= last.identity.attempt_seq
                 || scope.recipient != last.identity.recipient
             {
-                return Err(self.disable(&mut state, "message attempt scope is inconsistent"));
+                return Err(MessageError::Refused(
+                    "message attempt scope is inconsistent".into(),
+                ));
             }
         }
         if scope.attempt_seq == 0
@@ -165,10 +175,14 @@ impl MessageEvidence {
                 .as_ref()
                 .is_some_and(|id| id.is_pending() || scope.excluded_sessions.contains(id))
         {
-            return Err(self.disable(&mut state, "message attempt scope is ineligible"));
+            return Err(MessageError::Refused(
+                "message attempt scope is ineligible".into(),
+            ));
         }
         if state.scopes >= MAX_SCOPES || scope.excluded_sessions.len() > MAX_SESSIONS {
-            return Err(self.disable(&mut state, "message evidence scope capacity exhausted"));
+            return Err(MessageError::Unavailable(
+                "message evidence scope capacity exhausted".into(),
+            ));
         }
         if let Some(entry) = state.messages.get_mut(&scope.message_id) {
             entry.scopes.push(Scope {
@@ -182,12 +196,10 @@ impl MessageEvidence {
         Ok(())
     }
 
+    /// An unknown or acknowledged ID is unavailable, as in `snapshot`: Ok(None)
+    /// could incorrectly authorize an automatic retry.
     pub fn receipt(&self, id: MessageId) -> Result<Option<DeliveryReceipt>, MessageError> {
-        Ok(self
-            .state()?
-            .messages
-            .get(&id)
-            .and_then(|entry| entry.receipt.clone()))
+        self.snapshot(id).map(|facts| facts.receipt)
     }
 
     pub fn snapshot(&self, id: MessageId) -> Result<AttemptEvidence, MessageError> {

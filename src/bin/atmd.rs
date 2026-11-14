@@ -108,11 +108,17 @@ fn remove_pid_file(state_dir: &Path) {
 
 fn proc_stat_has_exited(stat: &str) -> bool {
     // comm may contain spaces and ')'; the state follows its final delimiter.
-    matches!(
-        stat.rsplit_once(')')
-            .and_then(|(_, fields)| fields.split_whitespace().next()),
-        Some("Z" | "X" | "x")
-    )
+    let Some((_, fields)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let mut fields = fields.split_whitespace();
+    match fields.next() {
+        Some("X" | "x") => true,
+        // The leader is Z as soon as it exits, while the group's other threads
+        // may still be exiting: only num_threads (field 20) == 1 is all of it.
+        Some("Z") => fields.nth(16) == Some("1"),
+        _ => false,
+    }
 }
 
 fn is_process_running(pid: u32) -> bool {
@@ -538,6 +544,36 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // Captured: Linux 7.2.14 procfs, 2026-11-14, a leader that called
+    // pthread_exit while one worker slept, under a parent that does not reap.
+    // Read before and after the worker exited; the process's pidfd became
+    // readable only after, when num_threads (field 20) dropped to 1.
+    const ZOMBIE_LEADER_LIVE_THREAD: &str = "614980 (z) Z 614974 614970 614970 0 -1 4227084 78 0 0 0 0 0 0 0 20 0 2 0 58947771 0 0 18446744073709551615 0 0 0 0 0 0 2147221247 0 0 0 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0";
+    const ZOMBIE_WHOLE_GROUP: &str = "614980 (z) Z 614974 614970 614970 0 -1 4227084 81 0 0 0 0 0 0 0 20 0 1 0 58947771 0 0 18446744073709551615 0 0 0 0 0 0 2147221247 0 0 1 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0";
+
+    /// The captured whole-group line with another name, state and thread count.
+    fn stat(comm: &str, state: &str, threads: &str) -> String {
+        let (_, fields) = ZOMBIE_WHOLE_GROUP.rsplit_once(')').unwrap();
+        let mut fields: Vec<&str> = fields.split_whitespace().collect();
+        fields[0] = state;
+        fields[17] = threads;
+        format!("614980 ({comm}) {}", fields.join(" "))
+    }
+
+    // The leader turns Z the moment it exits, while the group's other threads
+    // may still be exiting; stop reported success in that window under load.
+    #[test]
+    fn zombie_leader_has_not_exited_while_other_threads_live() {
+        assert!(!proc_stat_has_exited(ZOMBIE_LEADER_LIVE_THREAD));
+        assert!(proc_stat_has_exited(ZOMBIE_WHOLE_GROUP));
+        for threads in ["2", "17", "0", "-1", "one"] {
+            assert!(
+                !proc_stat_has_exited(&stat("atmd", "Z", threads)),
+                "num_threads {threads}"
+            );
+        }
+    }
+
     // Counting zombies as running breaks stop; counting stopped tasks as dead
     // would let startup ignore a still-live daemon's PID.
     #[test]
@@ -555,7 +591,7 @@ mod tests {
             ("?", false),
         ] {
             assert_eq!(
-                proc_stat_has_exited(&format!("123 (atmd) {state} 1 2 3")),
+                proc_stat_has_exited(&stat("atmd", state, "1")),
                 exited,
                 "state {state}"
             );
@@ -565,12 +601,12 @@ mod tests {
     #[test]
     fn proc_stat_state_follows_the_last_name_delimiter() {
         for (stat, exited) in [
-            ("123 (name with spaces) Z 1 2 3", true),
-            ("123 ((name) with spaces) X 1 2 3", true),
-            ("123 (name) Z still name) S 1 2 3", false),
-            ("123 (name\nwith ) parentheses) x 1 2 3", true),
+            (stat("name with spaces", "Z", "1"), true),
+            (stat("(name) with spaces", "X", "1"), true),
+            (stat("name) Z still name", "S", "1"), false),
+            (stat("name\nwith ) parentheses", "x", "1"), true),
         ] {
-            assert_eq!(proc_stat_has_exited(stat), exited, "{stat:?}");
+            assert_eq!(proc_stat_has_exited(&stat), exited, "{stat:?}");
         }
     }
 
@@ -583,6 +619,8 @@ mod tests {
             "123 (atmd)   \n",
             "123 (atmd) unknown 1 2 3",
             "123 (atmd) Zombie 1 2 3",
+            // A zombie without its thread count does not prove the group exited.
+            "123 (atmd) Z 1 2 3",
         ] {
             assert!(!proc_stat_has_exited(stat), "{stat:?}");
         }

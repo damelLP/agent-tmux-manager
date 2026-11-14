@@ -314,6 +314,28 @@ async fn json_preserves_additive_result_entry_and_delivery_fields() {
 }
 
 #[tokio::test]
+async fn json_escapes_del_and_c1_without_changing_values() {
+    let controls: String = ('\u{7f}'..='\u{9f}').collect();
+    let mut result =
+        json!({"messages":[inbox_entry(&controls)],"unread_count":1,"next_after":null});
+    result[&controls] = json!(controls);
+    let out = run(
+        &["inbox", "--format", "json"],
+        None,
+        vec![ok("msg.inbox", inbox(), result.clone())],
+        true,
+    )
+    .await;
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !text.chars().any(|c| ('\u{7f}'..='\u{9f}').contains(&c)),
+        "{text:?}"
+    );
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), result);
+    assert!(text.contains("\\u007f") && text.contains("\\u009b") && text.contains("\\u009f"));
+}
+
+#[tokio::test]
 async fn json_still_validates_known_result_fields() {
     for (args, method, params) in [
         (

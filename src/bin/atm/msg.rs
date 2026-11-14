@@ -185,7 +185,17 @@ fn output<R: Serialize>(
     out: &mut impl Write,
 ) -> Result<()> {
     match format {
-        MessageFormat::Json => writeln!(out, "{}", serde_json::to_string(result)?)?,
+        MessageFormat::Json => {
+            // serde_json escapes C0; also neutralize DEL/C1 for terminal readers.
+            for c in serde_json::to_string(result)?.chars() {
+                if ('\u{7f}'..='\u{9f}').contains(&c) {
+                    write!(out, "\\u{:04x}", u32::from(c))?;
+                } else {
+                    write!(out, "{c}")?;
+                }
+            }
+            writeln!(out)?;
+        }
         MessageFormat::Text => writeln!(out, "{text}")?,
     }
     Ok(())

@@ -335,7 +335,9 @@ drafts use normal attributes. Modal text never becomes an editor draft. Diagnost
 and suppressed hooks remain in event records, not invented screen chrome.
 
 `config.columns/rows` default to 120x40 and establish the private window size
-before launch. `screen_variant` defaults to `u5`; choose `rich-enabled`/`poor`
+before launch. A stand-in draws at its launch size: do not resize or split its
+pane after launch (split another pane instead). SIGWINCH is not handled and the
+minimum size is not rechecked after a resize. `screen_variant` defaults to `u5`; choose `rich-enabled`/`poor`
 for Claude or `rich`/`poor` for Codex at 100x30. Native geometry wins over a variant
 from another size. `screen_variant = "values"` (JSON `SCREEN_VARIANT`) selects
 Synthetic value-only variation: equal-width version/model substitutions, another

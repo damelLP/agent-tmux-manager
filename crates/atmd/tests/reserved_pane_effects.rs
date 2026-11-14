@@ -394,9 +394,11 @@ async fn reserved_missing_is_positive_and_transport_errors_are_not_absence() {
                     r.capture(&pane(), CaptureFormat::Plain).await,
                     Err(ReservationError::PaneGone { .. })
                 ));
-                let error = r.inspect(&pane()).await.unwrap_err().to_string();
+                let error = r.inspect(&pane()).await.unwrap_err();
+                assert!(matches!(error, ReservationError::Control(_)), "{error:?}");
+                let message = error.to_string();
                 assert!(
-                    error.contains("%0") && error.contains("read pane metadata"),
+                    message.contains("%0") && message.contains("read pane metadata"),
                     "{error}"
                 );
                 Ok(())

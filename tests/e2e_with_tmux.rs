@@ -86,6 +86,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -104,8 +105,6 @@ mod role_support;
 const HANG_GUARD: Duration = Duration::from_secs(60);
 const SOCKET_WAIT_TIMEOUT: Duration = HANG_GUARD;
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const SESSION_APPEAR_TIMEOUT: Duration = Duration::from_secs(2);
-const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Wait on SIGCHLD, not elapsed time. Subscribe before checking the child so
 /// an exit between try_wait and recv is retained. Every wake uses the same guard.
 fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
@@ -168,6 +167,39 @@ fn command_output(command: &mut Command) -> Output {
         }),
         stdout: out,
         stderr: err,
+    }
+}
+
+/// Kernel fd readiness is an event; poll(2) blocks, without a timer retry loop.
+fn readable(fd: RawFd, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "readiness guard expired"))?;
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // fd is borrowed from an open listener/FIFO throughout this call.
+        let result = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                remaining.as_millis().max(1).try_into().unwrap_or(i32::MAX),
+            )
+        };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -849,13 +881,13 @@ async fn scenario_atm_list_client(env: &E2eEnv, expected_session_id: &str) {
     // XDG_STATE_HOME so its `ensure_daemon_running` check (which reads the
     // PID file) sees the daemon we already started — preventing it from
     // spawning a second one.
-    let output = Command::new(&env.atm_path)
-        .args(["list", "--format", "json"])
-        .env("ATM_SOCKET", &env.daemon.socket_path)
-        .env("XDG_STATE_HOME", &env.daemon.state_dir)
-        .env("ATM_TMUX_SOCKET", env.tmux_server.label())
-        .output()
-        .expect("run atm list");
+    let output = command_output(
+        Command::new(&env.atm_path)
+            .args(["list", "--format", "json"])
+            .env("ATM_SOCKET", &env.daemon.socket_path)
+            .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_TMUX_SOCKET", env.tmux_server.label()),
+    );
 
     assert!(
         output.status.success(),
@@ -1509,20 +1541,20 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     let create_socket_label = format!("atm-{create_session_name}");
     let create_data_dir = awkward_data_dir();
 
-    let create_output = Command::new(&env.atm_path)
-        .args([
-            "workspace",
-            "create",
-            "--name",
-            &create_session_name,
-            "--isolate",
-        ])
-        .env("ATM_NO_ATTACH", "1")
-        .env("XDG_DATA_HOME", create_data_dir.path())
-        .env("XDG_STATE_HOME", &env.daemon.state_dir)
-        .env("ATM_SOCKET", &env.daemon.socket_path)
-        .output()
-        .expect("run atm workspace create");
+    let create_output = command_output(
+        Command::new(&env.atm_path)
+            .args([
+                "workspace",
+                "create",
+                "--name",
+                &create_session_name,
+                "--isolate",
+            ])
+            .env("ATM_NO_ATTACH", "1")
+            .env("XDG_DATA_HOME", create_data_dir.path())
+            .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_SOCKET", &env.daemon.socket_path),
+    );
     assert!(
         create_output.status.success(),
         "atm workspace create failed: stdout={} stderr={}",
@@ -1683,29 +1715,13 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         )
         .expect("resize first pane to 30%");
     }
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    loop {
-        let width = tmux_run_capture(
-            create_tmux.label(),
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                &sidebar_pane,
-                "#{pane_width}",
-            ],
-        )
-        .expect("read sidebar width after teammate spawn");
-        if width.trim() == expected_width.to_string() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "after-resize-pane hook should restore sidebar width {expected_width} after Claude's rebalance; got {}",
-            width.trim()
-        );
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
-    }
+    // Non-background run-shell hooks finish before the triggering command
+    // returns, including nested resize hooks (verified on tmux 3.6 and 3.8).
+    assert_eq!(
+        sidebar_width().trim(),
+        expected_width.to_string(),
+        "after-resize-pane hook should restore sidebar width after Claude's rebalance"
+    );
 
     // Below-target widths are restored too when attainable: in windows under
     // ~67 cols Claude's 30% is narrower than the 20-col minimum target.
@@ -1724,15 +1740,11 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         &["resize-pane", "-t", &sidebar_pane, "-x", &narrow_width],
     )
     .expect("narrow sidebar below target");
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    while read_sidebar("#{pane_width}") != expected_width.to_string() {
-        assert!(
-            Instant::now() < deadline,
-            "after-resize-pane hook should restore a below-target sidebar to {expected_width}; got {}",
-            read_sidebar("#{pane_width}")
-        );
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
-    }
+    assert_eq!(
+        read_sidebar("#{pane_width}"),
+        expected_width.to_string(),
+        "after-resize-pane hook should restore a below-target sidebar"
+    );
 
     // A window too narrow for the target width: the hook's own resize-pane
     // re-fires it, so it must give up after its retry cap instead of looping.
@@ -1741,20 +1753,25 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         &["resize-window", "-t", &create_session_name, "-x", "15"],
     )
     .expect("shrink window below sidebar minimum");
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    while read_sidebar("#{@atm-sidebar-tries}")
-        .parse::<u32>()
-        .unwrap_or(0)
-        < 5
-    {
-        assert!(
-            Instant::now() < deadline,
-            "hook should reach its retry cap in a too-small window; tries={}",
-            read_sidebar("#{@atm-sidebar-tries}")
-        );
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
-    }
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        read_sidebar("#{@atm-sidebar-tries}"),
+        "5",
+        "hook should reach its retry cap in a too-small window"
+    );
+    // The recursive hook chain has exited. Deliberately re-enter at the cap:
+    // completion, rather than a quiet second, proves another trigger cannot
+    // keep incrementing the counter. A cap-of-six disposable mutant fails this.
+    tmux_run_capture(
+        create_tmux.label(),
+        &[
+            "resize-pane",
+            "-t",
+            &sidebar_pane,
+            "-x",
+            &expected_width.to_string(),
+        ],
+    )
+    .expect("re-enter the resize hook at its cap");
     assert_eq!(
         read_sidebar("#{@atm-sidebar-tries}"),
         "5",
@@ -1772,15 +1789,11 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         ],
     )
     .expect("restore window width");
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    while read_sidebar("#{pane_width}:#{@atm-sidebar-tries}") != format!("{expected_width}:") {
-        assert!(
-            Instant::now() < deadline,
-            "sidebar should recover (width:tries) after the window grows; got {}",
-            read_sidebar("#{pane_width}:#{@atm-sidebar-tries}")
-        );
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
-    }
+    assert_eq!(
+        read_sidebar("#{pane_width}:#{@atm-sidebar-tries}"),
+        format!("{expected_width}:"),
+        "sidebar should recover (width:tries) after the window grows"
+    );
 
     // Regression: prefix-a must focus the sidebar even after a layout
     // change moves it away from pane index 0.
@@ -1845,31 +1858,21 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     ]);
     run_tmux_or_panic(&mut cmd, "new-window after workspace create");
 
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    loop {
-        let panes = list_panes_with_sidebar_marker(create_tmux.label())
-            .expect("list panes after create new-window");
-        let mut windows_with_sidebar: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        for entry in &panes {
-            if entry.is_sidebar {
-                *windows_with_sidebar
-                    .entry(entry.window_id.clone())
-                    .or_insert(0) += 1;
-            }
+    let panes = list_panes_with_sidebar_marker(create_tmux.label())
+        .expect("list panes after create new-window");
+    let mut windows_with_sidebar: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    for entry in &panes {
+        if entry.is_sidebar {
+            *windows_with_sidebar
+                .entry(entry.window_id.clone())
+                .or_insert(0) += 1;
         }
-
-        if windows_with_sidebar.len() == 2 && windows_with_sidebar.values().all(|count| *count == 1)
-        {
-            break;
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "new window should receive exactly one sidebar via after-new-window hook; panes: {panes:?}"
-        );
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
     }
+    assert!(
+        windows_with_sidebar.len() == 2 && windows_with_sidebar.values().all(|count| *count == 1),
+        "new window should receive exactly one sidebar via after-new-window hook; panes: {panes:?}"
+    );
 }
 
 /// Scenario 5b — `atm workspace attach` against a separate isolated
@@ -1920,14 +1923,14 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
         "expected 3 windows in the simulated workspace, got {pre_attach_window_count}"
     );
 
-    let attach_output = Command::new(&env.atm_path)
-        .args(["workspace", "attach", &attach_session_name, "--isolate"])
-        .env("ATM_NO_ATTACH", "1")
-        .env("XDG_DATA_HOME", attach_data_dir.path())
-        .env("XDG_STATE_HOME", &env.daemon.state_dir)
-        .env("ATM_SOCKET", &env.daemon.socket_path)
-        .output()
-        .expect("run atm workspace attach");
+    let attach_output = command_output(
+        Command::new(&env.atm_path)
+            .args(["workspace", "attach", &attach_session_name, "--isolate"])
+            .env("ATM_NO_ATTACH", "1")
+            .env("XDG_DATA_HOME", attach_data_dir.path())
+            .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_SOCKET", &env.daemon.socket_path),
+    );
     assert!(
         attach_output.status.success(),
         "atm workspace attach failed: stdout={} stderr={}",
@@ -2036,14 +2039,14 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
 
     // Idempotency: running attach a second time must NOT add another
     // sidebar to any window. The production code keys off `@atm-sidebar`.
-    let attach_output_2 = Command::new(&env.atm_path)
-        .args(["workspace", "attach", &attach_session_name, "--isolate"])
-        .env("ATM_NO_ATTACH", "1")
-        .env("XDG_DATA_HOME", attach_data_dir.path())
-        .env("XDG_STATE_HOME", &env.daemon.state_dir)
-        .env("ATM_SOCKET", &env.daemon.socket_path)
-        .output()
-        .expect("run atm workspace attach (second time)");
+    let attach_output_2 = command_output(
+        Command::new(&env.atm_path)
+            .args(["workspace", "attach", &attach_session_name, "--isolate"])
+            .env("ATM_NO_ATTACH", "1")
+            .env("XDG_DATA_HOME", attach_data_dir.path())
+            .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_SOCKET", &env.daemon.socket_path),
+    );
     assert!(
         attach_output_2.status.success(),
         "second attach failed: stderr={}",
@@ -2107,18 +2110,18 @@ async fn scenario_workspace_attach_autopick_rejects_unsupported_name(env: &E2eEn
     );
 
     let run_autopick_attach = || {
-        Command::new(&env.atm_path)
-            .args(["workspace", "attach"])
-            // With no name and no --isolate, attach uses the default server:
-            // a bogus $TMUX keeps a missed ATM_TMUX_SOCKET off the developer's.
-            .env("TMUX", "atm-e2e-fixture-no-real-tmux-here")
-            .env("ATM_TMUX_SOCKET", tmux.label())
-            .env("ATM_NO_ATTACH", "1")
-            .env("XDG_DATA_HOME", data_dir.path())
-            .env("XDG_STATE_HOME", &env.daemon.state_dir)
-            .env("ATM_SOCKET", &env.daemon.socket_path)
-            .output()
-            .expect("run atm workspace attach (no name)")
+        command_output(
+            Command::new(&env.atm_path)
+                .args(["workspace", "attach"])
+                // With no name and no --isolate, attach uses the default server:
+                // a bogus $TMUX keeps a missed ATM_TMUX_SOCKET off the developer's.
+                .env("TMUX", "atm-e2e-fixture-no-real-tmux-here")
+                .env("ATM_TMUX_SOCKET", tmux.label())
+                .env("ATM_NO_ATTACH", "1")
+                .env("XDG_DATA_HOME", data_dir.path())
+                .env("XDG_STATE_HOME", &env.daemon.state_dir)
+                .env("ATM_SOCKET", &env.daemon.socket_path),
+        )
     };
 
     let rejected = run_autopick_attach();
@@ -2358,9 +2361,12 @@ async fn scenario_workspace_create_rejects_unknown_harness(env: &E2eEnv) {
     };
     write_atm_config(config_home.path(), "[harness]\ndefault = 'nope'\n");
 
-    let output = workspace_create_command(env, &session_name, config_home.path(), data_dir.path())
-        .output()
-        .expect("run atm workspace create (unknown default)");
+    let output = command_output(&mut workspace_create_command(
+        env,
+        &session_name,
+        config_home.path(),
+        data_dir.path(),
+    ));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -2443,10 +2449,10 @@ async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
     .expect("join PATH");
 
     // config_home stays empty: no config.toml, so the built-in default applies.
-    let output = workspace_create_command(env, &session_name, config_home.path(), data_dir.path())
-        .env("PATH", &path)
-        .output()
-        .expect("run atm workspace create (no config)");
+    let output = command_output(
+        workspace_create_command(env, &session_name, config_home.path(), data_dir.path())
+            .env("PATH", &path),
+    );
     assert!(
         output.status.success(),
         "atm workspace create with no config failed: stdout={} stderr={}",
@@ -2522,22 +2528,22 @@ fn fake_tui_daemon(socket: &Path, sessions: Vec<SessionView>) -> mpsc::Receiver<
     let list = serde_json::to_string(&DaemonMessage::session_list(sessions)).expect("serialize");
     let (subscriber_tx, subscriber_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let stream = stream.expect("accept");
-            let mut reader = BufReader::new(&stream);
-            let mut line = String::new();
-            // `atm` first checks that something listens, then hangs up
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                continue;
+        let deadline = Instant::now() + HANG_GUARD;
+        loop {
+            readable(listener.as_raw_fd(), deadline).expect("TUI connection before guard");
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            // `atm` first checks that something listens, then hangs up.
+            match read_frame(&mut reader, deadline) {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,
+                result => {
+                    result.expect("TUI Connect");
+                }
             }
-            (&stream)
-                .write_all(format!("{connected}\n").as_bytes())
+            write_bytes(&mut stream, format!("{connected}\n").as_bytes(), deadline)
                 .expect("reply Connected");
-            // Read Subscribe
-            line.clear();
-            let _ = reader.read_line(&mut line);
-            (&stream)
-                .write_all(format!("{list}\n").as_bytes())
+            read_frame(&mut reader, deadline).expect("TUI Subscribe");
+            write_bytes(&mut stream, format!("{list}\n").as_bytes(), deadline)
                 .expect("reply SessionList");
             let _ = subscriber_tx.send(stream);
             return;
@@ -2577,6 +2583,57 @@ struct PreviewRig {
     socket_label: String,
     tui_pane: String,
     daemon: Option<UnixStream>,
+    capture_hold: PathBuf,
+}
+
+/// Only the TUI's private PATH uses this wrapper; the test's screen captures
+/// still reach real tmux. A lock stalls future capture replies, not the UI.
+fn preview_tmux_wrapper(dir: &Path, label: &str) -> PathBuf {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let real = shell_word(&tmux_on_path().unwrap().display().to_string());
+    let hold = shell_word(&dir.join("hold-capture").display().to_string());
+    let trace = shell_word(&dir.join("tmux-calls").display().to_string());
+    let label = shell_word(label);
+    role_support::executable(
+        &bin.join("tmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncapture=0\nfor arg do [ \"$arg\" = capture-pane ] && capture=1; done\n\
+         if [ \"$capture\" = 1 ] && [ -e {hold} ]; then\n\
+         {real} -L {label} wait-for -S preview-capture-blocked\n\
+         {real} -L {label} wait-for -L preview-capture-lock\n\
+         {real} -L {label} wait-for -U preview-capture-lock\nfi\nexec {real} \"$@\"\n"
+        ),
+    );
+    bin
+}
+
+fn shell_word(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn quiet_tmux(label: &str, args: &[&str]) {
+    if let Ok(mut child) = Command::new("tmux")
+        .args(["-L", label])
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        let _ = wait_child(&mut child, Instant::now() + HANG_GUARD);
+    }
+}
+
+struct CaptureHold {
+    label: String,
+    flag: PathBuf,
+}
+
+impl Drop for CaptureHold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.flag);
+        quiet_tmux(&self.label, &["wait-for", "-U", "preview-capture-lock"]);
+    }
 }
 
 impl Drop for PreviewRig {
@@ -2586,19 +2643,20 @@ impl Drop for PreviewRig {
     /// end, so EOF here means it's gone, zombie or not. A TUI that never
     /// subscribed gets only the pane's hangup.
     fn drop(&mut self) {
-        let tmux = |args: &[&str]| {
-            let _ = Command::new("tmux")
-                .args(["-L", self.socket_label.as_str()])
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        };
+        let tmux = |args: &[&str]| quiet_tmux(&self.socket_label, args);
         tmux(&["kill-pane", "-t", self.tui_pane.as_str()]);
         if let Some(daemon) = &mut self.daemon {
-            let _ = daemon.set_read_timeout(Some(PREVIEW_STEP_TIMEOUT));
+            let deadline = Instant::now() + HANG_GUARD;
             let mut buf = [0u8; 1024];
             loop {
+                let Some(remaining) = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|left| !left.is_zero())
+                else {
+                    eprintln!("the TUI outlived its pane's hang guard");
+                    break;
+                };
+                let _ = daemon.set_read_timeout(Some(remaining));
                 match daemon.read(&mut buf) {
                     Ok(0) => break,
                     Ok(_) => {}
@@ -2615,6 +2673,37 @@ impl Drop for PreviewRig {
 }
 
 impl PreviewRig {
+    fn hold_captures(&self) -> CaptureHold {
+        let calls = self.capture_hold.with_file_name("tmux-calls");
+        assert!(
+            calls.exists(),
+            "TUI did not use its private tmux wrapper; environment: {}",
+            tmux_stdout(
+                &self.socket_label,
+                &["show-environment", "-t", "preview-tui", "PATH"]
+            )
+        );
+        let deadline = Instant::now() + HANG_GUARD;
+        tmux_stdout(
+            &self.socket_label,
+            &["wait-for", "-L", "preview-capture-lock"],
+        );
+        let hold = CaptureHold {
+            label: self.socket_label.clone(),
+            flag: self.capture_hold.clone(),
+        };
+        std::fs::write(&hold.flag, "hold").unwrap();
+        wait_for_signal(&self.socket_label, "preview-capture-blocked", deadline).unwrap_or_else(
+            |error| {
+                panic!(
+                    "the TUI's next capture entered the test barrier: {error}; calls: {}",
+                    std::fs::read_to_string(calls).unwrap_or_default()
+                )
+            },
+        );
+        hold
+    }
+
     fn screen(&self) -> String {
         tmux_stdout(
             &self.socket_label,
@@ -2631,11 +2720,12 @@ impl PreviewRig {
 
     fn send(&mut self, message: &DaemonMessage) {
         let line = serde_json::to_string(message).expect("serialize");
-        self.daemon
-            .as_mut()
-            .expect("the TUI subscribed")
-            .write_all(format!("{line}\n").as_bytes())
-            .expect("write to the TUI");
+        write_bytes(
+            self.daemon.as_mut().expect("the TUI subscribed"),
+            format!("{line}\n").as_bytes(),
+            Instant::now() + HANG_GUARD,
+        )
+        .expect("write to the TUI");
     }
 
     /// Waits until the screen satisfies `done`, panicking with the screen at
@@ -2651,6 +2741,8 @@ impl PreviewRig {
                 start.elapsed() < PREVIEW_STEP_TIMEOUT,
                 "{step}: timed out, screen:\n{screen}"
             );
+            // The TUI has no semantic render acknowledgment; a daemon write
+            // or tmux output event cannot prove this screen predicate is true.
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -2676,7 +2768,7 @@ impl PreviewRig {
 fn start_preview_panes(label: &str) -> Vec<String> {
     let mut panes = Vec::new();
     for (i, marker) in PREVIEW_MARKERS.iter().enumerate() {
-        let print_and_stay = format!("echo {marker}; exec sleep 600");
+        let print_and_stay = format!("echo {marker}; exec cat >/dev/null");
         let mut args: Vec<&str> = if i == 0 {
             vec!["new-session", "-d", "-s", "preview-agents"]
         } else {
@@ -2700,6 +2792,12 @@ fn start_preview_tui(
     let label = env.tmux_server.label();
     let socket = dir.join("atmd.sock");
     let subscriber = fake_tui_daemon(&socket, sessions);
+    let wrapper = preview_tmux_wrapper(dir, label);
+    let path_env = format!(
+        "PATH={}:{}",
+        wrapper.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     // A window as big as the session asks for, so the preview has room.
     let socket_env = format!("ATM_SOCKET={}", socket.display());
@@ -2725,6 +2823,9 @@ fn start_preview_tui(
         "-F",
         "#{pane_id}",
         "env",
+        // tmux overwrites PATH for a new pane with its client's PATH, even
+        // with new-session -e PATH=... (verified 3.8). Set it at exec instead.
+        &path_env,
         &atm_path,
     ];
     args.extend_from_slice(atm_args);
@@ -2733,6 +2834,7 @@ fn start_preview_tui(
         socket_label: label.to_string(),
         tui_pane,
         daemon: None,
+        capture_hold: dir.join("hold-capture"),
     };
     let daemon = subscriber
         .recv_timeout(PREVIEW_STEP_TIMEOUT)
@@ -2765,24 +2867,24 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
     rig.press("j");
     rig.wait_for_preview("key to session-b", PREVIEW_MARKERS[1]);
 
-    // An update that keeps the selected pane leaves the preview alone: it
-    // must not blank until the next capture, which a poll would catch.
-    let start = Instant::now();
-    let mut sent = Duration::ZERO;
-    while start.elapsed() < Duration::from_millis(1500) {
-        if start.elapsed() >= sent {
-            rig.send(&DaemonMessage::session_updated(preview_session_b(Some(
-                pane_b,
-            ))));
-            sent += Duration::from_millis(150);
+    // Hold the replacement capture, then acknowledge processing of the update
+    // through a changed detail value. A clear-on-update bug cannot be hidden by
+    // a fast subsequent capture, nor by sampling the screen too late.
+    let hold = rig.hold_captures();
+    let mut updated = preview_session_b(Some(pane_b));
+    updated.working_directory = Some("same-pane-ack".into());
+    rig.send(&DaemonMessage::session_updated(updated));
+    rig.wait_until("same-pane update applied", |screen| {
+        if !screen.contains("same-pane-ack") {
+            return false;
         }
-        let screen = rig.screen();
         assert!(
             screen.contains(PREVIEW_MARKERS[1]),
             "same-pane update blanked the preview, screen:\n{screen}"
         );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        true
+    });
+    drop(hold);
 
     // A session update, with no key: the selected session moved pane.
     rig.send(&DaemonMessage::session_updated(preview_session_b(Some(
@@ -2874,10 +2976,7 @@ async fn scenario_tui_capture_preview_filter(env: &E2eEnv) {
     let label = env.tmux_server.label();
     let panes = start_preview_panes(label);
     let [pane_a, pane_b, pane_c] = [&panes[0], &panes[1], &panes[2]].map(String::as_str);
-    tmux_stdout(
-        label,
-        &["new-session", "-d", "-s", "preview-hold", "sleep", "600"],
-    );
+    tmux_stdout(label, &["new-session", "-d", "-s", "preview-hold", "cat"]);
     let hide = |pane: &str| {
         tmux_stdout(
             label,
@@ -3051,17 +3150,14 @@ struct PaneEntry {
 /// `@atm-sidebar` option value. Avoids `RealTmuxClient::list_panes`
 /// because we need the option, not just the standard fields.
 fn list_panes_with_sidebar_marker(socket_label: &str) -> Option<Vec<PaneEntry>> {
-    let output = Command::new("tmux")
-        .args([
-            "-L",
-            socket_label,
-            "list-panes",
-            "-a",
-            "-F",
-            "#{window_id}|#{pane_id}|#{@atm-sidebar}",
-        ])
-        .output()
-        .ok()?;
+    let output = command_output(Command::new("tmux").args([
+        "-L",
+        socket_label,
+        "list-panes",
+        "-a",
+        "-F",
+        "#{window_id}|#{pane_id}|#{@atm-sidebar}",
+    ]));
     if !output.status.success() {
         return None;
     }
@@ -3091,13 +3187,47 @@ fn awkward_data_dir() -> TempDir {
         .expect("create workspace data tempdir")
 }
 
+struct ControlClient {
+    child: Child,
+    reader: BufReader<UnixStream>,
+    deadline: Instant,
+}
+
+impl ControlClient {
+    fn until(&mut self, done: impl Fn(&str) -> bool) -> String {
+        loop {
+            let line = read_frame(&mut self.reader, self.deadline)
+                .expect("control-mode completion before the operation guard");
+            assert!(
+                !line.starts_with("%error ") && !line.starts_with("%exit"),
+                "{line}"
+            );
+            if done(&line) {
+                return line;
+            }
+        }
+    }
+}
+
+impl Drop for ControlClient {
+    fn drop(&mut self) {
+        self.child.stdin.take();
+        if std::thread::panicking() {
+            let _ = self.child.kill();
+        }
+        let _ = wait_child(&mut self.child, Instant::now() + HANG_GUARD);
+    }
+}
+
 /// Presses prefix-`key` as if typed, through a control-mode client attached
 /// to `session`, and keeps the client until `done` or a deadline: the
 /// binding runs in that client's queue. Running the binding's `list-keys`
 /// line instead would re-parse tmux's printed form, and tmux 3.4 prints a
 /// `$` in it as `\\$`.
 async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: impl Fn() -> bool) {
-    let mut client = Command::new("tmux")
+    let deadline = Instant::now() + HANG_GUARD;
+    let (reader, writer) = UnixStream::pair().expect("control output socketpair");
+    let child = Command::new("tmux")
         .args([
             "-L",
             socket_label,
@@ -3107,50 +3237,46 @@ async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: im
             &format!("={session}:"),
         ])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
         .stderr(Stdio::null())
         .spawn()
         .expect("attach a control client");
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    let name = loop {
-        let clients = tmux_run_capture(
-            socket_label,
-            &[
-                "list-clients",
-                "-F",
-                "#{client_control_mode} #{client_name}",
-            ],
-        )
-        .unwrap_or_default();
-        if let Some(name) = clients.lines().find_map(|line| line.strip_prefix("1 ")) {
-            break name.to_string();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "control client should attach; clients: {clients}"
-        );
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    let mut client = ControlClient {
+        child,
+        reader: BufReader::new(reader),
+        deadline,
     };
+    client.until(|line| line.starts_with("%session-changed "));
+    // Query through the attached client, not list-clients polling from outside.
+    client
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"list-clients -F \"#{client_control_mode} #{client_name}\"\n")
+        .unwrap();
+    let name = client.until(|line| line.starts_with("1 "));
+    let name = name.trim().strip_prefix("1 ").unwrap();
+    client.until(|line| line.starts_with("%end "));
     // The server may have loaded the developer's ~/.tmux.conf.
     let prefix = tmux_run_capture(socket_label, &["show-options", "-gv", "prefix"])
         .expect("read the prefix key");
     tmux_run_capture(
         socket_label,
-        &["send-keys", "-K", "-c", &name, prefix.trim(), key],
+        &["send-keys", "-K", "-c", name, prefix.trim(), key],
     )
     .expect("press the prefix key");
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    while !done() && Instant::now() < deadline {
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    // Layout events are retained in the socket even if the key completed
+    // before we started reading. Recheck the semantic condition on each event.
+    while !done() {
+        client.until(|line| line.starts_with("%layout-change "));
     }
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// Whether the `tmux` on PATH is at least `major.minor`. A version tmux
 /// prints without numbers (a `master` build) counts as new.
 fn tmux_version_at_least(major: u32, minor: u32) -> bool {
-    let output = Command::new("tmux").arg("-V").output().expect("tmux -V");
+    let output = command_output(Command::new("tmux").arg("-V"));
     let version = String::from_utf8_lossy(&output.stdout);
     let numbers: Vec<u32> = version
         .split_whitespace()
@@ -3177,7 +3303,7 @@ fn tmux_run_capture(socket_label: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("tmux");
     cmd.args(["-L", socket_label]);
     cmd.args(args);
-    let output = cmd.output().ok()?;
+    let output = command_output(&mut cmd);
     if !output.status.success() {
         return None;
     }

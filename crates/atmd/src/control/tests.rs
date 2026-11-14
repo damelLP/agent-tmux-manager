@@ -314,6 +314,372 @@ async fn typing_failure_does_not_submit_the_command() {
 }
 
 #[test]
+fn spawn_override_prefers_nonempty_specific_value_without_trimming() {
+    for (specific, global, expected) in [
+        (None, None, None),
+        (Some("specific"), Some("global"), Some("specific")),
+        (None, Some("global"), Some("global")),
+        (Some(""), Some("global"), Some("global")),
+        (Some(""), Some(""), None),
+        (None, Some(""), None),
+        (Some("specific"), None, Some("specific")),
+        (Some("   "), Some("global"), Some("   ")),
+        (None, Some("  global  "), Some("  global  ")),
+    ] {
+        let env = std::collections::HashMap::from([
+            ("ATM_SPAWN_CLAUDE_BIN", specific),
+            ("ATM_SPAWN_BIN", global),
+        ]);
+        assert_eq!(
+            super::spawn_env_override("claude", "BIN", |key| {
+                env.get(key).copied().flatten().map(str::to_string)
+            })
+            .as_deref(),
+            expected,
+            "specific={specific:?}, global={global:?}"
+        );
+    }
+}
+
+#[test]
+fn spawn_override_normalizes_harness_ids_and_selects_each_suffix_independently() {
+    let env = std::collections::HashMap::from([
+        ("ATM_SPAWN_MY_AGENT_BIN", "custom"),
+        ("ATM_SPAWN_BIN", "global"),
+        ("ATM_SPAWN_ARGS", "global args"),
+        ("ATM_SPAWN_PI_ARGS", "  x pi  "),
+    ]);
+    for (harness, suffix, expected) in [
+        ("my-agent", "BIN", "custom"),
+        ("my-agent", "ARGS", "global args"),
+        ("pi", "BIN", "global"),
+        ("pi", "ARGS", "  x pi  "),
+    ] {
+        assert_eq!(
+            super::spawn_env_override(harness, suffix, |key| {
+                env.get(key).map(|value| (*value).to_string())
+            })
+            .as_deref(),
+            Some(expected),
+            "{harness} {suffix}"
+        );
+    }
+}
+
+#[test]
+fn spawn_override_whitespace_args_mask_global_args() {
+    let env =
+        std::collections::HashMap::from([("ATM_SPAWN_PI_ARGS", "   "), ("ATM_SPAWN_ARGS", "x pi")]);
+    assert_eq!(
+        super::spawn_env_override("pi", "ARGS", |key| {
+            env.get(key).map(|value| (*value).to_string())
+        })
+        .as_deref(),
+        Some("   ")
+    );
+}
+
+// These cases catch required/role arguments being lost under BIN, or placed
+// before a wrapper's raw prefix or after its model argument.
+#[test]
+fn pure_builder_keeps_required_and_role_args_under_binary_overrides() {
+    let defaults = ["x".into(), "codex".into()];
+    let role = ["--profile".into(), "a b".into()];
+    for (binary, defaults, bin, raw, extra, flag, model, expected) in [
+        (
+            "codex",
+            &[][..],
+            None,
+            None,
+            &[][..],
+            None,
+            None,
+            "codex '--no-daemon'",
+        ),
+        (
+            "mise",
+            &defaults[..],
+            Some("/my stand-in"),
+            None,
+            &[][..],
+            None,
+            None,
+            "'/my stand-in' '--no-daemon'",
+        ),
+        (
+            "codex",
+            &[][..],
+            Some("mise"),
+            Some("x codex"),
+            &[][..],
+            None,
+            None,
+            "mise x codex '--no-daemon'",
+        ),
+        (
+            "mise",
+            &defaults[..],
+            None,
+            None,
+            &[][..],
+            None,
+            None,
+            "mise 'x' 'codex' '--no-daemon'",
+        ),
+        (
+            "mise",
+            &defaults[..],
+            Some("/my stand-in"),
+            None,
+            &role[..],
+            Some("-m"),
+            Some("role model"),
+            "'/my stand-in' '--no-daemon' '--profile' 'a b' -m 'role model'",
+        ),
+    ] {
+        assert_eq!(
+            build_spawn_command(
+                binary,
+                defaults,
+                flag,
+                None,
+                model,
+                bin,
+                raw,
+                extra,
+                &["--no-daemon"]
+            ),
+            expected
+        );
+    }
+}
+
+// Matching tokens in any typed input belong to the required block, not to
+// defaults or role args. Unrelated repeated flags/values must keep their order.
+#[test]
+fn pure_builder_normalizes_required_tokens_across_typed_inputs() {
+    for (defaults, extra, required) in [
+        (
+            vec!["--no-daemon", "--no-daemon"],
+            vec![],
+            vec!["--no-daemon"],
+        ),
+        (
+            vec![],
+            vec!["--no-daemon", "--no-daemon"],
+            vec!["--no-daemon"],
+        ),
+        (vec![], vec![], vec!["--no-daemon", "--no-daemon"]),
+        (
+            vec!["--no-daemon", "--no-daemon"],
+            vec!["--no-daemon", "--no-daemon"],
+            vec!["--no-daemon", "--no-daemon"],
+        ),
+    ] {
+        let defaults: Vec<String> = ["--tag", "same", "--tag", "same"]
+            .into_iter()
+            .chain(defaults)
+            .map(String::from)
+            .collect();
+        let extra: Vec<String> = [
+            "--label=--no-daemon",
+            "--profile",
+            "same",
+            "--profile",
+            "same",
+        ]
+        .into_iter()
+        .chain(extra)
+        .map(String::from)
+        .collect();
+        for (bin, expected) in [
+            (
+                None,
+                "codex '--tag' 'same' '--tag' 'same' '--no-daemon' '--label=--no-daemon' '--profile' 'same' '--profile' 'same' -m 'role model'",
+            ),
+            (
+                Some("/my stand-in"),
+                "'/my stand-in' '--no-daemon' '--label=--no-daemon' '--profile' 'same' '--profile' 'same' -m 'role model'",
+            ),
+        ] {
+            assert_eq!(
+                build_spawn_command(
+                    "codex", &defaults, Some("-m"), None, Some("role model"),
+                    bin, None, &extra, &required,
+                ),
+                expected,
+                "defaults={defaults:?}, extra={extra:?}, required={required:?}, bin={bin:?}"
+            );
+        }
+    }
+}
+
+// Requirements are generic tokens: preserve first-seen policy order, not a
+// sorted/set order, even when defaults or extras list them in another order.
+#[test]
+fn pure_builder_preserves_unique_required_token_order() {
+    assert_eq!(
+        build_spawn_command(
+            "agent",
+            &["--alpha".into(), "--zeta".into()],
+            None,
+            None,
+            None,
+            None,
+            Some("wrapper-prefix"),
+            &["--alpha".into(), "--zeta".into(), "tail".into()],
+            &["--zeta", "--alpha", "--zeta", "--alpha"],
+        ),
+        "agent wrapper-prefix '--zeta' '--alpha' 'tail'"
+    );
+}
+
+// The bounded contract reserves exact tokens, even in apparent value positions;
+// interpreting a preceding option here would invent a vendor argument grammar.
+#[test]
+fn pure_builder_reserves_required_tokens_without_parsing_option_values() {
+    assert_eq!(
+        build_spawn_command(
+            "codex",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &["--label".into(), "--no-daemon".into()],
+            &["--no-daemon"],
+        ),
+        "codex '--no-daemon' '--label'"
+    );
+}
+
+// Raw ARGS is caller-owned shell syntax. Parsing, deduplicating, rejecting or
+// escaping it would break this contract, even if it neutralizes a requirement.
+#[test]
+fn pure_builder_preserves_raw_shell_args_with_required_tokens() {
+    for (raw, expected) in [
+        ("x codex", "mise x codex '--no-daemon'"),
+        (
+            "x codex --no-daemon",
+            "mise x codex --no-daemon '--no-daemon'",
+        ),
+        (
+            "  x codex '--no-daemon'  ",
+            "mise x codex '--no-daemon' '--no-daemon'",
+        ),
+        (
+            "x\tcodex $FLAGS; next",
+            "mise x\tcodex $FLAGS; next '--no-daemon'",
+        ),
+        (
+            "x codex # caller comment",
+            "mise x codex # caller comment '--no-daemon'",
+        ),
+    ] {
+        assert_eq!(
+            build_spawn_command(
+                "codex",
+                &[],
+                None,
+                None,
+                None,
+                Some("mise"),
+                Some(raw),
+                &[],
+                &["--no-daemon"],
+            ),
+            expected,
+            "raw={raw:?}"
+        );
+    }
+}
+
+#[test]
+fn launch_policies_cover_exactly_discovery_enabled_harnesses() {
+    for definition in atm_core::builtin_harnesses() {
+        assert_eq!(
+            super::launch_policy(definition.harness).is_some(),
+            definition.discovery_enabled,
+            "launch policy coverage for {:?}",
+            definition.harness
+        );
+    }
+}
+
+#[test]
+fn launch_policy_requirements_reach_the_shared_builder() {
+    use atm_core::Harness;
+    for (harness, binary, expected) in [
+        (Harness::ClaudeCode, "claude", "claude"),
+        (Harness::Pi, "pi", "pi"),
+        (Harness::Codex, "codex", "codex '--no-daemon'"),
+    ] {
+        let policy = super::launch_policy(harness).unwrap();
+        assert_eq!(
+            build_spawn_command(
+                binary,
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                policy.required_args
+            ),
+            expected
+        );
+    }
+    for harness in [
+        Harness::Amp,
+        Harness::Qwen,
+        Harness::Gemini,
+        Harness::Unknown,
+    ] {
+        assert!(super::launch_policy(harness).is_none());
+    }
+}
+
+#[test]
+fn empty_requirements_preserve_legacy_command_bytes() {
+    for binary in ["claude", "pi", "my-agent"] {
+        for (bin, raw, expected_suffix) in [
+            (None, None, " '--profile' 'a b' --model 'model name'"),
+            (
+                None,
+                Some("   "),
+                " '--profile' 'a b'  --model 'model name'",
+            ),
+            (
+                Some("wrapper"),
+                Some("  x --raw;  "),
+                " x --raw; --model 'model name'",
+            ),
+        ] {
+            let expected = format!(
+                "cd '/work dir' && {}{expected_suffix}",
+                bin.unwrap_or(binary)
+            );
+            assert_eq!(
+                build_spawn_command(
+                    binary,
+                    &["--profile".into(), "a b".into()],
+                    Some("--model"),
+                    Some("/work dir"),
+                    Some("model name"),
+                    bin,
+                    raw,
+                    &[],
+                    &[]
+                ),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn pure_builder_preserves_defaults_overrides_quoting_and_raw_arguments() {
     let defaults = ["--profile".into(), "a b".into()];
     assert_eq!(
@@ -324,7 +690,9 @@ fn pure_builder_preserves_defaults_overrides_quoting_and_raw_arguments() {
             Some("/work/it's"),
             Some("model name"),
             None,
-            None
+            None,
+            &[],
+            &[],
         ),
         "cd '/work/it'\\''s' && agent '--profile' 'a b' --model 'model name'"
     );
@@ -336,16 +704,28 @@ fn pure_builder_preserves_defaults_overrides_quoting_and_raw_arguments() {
             None,
             Some("ignored"),
             Some("/my wrapper"),
-            Some("  x --raw;  ")
+            Some("  x --raw;  "),
+            &[],
+            &[],
         ),
         "'/my wrapper' x --raw;"
     );
     assert_eq!(
-        build_spawn_command("agent", &[], None, None, None, None, Some("   ")),
+        build_spawn_command("agent", &[], None, None, None, None, Some("   "), &[], &[]),
         "agent "
     );
     assert_eq!(
-        build_spawn_command("agent", &defaults, None, None, None, Some("wrapper"), None),
+        build_spawn_command(
+            "agent",
+            &defaults,
+            None,
+            None,
+            None,
+            Some("wrapper"),
+            None,
+            &[],
+            &[]
+        ),
         "wrapper"
     );
 }

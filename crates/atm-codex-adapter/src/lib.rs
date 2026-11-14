@@ -231,6 +231,7 @@
 //! - [`translate`] — translation from raw event to `LifecycleEvent`
 
 pub mod event;
+pub mod screen;
 pub mod transcript;
 pub mod translate;
 pub mod wire;

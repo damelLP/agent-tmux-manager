@@ -7,10 +7,11 @@
 //! [`ControlPolicy`] and [`ControlScreen`].
 
 use super::agent_screen::{AgentScreen, Foreground, PaneBaseline};
-use crate::control::reservation::{PaneCapture, PaneKey};
+use crate::control::reservation::{CaptureFormat, PaneCapture, PaneKey};
 use atm_core::harness_control::{
     ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
 };
+use atm_core::styled_screen::StyledScreen;
 use atm_core::{DialogState, InputState, SessionId, TurnState};
 use std::path::PathBuf;
 
@@ -290,4 +291,72 @@ fn ready(policy: &ControlPolicy, control: &ControlScreen, session: Option<&Sessi
         SessionArrival::AtFirstPrompt => Step::Ready(Ready::Editor),
         _ => Step::Stuck("the harness announces its session in a way atm does not know".into()),
     }
+}
+
+/// Whether a launch line may be pasted into a shell at all: printable ASCII
+/// only, so every character is one terminal cell and the staged line can be
+/// compared exactly. Anything else refuses the launch before any effect.
+#[must_use]
+pub(super) fn launch_text_is_safe(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| matches!(c, ' '..='~'))
+}
+
+/// The cells before the cursor on the cursor's logical line: the cursor's row
+/// up to the cursor, joined upward with every row that fills the pane's width
+/// (a wrapped line). Cells at or after the cursor are ignored: a shell leaves
+/// stale cells and suggestions there.
+///
+/// `None` when the line can't be read exactly: an undecodable capture, a
+/// cursor outside it, or a character before the cursor whose cell width is
+/// not certainly one (anything but printable ASCII).
+#[must_use]
+pub(super) fn launch_line(capture: &PaneCapture) -> Option<String> {
+    let decoded;
+    let text = match capture.format {
+        CaptureFormat::Plain => capture.text.as_str(),
+        CaptureFormat::Ansi => {
+            decoded = StyledScreen::parse(&capture.text).ok()?;
+            decoded.text()
+        }
+    };
+    let rows: Vec<&str> = text.lines().collect();
+    let width = usize::from(capture.inspection.pane.width);
+    let column = usize::try_from(capture.inspection.cursor_column).ok()?;
+    let row = usize::try_from(capture.inspection.cursor_row).ok()?;
+    if width == 0 || column > width {
+        return None;
+    }
+    // A cursor column equal to the width is the end of that row (dash leaves
+    // it there after an exact fit; bash and zsh move to the next row).
+    let mut line: String = rows.get(row)?.chars().take(column).collect();
+    if !launch_text_is_safe(&line) && !line.is_empty() {
+        return None;
+    }
+    // Cells never written before the cursor are blank.
+    while line.len() < column {
+        line.push(' ');
+    }
+    for above in rows.get(..row)?.iter().rev() {
+        let ascii = above.chars().filter(|c| matches!(c, ' '..='~')).count();
+        let other = above.chars().count() - ascii;
+        if other == 0 && ascii == width {
+            line.insert_str(0, above);
+        } else if ascii + 2 * other < width {
+            // Too short to fill the row whatever its characters' widths are.
+            break;
+        } else {
+            return None;
+        }
+    }
+    Some(line)
+}
+
+/// The Enter guard of a launch: the line reads exactly what the shell showed
+/// before the paste (`before`) followed by the launch text. Equality, never
+/// "ends with": text typed ahead of the paste would otherwise run with it.
+#[must_use]
+pub(super) fn launch_line_is_staged(capture: &PaneCapture, before: &str, text: &str) -> bool {
+    launch_line(capture).is_some_and(|line| {
+        line.len() == before.len() + text.len() && line.starts_with(before) && line.ends_with(text)
+    })
 }

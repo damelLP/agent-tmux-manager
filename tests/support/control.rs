@@ -74,6 +74,42 @@ impl Drop for Daemon {
     }
 }
 
+pub struct Autostarted(pub PathBuf);
+
+impl Autostarted {
+    pub fn pid(&self) -> u32 {
+        std::fs::read_to_string(self.0.join("state/atm/atmd.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+}
+
+impl Drop for Autostarted {
+    fn drop(&mut self) {
+        let Ok(contents) = std::fs::read_to_string(self.0.join("state/atm/atmd.pid")) else {
+            return;
+        };
+        let pid: u32 = contents.trim().parse().unwrap();
+        if !Path::new(&format!("/proc/{pid}/exe")).exists() {
+            return;
+        }
+        assert_owned(pid, &self.0);
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{pid}/exe")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "owned daemon failed to stop: {pid}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 pub fn assert_owned(pid: u32, dir: &Path) {
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
     assert_eq!(

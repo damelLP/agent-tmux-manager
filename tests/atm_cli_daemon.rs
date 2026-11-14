@@ -18,6 +18,55 @@ use atm_core::{SessionId, SessionView};
 #[path = "support/daemon.rs"]
 mod daemon;
 use daemon::fake_daemon;
+#[path = "support/control.rs"]
+mod control_support;
+
+fn autostart_control(args: &[&str], expected: &[u8]) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("path");
+    std::fs::create_dir(&path).unwrap();
+    let tmux = path.join("tmux");
+    std::fs::write(
+        &tmux,
+        r#"#!/bin/sh
+[ "$1" = -u ] && shift
+if [ "$1" = -L ]; then shift; shift; fi
+case $1 in
+list-panes) printf '%%7\tprobe\t0\t1\t80\t24\t1\n' ;;
+display-message) echo '0 1' ;;
+split-window) echo %42 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let guard = control_support::Autostarted(dir.path().to_owned());
+    assert!(!dir.path().join("atmd.sock").exists());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_atm"));
+    control_support::isolated(&mut command, dir.path())
+        .env("PATH", &path)
+        .env("TMUX", "private-stand-in")
+        .env("TMUX_PANE", "%7")
+        .env("ATM_SPAWN_BIN", "true")
+        .args(args);
+    let out = command.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, expected);
+    assert!(dir.path().join("atmd.sock").exists());
+    control_support::assert_owned(guard.pid(), dir.path());
+    drop(guard);
+    assert!(!dir.path().join("atmd.sock").exists());
+}
+
+#[test]
+fn send_autostarts_a_stopped_private_daemon() {
+    autostart_control(&["send", "%7", "hello"], b"Sent to %7 by tmux paste\n");
+}
+
+#[test]
+fn spawn_autostarts_a_stopped_private_daemon() {
+    autostart_control(&["spawn", "-w", "/work"], b"%42\n");
+}
 
 /// The CLI has no tmux executable; registry resolution and safety checks run
 /// in the real server through its injected control actor.

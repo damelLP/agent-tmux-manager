@@ -198,12 +198,13 @@ pub(super) fn non_empty_env(key: &str) -> Option<String> {
 ///
 /// `*_BIN` is one token: a plain word is typed bare so a shell alias of that
 /// name still works, and anything else is shell-quoted, so spaces/specials in
-/// a path "just work."
+/// a path "just work." A `*_BIN` override drops configured `default_args`.
 ///
 /// `*_ARGS` is inserted *between* the bin and appended model flag and is
 /// interpolated verbatim — the user's intent is multi-token wrapper syntax. The
 /// user is responsible for quoting anything inside `*_ARGS` that needs to be
-/// one token (same contract as `bash -c "..."`).
+/// one token (same contract as `bash -c "..."`). The adapter's required
+/// arguments follow `*_ARGS`, before the model flag, even with a BIN override.
 ///
 /// `cwd` and `model` go through `shell_quote`, so a model name like
 /// `opus 4.5` or a cwd with spaces compose safely without the caller

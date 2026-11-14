@@ -40,11 +40,11 @@ mod tests {
     #[test]
     fn resolver_precedence_in_isolated_processes() {
         for (atm, xdg, home, expected) in [
-            ("/override", "/xdg", "/home/test", "/override"),
-            ("relative", "/xdg", "/home/test", "relative"),
-            ("", "/xdg", "/home/test", "/xdg/atm"),
-            ("", "relative", "/home/test", "relative/atm"),
-            ("", "", "/home/test", "/home/test/.local/state/atm"),
+            ("/override", "/xdg", "/fixture", "/override"),
+            ("relative", "/xdg", "/fixture", "relative"),
+            ("", "/xdg", "/fixture", "/xdg/atm"),
+            ("", "relative", "/fixture", "relative/atm"),
+            ("", "", "/fixture", "/fixture/.local/state/atm"),
             ("", "", "", "/tmp/atm"),
         ] {
             let mut child = Command::new(std::env::current_exe().unwrap())

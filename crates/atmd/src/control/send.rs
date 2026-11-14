@@ -162,6 +162,12 @@ fn send_refusal(
     )
 }
 
+/// Paste terminators and other control bytes must never escape literal input.
+pub(super) fn unsafe_paste(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\r'))
+}
+
 /// Shared tmux-state rule. None retains U7's pre-3.7 unknown/allow policy.
 pub(super) fn input_refusal(
     in_mode: bool,

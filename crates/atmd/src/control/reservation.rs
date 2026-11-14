@@ -784,6 +784,8 @@ impl Reservation {
 /// | StaleReservation | Before effect | Before effect |
 /// | ScreenChanged | Before effect | Before effect |
 /// | PacingRefused | Before effect | Before effect |
+/// | PaneInputRefused | Before effect (state can change) | Before effect |
+/// | UnsafePaste | Before effect (permanent for this text) | Before effect |
 /// | TagMismatch | Before effect | Before effect |
 /// | PaneGone | Before effect | Before effect |
 /// | InvalidObservation | Before effect | Before effect |
@@ -825,6 +827,14 @@ pub enum ReservationError {
     /// or mutated; retry after pending observations drain, not by flooding the queue.
     #[error("capture pacing refused pane {pane}; nothing was sent")]
     PacingRefused { pane: PaneId },
+    /// Before effect: pane state refuses input. Nothing was sent; retry only
+    /// after the state changes (for example, copy mode exits).
+    #[error("pane {pane} refuses input: {reason}; nothing was sent")]
+    PaneInputRefused { pane: PaneId, reason: &'static str },
+    /// Before effect: text contains unsupported control bytes. Nothing was sent;
+    /// retrying the same text cannot succeed, regardless of pane state.
+    #[error("paste text for pane {pane} contains unsafe control bytes; nothing was sent")]
+    UnsafePaste { pane: PaneId },
     /// Before effect: mutation-time local tag did not match the expectation.
     #[error("pane {pane} tag mismatch: expected {expected}, found {}", actual.as_deref().unwrap_or("absent"))]
     TagMismatch {
@@ -853,10 +863,10 @@ pub enum ReservationError {
     #[error("reserved control operation timed out; admitted effects may have completed")]
     Timeout,
     /// Uncertain in general: tmux failure may follow a partial or complete effect.
-    /// Exception: SendRefused is before effect. Mode/dead-pane, explicit-off
-    /// multiline and unsafe-control-byte refusals all run before the predicate
-    /// and before any input; they send nothing. Other Control variants must not
-    /// be assumed pre-effect without a more specific caller contract.
+    /// Exception: SendRefused is before effect, but reserved input uses the
+    /// explicit PaneInputRefused and UnsafePaste variants instead. They run before
+    /// the predicate and any input. Other Control variants must not be assumed
+    /// pre-effect without a more specific caller contract.
     #[error(transparent)]
     Control(#[from] ControlError),
 }

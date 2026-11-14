@@ -246,25 +246,20 @@ fn check_input(
         Input::Paste(text) => Some(text.as_str()),
         Input::Key(_) => None,
     };
+    if text.is_some_and(crate::control::send::unsafe_paste) {
+        return Err(ReservationError::UnsafePaste { pane: pane.clone() });
+    }
     let reason = crate::control::send::input_refusal(
         inspection.in_mode,
         inspection.dead,
         inspection.bracketed_paste,
         text,
-    )
-    .or_else(|| {
-        text.filter(|text| {
-            text.chars()
-                .any(|c| c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\r'))
-        })
-        .map(|_| "paste text contains unsafe control bytes")
-    });
+    );
     match reason {
-        Some(reason) => Err(ControlError::SendRefused {
-            pane: pane.to_string(),
+        Some(reason) => Err(ReservationError::PaneInputRefused {
+            pane: pane.clone(),
             reason,
-        }
-        .into()),
+        }),
         None => Ok(()),
     }
 }

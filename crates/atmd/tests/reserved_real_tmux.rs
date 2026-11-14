@@ -344,9 +344,7 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
                         };
                         assert!(matches!(
                             result,
-                            Err(ReservationError::Control(
-                                atmd::control::ControlError::SendRefused { .. }
-                            ))
+                            Err(ReservationError::PaneInputRefused { .. })
                         ));
                     }
                 }
@@ -385,9 +383,7 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
                     };
                     assert!(matches!(
                         result,
-                        Err(ReservationError::Control(
-                            atmd::control::ControlError::SendRefused { .. }
-                        ))
+                        Err(ReservationError::PaneInputRefused { .. })
                     ));
                 }
                 assert!(!r

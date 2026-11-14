@@ -69,6 +69,12 @@ pub fn isolated<'a>(command: &'a mut Command, dir: &Path) -> &'a mut Command {
         .env("ATM_TMUX_SOCKET", "control-test")
 }
 
+/// `isolated` sets `ATM_STATE_DIR`, so atmd writes its PID file there rather
+/// than under the legacy `XDG_STATE_HOME/atm`.
+pub fn pid_file(dir: &Path) -> PathBuf {
+    dir.join("events/atmd.pid")
+}
+
 pub struct Daemon {
     child: Child,
     dir: PathBuf,
@@ -128,9 +134,9 @@ impl Drop for Daemon {
 #[test]
 fn autostart_cleanup_does_not_panic_on_invalid_or_unowned_pid() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("state/atm")).unwrap();
+    std::fs::create_dir_all(pid_file(dir.path()).parent().unwrap()).unwrap();
     for pid in ["invalid".to_string(), std::process::id().to_string()] {
-        std::fs::write(dir.path().join("state/atm/atmd.pid"), pid).unwrap();
+        std::fs::write(pid_file(dir.path()), pid).unwrap();
         drop(Autostarted(dir.path().to_owned()));
     }
 }
@@ -139,7 +145,7 @@ pub struct Autostarted(pub PathBuf);
 
 impl Autostarted {
     pub fn pid(&self) -> u32 {
-        std::fs::read_to_string(self.0.join("state/atm/atmd.pid"))
+        std::fs::read_to_string(pid_file(&self.0))
             .unwrap()
             .trim()
             .parse()
@@ -149,7 +155,7 @@ impl Autostarted {
 
 impl Drop for Autostarted {
     fn drop(&mut self) {
-        let Ok(contents) = std::fs::read_to_string(self.0.join("state/atm/atmd.pid")) else {
+        let Ok(contents) = std::fs::read_to_string(pid_file(&self.0)) else {
             return;
         };
         let Ok(pid) = contents.trim().parse::<u32>() else {

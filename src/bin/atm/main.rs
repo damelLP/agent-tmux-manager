@@ -41,6 +41,7 @@ use atm_tui::setup;
 use atm_tui::tmux;
 
 mod cli;
+pub mod rpc;
 mod spawn;
 mod tui;
 mod workspace;

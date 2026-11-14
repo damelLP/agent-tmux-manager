@@ -7,7 +7,7 @@
 //! Broadcast lag resynchronizes from the registry, never disables organisation
 //! methods. End times are observation times, not harness occurrence timestamps.
 
-use super::{OrgHandle, OrgServiceError};
+use super::OrgHandle;
 use crate::registry::{RegistryHandle, RemovalReason, SessionEvent};
 use atm_core::{builtin_harnesses, Harness, Money, SessionId, SessionView};
 use atm_org::{OrgCommand, OrgState, SessionSummary};
@@ -210,8 +210,9 @@ async fn run(
     let mut entries = Entries::new();
     let mut pending = JoinSet::new();
     let mut flushing = false;
+    let mut retry_at = None;
     loop {
-        if pending.is_empty() {
+        if pending.is_empty() && retry_at.is_none() {
             let next = entries
                 .values()
                 .find(|entry| entry.due(flushing))
@@ -232,6 +233,7 @@ async fn run(
             biased;
             _ = stop.cancelled(), if !flushing => {
                 flushing = true;
+                retry_at = None;
                 // Drain boundary events before the final snapshot: removed rows
                 // are no longer in the registry and must retain their last facts.
                 loop {
@@ -251,16 +253,24 @@ async fn run(
                             if summary.ended.is_some() && entry.latest == summary { entries.remove(&summary.session_id); }
                         }
                     },
-                    Some(Ok((_, Err(OrgServiceError::Timeout)))) => {
-                        // A snapshot is idempotent; retry only while state is
-                        // still trusted. Outcome-unknown errors disable actor.
-                        if org.status().is_err() { break; }
+                    Some(Ok((_, Err(error)))) => {
+                        if org.status().is_err() {
+                            tracing::warn!(%error, "Session summary persistence stopped");
+                            break;
+                        }
+                        // Refusal/overload/timeout is not service death. Keep the
+                        // dirty entry and consume updates while backing off, so
+                        // an invalid snapshot can be corrected without a hot loop.
+                        tracing::warn!(%error, "Session summary deferred; will retry");
+                        retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(100));
                     },
-                    Some(Ok((_, Err(error)))) => { tracing::warn!(%error, "Session summary persistence stopped"); break; },
                     Some(Err(error)) => { tracing::warn!(%error, "Session summary task failed"); break; },
                     None => {},
                 }
             },
+            _ = async {
+                if let Some(at) = retry_at { tokio::time::sleep_until(at).await; }
+            }, if retry_at.is_some() => { retry_at = None; },
             event = events.recv(), if !flushing => match event {
                 Ok(event) => observe(event, &registry, &mut entries, &recovered, Utc::now()).await,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {

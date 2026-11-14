@@ -85,6 +85,125 @@ fn pending_ids_are_never_summaries_and_bad_time_is_not_invented() {
     assert!(from_view(&invalid).is_none());
 }
 
+// Drive the observer at its actual wakeups, so a queue refusal is processed
+// while the actor remains stalled, without a delay or scheduler-speed assumption.
+#[tokio::test(start_paused = true)]
+async fn full_actor_queue_keeps_dirty_summary_for_retry() {
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+    };
+    use tokio::sync::{mpsc, watch, Semaphore};
+    struct Signal(Semaphore);
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.0.add_permits(1);
+        }
+    }
+    let signal = Arc::new(Signal(Semaphore::new(0)));
+    let waker = Waker::from(signal.clone());
+    let (requests, receive) = mpsc::channel(64);
+    let (health, status) = watch::channel(Ok(0));
+    let (committed, _) = broadcast::channel(1024);
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let mut entered = Some(entered);
+    let release = Arc::new(Semaphore::new(0));
+    let gate = release.clone();
+    let cancel = CancellationToken::new();
+    let mut seq = 0;
+    let actor = tokio::spawn(super::super::actor::run(
+        OrgState::default(),
+        receive,
+        health,
+        committed.clone(),
+        cancel.clone(),
+        move |_| {
+            seq += 1;
+            let seq = seq;
+            let entered = entered.take();
+            let gate = gate.clone();
+            async move {
+                if let Some(entered) = entered {
+                    entered.send(()).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                }
+                Ok(seq)
+            }
+        },
+    ));
+    let org = OrgHandle {
+        requests,
+        health: status,
+        committed,
+        reads: None,
+    };
+    let registry = crate::registry::spawn_registry();
+    let (events, receive) = broadcast::channel(8);
+    let stop = CancellationToken::new();
+    let mut observer = Box::pin(run(registry.clone(), org.clone(), receive, stop.clone()));
+    assert!(observer
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    signal.0.acquire().await.unwrap().forget(); // startup snapshot reply
+    assert!(observer
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    let caller = org.clone();
+    let stalled = tokio::spawn(async move {
+        caller
+            .execute(
+                OrgCommand::ControlSent(atm_org::ControlAudit {
+                    pane: "%1".into(),
+                    action: serde_json::json!({}),
+                }),
+                now(),
+            )
+            .await
+    });
+    entry.await.unwrap();
+    // Keep every queue slot occupied until after the observer handles refusal.
+    let permits: Vec<_> = org.requests.reserve_many(64).await.unwrap().collect();
+    assert_eq!(org.requests.capacity(), 0);
+    let live = view("retry", 0.01, Some("original"));
+    events
+        .send(SessionEvent::Updated {
+            session: Box::new(live),
+        })
+        .unwrap();
+    while let Ok(permit) = signal.0.try_acquire() {
+        permit.forget();
+    }
+    assert!(observer
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    signal.0.acquire().await.unwrap().forget(); // rejected execute task completed
+    assert!(
+        matches!(
+            observer.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ),
+        "one full-queue refusal stopped the summary observer"
+    );
+    drop(permits);
+    release.add_permits(1);
+    stalled.await.unwrap().unwrap();
+    // Flush is the next attempt; no time is spent waiting for the retry clock.
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(60), observer)
+        .await
+        .unwrap();
+    let state = org.snapshot().await.unwrap();
+    let summary = state.session_summary(&SessionId::new("retry")).unwrap();
+    assert_eq!(summary.first_prompt.as_deref(), Some("original"));
+    assert_eq!(summary.cost, Some(Money::from_microdollars(10_000)));
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
 #[tokio::test]
 async fn observer_lag_resync_and_shutdown_flush_exact_cost_without_disabling_org() {
     let dir = tempfile::tempdir().unwrap();

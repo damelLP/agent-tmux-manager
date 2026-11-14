@@ -89,12 +89,13 @@ class SceneTests(unittest.TestCase):
     def test_codex_value_variant_update_banner_offers_a_newer_version(self):
         import re
         for spec in SPECS:
-            if spec["mode"] == "codex" and spec["state"] == "update":
+            if spec["mode"] == "codex" and (spec["state"] == "update" or
+                    spec["key"] in ("codex.idle.u5", "codex.clear-menu.u5")):
                 with self.subTest(source=spec["source"]):
-                    result = scene.render_state([spec], ASSETS, "codex", "update", "",
+                    result = scene.render_state([spec], ASSETS, "codex", spec["state"], "",
                                                 "values", 120, 40, 1)
                     text = "\n".join(result.lines)
-                    match = re.search(r"(\d+\.\d+\.\d+) → (\d+\.\d+\.\d+)", text)
+                    match = re.search(r"(\d+\.\d+\.\d+) (?:→|->) (\d+\.\d+\.\d+)", text)
                     self.assertIsNotNone(match)
                     current, offered = match.groups()
                     self.assertGreater(tuple(map(int, offered.split("."))),

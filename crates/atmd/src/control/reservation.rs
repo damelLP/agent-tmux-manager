@@ -291,8 +291,12 @@ pub struct PaneInspection {
     /// Foreground PID, not a process group. tmux 3.6/3.8 do not expose it:
     /// None must not be replaced by pane_pid or inferred from a command name.
     pub foreground_pid: Option<u32>,
-    /// Raw pane_current_command, not proof of shell/editor identity. With job
-    /// control disabled tmux can report the root command while a child runs.
+    /// Neutral pane_current_command, never proof that the shell is back. A
+    /// same-named wrapper can report the shell while its child runs, even with
+    /// job control enabled. A dead pane can report its start command; immediately
+    /// after creation the name can transiently be tmux or a wrapper shell.
+    /// U8 reads procfs once for its baseline, outside any guard; these facts alone
+    /// cannot establish positive shell/editor identity.
     pub foreground_command: Option<String>,
 }
 

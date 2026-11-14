@@ -1,0 +1,6 @@
+Synthetic: rendered from pi 1.5.0's interactive-mode.js reloadBox; no real capture
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reloading keybindings, extensions, skills, prompts, themes, and context files...
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -6,7 +6,9 @@
 //! than newline, unverified cursor metadata, unknown footers/statuses and partial
 //! frames refuse observation. Trailing blank rows may be omitted.
 //!
-//! Pi has no native approval dialogs; unknown extension UI remains Unknown.
+//! Pi has no native tool approvals, but extension/core dialogs replace the editor.
+//! Recognized select/input/editor hints and the reload box report Other with
+//! unknown input/turn. Ambiguous nested borders refuse observation.
 //! Free-text drafts have only synthetic safety coverage, not real captures.
 //! The active upper border, not startup's interrupt help, establishes turn state.
 //! Fresh layout requires zero usage and startup-only history: the new-session
@@ -55,6 +57,19 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     let top = before_lower
         .iter()
         .rposition(|line| line.starts_with("──"))?;
+    let body = before_lower.get(top + 1..)?;
+    if editor_dialog(body) {
+        return Some(ScreenFacts {
+            dialog: DialogState::Other,
+            ..ScreenFacts::default()
+        });
+    }
+    // A pasted rule can masquerade as the last upper border. Without an editor
+    // marker, earlier rules are ambiguous unless they belong to known startup UI.
+    let history = lines.get(..top)?;
+    if history.contains(lower) && !startup_only(history) {
+        return None;
+    }
     let upper = *lines.get(top)?;
     let turn = if upper == *lower {
         TurnState::NotRunning
@@ -70,7 +85,7 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     } else {
         return None;
     };
-    let input = match before_lower.get(top + 1..)? {
+    let input = match body {
         [""] => InputState::Empty,
         [] => return None,
         _ => InputState::Draft,
@@ -90,6 +105,22 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
         dialog: DialogState::None,
         fresh_editor,
     })
+}
+
+fn editor_dialog(body: &[&str]) -> bool {
+    body.iter().any(|line| {
+        let hints: Vec<_> = line.trim().split("  ").collect();
+        hints
+            .iter()
+            .any(|hint| hint.ends_with(" select") || hint.ends_with(" submit"))
+            && hints.iter().any(|hint| hint.ends_with(" cancel"))
+    }) || body
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        == "Reloading keybindings, extensions, skills, prompts, themes, and context files..."
 }
 
 fn decimal(value: &str) -> Option<f64> {
@@ -344,6 +375,57 @@ mod tests {
                 observe_screen(&text, None).fresh_editor,
                 FreshEditorEvidence::Unknown
             );
+        }
+    }
+
+    #[test]
+    fn rendered_dialogs_never_become_editor_facts() {
+        // Synthetic: rendered from pi 1.5.0's components named in each fixture; no real capture.
+        // Strip the provenance label, then replace only the real idle editor slot.
+        let border = "─".repeat(120);
+        let (history, _) = IDLE.split_once(&border).unwrap();
+        let (_, footer) = IDLE.rsplit_once(&border).unwrap();
+        for name_and_text in [
+            ("select", capture!("dialog-select")),
+            ("confirm", capture!("dialog-confirm")),
+            ("input", capture!("dialog-input")),
+            ("editor", capture!("dialog-editor")),
+            ("missing-cwd", capture!("dialog-missing-cwd")),
+            ("summarize", capture!("dialog-summarize")),
+            ("reload", capture!("dialog-reload")),
+        ] {
+            let (name, labelled) = name_and_text;
+            let (_, body) = labelled.split_once('\n').unwrap();
+            let text = format!("{history}{}{footer}", body.trim_end_matches('\n'));
+            let facts = observe_screen(&text, None);
+            assert_eq!(facts.input, InputState::Unknown, "{name}");
+            assert_eq!(facts.turn, TurnState::Unknown, "{name}");
+            assert!(
+                matches!(facts.dialog, DialogState::Other | DialogState::Unknown),
+                "{name}"
+            );
+            assert_eq!(facts.fresh_editor, FreshEditorEvidence::Unknown, "{name}");
+            // Synthetic: custom keybindings alter key names, not the hint's action words.
+            let varied = text
+                .replace("enter select", "ctrl+x select")
+                .replace("enter submit", "ctrl+x submit")
+                .replace("escape/ctrl+c cancel", "alt+q cancel");
+            assert_eq!(observe_screen(&varied, None), facts, "{name} bindings");
+        }
+    }
+
+    #[test]
+    fn draft_with_a_full_width_rule_cannot_look_empty() {
+        // Synthetic: pasted editor content imitates the upper border, ending with an empty row.
+        let border = "─".repeat(120);
+        for draft in [format!("draft\n{border}\n"), format!("draft\n\n{border}\n")] {
+            let text = FRESH.replace(
+                &format!("{border}\n\n{border}"),
+                &format!("{border}\n{draft}\n{border}"),
+            );
+            let facts = observe_screen(&text, None);
+            assert_ne!(facts.input, InputState::Empty);
+            assert_eq!(facts.fresh_editor, FreshEditorEvidence::Unknown);
         }
     }
 

@@ -1,0 +1,13 @@
+Synthetic: rendered from pi 1.5.0's extension-selector.js (interactive-mode.js promptForMissingSessionCwd); no real capture
+────────────────────────────────────────
+
+ Session cwd not found
+ Use the fallback folder?
+
+ → Yes
+   No
+
+ ↑↓ navigate  enter select
+ escape/ctrl+c cancel
+
+────────────────────────────────────────

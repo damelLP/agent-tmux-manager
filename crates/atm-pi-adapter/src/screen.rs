@@ -110,19 +110,20 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
 }
 
 fn editor_dialog(body: &[&str]) -> bool {
-    body.iter().any(|line| {
-        let hints: Vec<_> = line.trim().split("  ").collect();
-        hints
-            .iter()
-            .any(|hint| hint.ends_with(" select") || hint.ends_with(" submit"))
-            && hints.iter().any(|hint| hint.ends_with(" cancel"))
-    }) || body
+    // Key names vary and hint rows wrap; action words survive both. A draft
+    // imitating this chrome also holds rather than risking an action on a dialog.
+    let hints: Vec<_> = body
         .iter()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        == "Reloading keybindings, extensions, skills, prompts, themes, and context files..."
+        .flat_map(|line| line.split_whitespace())
+        .collect();
+    (hints.contains(&"cancel") && (hints.contains(&"select") || hints.contains(&"submit")))
+        || body
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+            == "Reloading keybindings, extensions, skills, prompts, themes, and context files..."
 }
 
 fn decimal(value: &str) -> Option<f64> {
@@ -511,6 +512,13 @@ mod tests {
             ("missing-cwd", capture!("dialog-missing-cwd")),
             ("summarize", capture!("dialog-summarize")),
             ("reload", capture!("dialog-reload")),
+            ("select-narrow", capture!("dialog-select-narrow")),
+            ("confirm-narrow", capture!("dialog-confirm-narrow")),
+            ("input-narrow", capture!("dialog-input-narrow")),
+            ("editor-narrow", capture!("dialog-editor-narrow")),
+            ("missing-cwd-narrow", capture!("dialog-missing-cwd-narrow")),
+            ("summarize-narrow", capture!("dialog-summarize-narrow")),
+            ("reload-narrow", capture!("dialog-reload-narrow")),
         ] {
             let (name, labelled) = name_and_text;
             let (_, body) = labelled.split_once('\n').unwrap();

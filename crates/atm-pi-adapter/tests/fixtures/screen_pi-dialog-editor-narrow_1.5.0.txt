@@ -1,0 +1,14 @@
+Synthetic: rendered from pi 1.5.0's extension-editor.js; no real capture
+────────────────────────────────────────
+
+ Edit a value
+
+────────────────────────────────────────
+Draft text
+────────────────────────────────────────
+
+ enter submit  shift+enter/ctrl+j
+ newline  escape/ctrl+c cancel
+ external editor
+
+────────────────────────────────────────

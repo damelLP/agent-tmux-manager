@@ -1,0 +1,25 @@
+Captured: codex 0.167.0, 2026-11-14, sealed private-tmux retained-space styled capture; paths sanitized.
+                         
+  >_ [1mOpenAI Codex[0;2m (v0.167.0)[0m                      
+     [2m/tmp/xxxxxxxxxxxxxxxxxxxxxx/repo-fresh[0m       
+                                                                                                    
+                         
+                         
+                                                                                                    
+                                                                                                    
+                                                  
+                                                  
+                                                                                                    
+                                                                                                    
+                         
+                         
+                         
+                         
+                         
+  [1mWhere should the new conversation run?[0m          
+                                                                                                    
+                         
+[1;7m› 1. Use current Git worktree  [0;7mKeep using the current working directory[1m                             
+[0m  2. Create new Git worktree   [2mCreate a separate checkout of this repository in another directory[0m   
+                                                                                                    
+  [1menter[0;2m select · [0;1mesc[0;2m back                                                                           

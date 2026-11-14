@@ -29,9 +29,10 @@
 //! a sealed 2.1.325 probe confirmed `/clear   ` executes clear, not a prompt.
 //! The queued-message placeholder uses the same inverse-first-cell/faint-rest
 //! evidence as suggestions; other faint text is not a typed draft.
-//! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001),
-//! so that frame reads Unknown and the staged matcher returns None. Slash-menu
-//! and other permission-mode parsing belong to the control consumer's slice.
+//! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
+//! Legacy facts stay Unknown; the staged matcher accepts only the complete
+//! captured completion layout with both editor and selected command exact.
+//! The control observer additionally recognizes captured launch/footer modes.
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
 //! Header, bordered input and footer are found by chrome, not absolute rows.
@@ -43,6 +44,9 @@
 //! `/clear` remains in history after a successful clear. Consumers own temporal,
 //! process/pane identity and copy-mode checks; identical historical text cannot
 //! prove that it came from a currently live editor.
+
+mod control;
+pub use control::{observe_control_screen, CONTROL_POLICY};
 
 use atm_core::styled_screen::StyledScreen;
 use atm_core::{
@@ -108,8 +112,10 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 ///
 /// Requires Styled and a nonempty expected string without controls or trailing
 /// whitespace. Compares after removing trailing ASCII spaces from the draft only;
-/// leading whitespace stays exact. Other differences return Some(false); unknown
-/// layouts, faint text and multiline/wrapped drafts return None. A match proves
+/// leading whitespace stays exact. The known single-command completion menu also
+/// matches when both the editor draft and selected command equal expected exactly;
+/// its description is not command identity. Other differences return Some(false);
+/// unknown layouts, faint text and multiline/wrapped drafts return None. A match proves
 /// visible text only, not that Enter submits it: consumers must handle popups
 /// and refuse both Some(false) and None.
 #[must_use]
@@ -120,6 +126,12 @@ pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bo
         || expected.chars().any(char::is_control)
     {
         return None;
+    }
+    if let ScreenInput::Styled(text) = input {
+        let screen = StyledScreen::parse(text).ok()?;
+        if let Some((draft, selected)) = control::completion_draft(&screen) {
+            return Some(draft == expected && selected == expected);
+        }
     }
     let (_, draft) = inspect(input, None);
     let draft = draft?;
@@ -202,6 +214,15 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
     ) {
         return None;
     }
+    editor_facts(lines, styled, header_end, before_footer)
+}
+
+fn editor_facts(
+    lines: &[&str],
+    styled: Option<&StyledScreen>,
+    header_end: Option<usize>,
+    before_footer: &[&str],
+) -> Option<(ScreenFacts, Option<String>)> {
     let lower = before_footer.iter().rposition(|line| rule(line, '─'))?;
     if !before_footer
         .get(lower + 1..)?

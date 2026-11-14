@@ -33,6 +33,9 @@
 //! captures from different operations are byte-identical. Consumers own operation
 //! transitions, pane/process identity, live viewport, copy-mode and temporal checks.
 
+mod control;
+pub use control::{observe_control_screen, validate_hook_list, CONTROL_POLICY};
+
 use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
@@ -165,15 +168,10 @@ fn header<'a>(lines: &[&'a str]) -> Option<(usize, &'a str)> {
 
 fn known_dialog(lines: &[&str]) -> bool {
     let body = nonblank(lines);
-    match body.as_slice() {
-        [update, "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
-            if update
-                .strip_prefix("Update available · ")
-                .and_then(|s| s.split_once(" → "))
-                .is_some_and(|(old, new)| version(old) && version(new)) =>
-        {
-            true
-        }
+    if update_prompt(&body) {
+        return true;
+    }
+    matches!(body.as_slice(),
         [.., title, message, "k keep & next · esc dismiss & close · ^o copy · ←/→ warning"]
             if !message.is_empty()
                 && title
@@ -182,12 +180,18 @@ fn known_dialog(lines: &[&str]) -> bool {
                     .and_then(|s| s.split_once(" of "))
                     .is_some_and(|(index, total)| {
                         positive_integer(index) && positive_integer(total)
-                    }) =>
-        {
-            true
-        }
-        _ => false,
-    }
+                    })
+    )
+}
+
+fn update_prompt(body: &[&str]) -> bool {
+    matches!(body,
+        [update, "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
+            if update
+                .strip_prefix("Update available · ")
+                .and_then(|s| s.split_once(" → "))
+                .is_some_and(|(old, new)| version(old) && version(new))
+    )
 }
 
 fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {

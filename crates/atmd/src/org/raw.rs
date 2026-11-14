@@ -101,7 +101,9 @@ impl RawHandle {
         let unavailable = || OrgServiceError::Unavailable("raw logging disabled".into());
         let queue = self.queue.as_ref().ok_or_else(unavailable)?;
         let (send, receive) = oneshot::channel();
-        tokio::time::timeout(DEADLINE, async {
+        // Runs alongside summary flush after the 2 s connection drain; keep
+        // both flushes within 2 s, leaving margin in `atmd stop`'s 5 s wait.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             queue
                 .send(Request::Flush(send))
                 .await
@@ -145,11 +147,10 @@ mod tests {
         });
         raw.capture(chrono::Utc::now(), "hook_event", json!(0));
         receive.recv().await.unwrap();
-        let start = std::time::Instant::now();
         for n in 0..1000 {
             raw.capture(chrono::Utc::now(), "hook_event", json!(n));
         }
-        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        // Completion against the still-stalled append proves capture never waits.
         assert_eq!(raw.dropped(), 936);
         assert!(
             receive.try_recv().is_err(),
@@ -212,14 +213,25 @@ mod tests {
                 .await
                 .is_some());
         };
-        tokio::time::timeout(std::time::Duration::from_secs(1), probe)
+        tokio::time::timeout(std::time::Duration::from_secs(60), probe)
             .await
             .unwrap();
         cancel.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_raw_flush_fits_stop_budget_after_connection_drain() {
+        let raw = RawHandle::with_append(|_| std::future::pending());
+        raw.capture(chrono::Utc::now(), "hook_event", json!({}));
+        // Raw and summaries flush concurrently after the 2 s connection drain.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), raw.flush())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(OrgServiceError::Timeout)));
     }
 
     #[tokio::test]

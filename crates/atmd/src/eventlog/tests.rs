@@ -18,7 +18,7 @@ fn controlled_log() -> (EventLog, mpsc::Receiver<Append>) {
     )
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn expired_deadline_does_not_hand_over() {
     let (log, mut receiver) = controlled_log();
     let result = log
@@ -28,7 +28,7 @@ async fn expired_deadline_does_not_hand_over() {
     assert!(receiver.try_recv().is_err(), "expired append was submitted");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_after_handover_keeps_the_inflight_slot() {
     let (log, mut receiver) = controlled_log();
     let short = Duration::from_millis(20);
@@ -59,7 +59,7 @@ async fn timeout_after_handover_keeps_the_inflight_slot() {
     assert_eq!(result.unwrap(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancellation_and_last_handle_drop_do_not_release_an_active_write() {
     let (log, mut receiver) = controlled_log();
     let clone = log.clone();
@@ -89,7 +89,7 @@ async fn cancellation_and_last_handle_drop_do_not_release_an_active_write() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn gone_writer_is_closed_not_a_timeout() {
     let (log, receiver) = controlled_log();
     drop(receiver);
@@ -140,6 +140,50 @@ async fn concurrent_clones_publish_in_disk_order_and_lag_can_replay() {
     assert_eq!(recovered, (21..=1045).collect::<Vec<_>>());
 }
 
+#[tokio::test]
+async fn exec_child_does_not_keep_the_stream_locked() {
+    if std::env::var_os("ATM_TEST_CLOEXEC_CHILD").is_none() {
+        super::test_support::run_child(
+            "eventlog::tests::exec_child_does_not_keep_the_stream_locked",
+            |command| {
+                command.env("ATM_TEST_CLOEXEC_CHILD", "1");
+            },
+        );
+        return;
+    }
+    struct StopChild(std::process::Child);
+    impl Drop for StopChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let log = EventLog::open(dir.path(), Stream::Events).unwrap();
+    let mut live = log.subscribe();
+    // spawn returns after exec. The helper process isolates this test from
+    // unrelated pre-exec forks; the only child here remains alive throughout.
+    let mut child = StopChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(child.0.try_wait().unwrap().is_none());
+    drop(log);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), live.recv())
+            .await
+            .unwrap(),
+        Err(broadcast::error::RecvError::Closed)
+    ));
+    // Closed after the last handle means the writer exited, not just that the
+    // handle dropped. Reopen exactly once, while the exec'd child still lives.
+    let reopened = EventLog::open(dir.path(), Stream::Events).expect("exec child retained lock fd");
+    assert!(child.0.try_wait().unwrap().is_none());
+    drop(reopened);
+}
+
 #[derive(Clone)]
 struct TraceBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
 impl std::io::Write for TraceBuffer {
@@ -157,27 +201,13 @@ fn repair_warns_with_path_line_and_dropped_byte_count() {
     // Isolate tracing's process-wide callsite-interest cache from concurrent
     // tests installing/dropping different thread-local subscribers.
     if std::env::var_os("ATM_TEST_REPAIR_CHILD").is_none() {
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "eventlog::tests::repair_warns_with_path_line_and_dropped_byte_count",
-            ])
-            .env("ATM_TEST_REPAIR_CHILD", "1")
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success());
-                return;
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("repair child timed out");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        super::test_support::run_child(
+            "eventlog::tests::repair_warns_with_path_line_and_dropped_byte_count",
+            |command| {
+                command.env("ATM_TEST_REPAIR_CHILD", "1");
+            },
+        );
+        return;
     }
     let dir = tempfile::tempdir().unwrap();
     let path = segment(

@@ -36,8 +36,6 @@ pub(super) fn try_lock(path: &Path) -> io::Result<Option<File>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::process::Command;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn child_lock() {
@@ -54,25 +52,11 @@ mod tests {
         let lock = try_lock(&path).unwrap().unwrap();
         assert!(try_lock(&path).unwrap().is_none());
         for available in [false, true] {
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "eventlog::lock::tests::child_lock"])
-                .env("ATM_TEST_LOCK_PATH", &path)
-                .env("ATM_TEST_LOCK_FREE", if available { "yes" } else { "no" })
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success());
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("lock child timed out");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            super::super::test_support::run_child("eventlog::lock::tests::child_lock", |command| {
+                command
+                    .env("ATM_TEST_LOCK_PATH", &path)
+                    .env("ATM_TEST_LOCK_FREE", if available { "yes" } else { "no" });
+            });
             // Unlock without deleting the persistent inode for the second child.
             if !available {
                 assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);

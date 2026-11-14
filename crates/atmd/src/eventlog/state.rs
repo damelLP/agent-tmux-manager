@@ -26,8 +26,6 @@ pub fn state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn resolver_child() {
@@ -47,27 +45,16 @@ mod tests {
             ("", "", "/fixture", "/fixture/.local/state/atm"),
             ("", "", "", "/tmp/atm"),
         ] {
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "eventlog::state::tests::resolver_child"])
-                .env("ATM_STATE_DIR", atm)
-                .env("XDG_STATE_HOME", xdg)
-                .env("HOME", home)
-                .env("ATM_TEST_STATE_EXPECT", expected)
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("resolver child timed out");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            assert!(status.success(), "resolver case {expected}");
+            super::super::test_support::run_child(
+                "eventlog::state::tests::resolver_child",
+                |command| {
+                    command
+                        .env("ATM_STATE_DIR", atm)
+                        .env("XDG_STATE_HOME", xdg)
+                        .env("HOME", home)
+                        .env("ATM_TEST_STATE_EXPECT", expected);
+                },
+            );
         }
     }
 }

@@ -1,4 +1,6 @@
 //! Legacy input joins the same actor ordering as reserved pane effects.
+//! Parked input yields to reservation waiters on its pane, including later
+//! arrivals. A steady stream of reservations can starve it until its deadline.
 use super::org_mirror::{Mirror, View};
 use super::*;
 use crate::control::reservation::{pane_ops, state::InputGate, PaneId};

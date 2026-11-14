@@ -677,6 +677,7 @@ impl MessageHistory {
             return Ok(());
         };
         let open = self.open.entry(recipient.clone()).or_default();
+        let previous_head = open.first().copied();
         if matches!(
             message.status,
             DeliveryStatus::Queued | DeliveryStatus::Delivering
@@ -684,6 +685,14 @@ impl MessageHistory {
             open.insert(id);
         } else {
             open.remove(&id);
+        }
+        if seq > self.startup_high_water && open.first().copied() != previous_head {
+            // A live promotion starts a fresh readiness budget even if nobody
+            // consumed the replayed follower's wait. During replay the head
+            // keeps its recovery-time budget instead.
+            if let Some(track) = open.first().and_then(|head| self.messages.get_mut(head)) {
+                track.hold_since = None;
+            }
         }
         if message.status == DeliveryStatus::Delivered {
             // Terminal. A failed message keeps its continuity instead: a late

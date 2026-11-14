@@ -127,16 +127,9 @@ impl AgentProjects {
     }
 
     async fn request(&self, root: PathBuf, operation: Operation) -> Result<Output, AgentError> {
-        if !root.is_absolute() || root.to_str().is_none() {
-            return Err(AgentError::InvalidParams(
-                "project root must be absolute UTF-8".into(),
-            ));
-        }
+        super::agent_methods::validate_root(&root)?;
         if let Operation::Prepare(name) | Operation::Identify(name) = &operation {
-            // Validate with the existing ID parser before using a name as a path.
-            format!("project/{name}")
-                .parse::<AgentId>()
-                .map_err(|e| AgentError::InvalidParams(e.to_string()))?;
+            super::agent_methods::validate_name(name)?;
         }
         let deadline = Instant::now() + BUDGET;
         let (reply, response) = oneshot::channel();

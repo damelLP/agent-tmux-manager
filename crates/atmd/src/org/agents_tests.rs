@@ -964,6 +964,37 @@ mod agent_project {
     }
 
     #[tokio::test]
+    async fn configuration_validation_matches_rpc_boundary() {
+        let rig = Rig::new().await;
+        let root = rig.root("project");
+        let mut services =
+            crate::server::methods::MethodServices::new(crate::registry::spawn_registry());
+        services.agents = Some(super::AgentHandle::disabled("validation only"));
+        let router = crate::server::methods::router(services).unwrap();
+        for (path, name) in [
+            (PathBuf::new(), "lead"),
+            (PathBuf::from("relative"), "lead"),
+            (root.clone(), "../escape"),
+            (root.clone(), "x/y"),
+            (root.clone(), "two words"),
+        ] {
+            let rpc = router
+                .call(
+                    super::caller(),
+                    "agent.up",
+                    serde_json::json!({"project_root":path,"name":name}),
+                )
+                .await
+                .unwrap_err();
+            let project = rig.projects.prepare(path, name.into()).await.unwrap_err();
+            assert_eq!(project.to_string(), rpc.0.message);
+            assert!(matches!(project, AgentError::InvalidParams(_)));
+        }
+        assert_eq!(rig.org.status().unwrap(), 0);
+        assert!(!root.join(".atm").exists());
+    }
+
+    #[tokio::test]
     async fn first_use_creates_once() {
         let rig = Rig::new().await;
         let root = rig.root("project");

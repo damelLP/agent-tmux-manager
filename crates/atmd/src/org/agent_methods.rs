@@ -84,7 +84,7 @@ impl From<AgentError> for MethodError {
     }
 }
 
-fn validate_root(root: &std::path::Path) -> Result<(), AgentError> {
+pub(super) fn validate_root(root: &std::path::Path) -> Result<(), AgentError> {
     if !root.is_absolute() || root.to_str().is_none() {
         return Err(AgentError::InvalidParams(
             "project_root must be a nonempty absolute UTF-8 path".into(),
@@ -93,7 +93,7 @@ fn validate_root(root: &std::path::Path) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn validate_name(name: &str) -> Result<(), AgentError> {
+pub(super) fn validate_name(name: &str) -> Result<(), AgentError> {
     // Only validate the name here; A1 resolves the actual project identity.
     "validation"
         .parse()

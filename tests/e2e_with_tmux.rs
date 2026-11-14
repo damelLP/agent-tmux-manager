@@ -1775,21 +1775,29 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     let create_session_name = format!("jghcrt{}", std::process::id());
     let create_socket_label = format!("atm-{create_session_name}");
     let create_data_dir = awkward_data_dir();
-
-    let create_output = command_output(
-        Command::new(&env.atm_path)
-            .args([
-                "workspace",
-                "create",
-                "--name",
-                &create_session_name,
-                "--isolate",
-            ])
-            .env("ATM_NO_ATTACH", "1")
-            .env("XDG_DATA_HOME", create_data_dir.path())
-            .env("XDG_STATE_HOME", &env.daemon.state_dir)
-            .env("ATM_SOCKET", &env.daemon.socket_path),
+    let config_home = tempfile::tempdir().expect("create workspace config tempdir");
+    let standin_dir = tempfile::tempdir().expect("create workspace stand-in tempdir");
+    let log = standin_dir.path().join("pi.log");
+    let pi = write_pi_standin(standin_dir.path(), &log);
+    write_atm_config(
+        config_home.path(),
+        &format!(
+            "[harness]\ndefault = 'pi'\n\n[harness.pi]\nbinary = '{}'\n",
+            pi.display()
+        ),
     );
+    // Own cleanup before create can fail, and before its directories disappear.
+    let create_tmux = PrivateTmux {
+        socket_label: create_socket_label,
+    };
+
+    let deadline = Instant::now() + HANG_GUARD;
+    let create_output = command_output(&mut workspace_create_command(
+        env,
+        &create_session_name,
+        config_home.path(),
+        create_data_dir.path(),
+    ));
     assert!(
         create_output.status.success(),
         "atm workspace create failed: stdout={} stderr={}",
@@ -1797,9 +1805,15 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         String::from_utf8_lossy(&create_output.stderr)
     );
 
-    let create_tmux = PrivateTmux {
-        socket_label: create_socket_label,
-    };
+    let agent_pane = top_non_sidebar_pane(create_tmux.label(), &create_session_name);
+    wait_for_signal(create_tmux.label(), "pi-recorded", deadline)
+        .expect("workspace agent must run the configured stand-in");
+    let recorded = std::fs::read_to_string(&log).expect("read completed workspace stand-in record");
+    assert_eq!(
+        recorded,
+        format!("{agent_pane}\n\n"),
+        "the stand-in must run in the agent pane with no arguments"
+    );
 
     let installed_hooks = tmux_run_capture(
         create_tmux.label(),

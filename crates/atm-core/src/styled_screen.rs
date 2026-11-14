@@ -11,17 +11,20 @@ struct Style {
     inverse: bool,
 }
 
+/// Decoded viewport text and attributes at UTF-8 character-start byte offsets.
 #[derive(Debug, Clone)]
 pub struct StyledScreen {
     text: String,
     styles: Vec<(usize, Style)>,
 }
 
+/// Unsupported or malformed terminal control syntax invalidates the whole screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported or malformed captured terminal text")]
 pub struct InvalidStyledScreen;
 
 impl StyledScreen {
+    /// Decode supported SGR/OSC-8 controls, preserving every visible character and LF.
     pub fn parse(text: &str) -> Result<Self, InvalidStyledScreen> {
         let mut screen = Self {
             text: String::new(),
@@ -74,16 +77,19 @@ impl StyledScreen {
         Ok(screen)
     }
 
+    /// Return decoded text without trimming spaces or line breaks.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// Read faint at a decoded UTF-8 character start; LF, non-boundary and invalid offsets give None.
     #[must_use]
     pub fn faint_at(&self, byte_offset: usize) -> Option<bool> {
         self.style_at(byte_offset).map(|s| s.faint)
     }
 
+    /// Read inverse at a decoded UTF-8 character start; LF, non-boundary and invalid offsets give None.
     #[must_use]
     pub fn inverse_at(&self, byte_offset: usize) -> Option<bool> {
         self.style_at(byte_offset).map(|s| s.inverse)
@@ -230,7 +236,123 @@ mod tests {
         }
     }
 
+    // Independent reference for accepted streams: walk characters, skip link metadata,
+    // consume complete color groups and track only the two observable attributes.
+    type Reference = (String, Vec<(usize, bool, bool)>);
+
+    fn reference(text: &str) -> Option<Reference> {
+        let mut chars = text.chars();
+        let (mut faint, mut inverse) = (false, false);
+        let mut visible = String::new();
+        let mut attributes = Vec::new();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                if c != '\n' {
+                    attributes.push((visible.len(), faint, inverse));
+                }
+                visible.push(c);
+                continue;
+            }
+            match chars.next()? {
+                '[' => {
+                    let parameters: String = chars.by_ref().take_while(|c| *c != 'm').collect();
+                    if parameters.is_empty() {
+                        (faint, inverse) = (false, false);
+                        continue;
+                    }
+                    let mut values = parameters.split(';');
+                    while let Some(value) = values.next() {
+                        match value.parse::<u8>().ok()? {
+                            0 => (faint, inverse) = (false, false),
+                            2 => faint = true,
+                            7 => inverse = true,
+                            22 => faint = false,
+                            27 => inverse = false,
+                            38 | 48 => {
+                                let components = if values.next()?.parse::<u8>().ok()? == 5 {
+                                    1
+                                } else {
+                                    3
+                                };
+                                for _ in 0..components {
+                                    values.next()?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ']' => loop {
+                    match chars.next()? {
+                        '\x07' => break,
+                        '\x1b' if chars.next()? == '\\' => break,
+                        _ => {}
+                    }
+                },
+                _ => return None,
+            }
+        }
+        Some((visible, attributes))
+    }
+
+    const VALID_FRAGMENTS: &[&str] = &[
+        "A",
+        "é界",
+        " ",
+        "\n",
+        "\x1b[m",
+        "\x1b[0m",
+        "\x1b[2m",
+        "\x1b[7m",
+        "\x1b[22m",
+        "\x1b[27m",
+        "\x1b[1;2;3;7m",
+        "\x1b[0;2m",
+        "\x1b[38;5;2;7m",
+        "\x1b[038;05;2;7m",
+        "\x1b[48;2;7;7;7;2m",
+        "\x1b[38;2;2;7;0m",
+        "\x1b]8;id=x;https://example.test\x07",
+        "\x1b]8;;\x1b\\",
+    ];
+
     proptest! {
+        #[test]
+        fn fragment_alphabet_matches_reference(
+            fragments in proptest::collection::vec(prop_oneof![
+                proptest::sample::select(VALID_FRAGMENTS),
+                proptest::sample::select(&[
+                    "\x1b", "[", "]", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                    ";", ":", "m", "\x07", "\\", "\n", "text", "\r", "\u{9b}",
+                ][..]),
+            ], 0..128)
+        ) {
+            let text = fragments.concat();
+            if let Ok(screen) = StyledScreen::parse(&text) {
+                prop_assert!(!screen.text().chars().any(|c| c.is_control() && c != '\n'));
+                let (visible, attributes) = reference(&text).unwrap();
+                prop_assert_eq!(screen.text(), visible);
+                for (offset, faint, inverse) in attributes {
+                    prop_assert_eq!(screen.faint_at(offset), Some(faint));
+                    prop_assert_eq!(screen.inverse_at(offset), Some(inverse));
+                }
+            }
+        }
+
+        #[test]
+        fn valid_fragments_preserve_reference_attributes(
+            fragments in proptest::collection::vec(proptest::sample::select(VALID_FRAGMENTS), 0..128)
+        ) {
+            let text = fragments.concat();
+            let screen = StyledScreen::parse(&text).unwrap();
+            let (visible, attributes) = reference(&text).unwrap();
+            prop_assert_eq!(screen.text(), visible);
+            for (offset, faint, inverse) in attributes {
+                prop_assert_eq!(screen.faint_at(offset), Some(faint));
+                prop_assert_eq!(screen.inverse_at(offset), Some(inverse));
+            }
+        }
+
         #[test]
         fn arbitrary_unicode_is_panic_free(text in proptest::collection::vec(any::<char>(), 0..1024)) {
             let text: String = text.into_iter().collect();

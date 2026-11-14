@@ -224,6 +224,7 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
         0 => OrgCommand::RegisterProject {
             project_id: "p".parse().unwrap(),
             root: format!("/p{n}"),
+            move_root: flag,
         },
         1 => OrgCommand::Up {
             agent_id,

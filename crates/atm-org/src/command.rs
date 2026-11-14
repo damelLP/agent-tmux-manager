@@ -10,6 +10,8 @@ pub enum OrgCommand {
     RegisterProject {
         project_id: ProjectId,
         root: String,
+        /// The daemon verified the old root no longer holds this project.
+        move_root: bool,
     },
     Up {
         agent_id: AgentId,
@@ -77,6 +79,12 @@ pub enum OrgCommand {
 pub enum Refusal {
     #[error(transparent)]
     Invariant(#[from] ApplyError),
+    #[error("project {project_id} is registered at {registered:?}, not {requested:?}")]
+    ProjectRootConflict {
+        project_id: ProjectId,
+        registered: String,
+        requested: String,
+    },
     #[error("cannot {operation} agent {agent_id} while {state:?}")]
     InvalidAgentState {
         agent_id: AgentId,
@@ -108,9 +116,9 @@ impl OrgCommand {
     // The candidate shares validation with apply before policy can emit it.
     fn event(&self) -> OrgEvent {
         match self.clone() {
-            Self::RegisterProject { project_id, root } => {
-                OrgEvent::ProjectRegistered { project_id, root }
-            }
+            Self::RegisterProject {
+                project_id, root, ..
+            } => OrgEvent::ProjectRegistered { project_id, root },
             Self::Up { agent_id, role } | Self::Respawn { agent_id, role, .. } => {
                 OrgEvent::AgentUpRequested { agent_id, role }
             }
@@ -184,8 +192,21 @@ impl OrgState {
         let event = command.event();
         self.validate_event(&event)?;
         let changed = match command {
-            OrgCommand::RegisterProject { project_id, root } => {
+            OrgCommand::RegisterProject {
+                project_id,
+                root,
+                move_root,
+            } => {
                 nonempty("root", root)?;
+                if let Some(project) = self.project(project_id) {
+                    if &project.root != root && !move_root {
+                        return Err(Refusal::ProjectRootConflict {
+                            project_id: project_id.clone(),
+                            registered: project.root.clone(),
+                            requested: root.clone(),
+                        });
+                    }
+                }
                 self.project(project_id).is_none_or(|p| &p.root != root)
             }
             OrgCommand::Up { agent_id, role } => {
@@ -208,18 +229,29 @@ impl OrgState {
             } => {
                 if let Some(agent) = self.agent(agent_id) {
                     same_pane_or_unbound(agent, pane)?;
-                    agent.pane.as_ref() != Some(pane) || &agent.session_id != session_id
+                    let status = if session_id.is_some() {
+                        AgentStatus::Ready
+                    } else {
+                        AgentStatus::Starting
+                    };
+                    agent.pane.as_ref() != Some(pane)
+                        || &agent.session_id != session_id
+                        || agent.status != status
                 } else {
                     true
                 }
             }
             OrgCommand::PaneCreated { agent_id, pane } => {
                 let agent = self.require_agent(agent_id)?;
-                if agent.status != AgentStatus::Starting {
-                    return Err(agent_refusal(agent, "record pane"));
-                }
                 same_pane_or_unbound(agent, pane)?;
-                agent.pane.as_ref() != Some(pane)
+                if agent.pane.as_ref() == Some(pane) {
+                    false
+                } else {
+                    if agent.status != AgentStatus::Starting {
+                        return Err(agent_refusal(agent, "record pane"));
+                    }
+                    true
+                }
             }
             OrgCommand::SessionBound {
                 agent_id,
@@ -234,7 +266,8 @@ impl OrgState {
             OrgCommand::SessionLost { agent_id } => {
                 let agent = self.require_agent(agent_id)?;
                 !matches!(agent.status, AgentStatus::Clearing | AgentStatus::Down)
-                    && !(agent.status == AgentStatus::Starting && agent.session_id.is_none())
+                    && !(matches!(agent.status, AgentStatus::Starting | AgentStatus::Stuck)
+                        && agent.session_id.is_none())
             }
             OrgCommand::Clear { agent_id } => {
                 let agent = self.require_agent(agent_id)?;
@@ -286,7 +319,7 @@ impl OrgState {
                     .last_attempt
                     .as_ref()
                     .is_some_and(|a| a.attempt == *attempt && &a.pane == pane);
-                if message.status == DeliveryStatus::Delivering && same {
+                if terminal(message) || (message.status == DeliveryStatus::Delivering && same) {
                     false
                 } else {
                     if message.status != DeliveryStatus::Queued {
@@ -307,15 +340,7 @@ impl OrgState {
                 }
             }
             OrgCommand::Delivered { message_id, .. } => {
-                let message = self.require_message(message_id)?;
-                if terminal(message) {
-                    false
-                } else {
-                    if message.status != DeliveryStatus::Delivering {
-                        return Err(delivery_refusal(message, "confirm delivery"));
-                    }
-                    true
-                }
+                self.require_message(message_id)?.status != DeliveryStatus::Delivered
             }
             OrgCommand::DeliveryFailed {
                 message_id,
@@ -355,12 +380,6 @@ impl OrgState {
                 unread
             }
             OrgCommand::RecordSummary(summary) => {
-                if summary.ended.is_some_and(|ended| ended < summary.started) {
-                    return Err(Refusal::InvalidValue {
-                        field: "ended",
-                        reason: "precedes started".into(),
-                    });
-                }
                 self.session_summary(&summary.session_id) != Some(summary)
             }
             OrgCommand::ControlSent(audit)

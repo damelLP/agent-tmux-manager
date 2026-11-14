@@ -43,6 +43,7 @@ text_serde!(ProjectId);
 
 fn slug_chars(text: &str) -> bool {
     !text.is_empty()
+        && !text.starts_with('-')
         && text.len() <= 32
         && text
             .bytes()
@@ -53,6 +54,18 @@ impl ProjectId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// `index` is the zero-based collision number, producing suffixes 2, 3, ...
+    pub(crate) fn suffixed(&self, index: usize) -> Self {
+        // usize is at most 64 bits on supported targets: widening before adding
+        // leaves room for len + 1, and the suffix takes at most 21 ASCII bytes.
+        let suffix = format!("-{}", (index as u128).saturating_add(2));
+        let prefix = self
+            .0
+            .get(..32_usize.saturating_sub(suffix.len()))
+            .unwrap_or(&self.0);
+        Self(format!("{}{suffix}", prefix.trim_end_matches('-')))
     }
 
     pub(crate) fn from_folder(text: &str) -> Self {
@@ -75,7 +88,11 @@ impl FromStr for ProjectId {
         if slug_chars(text) {
             Ok(Self(text.into()))
         } else {
-            Err(invalid("project id", text, "expected [a-z0-9-]{1,32}"))
+            Err(invalid(
+                "project id",
+                text,
+                "expected [a-z0-9-]{1,32}, starting with a letter or digit",
+            ))
         }
     }
 }
@@ -86,7 +103,7 @@ impl fmt::Display for ProjectId {
 }
 
 pub(crate) fn validate_name(name: &str) -> Result<(), IdError> {
-    if slug_chars(name) && !name.starts_with('-') && !matches!(name, "owner" | "system") {
+    if slug_chars(name) && !matches!(name, "owner" | "system") {
         Ok(())
     } else {
         Err(invalid("agent name", name, "expected 1..32 lowercase ASCII letters, digits or hyphens; first character alphanumeric; owner/system reserved"))

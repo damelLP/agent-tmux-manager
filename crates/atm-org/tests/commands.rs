@@ -21,6 +21,7 @@ fn setup() -> (OrgState, u64) {
         OrgCommand::RegisterProject {
             project_id: "p".parse().unwrap(),
             root: "/p".into(),
+            move_root: false,
         },
         &mut seq,
     );
@@ -142,10 +143,10 @@ fn adopt_pane_ownership_and_respawn() {
             pane: "%2".into(),
             session_id: None,
         },
-        pane(),
     ] {
         assert!(state.decide(&command, time()).is_err());
     }
+    assert!(run(&mut state, pane(), &mut seq).is_empty());
     let events = run(
         &mut state,
         OrgCommand::Respawn {
@@ -169,7 +170,8 @@ fn project_move_unknown_references_invalid_ids_and_role_mismatch() {
         &mut state,
         OrgCommand::RegisterProject {
             project_id: "p".parse().unwrap(),
-            root: "/p".into()
+            root: "/p".into(),
+            move_root: false,
         },
         &mut seq
     )
@@ -179,7 +181,8 @@ fn project_move_unknown_references_invalid_ids_and_role_mismatch() {
             &mut state,
             OrgCommand::RegisterProject {
                 project_id: "p".parse().unwrap(),
-                root: "/renamed".into()
+                root: "/renamed".into(),
+                move_root: true,
             },
             &mut seq
         )
@@ -227,7 +230,7 @@ fn delivery_policy_and_read_ownership() {
         session_id: "s1".into(),
         confirmation: "token".into(),
     };
-    assert!(state.decide(&delivered, time()).is_err());
+    assert_eq!(state.decide(&delivered, time()).unwrap().len(), 1);
     let read = OrgCommand::ReadMessages {
         who: Address::Agent(id()),
         message_ids: vec![mid],

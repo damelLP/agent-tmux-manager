@@ -108,6 +108,23 @@ pub struct OrgState {
     summaries: HashMap<SessionId, SessionSummary>,
 }
 impl OrgState {
+    /// Choose an unregistered folder slug, then the first free -2, -3, ...
+    /// suffix. This does not reserve it: the single writer must register it.
+    #[must_use]
+    pub fn free_project_id(&self, dir_name: &str) -> ProjectId {
+        let base = ProjectId::from_folder(dir_name);
+        let mut candidate = base.clone();
+        for (index, _) in self.projects.iter().enumerate() {
+            if !self.projects.contains_key(&candidate) {
+                return candidate;
+            }
+            candidate = base.suffixed(index);
+        }
+        // N stored projects cannot occupy all N+1 distinct candidates. If every
+        // checked candidate was occupied, this last candidate must be free.
+        candidate
+    }
+
     #[must_use]
     pub fn project(&self, id: &ProjectId) -> Option<&Project> {
         self.projects.get(id)

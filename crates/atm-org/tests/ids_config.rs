@@ -17,10 +17,10 @@ fn folder_slugs_and_project_roundtrip() {
         new_project_file(&"A".repeat(40)).id.to_string(),
         "a".repeat(32)
     );
-    for valid in ["-", "a--b-", "0"] {
+    for valid in ["a--b-", "0"] {
         assert!(valid.parse::<ProjectId>().is_ok());
     }
-    for invalid in ["", "My-Repo", "a/b", "a b", &"a".repeat(33)] {
+    for invalid in ["", "-", "-x", "My-Repo", "a/b", "a b", &"a".repeat(33)] {
         assert!(invalid.parse::<ProjectId>().is_err());
     }
     assert!(parse_project("id='a'\ntypo=1")

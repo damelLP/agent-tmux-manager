@@ -36,12 +36,44 @@ const OBSERVE_BUDGET: Duration = Duration::from_secs(30);
 
 // A wake may wait both in the coalescer and in control admission. Retain only
 // its identity context, never a readiness decision or an event-history mirror.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct BindingCandidate {
     session: SessionId,
     pane: Option<String>,
     binding: Option<SessionId>,
     excluded: Option<SessionId>,
+    cursor: u64,
+    events: broadcast::Receiver<Arc<crate::eventlog::Envelope>>,
+}
+
+impl BindingCandidate {
+    fn valid(&mut self, agent: &Agent) -> bool {
+        if agent.pane != self.pane
+            || agent.session_id != self.binding
+            || agent.excluded_session_id != self.excluded
+        {
+            return false;
+        }
+        let id = agent.id.to_string();
+        loop {
+            match self.events.try_recv() {
+                Ok(event)
+                    if event.seq > self.cursor
+                        && event.kind.starts_with("agent.")
+                        && event
+                            .body
+                            .get("agent_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(id.as_str()) =>
+                {
+                    return false
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => return true,
+                Err(_) => return false,
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -448,11 +480,10 @@ impl AgentRuntime {
                     if agent.status == AgentStatus::Down || agent.pane != pane {
                         return Ok(());
                     }
-                    let bind = bind.and_then(|candidate| {
-                        (agent.pane == candidate.pane
+                    let bind = bind.filter(|candidate| {
+                        agent.pane == candidate.pane
                             && agent.session_id == candidate.binding
-                            && agent.excluded_session_id == candidate.excluded)
-                            .then_some(candidate.session)
+                            && agent.excluded_session_id == candidate.excluded
                     });
                     rt.inspect(&r, &state, agent, bind, initial).await
                 },
@@ -471,7 +502,7 @@ impl AgentRuntime {
         r: &Reservation,
         state: &OrgState,
         agent: &Agent,
-        bind: Option<SessionId>,
+        mut bind: Option<BindingCandidate>,
         initial: bool,
     ) -> Result<(), AgentError> {
         // Registry failure is never evidence that every agent is gone.
@@ -495,12 +526,45 @@ impl AgentRuntime {
                 .await?;
             return Ok(());
         }
-        if matches!(agent.status, AgentStatus::Clearing | AgentStatus::Stuck) {
+        if agent.status == AgentStatus::Clearing {
+            return Ok(());
+        }
+        let expected = harness(state, agent, &rows);
+        let eligible: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                matches_agent(agent, row)
+                    && !row.id.is_pending()
+                    && row.harness == expected.short_tag()
+            })
+            .collect();
+        if let Some(candidate) = bind.as_mut() {
+            if eligible.len() == 1
+                && eligible
+                    .first()
+                    .is_some_and(|row| row.id == candidate.session)
+                && candidate.valid(agent)
+            {
+                self.org
+                    .execute(
+                        OrgCommand::SessionBound {
+                            agent_id: agent.id.clone(),
+                            session_id: candidate.session.clone(),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
+        if agent.status == AgentStatus::Stuck || (!initial && agent.status == AgentStatus::Ready) {
             return Ok(());
         }
         let Some(pane) = &agent.pane else {
             return Ok(());
         };
+        #[cfg(test)]
+        self.progress("capture", Some(agent.id.clone()));
         let capture = r
             .capture(&PaneId::parse(pane)?, CaptureFormat::Plain)
             .await?;
@@ -512,9 +576,8 @@ impl AgentRuntime {
             .filter(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
             .collect();
         let parents = live.iter().filter(|row| !row.id.is_pending()).count();
-        let bind = bind.filter(|id| !id.is_pending() && live.iter().any(|row| &row.id == id));
         let revalidating = agent.status == AgentStatus::Ready || agent.session_id.is_some();
-        if (revalidating || bind.is_some())
+        if revalidating
             && !capture.inspection.dead
             && !capture.inspection.in_mode
             && capture.inspection.local_agent_tag.as_deref() == Some(&agent.id.to_string())
@@ -524,18 +587,15 @@ impl AgentRuntime {
             && facts.turn == TurnState::NotRunning
             && facts.dialog == DialogState::None
         {
-            let binding = bind.is_some();
-            let command = match bind {
-                Some(session_id) => OrgCommand::SessionBound {
-                    agent_id: agent.id.clone(),
-                    session_id,
-                },
-                None => OrgCommand::EditorReady {
-                    agent_id: agent.id.clone(),
-                },
-            };
-            if binding || agent.status != AgentStatus::Ready {
-                self.org.execute(command, chrono::Utc::now()).await?;
+            if agent.status != AgentStatus::Ready {
+                self.org
+                    .execute(
+                        OrgCommand::EditorReady {
+                            agent_id: agent.id.clone(),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .await?;
             }
         } else if initial && agent.status == AgentStatus::Ready && agent.session_id.is_some() {
             self.org
@@ -765,6 +825,8 @@ async fn observer(
             });
         }
         #[cfg(test)]
+        rt.progress("dispatched", None);
+        #[cfg(test)]
         if active.is_empty() && pending.is_empty() {
             rt.progress("idle", None);
         }
@@ -796,7 +858,7 @@ async fn observer(
             event = events.recv() => {
                 let (id, bind) = match event {
                     Ok(SessionEvent::Registered { session_id, .. }) => (Some(session_id), true),
-                    Ok(SessionEvent::Updated { session }) => (Some(session.id), false),
+                    Ok(SessionEvent::Updated { session }) => (Some(session.id), true),
                     Ok(SessionEvent::Removed { session_id, .. }) => (Some(session_id), false),
                     Err(broadcast::error::RecvError::Lagged(_)) => (None, true),
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -852,30 +914,51 @@ async fn schedule(
         }) {
             continue;
         }
-        let eligible: Vec<_> = rows
-            .iter()
-            .filter(|row| matches_agent(agent, row) && !row.id.is_pending())
-            .collect();
-        let candidate = if bind && eligible.len() == 1 {
-            eligible.first().map(|row| BindingCandidate {
-                session: row.id.clone(),
-                pane: agent.pane.clone(),
-                binding: agent.session_id.clone(),
-                excluded: agent.excluded_session_id.clone(),
-            })
+        let candidate = if bind {
+            // Subscribe before the FIFO snapshot. A complete clear can leave the
+            // identity tuple unchanged, and equal timestamps are not a fence.
+            let events = rt.org.committed.subscribe();
+            let cursor = rt.org.status()?;
+            let current = rt.org.snapshot().await?;
+            let Some(agent) = current.agent(&agent.id) else {
+                continue;
+            };
+            let current_rows = rt.rows().await?;
+            let expected = harness(&current, agent, &current_rows);
+            let eligible: Vec<_> = current_rows
+                .iter()
+                .filter(|row| {
+                    matches_agent(agent, row)
+                        && !row.id.is_pending()
+                        && row.harness == expected.short_tag()
+                })
+                .collect();
+            if eligible.len() == 1 {
+                eligible
+                    .first()
+                    .filter(|row| {
+                        agent.session_id.as_ref() != Some(&row.id)
+                            || agent.status == AgentStatus::Stuck
+                    })
+                    .map(|row| BindingCandidate {
+                        session: row.id.clone(),
+                        pane: agent.pane.clone(),
+                        binding: agent.session_id.clone(),
+                        excluded: agent.excluded_session_id.clone(),
+                        cursor,
+                        events,
+                    })
+            } else {
+                None
+            }
         } else {
             None
         };
         // One dirty bit/candidate per agent; event floods never create one
         // reservation waiter per event. Acquire re-reads all authoritative state.
-        pending
-            .entry(agent.id.clone())
-            .and_modify(|old| {
-                if candidate.is_some() {
-                    *old = candidate.clone();
-                }
-            })
-            .or_insert(candidate);
+        if candidate.is_some() || !pending.contains_key(&agent.id) {
+            pending.insert(agent.id.clone(), candidate);
+        }
     }
     Ok(())
 }

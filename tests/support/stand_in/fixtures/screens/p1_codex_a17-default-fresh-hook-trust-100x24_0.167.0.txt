@@ -1,0 +1,25 @@
+Captured: codex 0.167.0, 2026-11-14, P1 private tmux capture-pane -p; 100x24; paths sanitized at equal width.
+                         
+  Hooks need review                               
+  11 hooks are new or changed.                    
+  Hooks can run outside the sandbox after you trust them.                                           
+                         
+                         
+› 1. Review hooks                                                                                   
+  2. Trust all and continue                       
+  3. Continue without trusting (hooks won't run)  
+                         
+  enter confirm · esc skip                                                                          
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                                                  
+                         
+                         
+                         

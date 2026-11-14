@@ -388,6 +388,102 @@ fn assert_nothing_split(dir: &Path) {
     );
 }
 
+#[test]
+fn spawn_codex_requirements_survive_aliases_config_and_overrides() {
+    for (harness, configured, env, expected) in [
+        ("codex", false, vec![], "codex '--no-daemon'"),
+        ("codex-cli", false, vec![], "codex '--no-daemon'"),
+        ("codex-cli", true, vec![], "mise 'x' 'codex' '--no-daemon'"),
+        (
+            "codex",
+            true,
+            vec![("ATM_SPAWN_BIN", "/my stand-in")],
+            "'/my stand-in' '--no-daemon'",
+        ),
+        (
+            "codex-cli",
+            true,
+            vec![
+                ("ATM_SPAWN_BIN", "wrong"),
+                ("ATM_SPAWN_CODEX_BIN", "/my stand-in"),
+            ],
+            "'/my stand-in' '--no-daemon'",
+        ),
+        (
+            "codex",
+            true,
+            vec![("ATM_SPAWN_BIN", "mise"), ("ATM_SPAWN_ARGS", "x codex")],
+            "mise x codex '--no-daemon'",
+        ),
+        (
+            "codex-cli",
+            true,
+            vec![
+                ("ATM_SPAWN_CODEX_BIN", "mise"),
+                ("ATM_SPAWN_CODEX_ARGS", "x codex"),
+            ],
+            "mise x codex '--no-daemon'",
+        ),
+        (
+            "codex",
+            true,
+            vec![("ATM_SPAWN_ARGS", "--debug")],
+            "mise 'x' 'codex' --debug '--no-daemon'",
+        ),
+    ] {
+        let dir = rig();
+        if configured {
+            let config = dir.path().join("config/atm");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(
+                config.join("config.toml"),
+                "[harness.codex]\nbinary = 'mise'\ndefault_args = ['x', 'codex']\n",
+            )
+            .unwrap();
+        }
+        let out = spawn_command(
+            dir.path(),
+            Some("%7"),
+            &["-H", harness, "--prompt", "initial prompt"],
+        )
+        .envs(env)
+        .output()
+        .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            typed_command(dir.path()),
+            format!("cd '/from/pane' && {expected} 'initial prompt'")
+        );
+    }
+}
+
+#[test]
+fn spawn_counts_required_arguments_in_prompt_line_limit() {
+    for (cwd_len, succeeds) in [(3945, true), (3946, false)] {
+        let dir = rig();
+        let cwd = format!("/{}", "w".repeat(cwd_len - 1));
+        let out = spawn(
+            dir.path(),
+            Some("%7"),
+            &[
+                "-H",
+                "codex",
+                "-w",
+                &cwd,
+                "--prompt",
+                "/atm-implement /tmp/b.md",
+            ],
+        );
+        assert_eq!(out.status.success(), succeeds, "{out:?}");
+        if succeeds {
+            assert_eq!(typed_command(dir.path()).len(), 4000);
+        } else {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("4001 bytes"));
+            assert_nothing_split(dir.path());
+        }
+    }
+}
+
 /// Claude Code, pi and Codex take a first prompt as their last positional
 /// argument (verified 2026-11-05 against 2.1.318, 0.73.1 and 0.163.0). It
 /// goes last, after `ATM_SPAWN_*_ARGS` and `--model`, as one shell word.
@@ -417,16 +513,20 @@ fn spawn_puts_the_prompt_last_on_the_command_line() {
     );
 
     // Each harness's own skill call, as the coordinator sends it.
-    for (harness, prompt) in [
-        ("pi", "/skill:atm-implement --profile p /tmp/b.md"),
-        ("codex", "$atm-implement --profile p /tmp/b.md"),
+    for (harness, command, prompt) in [
+        ("pi", "pi", "/skill:atm-implement --profile p /tmp/b.md"),
+        (
+            "codex",
+            "codex '--no-daemon'",
+            "$atm-implement --profile p /tmp/b.md",
+        ),
     ] {
         let dir = rig();
         let out = spawn(dir.path(), Some("%7"), &["-H", harness, "--prompt", prompt]);
         assert!(out.status.success(), "atm spawn -H {harness}: {out:?}");
         assert_eq!(
             typed_command(dir.path()),
-            format!("cd '/from/pane' && {harness} '{prompt}'")
+            format!("cd '/from/pane' && {command} '{prompt}'")
         );
     }
 
@@ -569,6 +669,6 @@ fn spawn_refuses_a_one_word_or_dash_prompt_before_splitting() {
     assert!(out.status.success(), "atm spawn: {out:?}");
     assert_eq!(
         typed_command(dir.path()),
-        "cd '/from/pane' && codex '$atm-implement /tmp/b.md'"
+        "cd '/from/pane' && codex '--no-daemon' '$atm-implement /tmp/b.md'"
     );
 }

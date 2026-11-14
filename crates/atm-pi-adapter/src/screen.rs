@@ -30,6 +30,9 @@
 //! a particular clear completed. Consumers own viewport freshness, copy-mode,
 //! process/pane identity and temporal delivery checks.
 
+mod control;
+pub use control::{observe_control_screen, CONTROL_POLICY};
+
 use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,

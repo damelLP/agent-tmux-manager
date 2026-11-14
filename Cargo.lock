@@ -105,7 +105,10 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atm-claude-adapter",
+ "atm-codex-adapter",
  "atm-core",
+ "atm-pi-adapter",
  "atm-protocol",
  "atm-tmux",
  "atm-tui",

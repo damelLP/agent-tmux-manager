@@ -1,5 +1,27 @@
 # Claude screen fixtures
 
+## Lifecycle control observations (B0)
+
+Captured: Claude Code 2.1.325, 2026-11-14, sealed P1 private-tmux
+`capture-pane -p -e -N`. `screen_control_p1_<stem>_2.1.325.txt` maps to
+`<stem>.styled-N.txt`; corresponding `.plain.txt` and `.meta.json` contain
+wording and cursor/geometry evidence. Only private run roots are replaced by
+equal-width `/tmp/xxx…` paths. Attributes, rows, spaces and composer text are
+unchanged; the first provenance line is removed at test load.
+
+`tests/control_screen.rs` covers A80/A120/A200 default, selected, reset and
+ready frames; A-race-0/1-yes; A-auto-ready; B-clear-007;
+B-baseline-conversation; C1-auto-settled; B-auto-submitted; and C3-dialog.
+The new control observer recognizes both trust selections and captured manual/
+auto launch chrome. Lines above the first complete header are uninterpreted;
+a later copied header cannot erase earlier history. The legacy observer and
+its existing Unknown assertions are unchanged. Mutations are marked Synthetic.
+
+Full trust paths are not filesystem authorization; long/wrapped paths and
+unseeded onboarding remain unverified. Retry count is policy, not a key sender.
+Conversation=false is not proof of freshness. The four-option permission
+capture remains Unknown. Older limitations below describe the legacy observer.
+
 ## Styled fixtures (U8d)
 
 Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30
@@ -30,9 +52,13 @@ Captured: Claude Code 2.1.325, 2026-11-14, sealed private-tmux command probe:
 clear, not UserPromptSubmit; no API request occurred.
 
 P1 `B-auto-pasted-120x40` pins a matching padded real draft. `B-clear-001-120x40`
-pins the unsupported slash menu (it replaces the footer), and
-`C2-queued-001-120x40` pins the unsupported manual-mode queued frame. Both remain
-Unknown/None; U8 slice B owns other modes and slash-menu parsing. The queued
+pins the slash menu (it replaces the footer), and
+`C2-queued-001-120x40` pins the unsupported manual-mode queued frame. Legacy
+facts remain Unknown for both. B0's staged matcher now checks the single selected
+completion command and active editor exactly; description wording may vary but
+wrapped description alignment must remain intact. No selection, two selections,
+missing editor or malformed layout refuses. The menu is None (not a modal) only
+in the control observer. The manual queued staged check remains None. The queued
 frame's captured editor row is also transplanted into supported auto chrome in
 a labelled Synthetic test. A match alone never proves what Enter will do.
 

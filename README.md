@@ -60,6 +60,14 @@ default_args = ["x", "pi"]
 
 Environment overrides still take precedence when set (`ATM_SPAWN_PI_BIN/ARGS`, then legacy `ATM_SPAWN_BIN/ARGS`); otherwise config values are used, then built-in defaults.
 
+Codex launches through atm require codex-cli 0.158.0 or later for `--no-daemon` support.
+
+A `BIN` override drops ordinary configured `default_args`, but keeps required arguments (Codex's `--no-daemon`) and arguments from atm's agent roles. The command order is: binary, defaults (unless `BIN` is set), raw `ARGS`, required arguments, role arguments, model, then prompt. For example, `ATM_SPAWN_CODEX_BIN=mise ATM_SPAWN_CODEX_ARGS='x codex'` produces `mise x codex '--no-daemon'`.
+
+If `default_args` or an agent role already holds a required argument, atm types it once, in the required position. Other repeated arguments keep their order and repetitions. Don't use a required argument as another option's value: atm treats an exact match as the required argument, not as a value.
+
+`ATM_SPAWN_<HARNESS>_ARGS` and `ATM_SPAWN_ARGS` remain **caller-owned shell syntax**, passed through verbatim except for trimming whitespace at the ends. ATM does not parse, reject or remove repetitions from raw arguments, even if they repeat or neutralize a required argument. Shell expansions and wrappers can also repeat or neutralize it. Remove any raw `--no-daemon` you previously supplied to avoid repeating ATM's flag, and ensure wrappers forward the appended requirements. Quoting, option values and shell operators in raw `ARGS` are your responsibility.
+
 `atm spawn --prompt` puts the prompt last, after these arguments and `--model`. Don't end them with an option that takes several values, such as Claude Code's `--add-dir` or Codex's `-i`: it would take the prompt as one more value. Don't end them with `;`, `&`, `|` or `#` either: the shell would run the prompt as a command of its own, or read it as a comment.
 
 ```

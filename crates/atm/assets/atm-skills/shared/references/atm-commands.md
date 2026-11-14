@@ -198,9 +198,9 @@ in `<dir>`. Options: `-d left|right|above|below` (default below), `-s 30%`
   Code and pi report at startup. Codex 0.163.0 reports at its first prompt,
   so its row appears only after your first send or its `--prompt`.
   `atm send %N` works without a row.
-- **Spawn a Codex implementer with `--no-daemon`**, added in front of any
-  `ATM_SPAWN_CODEX_ARGS` you already have:
-  `ATM_SPAWN_CODEX_ARGS="--no-daemon ${ATM_SPAWN_CODEX_ARGS:-}" atm spawn -H codex ...`.
+- **`atm spawn -H codex` adds `--no-daemon` itself.** Don't put it in
+  `ATM_SPAWN_CODEX_ARGS` or `ATM_SPAWN_ARGS`; remove it if you previously
+  supplied it there.
   Under Codex's default shared app-server daemon, every Codex session's
   hooks report the daemon's process and the pane of the Codex that started
   it (0.163.0): a second Codex's row lands on that pane, its own pane gets

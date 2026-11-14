@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"msg-retry-unknown-field","method":"msg.retry","params":{"id":"m1","accept_duplicate_risk":true}},
+  "response": {"type":"response","id":"msg-retry-unknown-field","error":{"code":"invalid_params","message":"unknown field `accept_duplicate_risk`, expected `id`"}},
+  "ignore": []
+}

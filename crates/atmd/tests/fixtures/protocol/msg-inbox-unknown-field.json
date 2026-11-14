@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"msg-inbox-unknown-field","method":"msg.inbox","params":{"unexpected":true}},
+  "response": {"type":"response","id":"msg-inbox-unknown-field","error":{"code":"invalid_params","message":"unknown field `unexpected`, expected one of `for`, `unread_only`, `count_only`, `id`, `after`, `limit`"}},
+  "ignore": []
+}

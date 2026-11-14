@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-up-invalid","method":"agent.up","params":true},
+  "response": {"type":"response","id":"agent-up-invalid","error":{"code":"invalid_params","message":"params must be an object or null"}},
+  "ignore": []
+}

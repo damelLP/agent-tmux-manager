@@ -24,6 +24,10 @@ pub struct MethodServices {
     pub registry: RegistryHandle,
     /// Supplied at server startup, or injected by tests/in-process clients.
     pub control: Option<crate::control::service::ControlHandle>,
+    /// Named-agent service; None advertises explicitly unavailable operations.
+    pub agents: Option<crate::org::agents::AgentHandle>,
+    /// Confirmed-message service; None advertises explicitly unavailable operations.
+    pub messages: Option<crate::org::messages::MessageHandle>,
     /// Production resolves this before daemonization; tests can inject a path.
     /// daemon.info displays non-UTF-8 paths lossily; filesystem use stays exact.
     pub state_dir: PathBuf,
@@ -38,6 +42,8 @@ impl MethodServices {
         Self {
             registry,
             control: None,
+            agents: None,
+            messages: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
             raw: crate::org::RawHandle::default(),
@@ -177,6 +183,21 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     })?;
 
     register_control(&mut router, services.control)?;
+    crate::org::agents::register_agent_methods(
+        &mut router,
+        services.agents.unwrap_or_else(|| {
+            crate::org::agents::AgentHandle::disabled("named-agent operations are not configured")
+        }),
+    )?;
+
+    crate::org::messages::register_message_methods(
+        &mut router,
+        services.messages.unwrap_or_else(|| {
+            crate::org::messages::MessageHandle::disabled(
+                "confirmed-message operations are not configured",
+            )
+        }),
+    )?;
 
     // Add service-backed registrations above this finalization. The factory,
     // not callers, owns the complete capability snapshot used by daemon.info.
@@ -235,7 +256,7 @@ struct TypeParams {
     command: String,
 }
 
-fn control_error(error: crate::control::service::ServiceError) -> MethodError {
+pub(crate) fn control_error(error: crate::control::service::ServiceError) -> MethodError {
     use crate::control::{service::ServiceError, ControlError};
     use std::error::Error;
     let code = match &error {
@@ -245,7 +266,12 @@ fn control_error(error: crate::control::service::ServiceError) -> MethodError {
         ServiceError::Control(error) => match error {
             ControlError::NoSession { .. } | ControlError::NoPane { .. } => error_code::NOT_FOUND,
             ControlError::AmbiguousTarget { .. } => error_code::CONFLICT,
-            ControlError::SendRefused { .. } => error_code::REFUSED,
+            ControlError::SendRefused { .. } | ControlError::AgentClearing { .. } => {
+                error_code::REFUSED
+            }
+            ControlError::PaneQuarantined { .. } | ControlError::OrganisationUnavailable { .. } => {
+                error_code::UNAVAILABLE
+            }
             ControlError::Tmux {
                 source: atm_tmux::TmuxError::Timeout { .. },
                 ..
@@ -635,6 +661,53 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         org_cancel.cancel();
+    }
+
+    #[test]
+    fn contract_quarantine_and_org_failure_have_unavailable_code_and_human_messages() {
+        use crate::control::ControlError;
+        for (error, message) in [
+            (
+                ControlError::PaneQuarantined {
+                    pane: "%7".into(),
+                    agent: "project/lead".parse().unwrap(),
+                },
+                "pane %7: agent project/lead is quarantined; restart atmd and reconcile",
+            ),
+            (
+                ControlError::OrganisationUnavailable { pane: "%7".into() },
+                "organisation state is unavailable for pane %7; refusing input",
+            ),
+        ] {
+            let error = control_error(error.into());
+            assert_eq!(error.0.code, "unavailable");
+            assert_eq!(error.0.message, message);
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_clearing_error_reaches_method_response_unchanged() {
+        let mut router = MethodRouter::default();
+        router
+            .register("test.clearing", Duration::from_secs(1), |_, _| async {
+                Err(control_error(
+                    crate::control::ControlError::AgentClearing {
+                        pane: "%7".into(),
+                        agent: "project/lead".parse().unwrap(),
+                    }
+                    .into(),
+                ))
+            })
+            .unwrap();
+        let error = router
+            .call(context(), "test.clearing", Value::Null)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "refused");
+        assert_eq!(
+            error.0.message,
+            "Refusing to send to %7: agent project/lead is clearing; try again in a moment"
+        );
     }
 
     #[tokio::test]

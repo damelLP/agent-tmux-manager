@@ -106,6 +106,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atm-core",
+ "atm-org",
  "atm-protocol",
  "atm-tmux",
  "atm-tui",

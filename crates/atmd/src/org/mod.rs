@@ -12,6 +12,20 @@
 //! its filesystem worker may still hold the stream lock. Restart to recover.
 
 mod actor;
+mod agent_methods;
+mod agent_types;
+pub mod agents;
+#[cfg(test)]
+mod agents_tests;
+pub mod message_delivery;
+pub mod message_evidence;
+pub mod message_history;
+mod message_methods;
+pub mod message_notify;
+#[cfg(test)]
+mod message_seam_tests;
+pub mod message_types;
+pub mod messages;
 mod raw;
 mod storage;
 mod summary;

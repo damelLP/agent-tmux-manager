@@ -442,7 +442,12 @@ fn test_commands_read_the_daemons_session_list() {
 
     let status = atm(exe, dir.path(), &["status"]);
     assert!(status.status.success(), "atm status: {status:?}");
-    assert_eq!(String::from_utf8_lossy(&status.stdout), "1\u{2191} $0.00\n");
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        "1\u{2191} $0.00 ? unread\n"
+    );
+    assert!(String::from_utf8_lossy(&status.stderr)
+        .contains("unread count unavailable: the daemon is too old; restart atmd"));
 
     // Each legacy command's tmux subcommands, in `pane_commands` order.
     let subcommands: [&[&str]; 4] = [

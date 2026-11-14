@@ -81,9 +81,58 @@ atm layout pair                    # two agents + ATM sidebar
 
 `atm role` stores the tag on the pane, so it survives a clear or harness restart there. With no target or a `%N` target it needs only tmux, not atmd; without `$TMUX_PANE`, pass `-t`. A session-id target uses the daemon. `atm list -f json` adds `role: "coordinator"` when a session's pane is tagged and its parent does not share that pane, or `role: null` otherwise (also on failed tmux lookups). No parent, or a parent missing from the full session list, passes: a separate-process teammate on its own tagged pane can coordinate, but an in-process subagent sharing its parent's pane stays null, even when filters hide the parent. Table and ids formats are unchanged. `/atm-coordinate` tags its pane during setup. The TUI shows a bold cyan `C` on coordinator rows and puts them first within each agent group, keeping newest-first order within each band. Nested teammates stay in place. Press `c` to toggle the selected row's pane; group rows, rows without a pane and children sharing their parent's pane are unchanged. External tag changes appear on the next three-second poll; `c` updates the display immediately.
 
+## Confirmed messages and inbox
+
+The message CLI is distinct from the immediate `atm send` command. It calls the daemon's `msg.*` service, with no direct-tmux fallback. **The runtime on this branch is not enabled yet:** valid calls return `unavailable`; the commands and contracts below are ready for runtime integration, not evidence of working delivery.
+
+```sh
+atm msg send --to project/worker --kind brief --body 'Read the attached brief' --attach /absolute/path/brief.md --task task-1
+atm msg send --to owner --kind report --body 'Tests passed'
+atm inbox                             # your inbox; does not mark anything read
+atm inbox --for owner --unread --limit 100
+atm inbox --id m123 --format json      # full original body, including newlines
+atm inbox --after m123 --limit 100      # explicit pagination; follow next_after
+atm msg ack m123 m124                  # only your delivered messages
+atm msg retry m123 --accept-duplicate-risk
+atm msg give-up m123
+```
+
+All commands accept `--format text|json` (default `text`). Send requires `--to` and `--body`; optional flags are `--kind`, repeatable `--attach`, `--task`, and `--project-root`. Kinds are `note` (default), `brief`, `report`, `question`, `answer`, and `review`. Inbox accepts `--for`, `--unread`, `--id`, `--after`, and `--limit`; `--id` and `--after` are mutually exclusive. IDs use canonical `mN` form.
+
+- Targets are `owner`, a full `project/name` address, or an exact bare agent name. Full addresses bypass name lookup. Bare names use `--project-root` if supplied (relative paths become absolute); otherwise they use the uniquely bound, non-Down caller pane's project, or the absolute current directory if unbound. Unknown/ambiguous names or caller bindings fail rather than guessing across projects. `system` is not a recipient or inbox.
+- Sender attribution comes from the caller's pane binding; an unbound caller is Owner. There is no `--from` or send-now bypass. Owner can inspect agent inboxes; agents can inspect only their own. System notices and Owner-only resolution rely on local socket/client-supplied pane attribution, **not authentication against hostile local clients**.
+- Body limit: 16 KiB of UTF-8 bytes, with no trimming. An empty body needs at least one attachment. At most 32 attachments, each a nonempty literal path of at most 4096 bytes; task IDs are at most 256 bytes. Prefer absolute attachment paths across worktrees. Neither CLI nor daemon uploads/reads attached files, checks their existence, or automatically reads stdin. Quote multiline shell arguments to preserve blank lines and Unicode.
+- Every agent delivery uses the one-line reference defined by `message_delivery::inbox_reference`: for `m123`, `[m123] Read: atm inbox --id m123`, with no trailing newline. The body, task and attachments stay intact in the inbox. **Delivered means the harness accepted the retrieval reference**, not that it read the body or did the work. Owner messages are delivered directly to the inbox without terminal input.
+- Inbox includes full bodies, metadata, durable status and projected hold/retry/predecessor fields. Text indents every body line by two spaces under its entry, preserving body backslashes, line breaks and tabs and escaping other control characters. Prefer `--id` for individual reads; `--format json` is the exact form, preserving original content, nulls and additive daemon fields (DEL/C1 are JSON Unicode escapes). Limit is 1–1000 (default 100), even with `--id`; pages are bounded to 512 KiB without truncating bodies. An oversized legacy entry is refused with its ID. `next_after` indicates more matching messages. Unread counts cover all statuses, independent of page/filter.
+- Fetching never acknowledges reading. Explicit `atm msg ack` takes 1–1000 distinct IDs from your inbox; the whole batch must exist and be Delivered. A wrong recipient or undelivered entry refuses the whole batch. Already-read IDs are idempotent; output counts only newly marked messages. If fetch precedes the delivery receipt, wait for Delivered before acknowledging, not by sending again.
+- Retry is Owner-only for a latched/held delivery and **keeps the same ID and increasing attempt count**. Inspect the pane first: retry can duplicate delivery, hence the required `--accept-duplicate-risk`. It does not reset the attempt limit or bypass safety guards. After another restart an unconfirmed attempted message is held again. Give-up is allowed for held Queued/Delivering messages, not just one Blocked reason; repeating it on Failed is idempotent. A late receipt can still change a given-up message to Delivered, and cancels a pending same-ID retry. Already Delivered messages cannot be retried or given up.
+- A timeout is outcome-unknown, not rollback. Inspect inbox/pane before deciding what to do; the CLI never automatically resubmits. Ordinary message calls allow 15 seconds (10-second router budget + 5 margin); retry/give-up allow 70 seconds (60 + 10); name lookup allows 20 seconds per `agent.list` call (10 + 10).
+
+`atm status` requests only Owner's aggregate unread count, even from an agent pane: it appends `N unread` when nonzero and leaves the existing summary unchanged at zero. An old/unavailable daemon or invalid aggregate response produces `? unread` plus a stderr diagnostic, not a false zero or any Owner bodies. Command errors exit 1; invalid command syntax exits 2.
+
+### Delivery configuration
+
+`atmd` reads `[delivery]` and `[notify]` from the same bounded startup file read. Missing file/section uses the delivery defaults; unknown delivery keys, invalid values, malformed TOML or a failed/timed-out read return an explicit policy error, never a valid-looking default. A bad delivery section does not disable a valid notification section (nor vice versa). Restart to pick up changes. **On this branch the parsed policy is a handoff for runtime integration; validation is wired, but delivery remains unavailable regardless of policy.**
+
+Durations use `{ secs, nanos }`, not strings or bare numbers. Omitted fields take these defaults:
+
+```toml
+[delivery]
+stable_idle = { secs = 10, nanos = 0 }
+stable_empty_input = { secs = 5, nanos = 0 }
+confirmation_timeout = { secs = 3, nanos = 0 }
+retry_delays = [{ secs = 1, nanos = 0 }, { secs = 2, nanos = 0 }, { secs = 4, nanos = 0 }]
+stale_after = { secs = 120, nanos = 0 }
+readiness_timeout = { secs = 120, nanos = 0 }
+guard_poll_interval = { secs = 0, nanos = 250000000 }
+pane_gone_grace = { secs = 2, nanos = 0 }
+```
+
+Durations must be positive and fit the policy's checked timestamp arithmetic; retry delays must be nondecreasing. Maximum attempts are the number of retry delays plus one (four by default); an empty retry list permits one attempt. Timing defaults do not prove a harness editor is safe: observations and safety guards still control delivery.
+
 ## Notifications
 
-`atmd` can run a command of yours whenever a session starts needing input: a permission dialog, an MCP input dialog, or an agent asking you something, in any supported harness. Add a `[notify]` section to `config.toml`. `atm setup` writes this example commented out, but it never rewrites an existing file, so add the section by hand if you already have one:
+`atmd` can run a command of yours whenever a session starts needing input: a permission dialog, an MCP input dialog, or an agent asking you something, in any supported harness. The same command also handles newly committed Owner inbox messages, under the separate rules below. Add a `[notify]` section to `config.toml`. `atm setup` writes this example commented out, but it never rewrites an existing file, so add the section by hand if you already have one:
 
 ```toml
 [notify]
@@ -97,6 +146,8 @@ command = ["notify-send", "atm", "--"]
 - `atmd` reads `[notify]` when it starts. Run `atmd stop` to apply a change: an open TUI starts it again, or the next `atm` does. An invalid `config.toml`, or an unknown key in `[notify]`, is logged to the daemon log, and `atmd` starts without notifications.
 - The command runs in `atmd`'s environment, which comes from whoever started `atmd` (usually a TUI). Use absolute paths: with no shell, `~` and `$VAR` aren't expanded.
 - Stdin and stdout are closed. After 30 seconds `atmd` kills the command (but not processes it started). A failure is logged, with the command's stderr, to the daemon log.
+
+For Owner inbox messages, a separate consumer subscribes to committed events before service admission, skips startup history and deduplicates replay overlap within the process. It notifies only new Owner messages; OwnerFocused notices remain **inbox-only** (no `[notify]`). Its notification contains bounded metadata and an inbox reference with `--for owner`, not the body. `delay_secs` delays launch, and committed read state is checked again just before launch: reading while queued suppresses it, as does an unavailable state read. It has one running/delayed command and at most 32 pending commands; overflow is logged without changing the durable inbox. Commands use the same no-shell runner and 30-second timeout as attention notifications, which retain their independent per-session behavior. Notification failure never generates another message or retries the command. This external effect is **best effort**, not durable/exactly-once: shutdown cancels pending work and a crash can lose a notification. A watch error stops Owner notifications until restart and logs one warning; consult the inbox/status for durable state.
 
 [ntfy](https://ntfy.sh), through curl. `--data-raw` sends the message as it is; `-d` would read a file for a message that starts with `@`:
 

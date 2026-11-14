@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-down","method":"agent.down","params":{"agent":"project/lead"}},
+  "response": {"type":"response","id":"agent-down","error":{"code":"unavailable","message":"agent service unavailable: named-agent operations are not configured"}},
+  "ignore": []
+}

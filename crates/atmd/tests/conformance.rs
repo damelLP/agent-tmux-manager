@@ -208,6 +208,74 @@ async fn replay_all_protocol_fixtures() {
 }
 
 #[tokio::test]
+async fn message_bounds_precede_disabled_service_on_real_socket() {
+    let server = Server::start().await;
+    let mut client = server.client().await;
+    client.connect().await;
+    for (method, params) in [
+        ("msg.send", json!({"to":"owner","body":"x".repeat(16385)})),
+        (
+            "msg.send",
+            json!({"to":"owner","body":"x","attachments":vec!["p";33]}),
+        ),
+        (
+            "msg.send",
+            json!({"to":"owner","body":"x","attachments":[""]}),
+        ),
+        (
+            "msg.send",
+            json!({"to":"owner","body":"x","attachments":["x".repeat(4097)]}),
+        ),
+        (
+            "msg.send",
+            json!({"to":"owner","body":"x","task":"x".repeat(257)}),
+        ),
+        ("msg.inbox", json!({"limit":0})),
+        ("msg.inbox", json!({"limit":1001})),
+        ("msg.inbox", json!({"id":"m1","after":"m2"})),
+        ("msg.inbox", json!({"count_only":true,"id":"m1"})),
+        ("msg.inbox", json!({"count_only":true,"after":"m1"})),
+        ("msg.ack", json!({"ids":[]})),
+        (
+            "msg.ack",
+            json!({"ids":(1..=1001).map(|n|format!("m{n}")).collect::<Vec<_>>()}),
+        ),
+    ] {
+        client
+            .send(
+                serde_json::to_value(ClientMessage::request(
+                    "bounds".into(),
+                    method.into(),
+                    params,
+                    None,
+                ))
+                .unwrap(),
+            )
+            .await;
+        assert_eq!(
+            client.recv().await["error"]["code"],
+            "invalid_params",
+            "{method}"
+        );
+        client.require_next_pong().await;
+    }
+    client
+        .send(
+            serde_json::to_value(ClientMessage::request(
+                "boundary".into(),
+                "msg.send".into(),
+                json!({"to":"owner","body":"x".repeat(16384)}),
+                None,
+            ))
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(client.recv().await["error"]["code"], "unavailable");
+    client.require_next_pong().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn watch_refused_unwatch_noop_and_legacy_traffic_unchanged() {
     let server = Server::start().await;
     let mut client = server.client().await;

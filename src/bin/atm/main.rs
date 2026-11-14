@@ -40,7 +40,9 @@ use atm_tui::input::{ClientCommand, Event};
 use atm_tui::setup;
 use atm_tui::tmux;
 
+mod agent;
 mod cli;
+mod msg;
 pub mod rpc;
 mod spawn;
 mod tui;
@@ -79,8 +81,72 @@ struct Args {
     compact: bool,
 }
 
+#[cfg(test)]
+mod agent_contract_tests {
+    use super::*;
+
+    #[test]
+    fn all_six_named_agent_commands_have_help_and_parse() {
+        for (action, operands) in [
+            ("up", vec!["lead"]),
+            ("adopt", vec!["lead", "%7"]),
+            ("clear", vec!["project/lead"]),
+            ("respawn", vec!["project/lead"]),
+            ("down", vec!["project/lead"]),
+            ("list", vec![]),
+        ] {
+            let help = Args::try_parse_from(["atm", "agent", action, "--help"]).unwrap_err();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp, "{action}");
+            let mut args = vec!["atm", "agent", action];
+            args.extend(operands);
+            assert!(Args::try_parse_from(args).is_ok(), "{action}");
+        }
+    }
+
+    #[test]
+    fn clear_rejects_bad_ids_and_timeout_bounds() {
+        for args in [
+            vec!["atm", "agent", "clear", "lead"],
+            vec!["atm", "agent", "clear", "project/lead", "--timeout-ms", "0"],
+            vec![
+                "atm",
+                "agent",
+                "clear",
+                "project/lead",
+                "--timeout-ms",
+                "120001",
+            ],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+        for timeout in ["1", "120000"] {
+            assert!(Args::try_parse_from([
+                "atm",
+                "agent",
+                "clear",
+                "project/lead",
+                "--timeout-ms",
+                timeout
+            ])
+            .is_ok());
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Send, acknowledge or resolve durable messages
+    Msg {
+        #[command(subcommand)]
+        action: msg::MsgAction,
+    },
+    /// Read messages without marking them read
+    Inbox(msg::InboxArgs),
+    /// Manage durable named agents through the daemon
+    Agent {
+        #[command(subcommand)]
+        action: agent::AgentAction,
+    },
     /// Configure supported harness integrations for atm
     Setup,
     /// Remove atm integrations from supported harnesses
@@ -297,6 +363,9 @@ async fn main() -> Result<()> {
 
     // Handle subcommands first (before TUI initialization)
     match args.command {
+        Some(Command::Msg { action }) => return msg::cmd_msg(action).await,
+        Some(Command::Inbox(args)) => return msg::cmd_inbox(args).await,
+        Some(Command::Agent { action }) => return agent::cmd_agent(action).await,
         Some(Command::Setup) => {
             return Ok(setup::setup()?);
         }

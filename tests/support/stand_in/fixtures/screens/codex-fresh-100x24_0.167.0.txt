@@ -1,0 +1,25 @@
+Captured: Codex 0.167.0, 2026-11-14, P1 a18 private tmux capture-pane; path sanitized, trailing ASCII padding trimmed.
+
+  >_ OpenAI Codex (v0.167.0)
+     /fixture/xxxxxxxxxxxxxxxxxx/repo-fresh
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  gpt-5.4 default · /fixture/xxxxxxxxxxxxxxxxxx/repo-fresh
+  ← for agents · ? for shortcuts                                           ⚠ 1 warning · f2 to view

@@ -649,10 +649,15 @@ class CandidateKit(unittest.TestCase):
         with (self.root / 'kit/lock').open('r') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             child = self.lock_child('atm', 'list', trace_contention=True)
+            for _ in range(3):  # retries while held must contend again, never run
+                self.child_line(child, 'contended')
+                self.release_child(child)
             self.child_line(child, 'contended')
             fcntl.flock(lock, fcntl.LOCK_UN)
             self.release_child(child)
             self.child_line(child, 'running')
+            with self.assertRaises(BlockingIOError):  # runs under its shared lock
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.release_child(child)
             self.assertEqual(child.wait(timeout=35), 0, child.stderr.read())
 
@@ -662,6 +667,9 @@ class CandidateKit(unittest.TestCase):
         reader = self.lock_child('atm', 'list')
         self.child_line(reader, 'running')
         writer = self.lock_child('stop', trace_contention=True)
+        for _ in range(3):  # retries while the reader runs must contend again
+            self.child_line(writer, 'contended')
+            self.release_child(writer)
         self.child_line(writer, 'contended')
         self.release_child(reader)
         self.assertEqual(reader.wait(timeout=35), 0, reader.stderr.read())
@@ -679,6 +687,9 @@ class CandidateKit(unittest.TestCase):
                          ('uninstall', install)]:
                 fcntl.flock(lock, fcntl.LOCK_SH)
                 child = self.lock_child(*args, trace_contention=True)
+                for _ in range(3):
+                    self.child_line(child, 'contended')
+                    self.release_child(child)
                 self.child_line(child, 'contended')
                 fcntl.flock(lock, fcntl.LOCK_UN)
                 self.release_child(child)

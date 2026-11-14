@@ -1,179 +1,224 @@
 # Shared stand-in harness (test only)
 
-Python standard library fixture for root integration tests. Never invokes a
-model CLI or executes submitted text. Linux only (procfs process identity).
+Python stdlib fixture for root integration tests. Never invokes a model CLI or
+executes submitted text. Linux only (procfs process identity).
 
 ## Prerequisites and running
 
-Required, never silently skipped: `python3`, `tmux` (with bracketed-paste state,
-3.7+), `jq`, **real `socat`**, `timeout`, and `/bin/bash`. The rig resolves these
-from `/usr/local/bin:/usr/bin:/bin`; no pip/npm packages are needed. Missing tools
-fail with an install diagnostic. CI must provision them; the test does not install
-packages or replace the transport. The repository hook scripts remain unmodified.
+Required, never silently skipped: `python3`, `tmux` (including 3.6), `jq`, real
+`socat`, `timeout`, and `/bin/bash`. Tools resolve from
+`/usr/local/bin:/usr/bin:/bin`; no pip/npm packages. Missing prerequisites fail
+explicitly. CI installs socat; repository hook scripts remain unmodified.
 
-Run `cargo test --test stand_in_harness -- --nocapture` under your project's
-sealed test environment. This includes Python unittest, so Cargo CI cannot omit
-the parser/state-machine tests. Use Cargo's exact built binaries, not installed
-`atm`/`atmd`. Full workspace runs still need the project's outer seal for older
-tests; this new rig seals each subprocess independently.
+Run `cargo test --test stand_in_harness -- --nocapture` under the project's sealed
+test environment, using Cargo's built binaries, not installed `atm`/`atmd`.
+Python unittest runs from that Cargo target. Full workspace runs still require
+the outer seal for older tests; this rig seals each subprocess independently.
 
 ## Consumer API (U7, U8, U9b)
 
-Use ordinary synchronous `#[test]` functions. Protocol queries internally use a
-short-lived Tokio runtime with a deadline; do not nest them inside an async runtime.
-Include `#[path = "support/stand_in.rs"] mod stand_in;` in a root integration test:
+Include `#[path = "support/stand_in.rs"] mod stand_in;` in a root integration test.
+Use synchronous `#[test]` functions: protocol queries use a bounded internal Tokio
+runtime, so don't nest them in an async runtime.
 
 ```rust,ignore
 use atm_core::SessionStatus;
 use stand_in::{StandInConfig, StandInMode, StandInRig};
 
-let mut rig = StandInRig::start();
+let mut rig = StandInRig::start(); // real request round trip, not socket existence
 let mut config = StandInConfig::new(StandInMode::Claude);
-config.work_ms = 1200; // enough observation time even on a busy runner
-let pane = rig.launch(&config); // waits for editor + bracketed-paste flag
-let row = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
-let sent = rig.atm(&["send", &pane.pane_id, "one\ntwo"]);
-assert!(sent.status.success(), "{sent:?}");
+config.work_ms = 1200; // observation window, not a real-provider latency claim
+config.clear_gap_ms = 1200;
+let pane = rig.launch(&config); // current-process idle journal + exact screen line
+let old = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+assert!(rig.atm(&["send", &pane.pane_id, "one\ntwo"]).status.success());
 rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
 rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+rig.wait_ready(&pane, Some(old.id.as_str()));
 rig.paste(&pane, "/clear");
-rig.wait_for_absent(&row.id);
-let next = rig.wait_for_row(&pane, |r| r.id != row.id);
-rig.wait_ready(&pane, Some(next.id.as_str()));
+rig.wait_for_absent(&old.id);
+let new = rig.wait_for_row(&pane, |r| r.id != old.id);
+rig.wait_ready(&pane, Some(new.id.as_str()));
 rig.close();
 ```
 
-- `launch(config)` starts a named Python process in a new private window, with a
-  shell retained after exit. `StandInPane` has `pane_id`, `pid`, `launcher`, `log`.
-- `wait_ready(pane, optional_id)` requires the latest idle render, matching screen
-  and tmux bracketed-paste flag; use it instead of sleeps. Row/readiness polls run
-  every 20ms with 10-second deadlines. Row state can intentionally lag UI state.
-- `wait_for_row(pane, predicate)`, `wait_for_absent(id)`, `pane_rows(pane)`, `rows()`
-  use the real daemon. **SessionView has no PID**: use owned pane handles and IDs,
-  never total host session counts. Discovery can see unrelated procfs processes.
-- `paste(pane, text)` uses a tmux buffer with bracketed paste and separate Enter.
-  `key(pane, "Escape")` sends a key only to the handle's private server. These
-  controls are for fixture panes, not other agents' panes.
-- `atm(args)` and `tmux(args)` return bounded command output, including expected
-  failures. `command(path)` supplies the same sealed environment to custom CLI
-  invocations; run it with `rig.run(&mut command)`. `tmux` always supplies `-L`.
-  If also using the existing role-test helper, import `stand_in::bounded` rather
-  than compiling `support/role.rs` a second time.
-- `journal(pane)` supplies diagnostic JSONL (identity, accepted/rejected input,
-  event/dropped, render, ready, selection). Event entries are **attempts**, not
-  delivery acknowledgments: script exit zero never proves daemon receipt.
-- `discover()` exercises actual process discovery. A pending-PID row upgrading to
-  a single real-ID row proves that discovery and the real hook agree on identity.
-- `close()` explicitly checks cleanup success. Drop is the fallback on unwind.
-  Daemon child ownership and tmux socket/PID are rechecked before signaling; all
-  commands clear ambient environment, including TMUX, TMUX_PANE and spawn overrides.
+- `launch(config)` starts a named Python process in a new private window and
+  retains a shell after exit. `StandInPane` exposes `pane_id`, `pid`, `launcher`,
+  and `log`; actions reject handles from another rig.
+- `wait_ready(pane, optional_id)` checks the current process's latest idle render
+  and the **exact** `stand-in <mode> <id>: idle` screen line, joining wrapped
+  terminal lines. Bracketed paste is enabled before that line is printed. It does
+  not require `#{bracket_paste_flag}` (absent in tmux 3.6); an empty format means
+  **unknown**, not off. Readiness is not a claim that the input draft is empty:
+  inspect the active `❯ ` input line, not scrollback, before delivery.
+- Polls are every 20ms, with 10-second deadlines. Use predicates rather than
+  fixed sleeps. After sending clear, first wait for a changed ID or a `clearing`
+  render; `wait_ready(None)` called before the command is processed can still
+  describe the old editor. A long configured clear gap allows absence assertions
+  before the new start, so PID-based replacement cannot hide a missing end event.
+- `wait_for_row`, `wait_for_absent`, `pane_rows`, `rows` query the real daemon.
+  SessionView has no PID: use owned panes/IDs, never total host row counts.
+  `discover()` can see unrelated procfs processes. A pending row becoming one
+  real-ID row proves discovery and the hook agree on PID.
+- `capture(pane)` joins wrapped screen lines. `paste(pane, text)` uses bracketed
+  paste plus a separate Enter. `key(pane, "Escape")` sends a key to the private
+  server only. For an unsubmitted paste use `tmux` load/set-buffer + paste-buffer
+  without Enter; typed and pasted text are visible in the active input line.
+- `atm(args)` and `tmux(args)` return bounded command output, including refusals.
+  `command(path)` supplies the same sealed environment to custom invocations;
+  execute with `rig.run(&mut command)`. `tmux` supplies the private `-L` label.
+  If also using role support, import `stand_in::bounded` rather than including
+  `support/role.rs` twice.
+- `journal(pane)` is diagnostic JSONL: identity, accepted/rejected/queued input,
+  event/dropped, status, draft, render, ready, selection, connected/reconnecting.
+  Every entry includes PID and monotonic time. Events/status are **send attempts**,
+  not acknowledgments. Hook exit zero cannot prove delivery. Timeout diagnostics
+  include journals, daemon logs and panes, and name possible lost handshakes.
+- `close()` checks cleanup; Drop is the unwind fallback. Cleanup discovers every
+  `atmd` with an environment path inside this rig, including CLI-auto-started
+  daemons, rechecks procfs start time/environment, and stops it before removing
+  state. The canonical tmux socket is recorded before fallible startup queries;
+  cleanup uses that socket and rechecks its identity, including with symlinked
+  TMPDIR. No broad process-name kill is used.
 
-### Testing `atm spawn` or daemon-managed spawn
+### Daemon control
 
-`rig.launcher(mode)` returns an absolute executable path for `ATM_SPAWN_BIN`
-(or the appropriate per-harness override). It is a symlink named `claude`, `codex`
-or `pi`, not a shipped Rust binary. The program accepts one positional initial
-prompt, including a leading `-`. Current `atm spawn --prompt` rejects control
-characters, so use quoted single-line prompts there and multiline `atm send`.
+`stop_daemon()`, `start_daemon()`, and `restart_daemon()` retain the same private
+socket, state and tmux server. Start waits for a real list-sessions round trip.
+Stop also finds detached daemons. With the daemon stopped, `rig.atm(...)` can
+exercise the real CLI auto-start path, which cleanup owns too.
 
-Set these in the **private tmux server environment** before spawning (not just the
-CLI's environment: tmux's pane shell inherits its server):
+`set_daemon_env(key, value)` sets extra environment for **subsequent explicit
+starts**, e.g. set `ATM_SPAWN_BIN` to `rig.launcher(mode)` and then restart. It
+cannot override sealing variables or TMUX/PANE. It does not change environment
+inside an already-running daemon or in CLI-auto-started daemons; for the latter,
+set the extra variable on `rig.command(...)` before invoking the CLI.
+
+### Spawn, arguments, IDs and respawn
+
+`rig.launcher(mode)` is an absolute executable symlink named `claude`, `codex` or
+`pi`, suitable for `ATM_SPAWN_BIN` (or a per-harness override). It is not shipped
+as a binary. Arguments are validated **before** identity/session announcement.
+One positional initial prompt is supported; `--` makes a leading dash literal.
+Harness options such as `--model X` are ignored. Unknown options accept an
+optional following non-option value; `--name=value`, `--no-*`, `--offline` and
+`--dangerously-skip-permissions` need no following value. This is a test parser,
+not a complete vendor CLI grammar. Known value-taking flags reject missing
+values. Use `--` before a prompt if an unknown boolean option precedes it.
+
+For CLI spawn, configure the **private tmux server environment**, since spawned
+pane shells inherit the server rather than the CLI's environment:
 
 ```rust,ignore
 let log = rig.root().join("spawn.jsonl");
 for (key, value) in [
     ("ATM_STANDIN_LOG", log.to_str().unwrap()),
-    ("ATM_STANDIN_ID_PREFIX", "my-spawn"),
+    ("ATM_STANDIN_ID_PREFIX", "spawn"),
     ("ATM_STANDIN_WORK_MS", "1200"),
 ] {
     assert!(rig.tmux(&["set-environment", "-g", key, value]).status.success());
 }
 let mut cmd = rig.command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
-cmd.args(["spawn", "--target-pane", "%0", "--prompt", "one quoted prompt;"])
-   .env("TMUX", rig.tmux_env()) // only this private server, for CLI's in-tmux guard
+cmd.args(["spawn", "--target-pane", "%0", "--model", "fixture-model",
+          "--prompt", "one quoted prompt;"])
+   .env("TMUX", rig.tmux_env()) // private server, for CLI's in-tmux guard
    .env("ATM_SPAWN_BIN", rig.launcher(StandInMode::Claude));
 let out = rig.run(&mut cmd);
 assert!(out.status.success(), "{out:?}");
-let pane_id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
-let pane = rig.observe_pane(pane_id, StandInMode::Claude, log);
-// observe_pane waits for a live identity, not idle: initial prompt may be working.
+let id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+let pane = rig.observe_pane(id, StandInMode::Claude, log);
+// observe_pane waits for live identity, not idle: initial prompt may be working.
 ```
 
-For respawn in the same pane, the journal may be reused: `observe_pane` selects
-its newest live identity and verifies procfs start time, not just PID. Give each
-new process a fresh ID prefix and wait for that process's expected session ID;
-`wait_ready(None)` alone cannot distinguish an old ready screen from a new one.
+Current `atm spawn --prompt` rejects control characters: use single-line prompts
+there and multiline `atm send` for delivery tests.
 
-The rig also inherits private ATM_SOCKET, ATM_TMUX_SOCKET, TMUX_TMPDIR,
-ATM_STATE_DIR, HOME and XDG directories into its server. Direct program launch
-requires `ATM_STANDIN_ROOT` and socket/log paths resolving inside it, a private
-TMUX/PANE, and `ATM_STANDIN_ID_PREFIX`. Never unset ATM_SOCKET to use a default.
+Each process adds a fresh UUID nonce: IDs are `<prefix>-<nonce>-<generation>`.
+Generation starts at 1 and changes on clear. Treat IDs as opaque; read identity,
+render, or daemon rows, never splice suffixes. A respawn with the same prefix has
+new IDs. `observe_pane` selects the newest live identity, checking procfs start
+time as well as PID; readiness ignores old-process renders.
+
+`launch` writes `pane.log.with_extension("config.json")` and passes
+`--atm-config <path>` in the original pane command. `respawn-pane -k -t <pane>`
+therefore retains configuration without shell exports. A retained-shell relaunch
+can use `pane.launcher --atm-config <that-path>`. The file has `LOG`, `ID_PREFIX`,
+`WORK_MS`, `CLEAR_GAP_MS` keys; it and the log/socket must resolve inside
+`ATM_STANDIN_ROOT`. Defaults for the timers are 500ms/100ms; negatives fail before
+announcement. Direct launch also requires the private TMUX/PANE and root; never
+unset ATM_SOCKET to use a default.
 
 ## Controls and fidelity
 
-| Mode | Startup | Prompt / completion | Clear | Escape |
+| Mode | Startup | Prompt / completion | Clear | Interrupt |
 |---|---|---|---|---|
-| Claude | SessionStart | UserPromptSubmit / Stop | `/clear`: SessionEnd, gap, fresh-ID SessionStart(source=clear) | no hook; scheduled Stop cancelled |
-| Codex | **no event** | first prompt of each generation sends SessionStart then UserPromptSubmit; Stop completes | `/new`: fresh editor/ID internally, **no event until next prompt** | no hook; scheduled Stop cancelled |
-| pi replay | session_start | input + agent_start / turn_end + agent_end | `/new`: session_shutdown, gap, new session_start | turn_end then aborted agent_end (idle) |
+| Claude | SessionStart + status | UserPromptSubmit / Stop + status | `/clear`: SessionEnd, gap, new SessionStart(source=clear) + status | no ending hook; restores interrupted prompt as draft |
+| Codex | **no event** | first prompt in each generation: SessionStart then UserPromptSubmit; Stop completes | `/new`: fresh editor/ID internally, **no event until next prompt** | no ending hook |
+| pi replay | session_start | input + agent_start / turn_end + agent_end | `/new`: shutdown, gap, new start on **same connection** | turn_end + aborted agent_end |
 
-No event does not mean no row: Codex discovery can create `pending-{pid}`, and
-its old session row remains after clear. **Waiting for a Codex new-ID hook before
-sending the next prompt deadlocks.** Wait for the fresh editor (`wait_ready` with
-the next deterministic ID, or journal/screen evidence), then submit. Pi's turn_end
-is a usage update; agent_end is the lifecycle acknowledgment ending work.
+Codex discovery may create `pending-{pid}` and its old row remains across clear.
+Waiting for its new-ID hook before the next prompt deadlocks: wait for the new
+render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
 
-- `/atm/dialog` is **Claude-only**: sends PreToolUse and PermissionRequest, shows
-  captured question/Yes/No/Esc screen. Both daemon status refusal and `peek --prompt`
-  are meaningful. Escape erases the dialog but leaves attention_needed in atmd.
-  Enter records a selection, not a prompt, and emits no hook (synthetic safe
-  selection behavior, not an emulation of tool approval). No command executes.
-  **Codex has no dialog yet; pi replay models no native dialog** and does not run
-  pi-atm or its extension UI/transport code.
-- `/atm/drop-next [EVENT]` suppresses the next matching event, or literally the
-  next event if no name is supplied. `/atm/drop-next Stop` preserves submission
-  but loses completion. Names are case-sensitive; invalid names do not arm loss.
-- `/atm/exit` or native `/exit` (Claude), `/quit` (Codex/pi) emits end and returns
-  to the pane shell. Codex emits ends for all its generations. Ctrl-C also exits
-  cleanly. Dropping the exit hook lets tests observe actual PID-based reaping.
-- Ctrl-U clears the input draft. Escape interrupts a turn without exiting. No
-  background completion survives an interruption, clear or dialog.
-- Controls match whole submitted input; multiline text containing a control is
-  ordinary prompt text. Busy/clearing input is rejected locally, not queued.
-- `ATM_STANDIN_WORK_MS` defaults to 500, `ATM_STANDIN_CLEAR_GAP_MS` to 100. Negative
-  values fail. IDs are `<prefix>-<generation>` starting at 1; `launch` qualifies
-  config.id_prefix with the run and pane serial to prevent accidental collisions.
-- Bracketed paste is enabled before readiness; UTF-8/delimiters may be fragmented.
-  Like normal tty input, CR becomes LF (tmux paste-buffer translates LF to CR).
-  A lone ESC resolves after a 20ms input gap; this is not a full terminal emulator.
-- Claude/Codex payloads go through the real repository scripts and real socat.
-  Pi uses a bounded persistent socket per session, but **only replays envelopes**;
-  it does not test pi-atm reconnection, usage accounting or SDK behavior.
-- No tokens, models, trust/first-run flows, subagents or real tool executions are
-  simulated. Deterministic timers are not claims about real provider latency.
+- `/atm/dialog` (Claude only) sends PreToolUse and PermissionRequest and displays
+  the captured permission question/Yes/No/Esc screen. Up/Down select, Enter records
+  a 1-based `selection.option`, Escape denies. Selection emits no hook and executes
+  nothing (Synthetic: safe selection, not actual tool approval). Denial erases the
+  dialog but leaves the daemon attention_needed. `atm reply --option 2` and
+  `peek --prompt` exercise the real parser/key path.
+- `/atm/drop-next [EVENT]` suppresses the next matching hook, or literally the next
+  hook if omitted. Names are case-sensitive; invalid names don't arm loss. Status
+  frames are separate and do not consume this hook-drop control.
+- `/atm/status [ID]` (Claude only) forwards the captured-shaped status payload for
+  the current or supplied ID, including during clear. Use an ended ID to exercise
+  late-status handling. Synthetic: this control and automatic status timing are
+  deterministic, not real latency or usage samples. Other modes emit no status.
+- `/atm/exit`, `/exit` (Claude), `/quit` (Codex/pi) emit end and return to the shell.
+  Codex ends all generations. Tests use `/atm/exit` for cleanup.
+- Escape and Ctrl-C interrupt a running turn without exit; scheduled completion
+  is cancelled. Claude restores the interrupted prompt as a visible draft (U5 C5).
+  At idle Ctrl-C clears the draft; a second within one second exits. Ctrl-U clears
+  the draft without submitting it. Up/Down are ignored outside dialogs.
+- Claude submits busy input into a FIFO and emits UserPromptSubmit **only when the
+  preceding turn ends**. This reproduces late confirmation/double-delivery risks.
+  Clear discards queued input. Synthetic: queuing was not captured by U5; abort
+  while a queue exists is not a faithful queue-cancellation model (pending entries
+  remain until another turn completes). Codex/pi busy input is still rejected.
+- Whole-line controls only: multiline text containing a control is an ordinary
+  prompt. Input during the clear gap is rejected and journalled, not submitted.
+- Bracketed paste handles fragmented UTF-8/delimiters. CR becomes LF as in normal
+  tty input. Lone ESC resolves after a 20ms gap; CSI arrows are parsed atomically.
+  This is not a full editor/terminal emulator (no cursor editing/history).
+- Claude/Codex use `/bin/sh -c` to run the real repository hook scripts and socat,
+  exercising their parent-process walk; PID/pane fields aren't injected.
+- Pi **replays envelopes**, never loads pi-atm. One socket spans `/new`; after
+  disconnect it retries and buffers unsent frames while the daemon is down.
+  Buffering/backoff are synthetic, not an SDK transport conformance test. As with
+  real unacknowledged writes, a disconnect during a write can lose/duplicate a
+  frame; process exit does not guarantee flushing while the daemon is unavailable.
+
+Remaining gaps: no Codex/pi native dialogs, trust/update prompts, permission
+Notification hook or post-denial status timing, provider errors/resumptions,
+real tokens/usage evolution, subagents, tool execution, or paid model calls.
+Input-line rendering is deliberately simple, not a pixel-perfect vendor TUI.
 
 ## Captured templates
 
-Captured: Claude Code 2.1.325, 2026-11-14, U5 real TUI via timestamped private
-Unix proxy into atmd. `claude_2.1.325.jsonl` selects source envelope lines
-1, 3, 4, 6, 7, 14, 15, 18, respectively. The existing adapter's
-`claude_tui_session_2.1.310.jsonl` independently confirms these lifecycle shapes.
+Captured: Claude Code 2.1.325, 2026-11-14, U5 real TUI through a timestamped private
+Unix proxy into atmd. `claude_2.1.325.jsonl` selects source lines
+1, **2 (status)**, 3, 4, 6, 7, 14, 15, 18, respectively. The adapter's
+`claude_tui_session_2.1.310.jsonl` independently confirms lifecycle shapes.
 
-Captured: Codex 0.167.0, 2026-11-14, U5 real TUI with `--no-daemon` via the
-same proxy. `codex_0.167.0.jsonl` selects lines 3, 4, 5, 12.
+Captured: Codex 0.167.0, 2026-11-14, U5 real TUI with `--no-daemon` through the same
+proxy. `codex_0.167.0.jsonl` selects lines 3, 4, 5, 12.
 
-Captured: pi 1.5.0, 2026-11-14, U5 real TUI with pi-atm via the same proxy.
-`pi_1.5.0.jsonl` selects lines 1, 2, 3, 5, 6, 7, 8, 18, 19. The agent_end
-messages are excerpts retaining only the assistant; system/tools/user context
-and signed text metadata are omitted. This mode **replays captured envelopes;
-it does not run pi or pi-atm**.
+Captured: pi 1.5.0, 2026-11-14, U5 real TUI with pi-atm through the same proxy.
+`pi_1.5.0.jsonl` selects lines 1, 2, 3, 5, 6, 7, 8, 18, 19. agent_end retains only
+the assistant; system/tools/user context and signed text metadata are omitted.
+The capture carries `/new` on one persistent connection.
 
-Sanitization: original paths become `/fixture/...`; session/prompt/turn/tool/
-response identifiers become `fixture-*`; timestamps become zero. Forwarder-
-added PID and pane fields are removed: runtime must derive them. Model names,
-reason/source/stopReason fields and usage shapes are retained. The permission
-screen is an excerpt of U5's Claude permission capture with marker text replaced.
-
-Synthetic: runtime prompt, ID, path and timing substitutions construct controlled
-scenarios from these templates. They are not new real-harness captures. No native
-Codex or pi dialog was captured by U5, so neither mode claims dialog fidelity.
+Sanitization: paths become `/fixture/...`; identifiers become `fixture-*`;
+timestamps become zero. PID/pane are removed for the real forwarder to derive.
+Model names, source/reason/stopReason and usage shapes are retained. The permission
+screen is an excerpt with marker text replaced. Synthetic: runtime IDs, paths,
+prompt and timing substitutions construct controlled scenarios, not new captures.

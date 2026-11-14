@@ -242,7 +242,7 @@ impl OrgState {
                     agent.pane.as_ref() != Some(pane)
                         || &agent.session_id != session_id
                         || agent.status != status
-                        || agent.excluded_session_id.is_some()
+                        || (session_id.is_some() && agent.excluded_session_id.is_some())
                 } else {
                     true
                 }

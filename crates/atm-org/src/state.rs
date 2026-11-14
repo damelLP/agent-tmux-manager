@@ -347,7 +347,9 @@ impl OrgState {
                 );
                 agent.pane = Some(pane.clone());
                 agent.session_id.clone_from(session_id);
-                agent.excluded_session_id = None;
+                if session_id.is_some() {
+                    agent.excluded_session_id = None;
+                }
             }
             OrgEvent::AgentPaneCreated { agent_id, pane } => {
                 let agent = self.agent_mut(agent_id)?;

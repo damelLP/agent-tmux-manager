@@ -20,7 +20,7 @@
 //! | Command | Refusal | No event | Otherwise |
 //! |---|---|---|---|
 //! | Up | unknown project, mismatched role; starting/ready/clearing; stuck with pane | — | starting, fresh role snapshot |
-//! | Adopt | unknown project; another holder; own different pane | same pane/session and resulting status, no exclusion | ready with session, else starting; reset exclusion |
+//! | Adopt | unknown project; another holder; own different pane | same pane/session and resulting status, unless binding a session with an exclusion | ready with session (reset exclusion), else starting (retain exclusion) |
 //! | PaneCreated | unknown agent; another holder; own different pane; new pane while not starting | same recorded pane, in any status | record pane |
 //! | SessionBound | unknown agent; down; no pane | excluded session; ready with same session | ready, including stuck recovery/manual clear; reset exclusion |
 //! | EditorReady | unknown agent; down; no pane | ready, with or without session | starting/clearing/stuck → ready; session unchanged, reason cleared |
@@ -43,8 +43,9 @@
 //! Clear retains one pre-clear session ID to ignore obsolete SessionBound
 //! reports, even before EditorReady. Repeated clears without a new binding keep
 //! that exclusion; EditorReady, SessionLost and Stuck retain it. A new binding,
-//! Down or fresh Up resets it. Explicit Adopt also overrides the exclusion;
-//! routine session observations must use SessionBound, not Adopt. This is not
+//! Down or fresh Up resets it. Adopt with a session explicitly overrides the
+//! exclusion; session-less Adopt repairs status to starting while retaining it.
+//! Routine session observations must use SessionBound, not Adopt. This is not
 //! a permanent blacklist of historical IDs. Committed binding facts still fold
 //! regardless of today's exclusion policy, so older logs remain replayable.
 //!

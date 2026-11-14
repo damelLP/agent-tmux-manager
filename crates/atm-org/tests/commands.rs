@@ -307,11 +307,6 @@ fn explicit_binding_and_lifecycle_reset_exclusion() {
         OrgCommand::Adopt {
             agent_id: id(),
             pane: "%1".into(),
-            session_id: None,
-        },
-        OrgCommand::Adopt {
-            agent_id: id(),
-            pane: "%1".into(),
             session_id: Some("old".into()),
         },
         OrgCommand::Down {
@@ -336,20 +331,40 @@ fn explicit_binding_and_lifecycle_reset_exclusion() {
             assert_eq!(state.agent(&id()).unwrap().excluded_session_id, None);
         }
     }
-    // Adopt must clear exclusion even when pane/session/status already match.
-    let (mut state, mut seq) = clearing();
-    seq += 1;
-    state
-        .apply(seq, time(), &OrgEvent::AgentSessionLost { agent_id: id() })
-        .unwrap();
-    let adopt = OrgCommand::Adopt {
-        agent_id: id(),
-        pane: "%1".into(),
-        session_id: None,
-    };
-    assert_eq!(run(&mut state, adopt.clone(), &mut seq).len(), 1);
-    assert_eq!(state.agent(&id()).unwrap().excluded_session_id, None);
-    assert_noop(&mut state, adopt, &mut seq);
+}
+
+#[test]
+fn sessionless_adopt_repairs_status_without_losing_exclusion() {
+    // Confirmed review sequence, with and without editor readiness before repair.
+    for ready in [false, true] {
+        let (mut state, mut seq) = clearing();
+        if ready {
+            run(&mut state, editor_ready(), &mut seq);
+        }
+        let adopt = OrgCommand::Adopt {
+            agent_id: id(),
+            pane: "%1".into(),
+            session_id: None,
+        };
+        assert_eq!(run(&mut state, adopt.clone(), &mut seq).len(), 1);
+        let agent = state.agent(&id()).unwrap();
+        assert_eq!(agent.status, AgentStatus::Starting);
+        assert_eq!(agent.session_id, None);
+        assert_eq!(agent.excluded_session_id, Some("old".into()));
+        assert_noop(&mut state, bound("old"), &mut seq);
+        assert_noop(&mut state, adopt, &mut seq);
+        run(&mut state, editor_ready(), &mut seq);
+        assert_noop(&mut state, bound("old"), &mut seq);
+        let explicit = OrgCommand::Adopt {
+            agent_id: id(),
+            pane: "%1".into(),
+            session_id: Some("old".into()),
+        };
+        assert_eq!(run(&mut state, explicit.clone(), &mut seq).len(), 1);
+        assert_eq!(state.agent(&id()).unwrap().session_id, Some("old".into()));
+        assert_eq!(state.agent(&id()).unwrap().excluded_session_id, None);
+        assert_noop(&mut state, explicit, &mut seq);
+    }
 }
 
 #[test]

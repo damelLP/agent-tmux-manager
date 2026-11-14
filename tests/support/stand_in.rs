@@ -750,6 +750,7 @@ impl Drop for StandInRig {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.cleanup()))
             .map_or(true, |result| result.is_err())
         {
+            self.dir.disable_cleanup(true);
             eprintln!(
                 "private fixture cleanup failed; inspect {}",
                 self.root().display()

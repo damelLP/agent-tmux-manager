@@ -105,6 +105,28 @@ fn foreign_socket_is_refused_without_affecting_either_server() {
 }
 
 #[test]
+fn drop_retains_run_directory_when_cleanup_refuses_an_identity() {
+    let mut rig = StandInRig::start();
+    let mut foreign = StandInRig::start();
+    let root = rig.root().to_owned();
+    stop_server(&rig);
+    // Force an ownership refusal without leaving an owned server alive.
+    rig.tmux_identity = foreign.tmux_identity.clone();
+    let before = server(&foreign);
+    drop(rig);
+    let retained = root.is_dir();
+    assert_eq!(server(&foreign), before);
+    foreign.close();
+    if retained {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    assert!(
+        retained,
+        "cleanup failure must preserve its diagnostic run directory"
+    );
+}
+
+#[test]
 fn daemon_error_still_cleans_tmux_and_returns_first_error() {
     let mut rig = StandInRig::start();
     let (_, pid) = server(&rig);

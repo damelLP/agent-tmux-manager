@@ -341,7 +341,10 @@ impl MessageEvidence {
                 {
                     continue;
                 }
+                let latest = Some(identity.attempt_seq) == last_seq;
                 let bound = identity.session_id.as_ref().or(scope.lazy_session.as_ref());
+                // Whether this scope may bind or confirm from the event.
+                let mut trusted = proven;
                 if let Some(bound) = bound {
                     if bound != session {
                         continue;
@@ -350,17 +353,22 @@ impl MessageEvidence {
                     if pane.is_none() || harness.is_none() {
                         continue;
                     }
-                    if proven {
+                    // Only the latest scope binds lazily. Once a newer attempt
+                    // is armed, an unbound scope can no longer tell its session
+                    // from a later occupant of a reused pane.
+                    trusted = proven && latest;
+                    if trusted {
                         scope.lazy_session = Some(session.clone());
                     }
                 }
                 let exact = pane.is_some() && prompt == Some(entry.expected.as_str());
-                // An unproven exact reference may be a lost late receipt of an
-                // earlier scope: hold the message rather than lose the fact.
-                if Some(identity.attempt_seq) == last_seq || (exact && !proven) {
+                // An exact reference this scope cannot trust may be a lost late
+                // receipt, or the paste submitted by someone else: hold the
+                // message rather than lose the fact or confirm from it.
+                if latest || (exact && !trusted) {
                     entry.probably_landed = true;
                 }
-                if proven && exact && entry.receipt.is_none() {
+                if trusted && exact && entry.receipt.is_none() {
                     entry.receipt = Some(DeliveryReceipt {
                         session_id: session.clone(),
                         confirmation: "prompt_submit_exact_reference".into(),

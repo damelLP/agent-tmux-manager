@@ -605,3 +605,66 @@ fn unproven_status_activity_holds_the_bound_session_only() {
     assert!(e.snapshot(id()).unwrap().probably_landed);
     assert!(!e.snapshot(other).unwrap().probably_landed);
 }
+
+#[test]
+fn superseded_lazy_scope_holds_instead_of_confirming_a_stranger() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    // Attempt 1 is lazy on %7 and never sees its session.
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    // The recipient moved: attempt 2 is bound on %8.
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("moved")),
+        ..scope()
+    })
+    .unwrap();
+    // Later a stranger works on the reused %7. That is not the newer attempt.
+    e.observe(
+        &SessionId::new("stranger"),
+        Some("%7"),
+        Harness::Pi,
+        &LifecycleEvent::WorkingStart,
+    )
+    .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // The exact reference there shows the paste landed somewhere, no more.
+    observe(&e, "stranger", "%7", Harness::Pi, REFERENCE);
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.receipt.is_none());
+    assert!(facts.probably_landed);
+    // The bound attempt's own receipt still wins.
+    observe(&e, "moved", "%8", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "moved"
+    );
+}
+
+#[test]
+fn latest_lazy_scope_binds_after_an_unbound_earlier_one() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    for attempt_seq in [124, 130] {
+        e.arm(AttemptScope {
+            attempt_seq,
+            session_id: None,
+            ..scope()
+        })
+        .unwrap();
+    }
+    observe(&e, "started", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "started"
+    );
+    // The binding is frozen: a later occupant gets nothing.
+    let receipt = e.receipt(id()).unwrap();
+    observe(&e, "occupant", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(e.receipt(id()).unwrap(), receipt);
+}

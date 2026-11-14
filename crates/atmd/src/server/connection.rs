@@ -2641,6 +2641,103 @@ mod tests {
         );
     }
 
+    /// A history that fails every write, so a forwarded Activity shows as the
+    /// evidence's disable. Any Activity that is not forwarded leaves it on.
+    fn with_failing_history(
+        handler: EvidenceHandler,
+        evidence: &crate::org::message_evidence::MessageEvidence,
+    ) -> EvidenceHandler {
+        handler.with_message_evidence(
+            Some(evidence.clone()),
+            Some(crate::org::message_history::MessageHistoryHandle::disabled(
+                "synthetic history loss",
+            )),
+        )
+    }
+
+    #[tokio::test]
+    async fn message_evidence_unproven_event_still_forwards_activity() {
+        // The receive fact is real whatever the proof says, and history can
+        // only delay a paste with it.
+        let (handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut handler = with_failing_history(handler, &evidence);
+        handler
+            .registry
+            .remove(SessionId::new("evidence-session"))
+            .await
+            .unwrap();
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert!(!evidence.available());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_status_line_and_pane_less_event_forward_activity() {
+        // A status line of a session no message knows: no harness, no pane.
+        let (handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let mut handler = with_failing_history(handler, &evidence);
+        let mut data: serde_json::Value = serde_json::from_str(
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_status_line_2.1.310.jsonl"
+            )
+            .lines()
+            .next()
+            .unwrap(),
+        )
+        .unwrap();
+        data["session_id"] = serde_json::json!("some-other-session");
+        handler.handle_status_update(data).await.unwrap();
+        assert!(!evidence.available());
+
+        // A lifecycle event without a pane.
+        let (handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let mut handler = with_failing_history(handler, &evidence);
+        let mut payload = captured_prompt(atm_core::Harness::Pi);
+        payload.as_object_mut().unwrap().remove("tmux_pane");
+        handler.handle_pi_event(payload).await.unwrap();
+        assert!(!evidence.available());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_child_session_start_is_not_parent_activity() {
+        // Synthetic: the captured prompt's identity on a SubagentStart. It is
+        // a child lifecycle event of the bound parent, not parent activity.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let mut payload = captured_prompt(atm_core::Harness::ClaudeCode);
+        payload["hook_event_name"] = serde_json::json!("SubagentStart");
+        payload["agent_id"] = serde_json::json!("child-agent");
+        payload["agent_type"] = serde_json::json!("general-purpose");
+        handler.handle_hook_event(payload).await.unwrap();
+        assert_untouched(&evidence, m123());
+    }
+
+    #[tokio::test]
+    async fn message_evidence_pending_row_on_the_pane_holds() {
+        // The rule, pinned: a discovered `pending-<pid>` row is an occupant of
+        // its pane like any other parent row, so the session beside it cannot
+        // be proven and its reference holds instead of confirming.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let pid = 4_000_000_001_u32;
+        handler
+            .registry
+            .register_discovered(
+                SessionId::pending_from_pid(pid),
+                pid,
+                "/".into(),
+                Some("%7".into()),
+                atm_core::Harness::Pi,
+            )
+            .await
+            .unwrap();
+        handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .unwrap();
+        assert_held_without_receipt(&evidence);
+    }
+
     fn request_router() -> Arc<super::super::methods::MethodRouter> {
         let mut router = super::super::methods::MethodRouter::default();
         router.register("wait", Duration::from_secs(1000), |ctx, params| async move {

@@ -704,6 +704,16 @@ fn reference_on_another_pane_never_confirms_even_when_proven() {
 }
 
 #[test]
+fn arm_wakes_subscribers() {
+    // An arm resets the latch: a waiter must look again.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    let wake = e.subscribe();
+    e.arm(scope()).unwrap();
+    assert!(wake.has_changed().unwrap());
+}
+
+#[test]
 fn unproven_event_never_binds_a_lazy_scope() {
     let e = evidence();
     e.register(id(), REFERENCE.into()).unwrap();

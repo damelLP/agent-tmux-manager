@@ -270,6 +270,7 @@ async fn split_returns_the_pane_before_typing_then_command_and_enter_are_separat
             size: "20%".into(),
             direction: PaneDirection::Left,
             command: None,
+            cwd: None,
         }]
     );
     client.clear_calls();

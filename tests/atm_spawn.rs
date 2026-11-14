@@ -135,6 +135,74 @@ fn stdout(out: &Output) -> String {
 }
 
 #[test]
+fn spawn_request_carries_callers_directory_separately_from_harness_cwd() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let caller = dir.path().join("caller");
+    std::fs::create_dir(&caller).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(dir.path().join("atmd.sock")).unwrap();
+    let expected = caller.clone();
+    let peer = std::thread::spawn(move || {
+        for method in [
+            "session.spawn_prepare",
+            "session.spawn",
+            "session.spawn_type",
+        ] {
+            let (mut stream, mut read) = loop {
+                let mut ready = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut ready, 1, 30_000) },
+                    1,
+                    "client never connected"
+                );
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                    .unwrap();
+                let mut read = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if read.read_line(&mut line).unwrap() != 0 {
+                    break (stream, read);
+                }
+                // Startup probes open and close without a handshake.
+            };
+            writeln!(stream, "{}", serde_json::json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"test","methods":[method]})).unwrap();
+            let mut line = String::new();
+            read.read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], method);
+            let result = match method {
+                "session.spawn_prepare" => {
+                    serde_json::json!({"target_pane":"%7","cwd":"/from/pane","caller_pane_missing":false})
+                }
+                "session.spawn" => {
+                    assert_eq!(request["params"]["cwd"], expected.to_str().unwrap());
+                    serde_json::json!({"pane":"%42"})
+                }
+                _ => serde_json::Value::Null,
+            };
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({"type":"response","id":"r1","result":result})
+            )
+            .unwrap();
+        }
+    });
+    let out = spawn_command(dir.path(), Some("%7"), &[])
+        .current_dir(&caller)
+        .output()
+        .unwrap();
+    peer.join().unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
 fn spawn_splits_the_callers_pane_and_prints_the_new_one() {
     let dir = rig();
     let out = spawn(dir.path(), Some("%7"), &[]);

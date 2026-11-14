@@ -82,7 +82,13 @@ pub async fn split_spawn(
     size: &str,
 ) -> Result<String, ControlError> {
     client
-        .split_window(&context.target_pane, size, direction, None)
+        .split_window(
+            &context.target_pane,
+            size,
+            direction,
+            None,
+            context.cwd.as_deref(),
+        )
         .await
         .map_err(|source| ControlError::Tmux {
             // A stale caller deserves a hint, but a small pane does not.

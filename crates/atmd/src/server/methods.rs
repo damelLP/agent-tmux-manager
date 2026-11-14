@@ -217,6 +217,7 @@ struct PrepareParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SplitParams {
+    cwd: Option<String>,
     target_pane: String,
     caller_pane_missing: bool,
     direction: atm_tmux::PaneDirection,
@@ -303,7 +304,7 @@ fn register_control(
             async move {
                 let p: SplitParams = parse_params(params)?;
                 let context =
-                    crate::control::SpawnContext::new(p.target_pane, None, p.caller_pane_missing);
+                    crate::control::SpawnContext::new(p.target_pane, p.cwd, p.caller_pane_missing);
                 let pane = require_control(control, caller)?
                     .split_spawn(context, p.direction, p.size)
                     .await
@@ -443,6 +444,20 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         org_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn spawn_passes_optional_shell_start_directory_to_tmux() {
+        let (router, mock, cancel, task, _) =
+            control_router(crate::org::OrgHandle::disabled("test")).await;
+        for cwd in [Some("/caller"), None] {
+            router.call(context(), "session.spawn", json!({"target_pane":"%7","caller_pane_missing":false,"direction":"below","size":"50%","cwd":cwd})).await.unwrap();
+            assert!(
+                matches!(mock.calls().last(), Some(atm_tmux::mock::MockCall::SplitWindow { cwd: got, .. }) if got.as_deref() == cwd)
+            );
+        }
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test]

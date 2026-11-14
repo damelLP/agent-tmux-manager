@@ -308,7 +308,7 @@ pub(super) async fn cmd_spawn(
     let direction: atm_tmux::PaneDirection = direction.into();
     let result = super::rpc::call("session.spawn", serde_json::json!({
         "target_pane": context.target_pane, "caller_pane_missing": context.caller_pane_missing(),
-        "direction": direction, "size": size,
+        "direction": direction, "size": size, "cwd": fallback_cwd,
     }), budget).await?;
     let new_pane = result
         .get("pane")

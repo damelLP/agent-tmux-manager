@@ -659,7 +659,7 @@ async fn scenario_role_json(env: &E2eEnv, session_id: &str) {
         .pane_id;
     let other = env
         .tmux
-        .split_window(pane, "30%", PaneDirection::Below, None)
+        .split_window(pane, "30%", PaneDirection::Below, None, None)
         .await
         .unwrap();
     let other_pid: u32 = env
@@ -736,7 +736,7 @@ async fn scenario_real_tmux_lib(env: &E2eEnv) {
 
     let new_pane = env
         .tmux
-        .split_window(&probe_pane, "30%", PaneDirection::Below, None)
+        .split_window(&probe_pane, "30%", PaneDirection::Below, None, None)
         .await
         .expect("split-window");
     assert!(
@@ -832,6 +832,7 @@ async fn scenario_paste_text_and_atm_send(env: &E2eEnv) {
                 "printf READY; exec cat > '{}'",
                 plain_file.display()
             )),
+            None,
         )
         .await
         .expect("split plain cat pane");
@@ -845,6 +846,7 @@ async fn scenario_paste_text_and_atm_send(env: &E2eEnv) {
                 "printf '\\033[?2004hREADY'; exec cat > '{}'",
                 bracketed_file.display()
             )),
+            None,
         )
         .await
         .expect("split bracketed cat pane");

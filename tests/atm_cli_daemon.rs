@@ -41,9 +41,10 @@ mod shutdown {
             size: &str,
             direction: PaneDirection,
             command: Option<&str>,
+            cwd: Option<&str>,
         ) -> Result<String, TmuxError> {
             self.mock
-                .split_window(target, size, direction, command)
+                .split_window(target, size, direction, command, cwd)
                 .await
         }
         async fn get_pane_cwd(&self, pane: &str) -> Result<Option<String>, TmuxError> {

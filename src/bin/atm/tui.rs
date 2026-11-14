@@ -462,7 +462,7 @@ pub(super) async fn run_event_loop(
                                         // Split without a command to get an interactive shell
                                         // (the user's PATH and aliases), then send-keys.
                                         match client
-                                            .split_window(target, "50%", direction, None)
+                                            .split_window(target, "50%", direction, None, None)
                                             .await
                                         {
                                             Ok(pane_id) => {
@@ -861,6 +861,7 @@ mod capture_task_tests {
             _: &str,
             _: &str,
             _: PaneDirection,
+            _: Option<&str>,
             _: Option<&str>,
         ) -> Result<String, TmuxError> {
             unreachable!("the capture task only captures")

@@ -85,7 +85,7 @@ async fn test_split_and_kill_real() {
 
     // Split the pane
     let new_pane = client
-        .split_window(initial_pane, "50%", PaneDirection::Below, None)
+        .split_window(initial_pane, "50%", PaneDirection::Below, None, None)
         .await
         .expect("split_window");
     assert!(new_pane.starts_with('%'), "pane ID should start with %");
@@ -158,7 +158,7 @@ async fn test_resize_pane_real() {
     let panes = client.list_panes().await.expect("list_panes");
     let initial = &panes[0].pane_id;
     let new_pane = client
-        .split_window(initial, "50%", PaneDirection::Right, None)
+        .split_window(initial, "50%", PaneDirection::Right, None, None)
         .await
         .expect("split_window");
 

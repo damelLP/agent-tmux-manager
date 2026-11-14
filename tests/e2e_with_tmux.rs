@@ -109,7 +109,7 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Wait on SIGCHLD, not elapsed time. Subscribe before checking the child so
 /// an exit between try_wait and recv is retained. Every wake uses the same guard.
 fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 tokio::runtime::Builder::new_current_thread()
@@ -126,8 +126,6 @@ fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
                                 tokio::time::timeout_at(deadline.into(), exited.recv()).await,
                                 Ok(Some(()))
                             ) {
-                                let _ = child.kill();
-                                let _ = child.wait();
                                 return Err(io::Error::new(
                                     io::ErrorKind::TimedOut,
                                     "child exit guard expired or signal stream closed (killed and reaped)",
@@ -138,7 +136,13 @@ fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
             })
             .join()
             .expect("child waiter thread")
-    })
+    });
+    // Setup/signal errors must reap too, not only the normal timeout branch.
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 /// Files avoid a full stdout/stderr pipe preventing the exit we await.
@@ -202,6 +206,33 @@ fn readable(fd: RawFd, deadline: Instant) -> io::Result<()> {
             return Err(error);
         }
     }
+}
+
+fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let connected = tokio::time::timeout_at(
+                            deadline.into(),
+                            tokio::net::UnixStream::connect(path),
+                        )
+                        .await
+                        .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
+                        let stream = connected.into_std()?;
+                        stream.set_nonblocking(false)?;
+                        Ok(stream)
+                    })
+            })
+            .join()
+            .expect("socket connector thread")
+    })
 }
 
 /// A trickle of partial frames must not renew the operation's hang guard.
@@ -323,6 +354,49 @@ fn wait_for_signal(label: &str, channel: &str, deadline: Instant) -> io::Result<
             "tmux wait-for {channel}: {status}"
         )))
     }
+}
+
+#[test]
+fn expired_connect_guard_never_reaches_the_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("connect.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        connect_until(&path, Instant::now()).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let _connected = connect_until(&path, Instant::now() + HANG_GUARD).unwrap();
+    listener.accept().unwrap();
+}
+
+#[test]
+fn shim_connection_failure_records_its_stage() {
+    let Some(python) = python3_on_path() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let shim = write_claude_shim(dir.path());
+    let output = command_output(
+        Command::new(python)
+            .arg(&shim)
+            .env("ATM_SOCKET", dir.path().join("missing.sock"))
+            .env("TMUX_PANE", "%fixture"),
+    );
+    assert!(!output.status.success());
+    let stages = std::fs::read_to_string(shim.with_extension("stages")).unwrap();
+    assert!(
+        stages.contains("python started")
+            && stages.contains("connecting")
+            && stages.contains("error:"),
+        "{stages}"
+    );
+    assert!(!stages.contains("socket connected"), "{stages}");
 }
 
 #[test]
@@ -474,7 +548,6 @@ import json, os, socket, sys, time, uuid, signal
 
 PROTOCOL_VERSION = {{"major": {major}, "minor": {minor}}}
 
-socket_path = os.environ.get("ATM_SOCKET", "/tmp/atm.sock")
 pane = os.environ.get("TMUX_PANE", "")
 session_id = "fixture-" + uuid.uuid4().hex[:12]
 
@@ -484,6 +557,8 @@ def stage(label):
 
 stage("python started")
 try:
+    # Missing fixture configuration must never fall back to a live daemon.
+    socket_path = os.environ["ATM_SOCKET"]
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stage("connecting")
     s.connect(socket_path)
@@ -692,7 +767,7 @@ impl Daemon {
     async fn wait_for_socket(&self) {
         let start = Instant::now();
         while start.elapsed() < SOCKET_WAIT_TIMEOUT {
-            if UnixStream::connect(&self.socket_path).is_ok() {
+            if connect_until(&self.socket_path, start + SOCKET_WAIT_TIMEOUT).is_ok() {
                 return;
             }
             // atmd exposes no readiness fd: a successful connect, not a delay
@@ -753,7 +828,8 @@ struct Client {
 
 impl Client {
     fn connect(path: &Path) -> Self {
-        let stream = UnixStream::connect(path).expect("connect to atmd socket");
+        let stream =
+            connect_until(path, Instant::now() + HANG_GUARD).expect("connect to atmd socket");
         let writer = stream.try_clone().expect("clone unix stream");
         Self {
             reader: BufReader::new(stream),

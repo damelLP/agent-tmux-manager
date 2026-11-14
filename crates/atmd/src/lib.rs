@@ -39,6 +39,7 @@ pub mod discovery;
 pub mod eventlog;
 pub mod monitor;
 pub mod notify;
+pub mod org;
 pub mod project;
 pub mod registry;
 pub mod server;

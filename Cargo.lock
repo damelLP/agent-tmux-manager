@@ -246,6 +246,7 @@ dependencies = [
  "atm-claude-adapter",
  "atm-codex-adapter",
  "atm-core",
+ "atm-org",
  "atm-pi-adapter",
  "atm-protocol",
  "atm-tmux",

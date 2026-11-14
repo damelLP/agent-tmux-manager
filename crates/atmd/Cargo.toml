@@ -22,6 +22,7 @@ path = "src/lib.rs"
 
 [dependencies]
 atm-core = { workspace = true }
+atm-org = { workspace = true }
 atm-protocol = { workspace = true }
 atm-claude-adapter = { workspace = true }
 atm-pi-adapter = { workspace = true }

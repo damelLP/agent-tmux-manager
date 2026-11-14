@@ -55,13 +55,21 @@ fn rule(line: &str, glyph: char) -> bool {
 }
 
 fn header(lines: &[&str]) -> bool {
-    lines.get(1) == Some(&" ▐▛███▛█   Claude Code v2.1.325")
+    lines
+        .get(1)
+        .and_then(|line| line.strip_prefix(" ▐▛███▛█   Claude Code v"))
+        .is_some_and(|version| {
+            version
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        })
         && lines
             .get(2)
             .is_some_and(|line| line.starts_with("▝▜██████▀  "))
         && lines
             .get(3)
-            .is_some_and(|line| line.starts_with(" ▝▝   ▝▝   /"))
+            .and_then(|line| line.strip_prefix(" ▝▝   ▝▝   "))
+            .is_some_and(|cwd| cwd.starts_with('/') || cwd.starts_with("~/"))
 }
 
 fn dialog(lines: &[&str]) -> Option<DialogState> {
@@ -87,7 +95,7 @@ fn dialog(lines: &[&str]) -> Option<DialogState> {
             "Ask rule Bash overrides auto mode for this command.",
             "/permissions to let auto mode decide", "Do you want to proceed?",
             "❯ 1. Yes", "2. No", "Esc to cancel · Tab to amend"]
-            if header(lines) && rule(upper, '╌') && upper == lower =>
+            if rule(upper, '╌') && upper == lower =>
         {
             Some(DialogState::Permission)
         }
@@ -96,9 +104,7 @@ fn dialog(lines: &[&str]) -> Option<DialogState> {
 }
 
 fn editor(lines: &[&str]) -> Option<ScreenFacts> {
-    if !header(lines) {
-        return None;
-    }
+    let has_header = header(lines);
     let (footer, before_footer) = lines.split_last()?;
     if !matches!(
         footer.trim(),
@@ -142,7 +148,7 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
         .filter(|line| !line.is_empty())
         .collect();
     let history: Vec<_> = lines
-        .get(4..status_start)?
+        .get(if has_header { 4 } else { 0 }..status_start)?
         .iter()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
@@ -150,19 +156,23 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     // Blank status rows alone aren't idle evidence: an unfamiliar/shifted status
     // may have fallen into history. Require a captured idle history ending too.
     let idle_history = match history.last() {
-        None | Some(&"❯ /clear") => true,
-        Some(line) => line.starts_with("✻ ") && line.contains(" · done "),
+        None | Some(&"❯ /clear") => has_header,
+        Some(line) => spinner_body(line)
+            .is_some_and(|body| body.contains(" for ") && body.contains(" · done ")),
     };
-    let turn = match status.as_slice() {
-        [] | ["◐ medium · /effort"] if idle_history => TurnState::NotRunning,
-        ["✶ Levitating…" | "✽ Sketching… (running SessionEnd hook · 0s)", tip]
-            if tip.starts_with("⎿ \u{a0}Tip: ") =>
-        {
-            TurnState::Running
-        }
-        _ => TurnState::Unknown,
+    let running = status.iter().filter(|line| running_status(line)).count();
+    let known_status = status.iter().all(|line| {
+        running_status(line) || effort_status(line) || line.starts_with("⎿ \u{a0}Tip: ")
+    });
+    let turn = if running == 1 && known_status {
+        TurnState::Running
+    } else if running == 0 && status.iter().all(|line| effort_status(line)) && idle_history {
+        TurnState::NotRunning
+    } else {
+        TurnState::Unknown
     };
-    let fresh_editor = if turn == TurnState::NotRunning
+    let fresh_editor = if has_header
+        && turn == TurnState::NotRunning
         && input != InputState::Draft
         && matches!(history.as_slice(), [] | ["❯ /clear"])
     {
@@ -176,6 +186,35 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
         dialog: DialogState::None,
         fresh_editor,
     })
+}
+
+fn spinner_body(line: &str) -> Option<&str> {
+    let (frame, body) = line.split_once(' ')?;
+    (frame.chars().count() == 1 && "·✢✳✶✻✽".contains(frame)).then_some(body)
+}
+
+fn running_status(line: &str) -> bool {
+    let Some((verb, details)) = spinner_body(line).and_then(|s| s.split_once('…')) else {
+        return false;
+    };
+    !verb.is_empty()
+        && verb.chars().all(char::is_alphabetic)
+        && (details.is_empty() || (details.starts_with(" (") && details.ends_with(')')))
+}
+
+fn effort_status(line: &str) -> bool {
+    let Some((value, notice)) = line.split_once(" · /effort") else {
+        return false;
+    };
+    let Some(level) = value
+        .strip_prefix("◐ ")
+        .or_else(|| value.strip_prefix("◈ "))
+    else {
+        return false;
+    };
+    !level.is_empty()
+        && level.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+        && (notice.is_empty() || notice.starts_with(" · "))
 }
 
 #[cfg(test)]
@@ -261,6 +300,115 @@ mod tests {
     }
 
     #[test]
+    fn value_variations_preserve_facts() {
+        for (name, text, expected) in cases() {
+            // Synthetic: value variation of each named U5 fixture; chrome unchanged.
+            let varied = text
+                .replace("v2.1.325", "v12.34.567")
+                .replace(
+                    "◐ medium · /effort",
+                    "◈ max · /effort · ✘ Auto-update failed · Run claude doctor",
+                )
+                .replace("✶ Levitating…", "✳ Generating… (2m 31s · ↓ 15.3k tokens)")
+                .replace(
+                    "✽ Sketching… (running SessionEnd hook · 0s)",
+                    "✢ Thinking… (running SessionEnd hook · 14s)",
+                )
+                .replace("Crunched for 1s", "Calculated for 3m 19s")
+                .replace("done 11:25", "done 09:47")
+                .replace("Haiku 5.5 · Claude Ultra", "Another-model · Another-plan")
+                .replace("/tmp/u8a-fixture/cwd/claude", "/other/project");
+            let expected = if name == "startup" {
+                ScreenFacts {
+                    dialog: DialogState::FolderTrust {
+                        folder: "/other/project".into(),
+                    },
+                    ..expected
+                }
+            } else {
+                expected
+            };
+            assert_eq!(observe_screen(&varied, None), expected, "{name}");
+            // Synthetic: header cwd value variation; trust still requires its full absolute path.
+            if name != "startup" {
+                assert_eq!(
+                    observe_screen(
+                        &varied.replace("/other/project", "~/other/project (topic)"),
+                        None
+                    ),
+                    expected,
+                    "{name} home cwd"
+                );
+            }
+        }
+        // Synthetic: permission's complete current dialog with the historical header scrolled off.
+        let cropped = PERMISSION.lines().skip(4).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            observe_screen(&cropped, None).dialog,
+            DialogState::Permission
+        );
+        // Synthetic: value variation of before-escape, with optional tip omitted.
+        for frame in "·✢✳✶✻✽".chars() {
+            let varied =
+                capture!("before-escape").replace("✶ Levitating…", &format!("{frame} Generating…"));
+            let varied = varied
+                .lines()
+                .filter(|line| !line.contains("Tip: "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(observe_screen(&varied, None).turn, TurnState::Running);
+        }
+    }
+
+    #[test]
+    fn cropped_coordinator_background_footer_is_unknown() {
+        // Captured: Claude Code 2.1.325, 2026-11-14, coordinator read-only tmux capture-pane -p; sanitized.
+        let text = capture!("extra-running-bottom");
+        // Background-agent selection/status beneath the composer is not yet supported.
+        assert_eq!(observe_screen(text, None), ScreenFacts::default());
+        // Synthetic: bottom-layout variant of extra-running-bottom with the unsupported
+        // background footer replaced by the previously captured standard footer.
+        let (bottom, _) = text.split_once("  ⏵⏵ auto mode on · 1 shell").unwrap();
+        let text = format!("{bottom}  ⏵⏵ auto mode on (shift+tab to cycle)\n");
+        assert_eq!(
+            observe_screen(&text, None),
+            ScreenFacts {
+                input: InputState::Empty,
+                turn: TurnState::Running,
+                dialog: DialogState::None,
+                fresh_editor: FreshEditorEvidence::Unknown
+            }
+        );
+    }
+
+    #[test]
+    fn prose_footer_and_malformed_status_remain_unknown() {
+        // Synthetic: structural damage of before-escape and after-clear.
+        assert_eq!(
+            observe_screen(
+                &IDLE.replace("⏵⏵ auto mode on (shift+tab to cycle)", "a prose footer"),
+                None
+            ),
+            ScreenFacts::default()
+        );
+        for status in [
+            "Generating…",
+            "? Generating…",
+            "✻ Generating",
+            "✻ Generating… (unterminated",
+        ] {
+            assert_eq!(
+                observe_screen(
+                    &capture!("before-escape").replace("✶ Levitating…", status),
+                    None
+                )
+                .turn,
+                TurnState::Unknown
+            );
+        }
+    }
+
+    #[test]
     fn control_policy_uses_captured_commands() {
         assert_eq!(CLEAR_COMMAND, "/clear");
         assert!(LAUNCH_POLICY.required_args.is_empty());
@@ -272,7 +420,7 @@ mod tests {
         // Synthetic: remove required frame regions rather than guessing partial UI semantics.
         let lines: Vec<_> = IDLE.lines().collect();
         for text in [
-            lines[2..].join("\n"),
+            lines[36..].join("\n"),
             lines[..38].join("\n"),
             "❯\u{a0}".into(),
         ] {
@@ -389,6 +537,16 @@ mod tests {
             "Unrecognized active operation",
         );
         assert_eq!(observe_screen(&unfamiliar, None).turn, TurnState::Unknown);
+    }
+
+    #[test]
+    fn orphan_tip_does_not_prove_idle() {
+        // Synthetic: structural damage of clear-poll-01 removes the spinner but leaves its tip.
+        let text =
+            capture!("clear-poll-01").replace("✽ Sketching… (running SessionEnd hook · 0s)", "");
+        let facts = observe_screen(&text, None);
+        assert_eq!(facts.turn, TurnState::Unknown);
+        assert_eq!(facts.fresh_editor, FreshEditorEvidence::Unknown);
     }
 
     #[test]

@@ -62,14 +62,42 @@ account identifiers, home names or local infrastructure paths are retained.
   drafts and incomplete/scrollback layouts have no positive real coverage here.
   The restored Escape draft is the real positive draft fixture. Alterations for
   adversarial draft/path/control tests are marked Synthetic in their tests.
-- Only the captured working status layouts are recognized. An unknown status
-  in the active status region yields Unknown turn state, never inferred idle.
+- Fixed borders, footer/help/dialog wording and prompt glyphs are exact.
+  Versions, model names, effort levels, spinner frames and the turn verb are
+  values, not gates. A spinner plus an alphabetic word ending in `…` is active,
+  with optional parenthesized details. Tips and effort/update notices may be
+  absent or vary. Unrecognized status structure is Unknown, never inferred idle.
 - Clear of an already-fresh editor, clear in a Git worktree, and timing relative
   to a particular clear command were not verified. Present is layout evidence,
   not a new generation, session identity or permission to paste.
 - Recognition cannot distinguish a live screen from an identical historical
   copy. Consumers must establish pane/process identity, current viewport,
   copy mode, freshness and stable safe observations separately.
+
+## Additional coordinator capture
+
+**Captured: Claude Code 2.1.325, 2026-11-14, coordinator read-only tmux capture-pane -p; sanitized.**
+
+`claude-2.1.325-running-bottom25.txt` maps to
+`screen_claude-extra-running-bottom_2.1.325.txt`. It is a cropped bottom-only
+viewport with `✻ Generating…`, parenthesized elapsed/token details, a tip,
+max effort/update notice, and background-agent rows below the composer.
+**The background-agent footer is deliberately unsupported: the real frame
+returns all Unknown.** It is not an ordinary standard footer, and no safe
+selection/action semantics have been established for it.
+
+A labelled synthetic variant replaces only that unsupported footer with the
+previously captured standard footer: the complete bottom layout then reports
+Empty/Running/None, without requiring the scrolled-off startup header. This
+checks the new verb/status shape without misrepresenting background UI support.
+Fresh-layout evidence still needs a recognizable startup/cleared history.
+
+Additional sanitization replaces all nonblank transcript rows above the active
+spinner with padded redaction markers. The background task description and
+personal free-review quota are redacted in place. Every row and character count,
+blank row, border, input glyph, spinner, effort label and status column remains;
+no row is rewrapped. Local paths, identifiers and conversation text are removed.
+The original 15 U5 fixtures and all their expected facts are unchanged.
 
 The unit adds no RPC method. These capture tables and synthetic refusals are
 parser conformance coverage; launch/clear constants have exact policy tests.

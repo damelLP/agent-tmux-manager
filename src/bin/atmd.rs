@@ -820,11 +820,9 @@ mod tests {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success());
+        let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("fifo path");
+        // A fork could briefly retain another test thread's flock after it drops the file.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
         // One writer/open only: a second config read would wait forever.
         let writer = std::thread::spawn({
             let path = path.clone();

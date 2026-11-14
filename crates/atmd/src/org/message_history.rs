@@ -38,15 +38,16 @@ use atm_core::{
 };
 use atm_org::{
     delivery::{
-        next_delivery, track_agent_not_ready, track_hold, track_stale_blocker, DeliveryPolicy,
-        DeliveryStep, InputLine, LiveSession, PaneLiveness, RecipientLiveView, WaitReason,
+        delivery_in_flight, next_delivery, track_agent_not_ready, track_hold, track_stale_blocker,
+        DeliveryPolicy, DeliveryStep, InputLine, LiveSession, PaneLiveness, RecipientLiveView,
+        WaitReason,
     },
     Address, Agent, AgentId, AgentStatus, DeliveryReceipt, DeliveryStatus, Message, MessageId,
     OrgEvent, OrgState,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use tokio::sync::watch;
@@ -62,7 +63,9 @@ pub struct DeliverySnapshot {
     pub last_attempt_seq: Option<u64>,
     /// Executor diagnostic; latches probably_landed until new arm or matching retry.
     pub hold: Option<ExecutorHold>,
-    /// Current FIFO predecessor, not a list of followers.
+    /// Current FIFO predecessor, not a list of followers. While it is Some,
+    /// `live.other_delivery_in_flight` is set, whether or not the predecessor
+    /// was attempted yet.
     pub blocked_by: Option<MessageId>,
 }
 
@@ -131,6 +134,11 @@ pub enum HistoryUpdate {
     /// Loss breaks observation continuity but is never positive pane death.
     ObservationLost { recipient: AgentId },
     /// Genuine event receive order; polls/discovery refreshes must not emit this.
+    /// Accepted before the replay is complete, and never an error for an
+    /// ordinary event: a session the history has never seen, one bound to no
+    /// agent, no pane, an older time. Such an event is remembered or ignored.
+    /// Only an event time outside the clock's range fails, because the tap's
+    /// caller treats a failed write as a broken invariant.
     Activity {
         /// Stamped by evidence's clock at receipt, never at a later wake/drain.
         at: DateTime<Utc>,
@@ -141,23 +149,32 @@ pub enum HistoryUpdate {
     Armed { scope: AttemptScope },
     /// Retained facts; absence/false is not permission to clear a prior latch.
     /// Only a new arm or explicit matching owner retry can release that latch.
+    /// probably_landed for a message with no attempt is a `Conflict`.
     Evidence {
         id: MessageId,
         receipt: Option<DeliveryReceipt>,
         probably_landed: bool,
     },
     /// Successful serialized policy consumption; PasteNow resets hold, not paste time.
+    /// Record it with the `now` of the snapshot the step was evaluated on: the
+    /// step is checked against the policy at that instant. `Conflict` means the
+    /// decision is no longer current (time moved, or an update arrived in
+    /// between): take a new snapshot and evaluate again.
     Consumed { id: MessageId, step: DeliveryStep },
     /// Applied/Unknown records now and resets pane readiness before job release.
     /// NotStarted must never manufacture a paste timestamp. Paste never latches
     /// probably_landed by itself: B records Held for uncertain effects.
+    /// While the current attempt is recorded NotStarted and no earlier attempt
+    /// of the message was recorded Applied or Unknown, the evidence latch does
+    /// not block it, whichever arrives first; a receipt still confirms.
     Paste {
         id: MessageId,
         pane: PaneId,
         certainty: EffectCertainty,
     },
     /// Latch probably_landed and this diagnostic for the matching attempted log
-    /// sequence. Only new Armed or matching OwnerRetry releases it.
+    /// sequence. Only an Armed for another attempt or a matching OwnerRetry
+    /// releases it; the first Armed of this same attempt does not.
     Held {
         id: MessageId,
         attempt_seq: u64,
@@ -207,16 +224,126 @@ struct MessageContinuity {
     restarted: bool,
     scope: Option<AttemptScope>,
     receipt: Option<DeliveryReceipt>,
-    probably_landed: bool,
+    /// probably_landed, as the attempt sequence the latch was set for.
+    latch: Option<u64>,
     hold: Option<ExecutorHold>,
+    /// The attempt recorded `Paste { NotStarted }`: it typed nothing.
+    no_effect_seq: Option<u64>,
+    /// Some attempt may have typed something: it was recorded Applied or
+    /// Unknown, the executor held it, or it predates this process and its
+    /// record is gone. Never cleared.
+    effect_possible: bool,
     hold_since: Option<DateTime<Utc>>,
     stale_since: Option<DateTime<Utc>>,
     stale_blocker: Option<WaitReason>,
 }
 
+impl MessageContinuity {
+    /// This message's own clocks and evidence, on top of its recipient's view.
+    fn apply(&self, live: &mut RecipientLiveView) {
+        live.hold_since = self.hold_since;
+        live.stale_blocker_since = self.stale_since;
+        live.last_attempt_before_start = self.restarted;
+        live.confirmation = self.receipt.clone();
+        // While the current attempt typed nothing and no earlier attempt may
+        // have, activity in the session cannot be ours, so the latch does not
+        // block. This is read here, not folded into the latch, so the order in
+        // which the latch and the paste record arrive does not matter. After
+        // any possible effect every latch stays in force: the activity may be
+        // that paste landing late.
+        let untyped = !self.effect_possible
+            && self.no_effect_seq.is_some()
+            && self.no_effect_seq == self.last_attempt_seq;
+        live.probably_landed = self.latch.is_some() && !untyped;
+    }
+}
+
+/// A recipient's open messages as any one of them sees the others.
+#[derive(Debug, Clone, Copy, Default)]
+struct Queue {
+    /// The first two attempted, unconfirmed messages: enough to find one that
+    /// is not the message asking.
+    in_flight: [Option<MessageId>; 2],
+    head: Option<MessageId>,
+}
+
+impl Queue {
+    /// Another attempted, unconfirmed message: the reservation.
+    fn other_in_flight(&self, id: MessageId) -> Option<MessageId> {
+        self.in_flight
+            .iter()
+            .flatten()
+            .copied()
+            .find(|other| *other != id)
+    }
+
+    /// The reservation first, else the FIFO head while it is older than `id`.
+    /// Either one is the policy's veto (`other_delivery_in_flight`), so a
+    /// follower is answered `Wait(OtherDelivery)` and `Consumed` refuses its
+    /// paste: FIFO holds before any first attempt too. That wait is no hold:
+    /// a follower's readiness budget and stale-blocker bound start when it
+    /// becomes the head, not while it waits its turn.
+    fn blocked_by(&self, id: MessageId) -> Option<MessageId> {
+        self.other_in_flight(id)
+            .or(self.head.filter(|head| *head < id))
+    }
+}
+
+/// New stale-blocker clocks, computed before any of them is written.
+type ShortClocks = Vec<(MessageId, Option<DateTime<Utc>>, Option<WaitReason>)>;
+
+/// The one agent an applied event can change. Exhaustive on purpose: a new
+/// event kind must say here whether it names an agent.
+fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
+    match event {
+        OrgEvent::AgentUpRequested { agent_id, .. }
+        | OrgEvent::AgentPaneCreated { agent_id, .. }
+        | OrgEvent::AgentAdopted { agent_id, .. }
+        | OrgEvent::AgentSessionBound { agent_id, .. }
+        | OrgEvent::AgentSessionLost { agent_id }
+        | OrgEvent::AgentEditorReady { agent_id }
+        | OrgEvent::AgentClearRequested { agent_id }
+        | OrgEvent::AgentStuck { agent_id, .. }
+        | OrgEvent::AgentDown { agent_id, .. } => Some(agent_id),
+        OrgEvent::ProjectRegistered { .. }
+        | OrgEvent::MessageSent(_)
+        | OrgEvent::MessageDeliveryAttempted { .. }
+        | OrgEvent::MessageDelivered { .. }
+        | OrgEvent::MessageDeliveryFailed { .. }
+        | OrgEvent::MessageRead { .. }
+        | OrgEvent::SessionSummary(_)
+        | OrgEvent::ControlSent(_)
+        | OrgEvent::ControlSpawned(_)
+        | OrgEvent::ControlKilled(_) => None,
+    }
+}
+
+/// The applied facts of an agent that its live continuity depends on.
+type AgentFacts = (
+    AgentStatus,
+    Option<String>,
+    Option<SessionId>,
+    Option<SessionId>,
+);
+
+fn agent_facts(agent: &Agent) -> AgentFacts {
+    (
+        agent.status,
+        agent.pane.clone(),
+        agent.session_id.clone(),
+        agent.excluded_session_id.clone(),
+    )
+}
+
 /// Pure projection, not an org command writer. Every clock and replay boundary
 /// is supplied. Updates are transactional: invalid input/arithmetic cannot leave
 /// partially updated continuity or advance the applied cursor.
+///
+/// An update costs what it touches, not what the log holds. `Applied` is
+/// validated and then folded in place. Every other update computes what can
+/// fail first, on a staged copy of the one recipient entry it changes, and
+/// writes afterwards. Clocks are refreshed only for a recipient's open
+/// messages (queued or delivering), never for delivered or failed ones.
 #[derive(Debug, Clone)]
 pub struct MessageHistory {
     state: Arc<OrgState>,
@@ -225,6 +352,8 @@ pub struct MessageHistory {
     recovery_time: DateTime<Utc>,
     policy: DeliveryPolicy,
     recipients: BTreeMap<AgentId, RecipientHistory>,
+    /// Per recipient, in FIFO order: its messages that can still be scheduled.
+    open: BTreeMap<AgentId, BTreeSet<MessageId>>,
     messages: BTreeMap<MessageId, MessageContinuity>,
     activity: HashMap<SessionId, (Option<PaneId>, DateTime<Utc>)>,
     pastes: HashMap<PaneId, DateTime<Utc>>,
@@ -244,6 +373,7 @@ impl MessageHistory {
             recovery_time,
             policy,
             recipients: BTreeMap::new(),
+            open: BTreeMap::new(),
             messages: BTreeMap::new(),
             activity: HashMap::new(),
             pastes: HashMap::new(),
@@ -255,35 +385,42 @@ impl MessageHistory {
         self.cursor
     }
 
-    pub fn snapshot(
-        &self,
-        id: MessageId,
-        now: DateTime<Utc>,
-    ) -> Result<DeliverySnapshot, MessageError> {
+    fn replayed(&self) -> Result<(), MessageError> {
         if self.cursor < self.startup_high_water {
             return Err(MessageError::Unavailable(
                 "message history replay is incomplete".into(),
             ));
         }
-        let message = self
-            .state
-            .message(&id)
-            .ok_or_else(|| MessageError::NotFound(format!("message {id} was not found")))?;
-        let Address::Agent(recipient) = &message.content.to else {
-            return Err(MessageError::Refused(
-                "only agent messages have delivery snapshots".into(),
-            ));
+        Ok(())
+    }
+
+    fn queue(&self, recipient: &AgentId) -> Queue {
+        let Some(open) = self.open.get(recipient) else {
+            return Queue::default();
         };
-        let agent = self
-            .state
-            .agent(recipient)
-            .ok_or_else(|| MessageError::NotFound(format!("agent {recipient} was not found")))?;
-        let track = self
-            .messages
-            .get(&id)
-            .ok_or_else(|| MessageError::Internal("message continuity missing".into()))?;
-        let mut live = RecipientLiveView::new(message, agent, self.state.messages());
-        if let Some(history) = self.recipients.get(recipient) {
+        let mut in_flight = open.iter().copied().filter(|id| {
+            self.state
+                .message(id)
+                .is_some_and(|message| delivery_in_flight(message, recipient))
+        });
+        Queue {
+            in_flight: [in_flight.next(), in_flight.next()],
+            head: open.first().copied(),
+        }
+    }
+
+    /// The live view all of a recipient's messages share at `now`; the veto
+    /// and each message's own continuity are added by the caller. `history`
+    /// may be a staged copy.
+    fn shared_live(
+        &self,
+        message: &Message,
+        agent: &Agent,
+        history: Option<&RecipientHistory>,
+        now: DateTime<Utc>,
+    ) -> RecipientLiveView {
+        let mut live = RecipientLiveView::new(message, agent, std::iter::empty());
+        if let Some(history) = history {
             live.agent_not_ready_since = history.not_ready_since;
             live.pane = history.pane;
             live.input_line = history.input;
@@ -311,54 +448,89 @@ impl MessageHistory {
             .and_then(|pane| PaneId::parse(pane).ok())
             .and_then(|pane| self.pastes.get(&pane).copied())
             .or(Some(self.recovery_time));
-        live.hold_since = track.hold_since;
-        live.stale_blocker_since = track.stale_since;
-        live.last_attempt_before_start = track.restarted;
-        live.confirmation = track.receipt.clone();
-        live.probably_landed = track.probably_landed;
-        let blocked_by = self
+        live
+    }
+
+    pub fn snapshot(
+        &self,
+        id: MessageId,
+        now: DateTime<Utc>,
+    ) -> Result<DeliverySnapshot, MessageError> {
+        self.replayed()?;
+        let message = self
             .state
-            .messages()
-            .find(|other| other.id != id && atm_org::delivery::delivery_in_flight(other, recipient))
-            .or_else(|| {
-                self.state.messages().find(|other| {
-                    other.id < id
-                        && other.content.to == message.content.to
-                        && matches!(
-                            other.status,
-                            DeliveryStatus::Queued | DeliveryStatus::Delivering
-                        )
-                })
-            })
-            .map(|other| other.id);
+            .message(&id)
+            .ok_or_else(|| MessageError::NotFound(format!("message {id} was not found")))?;
+        let Address::Agent(recipient) = &message.content.to else {
+            return Err(MessageError::Refused(
+                "only agent messages have delivery snapshots".into(),
+            ));
+        };
+        let agent = self
+            .state
+            .agent(recipient)
+            .ok_or_else(|| MessageError::NotFound(format!("agent {recipient} was not found")))?;
+        let terminal = MessageContinuity::default();
+        let track = match self.messages.get(&id) {
+            Some(track) => track,
+            // Delivered is terminal: its continuity was dropped.
+            None if message.status == DeliveryStatus::Delivered => &terminal,
+            None => return Err(MessageError::Internal("message continuity missing".into())),
+        };
+        let queue = self.queue(recipient);
+        let mut live = self.shared_live(message, agent, self.recipients.get(recipient), now);
+        live.other_delivery_in_flight = queue.blocked_by(id).is_some();
+        track.apply(&mut live);
         Ok(DeliverySnapshot {
             message: message.clone(),
             recipient: agent.clone(),
             live,
             last_attempt_seq: track.last_attempt_seq,
-            blocked_by,
+            blocked_by: queue.blocked_by(id),
             hold: track.hold,
         })
     }
 
+    /// All-or-nothing without copying the history: see the type's docs.
     pub fn record(
         &mut self,
         update: HistoryUpdate,
         now: DateTime<Utc>,
     ) -> Result<(), MessageError> {
-        // Stage pure state so even multi-message/recipient updates are all-or-none.
-        // Share durable message bodies across observation updates; only Applied
-        // uses copy-on-write for the org projection.
-        let mut next = self.clone();
-        next.update(update, now)?;
-        *self = next;
-        Ok(())
+        self.update(update, now)
     }
 
+    /// Continuity exists for an agent-addressed message until it is delivered.
     fn track(&mut self, id: MessageId) -> Result<&mut MessageContinuity, MessageError> {
-        self.messages
-            .get_mut(&id)
-            .ok_or_else(|| MessageError::NotFound(format!("message {id} was not found")))
+        let delivered = (self.state.message(&id))
+            .is_some_and(|message| message.status == DeliveryStatus::Delivered);
+        self.messages.get_mut(&id).ok_or_else(|| {
+            if delivered {
+                MessageError::Conflict(format!("message {id} is already delivered"))
+            } else {
+                MessageError::NotFound(format!("message {id} was not found"))
+            }
+        })
+    }
+
+    /// Forget event times no recipient can use: older than `stale_after`, of a
+    /// session that no agent is bound to and no stored observation names. A
+    /// bound session keeps its time, however old: after an observation loss
+    /// that time is what lets a stuck Working row go stale again.
+    fn prune_activity(&mut self, at: DateTime<Utc>) {
+        let Ok(stale_after) = TimeDelta::from_std(self.policy.settings().stale_after) else {
+            return;
+        };
+        let bound = self.state.agents().filter_map(|a| a.session_id.as_ref());
+        let observed = (self.recipients.values())
+            .filter_map(|history| Some(&history.observation.as_ref()?.session.as_ref()?.id));
+        let kept: HashSet<&SessionId> = bound.chain(observed).collect();
+        self.activity.retain(|session, (_, seen)| {
+            kept.contains(session)
+                || seen
+                    .checked_add_signed(stale_after)
+                    .is_none_or(|stale_at| stale_at >= at)
+        });
     }
 
     fn matching_attempt(
@@ -375,43 +547,165 @@ impl MessageHistory {
         Ok(track)
     }
 
-    fn reset_short_clock(&mut self, recipient: &AgentId) {
-        for message in self
-            .state
-            .messages()
-            .filter(|m| m.content.to == Address::Agent(recipient.clone()))
-        {
-            if let Some(track) = self.messages.get_mut(&message.id) {
+    /// Restart the stale-blocker clocks of the recipient's open messages, and
+    /// their holds too when `hold` is set.
+    fn reset_clocks(&mut self, recipient: &AgentId, hold: bool) {
+        for id in self.open.get(recipient).into_iter().flatten() {
+            if let Some(track) = self.messages.get_mut(id) {
+                if hold {
+                    track.hold_since = None;
+                }
                 track.stale_since = None;
                 track.stale_blocker = None;
             }
         }
     }
 
-    fn refresh_short_clocks(
-        &mut self,
+    /// The stale-blocker clocks of the recipient's open messages under
+    /// `history`, which may be a staged copy. `reset` restarts them first.
+    /// Nothing is written, so a failure changes no clock, and a recipient with
+    /// no open message evaluates nothing.
+    fn short_clocks(
+        &self,
         recipient: &AgentId,
+        history: &RecipientHistory,
+        reset: bool,
         now: DateTime<Utc>,
-    ) -> Result<(), MessageError> {
-        let ids: Vec<_> = self
+    ) -> Result<ShortClocks, MessageError> {
+        let Some(open) = self.open.get(recipient).filter(|open| !open.is_empty()) else {
+            return Ok(vec![]);
+        };
+        let agent = self
             .state
-            .messages()
-            .filter(|m| m.content.to == Address::Agent(recipient.clone()))
-            .map(|m| m.id)
-            .collect();
-        for id in ids {
-            let mut live = self.snapshot(id, now)?.live;
-            let mut previous = self.messages.get(&id).and_then(|track| track.stale_blocker);
+            .agent(recipient)
+            .ok_or_else(|| MessageError::NotFound(format!("agent {recipient} was not found")))?;
+        let queue = self.queue(recipient);
+        let mut shared = None;
+        let mut clocks = Vec::with_capacity(open.len());
+        for id in open {
+            let (Some(message), Some(track)) = (self.state.message(id), self.messages.get(id))
+            else {
+                continue;
+            };
+            let mut live: RecipientLiveView = shared
+                .get_or_insert_with(|| self.shared_live(message, agent, Some(history), now))
+                .clone();
+            live.other_delivery_in_flight = queue.blocked_by(*id).is_some();
+            track.apply(&mut live);
+            let mut previous = track.stale_blocker;
+            if reset {
+                live.stale_blocker_since = None;
+                previous = None;
+            }
             track_stale_blocker(&mut live, &mut previous, now, &self.policy)
                 .map_err(|error| MessageError::Internal(error.to_string()))?;
-            let track = self.track(id)?;
-            track.stale_since = live.stale_blocker_since;
-            track.stale_blocker = previous;
+            clocks.push((*id, live.stale_blocker_since, previous));
+        }
+        Ok(clocks)
+    }
+
+    fn set_short_clocks(&mut self, clocks: ShortClocks) {
+        for (id, since, blocker) in clocks {
+            if let Some(track) = self.messages.get_mut(&id) {
+                track.stale_since = since;
+                track.stale_blocker = blocker;
+            }
+        }
+    }
+
+    /// Fold one applied event. `OrgState::apply` validates before it changes
+    /// anything and this history holds the only reference to the state, so
+    /// nothing is copied; nothing after the apply can fail.
+    fn fold(&mut self, seq: u64, at: DateTime<Utc>, event: &OrgEvent) -> Result<(), MessageError> {
+        let named = named_agent(event);
+        let before = named.and_then(|id| self.state.agent(id)).map(agent_facts);
+        Arc::make_mut(&mut self.state)
+            .apply(seq, at, event)
+            .map_err(|error| MessageError::Internal(error.to_string()))?;
+        if let Some((id, after)) =
+            named.and_then(|id| Some((id, agent_facts(self.state.agent(id)?))))
+        {
+            let history = self.recipients.entry(id.clone()).or_default();
+            track_agent_not_ready(
+                &mut history.not_ready_since,
+                before.as_ref().map(|old| old.0),
+                after.0,
+                at,
+            );
+            let moved = before
+                .as_ref()
+                .is_none_or(|old| (&old.1, &old.2, &old.3) != (&after.1, &after.2, &after.3));
+            if moved {
+                history.lose();
+                // A paste time is kept only while some agent holds its pane.
+                if let Some(left) = before.as_ref().and_then(|old| old.1.as_deref()) {
+                    if self.state.agent_for_pane(left).is_none() {
+                        if let Ok(pane) = PaneId::parse(left) {
+                            self.pastes.remove(&pane);
+                        }
+                    }
+                }
+            }
+            let status_changed = before.as_ref().is_some_and(|old| old.0 != after.0);
+            if moved || status_changed {
+                self.reset_clocks(id, status_changed);
+            }
+        }
+        let id = match event {
+            OrgEvent::MessageSent(_) => MessageId::new(seq),
+            OrgEvent::MessageDeliveryAttempted { message_id, .. }
+            | OrgEvent::MessageDelivered { message_id, .. }
+            | OrgEvent::MessageDeliveryFailed { message_id, .. } => *message_id,
+            _ => return Ok(()),
+        };
+        let Some(message) = self.state.message(&id) else {
+            return Ok(());
+        };
+        // Owner and system messages are never scheduled: no continuity.
+        let Address::Agent(recipient) = &message.content.to else {
+            return Ok(());
+        };
+        let open = self.open.entry(recipient.clone()).or_default();
+        if matches!(
+            message.status,
+            DeliveryStatus::Queued | DeliveryStatus::Delivering
+        ) {
+            open.insert(id);
+        } else {
+            open.remove(&id);
+        }
+        if message.status == DeliveryStatus::Delivered {
+            // Terminal. A failed message keeps its continuity instead: a late
+            // receipt may still confirm it.
+            self.messages.remove(&id);
+            return Ok(());
+        }
+        let replayed = seq <= self.startup_high_water;
+        let track = self
+            .messages
+            .entry(id)
+            .or_insert_with(|| MessageContinuity {
+                hold_since: replayed.then_some(self.recovery_time),
+                ..MessageContinuity::default()
+            });
+        if matches!(event, OrgEvent::MessageDeliveryAttempted { .. }) {
+            track.last_attempt_seq = Some(seq);
+            track.restarted = replayed;
+            track.effect_possible |= replayed;
         }
         Ok(())
     }
 
     fn update(&mut self, update: HistoryUpdate, now: DateTime<Utc>) -> Result<(), MessageError> {
+        // The replay itself and the tap, which runs from the first connection,
+        // come before the watermark. Every other update is a live input or a
+        // decision, and means nothing until the replay is complete.
+        if !matches!(
+            update,
+            HistoryUpdate::Applied { .. } | HistoryUpdate::Activity { .. }
+        ) {
+            self.replayed()?;
+        }
         match update {
             HistoryUpdate::Applied { seq, at, event } => {
                 if seq <= self.cursor {
@@ -423,76 +717,7 @@ impl MessageHistory {
                     ));
                 }
                 if let Some(event) = event {
-                    let previous: BTreeMap<_, _> = self
-                        .state
-                        .agents()
-                        .map(|agent| (agent.id.clone(), agent.clone()))
-                        .collect();
-                    Arc::make_mut(&mut self.state)
-                        .apply(seq, at, &event)
-                        .map_err(|error| MessageError::Internal(error.to_string()))?;
-                    for agent in self.state.agents() {
-                        let before = previous.get(&agent.id);
-                        let history = self.recipients.entry(agent.id.clone()).or_default();
-                        track_agent_not_ready(
-                            &mut history.not_ready_since,
-                            before.map(|a| a.status),
-                            agent.status,
-                            at,
-                        );
-                        if before.is_none_or(|old| {
-                            old.pane != agent.pane
-                                || old.session_id != agent.session_id
-                                || old.excluded_session_id != agent.excluded_session_id
-                        }) {
-                            history.lose();
-                            for message in self
-                                .state
-                                .messages()
-                                .filter(|m| m.content.to == Address::Agent(agent.id.clone()))
-                            {
-                                if let Some(track) = self.messages.get_mut(&message.id) {
-                                    track.stale_since = None;
-                                    track.stale_blocker = None;
-                                }
-                            }
-                        }
-                        if before.is_some_and(|old| old.status != agent.status)
-                            && (agent.status != AgentStatus::Ready
-                                || before.is_some_and(|old| old.status != AgentStatus::Ready))
-                        {
-                            for message in self
-                                .state
-                                .messages()
-                                .filter(|m| m.content.to == Address::Agent(agent.id.clone()))
-                            {
-                                if let Some(track) = self.messages.get_mut(&message.id) {
-                                    track.hold_since = None;
-                                    track.stale_since = None;
-                                    track.stale_blocker = None;
-                                }
-                            }
-                        }
-                    }
-                    match event {
-                        OrgEvent::MessageSent(_) => {
-                            self.messages.insert(
-                                MessageId::new(seq),
-                                MessageContinuity {
-                                    hold_since: (seq <= self.startup_high_water)
-                                        .then_some(self.recovery_time),
-                                    ..MessageContinuity::default()
-                                },
-                            );
-                        }
-                        OrgEvent::MessageDeliveryAttempted { message_id, .. } => {
-                            let restarted = seq <= self.startup_high_water;
-                            let track = self.track(message_id)?;
-                            track.last_attempt_seq = Some(seq);
-                            track.restarted = restarted;
-                        }
-                        _ => {}
-                    }
+                    self.fold(seq, at, &event)?;
                 }
                 self.cursor = seq;
             }
@@ -517,7 +742,8 @@ impl MessageHistory {
                         "observation does not match recipient identity".into(),
                     ));
                 }
-                let history = self.recipients.entry(recipient.clone()).or_default();
+                // Staged: the stored entry changes only after the clocks are known.
+                let mut history = self.recipients.get(&recipient).cloned().unwrap_or_default();
                 let same_source = history.observation.as_ref().is_some_and(|old| {
                     old.pane == observation.pane
                         && old.session.as_ref().map(|s| (&s.id, s.harness))
@@ -538,7 +764,7 @@ impl MessageHistory {
                     history.last_event_at = observation.session.as_ref().and_then(|row| {
                         self.activity
                             .get(&row.id)
-                            .filter(|(pane, _)| pane == &observation.pane)
+                            .filter(|(pane, _)| pane.is_none() || pane == &observation.pane)
                             .map(|(_, at)| *at)
                             .or(row.last_event_at)
                     });
@@ -577,37 +803,50 @@ impl MessageHistory {
                     }
                 };
                 history.observation = Some(observation);
-                if !same_status {
-                    self.reset_short_clock(&recipient);
-                }
-                self.refresh_short_clocks(&recipient, now)?;
+                let clocks = self.short_clocks(&recipient, &history, !same_status, now)?;
+                self.recipients.insert(recipient, history);
+                self.set_short_clocks(clocks);
             }
             HistoryUpdate::ObservationLost { recipient } => {
                 let history = self.recipients.get_mut(&recipient).ok_or_else(|| {
                     MessageError::NotFound(format!("agent {recipient} was not found"))
                 })?;
                 history.lose();
-                self.reset_short_clock(&recipient);
+                self.reset_clocks(&recipient, false);
             }
             HistoryUpdate::Activity {
                 session_id,
                 pane,
                 at,
             } => {
-                self.activity.insert(session_id.clone(), (pane.clone(), at));
-                let mut changed = vec![];
-                for (recipient, history) in &mut self.recipients {
+                // Staged per matching recipient: all clocks are known before
+                // any entry is written.
+                let mut staged = vec![];
+                for (recipient, history) in &self.recipients {
+                    // No pane means "not reported": the session id alone
+                    // matches. A reported pane must be the observed one.
                     if history.observation.as_ref().is_some_and(|obs| {
-                        obs.pane == pane
+                        pane.as_ref()
+                            .is_none_or(|pane| obs.pane.as_ref() == Some(pane))
                             && obs.session.as_ref().is_some_and(|row| row.id == session_id)
                     }) {
+                        let mut history = history.clone();
                         history.last_event_at = Some(at);
-                        changed.push(recipient.clone());
+                        let clocks = self.short_clocks(recipient, &history, false, now)?;
+                        staged.push((recipient.clone(), history, clocks));
                     }
                 }
-                for recipient in changed {
-                    self.refresh_short_clocks(&recipient, now)?;
+                for (recipient, history, clocks) in staged {
+                    self.recipients.insert(recipient, history);
+                    self.set_short_clocks(clocks);
                 }
+                if !self.activity.contains_key(&session_id) {
+                    // The map can only grow here, so this is where it is pruned.
+                    self.prune_activity(at);
+                }
+                // A pane-less event never erases the pane a session reported.
+                let pane = pane.or_else(|| self.activity.get(&session_id)?.0.clone());
+                self.activity.insert(session_id, (pane, at));
             }
             HistoryUpdate::Armed { scope } => {
                 let message = self.state.message(&scope.message_id).ok_or_else(|| {
@@ -644,8 +883,12 @@ impl MessageHistory {
                         "replayed attempt requires owner resolution".into(),
                     ));
                 }
-                track.probably_landed = false;
-                track.hold = None;
+                // An arm releases the latch of an earlier attempt. A latch set
+                // for this same attempt (Held before its first arm) stays.
+                if track.latch != Some(scope.attempt_seq) {
+                    track.latch = None;
+                    track.hold = None;
+                }
                 track.scope = Some(scope);
             }
             HistoryUpdate::Evidence {
@@ -654,10 +897,17 @@ impl MessageHistory {
                 probably_landed,
             } => {
                 let track = self.track(id)?;
+                if probably_landed {
+                    // Nothing can have landed before an attempt, and the policy
+                    // would refuse that state for ever with nothing to release it.
+                    let attempt = track.last_attempt_seq.ok_or_else(|| {
+                        MessageError::Conflict("message has no attempt that could land".into())
+                    })?;
+                    track.latch.get_or_insert(attempt);
+                }
                 if receipt.is_some() {
                     track.receipt = receipt;
                 }
-                track.probably_landed |= probably_landed;
             }
             HistoryUpdate::Consumed { id, step } => {
                 let snapshot = self.snapshot(id, now)?;
@@ -670,11 +920,13 @@ impl MessageHistory {
                 }
                 let mut live = snapshot.live;
                 track_hold(&mut live, &step, now);
-                let track = self.track(id)?;
-                track.hold_since = live.hold_since;
-                track.stale_since = live.stale_blocker_since;
-                if track.stale_since.is_none() {
-                    track.stale_blocker = None;
+                // A delivered message has no clocks left to move.
+                if let Some(track) = self.messages.get_mut(&id) {
+                    track.hold_since = live.hold_since;
+                    track.stale_since = live.stale_blocker_since;
+                    if track.stale_since.is_none() {
+                        track.stale_blocker = None;
+                    }
                 }
             }
             HistoryUpdate::Paste {
@@ -695,8 +947,14 @@ impl MessageHistory {
                         "paste does not match applied attempted pane".into(),
                     ));
                 }
+                if let Some(track) = self.messages.get_mut(&id) {
+                    if certainty == EffectCertainty::NotStarted {
+                        track.no_effect_seq = track.last_attempt_seq;
+                    } else {
+                        track.effect_possible = true;
+                    }
+                }
                 if certainty != EffectCertainty::NotStarted {
-                    self.pastes.insert(pane.clone(), now);
                     let mut changed = vec![];
                     for (recipient, history) in &mut self.recipients {
                         if history
@@ -710,8 +968,9 @@ impl MessageHistory {
                         }
                     }
                     for recipient in changed {
-                        self.reset_short_clock(&recipient);
+                        self.reset_clocks(&recipient, false);
                     }
+                    self.pastes.insert(pane, now);
                 }
             }
             HistoryUpdate::Held {
@@ -720,13 +979,14 @@ impl MessageHistory {
                 hold,
             } => {
                 let track = self.matching_attempt(id, attempt_seq)?;
-                track.probably_landed = true;
+                track.latch = Some(attempt_seq);
                 track.hold = Some(hold);
+                track.effect_possible = true;
             }
             HistoryUpdate::OwnerRetry { id, attempt_seq } => {
                 let track = self.matching_attempt(id, attempt_seq)?;
                 track.restarted = false;
-                track.probably_landed = false;
+                track.latch = None;
                 track.hold = None;
             }
         }

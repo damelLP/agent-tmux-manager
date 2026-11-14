@@ -421,6 +421,31 @@ mod tests {
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    /// Run explicitly with a built atmd on a private PATH and all daemon/tmux
+    /// state isolated. The outer rig owns and cleans up the spawned daemon.
+    #[tokio::test]
+    #[ignore = "requires a built atmd and a sealed process environment"]
+    async fn autostart_stopped_daemon() {
+        let socket = std::path::PathBuf::from(
+            std::env::var_os("ATM_SOCKET").expect("private socket required"),
+        );
+        let state = std::path::PathBuf::from(
+            std::env::var_os("ATM_STATE_DIR").expect("private state required"),
+        );
+        let tmux = std::path::PathBuf::from(
+            std::env::var_os("TMUX_TMPDIR").expect("private tmux required"),
+        );
+        assert_eq!(socket.parent().and_then(Path::parent), state.parent());
+        assert_eq!(tmux.parent(), state.parent());
+        assert!(std::env::var_os("TMUX").is_none());
+        assert!(std::env::var_os("TMUX_PANE").is_none());
+        assert!(!socket.exists());
+        assert!(!atm_tui::daemon::is_daemon_running());
+        let result = call("daemon.info", json!({"bad":1}), Duration::from_secs(10)).await;
+        assert!(matches!(result, Err(RpcError::Daemon(error)) if error.code == "invalid_params"));
+        assert!(socket.exists());
+    }
+
     #[tokio::test]
     async fn actual_daemon_returns_typed_invalid_params() {
         let dir = tempfile::tempdir().unwrap();

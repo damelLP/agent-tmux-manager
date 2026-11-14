@@ -1289,6 +1289,53 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn method_timeout_is_a_correlated_error_and_connection_survives() {
+        let mut router = super::super::methods::MethodRouter::default();
+        router
+            .register("wait", Duration::from_millis(5), |_, _| {
+                std::future::pending()
+            })
+            .unwrap();
+        let (mut read, mut write, cancel, run) = request_connection(Arc::new(router)).await;
+        send_client(&mut write, request("timed", 0)).await;
+        assert!(
+            matches!(receive(&mut read).await, DaemonMessage::Response { id, payload:atm_protocol::ResponsePayload::Error(error) } if id == "timed" && error.code == "timeout")
+        );
+        send_client(&mut write, ClientMessage::ping(7)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 7 }
+        ));
+        cancel.cancel();
+        run.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_request_reply_closes_connection() {
+        let mut router = super::super::methods::MethodRouter::default();
+        router
+            .register("wait", Duration::from_secs(1), |_, _| async {
+                Ok(serde_json::Value::String("x".repeat(2_000_000)))
+            })
+            .unwrap();
+        let (mut read, mut write, cancel, run) = request_connection(Arc::new(router)).await;
+        send_client(&mut write, request("large", 0)).await;
+        timeout(Duration::from_secs(20), cancel.cancelled())
+            .await
+            .expect("blocked response must cancel connection");
+        timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
+        let mut bytes = Vec::new();
+        timeout(Duration::from_secs(5), read.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !bytes.ends_with(b"\n"),
+            "large response should have been interrupted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn reply_deadline_includes_waiting_for_the_writer_lock() {
         let (writer, _peer) = subscriber_pair();
         let _guard = writer.lock().await;

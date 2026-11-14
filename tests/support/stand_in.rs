@@ -15,6 +15,8 @@ pub(crate) mod bounded;
 mod events;
 #[path = "stand_in/ownership.rs"]
 mod ownership;
+#[path = "stand_in/parent.rs"]
+pub mod parent;
 #[path = "stand_in/process.rs"]
 mod process;
 #[path = "stand_in/rows.rs"]
@@ -92,6 +94,7 @@ pub struct StandInRig {
     // Drop the listener before deleting its socket directory.
     events: events::Events,
     rows: Option<rows::Rows>,
+    parent_stream: Option<std::os::unix::net::UnixStream>,
     dir: tempfile::TempDir,
     label: String,
     tmux_identity: Option<(PathBuf, Option<u32>)>,
@@ -131,7 +134,7 @@ pub fn require_tools(path: &std::ffi::OsStr) {
 
 impl StandInRig {
     pub fn start() -> Self {
-        let dir = tempfile::Builder::new()
+        let mut dir = tempfile::Builder::new()
             .prefix("u11-")
             .tempdir()
             .expect("private run dir");
@@ -139,12 +142,18 @@ impl StandInRig {
         for sub in ["tmux", "state", "config", "tmp", "home", "bin"] {
             std::fs::create_dir(root.join(sub)).unwrap();
         }
+        let parent_stream = parent::register(root);
+        if parent_stream.is_some() {
+            // Parent acknowledged ownership before any dependent resource starts.
+            dir.disable_cleanup(true);
+        }
         // Exclude installed atm/atmd even when a caller forgot the outer seal.
         let path = std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin");
         require_tools(&path);
         let mut rig = Self {
-            events: events::Events::bind(root.join("events.sock")),
+            events: events::Events::bind(dir.path().join("events.sock")),
             rows: None,
+            parent_stream,
             dir,
             label: "stand-in".into(),
             tmux_identity: None,
@@ -201,6 +210,14 @@ impl StandInRig {
         ]));
         rig.start_daemon();
         rig
+    }
+
+    pub fn parent_ready(&self) {
+        parent::ready(
+            self.parent_stream
+                .as_ref()
+                .expect("registered parent guardian"),
+        );
     }
 
     /// Extra environment survives restarts; sealing variables cannot be overridden.

@@ -127,6 +127,19 @@ rig.close();
   canonicalized for ownership; no broad process-name kill is used. Diagnostics
   also read the known detached-daemon path `state/atm/atm.log` without recursively
   scanning unrelated paths.
+- The symlinked-TMPDIR subprocess test uses `parent::ChildGuard`, not the shared
+  short command-timeout helper. The parent owns its base before spawn; the child
+  reports its root, canonical socket and creator identity, then waits for an
+  acknowledgment **before** starting event listeners/tmux/atmd. After acknowledgment
+  the child's TempDir no longer deletes its directory: only the parent may do so.
+  A second socket barrier holds the fully started child for normal finish or a
+  deliberate forced exit. Parent cleanup uses the same procfs ownership rules,
+  rechecks before signals/server shutdown, then removes the child root. Drop also
+  handles parent assertion unwinding; cleanup failure retains the directory for
+  diagnosis rather than deleting a live server's socket. Tests check directory
+  retention after forced exit, so this path prevents the old missing-socket leak
+  instead of relying on socket reconstruction. Deliberate external deletion of
+  a guarded socket directory is not modeled.
 
 ### Daemon control
 

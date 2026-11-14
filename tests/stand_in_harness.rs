@@ -734,25 +734,36 @@ fn stand_in_symlinked_tmpdir_cleanup() {
         let mut rig = StandInRig::start();
         let pane = rig.launch(&StandInConfig::new(StandInMode::Claude));
         rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+        rig.parent_ready(); // Parent owns the root before resources start, then holds this barrier.
         rig.close();
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let real = dir.path().join("real");
-    let alias = dir.path().join("alias");
-    std::fs::create_dir(&real).unwrap();
-    std::os::unix::fs::symlink(&real, &alias).unwrap();
-    success(bounded::run(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "stand_in_symlinked_tmpdir_cleanup",
-                "--nocapture",
-            ])
-            .env("STANDIN_SYMLINK_CHILD", "1")
-            .env("TMPDIR", &alias),
-    ));
-    assert_eq!(std::fs::read_dir(real).unwrap().count(), 0);
+    for forced_exit in [false, true] {
+        let mut guard = stand_in::parent::ChildGuard::spawn("stand_in_symlinked_tmpdir_cleanup");
+        guard.wait_ready();
+        assert!(
+            guard.child_root().exists(),
+            "guardian retains the child's socket directory"
+        );
+        guard.finish(forced_exit);
+        assert_eq!(std::fs::read_dir(guard.real()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn stand_in_parent_guard_cleans_on_parent_unwind() {
+    let guard = stand_in::parent::ChildGuard::spawn("stand_in_symlinked_tmpdir_cleanup");
+    let base = guard.real().parent().unwrap().to_owned();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut guard = guard;
+        guard.wait_ready();
+        panic!("synthetic parent assertion after child resources started");
+    }));
+    assert!(result.is_err());
+    assert!(
+        !base.exists(),
+        "guardian must stop resources before deleting its base"
+    );
 }
 
 #[test]

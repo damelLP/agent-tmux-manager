@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"unknown","method":"x.y"},
+  "response": {"type":"response","id":"unknown","error":{"code":"unknown_method","message":"no method 'x.y'"}},
+  "ignore": []
+}

@@ -37,6 +37,7 @@
 //! - Server errors are logged and allow continued operation
 
 mod connection;
+pub mod methods;
 
 pub use connection::{
     parse_status_line, ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter,
@@ -133,6 +134,7 @@ impl DaemonServer {
     /// Listens for connections until the cancellation token is triggered.
     /// This method does not return until shutdown.
     pub async fn run(&self) -> Result<(), ServerError> {
+        let methods = Arc::new(methods::router()?);
         // Remove existing socket file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path).map_err(|e| ServerError::SocketSetup {
@@ -180,7 +182,7 @@ impl DaemonServer {
                     match result {
                         Ok((stream, _addr)) => {
                             let conn_num = self.connection_counter.fetch_add(1, Ordering::Relaxed);
-                            self.handle_connection(&mut connections, stream, conn_num);
+                            self.handle_connection(&mut connections, stream, conn_num, Arc::clone(&methods));
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to accept connection");
@@ -212,6 +214,7 @@ impl DaemonServer {
         connections: &mut JoinSet<()>,
         stream: tokio::net::UnixStream,
         connection_number: u64,
+        methods: Arc<methods::MethodRouter>,
     ) {
         let (reader, writer) = stream.into_split();
         let registry = self.registry.clone();
@@ -226,6 +229,7 @@ impl DaemonServer {
                 Arc::clone(&subscribers),
                 connection_number,
                 cancel,
+                methods,
             );
 
             // Run the handler and get the client_id when done
@@ -324,6 +328,9 @@ pub enum ServerError {
 
     #[error("Connection error: {0}")]
     Connection(#[from] ConnectionError),
+
+    #[error("Method registration failed: {0}")]
+    Methods(#[from] methods::MethodError),
 }
 
 #[cfg(test)]

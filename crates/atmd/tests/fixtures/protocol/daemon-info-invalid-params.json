@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"invalid","method":"daemon.info","params":{"unexpected":true}},
+  "response": {"type":"response","id":"invalid","error":{"code":"invalid_params","message":"unknown field `unexpected`, there are no fields"}},
+  "ignore": []
+}

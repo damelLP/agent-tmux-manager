@@ -1,5 +1,31 @@
 # Claude screen fixtures
 
+## Styled fixtures (U8d)
+
+Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30
+`capture-pane -p -e`, and P1 private tmux `capture-pane -p -e -N`.
+`screen_styled_u5b_<state>_2.1.325.txt` maps to
+`claude-<state>.sgr.txt`; `screen_styled_p1_<state>_2.1.325.txt` maps to
+`<state>.styled-N.txt` (dimensions are in each P1 state name). Headers are
+provenance, removed only at test load. U5b is attribute evidence, not retained
+space evidence. Its cursor sidecars are `<source without .sgr.txt>.cursor.txt`;
+P1 geometry/cursor sidecars are `<state>.meta.json`.
+
+U5b bytes are unchanged. P1 replaces only the non-composer private run root
+with an equal-width `/tmp/xxx…` token; no row, SGR, OSC, space or glyph moves.
+The retained tests cover three terminal modes, Home drafts, blank editors,
+80/120/200-column trust, Yes-selected refusal, manual mode, four-option
+permission, and a shell launch prefix. Synthetic mutations are labelled in
+`tests/styled_screen.rs`.
+
+These styled tests supersede the **plain-only** limitations below: inverse/faint
+suggestions are distinguishable, while coordinates alone still prove nothing.
+Blank/padding stays Empty despite its whitespace-only-draft collision; consumers
+must verify the exact staged draft before Enter. Leading whitespace is preserved.
+Multiline reconstruction and trailing-padding-only differences return unknown
+from the staged matcher, not equality. `-N` retains allocated grid padding, not
+just authored spaces (verified with tmux 3.8 and 3.6).
+
 The original text fixtures are the 15 distinct frames among 48 raw U5 Claude
 screens (40 rows, 120 columns). The additional coordinator and U5b frames are
 described below; there are 65 Claude screen fixture files in total. Existing JSON/JSONL hook fixtures retain the

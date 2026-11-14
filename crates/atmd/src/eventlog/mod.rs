@@ -8,6 +8,10 @@
 //! and sorted numerically. Sequence numbers start at 1 independently per stream.
 //! An empty newest segment reserves its filename's sequence for the next append.
 //! The persistent `.lock` file is advisory-locked exclusively and never unlinked.
+//! `<state>/log/format` contains exactly `1` followed by a newline. Open creates
+//! and syncs it if absent, and rejects any other contents with `UnsupportedFormat`.
+//! Initial publication uses a synced `.format-<pid>-<id>.tmp` hard-linked into
+//! place without replacement; crash leftovers with that prefix can be discarded.
 //!
 //! Open lists segments and validates only the newest. Its unterminated final
 //! record is truncated and reported with a tracing warning; malformed complete
@@ -32,6 +36,7 @@
 //! would otherwise prevent runtime shutdown). They remain safe to call on any
 //! thread, including a Tokio worker, but can block that caller.
 
+mod format;
 mod lock;
 mod reader;
 mod state;
@@ -101,6 +106,8 @@ pub enum EventLogError {
         line: u64,
         reason: String,
     },
+    #[error("unsupported log format in {path}: {contents:?} (expected bytes [49, 10])")]
+    UnsupportedFormat { path: PathBuf, contents: Vec<u8> },
     #[error("stream already locked: {0}")]
     Locked(PathBuf),
     #[error("event log writer is closed")]

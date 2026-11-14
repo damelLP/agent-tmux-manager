@@ -81,6 +81,7 @@ impl Writer {
         let lock = lock::try_lock(&lock_path)
             .map_err(|e| io_error(&lock_path, e))?
             .ok_or(EventLogError::Locked(lock_path))?;
+        super::format::ensure_format(directory.parent().unwrap_or_else(|| Path::new(".")))?;
         let files = segments(directory)?;
         // Snapshot ages before repairing the tail changes the newest mtime.
         let ages = if stream == Stream::Raw {

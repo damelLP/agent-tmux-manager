@@ -374,6 +374,51 @@ fn replay_uses_numeric_names_and_can_start_within_a_segment() {
         .is_none());
 }
 
+#[test]
+fn format_marker_is_created_and_rejects_every_other_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = EventLog::open(dir.path(), Stream::Events).unwrap();
+    let marker = dir.path().join("log/format");
+    assert_eq!(fs::read(&marker).unwrap(), b"1\n");
+    drop(log);
+    for contents in [b"2\n".as_slice(), b"1", b"1\n\n", b"", b"\xff"] {
+        fs::write(&marker, contents).unwrap();
+        let error = EventLog::open(dir.path(), Stream::Raw).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("unsupported log format"), "{text}");
+        assert!(text.contains(&marker.display().to_string()), "{text}");
+        assert!(text.contains(&format!("{contents:?}")), "{text}");
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            contents,
+            "replaced unknown format"
+        );
+    }
+}
+
+#[test]
+fn independent_streams_can_initialize_one_format_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = [Stream::Events, Stream::Raw]
+        .into_iter()
+        .map(|stream| {
+            let barrier = barrier.clone();
+            let root = dir.path().to_owned();
+            std::thread::spawn(move || {
+                barrier.wait();
+                EventLog::open(&root, stream).unwrap()
+            })
+        })
+        .collect();
+    let logs: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(fs::read(dir.path().join("log/format")).unwrap(), b"1\n");
+}
+
 fn ts() -> DateTime<Utc> {
     DateTime::from_timestamp(1_700_000_000, 0).unwrap()
 }

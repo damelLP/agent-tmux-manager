@@ -1167,3 +1167,178 @@ fn pane_less_activity_alone_gives_a_new_source_its_event_time() {
         at(50_000)
     );
 }
+
+/// A Working observation with no event time of its own, so the history's
+/// remembered activity (or its absence) decides the event clock.
+fn observe_without_provenance(f: &mut Fixture, session: Option<&str>, ms: i64) {
+    let mut obs = observation(SessionStatus::Working);
+    obs.session = session.map(|id| SessionObservation {
+        id: id.into(),
+        harness: Harness::Pi,
+        status: SessionStatus::Working,
+        last_event_at: None,
+    });
+    f.observe(obs, ms);
+}
+
+#[test]
+fn activity_of_a_session_no_recipient_uses_is_pruned() {
+    let mut f = Fixture::new(0);
+    activity(&mut f, "gone", Some(pane()), 0);
+    // Older than stale_after (120 s) and bound to no agent: the next new
+    // session's activity drops it.
+    activity(&mut f, "fresh", None, 200_000);
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "gone".into(),
+        },
+        201_000,
+    );
+    observe_without_provenance(&mut f, Some("gone"), 201_000);
+    // No remembered time: the row stays busy instead of going stale at once.
+    assert_eq!(
+        f.snapshot(400_000).live.session.unwrap().last_event_at,
+        at(400_000)
+    );
+    wait(f.step(400_000), WaitReason::SessionBusy);
+}
+
+#[test]
+fn activity_of_a_bound_or_observed_session_survives_pruning() {
+    // Bound to an agent: after an observation loss its old time is what lets
+    // a stuck Working row go stale again.
+    let mut f = Fixture::new(0);
+    activity(&mut f, "s1", Some(pane()), 0);
+    activity(&mut f, "fresh", None, 300_000);
+    observe_without_provenance(&mut f, Some("s1"), 300_000);
+    assert_eq!(
+        f.snapshot(300_000).live.session.unwrap().last_event_at,
+        at(0)
+    );
+
+    // Named by the stored observation only (the agent has no session yet).
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::AgentSessionLost { agent_id: agent() }, 0);
+    observe_without_provenance(&mut f, Some("s9"), 0);
+    activity(&mut f, "s9", Some(pane()), 1_000);
+    activity(&mut f, "fresh", None, 300_000);
+    observe_without_provenance(&mut f, None, 301_000);
+    observe_without_provenance(&mut f, Some("s9"), 302_000);
+    assert_eq!(
+        f.snapshot(302_000).live.session.unwrap().last_event_at,
+        at(1_000)
+    );
+}
+
+#[test]
+fn paste_time_is_dropped_when_no_agent_holds_the_pane() {
+    let mut f = Fixture::new(0);
+    f.attempt(10_000);
+    f.record(
+        HistoryUpdate::Paste {
+            id: f.id,
+            pane: pane(),
+            certainty: EffectCertainty::Applied,
+        },
+        11_000,
+    );
+    // A status change keeps the pane, and with it the paste time.
+    f.apply(
+        OrgEvent::AgentStuck {
+            agent_id: agent(),
+            reason: "stuck".into(),
+        },
+        12_000,
+    );
+    assert_eq!(f.snapshot(12_000).live.last_paste_at, Some(at(11_000)));
+    // The agent leaves %1; nobody holds it.
+    f.apply(
+        OrgEvent::AgentAdopted {
+            agent_id: agent(),
+            pane: "%2".into(),
+            session_id: Some("s2".into()),
+        },
+        20_000,
+    );
+    let other: AgentId = "p/other".parse().unwrap();
+    f.apply(
+        OrgEvent::AgentAdopted {
+            agent_id: other.clone(),
+            pane: "%1".into(),
+            session_id: Some("s3".into()),
+        },
+        30_000,
+    );
+    f.apply(OrgEvent::MessageSent(content(other)), 30_000);
+    let live = f
+        .history
+        .snapshot(MessageId::new(f.seq), at(30_000))
+        .unwrap()
+        .live;
+    // Back to the recovery time, the default for a pane with no known paste.
+    assert_eq!(live.last_paste_at, Some(at(0)));
+}
+
+fn continuities(f: &Fixture) -> usize {
+    format!("{:?}", f.history)
+        .matches("MessageContinuity {")
+        .count()
+}
+
+#[test]
+fn only_undelivered_agent_messages_keep_continuity() {
+    let mut f = Fixture::new(0);
+    assert_eq!(continuities(&f), 1);
+    let mut owner = content(agent());
+    owner.to = Address::Owner;
+    f.apply(OrgEvent::MessageSent(owner), 0);
+    assert_eq!(continuities(&f), 1);
+    // A failed message keeps its continuity: a late receipt may confirm it.
+    f.attempt(1_000);
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "gave up".into(),
+            final_failure: true,
+        },
+        2_000,
+    );
+    assert_eq!(continuities(&f), 1);
+    let receipt = DeliveryReceipt {
+        session_id: "s1".into(),
+        confirmation: "late exact".into(),
+    };
+    f.record(
+        HistoryUpdate::Evidence {
+            id: f.id,
+            receipt: Some(receipt.clone()),
+            probably_landed: false,
+        },
+        3_000,
+    );
+    assert_eq!(f.consume(3_000), DeliveryStep::Confirm { receipt });
+    // Delivered is terminal: the continuity goes, the snapshot still answers.
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: f.id,
+            session_id: "s1".into(),
+            confirmation: "late exact".into(),
+        },
+        4_000,
+    );
+    assert_eq!(continuities(&f), 0);
+    assert_eq!(f.consume(4_000), DeliveryStep::Complete);
+    assert_eq!(f.snapshot(4_000).last_attempt_seq, None);
+    assert!(matches!(
+        f.history.record(
+            HistoryUpdate::Evidence {
+                id: f.id,
+                receipt: None,
+                probably_landed: false,
+            },
+            at(5_000),
+        ),
+        Err(super::messages::MessageError::Conflict(_))
+    ));
+}

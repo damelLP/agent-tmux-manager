@@ -45,9 +45,9 @@ use atm_org::{
     Address, Agent, AgentId, AgentStatus, DeliveryReceipt, DeliveryStatus, Message, MessageId,
     OrgEvent, OrgState,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use tokio::sync::watch;
@@ -433,10 +433,13 @@ impl MessageHistory {
             .state
             .agent(recipient)
             .ok_or_else(|| MessageError::NotFound(format!("agent {recipient} was not found")))?;
-        let track = self
-            .messages
-            .get(&id)
-            .ok_or_else(|| MessageError::Internal("message continuity missing".into()))?;
+        let terminal = MessageContinuity::default();
+        let track = match self.messages.get(&id) {
+            Some(track) => track,
+            // Delivered is terminal: its continuity was dropped.
+            None if message.status == DeliveryStatus::Delivered => &terminal,
+            None => return Err(MessageError::Internal("message continuity missing".into())),
+        };
         let queue = self.queue(recipient);
         let mut live = self.shared_live(message, agent, self.recipients.get(recipient), now);
         live.other_delivery_in_flight = queue.other_in_flight(id).is_some();
@@ -460,10 +463,37 @@ impl MessageHistory {
         self.update(update, now)
     }
 
+    /// Continuity exists for an agent-addressed message until it is delivered.
     fn track(&mut self, id: MessageId) -> Result<&mut MessageContinuity, MessageError> {
-        self.messages
-            .get_mut(&id)
-            .ok_or_else(|| MessageError::NotFound(format!("message {id} was not found")))
+        let delivered = (self.state.message(&id))
+            .is_some_and(|message| message.status == DeliveryStatus::Delivered);
+        self.messages.get_mut(&id).ok_or_else(|| {
+            if delivered {
+                MessageError::Conflict(format!("message {id} is already delivered"))
+            } else {
+                MessageError::NotFound(format!("message {id} was not found"))
+            }
+        })
+    }
+
+    /// Forget event times no recipient can use: older than `stale_after`, of a
+    /// session that no agent is bound to and no stored observation names. A
+    /// bound session keeps its time, however old: after an observation loss
+    /// that time is what lets a stuck Working row go stale again.
+    fn prune_activity(&mut self, at: DateTime<Utc>) {
+        let Ok(stale_after) = TimeDelta::from_std(self.policy.settings().stale_after) else {
+            return;
+        };
+        let bound = self.state.agents().filter_map(|a| a.session_id.as_ref());
+        let observed = (self.recipients.values())
+            .filter_map(|history| Some(&history.observation.as_ref()?.session.as_ref()?.id));
+        let kept: HashSet<&SessionId> = bound.chain(observed).collect();
+        self.activity.retain(|session, (_, seen)| {
+            kept.contains(session)
+                || seen
+                    .checked_add_signed(stale_after)
+                    .is_none_or(|stale_at| stale_at >= at)
+        });
     }
 
     fn matching_attempt(
@@ -571,6 +601,14 @@ impl MessageHistory {
                 .is_none_or(|old| (&old.1, &old.2, &old.3) != (&after.1, &after.2, &after.3));
             if moved {
                 history.lose();
+                // A paste time is kept only while some agent holds its pane.
+                if let Some(left) = before.as_ref().and_then(|old| old.1.as_deref()) {
+                    if self.state.agent_for_pane(left).is_none() {
+                        if let Ok(pane) = PaneId::parse(left) {
+                            self.pastes.remove(&pane);
+                        }
+                    }
+                }
             }
             let status_changed = before.as_ref().is_some_and(|old| old.0 != after.0)
                 && (after.0 != AgentStatus::Ready
@@ -591,34 +629,36 @@ impl MessageHistory {
         let Some(message) = self.state.message(&id) else {
             return Ok(());
         };
-        if let Address::Agent(recipient) = &message.content.to {
-            let open = self.open.entry(recipient.clone()).or_default();
-            if matches!(
-                message.status,
-                DeliveryStatus::Queued | DeliveryStatus::Delivering
-            ) {
-                open.insert(id);
-            } else {
-                open.remove(&id);
-            }
+        // Owner and system messages are never scheduled: no continuity.
+        let Address::Agent(recipient) = &message.content.to else {
+            return Ok(());
+        };
+        let open = self.open.entry(recipient.clone()).or_default();
+        if matches!(
+            message.status,
+            DeliveryStatus::Queued | DeliveryStatus::Delivering
+        ) {
+            open.insert(id);
+        } else {
+            open.remove(&id);
+        }
+        if message.status == DeliveryStatus::Delivered {
+            // Terminal. A failed message keeps its continuity instead: a late
+            // receipt may still confirm it.
+            self.messages.remove(&id);
+            return Ok(());
         }
         let replayed = seq <= self.startup_high_water;
-        match event {
-            OrgEvent::MessageSent(_) => {
-                self.messages.insert(
-                    id,
-                    MessageContinuity {
-                        hold_since: replayed.then_some(self.recovery_time),
-                        ..MessageContinuity::default()
-                    },
-                );
-            }
-            OrgEvent::MessageDeliveryAttempted { .. } => {
-                let track = self.messages.entry(id).or_default();
-                track.last_attempt_seq = Some(seq);
-                track.restarted = replayed;
-            }
-            _ => {}
+        let track = self
+            .messages
+            .entry(id)
+            .or_insert_with(|| MessageContinuity {
+                hold_since: replayed.then_some(self.recovery_time),
+                ..MessageContinuity::default()
+            });
+        if matches!(event, OrgEvent::MessageDeliveryAttempted { .. }) {
+            track.last_attempt_seq = Some(seq);
+            track.restarted = replayed;
         }
         Ok(())
     }
@@ -758,6 +798,10 @@ impl MessageHistory {
                     self.recipients.insert(recipient, history);
                     self.set_short_clocks(clocks);
                 }
+                if !self.activity.contains_key(&session_id) {
+                    // The map can only grow here, so this is where it is pruned.
+                    self.prune_activity(at);
+                }
                 // A pane-less event never erases the pane a session reported.
                 let pane = pane.or_else(|| self.activity.get(&session_id)?.0.clone());
                 self.activity.insert(session_id, (pane, at));
@@ -823,11 +867,13 @@ impl MessageHistory {
                 }
                 let mut live = snapshot.live;
                 track_hold(&mut live, &step, now);
-                let track = self.track(id)?;
-                track.hold_since = live.hold_since;
-                track.stale_since = live.stale_blocker_since;
-                if track.stale_since.is_none() {
-                    track.stale_blocker = None;
+                // A delivered message has no clocks left to move.
+                if let Some(track) = self.messages.get_mut(&id) {
+                    track.hold_since = live.hold_since;
+                    track.stale_since = live.stale_blocker_since;
+                    if track.stale_since.is_none() {
+                        track.stale_blocker = None;
+                    }
                 }
             }
             HistoryUpdate::Paste {

@@ -56,7 +56,7 @@ class Runtime:
             if not path.is_relative_to(self.root):
                 raise ValueError("config must be inside ATM_STANDIN_ROOT")
             config = json.loads(path.read_text())
-            for key in ("LOG", "ID_PREFIX", "WORK_MS", "CLEAR_GAP_MS"):
+            for key in ("LOG", "ID_PREFIX", "WORK_MS", "CLEAR_GAP_MS", "MANUAL_CLOCK"):
                 if key in config:
                     os.environ["ATM_STANDIN_" + key] = str(config[key])
         self.log_path = private_path("ATM_STANDIN_LOG", self.root)
@@ -77,20 +77,79 @@ class Runtime:
         self.pending_renders = []
         self.render_sequence = 0
         self.draft_dirty = False
+        self.manual_clock = os.environ.get("ATM_STANDIN_MANUAL_CLOCK", "0") == "1"
+        self.clock_ms = 0
+        self.event_sequence = 0
+        self.control_buffer = bytearray()
+        self.event_stream = None
+        if os.environ.get("ATM_STANDIN_EVENTS"):
+            event_path = private_path("ATM_STANDIN_EVENTS", self.root)
+            self.event_stream = socket.socket(socket.AF_UNIX)
+            self.event_stream.settimeout(30)
+            self.event_stream.connect(str(event_path))
         self.log = self.log_path.open("a", buffering=1)
         Path("/proc/self/comm").write_text(self.mode)
         if Path("/proc/self/comm").read_text().strip() != self.mode:
             raise RuntimeError("failed to set process comm")
-        start_time = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
-        self.record({"kind": "identity", "pid": os.getpid(), "pane": os.environ["TMUX_PANE"],
-                     "mode": self.mode, "argv": sys.argv, "start_time": start_time,
+        self.start_time = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
+        self.pane = os.environ["TMUX_PANE"]
+        self.record({"kind": "identity", "mode": self.mode, "argv": sys.argv,
                      "session_id": self.model.session_id})
 
     def next_id(self):
         return f"{self.prefix}-{self.generation}"
 
     def record(self, effect):
-        self.log.write(json.dumps(dict(effect, pid=os.getpid(), at_ms=int(time.monotonic()*1000))) + "\n")
+        self.event_sequence += 1
+        line = json.dumps(dict(effect, pid=os.getpid(), start_time=self.start_time,
+                               pane=self.pane, event_sequence=self.event_sequence,
+                               at_ms=self.now_ms())) + "\n"
+        self.log.write(line)
+        if self.event_stream is not None:
+            self.event_stream.sendall(line.encode())
+
+    def now_ms(self):
+        return self.clock_ms if self.manual_clock else int(time.monotonic() * 1000)
+
+    def control(self, message):
+        """Private controls never pass through the simulated editor."""
+        reply = {"kind": "control", "id": message.get("id")}
+        if message.get("command") == "advance_to":
+            value = message.get("now_ms")
+            if not self.manual_clock or type(value) is not int or value < self.clock_ms:
+                reply["error"] = "advance_to requires manual mode and nondecreasing integer time"
+            else:
+                self.clock_ms = value
+                self.effects(self.model.tick(value))
+        elif message.get("command") != "barrier":
+            reply["error"] = "unknown control"
+        self.record(dict(reply, state=self.model.state, now_ms=self.now_ms(),
+                         render_sequence=self.render_sequence))
+
+    def receive_controls(self):
+        data = self.event_stream.recv(65536)
+        if not data:
+            raise RuntimeError("private event observer disconnected")
+        self.control_buffer.extend(data)
+        while b"\n" in self.control_buffer:
+            line, _, rest = self.control_buffer.partition(b"\n")
+            self.control_buffer = bytearray(rest)
+            message = json.loads(line)
+            self.control(message)
+        if len(self.control_buffer) > 65536:
+            raise ValueError("oversize private control")
+
+    def next_timeout(self, now_ms):
+        deadlines = []
+        if not self.manual_clock and self.model.deadline is not None:
+            deadlines.append(max(0, (self.model.deadline - now_ms) / 1000))
+        if self.parser.pending == b"\x1b" and not self.parser.pasting:
+            # Only the ambiguous standalone Escape key needs a terminal timeout.
+            deadlines.append(.02)
+        if self.mode == "pi" and self.stream is None:
+            # Existing replay retry behavior; fidelity is addressed separately.
+            deadlines.append(max(0, self.retry_at - time.monotonic()))
+        return min(deadlines) if deadlines else None
 
     def forward(self, data):
         data = patch_paths(data, self.root)
@@ -206,7 +265,7 @@ class Runtime:
     def action(self, action):
         if action == ("submit", "/clear" if self.mode == "claude" else "/new"):
             self.generation += 1
-        self.effects(self.model.handle(action, int(time.monotonic()*1000), self.next_id()))
+        self.effects(self.model.handle(action, self.now_ms(), self.next_id()))
 
     def run(self):
         saved = termios.tcgetattr(sys.stdin.fileno())
@@ -222,24 +281,34 @@ class Runtime:
             if self.prompt is not None:
                 self.action(("submit", self.prompt))
             while self.running:
-                readable, _, _ = select.select([sys.stdin], [], [], .02)
-                if readable:
+                sources = [sys.stdin]
+                if self.event_stream is not None:
+                    sources.append(self.event_stream)
+                if self.stream is not None:
+                    sources.append(self.stream)
+                readable, _, _ = select.select(sources, [], [], self.next_timeout(self.now_ms()))
+                if sys.stdin in readable:
                     data = os.read(sys.stdin.fileno(), 65536)
                     if not data:
                         self.action(("exit", ""))
                         break
                     self.input(data)
-                else:
+                elif not readable:
                     for action in self.parser.flush_escape():
                         self.action(action)
                 if self.running:
-                    self.effects(self.model.tick(int(time.monotonic()*1000)))
+                    if self.event_stream in readable:
+                        self.receive_controls()
+                    if not self.manual_clock:
+                        self.effects(self.model.tick(self.now_ms()))
                     self.flush_pi()
         finally:
             print("\x1b[?2004l\r\n", end="", flush=True)
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)
             if self.stream is not None:
                 self.stream.close()
+            if self.event_stream is not None:
+                self.event_stream.close()
             self.log.close()
 
 

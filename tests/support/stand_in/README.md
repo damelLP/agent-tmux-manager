@@ -29,7 +29,7 @@ let mut rig = StandInRig::start(); // real request round trip, not socket existe
 let mut config = StandInConfig::new(StandInMode::Claude);
 config.work_ms = 1200; // observation window, not a real-provider latency claim
 config.clear_gap_ms = 1200;
-let pane = rig.launch(&config); // current-process idle journal + exact screen line
+let pane = rig.launch(&config); // current-process terminal-acknowledged first frame
 let old = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
 assert!(rig.atm(&["send", &pane.pane_id, "one\ntwo"]).status.success());
 rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
@@ -45,22 +45,37 @@ rig.close();
 - `launch(config)` starts a named Python process in a new private window and
   retains a shell after exit. `StandInPane` exposes `pane_id`, `pid`, `launcher`,
   and `log`; actions reject handles from another rig.
-- `wait_ready(pane, optional_id)` checks the current process's latest idle render
-  and the **exact** `stand-in <mode> <id>: idle` screen line, joining wrapped
-  terminal lines. Bracketed paste is enabled before that line is printed. It does
-  not require `#{bracket_paste_flag}` (absent in tmux 3.6); an empty format means
-  **unknown**, not off. Readiness is not a claim that the input draft is empty:
-  inspect the active `❯ ` input line, not scrollback, before delivery.
-- Polls are every 20ms, with 10-second deadlines. Use predicates rather than
-  fixed sleeps. After sending clear, first wait for a changed ID or a `clearing`
-  render; `wait_ready(None)` called before the command is processed can still
-  describe the old editor. A long configured clear gap allows absence assertions
-  before the new start, so PID-based replacement cannot hide a missing end event.
+- `launch` returns after the first terminal-acknowledged frame, not necessarily
+  idle. `wait_ready(pane, optional_id)` waits on the private event stream for an
+  idle frame at least as recent as a control barrier. Bracketed paste is enabled
+  first; no `#{bracket_paste_flag}` or journal/screen polling is required. This
+  is a rig milestone, **not** proof of empty input or readiness for delivery.
+- `event_cursor(pane)` and `wait_event(pane, after, predicate)` replay and await
+  sequenced runtime events with a 30-second outer hang guard. The listener is
+  bound before launch. Every record has `pid`, procfs `start_time`, `pane`, and
+  `event_sequence`; respawn cannot reuse an old process's ready record.
+  `sequence` remains the separate per-process frame counter. Take a cursor
+  **before** an action, then await its `rendered` event before capture. A control
+  barrier alone does not prove that earlier tmux key input has been consumed.
+- Set `config.manual_clock = true` to hold working/clearing phases without a
+  duration race. Model time starts at zero; `control(pane, json!({"command":
+  "advance_to", "now_ms": 500}))` advances it explicitly and acknowledges
+  completed effect dispatch. Await `rendered` separately for the terminal.
+  Time must be a nondecreasing integer. `{"command":"barrier"}` only acknowledges
+  effects already processed; controls never become editor input. Autonomous
+  model completion is disabled, not delayed. The selector blocks on input,
+  controls and actual deadlines (only lone Escape needs a 20ms ambiguity timer).
+- Legacy daemon-row/shell waits still poll at 20ms with 10-second guards; their
+  subscription/process-exit migration is separate. Existing automatic-clock
+  tests still use configured observation windows. New scenarios should hold
+  phases with manual time instead of relying on those windows.
 - `wait_for_row`, `wait_for_absent`, `pane_rows`, `rows` query the real daemon.
   SessionView has no PID: use owned panes/IDs, never total host row counts.
   `discover()` can see unrelated procfs processes. A pending row becoming one
   real-ID row proves discovery and the hook agree on PID.
-- `capture(pane)` joins wrapped screen lines. `paste(pane, text)` uses bracketed
+- `capture(pane)` joins wrapped screen lines; `capture_plain(pane)` preserves
+  viewport line structure and trailing newlines (`capture-pane -p`, no `-J`).
+  `paste(pane, text)` uses bracketed
   paste plus a separate Enter. `key(pane, "Escape")` sends a key to the private
   server only. For an unsubmitted paste use `tmux` load/set-buffer + paste-buffer
   without Enter; typed and pasted text are visible in the active input line.
@@ -78,9 +93,9 @@ rig.close();
   Frame output is deferred during fragmented paste/escape sequences. Exit stops
   input processing and discards pending frame acknowledgements, so no later
   render/ready can describe the exited process. These are rig milestones, not
-  evidence of empty input or confirmed hook delivery. The Rust rig's migration
-  from polling to these events is tracked separately.
-  Every entry includes PID and monotonic time. Events/status are **send attempts**,
+  evidence of empty input or confirmed hook delivery. The same records are sent
+  over `ATM_STANDIN_EVENTS`, a private Unix stream, before any model announcement.
+  Every entry includes process identity and model time (manual when configured). Events/status are **send attempts**,
   not acknowledgments. Hook exit zero cannot prove delivery. Timeout diagnostics
   include journals, daemon logs and panes, and name possible lost handshakes.
 - `close()` checks cleanup; Drop is the unwind fallback. Cleanup discovers every
@@ -152,7 +167,7 @@ time as well as PID; readiness ignores old-process renders.
 `--atm-config <path>` in the original pane command. `respawn-pane -k -t <pane>`
 therefore retains configuration without shell exports. A retained-shell relaunch
 can use `pane.launcher --atm-config <that-path>`. The file has `LOG`, `ID_PREFIX`,
-`WORK_MS`, `CLEAR_GAP_MS` keys; it and the log/socket must resolve inside
+`WORK_MS`, `CLEAR_GAP_MS`, `MANUAL_CLOCK` (0/1) keys; it and the log/socket must resolve inside
 `ATM_STANDIN_ROOT`. Defaults for the timers are 500ms/100ms; negatives fail before
 announcement. Direct launch also requires the private TMUX/PANE and root; never
 unset ATM_SOCKET to use a default.

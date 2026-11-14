@@ -11,6 +11,8 @@ use serde_json::Value;
 
 #[path = "role.rs"]
 pub(crate) mod bounded;
+#[path = "stand_in/events.rs"]
+mod events;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
@@ -37,6 +39,7 @@ pub struct StandInConfig {
     pub mode: StandInMode,
     pub work_ms: u64,
     pub clear_gap_ms: u64,
+    pub manual_clock: bool,
     pub id_prefix: String,
 }
 impl StandInConfig {
@@ -45,6 +48,7 @@ impl StandInConfig {
             mode,
             work_ms: 500,
             clear_gap_ms: 100,
+            manual_clock: false,
             id_prefix: "stand-in".into(),
         }
     }
@@ -54,12 +58,15 @@ impl StandInConfig {
 pub struct StandInPane {
     pub pane_id: String,
     pub pid: u32,
+    start_time: String,
     pub launcher: PathBuf,
     pub log: PathBuf,
     owner: PathBuf,
 }
 
 pub struct StandInRig {
+    // Drop the listener before deleting its socket directory.
+    events: events::Events,
     dir: tempfile::TempDir,
     label: String,
     tmux_identity: Option<(PathBuf, Option<u32>)>,
@@ -111,6 +118,7 @@ impl StandInRig {
         let path = std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin");
         require_tools(&path);
         let mut rig = Self {
+            events: events::Events::bind(root.join("events.sock")),
             dir,
             label: "stand-in".into(),
             tmux_identity: None,
@@ -314,6 +322,7 @@ impl StandInRig {
             .env("XDG_CACHE_HOME", self.root().join("tmp"))
             .env("TMPDIR", self.root().join("tmp"))
             .env("ATM_STANDIN_ROOT", self.root())
+            .env("ATM_STANDIN_EVENTS", self.events.path())
             .env("ATM_DEBUG", "0")
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .current_dir(self.root());
@@ -350,6 +359,7 @@ impl StandInRig {
             &config_path,
             serde_json::to_vec(&serde_json::json!({
                 "WORK_MS": config.work_ms, "CLEAR_GAP_MS": config.clear_gap_ms,
+                "MANUAL_CLOCK": u8::from(config.manual_clock),
                 "ID_PREFIX": prefix, "LOG": log,
             }))
             .unwrap(),
@@ -369,7 +379,7 @@ impl StandInRig {
             &format!("/bin/bash --noprofile --norc -c {}", quote(&command)),
         ]));
         let pane = self.observe_pane(pane_id, config.mode, log);
-        self.wait_ready(&pane, None);
+        self.wait_event(&pane, 0, |e| e["kind"] == "rendered");
         pane
     }
 
@@ -380,30 +390,28 @@ impl StandInRig {
             Some(self.root()),
             "journal must be in this rig"
         );
-        let mut pane = StandInPane {
+        let identity = self.events.wait(|e| {
+            if e["kind"] != "identity" || e["pane"] != pane_id || e["mode"] != mode.name() {
+                return false;
+            }
+            let Some(pid) = e["pid"].as_u64().and_then(|p| u32::try_from(p).ok()) else {
+                return false;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            stat.rsplit_once(')')
+                .and_then(|(_, tail)| tail.split_whitespace().nth(19))
+                == e["start_time"].as_str()
+        });
+        StandInPane {
             pane_id,
-            pid: 0,
+            pid: u32::try_from(identity["pid"].as_u64().unwrap()).unwrap(),
+            start_time: identity["start_time"].as_str().unwrap().into(),
             launcher: self.launcher(mode),
             log,
             owner: self.root().into(),
-        };
-        self.wait("stand-in identity", || {
-            let identity = self.journal(&pane).into_iter().rev().find_map(|e| {
-                if e["kind"] != "identity" || e["pane"] != pane.pane_id || e["mode"] != mode.name()
-                {
-                    return None;
-                }
-                let pid = u32::try_from(e["pid"].as_u64()?).ok()?;
-                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-                let start_time = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?;
-                (Some(start_time) == e["start_time"].as_str()).then_some(pid)
-            });
-            if let Some(pid) = identity {
-                pane.pid = pid;
-            }
-            identity.is_some()
-        });
-        pane
+        }
     }
 
     fn owns(&self, pane: &StandInPane) {
@@ -421,24 +429,42 @@ impl StandInRig {
         self.owns(pane);
         checked(self.tmux(&["capture-pane", "-p", "-J", "-t", &pane.pane_id]))
     }
+    pub fn capture_plain(&self, pane: &StandInPane) -> String {
+        self.owns(pane);
+        let output = self.tmux(&["capture-pane", "-p", "-t", &pane.pane_id]);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).expect("utf8 pane")
+    }
+    pub fn event_cursor(&self, pane: &StandInPane) -> u64 {
+        self.owns(pane);
+        self.events.cursor(pane.pid, &pane.start_time)
+    }
+    pub fn wait_event(
+        &self,
+        pane: &StandInPane,
+        after: u64,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        self.owns(pane);
+        self.events.wait(|e| {
+            events::matches_process(e, pane.pid, &pane.start_time)
+                && e["event_sequence"].as_u64().is_some_and(|seq| seq > after)
+                && predicate(e)
+        })
+    }
+    pub fn control(&self, pane: &StandInPane, command: Value) -> Value {
+        self.owns(pane);
+        self.events.control(pane.pid, &pane.start_time, command)
+    }
     pub fn wait_ready(&self, pane: &StandInPane, session_id: Option<&str>) {
-        self.wait("stand-in ready", || {
-            self.journal(pane)
-                .iter()
-                .rev()
-                .find(|e| e["kind"] == "render" && e["pid"] == pane.pid)
-                .is_some_and(|e| {
-                    let Some(id) = e["session_id"].as_str() else {
-                        return false;
-                    };
-                    let mode = pane.launcher.file_name().unwrap().to_str().unwrap();
-                    e["state"] == "idle"
-                        && session_id.is_none_or(|wanted| id == wanted)
-                        && self
-                            .capture(pane)
-                            .lines()
-                            .any(|line| line == format!("stand-in {mode} {id}: idle"))
-                })
+        // Barrier orders this check after effects already processed by the runtime.
+        // For a particular key/action use wait_event with a pre-action cursor.
+        let barrier = self.control(pane, serde_json::json!({"command": "barrier"}));
+        let sequence = barrier["render_sequence"].as_u64().unwrap();
+        self.wait_event(pane, 0, |e| {
+            e["kind"] == "ready"
+                && e["sequence"].as_u64().is_some_and(|s| s >= sequence)
+                && session_id.is_none_or(|id| e["session_id"] == id)
         });
     }
     pub fn wait_for_shell(&self, pane: &StandInPane) {

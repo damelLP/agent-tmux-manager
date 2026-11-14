@@ -21,12 +21,100 @@ def runtime():
     r.pending_renders = []
     r.render_sequence = 0
     r.draft_dirty = False
+    r.manual_clock = True
+    r.clock_ms = 0
+    r.event_sequence = 0
+    r.event_stream = None
+    r.start_time = "test-start"
+    r.pane = "%test"
     return r
 
 
 def journal(r):
     import json
     return [json.loads(line) for line in r.log.getvalue().splitlines()]
+
+
+class ControlTests(unittest.TestCase):
+    def test_event_stream_carries_identity_and_total_order(self):
+        import json
+        import socket
+        r = runtime()
+        writer, reader = socket.socketpair()
+        with writer, reader:
+            reader.settimeout(30)
+            r.event_stream = writer
+            r.record({"kind": "first"})
+            r.record({"kind": "second"})
+            with reader.makefile("r") as lines:
+                events = [json.loads(lines.readline()), json.loads(lines.readline())]
+        self.assertEqual([e["event_sequence"] for e in events], [1, 2])
+        self.assertEqual([e["kind"] for e in events], ["first", "second"])
+        self.assertTrue(all(e["pane"] == "%test" and e["start_time"] == "test-start" for e in events))
+        self.assertEqual(events, journal(r))
+
+    def test_manual_clock_holds_work_and_clear_until_explicit_advance(self):
+        r = runtime()
+        r.forward = lambda data: None
+        with redirect_stdout(io.StringIO()):
+            r.action(("submit", "held"))
+            self.assertEqual(r.model.deadline, 500)
+            r.control({"id": 1, "command": "advance_to", "now_ms": 499})
+            self.assertEqual(r.model.state, "working")
+            r.control({"id": 2, "command": "advance_to", "now_ms": 500})
+            self.assertEqual(r.model.state, "idle")
+            r.action(("submit", "/clear"))
+            r.control({"id": 3, "command": "advance_to", "now_ms": 599})
+            self.assertEqual(r.model.state, "clearing")
+            r.control({"id": 4, "command": "advance_to", "now_ms": 600})
+        self.assertEqual(r.model.state, "idle")
+        self.assertEqual(journal(r)[-1]["kind"], "control")
+        self.assertEqual(journal(r)[-1]["id"], 4)
+
+    def test_control_rejects_time_reversal_without_affecting_draft(self):
+        r = runtime()
+        r.parser.draft.extend(b"keep me")
+        r.control({"id": 1, "command": "advance_to", "now_ms": 20})
+        for value in [19, -1, True, "21", None]:
+            r.control({"id": 2, "command": "advance_to", "now_ms": value})
+            self.assertIn("error", journal(r)[-1])
+        self.assertEqual(r.clock_ms, 20)
+        self.assertEqual(r.parser.draft, b"keep me")
+        r.manual_clock = False
+        r.control({"id": 3, "command": "advance_to", "now_ms": 30})
+        self.assertIn("error", journal(r)[-1])
+
+    def test_fragmented_control_is_separate_from_editor_input(self):
+        import socket
+        r = runtime()
+        r.control_buffer = bytearray()
+        r.parser.draft.extend(b"untouched")
+        writer, reader = socket.socketpair()
+        with writer, reader:
+            writer.settimeout(30)
+            reader.settimeout(30)
+            r.event_stream = reader
+            writer.sendall(b'{"id":1,"command":"bar')
+            r.receive_controls()
+            self.assertEqual(journal(r), [])
+            writer.sendall(b'rier"}\n{"id":2,"command":"advance_to","now_ms":40}\n')
+            r.receive_controls()
+        self.assertEqual([e["id"] for e in journal(r)], [1, 2])
+        self.assertEqual(r.clock_ms, 40)
+        self.assertEqual(r.parser.draft, b"untouched")
+        self.assertEqual(r.render_sequence, 0, "barriers must not redraw")
+
+    def test_manual_clock_has_no_automatic_model_deadline(self):
+        r = runtime()
+        r.mode = "codex"
+        r.model.deadline = 5
+        self.assertIsNone(r.next_timeout(1000))
+        r.manual_clock = False
+        self.assertEqual(r.next_timeout(2), .003)
+        self.assertEqual(r.next_timeout(9), 0)
+        r.model.deadline = None
+        r.parser.pending.extend(b"\x1b")
+        self.assertGreater(r.next_timeout(9), 0)
 
 
 class RenderTests(unittest.TestCase):

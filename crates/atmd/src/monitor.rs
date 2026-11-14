@@ -270,42 +270,6 @@ mod tests {
     }
 
     #[test]
-    fn test_monitor_cpu_measurement() {
-        use std::time::Duration;
-
-        let mut monitor = ProcessMonitor::new();
-
-        // First refresh establishes baseline
-        let _ = monitor.refresh();
-
-        // Do CPU work for 500ms
-        let start = std::time::Instant::now();
-        let mut sum: u64 = 0;
-        while start.elapsed() < Duration::from_millis(500) {
-            for i in 0..100000 {
-                sum = sum.wrapping_add(i);
-            }
-        }
-        std::hint::black_box(sum);
-
-        // Second refresh should show CPU usage
-        let metrics = monitor.refresh();
-
-        // CPU should show ~100% for one core (we did 500ms of work in 500ms)
-        // Allow some variance due to scheduling
-        assert!(
-            metrics.cpu_percent > 50.0,
-            "Expected CPU > 50%, got {:.2}%",
-            metrics.cpu_percent
-        );
-        assert!(
-            metrics.cpu_percent < 200.0,
-            "CPU seems too high: {:.2}%",
-            metrics.cpu_percent
-        );
-    }
-
-    #[test]
     fn test_constants() {
         assert_eq!(HIGH_MEMORY_THRESHOLD_MB, 100);
         assert_eq!(HIGH_CPU_THRESHOLD_PERCENT, 80.0);

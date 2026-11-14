@@ -130,6 +130,10 @@ impl Client {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Fixture {
+    // Legacy fixtures (including caller-server transport cases) test the
+    // disabled contract unless they explicitly opt into the enabled service.
+    #[serde(default)]
+    agents_enabled: bool,
     request: Value,
     response: Value,
     ignore: Vec<String>,
@@ -194,6 +198,11 @@ async fn replay_all_protocol_fixtures() {
         let mut services = MethodServices::new(spawn_registry());
         services.state_dir = state.path().into();
         services.org = atmd::org::OrgHandle::open(state.path().into(), cancel.clone()).await;
+        if !fixture.agents_enabled {
+            services.agents = Some(atmd::org::agents::AgentHandle::disabled(
+                "named-agent operations are not configured",
+            ));
+        }
         let server = Server::with_services(services).await;
         let mut client = server.client().await;
         client.connect().await;
@@ -266,6 +275,78 @@ async fn info_methods_match_handshake_and_registered_names_with_default_and_inje
         assert_eq!(response["result"]["state_dir"], json!(expected_dir));
         client.require_next_pong().await;
         server.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn agent_methods_are_advertised_enabled_or_explicitly_disabled() {
+    use atmd::org::agents::AgentHandle;
+    for injected in [false, true] {
+        let state = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let missing_root = state.path().join("missing");
+        let mut services = MethodServices::new(spawn_registry());
+        services.org = atmd::org::OrgHandle::open(state.path().into(), cancel.clone()).await;
+        if injected {
+            services.agents = Some(AgentHandle::disabled("maintenance"));
+        }
+        let server = Server::with_services(services).await;
+        let mut client = server.client().await;
+        let connected = client.connect().await;
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"info","method":"daemon.info","params":{}})).await;
+        let info = client.recv().await;
+        assert_eq!(info["result"]["methods"], connected["methods"]);
+        client.require_next_pong().await;
+        if !injected {
+            // Synchronize with initial reconciliation before testing mutations.
+            client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"initial-list","method":"agent.list","params":{}})).await;
+            assert_eq!(
+                client.recv().await,
+                json!({"type":"response","id":"initial-list","result":[]})
+            );
+            client.require_next_pong().await;
+        }
+        for (method, params) in [
+            (
+                "agent.up",
+                json!({"project_root":missing_root,"name":"lead"}),
+            ),
+            (
+                "agent.adopt",
+                json!({"project_root":missing_root,"name":"lead","pane":"%7"}),
+            ),
+            ("agent.clear", json!({"agent":"project/lead"})),
+            ("agent.respawn", json!({"agent":"project/lead"})),
+            ("agent.down", json!({"agent":"project/lead"})),
+            ("agent.list", Value::Null),
+        ] {
+            assert!(connected["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(method)));
+            client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":method,"method":method,"params":params})).await;
+            let expected = if injected {
+                json!({"type":"response","id":method,"error":{"code":"unavailable","message":"agent service unavailable: maintenance"}})
+            } else if method == "agent.list" {
+                json!({"type":"response","id":method,"result":[]})
+            } else if matches!(method, "agent.up" | "agent.adopt") {
+                let message = format!("{}: directory cannot be resolved", missing_root.display());
+                json!({"type":"response","id":method,"error":{"code":"refused","message":message}})
+            } else {
+                json!({"type":"response","id":method,"error":{"code":"not_found","message":"agent project/lead was not found"}})
+            };
+            assert_eq!(client.recv().await, expected);
+            client.require_next_pong().await;
+        }
+        // Semantic errors win even over an explicitly injected disabled reason.
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"invalid","method":"agent.clear","params":{"agent":"project/lead","timeout_ms":0}})).await;
+        assert_eq!(
+            client.recv().await,
+            json!({"type":"response","id":"invalid","error":{"code":"invalid_params","message":"invalid agent parameters: timeout_ms must be in 1..=120000"}})
+        );
+        client.require_next_pong().await;
+        server.stop().await;
+        cancel.cancel();
     }
 }
 

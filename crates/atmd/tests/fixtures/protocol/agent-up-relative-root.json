@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-up-relative-root","method":"agent.up","params":{"project_root":"relative","name":"lead"}},
+  "response": {"type":"response","id":"agent-up-relative-root","error":{"code":"invalid_params","message":"invalid agent parameters: project_root must be a nonempty absolute UTF-8 path"}},
+  "ignore": []
+}

@@ -41,7 +41,7 @@ pub struct Seed {
 }
 pub fn arb_seed() -> impl Strategy<Value = Seed> {
     (
-        0usize..20,
+        0usize..21,
         0usize..3,
         0usize..4,
         0usize..6,
@@ -176,7 +176,8 @@ impl Seed {
             16 => OrgCommand::ControlSent(audit),
             17 => OrgCommand::ControlSpawned(audit),
             18 => OrgCommand::ControlKilled(audit),
-            _ => OrgCommand::EditorReady { agent_id },
+            19 => OrgCommand::EditorReady { agent_id },
+            _ => OrgCommand::Revalidate { agent_id },
         }
     }
 }
@@ -280,6 +281,22 @@ impl History {
         };
         history.step(adopted.clone()).unwrap();
         assert!(history.step(adopted).unwrap().is_empty());
+        let bound = history.state.agent(&lead).unwrap().clone();
+        history
+            .step(OrgCommand::Revalidate {
+                agent_id: lead.clone(),
+            })
+            .unwrap();
+        let starting = history.state.agent(&lead).unwrap();
+        assert_eq!(starting.status, AgentStatus::Starting);
+        assert_eq!(starting.session_id, bound.session_id);
+        assert_eq!(starting.pane, bound.pane);
+        assert_eq!(starting.excluded_session_id, bound.excluded_session_id);
+        history
+            .step(OrgCommand::EditorReady {
+                agent_id: lead.clone(),
+            })
+            .unwrap();
         history
             .step(OrgCommand::PaneCreated {
                 agent_id: worker.clone(),
@@ -512,7 +529,7 @@ impl History {
                 history.step(command).unwrap();
             }
         }
-        assert_eq!(history.kinds.len(), 19);
+        assert_eq!(history.kinds.len(), 20);
         assert_eq!(history.state.agents().count(), 3);
         assert_eq!(history.state.projects().count(), 2);
         history

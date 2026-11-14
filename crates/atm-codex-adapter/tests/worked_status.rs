@@ -52,11 +52,23 @@ fn captured_finished_turns_and_historical_worked_lines() {
 
 #[test]
 fn finished_turn_clock_boundaries_and_independent_duration_shapes() {
-    // Synthetic: vary values within the captured seconds/clock grammars,
-    // independently, to catch accidental coupling of <1s to 24-hour clocks.
-    for elapsed in ["<1s", "1s", "12s", "59s"] {
+    // Synthetic: vary captured seconds/minutes and both clock grammars independently.
+    // Hour shapes follow the codex-cli 0.167.0 binary formatter; not seen on screen.
+    for elapsed in [
+        "<1s",
+        "1s",
+        "12s",
+        "59s",
+        "1m 0s",
+        "1m 5s",
+        "12m 3s",
+        "59m 59s",
+        "1h 0m 0s",
+        "1h 2m 30s",
+        "12h 59m 59s",
+    ] {
         for clock in [
-            "00:00", "09:05", "12:00", "23:59", "1:00 AM", "09:45 PM", "12:59 AM", "12:00 PM",
+            "00:00", "09:05", "12:00", "23:59", "1:00 AM", "9:45 PM", "12:59 AM", "12:00 PM",
         ] {
             let line = format!("Worked for {elapsed} • {clock}");
             let text = IDLE.replace(WORKED, &line);
@@ -82,8 +94,26 @@ fn unsupported_duration_and_invalid_clock_mutations_stay_unknown() {
         "1ms",
         "1m",
         "1h",
-        "12m 3s",
-        "1h 2m 30s",
+        "0s",
+        "01s",
+        "60s",
+        "999s",
+        "1m 05s",
+        "0m 5s",
+        "1m 60s",
+        "60m 0s",
+        "01m 5s",
+        "1m5s",
+        "1h 5s",
+        "0h 2m 30s",
+        "01h 2m 30s",
+        "1h 02m 30s",
+        "1h 2m 03s",
+        "1h 60m 0s",
+        "1h 0m 60s",
+        "1h  2m 30s",
+        "1h 2m 30s 1s",
+        "18446744073709551616h 0m 0s",
         "1s 2s",
         "-1s",
         "+1s",
@@ -103,6 +133,10 @@ fn unsupported_duration_and_invalid_clock_mutations_stay_unknown() {
         "24:00",
         "23:60",
         "00:00 AM",
+        "09:45 PM",
+        "01:00 AM",
+        "Nov 13 at 16:34",
+        "Dec 31, 2025 at 11:59 PM",
         "13:00 PM",
         "12:60 PM",
         "1:00",

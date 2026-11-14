@@ -341,6 +341,26 @@ fn duration(value: &str) -> bool {
         })
 }
 
+fn worked_duration(value: &str) -> bool {
+    let component = |part: &str, suffix: char, range: std::ops::RangeInclusive<u64>| {
+        part.strip_suffix(suffix)
+            .filter(|n| *n == "0" || (!n.starts_with('0') && positive_integer(n)))
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| range.contains(&n))
+    };
+    match value.split(' ').collect::<Vec<_>>().as_slice() {
+        ["<1s"] => true,
+        [seconds] => component(seconds, 's', 1..=59),
+        [minutes, seconds] => component(minutes, 'm', 1..=59) && component(seconds, 's', 0..=59),
+        [hours, minutes, seconds] => {
+            component(hours, 'h', 1..=u64::MAX)
+                && component(minutes, 'm', 0..=59)
+                && component(seconds, 's', 0..=59)
+        }
+        _ => false,
+    }
+}
+
 fn worked_status(line: &str) -> bool {
     let Some((elapsed, clock)) = line
         .strip_prefix("Worked for ")
@@ -349,13 +369,12 @@ fn worked_status(line: &str) -> bool {
         return false;
     };
     let (clock, hours) = match clock.split_once(' ') {
-        Some((clock, "AM" | "PM")) => (clock, 1..=12),
+        Some((clock, "AM" | "PM")) if !clock.starts_with('0') => (clock, 1..=12),
         None if clock.len() == 5 => (clock, 0..=23),
         _ => return false,
     };
-    // Only seconds and <1s occur in the captured finished-turn lines. Do not
-    // borrow the broader running-duration grammar for unverified finished forms.
-    (elapsed == "<1s" || elapsed.strip_suffix('s').is_some_and(positive_integer))
+    // Finished durations are unpadded and range-bounded, unlike running status.
+    worked_duration(elapsed)
         && clock.split_once(':').is_some_and(|(hour, minute)| {
             (1..=2).contains(&hour.len())
                 && hour.chars().all(|c| c.is_ascii_digit())
@@ -394,6 +413,50 @@ fn status_output(body: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_minute_completion_line_is_recognized() {
+        // Captured: codex-cli 0.167.0, 2026-11-14, sealed loopback stub held
+        // 65 seconds, private tmux capture-pane -p -e -N at both widths.
+        for capture in [
+            include_str!("../tests/fixtures/screen_styled_u8g_finished-100x32_0.167.0.txt"),
+            include_str!("../tests/fixtures/screen_styled_u8g_finished-120x40_0.167.0.txt"),
+        ] {
+            let text = capture.split_once('\n').unwrap().1;
+            let decoded = StyledScreen::parse(text).unwrap();
+            let line = decoded
+                .text()
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("Worked for "))
+                .unwrap();
+            assert!(worked_status(line), "{line}");
+            // This argv-started session has compact footer chrome not supported
+            // by the editor parser. Duration evidence must not broaden that gate.
+            assert_eq!(
+                super::observe_screen(ScreenInput::Styled(text), None).turn,
+                TurnState::Unknown
+            );
+            // Synthetic: transplant the real completed line into a captured
+            // supported editor to exercise both public observers end to end.
+            let supported =
+                include_str!("../tests/fixtures/screen_styled_p1_c02-multiline-100x24_0.167.0.txt")
+                    .split_once('\n')
+                    .unwrap()
+                    .1
+                    .replace("Worked for <1s • 16:34", line);
+            assert_eq!(
+                super::observe_screen(ScreenInput::Styled(&supported), None).turn,
+                TurnState::NotRunning
+            );
+            assert_eq!(
+                observe_control_screen(ScreenInput::Styled(&supported), None)
+                    .facts
+                    .turn,
+                TurnState::NotRunning
+            );
+        }
+    }
     use proptest::prelude::*;
 
     fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
@@ -563,8 +626,11 @@ mod tests {
                     "~/another/project (feature/topic)",
                 )
                 .replace("Reply ok", "A different conversation title")
-                .replace("Worked for 1s • 11:31 AM", "Worked for 12s • 09:45 PM")
-                .replace("Worked for 2s • 11:32 AM", "Worked for 30s • 10:59 AM")
+                .replace("Worked for 1s • 11:31 AM", "Worked for 12m 3s • 9:45 PM")
+                .replace(
+                    "Worked for 2s • 11:32 AM",
+                    "Worked for 1h 2m 30s • 10:59 AM",
+                )
                 .replace("Working (0s •", "Working (4m 15s •")
                 .replace("⚠ 1 warning", "⚠ 12 warnings")
                 .replace(

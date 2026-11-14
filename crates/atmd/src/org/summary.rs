@@ -130,7 +130,12 @@ impl Entry {
 const MAX_PENDING: usize = 4096;
 type Entries = HashMap<SessionId, Entry>;
 
-fn update(entries: &mut Entries, recovered: &OrgState, view: &SessionView) {
+struct Recovery {
+    startup: OrgState,
+    saved: HashMap<SessionId, SessionSummary>,
+}
+
+fn update(entries: &mut Entries, recovered: &Recovery, view: &SessionView) {
     let Some(summary) = from_view(view) else {
         return;
     };
@@ -144,14 +149,20 @@ fn update(entries: &mut Entries, recovered: &OrgState, view: &SessionView) {
     }
     entries.insert(
         view.id.clone(),
-        Entry::new(summary, recovered.session_summary(&view.id)),
+        Entry::new(
+            summary,
+            recovered
+                .saved
+                .get(&view.id)
+                .or_else(|| recovered.startup.session_summary(&view.id)),
+        ),
     );
 }
 
 async fn resync(
     registry: &RegistryHandle,
     entries: &mut Entries,
-    recovered: &OrgState,
+    recovered: &Recovery,
     now: DateTime<Utc>,
 ) {
     let views = registry.get_all_sessions().await;
@@ -174,7 +185,7 @@ async fn observe(
     event: SessionEvent,
     registry: &RegistryHandle,
     entries: &mut Entries,
-    recovered: &OrgState,
+    recovered: &Recovery,
     now: DateTime<Utc>,
 ) {
     match event {
@@ -202,14 +213,18 @@ async fn run(
     mut events: broadcast::Receiver<SessionEvent>,
     stop: CancellationToken,
 ) {
-    // One startup snapshot supplies recovery defaults. This is a read-only
-    // clone, never a second mutable organisation authority.
-    let recovered = match org.snapshot().await {
+    // Read-only recovery defaults, overlaid with summaries saved in this run.
+    // The org actor remains the sole authority for decisions and durable state.
+    let startup = match org.snapshot().await {
         Ok(state) => state,
         Err(error) => {
             tracing::warn!(%error, "Session summaries unavailable");
             return;
         }
+    };
+    let mut recovered = Recovery {
+        startup,
+        saved: HashMap::new(),
     };
     let mut entries = Entries::new();
     let mut pending = JoinSet::new();
@@ -252,6 +267,7 @@ async fn run(
             result = pending.join_next(), if !pending.is_empty() => {
                 match result {
                     Some(Ok((summary, Ok(_)))) => {
+                        recovered.saved.insert(summary.session_id.clone(), summary.clone());
                         if let Some(entry) = entries.get_mut(&summary.session_id) {
                             entry.saved = Some(summary.clone());
                             if summary.ended.is_some() && entry.latest == summary { entries.remove(&summary.session_id); }

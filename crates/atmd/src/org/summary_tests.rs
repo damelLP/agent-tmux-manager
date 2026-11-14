@@ -258,6 +258,37 @@ async fn registry_death_does_not_invent_session_end_on_flush() {
 }
 
 #[tokio::test]
+async fn same_run_resume_keeps_first_prompt_and_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let registry = crate::registry::spawn_registry();
+    let observer = SummaryObserver::spawn(registry.clone(), org.clone());
+    let mut watch = org.watch(vec!["session".into()], 0).unwrap();
+    let id = SessionId::new("resumed");
+    let mut first = SessionDomain::new(id.clone(), AgentType::GeneralPurpose, Model::Unknown);
+    first.started_at = now();
+    first.first_prompt = Some("original".into());
+    registry.register(first).await.unwrap();
+    assert_eq!(
+        next_summary(&mut watch).await.first_prompt.as_deref(),
+        Some("original")
+    );
+    registry.remove(id.clone()).await.unwrap();
+    assert!(next_summary(&mut watch).await.ended.is_some());
+    let mut resumed = SessionDomain::new(id.clone(), AgentType::GeneralPurpose, Model::Unknown);
+    resumed.started_at = now() + chrono::Duration::hours(1);
+    resumed.first_prompt = Some("later prompt".into());
+    registry.register(resumed).await.unwrap();
+    let summary = next_summary(&mut watch).await;
+    assert_eq!(summary.first_prompt.as_deref(), Some("original"));
+    assert_eq!(summary.started, now());
+    assert!(summary.ended.is_none());
+    observer.finish().await;
+    cancel.cancel();
+}
+
+#[tokio::test]
 async fn observer_lag_resync_and_shutdown_flush_exact_cost_without_disabling_org() {
     let dir = tempfile::tempdir().unwrap();
     let org = OrgHandle::open(dir.path().to_owned(), CancellationToken::new()).await;

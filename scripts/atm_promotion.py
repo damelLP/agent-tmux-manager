@@ -187,6 +187,8 @@ def same_pair(left, right):
 
 
 def promote(bin_dir, source, socket_path, metadata):
+    require(not any(bin_dir.glob('.atm-stage-*')),
+            'interrupted promotion; run atm-rollback first')
     require(not same_pair(bin_dir, source), 'source pair already installed')
     old_previous = previous(metadata) if (metadata / 'previous.json').exists() else None
     saved = backup(bin_dir, metadata)
@@ -254,6 +256,8 @@ def main(operation):
                     retained = backup(bin_dir, metadata, record=False)
                     print(f'Retained replaced pair: {retained}', flush=True)
                 replace_pair(saved, bin_dir)
+                for staged in bin_dir.glob('.atm-stage-*'):
+                    staged.unlink()
                 setup(bin_dir, socket_path)
                 print(f'Restored previous pair: {saved}')
             print('Pair installed and setup completed. Daemon remains stopped.')

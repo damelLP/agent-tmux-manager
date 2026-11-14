@@ -542,11 +542,24 @@ if mode == 'failure':
 
     def test_rollback_repairs_accepted_interrupted_rename_window(self):
         self.call()
-        # Model SIGKILL after only atm was replaced: previous remains complete.
+        # Model SIGKILL after only atm was replaced: previous remains complete,
+        # and the staged atmd file has not yet been renamed into place.
         (self.bin / 'atmd').write_bytes(self.old['atmd'][0])
+        staged = self.bin / '.atm-stage-interrupted'
+        shutil.copy2(self.source / 'atmd', staged)
+        marker = self.bin / '.atm-promotion/previous.json'
+        previous = marker.read_bytes()
+        mixed = self.pair_bytes(self.bin)
+        result = self.call(ok=False)
+        self.assertIn('interrupted promotion', result.stderr)
+        self.assertIn('atm-rollback', result.stderr)
+        self.assertEqual(marker.read_bytes(), previous)
+        self.assertEqual(self.pair_bytes(self.bin), mixed)
+        self.assertTrue(staged.exists())
         self.call('rollback')
         self.assertEqual(self.pair_bytes(self.bin), self.old)
         self.assertEqual(self.pair_bytes(self.previous()), self.old)
+        self.assertEqual(list(self.bin.glob('.atm-stage-*')), [])
 
 
 class PromotionRealSetup(Sealed):

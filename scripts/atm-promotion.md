@@ -70,7 +70,9 @@ its rollback target.
 The rename pair is deliberately **not atomic**. SIGKILL or power loss between
 renames can leave mixed binaries. With the daemon stopped and TUIs closed,
 nothing should execute them until the owner runs rollback, which restores both.
-Do not rerun promotion on that mixed pair: it would save the mixture as previous.
+A leftover `.atm-stage-*` file blocks further promotion: run rollback first.
+Rollback removes those files after restoring both binaries. Do not remove them
+and rerun promotion on a mixed pair: that would save the mixture as previous.
 No power-loss durability or unattended recovery is promised.
 
 After replacement, the absolute destination `atm setup` runs with a 60-second

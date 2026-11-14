@@ -35,6 +35,12 @@ mod reconciliation {
         async fn gated(
             gate: Option<(&'static str, mpsc::Sender<tokio::sync::oneshot::Sender<()>>)>,
         ) -> Self {
+            Self::gated_with_failure(gate, None).await
+        }
+        async fn gated_with_failure(
+            gate: Option<(&'static str, mpsc::Sender<tokio::sync::oneshot::Sender<()>>)>,
+            mut fail_once: Option<&'static str>,
+        ) -> Self {
             let cancel = CancellationToken::new();
             let (requests, receive) = mpsc::channel(64);
             let (health, status) = watch::channel(Ok(0));
@@ -48,9 +54,17 @@ mod reconciliation {
                 {
                     let mut seq = 0;
                     move |envelope: crate::eventlog::Envelope| {
-                        seq += 1;
+                        let fail = fail_once == Some(envelope.kind.as_str());
+                        if fail {
+                            fail_once = None;
+                        } else {
+                            seq += 1;
+                        }
                         let gate = gate.clone();
                         async move {
+                            if fail {
+                                return Err(crate::eventlog::EventLogError::TimeoutBeforeHandover);
+                            }
                             if let Some((kind, gate)) = gate {
                                 if envelope.kind == kind {
                                     let (release, released) = tokio::sync::oneshot::channel();
@@ -484,6 +498,38 @@ mod reconciliation {
             )
             .await
             .unwrap();
+        // The filesystem lane must survive too; resume real time before I/O.
+        tokio::time::resume();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".atm/roles")).unwrap();
+        std::fs::write(
+            dir.path().join(".atm/roles/lead.md"),
+            "+++\nharness='pi'\n+++\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            agents
+                .up(
+                    UpParams {
+                        project_root: dir.path().into(),
+                        name: "lead".into(),
+                        caller_server: None,
+                    },
+                    caller(),
+                )
+                .await,
+            Err(AgentError::NotImplemented {
+                operation: "agent.up"
+            })
+        ));
+        assert!(dir.path().join(".atm/project.toml").is_file());
+        assert!(agents
+            .list(ListParams {
+                project_root: Some(dir.path().into())
+            })
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1002,6 +1048,41 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn review_failed_restart_note_retries_on_next_wake() {
+        let rig = Rig::gated_with_failure(None, Some("msg.sent")).await;
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.row("pending-100", "%1", false).await;
+        rig.inspect_only("%1", "p/lead");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+        assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 0);
+        assert!(agents.list(ListParams::default()).await.unwrap()[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("observation unavailable"));
+        let mut events = agents.observation_events();
+        for _ in 0..2 {
+            rig.inspect_only("%1", "p/lead");
+            update(&rig, "pending-100").await;
+            progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 1);
+            assert_eq!(
+                agents.list(ListParams::default()).await.unwrap()[0]
+                    .reason
+                    .as_deref(),
+                Some("clear interrupted by daemon restart; inspect %1")
+            );
+        }
+        assert_eq!(rig.state("lead").await.session_id, None);
+    }
+
+    #[tokio::test]
     async fn review_runtime_clearing_is_not_restart_failure() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("old")).await;
@@ -1088,7 +1169,7 @@ mod reconciliation {
         agents.reconciled().await.unwrap();
         assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
         let mut events = rig.org.committed.subscribe();
-        rig.frame("%1", "p/lead", IDLE);
+        rig.inspect_only("%1", "p/lead");
         rig.row("new-real", "%1", false).await;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
@@ -1365,7 +1446,7 @@ mod reconciliation {
             rig.state("lead").await.session_id,
             Some(SessionId::new("recorded"))
         );
-        rig.frame("%1", "p/lead", IDLE);
+        rig.inspect_only("%1", "p/lead");
         let mut committed = rig.org.committed.subscribe();
         // No await: overflow the subscription before it can consume any wake.
         for _ in 0..2050 {

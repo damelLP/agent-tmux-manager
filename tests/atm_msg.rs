@@ -267,6 +267,77 @@ async fn inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls() {
 }
 
 #[tokio::test]
+async fn json_preserves_additive_result_entry_and_delivery_fields() {
+    let mut entry = inbox_entry("original");
+    entry["extra_entry"] = json!({"nested":null});
+    entry["delivery"]["extra_delivery"] = json!([1, "new"]);
+    for (mut args, method, params, result) in [
+        (
+            vec!["msg", "send", "--to", "owner", "--body", "hi"],
+            "msg.send",
+            send("owner", "hi"),
+            json!({"message_id":"m9","extra":1}),
+        ),
+        (
+            vec!["msg", "ack", "m9"],
+            "msg.ack",
+            json!({"ids":["m9"]}),
+            json!({"count":1,"extra":1}),
+        ),
+        (
+            vec!["msg", "retry", "m9", "--accept-duplicate-risk"],
+            "msg.retry",
+            json!({"id":"m9"}),
+            json!({"message_id":"m9","status":"queued","extra":1}),
+        ),
+        (
+            vec!["msg", "give-up", "m9"],
+            "msg.give_up",
+            json!({"id":"m9"}),
+            json!({"message_id":"m9","status":"failed","extra":1}),
+        ),
+        (
+            vec!["inbox"],
+            "msg.inbox",
+            inbox(),
+            json!({"messages":[entry],"unread_count":1,"next_after":null,"extra":1}),
+        ),
+    ] {
+        args.extend(["--format", "json"]);
+        let out = run(&args, None, vec![ok(method, params, result.clone())], true).await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            result,
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn json_still_validates_known_result_fields() {
+    for (args, method, params) in [
+        (
+            vec![
+                "msg", "send", "--to", "owner", "--body", "hi", "--format", "json",
+            ],
+            "msg.send",
+            send("owner", "hi"),
+        ),
+        (vec!["inbox", "--format", "json"], "msg.inbox", inbox()),
+    ] {
+        let out = run(
+            &args,
+            None,
+            vec![ok(method, params, json!({"extra":1}))],
+            false,
+        )
+        .await;
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid message result from daemon"));
+    }
+}
+
+#[tokio::test]
 async fn bare_names_use_caller_project_or_absolute_root_without_guessing() {
     let rows = json!([
         agent("p/caller", Some("%7"), "ready"),

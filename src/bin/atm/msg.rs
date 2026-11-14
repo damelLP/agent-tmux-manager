@@ -88,18 +88,22 @@ async fn request<P: Serialize, R: DeserializeOwned>(
     method: &str,
     params: P,
     budget: Duration,
-) -> Result<R> {
+) -> Result<(R, serde_json::Value)> {
     let value = super::rpc::call(method, serde_json::to_value(params)?, budget)
         .await
         .map_err(|error| match error {
             super::rpc::RpcError::Timeout => anyhow::Error::new(MessageError::Timeout),
             other => anyhow::Error::new(other),
         })?;
-    serde_json::from_value(value).context("invalid message result from daemon")
+    let result =
+        serde_json::from_value(value.clone()).context("invalid message result from daemon")?;
+    Ok((result, value))
 }
 
 pub(super) async fn inbox_request(params: InboxParams) -> Result<InboxResult> {
-    request("msg.inbox", params, MESSAGE_RPC_TIMEOUT).await
+    request("msg.inbox", params, MESSAGE_RPC_TIMEOUT)
+        .await
+        .map(|(result, _)| result)
 }
 
 async fn list(root: Option<PathBuf>) -> Result<ListResult> {
@@ -109,6 +113,7 @@ async fn list(root: Option<PathBuf>) -> Result<ListResult> {
         AGENT_LIST_TIMEOUT,
     )
     .await
+    .map(|(result, _)| result)
 }
 fn unique_name(rows: &[AgentListEntry], name: &str) -> Result<Address> {
     let mut matches = rows.iter().filter(|row| row.agent_id.name == name);
@@ -207,7 +212,7 @@ pub async fn cmd_msg(action: MsgAction) -> Result<()> {
                 .context("invalid message kind")?;
             let to = recipient(&to, project_root).await?;
             let owner = to == Address::Owner;
-            let result: SendResult = request(
+            let (result, raw): (SendResult, _) = request(
                 "msg.send",
                 SendParams {
                     to,
@@ -228,13 +233,13 @@ pub async fn cmd_msg(action: MsgAction) -> Result<()> {
                     "queued"
                 }
             );
-            output(&result, format, &text, &mut io::stdout().lock())
+            output(&raw, format, &text, &mut io::stdout().lock())
         }
         MsgAction::Ack { ids, format } => {
-            let result: AckResult =
+            let (result, raw): (AckResult, _) =
                 request("msg.ack", AckParams { ids }, MESSAGE_RPC_TIMEOUT).await?;
             output(
-                &result,
+                &raw,
                 format,
                 &format!("{} marked read", result.count),
                 &mut io::stdout().lock(),
@@ -248,7 +253,7 @@ pub async fn cmd_msg(action: MsgAction) -> Result<()> {
             if !accept_duplicate_risk {
                 bail!("Inspect the pane first; retry can duplicate delivery. Repeat with --accept-duplicate-risk.");
             }
-            let result: RetryResult = request(
+            let (result, raw): (RetryResult, _) = request(
                 "msg.retry",
                 ResolveParams { id },
                 MESSAGE_RESOLUTION_TIMEOUT,
@@ -259,17 +264,17 @@ pub async fn cmd_msg(action: MsgAction) -> Result<()> {
                 result.message_id,
                 status_text(result.status)?
             );
-            output(&result, format, &text, &mut io::stdout().lock())
+            output(&raw, format, &text, &mut io::stdout().lock())
         }
         MsgAction::GiveUp { id, format } => {
-            let result: GiveUpResult = request(
+            let (result, raw): (GiveUpResult, _) = request(
                 "msg.give_up",
                 ResolveParams { id },
                 MESSAGE_RESOLUTION_TIMEOUT,
             )
             .await?;
             let text = format!("{} {}", result.message_id, status_text(result.status)?);
-            output(&result, format, &text, &mut io::stdout().lock())
+            output(&raw, format, &text, &mut io::stdout().lock())
         }
     }
 }
@@ -312,18 +317,22 @@ fn render_inbox(result: &InboxResult, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 pub async fn cmd_inbox(args: InboxArgs) -> Result<()> {
-    let result = inbox_request(InboxParams {
-        recipient: args.recipient,
-        unread_only: args.unread,
-        count_only: false,
-        id: args.id,
-        after: args.after,
-        limit: args.limit,
-    })
+    let (result, raw): (InboxResult, _) = request(
+        "msg.inbox",
+        InboxParams {
+            recipient: args.recipient,
+            unread_only: args.unread,
+            count_only: false,
+            id: args.id,
+            after: args.after,
+            limit: args.limit,
+        },
+        MESSAGE_RPC_TIMEOUT,
+    )
     .await?;
     let mut out = io::stdout().lock();
     match args.format {
-        MessageFormat::Json => output(&result, args.format, "", &mut out),
+        MessageFormat::Json => output(&raw, args.format, "", &mut out),
         MessageFormat::Text => render_inbox(&result, &mut out),
     }
 }

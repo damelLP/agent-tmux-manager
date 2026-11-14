@@ -468,3 +468,140 @@ async fn two_wake_subscribers_both_see_an_observation() {
     }
     assert!(e.receipt(id()).unwrap().is_some());
 }
+
+/// The tap's entry for an event whose parent proof is missing.
+fn unproven(e: &MessageEvidence, session: &str, pane: Option<&str>, text: Option<&str>) {
+    let event = match text {
+        Some(text) => LifecycleEvent::PromptSubmit {
+            prompt: Some(text.into()),
+        },
+        None => LifecycleEvent::WorkingStart,
+    };
+    e.tap(
+        &SessionId::new(session),
+        pane,
+        Some(Harness::Pi),
+        Some(&event),
+        false,
+        None,
+    )
+    .unwrap();
+}
+
+fn other_armed(e: &MessageEvidence) -> MessageId {
+    let other: MessageId = "m200".parse().unwrap();
+    e.register(other, "[m200] Read: atm inbox --id m200".into())
+        .unwrap();
+    e.arm(AttemptScope {
+        message_id: other,
+        attempt_seq: 201,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("other")),
+        ..scope()
+    })
+    .unwrap();
+    other
+}
+
+#[test]
+fn unproven_event_holds_only_what_it_could_affect() {
+    let e = armed();
+    let other = other_armed(&e);
+    unproven(&e, "session", Some("%7"), Some(REFERENCE));
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.probably_landed);
+    assert!(facts.receipt.is_none());
+    let facts = e.snapshot(other).unwrap();
+    assert!(!facts.probably_landed && facts.receipt.is_none());
+    // A later proven receipt still confirms the held message.
+    exact(&e);
+    assert!(e.receipt(id()).unwrap().is_some());
+}
+
+#[test]
+fn unproven_event_reaches_no_scope_the_proven_event_would_not() {
+    // Another session on the bound scope's pane, the bound session on another
+    // pane or harness, a pending ID: the proven path credits none of them.
+    for (session, pane, harness) in [
+        ("stranger", Some("%7"), Harness::Pi),
+        ("session", Some("%8"), Harness::Pi),
+        ("session", Some("%7"), Harness::Codex),
+        ("pending-42", Some("%7"), Harness::Pi),
+    ] {
+        let e = armed();
+        e.tap(
+            &SessionId::new(session),
+            pane,
+            Some(harness),
+            Some(&LifecycleEvent::PromptSubmit {
+                prompt: Some(REFERENCE.into()),
+            }),
+            false,
+            None,
+        )
+        .unwrap();
+        let facts = e.snapshot(id()).unwrap();
+        assert!(
+            !facts.probably_landed && facts.receipt.is_none(),
+            "{session} {pane:?} {harness:?}"
+        );
+    }
+    // A lazy scope ignores its excluded baseline, proven or not.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    let mut lazy = scope();
+    lazy.session_id = None;
+    lazy.excluded_sessions.insert(SessionId::new("old"));
+    e.arm(lazy).unwrap();
+    unproven(&e, "old", Some("%7"), Some(REFERENCE));
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+}
+
+#[test]
+fn unproven_event_never_binds_a_lazy_scope() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    unproven(&e, "first", Some("%7"), None);
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.probably_landed && facts.receipt.is_none());
+    // Had "first" bound the scope, "second" could no longer confirm.
+    observe(&e, "second", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "second"
+    );
+}
+
+#[test]
+fn unproven_exact_reference_of_an_older_scope_holds() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    // Plain activity in the older scope says nothing about the newer attempt.
+    unproven(&e, "session", Some("%7"), None);
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // Its exact reference may be the lost late receipt.
+    unproven(&e, "session", Some("%7"), Some(REFERENCE));
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.probably_landed && facts.receipt.is_none());
+}
+
+#[test]
+fn unproven_status_activity_holds_the_bound_session_only() {
+    let e = armed();
+    let other = other_armed(&e);
+    e.tap(&SessionId::new("session"), None, None, None, false, None)
+        .unwrap();
+    assert!(e.snapshot(id()).unwrap().probably_landed);
+    assert!(!e.snapshot(other).unwrap().probably_landed);
+}

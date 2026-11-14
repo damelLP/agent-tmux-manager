@@ -3,6 +3,14 @@
 //! The connection tap must first apply the translated event and prove original
 //! parent/session/pane eligibility. Registry Ok alone is not that proof. In
 //! particular, never repair an old event with a new pane occupant's identity.
+//!
+//! A parent event whose proof is missing (the apply failed, the registry
+//! stalled or closed, the row is absent or ambiguous) is never dropped. It
+//! enters as unproven and reaches exactly the scopes the proven event would
+//! have reached, judged by the event's own identity. There it can only hold:
+//! it latches probably-landed, and never binds a lazy scope or confirms. So a
+//! lost proof holds the messages that event could affect, until a new arm or
+//! the owner's retry, and leaves every other message alone.
 //! Register/arm/observe share one short synchronous lock. Coalesced wakeups do
 //! not discard retained facts; poisoned/exhausted retention fails closed.
 //! Earlier scopes survive retries and final failure for late exact receipts.
@@ -268,28 +276,31 @@ impl MessageEvidence {
         harness: Harness,
         event: &LifecycleEvent,
     ) -> Result<(), MessageError> {
-        self.credit(session, pane, Some(harness), prompt(event), None)
+        self.credit(session, pane, Some(harness), prompt(event), true, None)
     }
 
     /// The connection tap's entry. A status line has no event and no harness.
     /// Stamps the receive time, credits the scopes and forwards the Activity
     /// to history under one lock acquisition; never substitute a later time.
+    /// `proven` is the tap's parent proof; see the module docs for an event
+    /// without it. Either way the receive fact is real activity for history.
     pub(crate) fn tap(
         &self,
         session: &SessionId,
         pane: Option<&str>,
         harness: Option<Harness>,
         event: Option<&LifecycleEvent>,
+        proven: bool,
         history: Option<&MessageHistoryHandle>,
     ) -> Result<(), MessageError> {
-        self.credit(session, pane, harness, event.and_then(prompt), history)
-    }
-
-    pub(crate) fn invalidate(&self, reason: &str) -> MessageError {
-        match self.state() {
-            Ok(mut state) => self.disable(&mut state, reason),
-            Err(error) => error,
-        }
+        self.credit(
+            session,
+            pane,
+            harness,
+            event.and_then(prompt),
+            proven,
+            history,
+        )
     }
 
     /// Genuine accepted status-line activity cannot create a receipt or bind a
@@ -299,7 +310,7 @@ impl MessageEvidence {
         session: &SessionId,
         pane: Option<&str>,
     ) -> Result<(), MessageError> {
-        self.credit(session, pane, None, None, None)
+        self.credit(session, pane, None, None, true, None)
     }
 
     fn credit(
@@ -308,6 +319,7 @@ impl MessageEvidence {
         pane: Option<&str>,
         harness: Option<Harness>,
         prompt: Option<&str>,
+        proven: bool,
         history: Option<&MessageHistoryHandle>,
     ) -> Result<(), MessageError> {
         let mut state = self.state()?;
@@ -338,15 +350,17 @@ impl MessageEvidence {
                     if pane.is_none() || harness.is_none() {
                         continue;
                     }
-                    scope.lazy_session = Some(session.clone());
+                    if proven {
+                        scope.lazy_session = Some(session.clone());
+                    }
                 }
-                if Some(identity.attempt_seq) == last_seq {
+                let exact = pane.is_some() && prompt == Some(entry.expected.as_str());
+                // An unproven exact reference may be a lost late receipt of an
+                // earlier scope: hold the message rather than lose the fact.
+                if Some(identity.attempt_seq) == last_seq || (exact && !proven) {
                     entry.probably_landed = true;
                 }
-                if pane.is_some()
-                    && prompt == Some(entry.expected.as_str())
-                    && entry.receipt.is_none()
-                {
+                if proven && exact && entry.receipt.is_none() {
                     entry.receipt = Some(DeliveryReceipt {
                         session_id: session.clone(),
                         confirmation: "prompt_submit_exact_reference".into(),

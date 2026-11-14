@@ -11,6 +11,7 @@ pub mod context;
 pub mod cost;
 pub mod error;
 pub mod harness;
+pub mod harness_control;
 pub mod harness_registry;
 pub mod lifecycle;
 pub mod model;
@@ -24,6 +25,10 @@ pub use context::{ContextUsage, TokenCount};
 pub use cost::Money;
 pub use error::{DomainError, DomainResult};
 pub use harness::Harness;
+pub use harness_control::{
+    DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
+    TurnState,
+};
 pub use harness_registry::{
     builtin_harness_ids_display, builtin_harnesses, default_harness_definition,
     find_harness_definition, ArgvExclude, HarnessDefinition, ProcessMatcher, PromptMode,

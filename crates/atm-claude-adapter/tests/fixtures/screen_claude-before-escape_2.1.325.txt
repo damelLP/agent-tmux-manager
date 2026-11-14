@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   /tmp/u8a-fixture/cwd/claude    
+
+
+❯ /clear
+
+❯ [m-c-u5-2] reply with the word ok
+
+● ok
+
+✻ Crunched for 1s · done 11:25
+
+❯ count from 1 to 60, one number per line
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✶ Levitating…
+  ⎿  Tip: Send messages to Claude while it works to steer Claude in real-time
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ auto mode on (shift+tab to cycle)

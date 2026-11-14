@@ -1,0 +1,40 @@
+bash-5.3$ python3 /tmp/u8a-fixture/bin/capture.py subject claude
+U5 guard: live socket absent; private ATM_SOCKET=/tmp/u8a-fixture/tap.sock ATM_AGENT=fixture/claude  
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /tmp/u8a-fixture/cwd/claude    
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

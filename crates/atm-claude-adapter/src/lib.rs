@@ -373,6 +373,7 @@
 //!   checked). `PermissionRequest` has no `tool_use_id`.
 
 pub mod event;
+pub mod screen;
 pub mod status_line;
 pub mod translate;
 pub mod wire;

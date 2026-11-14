@@ -134,6 +134,7 @@ name = "atm-claude-adapter"
 version = "0.3.0"
 dependencies = [
  "atm-core",
+ "proptest",
  "serde",
  "serde_json",
 ]

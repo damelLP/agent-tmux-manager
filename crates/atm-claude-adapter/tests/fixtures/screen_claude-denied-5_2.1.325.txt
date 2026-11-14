@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   /tmp/u8a-fixture/cwd/claude    
+
+
+❯ /clear
+
+❯ [m-c-u5-2] reply with the word ok
+
+● ok
+
+✻ Crunched for 1s · done 11:25
+
+❯ Run the Bash command printf u5-dialog. Do nothing else.
+
+  No result recorded for 1 call
+  ⎿  $ printf u5-dialog
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Sautéed for 1s · done 11:26
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ auto mode on (shift+tab to cycle)

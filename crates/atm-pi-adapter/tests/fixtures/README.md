@@ -1,5 +1,24 @@
 # Pi screen fixtures
 
+## Lifecycle control observations (B0)
+
+Captured: pi 1.5.0, 2026-11-14, sealed P1 private tmux
+`capture-pane -p -e -N`. New
+`screen_control_p1_B-conversation-120x40_1.5.0.txt` maps to
+`B-conversation-120x40.styled-N.txt`, paired with `.plain.txt` and `.meta.json`.
+Only the private run root becomes an equal-width `/tmp/xxx…` path; all rows,
+attributes, spaces and composer content remain. Strip the provenance label at
+load. Other control tests reuse the existing styled P1 fixtures below.
+
+No startup dialogs appeared: the control observer emits None only for existing
+recognized editors, Unknown otherwise. Conversation is independent of draft/
+turn facts: content beyond recognized startup blocks proves visible history.
+P1's scrolled working/draft screens have separate indented transcript blocks
+and nonzero usage; neither usage nor an old new-session notice alone proves
+conversation or freshness. A draft alone is not conversation. Unknown custom
+UI, trust-gated project startup and permission extensions remain unverified.
+Mutations are Synthetic; legacy observation and staged-check results do not change.
+
 ## Styled fixtures (U8d)
 
 Captured: pi 1.5.0, 2026-11-14, P1 private tmux 120x40

@@ -490,8 +490,9 @@ fn trust_permission_and_codex_dialog_keys_preserve_conservative_observer_facts()
         if !cancel {
             let after = rig.event_cursor(&pane);
             rig.key(&pane, "Down");
+            rig.key(&pane, "Down"); // Both Yes options approve; option 3 denies.
             rig.wait_event(&pane, after, |e| {
-                e["kind"] == "rendered" && e["selection"] == 2
+                e["kind"] == "rendered" && e["selection"] == 3
             });
             assert_eq!(
                 observe(StandInMode::Codex, &rig.capture_plain(&pane)),
@@ -507,6 +508,69 @@ fn trust_permission_and_codex_dialog_keys_preserve_conservative_observer_facts()
         .journal(&pane)
         .iter()
         .any(|e| e["event"] == "UserPromptSubmit"));
+    rig.close();
+}
+
+#[test]
+fn permission_yes_runs_before_completion_and_hooks_precede_the_modal() {
+    let mut rig = StandInRig::start();
+    for (mode, option) in [
+        (StandInMode::Claude, 1),
+        (StandInMode::Codex, 1),
+        (StandInMode::Codex, 2),
+    ] {
+        let mut config = StandInConfig::new(mode);
+        config.manual_clock = true;
+        config.permission_dialog = true;
+        let pane = rig.launch(&config);
+        let after = rig.event_cursor(&pane);
+        rig.paste(&pane, "/atm/dialog");
+        rendered(&rig, &pane, after, "permission");
+        let events = rig.journal(&pane);
+        let permission = events
+            .iter()
+            .position(|e| e["event"] == "PermissionRequest")
+            .unwrap();
+        let modal = events
+            .iter()
+            .position(|e| e["kind"] == "render" && e["frame"] == "permission")
+            .unwrap();
+        assert!(permission < modal);
+        rig.wait_for_row(&pane, |row| {
+            row.status == atm_core::SessionStatus::AttentionNeeded
+        });
+        for _ in 1..option {
+            rig.key(&pane, "Down");
+        }
+        let after = rig.event_cursor(&pane);
+        rig.key(&pane, "Enter");
+        rendered(&rig, &pane, after, "working");
+        assert_eq!(
+            observe(mode, &rig.capture_plain(&pane)).turn,
+            TurnState::Running
+        );
+        assert!(!rig
+            .journal(&pane)
+            .iter()
+            .any(|e| e["event"] == "PostToolUse"));
+        let after = rig.event_cursor(&pane);
+        rig.control(
+            &pane,
+            serde_json::json!({"command":"advance_to", "now_ms":500}),
+        );
+        rendered(&rig, &pane, after, "idle");
+        let events = rig.journal(&pane);
+        let post = events
+            .iter()
+            .position(|e| e["event"] == "PostToolUse")
+            .unwrap();
+        let stop = events.iter().position(|e| e["event"] == "Stop").unwrap();
+        assert!(post < stop);
+        assert_eq!(
+            observe(mode, &rig.capture_plain(&pane)).turn,
+            TurnState::NotRunning
+        );
+    }
     rig.close();
 }
 

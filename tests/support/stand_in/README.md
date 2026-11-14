@@ -247,14 +247,16 @@ Codex discovery may create `pending-{pid}` and its old row remains across clear.
 Waiting for its new-ID hook before the next prompt deadlocks: wait for the new
 render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
 
-- `/atm/dialog` in Claude sends PreToolUse and PermissionRequest and displays
-  the captured permission question/Yes/No/Esc screen. Up/Down select, Enter records
-  a 1-based `selection.option`, Escape denies. Selection emits no hook and executes
-  nothing (Synthetic: safe selection, not actual tool approval). Denial erases the
-  dialog but leaves the daemon attention_needed. `atm reply --option 2` and
-  `peek --prompt` exercise the real parser/key path. Codex supports `/atm/dialog`
-  only with `permission_dialog = true`: it renders P1's actual three-option modal,
-  consumes Down/Enter or Escape, and executes nothing/emits no fabricated hooks.
+- `/atm/dialog` sends captured PreToolUse and PermissionRequest **before** the
+  Claude permission screen or optional Codex three-option modal appears (Codex
+  requires `permission_dialog = true` and announces the generation if needed).
+  Up/Down select; Enter records a 1-based `selection.option`. Claude option 1 and
+  Codex options 1/2 approve: show working, then at the work deadline replay
+  PostToolUse followed by Stop. Synthetic: tool execution is represented by its
+  captured completion, never by running arbitrary shell commands. No/Enter and
+  Escape retain the denial/interruption screens and emit no completion hooks;
+  the daemon may remain attention_needed. `atm reply --option 2` for Claude and
+  `peek --prompt` exercise the real parser/key path.
 - `/atm/drop-next [EVENT]` suppresses the next matching hook, or literally the next
   hook if omitted. Names are case-sensitive; invalid names don't arm loss. Status
   frames are separate and do not consume this hook-drop control.
@@ -390,6 +392,12 @@ Unix proxy into atmd. `claude_2.1.325.jsonl` selects source lines
 
 Captured: Codex 0.167.0, 2026-11-14, U5 real TUI with `--no-daemon` through the same
 proxy. `codex_0.167.0.jsonl` selects lines 3, 4, 5, 12.
+
+Captured: Claude Code 2.1.325 and Codex 0.167.0, 2026-11-14, P1 private proxy
+permission probes. Claude's appended PostToolUse is raw record 52; Codex's
+appended PreToolUse, PermissionRequest and PostToolUse are raw records 39–41.
+They preserve payload shapes and tool results, with the identifier/path
+sanitization below. The stand-in replays these events rather than executing tools.
 
 Captured: pi 1.5.0, 2026-11-14, U5 real TUI with pi-atm through the same proxy.
 `pi_1.5.0.jsonl` selects lines 1, 2, 3, 5, 6, 7, 8, 18, 19. agent_end retains only

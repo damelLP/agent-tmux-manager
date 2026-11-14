@@ -200,6 +200,7 @@ class LifecycleTests(unittest.TestCase):
                 m.handle(("submit", "work"), 0)
                 self.assertEqual(events(m.handle(("submit", "/atm/dialog"), 1)),
                                  ["PreToolUse", "PermissionRequest"])
+                m.handle(("down", ""), 1)  # Deny, not the approving default.
                 effects = m.handle(action, 2)
                 self.assertEqual(events(effects), [])
                 self.assertEqual(events(m.tick(1000)), [])

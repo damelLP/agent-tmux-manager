@@ -112,6 +112,7 @@ class Model:
         self.announced = False
         self.drop_next = None
         self.active_prompt = ""
+        self.approved_tool = False
         self.queue = []
         self.last_ctrl_c = None
         self.selection = 1
@@ -208,9 +209,14 @@ class Model:
                 self.dialog = None
                 return self.begin_clear(now_ms, self.pending_id)
         if name == "permission" and (cancel or enter):
-            self.state, self.dialog = "idle", None
-            self.frame = "denied" if self.mode == "claude" else "interrupted"
+            self.dialog = None
             selection = [{"kind": "selection", "text": text, "option": self.selection}] if enter else []
+            if enter and self.selection <= (2 if self.mode == "codex" else 1):
+                self.approved_tool = True
+                self.state, self.deadline = "working", now_ms + self.work_ms
+            else:
+                self.state, self.deadline = "idle", None
+                self.frame = "denied" if self.mode == "claude" else "interrupted"
             return selection + self.render()
         return [{"kind": "rejected", "text": text, "reason": name}]
 
@@ -219,7 +225,9 @@ class Model:
         self.frame = "interrupted" if aborted else "idle"
         if self.mode == "pi":
             return self.emit("turn_end") + self.emit("agent_end", "aborted" if aborted else "stop")
-        return [] if aborted else self.emit("Stop") + self.status()
+        tool = self.emit("PostToolUse") if self.approved_tool and not aborted else []
+        self.approved_tool = False
+        return [] if aborted else tool + self.emit("Stop") + self.status()
 
     def handle(self, action, now_ms, next_id=None):
         kind, text = action
@@ -264,7 +272,8 @@ class Model:
         if text == "/atm/dialog":
             if self.mode != "claude" and not self.permission_dialog:
                 return self.render("unsupported control: dialog")
-            effects = self.emit("PreToolUse") + self.emit("PermissionRequest") if self.mode == "claude" else []
+            effects = [] if self.announced else self.announce()
+            effects += self.emit("PreToolUse") + self.emit("PermissionRequest")
             return effects + self.open_dialog("permission")
         if text == "/atm/drop-next" or (text.startswith("/atm/drop-next ") and not any(c in text for c in "\r\n")):
             name = text.partition(" ")[2] or "*"

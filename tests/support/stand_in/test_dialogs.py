@@ -97,6 +97,27 @@ class DialogTests(unittest.TestCase):
         self.assertEqual(events(m.handle(("submit", "new prompt"), 607)),
                          ["SessionStart", "UserPromptSubmit"])
 
+    def test_permission_approval_runs_tool_before_stop(self):
+        for mode, selections in [("claude", [1]), ("codex", [1, 2])]:
+            for selection in selections:
+                with self.subTest(mode=mode, selection=selection):
+                    m = make(mode, permission_dialog=True)
+                    m.start()
+                    m.handle(("submit", "work"), 0)
+                    opened = m.handle(("submit", "/atm/dialog"), 1)
+                    self.assertEqual(events(opened), ["PreToolUse", "PermissionRequest"])
+                    self.assertEqual(opened[-1]["frame"], "permission")
+                    for _ in range(selection - 1):
+                        m.handle(("down", ""), 2)
+                    approved = m.handle(("submit", ""), 3)
+                    self.assertEqual(events(approved), [])
+                    self.assertEqual(m.state, "working")
+                    self.assertEqual(approved[-1]["frame"], "working")
+                    self.assertEqual(m.tick(502), [])
+                    self.assertEqual(events(m.tick(503)), ["PostToolUse", "Stop"])
+                    self.assertEqual(m.state, "idle")
+                    self.assertEqual(events(m.tick(1000)), [])
+
     def test_optional_codex_permission_consumes_keys_and_never_submits(self):
         for action in [("escape", ""), ("submit", "ignored")]:
             m = make("codex", permission_dialog=True)
@@ -105,6 +126,7 @@ class DialogTests(unittest.TestCase):
             self.assertEqual(m.render()[0]["frame"], "permission")
             m.handle(("down", ""), 1)
             self.assertEqual(m.selection, 2)
+            m.handle(("down", ""), 1)  # Option 3 is No; both Yes options approve.
             self.assertEqual(events(m.handle(action, 2)), [])
             self.assertEqual(m.state, "idle")
 

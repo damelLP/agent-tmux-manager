@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -72,10 +73,15 @@ def owned_root(value, create=True):
 def save(path, data):
     require(not path.is_symlink(), 'manifest is a symlink')
     temporary = path.with_suffix('.new')
-    with temporary.open('x') as stream:
-        json.dump(data, stream, indent=2)
-        stream.write('\n')
-    temporary.replace(path)
+    # All writers hold the kit lock: a previous interrupted write is disposable.
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open('x') as stream:
+            json.dump(data, stream, indent=2)
+            stream.write('\n')
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load(path):
@@ -121,7 +127,11 @@ def asset_manifest(repo, sha):
                 pairs[prefix + name] = 'crates/atm/assets/atm-skills/shared/' + name
     hashes = {}
     for source in set(pairs.values()):
-        content = subprocess.check_output(['git', 'show', sha + ':' + source], cwd=repo, timeout=30)
+        try:
+            content = subprocess.check_output(['git', 'show', sha + ':' + source], cwd=repo,
+                                              stderr=subprocess.PIPE, timeout=30)
+        except subprocess.CalledProcessError as error:
+            raise Refused(f'missing required asset at ref {sha}: {source}') from error
         hashes[source] = hashlib.sha256(content).hexdigest()
     return {installed: hashes[source] for installed, source in pairs.items()}
 
@@ -194,6 +204,7 @@ class Kit:
         name = sha + '-' + profile
         destination = self.installs / name
         require(not destination.exists(), 'immutable install already exists')
+        assets = asset_manifest(repo, sha)  # refuse incompatible refs before any build
         worktree = self.build / ('source-' + uuid.uuid4().hex)
         stage = Path(tempfile.mkdtemp(prefix='.install-', dir=self.installs))
         added = False
@@ -209,8 +220,8 @@ class Kit:
                 target.mkdir(mode=0o700, exist_ok=True)
                 private_dir(target)
                 env['CARGO_TARGET_DIR'] = str(target)
+                added = True  # git may register the worktree before timeout/interrupt
                 run(['git', 'worktree', 'add', '--detach', worktree, sha], cwd=repo)
-                added = True
                 toolchain = run([cargo, '--version'], env=env)
                 command = [cargo, 'build', '--locked', '--bin', 'atm', '--bin', 'atmd']
                 if not args.debug:
@@ -226,17 +237,33 @@ class Kit:
                 shutil.copy2(source, stage / 'bin' / exe)
                 hashes[exe] = hashlib.sha256((stage / 'bin' / exe).read_bytes()).hexdigest()
             data = dict(id=name, sha=sha, profile=profile, toolchain=toolchain,
-                        hashes=hashes, assets=asset_manifest(repo, sha),
+                        hashes=hashes, assets=assets,
                         prebuilt_provenance_unverified=bool(args.prebuilt))
             save(stage / 'install.json', data)
             stage.rename(destination)
             save(self.root / 'selected.json', {'id': name})
             print(name)
         finally:
-            if added:
-                run(['git', 'worktree', 'remove', '--force', worktree], cwd=repo)
-            if stage.exists():
-                shutil.rmtree(stage)
+            original_error = sys.exc_info()[1]
+            try:
+                if added:
+                    try:
+                        run(['git', 'worktree', 'remove', '--force', worktree], cwd=repo)
+                    except (OSError, subprocess.SubprocessError):
+                        # Remove only our unique staging tree, then deregister it
+                        # if add completed. Never prune another worktree's records.
+                        if worktree.exists():
+                            shutil.rmtree(worktree)
+                        registered = run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
+                        if 'worktree ' + str(worktree) in registered.splitlines():
+                            run(['git', 'worktree', 'remove', '--force', worktree], cwd=repo)
+            except (OSError, subprocess.SubprocessError) as error:
+                if original_error is None:
+                    raise
+                print(f'candidate: worktree cleanup failed: {error}', file=sys.stderr)
+            finally:
+                if stage.exists():
+                    shutil.rmtree(stage)
 
     def active(self, optional=False, missing_runtime=False):
         if optional and not self.active_file.exists():
@@ -263,7 +290,8 @@ class Kit:
         env = clean_env()
         env.update(ATM_SOCKET=a['socket'], ATM_STATE_DIR=a['state'], ATM_TMUX_SOCKET='candidate',
                    TMUX_TMPDIR=str(Path(a['run']) / 't'), ATM_CANDIDATE_RUN=a['token'],
-                   PATH=a['bin'] + ':' + env.get('PATH', '/usr/local/bin:/usr/bin:/bin'))
+                   PATH=str(Path(a['run']) / 'bin') + ':' + a['bin'] + ':'
+                   + env.get('PATH', '/usr/local/bin:/usr/bin:/bin'))
         return env
 
     def tm(self, a, *args):
@@ -392,6 +420,11 @@ class Kit:
         private_dir(state)
         runtime = Path(tempfile.mkdtemp(prefix=f'atmc-{os.getuid()}-', dir=self.runtime))
         (runtime / 't').mkdir(mode=0o700)
+        (runtime / 'bin').mkdir(mode=0o700)
+        wrapper = runtime / 'bin/atm'
+        launcher = Path(__file__).resolve().with_name('atm-candidate')
+        wrapper.write_text('#!/bin/sh\nexec bash ' + shlex.quote(str(launcher)) + ' atm "$@"\n')
+        wrapper.chmod(0o700)
         a = dict(id=name, run=str(runtime), token=uuid.uuid4().hex,
                  socket=str(runtime / 'a.sock'), state=str(state),
                  tmux_socket=str(runtime / 't' / f'tmux-{os.getuid()}' / 'candidate'),
@@ -420,6 +453,8 @@ class Kit:
         a = self.active(optional=True, missing_runtime=True)
         if a is None:
             return
+        require(os.environ.get('ATM_CANDIDATE_RUN') != a['token'],
+                'run stop outside the candidate server')
         if not Path(a['run']).exists():
             self.active_file.unlink()  # active() proved there are no owned processes
             return
@@ -486,8 +521,13 @@ class Kit:
                 # Interactive attachment owns its terminal; not a timed subprocess.
                 argv = ['tmux', '-L', 'candidate', 'attach-session', '-t', 'candidate']
             else:
-                require(not any(x in ('setup', 'uninstall') for x in args.args),
-                        'setup/uninstall would mutate live assets; refused')
+                require(not any(x in ('setup', 'uninstall', 'workspace') for x in args.args),
+                        'setup/uninstall/workspace would mutate live assets; refused')
+                # Preserve pane context only from this verified candidate server.
+                if (os.environ.get('ATM_CANDIDATE_RUN') == a['token']
+                        and os.environ.get('TMUX', '').startswith(
+                            a['tmux_socket'] + ',' + str(a['server']['pid']) + ',')):
+                    env.update({k: os.environ[k] for k in ('TMUX', 'TMUX_PANE') if k in os.environ})
                 argv = [str(Path(a['bin']) / 'atm'), *args.args]
             # Interactive atm/attach must not hold the lifecycle lock indefinitely.
             self.lock.close()
@@ -527,8 +567,9 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (Refused, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
-        print(f'candidate: {error}', file=sys.stderr)
+    except (Refused, OSError, ValueError, KeyError, AttributeError, TypeError,
+            KeyboardInterrupt, subprocess.SubprocessError) as error:
+        print(f'candidate: {error or "interrupted"}', file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError):
             print(error.stderr, file=sys.stderr)
         sys.exit(1)

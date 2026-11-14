@@ -4,4 +4,4 @@
 # atm ARGS...; restart-daemon; status; stop; uninstall ID [--wipe-state].
 # Keep this launcher and atm_candidate.py together. Never runs atm setup.
 set -euo pipefail
-exec python3 "$(dirname -- "${BASH_SOURCE[0]}")/atm_candidate.py" "$@"
+exec python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/atm_candidate.py" "$@"

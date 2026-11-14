@@ -1995,6 +1995,11 @@ fn follower_stale_blocker_bound_starts_when_it_becomes_the_head() {
         }
         wait(consume_of(&mut f, follower, ms), WaitReason::OtherDelivery);
     }
+    // An observation alone, with no step consumed after it, starts no clock
+    // for the follower either.
+    f.observe(obs.clone(), 90_000);
+    let live = f.history.snapshot(follower, at(90_000)).unwrap().live;
+    assert_eq!(live.stale_blocker_since, None);
     f.apply(
         OrgEvent::MessageDeliveryFailed {
             message_id: f.id,

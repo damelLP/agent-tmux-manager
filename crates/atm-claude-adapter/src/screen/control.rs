@@ -2,8 +2,9 @@
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-14, sealed P1 private tmux.
 //! See the fixture README. Trust paths are facts, never authorization. Prefixes
-//! above the first complete header are uninterpreted shell output; a second
-//! header is history, not a reason to discard an existing conversation.
+//! above the first complete header are uninterpreted shell output, except that
+//! Claude editor/transcript chrome there vetoes freshness. A second header is
+//! history, not a reason to discard an existing conversation.
 use super::*;
 use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
@@ -59,7 +60,7 @@ pub fn observe_control_screen(
     }
     let header = lines.iter().enumerate().find_map(|(i, line)| {
         line.starts_with(" ▐▛███▛█   Claude Code v")
-            .then(|| lines.get(i..).and_then(header_end).map(|end| i + end))
+            .then(|| lines.get(i..).and_then(header_end).map(|end| (i, i + end)))
             .flatten()
     });
     let Some((footer, before_footer)) = lines.split_last() else {
@@ -77,19 +78,28 @@ pub fn observe_control_screen(
         .trim()
         .split_once("  ")
         .map_or(footer.trim(), |(left, _)| left);
-    if !matches!(
-        footer,
-        "⏵⏵ auto mode on (shift+tab to cycle)"
-            | "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
-            | "⏸ manual mode on"
-            | "⏸ manual mode on · ← for agents"
-    ) {
+    let footers = [
+        "⏵⏵ auto mode on (shift+tab to cycle)",
+        "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+        "⏸ manual mode on",
+        "⏸ manual mode on · ← for agents",
+    ];
+    if !footers.contains(&footer) {
         return result;
     }
     // Without a complete header, only already-recognized ordinary facts apply.
-    if let Some(end) = header {
+    if let Some((start, end)) = header {
         if let Some((facts, _)) = editor_facts(&lines, styled, Some(end), before_footer) {
             result.facts = facts;
+        }
+        if lines.get(..start).unwrap_or_default().iter().any(|line| {
+            let trimmed = line.trim();
+            line.starts_with("❯ ")
+                || line.starts_with("❯\u{a0}")
+                || line.starts_with("● ")
+                || footers.contains(&trimmed.split_once("  ").map_or(trimmed, |(left, _)| left))
+        }) {
+            result.facts.fresh_editor = FreshEditorEvidence::Unknown;
         }
     }
     if result.facts.dialog == DialogState::None
@@ -101,7 +111,9 @@ pub fn observe_control_screen(
                 .get(..lower)
                 .and_then(|s| s.iter().rposition(|s| rule(s, '─')))
             {
-                let history = lines.get(header.unwrap_or(0)..top).unwrap_or_default();
+                let history = lines
+                    .get(header.map_or(0, |(_, end)| end)..top)
+                    .unwrap_or_default();
                 result.conversation = history.iter().any(|s| {
                     s.trim()
                         .strip_prefix("❯ ")

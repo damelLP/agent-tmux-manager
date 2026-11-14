@@ -216,6 +216,52 @@ fn synthetic_damaged_trust_or_active_suffix_never_authorizes_keys() {
 }
 
 #[test]
+fn synthetic_scrolled_transcript_before_a_complete_header_is_not_fresh() {
+    // Synthetic: the original header scrolled away, leaving real transcript rows
+    // above a copied complete header and the captured fresh editor/footer.
+    let baseline = plain(capture!("B-baseline-conversation-120x40"));
+    let transcript = baseline
+        .split_once("❯ /clear")
+        .unwrap()
+        .1
+        .split_once('─')
+        .unwrap()
+        .0;
+    let auto = plain(AUTO);
+    let fresh = &auto[auto.find(" ▐▛███▛█   Claude Code v").unwrap()..];
+    let editor = auto.lines().find(|row| row.starts_with("❯\u{a0}")).unwrap();
+    let rule = auto.lines().find(|row| row.starts_with('─')).unwrap();
+    for prefix in [
+        format!("❯ /clear{transcript}"),
+        "❯ old prompt".into(),
+        "● old reply".into(),
+        format!("{rule}\n{editor}\n{rule}"),
+        "  ⏵⏵ auto mode on (shift+tab to cycle)".into(),
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".into(),
+        "  ⏸ manual mode on".into(),
+        "  ⏸ manual mode on · ← for agents  right-aligned notice".into(),
+    ] {
+        let text = format!("{prefix}\n{fresh}");
+        for input in [ScreenInput::Styled(&text), ScreenInput::Plain(&text)] {
+            let observed = observe_control_screen(input, None);
+            assert_eq!(observed.dialog, ControlDialog::None, "{prefix}");
+            assert_eq!(
+                observed.facts.fresh_editor,
+                FreshEditorEvidence::Unknown,
+                "{prefix}"
+            );
+        }
+    }
+    // Synthetic: an ordinary shell preamble remains uninterpreted.
+    assert_eq!(
+        observe(&format!("shell$ cd '/tmp/project' && claude\n{fresh}"))
+            .facts
+            .fresh_editor,
+        FreshEditorEvidence::Present
+    );
+}
+
+#[test]
 fn synthetic_headers_and_footer_damage_do_not_manufacture_freshness() {
     let auto = plain(AUTO);
     for text in [

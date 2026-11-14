@@ -1342,3 +1342,166 @@ fn only_undelivered_agent_messages_keep_continuity() {
         Err(super::messages::MessageError::Conflict(_))
     ));
 }
+
+fn paste(f: &mut Fixture, certainty: EffectCertainty, ms: i64) {
+    f.record(
+        HistoryUpdate::Paste {
+            id: f.id,
+            pane: pane(),
+            certainty,
+        },
+        ms,
+    );
+}
+fn evidence_latch(f: &mut Fixture, ms: i64) {
+    f.record(
+        HistoryUpdate::Evidence {
+            id: f.id,
+            receipt: None,
+            probably_landed: true,
+        },
+        ms,
+    );
+}
+fn fail_for_retry(f: &mut Fixture, ms: i64) {
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        ms,
+    );
+}
+/// A second attempt of the fixture's message, armed.
+fn second_attempt(f: &mut Fixture, first: &AttemptScope, ms: i64) {
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: f.id,
+            attempt: 2,
+            pane: "%1".into(),
+        },
+        ms,
+    );
+    let mut scope = first.clone();
+    scope.attempt_seq = f.seq;
+    f.record(HistoryUpdate::Armed { scope }, ms);
+}
+
+#[test]
+fn zero_effect_attempt_discounts_the_evidence_latch_in_either_order() {
+    for latch_first in [true, false] {
+        let mut f = Fixture::new(0);
+        let scope = f.attempt(10_000);
+        f.record(HistoryUpdate::Armed { scope }, 10_000);
+        if latch_first {
+            evidence_latch(&mut f, 11_000);
+            paste(&mut f, EffectCertainty::NotStarted, 11_000);
+        } else {
+            paste(&mut f, EffectCertainty::NotStarted, 11_000);
+            evidence_latch(&mut f, 11_000);
+        }
+        // Nothing of ours was typed, so the session's activity is not ours.
+        assert!(!f.snapshot(11_000).live.probably_landed, "{latch_first}");
+        fail_for_retry(&mut f, 12_000);
+        assert!(
+            matches!(f.step(12_000), DeliveryStep::RetryAt { .. }),
+            "{latch_first}"
+        );
+        // A receipt is no latch: it still confirms.
+        let receipt = DeliveryReceipt {
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        };
+        f.record(
+            HistoryUpdate::Evidence {
+                id: f.id,
+                receipt: Some(receipt.clone()),
+                probably_landed: true,
+            },
+            12_000,
+        );
+        assert_eq!(f.step(12_000), DeliveryStep::Confirm { receipt });
+    }
+}
+
+#[test]
+fn an_earlier_real_paste_keeps_every_latch_in_force() {
+    for certainty in [EffectCertainty::Applied, EffectCertainty::Unknown] {
+        let mut f = Fixture::new(0);
+        let scope = f.attempt(10_000);
+        f.record(
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            10_000,
+        );
+        paste(&mut f, certainty, 11_000);
+        fail_for_retry(&mut f, 12_000);
+        // The second attempt types nothing, in either arrival order.
+        for latch_first in [true, false] {
+            let mut f = Fixture {
+                history: f.history.clone(),
+                seq: f.seq,
+                id: f.id,
+            };
+            second_attempt(&mut f, &scope, 20_000);
+            if latch_first {
+                evidence_latch(&mut f, 21_000);
+                paste(&mut f, EffectCertainty::NotStarted, 21_000);
+            } else {
+                paste(&mut f, EffectCertainty::NotStarted, 21_000);
+                evidence_latch(&mut f, 21_000);
+            }
+            // The activity may be the first attempt's paste landing late.
+            assert!(
+                f.snapshot(21_000).live.probably_landed,
+                "{certainty:?} {latch_first}"
+            );
+            fail_for_retry(&mut f, 22_000);
+            blocked(f.step(22_000), FailureReason::ProbablyDelivered);
+        }
+    }
+}
+
+#[test]
+fn a_held_or_replayed_attempt_is_never_discounted() {
+    // The executor held the first attempt: its effect is uncertain.
+    let mut f = Fixture::new(0);
+    let scope = f.attempt(10_000);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        10_000,
+    );
+    f.record(
+        HistoryUpdate::Held {
+            id: f.id,
+            attempt_seq: scope.attempt_seq,
+            hold: ExecutorHold::InputOutcomeUnknown,
+        },
+        11_000,
+    );
+    fail_for_retry(&mut f, 12_000);
+    second_attempt(&mut f, &scope, 20_000);
+    paste(&mut f, EffectCertainty::NotStarted, 21_000);
+    evidence_latch(&mut f, 21_000);
+    assert!(f.snapshot(21_000).live.probably_landed);
+
+    // The first attempt predates this process: what it typed is not known.
+    let mut f = Fixture::new(4);
+    let scope = f.attempt(10_000);
+    f.record(
+        HistoryUpdate::OwnerRetry {
+            id: f.id,
+            attempt_seq: scope.attempt_seq,
+        },
+        11_000,
+    );
+    fail_for_retry(&mut f, 12_000);
+    second_attempt(&mut f, &scope, 20_000);
+    paste(&mut f, EffectCertainty::NotStarted, 21_000);
+    evidence_latch(&mut f, 21_000);
+    assert!(f.snapshot(21_000).live.probably_landed);
+}

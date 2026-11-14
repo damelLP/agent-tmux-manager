@@ -152,6 +152,9 @@ pub enum HistoryUpdate {
     /// Applied/Unknown records now and resets pane readiness before job release.
     /// NotStarted must never manufacture a paste timestamp. Paste never latches
     /// probably_landed by itself: B records Held for uncertain effects.
+    /// While the current attempt is recorded NotStarted and no earlier attempt
+    /// of the message was recorded Applied or Unknown, the evidence latch does
+    /// not block it, whichever arrives first; a receipt still confirms.
     Paste {
         id: MessageId,
         pane: PaneId,
@@ -210,6 +213,12 @@ struct MessageContinuity {
     receipt: Option<DeliveryReceipt>,
     probably_landed: bool,
     hold: Option<ExecutorHold>,
+    /// The attempt recorded `Paste { NotStarted }`: it typed nothing.
+    no_effect_seq: Option<u64>,
+    /// Some attempt may have typed something: it was recorded Applied or
+    /// Unknown, the executor held it, or it predates this process and its
+    /// record is gone. Never cleared.
+    effect_possible: bool,
     hold_since: Option<DateTime<Utc>>,
     stale_since: Option<DateTime<Utc>>,
     stale_blocker: Option<WaitReason>,
@@ -222,7 +231,16 @@ impl MessageContinuity {
         live.stale_blocker_since = self.stale_since;
         live.last_attempt_before_start = self.restarted;
         live.confirmation = self.receipt.clone();
-        live.probably_landed = self.probably_landed;
+        // While the current attempt typed nothing and no earlier attempt may
+        // have, activity in the session cannot be ours, so the latch does not
+        // block. This is read here, not folded into the latch, so the order in
+        // which the latch and the paste record arrive does not matter. After
+        // any possible effect every latch stays in force: the activity may be
+        // that paste landing late.
+        let untyped = !self.effect_possible
+            && self.no_effect_seq.is_some()
+            && self.no_effect_seq == self.last_attempt_seq;
+        live.probably_landed = self.probably_landed && !untyped;
     }
 }
 
@@ -659,6 +677,7 @@ impl MessageHistory {
         if matches!(event, OrgEvent::MessageDeliveryAttempted { .. }) {
             track.last_attempt_seq = Some(seq);
             track.restarted = replayed;
+            track.effect_possible |= replayed;
         }
         Ok(())
     }
@@ -894,6 +913,13 @@ impl MessageHistory {
                         "paste does not match applied attempted pane".into(),
                     ));
                 }
+                if let Some(track) = self.messages.get_mut(&id) {
+                    if certainty == EffectCertainty::NotStarted {
+                        track.no_effect_seq = track.last_attempt_seq;
+                    } else {
+                        track.effect_possible = true;
+                    }
+                }
                 if certainty != EffectCertainty::NotStarted {
                     let mut changed = vec![];
                     for (recipient, history) in &mut self.recipients {
@@ -921,6 +947,7 @@ impl MessageHistory {
                 let track = self.matching_attempt(id, attempt_seq)?;
                 track.probably_landed = true;
                 track.hold = Some(hold);
+                track.effect_possible = true;
             }
             HistoryUpdate::OwnerRetry { id, attempt_seq } => {
                 let track = self.matching_attempt(id, attempt_seq)?;

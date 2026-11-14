@@ -65,8 +65,9 @@
 //! | Queued, another message delivering or retry-pending for recipient | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
 //! | Queued, fresh non-idle row, no send_now OR input not EmptySince | Wait(SessionBusy) until stale or new observation |
-//! | Stale non-idle row, draft/dialog | Wait; Blocked after three guard polls of this blocker, capped by the overall hold |
-//! | Other copy mode, dialog, draft, unknown guards/input | Wait; Blocked after continuous hold + readiness_timeout |
+//! | Copy mode, or unknown copy-mode/dialog guard | Wait; Blocked after continuous hold + readiness_timeout |
+//! | Stale non-idle row, draft/dialog (earlier guards satisfied) | Wait; Blocked after three guard polls of this blocker, capped by the overall hold |
+//! | Other dialog, draft, unknown input | Wait; Blocked after continuous hold + readiness_timeout |
 //! | No row, positive empty input | Wait until max(empty_since,last_paste) + stable_empty_input |
 //! | Idle row, no send_now | Wait until max(status_since,empty_since,last_paste) + stable_idle |
 //! | Stale non-idle row, or send_now with any row | Wait until max(empty_since,last_paste) + stable_idle |

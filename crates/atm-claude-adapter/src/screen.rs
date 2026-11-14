@@ -9,9 +9,16 @@
 //! Startup suggestions cannot be distinguished from identical drafts in plain
 //! text. They remain Unknown: consumers cannot deliver into a freshly started
 //! Claude editor until a later evidence-backed implementation resolves this.
-//! No cursor was captured; supplying one currently returns all Unknown rather
-//! than treating its position (even Home) as proof of emptiness. Ordinary unknown
+//! U5b also captured cursors and confirmed that Home-position drafts collide with
+//! empty editors. Supplying a cursor still returns all Unknown, not emptiness.
+//! Ordinary unknown
 //! layouts, versions, modes, overlays and incomplete dialogs also fail closed.
+//!
+//! Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
+//! Header, bordered input and footer are found by chrome, not absolute rows.
+//! Status is the transcript tail, independent of blank spacing. Right-aligned
+//! footer notices and the deleted-text hint are not turn evidence. Separate
+//! update/focus-warning footer rows remain unsupported and return Unknown.
 //!
 //! Fresh layout evidence does not establish that a particular clear completed.
 //! `/clear` remains in history after a successful clear. Consumers own temporal,
@@ -54,9 +61,10 @@ fn rule(line: &str, glyph: char) -> bool {
     line.chars().take(8).count() == 8 && line.chars().all(|c| c == glyph)
 }
 
-fn header(lines: &[&str]) -> bool {
-    lines
-        .get(1)
+fn header_end(lines: &[&str]) -> Option<usize> {
+    let start = lines.iter().position(|line| !line.trim().is_empty())?;
+    (lines
+        .get(start)
         .and_then(|line| line.strip_prefix(" ▐▛███▛█   Claude Code v"))
         .is_some_and(|version| {
             version
@@ -64,12 +72,15 @@ fn header(lines: &[&str]) -> bool {
                 .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
         })
         && lines
-            .get(2)
+            .get(start + 1)
             .is_some_and(|line| line.starts_with("▝▜██████▀  "))
         && lines
-            .get(3)
+            .get(start + 2)
             .and_then(|line| line.strip_prefix(" ▝▝   ▝▝   "))
-            .is_some_and(|cwd| cwd.starts_with('/') || cwd.starts_with("~/"))
+            .is_some_and(|cwd| {
+                cwd.trim_end() == "~" || cwd.starts_with('/') || cwd.starts_with("~/")
+            }))
+    .then_some(start + 3)
 }
 
 fn dialog(lines: &[&str]) -> Option<DialogState> {
@@ -104,10 +115,20 @@ fn dialog(lines: &[&str]) -> Option<DialogState> {
 }
 
 fn editor(lines: &[&str]) -> Option<ScreenFacts> {
-    let has_header = header(lines);
+    let header_end = header_end(lines);
     let (footer, before_footer) = lines.split_last()?;
+    let (footer, before_footer) = if footer.trim() == "Ctrl+Y to paste deleted text" {
+        before_footer.split_last()?
+    } else {
+        (footer, before_footer)
+    };
+    // The left help chrome is fixed; a separately aligned notice decides no fact.
+    let footer = footer
+        .trim()
+        .split_once("  ")
+        .map_or(footer.trim(), |(left, _)| left);
     if !matches!(
-        footer.trim(),
+        footer,
         "⏵⏵ auto mode on (shift+tab to cycle)"
             | "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
     ) {
@@ -123,7 +144,7 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     }
     let before_lower = lines.get(..lower)?;
     let top = before_lower.iter().rposition(|line| rule(line, '─'))?;
-    if top < 7 || lines.get(top) != lines.get(lower) {
+    if lines.get(top) != lines.get(lower) {
         return None;
     }
     let (first, continuation) = lines.get(top + 1..lower)?.split_first()?;
@@ -138,40 +159,38 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     } else {
         InputState::Draft
     };
-    // Captured active status occupies the three rows immediately above the border.
-    // Unknown text here may be new progress UI: absence of a known spinner isn't idle.
-    let status_start = top.saturating_sub(3);
-    let status: Vec<_> = lines
-        .get(status_start..top)?
+    // Status follows the transcript, whether the input is inline or bottom-pinned.
+    // Only recognized trailing chrome may be skipped, never arbitrary progress text.
+    let mut history: Vec<_> = lines
+        .get(header_end.unwrap_or(0)..top)?
         .iter()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .collect();
-    let history: Vec<_> = lines
-        .get(if has_header { 4 } else { 0 }..status_start)?
-        .iter()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect();
-    // Blank status rows alone aren't idle evidence: an unfamiliar/shifted status
-    // may have fallen into history. Require a captured idle history ending too.
+    if header_end.is_some() {
+        skip_startup_notice(&mut history);
+    }
+    while history.last().is_some_and(|line| effort_status(line)) {
+        history.pop();
+    }
+    let status = match history.as_slice() {
+        [.., spinner, tip] if tip.starts_with("⎿ \u{a0}Tip: ") => Some(*spinner),
+        [.., last] => Some(*last),
+        [] => None,
+    };
     let idle_history = match history.last() {
-        None | Some(&"❯ /clear") => has_header,
+        None | Some(&"❯ /clear") => header_end.is_some(),
         Some(line) => spinner_body(line)
             .is_some_and(|body| body.contains(" for ") && body.contains(" · done ")),
     };
-    let running = status.iter().filter(|line| running_status(line)).count();
-    let known_status = status.iter().all(|line| {
-        running_status(line) || effort_status(line) || line.starts_with("⎿ \u{a0}Tip: ")
-    });
-    let turn = if running == 1 && known_status {
+    let turn = if status.is_some_and(running_status) {
         TurnState::Running
-    } else if running == 0 && status.iter().all(|line| effort_status(line)) && idle_history {
+    } else if idle_history {
         TurnState::NotRunning
     } else {
         TurnState::Unknown
     };
-    let fresh_editor = if has_header
+    let fresh_editor = if header_end.is_some()
         && turn == TurnState::NotRunning
         && input != InputState::Draft
         && matches!(history.as_slice(), [] | ["❯ /clear"])
@@ -186,6 +205,27 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
         dialog: DialogState::None,
         fresh_editor,
     })
+}
+
+fn skip_startup_notice(history: &mut Vec<&str>) {
+    // U5b's one-time auto-mode explanation is chrome, not conversation. Match the
+    // whole paragraph after joining wrapped rows, only immediately after the header.
+    let Some(end) = history
+        .iter()
+        .position(|line| *line == "▎ https://code.claude.com/docs/en/permission-modes")
+    else {
+        return;
+    };
+    let Some(rows) = history.get(..end) else {
+        return;
+    };
+    let paragraph = rows
+        .iter()
+        .filter_map(|line| line.strip_prefix("▎ "))
+        .collect::<Vec<_>>();
+    if paragraph.len() == rows.len() && paragraph.join(" ") == "Auto mode is now Claude Code's default permission mode. Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest." {
+        history.drain(..=end);
+    }
 }
 
 fn spinner_body(line: &str) -> Option<&str> {
@@ -295,6 +335,241 @@ mod tests {
                 observe_screen(text.trim_end_matches('\n'), None),
                 expected,
                 "{name} trimmed"
+            );
+        }
+    }
+
+    // These fixtures retain their individual Captured: labels; only the body is parser input.
+    macro_rules! u5b_capture {
+        ($name:literal) => {
+            include_str!(concat!(
+                "../tests/fixtures/screen_u5b_claude-",
+                $name,
+                "_2.1.325.txt"
+            ))
+            .split_once('\n')
+            .unwrap()
+            .1
+        };
+    }
+
+    #[test]
+    fn u5b_captured_screens() {
+        use FreshEditorEvidence::{Present, Unknown as NotFresh};
+        use InputState::{Draft, Empty, Unknown};
+        let mut cases = Vec::new();
+        macro_rules! case {
+            ($name:literal, $input:expr, $fresh:expr) => {
+                cases.push((
+                    $name,
+                    u5b_capture!($name),
+                    ScreenFacts {
+                        input: $input,
+                        turn: TurnState::NotRunning,
+                        dialog: DialogState::None,
+                        fresh_editor: $fresh,
+                    },
+                ));
+            };
+        }
+        // Plain-text suggestions and identical drafts are intentionally indistinguishable.
+        case!("poor-fresh", Empty, Present);
+        case!("poor-same-pattern-draft", Unknown, Present);
+        case!("poor-same-pattern-draft-cursor-start", Unknown, Present);
+        case!("poor-different-draft", Draft, NotFresh);
+        case!("poor-erased", Empty, Present);
+        case!("poor-after-clear", Empty, Present);
+        case!("poor-after-clear-same-pattern-draft", Unknown, Present);
+        case!("poor-after-clear-different-draft", Draft, NotFresh);
+        case!("poor-enabled-fresh", Unknown, Present);
+        case!("poor-enabled-same-text-draft", Unknown, Present);
+        case!(
+            "poor-enabled-same-text-draft-cursor-start",
+            Unknown,
+            Present
+        );
+        case!("poor-enabled-different-draft", Draft, NotFresh);
+        case!("poor-enabled-erased", Unknown, Present);
+        case!("poor-enabled-after-clear", Empty, Present);
+        case!("poor-enabled-after-clear-same-text-draft", Unknown, Present);
+        case!("poor-enabled-after-clear-different-draft", Draft, NotFresh);
+        case!("poor-enabled-after-clear-settled", Empty, Present);
+        case!("rich-fresh", Empty, Present);
+        case!("rich-same-pattern-draft", Unknown, Present);
+        case!("rich-different-draft", Draft, NotFresh);
+        case!("rich-erased", Empty, Present);
+        case!("rich-after-clear", Empty, Present);
+        case!("rich-after-clear-same-pattern-draft", Unknown, Present);
+        case!("rich-after-clear-different-draft", Draft, NotFresh);
+        case!("rich-enabled-fresh", Unknown, Present);
+        case!(
+            "rich-enabled-same-text-draft-cursor-start",
+            Unknown,
+            Present
+        );
+        case!("rich-enabled-different-draft", Draft, NotFresh);
+        case!("rich-enabled-erased", Unknown, Present);
+        case!("rich-enabled-after-clear", Empty, Present);
+        case!("rich-enabled-after-clear-same-text-draft", Unknown, Present);
+        case!("rich-enabled-after-clear-different-draft", Draft, NotFresh);
+        case!("rich-enabled-after-clear-settled", Empty, Present);
+        case!("rich-enabled-repeat-fresh", Unknown, Present);
+        case!("screen-with-colorterm-fresh", Empty, Present);
+        case!("screen-with-colorterm-different-draft", Draft, NotFresh);
+        case!("screen-with-colorterm-erased", Empty, Present);
+        case!("screen-with-colorterm-after-clear", Empty, Present);
+        case!(
+            "screen-with-colorterm-after-clear-same-pattern-draft",
+            Unknown,
+            Present
+        );
+        case!(
+            "screen-with-colorterm-after-clear-different-draft",
+            Draft,
+            NotFresh
+        );
+        case!("screen-with-colorterm-enabled-fresh", Unknown, Present);
+        case!(
+            "screen-with-colorterm-enabled-different-draft",
+            Draft,
+            NotFresh
+        );
+        case!("screen-with-colorterm-enabled-erased", Unknown, Present);
+        case!("screen-with-colorterm-enabled-after-clear", Empty, Present);
+        case!(
+            "screen-with-colorterm-enabled-after-clear-same-text-draft",
+            Unknown,
+            Present
+        );
+        case!(
+            "screen-with-colorterm-enabled-after-clear-different-draft",
+            Draft,
+            NotFresh
+        );
+        macro_rules! unsupported {
+            ($name:literal) => {
+                cases.push(($name, u5b_capture!($name), ScreenFacts::default()));
+            };
+        }
+        // Separate update/focus-warning footer rows are not the recognized single-line footer.
+        unsupported!("rich-enabled-same-text-draft");
+        unsupported!("screen-with-colorterm-same-pattern-draft");
+        unsupported!("screen-with-colorterm-enabled-same-text-draft");
+        unsupported!("screen-with-colorterm-enabled-same-text-draft-cursor-start");
+        assert_eq!(cases.len(), 49);
+        for (name, text, expected) in cases {
+            assert_eq!(observe_screen(text, None), expected, "{name}");
+            assert_eq!(
+                observe_screen(text.trim_end_matches('\n'), None),
+                expected,
+                "{name} trimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_notices_and_deleted_text_hint_preserve_facts() {
+        // Synthetic: each independent U5b footer feature applied to the U5 idle capture.
+        let footer = "⏵⏵ auto mode on (shift+tab to cycle)";
+        for suffix in [
+            "  ◐ medium · /effort",
+            "  ✘ Auto-update failed · Run claude doctor",
+            "\n  Ctrl+Y to paste deleted text",
+        ] {
+            let text = IDLE.replace(footer, &format!("{footer}{suffix}"));
+            assert_eq!(
+                observe_screen(&text, None),
+                ScreenFacts {
+                    input: InputState::Empty,
+                    turn: TurnState::NotRunning,
+                    dialog: DialogState::None,
+                    fresh_editor: FreshEditorEvidence::Unknown,
+                }
+            );
+        }
+        // Synthetic: unseparated prose is not a right-aligned notice; unknown hint is not chrome.
+        for suffix in [" novel footer", "\n  Novel dialog"] {
+            assert_eq!(
+                observe_screen(&IDLE.replace(footer, &format!("{footer}{suffix}")), None),
+                ScreenFacts::default()
+            );
+        }
+    }
+
+    #[test]
+    fn header_and_composer_are_located_by_chrome() {
+        // Synthetic: U5 cleared frame moved vertically, with cwd at HOME and variable borders.
+        for blank_rows in [0, 1, 6] {
+            for width in [80, 100, 120, 200] {
+                let compact = FRESH
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .replace("/tmp/u8a-fixture/cwd/claude", "~")
+                    .replace(&"─".repeat(120), &"─".repeat(width));
+                let text = format!("{}{compact}", "\n".repeat(blank_rows));
+                assert_eq!(
+                    observe_screen(&text, None),
+                    ScreenFacts {
+                        input: InputState::Empty,
+                        turn: TurnState::NotRunning,
+                        dialog: DialogState::None,
+                        fresh_editor: FreshEditorEvidence::Present,
+                    },
+                    "rows={blank_rows} width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idle_done_line_can_immediately_precede_the_input_box() {
+        // Synthetic: U5 after-clear's done line two rows above the input's upper border.
+        let lines: Vec<_> = IDLE.lines().collect();
+        let done = lines
+            .iter()
+            .position(|line| line.contains(" · done "))
+            .unwrap();
+        let border = lines
+            .iter()
+            .position(|line| line.starts_with("────"))
+            .unwrap();
+        let text = lines[..=done]
+            .iter()
+            .copied()
+            .chain([""])
+            .chain(lines[border..].iter().copied())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            observe_screen(&text, None),
+            ScreenFacts {
+                input: InputState::Empty,
+                turn: TurnState::NotRunning,
+                dialog: DialogState::None,
+                fresh_editor: FreshEditorEvidence::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn only_complete_startup_notice_is_excluded_from_history() {
+        // Synthetic: damage the U5b explanatory banner; unknown history cannot prove freshness.
+        let text = u5b_capture!("rich-fresh");
+        for damaged in [
+            text.replace("blocks the rest.", "Unrecognized operation…"),
+            text.replace("▎ https://code.claude.com/docs/en/permission-modes", ""),
+            format!("unknown transcript\n{text}"),
+        ] {
+            assert_eq!(
+                observe_screen(&damaged, None),
+                ScreenFacts {
+                    input: InputState::Empty,
+                    turn: TurnState::Unknown,
+                    dialog: DialogState::None,
+                    fresh_editor: FreshEditorEvidence::Unknown,
+                }
             );
         }
     }
@@ -527,11 +802,11 @@ mod tests {
     }
 
     #[test]
-    fn activity_outside_captured_status_region_does_not_prove_idle() {
-        // Synthetic: a shifted or partially redrawn status must not disappear into history.
+    fn status_is_located_by_chrome_not_distance_from_input() {
+        // Synthetic: vertical spacing doesn't hide a recognized spinner or imply idle.
         let border = "─".repeat(120);
         let shifted = capture!("before-escape").replacen(&border, &format!("\n\n\n\n{border}"), 1);
-        assert_eq!(observe_screen(&shifted, None).turn, TurnState::Unknown);
+        assert_eq!(observe_screen(&shifted, None).turn, TurnState::Running);
         let unfamiliar = IDLE.replace(
             "✻ Crunched for 1s · done 11:25",
             "Unrecognized active operation",

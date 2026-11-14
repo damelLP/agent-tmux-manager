@@ -1,0 +1,31 @@
+Captured: Claude Code 2.1.325, 2026-11-14, capture-pane -p; private tmux, 100x30; poor-enabled.
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   ~
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "create a util logging.py that..."
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                    ✘ Auto-update failed · Run claude doctor
+                                                                      Ctrl+Y to paste deleted text
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

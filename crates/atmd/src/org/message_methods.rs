@@ -171,6 +171,12 @@ mod tests {
         json!({"to":"owner","body":"","attachments":["literal/path"]})
     );
     bound!(
+        send_whitespace_only_body_needs_no_attachment,
+        "msg.send",
+        json!({"to":"owner","body":""}),
+        json!({"to":"owner","body":" \n\t "})
+    );
+    bound!(
         send_body_has_16_kib_utf8_byte_limit,
         "msg.send",
         json!({"to":"owner","body":format!("{}x", "é".repeat(8192))}),

@@ -28,7 +28,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
-        let mut services = MethodServices::new(spawn_registry());
+        Self::with_services(MethodServices::new(spawn_registry())).await
+    }
+
+    async fn with_services(mut services: MethodServices) -> Self {
         let mock = atm_tmux::MockTmuxClient::new();
         mock.set_next_raw_output("0 1\n");
         mock.set_next_pane_id("%42");
@@ -39,10 +42,6 @@ impl Server {
             CancellationToken::new(),
         );
         services.control = Some(control);
-        Self::with_services(services).await
-    }
-
-    async fn with_services(services: MethodServices) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let cancel = CancellationToken::new();

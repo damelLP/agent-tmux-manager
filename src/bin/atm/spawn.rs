@@ -178,21 +178,8 @@ pub(super) fn build_spawn_command(cwd: Option<&str>, model: Option<&str>) -> Str
     build_spawn_command_for_harness(&harness, cwd, model)
 }
 
-fn harness_spawn_env_key(harness: &SpawnHarnessDefinition, suffix: &str) -> String {
-    format!(
-        "ATM_SPAWN_{}_{}",
-        harness.id.replace('-', "_").to_ascii_uppercase(),
-        suffix
-    )
-}
-
 pub(super) fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
-}
-
-fn spawn_env_override(harness: &SpawnHarnessDefinition, suffix: &str) -> Option<String> {
-    let harness_key = harness_spawn_env_key(harness, suffix);
-    non_empty_env(&harness_key).or_else(|| non_empty_env(&format!("ATM_SPAWN_{suffix}")))
 }
 
 /// Build the shell command string sent to a freshly-split tmux pane.
@@ -232,8 +219,8 @@ pub(super) fn build_spawn_command_for_harness(
         harness.model_flag.as_deref(),
         cwd,
         model,
-        spawn_env_override(harness, "BIN").as_deref(),
-        spawn_env_override(harness, "ARGS").as_deref(),
+        control::spawn_env_override(&harness.id, "BIN", |key| std::env::var(key).ok()).as_deref(),
+        control::spawn_env_override(&harness.id, "ARGS", |key| std::env::var(key).ok()).as_deref(),
     )
 }
 

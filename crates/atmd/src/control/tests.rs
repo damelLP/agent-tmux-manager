@@ -314,6 +314,72 @@ async fn typing_failure_does_not_submit_the_command() {
 }
 
 #[test]
+fn spawn_override_prefers_nonempty_specific_value_without_trimming() {
+    for (specific, global, expected) in [
+        (None, None, None),
+        (Some("specific"), Some("global"), Some("specific")),
+        (None, Some("global"), Some("global")),
+        (Some(""), Some("global"), Some("global")),
+        (Some(""), Some(""), None),
+        (None, Some(""), None),
+        (Some("specific"), None, Some("specific")),
+        (Some("   "), Some("global"), Some("   ")),
+        (None, Some("  global  "), Some("  global  ")),
+    ] {
+        let env = std::collections::HashMap::from([
+            ("ATM_SPAWN_CLAUDE_BIN", specific),
+            ("ATM_SPAWN_BIN", global),
+        ]);
+        assert_eq!(
+            super::spawn_env_override("claude", "BIN", |key| {
+                env.get(key).copied().flatten().map(str::to_string)
+            })
+            .as_deref(),
+            expected,
+            "specific={specific:?}, global={global:?}"
+        );
+    }
+}
+
+#[test]
+fn spawn_override_normalizes_harness_ids_and_selects_each_suffix_independently() {
+    let env = std::collections::HashMap::from([
+        ("ATM_SPAWN_MY_AGENT_BIN", "custom"),
+        ("ATM_SPAWN_BIN", "global"),
+        ("ATM_SPAWN_ARGS", "global args"),
+        ("ATM_SPAWN_PI_ARGS", "  x pi  "),
+    ]);
+    for (harness, suffix, expected) in [
+        ("my-agent", "BIN", "custom"),
+        ("my-agent", "ARGS", "global args"),
+        ("pi", "BIN", "global"),
+        ("pi", "ARGS", "  x pi  "),
+    ] {
+        assert_eq!(
+            super::spawn_env_override(harness, suffix, |key| {
+                env.get(key).map(|value| (*value).to_string())
+            })
+            .as_deref(),
+            Some(expected),
+            "{harness} {suffix}"
+        );
+    }
+}
+
+#[test]
+fn spawn_override_whitespace_args_mask_global_args() {
+    let env =
+        std::collections::HashMap::from([("ATM_SPAWN_PI_ARGS", "   "), ("ATM_SPAWN_ARGS", "x pi")]);
+    assert_eq!(
+        super::spawn_env_override("pi", "ARGS", |key| {
+            env.get(key).map(|value| (*value).to_string())
+        })
+        .as_deref(),
+        Some("   ")
+    );
+}
+
+#[test]
 fn pure_builder_preserves_defaults_overrides_quoting_and_raw_arguments() {
     let defaults = ["--profile".into(), "a b".into()];
     assert_eq!(

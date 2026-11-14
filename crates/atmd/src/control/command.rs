@@ -1,5 +1,25 @@
 //! Pure shell command construction from resolved config and spawn overrides.
 
+/// Resolve a spawn override using the caller's environment reader.
+/// `harness_id` is canonical; its uppercase form replaces hyphens with underscores.
+/// A nonempty harness-specific value wins over the global value. Whitespace is
+/// preserved, and an absent or empty value falls back. BIN and ARGS are independent.
+#[must_use]
+pub fn spawn_env_override(
+    harness_id: &str,
+    suffix: &str,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    let harness_key = format!(
+        "ATM_SPAWN_{}_{}",
+        harness_id.replace('-', "_").to_ascii_uppercase(),
+        suffix
+    );
+    lookup(&harness_key)
+        .filter(|s| !s.is_empty())
+        .or_else(|| lookup(&format!("ATM_SPAWN_{suffix}")).filter(|s| !s.is_empty()))
+}
+
 /// POSIX shell-quote `s` by single-quoting and escaping embedded `'`.
 /// Result is exactly one shell token regardless of spaces or specials.
 #[must_use]

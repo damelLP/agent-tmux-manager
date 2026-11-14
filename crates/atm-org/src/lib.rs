@@ -73,6 +73,7 @@
 
 mod command;
 mod config;
+pub mod delivery;
 mod event;
 mod ids;
 mod replay;

@@ -210,34 +210,41 @@ async fn watch_refused_unwatch_noop_and_legacy_traffic_unchanged() {
 }
 
 #[tokio::test]
-async fn info_methods_match_handshake_and_registered_names_with_injected_services() {
+async fn info_methods_match_handshake_and_registered_names_with_default_and_injected_services() {
     let dir = tempfile::tempdir().unwrap();
-    let mut services = MethodServices::new(spawn_registry());
-    services.state_dir = Some(dir.path().to_owned());
-    let names = router(services.clone()).unwrap().names();
-    assert!(names.iter().any(|name| name == "daemon.info"));
-    let server = Server::with_services(services).await;
-    let mut client = server.client().await;
-    let connected = client.connect().await;
-    client
-        .send(
-            serde_json::to_value(ClientMessage::request(
-                "info".into(),
-                "daemon.info".into(),
-                json!({}),
-                None,
-            ))
-            .unwrap(),
-        )
-        .await;
-    let response = client.recv().await;
-    assert_eq!(response["result"]["methods"], connected["methods"]);
-    assert_eq!(connected["methods"], json!(names));
-    assert_eq!(response["result"]["protocol"], "1.1");
-    assert_eq!(response["result"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(response["result"]["state_dir"], json!(dir.path()));
-    client.require_next_pong().await;
-    server.stop().await;
+    for injected in [false, true] {
+        let mut services = MethodServices::new(spawn_registry());
+        let expected_dir = if injected {
+            services.state_dir = dir.path().to_owned();
+            dir.path().to_owned()
+        } else {
+            atmd::eventlog::state_dir()
+        };
+        let names = router(services.clone()).unwrap().names();
+        assert!(names.iter().any(|name| name == "daemon.info"));
+        let server = Server::with_services(services).await;
+        let mut client = server.client().await;
+        let connected = client.connect().await;
+        client
+            .send(
+                serde_json::to_value(ClientMessage::request(
+                    "info".into(),
+                    "daemon.info".into(),
+                    json!({}),
+                    None,
+                ))
+                .unwrap(),
+            )
+            .await;
+        let response = client.recv().await;
+        assert_eq!(response["result"]["methods"], connected["methods"]);
+        assert_eq!(connected["methods"], json!(names));
+        assert_eq!(response["result"]["protocol"], "1.1");
+        assert_eq!(response["result"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(response["result"]["state_dir"], json!(expected_dir));
+        client.require_next_pong().await;
+        server.stop().await;
+    }
 }
 
 #[tokio::test]

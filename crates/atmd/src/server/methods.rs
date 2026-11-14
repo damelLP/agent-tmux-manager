@@ -22,15 +22,15 @@ use serde_json::Value;
 #[derive(Clone)]
 pub struct MethodServices {
     pub registry: RegistryHandle,
-    /// None while persistent state is unavailable; tests can inject a private path.
-    pub state_dir: Option<PathBuf>,
+    /// Resolved once at server setup; tests can inject a private path.
+    pub state_dir: PathBuf,
 }
 
 impl MethodServices {
     pub fn new(registry: RegistryHandle) -> Self {
         Self {
             registry,
-            state_dir: None,
+            state_dir: crate::eventlog::state_dir(),
         }
     }
 }
@@ -150,25 +150,17 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     let mut names = router.names();
     names.push("daemon.info".into());
     names.sort();
-    let info = services.state_dir.map(|state_dir| {
-        serde_json::json!({
-            "protocol": ProtocolVersion::CURRENT.to_string(),
-            "version": env!("CARGO_PKG_VERSION"),
-            "methods": names,
-            "state_dir": state_dir,
-        })
+    let info = serde_json::json!({
+        "protocol": ProtocolVersion::CURRENT.to_string(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "methods": names,
+        "state_dir": services.state_dir,
     });
     router.register("daemon.info", Duration::from_secs(5), move |_, params| {
         let info = info.clone();
         async move {
             parse_params::<InfoParams>(params)?;
-            // U2 will provide the default state_dir; injected services work now.
-            info.ok_or_else(|| {
-                MethodError::new(
-                    error_code::UNAVAILABLE,
-                    "daemon information is not available yet",
-                )
-            })
+            Ok(info)
         }
     })?;
     Ok(router)
@@ -301,13 +293,9 @@ mod tests {
             assert_eq!(error.0.code, "invalid_params");
             assert!(!error.0.message.is_empty());
         }
-        // U2 supplies state_dir later; valid params must already get past parsing.
         for params in [Value::Null, json!({})] {
-            let error = router
-                .call(context(), "daemon.info", params)
-                .await
-                .unwrap_err();
-            assert_eq!(error.0.code, "unavailable");
+            let info = router.call(context(), "daemon.info", params).await.unwrap();
+            assert_eq!(info["state_dir"], json!(crate::eventlog::state_dir()));
         }
     }
 }

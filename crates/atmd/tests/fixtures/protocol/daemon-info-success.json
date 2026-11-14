@@ -1,0 +1,20 @@
+{
+  "request": {
+    "protocol_version": { "major": 1, "minor": 1 },
+    "type": "request",
+    "id": "info",
+    "method": "daemon.info",
+    "params": {}
+  },
+  "response": {
+    "type": "response",
+    "id": "info",
+    "result": {
+      "protocol": "1.1",
+      "version": "ignored",
+      "methods": [],
+      "state_dir": "ignored"
+    }
+  },
+  "ignore": ["/result/version", "/result/state_dir", "/result/methods"]
+}

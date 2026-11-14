@@ -425,8 +425,10 @@ impl ControlHandle {
     /// Includes metadata, local tag, viewport (-N, optionally styled), focus and
     /// neutral process facts. Captures of one pane are paced at least 250ms apart,
     /// including guarded input, without blocking other panes. No cached frame is
-    /// returned. The scheduler bounds pending captures and recent pane keys to
-    /// 32 each; overflow is Unavailable. The original 30-second deadline includes
+    /// returned. At most 32 captures wait per pane, across at most 32 recent pane
+    /// keys. Overflow is PacingRefused (nothing was sent); a burst on one pane
+    /// cannot fill another pane's wait list. Await each observation rather than
+    /// repeatedly dropping/reissuing it. The original 30-second deadline includes
     /// pacing/queue time.
     /// U8 owns any spawn/adopt shell identity baseline and its interpretation;
     /// a command-name match alone is not positive process identity evidence.
@@ -781,6 +783,7 @@ impl Reservation {
 /// | Busy | Before effect (admission) | Before effect (admission) |
 /// | StaleReservation | Before effect | Before effect |
 /// | ScreenChanged | Before effect | Before effect |
+/// | PacingRefused | Before effect | Before effect |
 /// | TagMismatch | Before effect | Before effect |
 /// | PaneGone | Before effect | Before effect |
 /// | InvalidObservation | Before effect | Before effect |
@@ -818,6 +821,10 @@ pub enum ReservationError {
     /// Before effect: the fresh predicate rejected (or panicked); no input sent.
     #[error("pane {pane} no longer passes the approved screen check; nothing was sent")]
     ScreenChanged { pane: PaneId },
+    /// Before effect: capture pacing capacity refused this call. Nothing was sent
+    /// or mutated; retry after pending observations drain, not by flooding the queue.
+    #[error("capture pacing refused pane {pane}; nothing was sent")]
+    PacingRefused { pane: PaneId },
     /// Before effect: mutation-time local tag did not match the expectation.
     #[error("pane {pane} tag mismatch: expected {expected}, found {}", actual.as_deref().unwrap_or("absent"))]
     TagMismatch {

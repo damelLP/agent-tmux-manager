@@ -277,15 +277,17 @@ impl Queue {
             .find(|other| *other != id)
     }
 
-    /// The reservation first, else the FIFO head while it is older than `id`.
+    /// The reservation first, else the older FIFO head if `id` is not itself
+    /// in flight: its retry must not wait on an unattempted head.
     /// Either one is the policy's veto (`other_delivery_in_flight`), so a
     /// follower is answered `Wait(OtherDelivery)` and `Consumed` refuses its
     /// paste: FIFO holds before any first attempt too. That wait is no hold:
     /// a follower's readiness budget and stale-blocker bound start when it
     /// becomes the head, not while it waits its turn.
     fn blocked_by(&self, id: MessageId) -> Option<MessageId> {
-        self.other_in_flight(id)
-            .or(self.head.filter(|head| *head < id))
+        self.other_in_flight(id).or(self
+            .head
+            .filter(|head| *head < id && !self.in_flight.contains(&Some(id))))
     }
 }
 

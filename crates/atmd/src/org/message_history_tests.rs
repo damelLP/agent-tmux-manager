@@ -1888,6 +1888,54 @@ fn consume_of(f: &mut Fixture, id: MessageId, ms: i64) -> DeliveryStep {
 }
 
 #[test]
+fn attempted_follower_retries_without_stalling_the_unattempted_head() {
+    // A log from a writer that did not consume PasteNow can contain this
+    // ordering. The attempted follower owns the reservation, not the FIFO head.
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    let follower = MessageId::new(f.seq);
+    f.observe(observation(SessionStatus::Idle), 0);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: follower,
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        20_000,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: follower,
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        30_000,
+    );
+    for ms in [100_000, 1_000_000, 100_000_000] {
+        f.observe(observation(SessionStatus::Idle), ms);
+        wait(f.step(ms), WaitReason::OtherDelivery);
+        assert_eq!(f.snapshot(ms).blocked_by, Some(follower));
+        assert_eq!(
+            consume_of(&mut f, follower, ms),
+            DeliveryStep::PasteNow { attempt: 2 }
+        );
+        assert_eq!(
+            f.history.snapshot(follower, at(ms)).unwrap().blocked_by,
+            None
+        );
+    }
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: follower,
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        },
+        100_000_001,
+    );
+    assert_eq!(f.step(100_000_001), DeliveryStep::PasteNow { attempt: 1 });
+}
+
+#[test]
 fn two_unattempted_messages_are_pasted_in_fifo_order() {
     let mut f = Fixture::new(0);
     f.apply(OrgEvent::MessageSent(content(agent())), 0);

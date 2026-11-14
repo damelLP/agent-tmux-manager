@@ -1,5 +1,34 @@
 # Codex screen fixtures
 
+## Lifecycle control observations (B0)
+
+Captured: codex-cli 0.167.0, 2026-11-14, sealed P1 private-tmux
+`capture-pane -p -e -N`. `screen_control_p1_<stem>_0.167.0.txt` maps to
+`<stem>.styled.txt` (retained spaces despite its filename); `.plain.txt` and
+`.meta.json` accompany the original captures. Private run roots alone become
+equal-width `/tmp/xxx…` paths; attributes, rows, spaces and composers remain.
+Tests remove the provenance label, not terminal rows.
+
+Control tests cover a02/a10/a17 default Review hooks; a14/a16 Folder access;
+b27/b31/b35/b38 current-worktree selection; a04 pending and a05/a06 trusted
+hook pages; b12 conversation, plus existing styled working/fresh fixtures.
+The update prompt uses the existing U5 startup/restart-startup Plain captures:
+U5's control-plane findings verified Escape skips that launch; P1's sealed
+probe could not provoke an update prompt. No styled update evidence is claimed.
+Warnings is Blocked, not LaunchSkip; unsupported modals stay Unknown.
+
+All three real hook pages show eight of eleven rows with a down indicator.
+There is NO real complete/lower-page capture or upper marker; those layouts
+remain unsupported. Complete-set validation tests are marked Synthetic data,
+not invented accepted screens. Pending requires Installed=1, Active in {0,1},
+Review=1-Active and the exact trust-all footer. Trusted omits Review, requires
+Active=1, no review banner and the details footer. Missing/duplicate/extra
+complete-set names refuse. Counts/event names cannot establish command identity:
+a foreign replacement with identical event/count is undetectable. Page traversal
+and sending literal t are not implemented here. Descriptions validate grammar,
+not identity. Existing legacy observations/tests and Worked-line parsing stay
+unchanged; the older limitations below describe that legacy observer.
+
 ## Styled fixtures (U8d)
 
 Captured: codex-cli 0.167.0, 2026-11-14, U5b private tmux 100x30

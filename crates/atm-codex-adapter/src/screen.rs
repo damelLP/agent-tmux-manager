@@ -33,6 +33,9 @@
 //! captures from different operations are byte-identical. Consumers own operation
 //! transitions, pane/process identity, live viewport, copy-mode and temporal checks.
 
+mod control;
+pub use control::{observe_control_screen, validate_hook_list, CONTROL_POLICY};
+
 use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,

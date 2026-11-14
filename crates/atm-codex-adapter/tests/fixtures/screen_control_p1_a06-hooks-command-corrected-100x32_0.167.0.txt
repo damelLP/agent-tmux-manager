@@ -1,0 +1,33 @@
+Captured: codex 0.167.0, 2026-11-14, sealed private-tmux retained-space styled capture; paths sanitized.
+[1;2m[48;5;8m› [0m[48;5;8mB_FIRST_AFTER_NEW                                                                                 
+[49m                                                  
+[1m[38;5;1m•[0m Hook failed                                     
+  └ hook exited with code 126                     
+                                                                                                    
+[2m• [0mPROBE_REPLY_1                                                                                     
+                                                                                                    
+[1m[38;5;1m•[0m Hook failed                                                                                       
+  └ hook exited with code 126                                                                       
+                                                                                                    
+[2m  Worked for <1s • 16:30                                                                            
+[0m                                                                                                    
+                                                                                                    
+  [1mHooks[0m                                                                                             
+  [2mLifecycle hooks from config and enabled plugins.[0m                                                  
+                                                                                                    
+  [1mIssues[0m                                                                                            
+  ⚠ clamping SessionEnd hook timeout to 3s in /tmp/xxxxxxxxxxxxxxxxxxxxxx/codex/hooks.json          
+                                                                                                    
+  Event                 Installed   Active      Description                                         
+                                                                                                    
+[1;7m› PreToolUse            1           1           Before a tool executes                              
+[0m  PermissionRequest     [2m1           1           When permission is requested[0m                        
+  PostToolUse           [2m1           1           After a tool executes[0m                               
+  PreCompact            [2m1           1           Before context compaction[0m                           
+  PostCompact           [2m1           1           After context compaction[0m                            
+  SessionStart          [2m1           1           When a new session starts[0m                           
+  SessionEnd            [2m1           1           Right before a session ends[0m                         
+  UserPromptSubmit      [2m1           1           When the user submits a prompt[0m                      
+[38;2;99;168;248m↓[39m                        
+                                                                                                    
+  [1menter[0;2m details · [0;1mesc[0;2m close                                                                         

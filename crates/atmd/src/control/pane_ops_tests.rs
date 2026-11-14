@@ -90,6 +90,27 @@ fn reservation_decodes_real_tmux_frames_and_preserves_whitespace_style() {
     }
 }
 #[test]
+fn reservation_focus_accepts_real_key_value_client_flags() {
+    for fixture in [
+        include_str!("fixtures/tmux_3.6_clients.json"),
+        include_str!("fixtures/tmux_3.8_clients.json"),
+    ] {
+        let data: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        for key in ["attached", "paused"] {
+            let line = data[key].as_str().unwrap();
+            assert_eq!(
+                decode_focus(&PaneId::parse("%0").unwrap(), line),
+                Some(true)
+            );
+            assert_eq!(
+                decode_focus(&PaneId::parse("%7").unwrap(), line),
+                Some(false)
+            );
+        }
+    }
+}
+
+#[test]
 fn reservation_focus_is_exact_and_malformed_clients_are_unknown() {
     let pane = PaneId::parse("%0").unwrap();
     let data = fixture();

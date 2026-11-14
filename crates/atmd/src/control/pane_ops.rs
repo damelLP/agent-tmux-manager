@@ -557,10 +557,16 @@ fn decode_focus(pane: &PaneId, output: &str) -> Option<bool> {
         let target = PaneId::parse(target).ok()?;
         let mut client_focused = false;
         for flag in flags.split(',') {
-            if flag.is_empty()
-                || !flag
+            let (name, value) = flag
+                .split_once('=')
+                .map_or((flag, None), |(name, value)| (name, Some(value)));
+            if name.is_empty()
+                || !name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || value.is_some_and(|value| {
+                    value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic())
+                })
             {
                 return None;
             }

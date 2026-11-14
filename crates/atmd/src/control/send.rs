@@ -59,6 +59,17 @@ pub(super) async fn send_resolved(
     pane_id: &str,
     text: &str,
 ) -> Result<String, ControlError> {
+    check_send(client, sessions, target, pane_id, text).await?;
+    paste_and_submit(client, pane_id, text).await
+}
+
+pub(super) async fn check_send(
+    client: &(impl TmuxClient + ?Sized),
+    sessions: &[SessionView],
+    target: &str,
+    pane_id: &str,
+    text: &str,
+) -> Result<(), ControlError> {
     let pane_state = client
         .raw_command(
             "display-message",
@@ -75,6 +86,14 @@ pub(super) async fn send_resolved(
             reason,
         });
     }
+    Ok(())
+}
+
+pub(super) async fn paste_and_submit(
+    client: &(impl TmuxClient + ?Sized),
+    pane_id: &str,
+    text: &str,
+) -> Result<String, ControlError> {
     client
         .paste_text(pane_id, text)
         .await

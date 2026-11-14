@@ -284,6 +284,41 @@ async fn agent_cli_parse_failures_exit_two_without_connecting() {
             cases.push(vec!["agent", action, id]);
         }
     }
+    for action in ["up", "adopt"] {
+        for name in [
+            "",
+            "../lead",
+            "a/b",
+            "Lead",
+            "léad",
+            "-lead",
+            " lead",
+            "owner",
+            "system",
+            "012345678901234567890123456789012",
+        ] {
+            let mut args = vec!["agent", action, name];
+            if action == "adopt" {
+                args.push("%7");
+            }
+            cases.push(args);
+        }
+    }
+    for pane in [
+        "%00",
+        "%07",
+        "7",
+        "%",
+        "%+7",
+        "%-7",
+        "%٧",
+        " %7",
+        "%7\n",
+        "%7; kill-pane",
+        "session:0.1",
+    ] {
+        cases.push(vec!["agent", "adopt", "lead", pane]);
+    }
     for args in cases {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("rpc.sock");

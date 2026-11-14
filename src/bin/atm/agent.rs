@@ -23,6 +23,7 @@ pub enum AgentListFormat {
 #[derive(Debug, Subcommand)]
 pub enum AgentAction {
     Up {
+        #[arg(value_parser = parse_name)]
         name: String,
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -30,7 +31,9 @@ pub enum AgentAction {
         format: AgentFormat,
     },
     Adopt {
+        #[arg(value_parser = parse_name)]
         name: String,
+        #[arg(value_parser = parse_pane)]
         pane: String,
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -62,6 +65,20 @@ pub enum AgentAction {
         #[arg(long, value_enum, default_value = "table")]
         format: AgentListFormat,
     },
+}
+
+fn parse_name(name: &str) -> Result<String, String> {
+    "validation"
+        .parse()
+        .and_then(|project| AgentId::new(project, name))
+        .map(|agent| agent.name)
+        .map_err(|error| error.to_string())
+}
+
+fn parse_pane(pane: &str) -> Result<String, String> {
+    atmd::control::reservation::PaneId::parse(pane)
+        .map(|pane| pane.to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn absolute_root(root: Option<PathBuf>) -> io::Result<PathBuf> {

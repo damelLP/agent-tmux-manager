@@ -103,6 +103,63 @@ mod agent_contract_tests {
     }
 
     #[test]
+    fn agent_names_are_validated_by_clap() {
+        for action in ["up", "adopt"] {
+            for (name, valid) in [
+                ("", false),
+                ("../lead", false),
+                ("a/b", false),
+                ("Lead", false),
+                ("léad", false),
+                ("-lead", false),
+                (" lead", false),
+                ("owner", false),
+                ("system", false),
+                ("012345678901234567890123456789012", false),
+                ("lead-", true),
+                ("0", true),
+                ("01234567890123456789012345678901", true),
+            ] {
+                let mut args = vec!["atm", "agent", action, name];
+                if action == "adopt" {
+                    args.push("%0");
+                }
+                let result = Args::try_parse_from(args);
+                assert_eq!(result.is_ok(), valid, "{action}: {name:?}");
+                if let Err(error) = result {
+                    assert_eq!(error.exit_code(), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_panes_are_validated_by_clap() {
+        for (pane, valid) in [
+            ("%0", true),
+            ("%7", true),
+            ("%123456789012345678901234567890", true),
+            ("%00", false),
+            ("%07", false),
+            ("7", false),
+            ("%", false),
+            ("%+7", false),
+            ("%-7", false),
+            ("%٧", false),
+            (" %7", false),
+            ("%7\n", false),
+            ("%7; kill-pane", false),
+            ("session:0.1", false),
+        ] {
+            let result = Args::try_parse_from(["atm", "agent", "adopt", "lead", pane]);
+            assert_eq!(result.is_ok(), valid, "{pane:?}");
+            if let Err(error) = result {
+                assert_eq!(error.exit_code(), 2);
+            }
+        }
+    }
+
+    #[test]
     fn clear_rejects_bad_ids_and_timeout_bounds() {
         for args in [
             vec!["atm", "agent", "clear", "lead"],

@@ -171,7 +171,7 @@ fn known_dialog(lines: &[&str]) -> bool {
     if update_prompt(&body) {
         return true;
     }
-    match body.as_slice() {
+    matches!(body.as_slice(),
         [.., title, message, "k keep & next · esc dismiss & close · ^o copy · ←/→ warning"]
             if !message.is_empty()
                 && title
@@ -180,12 +180,8 @@ fn known_dialog(lines: &[&str]) -> bool {
                     .and_then(|s| s.split_once(" of "))
                     .is_some_and(|(index, total)| {
                         positive_integer(index) && positive_integer(total)
-                    }) =>
-        {
-            true
-        }
-        _ => false,
-    }
+                    })
+    )
 }
 
 fn update_prompt(body: &[&str]) -> bool {

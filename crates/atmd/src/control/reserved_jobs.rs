@@ -165,7 +165,7 @@ pub(in crate::control) enum Command {
     },
     Drain {
         fence: Fence,
-        reply: oneshot::Sender<Result<Option<Arc<KillAudit>>, ReservationError>>,
+        reply: oneshot::Sender<Result<Vec<Arc<KillAudit>>, ReservationError>>,
     },
     Cleanup {
         fence: Fence,
@@ -202,7 +202,7 @@ pub(in crate::control) struct Jobs {
     task_ids: HashMap<Id, OperationId>,
     cancel: CancellationToken,
     audit_queue: crate::control::service::AuditQueue,
-    kill_audits: HashMap<OperationId, Arc<KillAudit>>,
+    kill_audits: HashMap<OperationId, Vec<Arc<KillAudit>>>,
 }
 
 impl Jobs {
@@ -249,6 +249,10 @@ impl Jobs {
                 reply,
             } => {
                 let audit = action.audit();
+                if let Some(pending) = self.kill_audits.get_mut(&fence.operation) {
+                    pending.retain(|ack| ack.pending());
+                }
+                let mut permit = None;
                 let mut result = match self
                     .state
                     .check(&fence, None, now)
@@ -261,34 +265,56 @@ impl Jobs {
                             && self
                                 .kill_audits
                                 .get(&fence.operation)
-                                .is_some_and(|audit| audit.pending()) =>
+                                .is_some_and(|audits| audits.len() >= 2) =>
                     {
                         Err(ReservationError::InvalidRequest {
-                            reason: "await the previous kill audit before killing another pane"
-                                .into(),
+                            reason: "at most two pending kill audits per job".into(),
                         })
                     }
-                    Ok(work_deadline) => tokio::time::timeout_at(
-                        deadline.min(work_deadline),
-                        super::pane_ops::execute(client, &mut self.state, &fence, action, now),
-                    )
-                    .await
-                    .unwrap_or(Err(ReservationError::Timeout)),
+                    Ok(work_deadline) => {
+                        let reserved = audit
+                            .as_ref()
+                            .map(|_| self.audit_queue.reserve())
+                            .transpose();
+                        match reserved {
+                            Err(error) => Err(error),
+                            Ok(slot) => {
+                                permit = slot;
+                                tokio::time::timeout_at(
+                                    deadline.min(work_deadline),
+                                    super::pane_ops::execute(
+                                        client,
+                                        &mut self.state,
+                                        &fence,
+                                        action,
+                                        now,
+                                    ),
+                                )
+                                .await
+                                .unwrap_or(Err(ReservationError::Timeout))
+                            }
+                        }
+                    }
                 };
                 if result.is_ok() {
-                    if let Some((command, time)) = audit {
-                        let ack = KillAudit::submit(&self.audit_queue, command, time);
-                        self.kill_audits.insert(fence.operation, ack.clone());
+                    if let (Some((command, time)), Some(permit)) = (audit, permit) {
+                        let ack = KillAudit::submit(permit, command, time);
+                        self.kill_audits
+                            .entry(fence.operation)
+                            .or_default()
+                            .push(ack.clone());
                         result = Ok(super::pane_ops::Output::Audit(ack));
                     }
                 }
                 let _ = reply.send(result);
             }
             Command::Drain { fence, reply } => {
-                let result = self
-                    .state
-                    .check(&fence, None, now)
-                    .map(|()| self.kill_audits.get(&fence.operation).cloned());
+                let result = self.state.check(&fence, None, now).map(|()| {
+                    self.kill_audits
+                        .get(&fence.operation)
+                        .cloned()
+                        .unwrap_or_default()
+                });
                 let _ = reply.send(result);
             }
             Command::Cleanup {

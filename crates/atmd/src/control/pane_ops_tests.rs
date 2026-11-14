@@ -90,6 +90,30 @@ fn reservation_decodes_real_tmux_frames_and_preserves_whitespace_style() {
     }
 }
 #[test]
+fn reservation_grouped_panes_agree_and_mode_count_is_not_boolean() {
+    let data = fixture();
+    let pane = PaneId::parse("%0").unwrap();
+    let metadata = data["filtered_list"].as_str().unwrap();
+    let first = decode_metadata(&pane, metadata).unwrap();
+    let linked = metadata.replace(
+        &format!(
+            "\t{}\t{}\t",
+            first.pane.session_name, first.pane.window_index
+        ),
+        "\tlinked\t99\t",
+    );
+    assert_eq!(
+        decode_metadata(&pane, &format!("{metadata}{linked}")).unwrap(),
+        first
+    );
+    assert!(
+        decode_metadata(&pane, &metadata.replace("\t0\t0\t0\t5", "\t0\t2\t0\t5"))
+            .unwrap()
+            .in_mode
+    );
+}
+
+#[test]
 fn reservation_rejects_malformed_metadata_and_incomplete_framing() {
     let data = fixture();
     let pane = PaneId::parse("%0").unwrap();
@@ -99,8 +123,9 @@ fn reservation_rejects_malformed_metadata_and_incomplete_framing() {
         metadata.replace("\t40\t", "\t0\t"),
         metadata.replace("\t5\t1\n", "\t5\t8\n"),
         metadata.replace("%0", "%00"),
-        metadata.replace("\t0\t0\t0\t5", "\t0\t2\t0\t5"),
-        format!("{metadata}{metadata}"),
+        metadata.replace("\t0\t0\t0\t5", "\t0\tbad\t0\t5"),
+        format!("{metadata}{}", metadata.replace("2353666", "2353667")),
+        format!("{metadata}{}", metadata.replace("%0", "%1")),
         data["missing_display"].as_str().unwrap().into(),
         metadata.trim_end().into(),
     ] {

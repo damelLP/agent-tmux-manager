@@ -1,6 +1,6 @@
 //! Shared acknowledgement: dropping an individual kill future never drops the
 //! actor-owned receiver. Work/cleanup await it outside the tmux actor.
-use crate::{control::service::AuditQueue, eventlog::Envelope, org::OrgServiceError};
+use crate::{control::service::AuditPermit, eventlog::Envelope, org::OrgServiceError};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
@@ -10,16 +10,16 @@ pub(in crate::control) struct KillAudit(Mutex<Option<Acknowledgement>>);
 
 impl KillAudit {
     pub(super) fn submit(
-        queue: &AuditQueue,
+        permit: AuditPermit,
         command: atm_org::OrgCommand,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Arc<Self> {
         let (ack, receive) = oneshot::channel();
-        queue.submit(command, now, Some(ack));
+        permit.submit(command, now, ack);
         Arc::new(Self(Mutex::new(Some(receive))))
     }
 
-    /// Never block the tmux actor. At most one unacknowledged kill per job.
+    /// Never block the tmux actor. Jobs retain at most two pending kills.
     pub(super) fn pending(&self) -> bool {
         self.0.try_lock().map_or(true, |pending| pending.is_some())
     }

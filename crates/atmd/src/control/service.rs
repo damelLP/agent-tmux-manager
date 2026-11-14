@@ -456,6 +456,15 @@ pub enum ServiceError {
     ServerRefused(String),
 }
 
+fn reservation_error(error: ServiceError) -> ReservationError {
+    match error {
+        ServiceError::Timeout => ReservationError::Timeout,
+        ServiceError::Unavailable => ReservationError::Unavailable,
+        ServiceError::Control(error) => error.into(),
+        ServiceError::ServerRefused(reason) => ReservationError::InvalidRequest { reason },
+    }
+}
+
 type Reply<T> = oneshot::Sender<Result<T, ServiceError>>;
 
 enum Request {
@@ -501,7 +510,32 @@ pub struct AuditQueue {
     dropped: Arc<AtomicU64>,
 }
 
+pub(in crate::control) struct AuditPermit(mpsc::OwnedPermit<Audit>);
+
+impl AuditPermit {
+    pub(in crate::control) fn submit(
+        self,
+        command: OrgCommand,
+        now: chrono::DateTime<chrono::Utc>,
+        acknowledgement: AuditAcknowledgement,
+    ) {
+        self.0.send(Audit::Record {
+            command: Box::new(command),
+            now,
+            acknowledgement: Some(acknowledgement),
+        });
+    }
+}
+
 impl AuditQueue {
+    pub(in crate::control) fn reserve(&self) -> Result<AuditPermit, ReservationError> {
+        self.sender
+            .clone()
+            .try_reserve_owned()
+            .map(AuditPermit)
+            .map_err(|_| ReservationError::Unavailable)
+    }
+
     /// Capture time at the effect, not when persistence eventually catches up.
     /// Optional acknowledgement is awaited by callers outside the control actor.
     pub fn submit(
@@ -815,7 +849,7 @@ where
                                 if let Some(server) = server {
                                     let budget = deadline.min(Instant::now() + ACTION_TIMEOUT);
                                     if let Err(error) = outcome(budget, verify_server(&*client, server, "reserve pane control".into())).await {
-                                        command.reject_with(ReservationError::InvalidRequest { reason: error.to_string() });
+                                        command.reject_with(reservation_error(error));
                                         continue;
                                     }
                                 }

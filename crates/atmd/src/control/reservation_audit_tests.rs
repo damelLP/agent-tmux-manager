@@ -41,6 +41,21 @@ fn now() -> chrono::DateTime<chrono::Utc> {
     "2001-02-03T04:05:06Z".parse().unwrap()
 }
 
+#[test]
+fn reserved_identity_errors_preserve_operational_categories() {
+    assert!(matches!(
+        reservation_error(ServiceError::Timeout),
+        ReservationError::Timeout
+    ));
+    assert!(matches!(
+        reservation_error(ServiceError::Unavailable),
+        ReservationError::Unavailable
+    ));
+    assert!(
+        matches!(reservation_error(ServiceError::ServerRefused("different socket".into())), ReservationError::InvalidRequest { reason } if reason == "different socket")
+    );
+}
+
 #[tokio::test]
 async fn reserved_server_identity_mismatch_rejects_before_callbacks_or_effects() {
     let dir = tempfile::tempdir().unwrap();
@@ -72,6 +87,150 @@ async fn reserved_server_identity_mismatch_rejects_before_callbacks_or_effects()
     assert_eq!(mock.call_count(), 1);
     cancel.cancel();
     actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn reserved_full_audit_queue_refuses_before_killing() {
+    let client = ScriptedTmuxClient::new();
+    script(&client);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (entered, mut entering) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let held = gate.clone();
+    let (control, actor) = spawn_control_with_audit(
+        Box::new(client.clone()),
+        crate::registry::spawn_registry(),
+        org_mirror::Mirror::start(OrgHandle::disabled("full audit test")),
+        cancel.clone(),
+        move |_, _| {
+            let gate = held.clone();
+            let entered = entered.clone();
+            async move {
+                entered.send(()).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(Vec::new())
+            }
+        },
+    );
+    let command = || {
+        OrgCommand::ControlKilled(atm_org::ControlAudit {
+            pane: "%99".into(),
+            action: serde_json::Value::Null,
+        })
+    };
+    control.audit_queue().submit(command(), now(), None);
+    entering.recv().await.unwrap();
+    for _ in 0..AUDIT_CAPACITY {
+        control.audit_queue().submit(command(), now(), None);
+    }
+    let result = control
+        .run_reserved(
+            request("p/a", "%1", ReservationKind::Down),
+            |r| async move {
+                r.kill(
+                    &PaneId::parse("%1")?,
+                    r.agent().clone(),
+                    serde_json::Value::Null,
+                    now(),
+                )
+                .await
+            },
+            cleanup,
+        )
+        .await;
+    gate.add_permits(AUDIT_CAPACITY + 1);
+    cancel.cancel();
+    actor.await.unwrap();
+    assert!(
+        matches!(result, Err(ReservationError::Unavailable)),
+        "{result:?}"
+    );
+    assert!(!client
+        .mock()
+        .calls()
+        .iter()
+        .any(|call| matches!(call, MockCall::KillPane { .. })));
+}
+
+#[tokio::test]
+async fn reserved_cleanup_can_kill_replacement_while_dropped_kill_audit_is_pending() {
+    let client = ScriptedTmuxClient::new();
+    script(&client);
+    client.mock().set_next_pane_id("%2");
+    client
+        .script_tag_check(&PaneInspection::new(
+            atm_tmux::PaneInfo {
+                pane_id: "%2".into(),
+                session_name: "private".into(),
+                window_index: 0,
+                pane_pid: 2,
+                width: 80,
+                height: 24,
+                is_active: true,
+            },
+            Some("p/a".into()),
+            false,
+            false,
+            Some(true),
+            0,
+            0,
+        ))
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let held = gate.clone();
+    let (entered, mut entering) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control_with_audit(
+        Box::new(client.clone()),
+        crate::registry::spawn_registry(),
+        org_mirror::Mirror::start(OrgHandle::disabled("cleanup audit test")),
+        cancel.clone(),
+        move |command, _| {
+            let gate = held.clone();
+            let entered = entered.clone();
+            async move {
+                entered.send(command).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(Vec::new())
+            }
+        },
+    );
+    let (drop_first, dropped) = oneshot::channel();
+    let (queued, queued_seen) = oneshot::channel();
+    let running = control.clone();
+    let job = tokio::spawn(async move {
+        running.run_reserved(request("p/a", "%1", ReservationKind::Respawn), move |r| async move {
+            r.split(SpawnContext::new("%1".into(), None, false), PaneDirection::Below, "50%".into()).await?;
+            let pane = PaneId::parse("%1")?;
+            tokio::select! { biased; _ = dropped => Ok(()), result = r.kill(&pane, r.agent().clone(), serde_json::Value::Null, now()) => result }
+        }, move |r, _| async move {
+            let pane = PaneId::parse("%2")?;
+            let mut kill = Box::pin(r.kill(&pane, r.agent().clone(), serde_json::Value::Null, now()));
+            std::future::poll_fn(|cx| { assert!(kill.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+            queued.send(()).unwrap();
+            kill.await
+        }).await
+    });
+    entering.recv().await.unwrap();
+    drop_first.send(()).unwrap();
+    queued_seen.await.unwrap();
+    // FIFO actor request establishes that cleanup's kill has been dispatched.
+    let _ = control.prepare_spawn(None, None, None, None).await;
+    let killed = client
+        .mock()
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, MockCall::KillPane { .. }))
+        .count();
+    gate.add_permits(2);
+    let result = job.await.unwrap();
+    cancel.cancel();
+    actor.await.unwrap();
+    assert_eq!(killed, 2);
+    result.unwrap();
+    assert!(
+        matches!(entering.try_recv().unwrap(), OrgCommand::ControlKilled(audit) if audit.pane == "%2")
+    );
 }
 
 #[tokio::test]

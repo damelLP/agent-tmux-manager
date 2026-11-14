@@ -135,10 +135,28 @@ fn send_refusal(
              or, if the dialog is gone, type in the pane",
         );
     }
+    input_refusal(
+        in_mode,
+        false,
+        bracketed_paste.map(|flag| flag != "0"),
+        Some(text),
+    )
+}
+
+/// Shared tmux-state rule. None retains U7's pre-3.7 unknown/allow policy.
+pub(super) fn input_refusal(
+    in_mode: bool,
+    dead: bool,
+    bracketed_paste: Option<bool>,
+    text: Option<&str>,
+) -> Option<&'static str> {
     if in_mode {
         return Some("the pane is in copy mode (or another mode), so Enter would go to tmux");
     }
-    if bracketed_paste == Some("0") && text.contains(['\n', '\r']) {
+    if dead {
+        return Some("the pane is dead, so input would be lost");
+    }
+    if bracketed_paste == Some(false) && text.is_some_and(|text| text.contains(['\n', '\r'])) {
         return Some("the program didn't ask for bracketed paste, so each line would submit alone");
     }
     None

@@ -88,6 +88,11 @@
 //! pure, quick predicate in the same actor turn as the effect. Use predicates,
 //! not whole-frame equality: harmless counters/spinners may change. This closes
 //! the actor-queue gap, not races with external harness redraws or tmux clients.
+//! Before either predicate or input, fresh metadata refuses dead panes, any mode,
+//! and multiline paste when bracketed paste is explicitly off (U7's rule).
+//! tmux before 3.7 reports no flag: unknown remains allowed, not a guarantee
+//! against line submission. Reserved paste rejects ASCII control bytes except
+//! tab, LF and CR, including injected bracketed-paste terminators on older tmux.
 //!
 //! Do not call legacy `send` or `type_spawn_command` inside a reservation: those
 //! paths wait behind its ownership. Use reserved guarded paste/keys instead.
@@ -268,7 +273,8 @@ pub enum CaptureFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneInspection {
     pub pane: PaneInfo,
-    /// Preserve empty or malformed values; None means positively absent locally.
+    /// Preserve empty or malformed values. None means the local tag query
+    /// returned no bytes; the pane may have vanished after the metadata read.
     pub local_agent_tag: Option<String>,
     pub dead: bool,
     pub in_mode: bool,
@@ -318,7 +324,11 @@ impl PaneInspection {
 /// samples agreed with the first metadata's cursor (59 distinct positions).
 /// Local absent/inherited tags produce no bytes; an empty local tag produces
 /// one newline. A missing-target display can succeed with empty fields, so it
-/// is not positive liveness evidence. Versions 3.6a and 3.4 remain unverified.
+/// is not positive liveness evidence. The separate local tag read also returns
+/// no bytes if the pane disappears after metadata; no external-client CAS is
+/// promised. Mutations of that missing canonical pane fail, never retarget.
+/// Grouped/linked metadata accepts agreeing pane fields, retaining the first
+/// line's session/window. Versions 3.6a and 3.4 remain unverified.
 ///
 /// Preserve meaningful whitespace and rows. A consumer may construct its
 /// shared ScreenCursor from the inspection's coordinates when its adapter
@@ -441,7 +451,7 @@ impl Reservation {
                 reply,
             })
             .await?;
-        if let Some(audit) = pending {
+        for audit in pending {
             tokio::time::timeout_at(deadline, audit.wait())
                 .await
                 .map_err(|_| ReservationError::Timeout)?;
@@ -499,7 +509,7 @@ impl Reservation {
     }
 
     /// Up/Respawn/Clear/Delivery: one allowed key. expected must equal self.agent();
-    /// the matching agent tag is checked again inside the actor.
+    /// the matching agent tag and live/non-mode state are checked in the actor.
     /// This unguarded form is retained for legacy callers, not U8/U9b input:
     /// an unguarded Enter after paste is never safe. Use [`Self::keys_guarded`].
     pub async fn keys(
@@ -517,7 +527,9 @@ impl Reservation {
         .await
     }
 
-    /// Up/Respawn/Clear/Delivery: literal text without Enter, after tag/fence checks.
+    /// Up/Respawn/Clear/Delivery: paste text without a separate Enter key, after
+    /// tag/fence and input-safety checks. Multiline text may still submit lines
+    /// on tmux before 3.7, whose bracketed-paste state is unknown (U7 policy).
     /// expected must equal self.agent(), otherwise InvalidRequest.
     /// Reuses TmuxClient::paste_text; adapters/callers own editor safety policy.
     /// U8/U9b use [`Self::paste_guarded`], not a prior capture plus this call.
@@ -539,8 +551,8 @@ impl Reservation {
     /// Re-capture, run a caller-supplied pure screen check, then send one key.
     ///
     /// The implementation contract is one actor turn: validate fence/ownership
-    /// and expected agent, capture in `format`, check the fresh local tag, invoke
-    /// `check` on the fresh capture, and send only if it returns true. False
+    /// and expected agent, capture in `format`, check the fresh local tag and
+    /// input safety, invoke `check`, and send only if it returns true. False
     /// returns [`ReservationError::ScreenChanged`] without sending anything.
     /// `check` must be quick and pure: no I/O, awaiting, or blocking. Build it
     /// from the adapter's observation policy, allowing irrelevant chrome changes;
@@ -574,7 +586,8 @@ impl Reservation {
     }
 
     /// Re-capture, run a caller-supplied pure screen check, then paste literal
-    /// text without Enter. Same actor-turn, predicate and failure contract as
+    /// text without a separate Enter key (see [`Self::paste`] for the pre-3.7
+    /// multiline limit). Same actor-turn, predicate and failure contract as
     /// [`Self::keys_guarded`]. U8 uses it for launch/clear text; U9b for delivery
     /// text. A true predicate must authorize this text in this editor/shell,
     /// not merely recognize the harness's name or a still-matching pane tag.
@@ -637,9 +650,11 @@ impl Reservation {
     }
 
     /// Down/Respawn: kill once after fence/tag checks; expected must equal
-    /// self.agent(). Submit ControlKilled through the actor's sole audit queue
-    /// using the supplied action/time, then await its acknowledgement outside
-    /// the actor. At most one unacknowledged kill per job; await it before another.
+    /// self.agent(). Reserve a slot in the actor's sole audit queue before the
+    /// effect; a full/closed queue refuses the kill with Unavailable. On success,
+    /// enqueue ControlKilled through that slot using the supplied action/time,
+    /// then await its acknowledgement outside the actor. At most two pending
+    /// kills per job allow cleanup of a replacement after a dropped first wait.
     /// A disabled organisation still permits the kill but cannot persist an audit.
     /// The actor/supervisor retain the acknowledgement even if this future drops. Audit failure never
     /// fails/repeats a successful kill. The owned continuation attempts audit even

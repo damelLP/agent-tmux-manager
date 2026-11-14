@@ -97,9 +97,9 @@ fn observation(pane: &PaneId, reason: &str) -> ReservationError {
         reason: reason.into(),
     }
 }
-fn tmux(source: TmuxError) -> ReservationError {
+fn tmux(pane: &PaneId, step: &str, source: TmuxError) -> ReservationError {
     ControlError::Tmux {
-        context: "Reserved pane operation failed".into(),
+        context: format!("Failed to {step} for pane {pane}"),
         source,
     }
     .into()
@@ -151,7 +151,7 @@ pub(super) async fn execute(
                     &["-p", "-t", pane.as_str(), "@atm-agent", &agent.to_string()],
                 )
                 .await
-                .map_err(tmux)?;
+                .map_err(|source| tmux(&pane, "set local tag", source))?;
             Ok(Output::Done)
         }
         Action::Untag(pane, expected) => {
@@ -166,7 +166,7 @@ pub(super) async fn execute(
                     &["-p", "-u", "-t", pane.as_str(), "@atm-agent"],
                 )
                 .await
-                .map_err(tmux)?;
+                .map_err(|source| tmux(&pane, "remove local tag", source))?;
             Ok(Output::Done)
         }
         Action::Kill(pane, expected, _, _) => {
@@ -175,7 +175,10 @@ pub(super) async fn execute(
                 &ExpectedTag::Agent(expected),
                 &present(client, &pane).await?,
             )?;
-            client.kill_pane(pane.as_str()).await.map_err(tmux)?;
+            client
+                .kill_pane(pane.as_str())
+                .await
+                .map_err(|source| tmux(&pane, "kill", source))?;
             Ok(Output::Done)
         }
         Action::Input {
@@ -188,6 +191,7 @@ pub(super) async fn execute(
             if let Some((format, check)) = guard {
                 let fresh = capture(client, &pane, format).await?;
                 check_tag(&pane, &expected, &fresh.inspection)?;
+                check_input(&pane, &fresh.inspection, &input)?;
                 // A consumer predicate is required to be pure and quick. Treat a
                 // violated contract (panic) as rejection, not loss of the actor.
                 let approved =
@@ -197,7 +201,9 @@ pub(super) async fn execute(
                     return Err(ReservationError::ScreenChanged { pane });
                 }
             } else {
-                check_tag(&pane, &expected, &present(client, &pane).await?)?;
+                let fresh = present(client, &pane).await?;
+                check_tag(&pane, &expected, &fresh)?;
+                check_input(&pane, &fresh, &input)?;
             }
             match input {
                 Input::Key(key) => {
@@ -215,11 +221,43 @@ pub(super) async fn execute(
                 }
                 Input::Paste(text) => client.paste_text(pane.as_str(), &text).await,
             }
-            .map_err(tmux)?;
+            .map_err(|source| tmux(&pane, "send reserved input", source))?;
             Ok(Output::Done)
         }
     }
 }
+fn check_input(
+    pane: &PaneId,
+    inspection: &PaneInspection,
+    input: &Input,
+) -> Result<(), ReservationError> {
+    let text = match input {
+        Input::Paste(text) => Some(text.as_str()),
+        Input::Key(_) => None,
+    };
+    let reason = crate::control::send::input_refusal(
+        inspection.in_mode,
+        inspection.dead,
+        inspection.bracketed_paste,
+        text,
+    )
+    .or_else(|| {
+        text.filter(|text| {
+            text.chars()
+                .any(|c| c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\r'))
+        })
+        .map(|_| "paste text contains unsafe control bytes")
+    });
+    match reason {
+        Some(reason) => Err(ControlError::SendRefused {
+            pane: pane.to_string(),
+            reason,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
 fn check_tag(
     pane: &PaneId,
     expected: &ExpectedTag,
@@ -247,7 +285,7 @@ async fn metadata(
     let output = client
         .raw_command("list-panes", &["-a", "-f", &filter, "-F", FORMAT])
         .await
-        .map_err(tmux)?;
+        .map_err(|source| tmux(pane, "read pane metadata", source))?;
     if output.is_empty() {
         Ok(None)
     } else {
@@ -261,7 +299,7 @@ async fn tag(client: &dyn TmuxClient, pane: &PaneId) -> Result<Option<String>, R
             &["-p", "-q", "-v", "-t", pane.as_str(), "@atm-agent"],
         )
         .await
-        .map_err(tmux)?;
+        .map_err(|source| tmux(pane, "read local tag", source))?;
     if output.is_empty() {
         return Ok(None);
     }
@@ -322,7 +360,7 @@ async fn capture(
     let output = client
         .raw_command("display-message", &args)
         .await
-        .map_err(tmux)?;
+        .map_err(|source| tmux(pane, "capture viewport", source))?;
     let mut capture = decode_capture(pane, &output, format)?;
     capture.inspection.local_agent_tag = tag(client, pane).await?;
     Ok(capture)
@@ -330,8 +368,23 @@ async fn capture(
 
 fn decode_metadata(pane: &PaneId, output: &str) -> Result<PaneInspection, ReservationError> {
     let fail = || observation(pane, "malformed pane metadata");
-    let line = output.strip_suffix('\n').ok_or_else(fail)?;
-    if line.contains(['\n', '\r', '\0']) {
+    let mut lines = output.strip_suffix('\n').ok_or_else(fail)?.split('\n');
+    let first = decode_metadata_line(pane, lines.next().ok_or_else(fail)?)?;
+    for line in lines {
+        let mut next = decode_metadata_line(pane, line)?;
+        // Linked/grouped windows list the same pane once per session. Preserve
+        // the first location, but require every pane-level observation to agree.
+        next.pane.session_name.clone_from(&first.pane.session_name);
+        next.pane.window_index = first.pane.window_index;
+        if next != first {
+            return Err(fail());
+        }
+    }
+    Ok(first)
+}
+fn decode_metadata_line(pane: &PaneId, line: &str) -> Result<PaneInspection, ReservationError> {
+    let fail = || observation(pane, "malformed pane metadata");
+    if line.contains(['\r', '\0']) {
         return Err(fail());
     }
     let mut fields = line.split('\t');
@@ -370,7 +423,12 @@ fn decode_metadata(pane: &PaneId, output: &str) -> Result<PaneInspection, Reserv
     };
     let is_active = boolean(fields.next())?;
     let dead = boolean(fields.next())?;
-    let in_mode = boolean(fields.next())?;
+    let in_mode = fields
+        .next()
+        .ok_or_else(fail)?
+        .parse::<u32>()
+        .map_err(|_| fail())?
+        != 0;
     let bracketed_paste = match fields.next() {
         Some("") => None,
         value => Some(boolean(value)?),

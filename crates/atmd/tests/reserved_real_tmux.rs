@@ -55,7 +55,7 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
     assert!(std::env::var_os("TMUX").is_none());
     assert!(std::env::var_os("TMUX_PANE").is_none());
     let root = std::env::var("TMUX_TMPDIR").unwrap();
-    assert!(root.starts_with("/tmp/xxxxxxxxxxx"));
+    assert!(std::path::Path::new(&root).is_absolute());
     let socket = std::path::PathBuf::from(std::env::var("ATM_SOCKET").unwrap());
     assert!(socket.starts_with(std::path::Path::new(&root).parent().unwrap()));
     assert_ne!(socket, std::path::Path::new("/tmp/atm.sock"));
@@ -282,6 +282,124 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
     probe.unwrap();
 }
 
+#[tokio::test]
+#[ignore = "requires explicit sealed environment and private tmux server"]
+async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
+    assert!(std::env::var_os("TMUX").is_none());
+    assert!(std::env::var_os("TMUX_PANE").is_none());
+    let root = std::env::var("TMUX_TMPDIR").unwrap();
+    assert!(std::path::Path::new(&root).is_absolute());
+    assert_ne!(std::env::var("ATM_SOCKET").unwrap(), "/tmp/atm.sock");
+    let client = RealTmuxClient::with_socket(std::env::var("ATM_TMUX_SOCKET").unwrap());
+    client
+        .raw_command("new-session", &["-d", "-s", "input-refusal", "cat"])
+        .await
+        .unwrap();
+    verify_private(&client, &root).await;
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(client.clone()),
+        atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("input safety probe"),
+        cancel.clone(),
+    );
+    control
+        .run_reserved(
+            reservation(ReservationKind::Adopt),
+            |r| async move { r.tag(&PaneId::parse("%0")?, ExpectedTag::Absent).await },
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+    let probe = client.clone();
+    let result = control
+        .run_reserved(
+            reservation(ReservationKind::Delivery),
+            move |r| async move {
+                let pane = PaneId::parse("%0")?;
+                // cat never enables bracketed paste. tmux <3.7 cannot report the flag;
+                // its unknown/allow policy is covered separately, not silently changed.
+                let fresh = r.inspect(&pane).await?.unwrap();
+                if fresh.bracketed_paste == Some(false) {
+                    for guarded in [false, true] {
+                        let result = if guarded {
+                            r.paste_guarded(
+                                &pane,
+                                r.agent().clone(),
+                                "UNSAFE-FIRST\nSECOND".into(),
+                                CaptureFormat::Plain,
+                                |_| true,
+                            )
+                            .await
+                        } else {
+                            r.paste(&pane, r.agent().clone(), "UNSAFE-FIRST\nSECOND".into())
+                                .await
+                        };
+                        assert!(matches!(
+                            result,
+                            Err(ReservationError::Control(
+                                atmd::control::ControlError::SendRefused { .. }
+                            ))
+                        ));
+                    }
+                }
+                probe
+                    .raw_command("clock-mode", &["-t", "%0"])
+                    .await
+                    .unwrap();
+                probe.raw_command("copy-mode", &["-t", "%0"]).await.unwrap();
+                for operation in 0..4 {
+                    let result = match operation {
+                        0 => r.keys(&pane, r.agent().clone(), PaneKey::Enter).await,
+                        1 => {
+                            r.paste(&pane, r.agent().clone(), "UNSAFE-FIRST\nSECOND".into())
+                                .await
+                        }
+                        2 => {
+                            r.keys_guarded(
+                                &pane,
+                                r.agent().clone(),
+                                PaneKey::Enter,
+                                CaptureFormat::Ansi,
+                                |_| true,
+                            )
+                            .await
+                        }
+                        _ => {
+                            r.paste_guarded(
+                                &pane,
+                                r.agent().clone(),
+                                "UNSAFE-FIRST\nSECOND".into(),
+                                CaptureFormat::Ansi,
+                                |_| true,
+                            )
+                            .await
+                        }
+                    };
+                    assert!(matches!(
+                        result,
+                        Err(ReservationError::Control(
+                            atmd::control::ControlError::SendRefused { .. }
+                        ))
+                    ));
+                }
+                assert!(!r
+                    .capture(&pane, CaptureFormat::Plain)
+                    .await?
+                    .text
+                    .contains("UNSAFE-FIRST"));
+                Ok::<_, ReservationError>(())
+            },
+            |_, _| async { Ok(()) },
+        )
+        .await;
+    cancel.cancel();
+    actor.await.unwrap();
+    verify_private(&client, &root).await;
+    client.raw_command("kill-server", &[]).await.unwrap();
+    result.unwrap();
+}
+
 async fn verify_private(client: &RealTmuxClient, root: &str) {
     let identity = client
         .raw_command("display-message", &["-p", "#{socket_path}\t#{pid}"])
@@ -298,7 +416,7 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
     assert!(std::env::var_os("TMUX").is_none());
     assert!(std::env::var_os("TMUX_PANE").is_none());
     let root = std::env::var("TMUX_TMPDIR").unwrap();
-    assert!(root.starts_with("/tmp/xxxxxxxxxxx"));
+    assert!(std::path::Path::new(&root).is_absolute());
     assert_ne!(std::env::var("ATM_SOCKET").unwrap(), "/tmp/atm.sock");
     let label = std::env::var("ATM_TMUX_SOCKET").unwrap();
     let client = RealTmuxClient::with_socket(label);

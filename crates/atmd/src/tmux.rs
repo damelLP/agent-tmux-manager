@@ -13,7 +13,8 @@ use atm_tmux::{TmuxClient, TmuxError};
 ///
 /// # Errors
 /// Returns the client's [`TmuxError`] (no server, tmux not installed,
-/// timeout). Discovery treats any error as "no pane info".
+/// timeout). Default discovery treats errors as "no pane info"; discovery
+/// scoped by a nonempty `ATM_TMUX_SOCKET` admits no processes on error.
 pub async fn list_pane_pids(tmux: &dyn TmuxClient) -> Result<HashMap<u32, String>, TmuxError> {
     let panes = tmux.list_panes().await?;
     Ok(panes

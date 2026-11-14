@@ -109,9 +109,22 @@ before it can hang up its own terminal. Unverified: processes deliberately
 stripping all routing/ownership environment or escaping through privilege
 boundaries. These are not supported; this is not a cgroup/container supervisor.
 
-At the initial trial ref, procfs discovery is host-wide: another daemon can list
-candidate harnesses as **pending rows without panes**, and vice versa. Do not
-filter those rows. Foreign rows assigned a local pane are a stop-the-trial defect.
+The initial M1 trial policy in this section allowed host-wide discovery and
+said not to filter foreign **pending rows without panes**. Named-server
+isolation supersedes that policy: U11b's concurrent stand-in runs proved that
+host processes fill a private daemon's 100-row registry and reject its own
+sessions; failure diagnostics also exposed host sessions and working directories.
+
+With a nonempty `ATM_TMUX_SOCKET`, discovery now admits only processes mapped
+to that server's panes. The candidate sets this label, so startup and explicit
+rescans exclude live sessions outside its server. An unavailable, empty or
+failed pane listing admits no discovered processes, rather than falling back
+to host-wide discovery. Direct hooks/events are still accepted; this is not
+an authentication boundary, and historical logs are not purged.
+The default daemon, and a daemon that only relocates `ATM_SOCKET` (for example
+a devcontainer setup), retain host-wide discovery. They may still list candidate
+harnesses without panes, as can candidates installed from older refs. A foreign
+row assigned a local pane remains a stop-the-trial defect.
 The kit does not isolate harness user state or model credentials and does not
 start any model CLI itself. At pre-U7 refs, `atm spawn` still requires an actual
 tmux pane: run it inside the attached candidate, not through the outside wrapper.

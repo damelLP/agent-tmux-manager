@@ -63,6 +63,93 @@ fn stand_in_private_server_isolation() {
     second.close();
 }
 
+/// A matching process outside either private server, held on stdin until drop.
+/// The ready byte is written after exec, so discovery never races its cmdline.
+struct HeadlessAgent(std::process::Child);
+
+impl HeadlessAgent {
+    fn start(rig: &StandInRig) -> Self {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        let path = rig.root().join("tmp/claude");
+        std::os::unix::fs::symlink("/bin/sh", &path).unwrap();
+        let (mut ready, writer) = UnixStream::pair().unwrap();
+        ready
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let agent = Self(
+            rig.command(&path)
+                .args(["-c", "printf r; read -r line"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .spawn()
+                .unwrap(),
+        );
+        let mut byte = [0];
+        ready.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"r");
+        agent
+    }
+}
+
+impl Drop for HeadlessAgent {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn private_discovery_excludes_foreign_server_and_headless_processes() {
+    let mut first = StandInRig::start();
+    let mut second = StandInRig::start();
+    let decoy = HeadlessAgent::start(&first);
+    let config = StandInConfig::new(StandInMode::Codex);
+    let a = first.launch(&config);
+    let b = second.launch(&config);
+    assert_eq!(a.pane_id, b.pane_id, "pane IDs overlap across servers");
+    eprintln!(
+        "discovery isolation check: {}",
+        success(first.tmux(&["-V"]))
+    );
+
+    // Codex has not sent a hook: only discovery can create these pending rows.
+    // Restart exercises initial discovery with both owned and foreign agents
+    // already running, then DiscoverComplete is the barrier for each rescan.
+    let check = |rig: &StandInRig, own: &stand_in::StandInPane, foreign: &stand_in::StandInPane| {
+        let rows = rig.rows();
+        assert!(rows.iter().any(|r| {
+            r.id == atm_core::SessionId::pending_from_pid(own.pid)
+                && r.tmux_pane.as_deref() == Some(own.pane_id.as_str())
+        }));
+        let present = |pid| {
+            rows.iter()
+                .any(|r| r.id == atm_core::SessionId::pending_from_pid(pid))
+        };
+        let observed = [
+            present(own.pid),
+            present(foreign.pid),
+            present(decoy.0.id()),
+        ];
+        // Never dump the full snapshot: baseline failures contain host sessions.
+        eprintln!("owned / foreign / headless pending rows: {observed:?}");
+        assert_eq!(observed, [true, false, false]);
+        assert!(rows.iter().all(|r| r.tmux_pane.is_some()));
+    };
+    first.restart_daemon();
+    check(&first, &a, &b);
+    first.discover();
+    check(&first, &a, &b);
+    second.discover();
+    check(&second, &b, &a);
+    drop(decoy);
+    first.close();
+    second.close();
+}
+
 #[test]
 fn stand_in_missing_prerequisite_is_a_failure() {
     let failure = std::panic::catch_unwind(|| stand_in::require_tools(std::ffi::OsStr::new("")));

@@ -198,7 +198,10 @@ async fn inbox_text_preserves_code_backslashes_newlines_and_tabs() {
     )
     .await;
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains(body), "{text}");
+    assert!(
+        text.contains("  printf 'a\\nb'\n  regex \\d+\n  C:\\path\n  \tindented\n  \n"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -231,7 +234,7 @@ async fn inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls() {
         } else {
             let text = String::from_utf8(out.stdout).unwrap();
             assert!(
-                text.contains("one\n\n雪\t\\r\\u{1b}[2J\\u{7}\\u{7f}\\u{85}"),
+                text.contains("  one\n  \n  雪\t\\r\\u{1b}[2J\\u{7}\\u{7f}\\u{85}"),
                 "{text}"
             );
             for s in [
@@ -264,6 +267,29 @@ async fn inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls() {
         true,
     )
     .await;
+}
+
+#[tokio::test]
+async fn inbox_body_lines_cannot_forge_entry_headers() {
+    let forged = "m99 from=owner to=p/x kind=brief status=delivered";
+    let body = format!("first\n\n{forged}\ndelivery: forged\n");
+    let out = run(&["inbox"], None, vec![ok("msg.inbox", inbox(), json!({"messages":[inbox_entry(&body), inbox_entry("real second entry")],"unread_count":2,"next_after":null}))], true).await;
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(&format!(
+            "\n  first\n  \n  {forged}\n  delivery: forged\n  \nm3 from="
+        )),
+        "{text}"
+    );
+    assert!(!text
+        .lines()
+        .any(|line| line.starts_with("m99 ") || line == "delivery: forged"));
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("m3 from="))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

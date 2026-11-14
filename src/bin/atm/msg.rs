@@ -318,7 +318,9 @@ fn render_inbox(result: &InboxResult, out: &mut impl Write) -> Result<()> {
         for path in &c.attachments {
             writeln!(out, "attach: {}", escaped(path, false))?;
         }
-        writeln!(out, "{}", escaped(&c.body, true))?;
+        for line in escaped(&c.body, true).split('\n') {
+            writeln!(out, "  {line}")?;
+        }
     }
     writeln!(out, "{} unread", result.unread_count)?;
     if let Some(id) = result.next_after {

@@ -777,41 +777,55 @@ pub fn protocol_request(
     request: ClientMessage,
     timeout: Duration,
 ) -> anyhow::Result<DaemonMessage> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
-        tokio::time::timeout(timeout, async {
-            let stream = tokio::net::UnixStream::connect(path).await?;
-            let (read, mut write) = stream.into_split();
-            let mut reader = BufReader::new(read);
-            let mut line = String::new();
-            for (index, message) in [
-                ClientMessage::connect(Some("stand-in-test".into())),
-                request,
-            ]
-            .into_iter()
-            .enumerate()
+    runtime.block_on(protocol_request_on(
+        tokio::net::UnixStream::connect(path),
+        request,
+        timeout,
+    ))
+}
+
+// The same exchange accepts in-memory I/O for deterministic deadline tests.
+pub async fn protocol_request_on<S>(
+    connect: impl std::future::Future<Output = std::io::Result<S>>,
+    request: ClientMessage,
+    timeout: Duration,
+) -> anyhow::Result<DaemonMessage>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    tokio::time::timeout(timeout, async {
+        let stream = connect.await?;
+        let (read, mut write) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        for (index, message) in [
+            ClientMessage::connect(Some("stand-in-test".into())),
+            request,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&message)?).as_bytes())
+                .await?;
+            line.clear();
+            reader.read_line(&mut line).await?;
+            if index == 0
+                && !matches!(
+                    serde_json::from_str::<DaemonMessage>(&line)?,
+                    DaemonMessage::Connected { .. }
+                )
             {
-                write
-                    .write_all(format!("{}\n", serde_json::to_string(&message)?).as_bytes())
-                    .await?;
-                line.clear();
-                reader.read_line(&mut line).await?;
-                if index == 0
-                    && !matches!(
-                        serde_json::from_str::<DaemonMessage>(&line)?,
-                        DaemonMessage::Connected { .. }
-                    )
-                {
-                    anyhow::bail!("private daemon handshake refused");
-                }
+                anyhow::bail!("private daemon handshake refused");
             }
-            Ok(serde_json::from_str(&line)?)
-        })
-        .await?
+        }
+        Ok(serde_json::from_str(&line)?)
     })
+    .await?
 }
 
 #[cfg(test)]

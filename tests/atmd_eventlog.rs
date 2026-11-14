@@ -215,11 +215,21 @@ impl Client {
             assert_eq!(event["body"], envelope.body);
             assert_eq!(event["ts"], json!(envelope.ts));
         }
-        // A duplicate event would appear before this pong. Unwatch keeps the
-        // connection reusable without assuming a ping flushes pending replay.
+        // Unwatch followed by pong is the boundary, not the earlier tail.
+        // A coalesced summary may commit in between; accept only contiguous
+        // new events, so duplicates or holes still fail before the sentinel.
         self.send(ClientMessage::unwatch());
         self.send(ClientMessage::ping(42));
-        assert_eq!(self.recv(), json!({"type":"pong","seq":42}));
+        let mut cursor = expected.last().map_or(after, |record| record.seq);
+        loop {
+            let frame = self.recv();
+            if frame == json!({"type":"pong","seq":42}) {
+                break;
+            }
+            assert_eq!(frame["type"], "event");
+            assert_eq!(frame["seq"], cursor + 1);
+            cursor += 1;
+        }
     }
 
     fn captured(&mut self, fixture: &str, finish: bool) -> String {

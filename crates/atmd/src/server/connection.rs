@@ -1151,10 +1151,7 @@ impl Forwarder {
                 let (message, done) = match event {
                     Ok(Some(event)) => (crate::org::event_message(&event), false),
                     Ok(None) => break,
-                    Err(error) => (
-                        DaemonMessage::error_with_code(&error.to_string(), error_code::UNAVAILABLE),
-                        true,
-                    ),
+                    Err(error) => (watch_error(error), true),
                 };
                 // Unwatch waits at frame boundaries. Shutdown drops the owning
                 // JoinSet, cancelling even a blocked write to this peer.
@@ -1176,6 +1173,14 @@ impl Forwarder {
         self.stop.cancel();
         while self.task.join_next().await.is_some() {}
     }
+}
+
+fn watch_error(error: crate::org::OrgServiceError) -> DaemonMessage {
+    let code = match error {
+        crate::org::OrgServiceError::Timeout => error_code::TIMEOUT,
+        _ => error_code::UNAVAILABLE,
+    };
+    DaemonMessage::error_with_code(&error.to_string(), code)
 }
 
 /// Forwards registry events to one subscriber until `stop` is cancelled.
@@ -1855,6 +1860,15 @@ mod tests {
         );
         cancel.cancel();
         run.await.unwrap();
+    }
+
+    #[test]
+    fn watch_reader_timeout_has_timeout_code_without_id() {
+        let frame =
+            serde_json::to_value(watch_error(crate::org::OrgServiceError::Timeout)).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "timeout");
+        assert!(frame.get("id").is_none());
     }
 
     #[tokio::test(start_paused = true)]

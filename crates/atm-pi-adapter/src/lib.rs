@@ -219,6 +219,7 @@
 //!   the first.
 
 pub mod event;
+pub mod screen;
 pub mod translate;
 pub mod wire;
 

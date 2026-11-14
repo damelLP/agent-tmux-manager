@@ -16,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 # Used by examples/parity_demo.rs to feed equivalent payloads through
 # both adapters and show the LifecycleEvent output is identical.
 atm-claude-adapter = { workspace = true }

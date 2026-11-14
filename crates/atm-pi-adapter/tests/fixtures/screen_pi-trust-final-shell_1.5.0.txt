@@ -1,0 +1,40 @@
+U5 guard: live socket absent; private ATM_SOCKET=/tmp/u8a-fixture/tap.sock ATM_AGENT=fixture/pi-trust  
+
+ ▀▀█  v1.5.0
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+
+[Context]
+  AGENTS.md
+
+[Skills]
+  atm-coordinate, atm-implement, brainstorming, diagnosing-superpowers, dispatching-parallel-agents, executing-plans,
+feature-dev, finishing-a-development-branch, receiving-code-review, requesting-code-review, subagent-driven-development,
+systematic-debugging, test-driven-development, using-git-worktrees, using-superpowers, verification-before-completion,
+writing-plans, writing-skills
+
+[Prompts]
+  /feature-dev
+
+[Extensions]
+  obra/superpowers:.pi/extensions/superpowers.ts, pi-atm.ts
+
+
+ Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf
+ and restart tmux.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Update Available
+ New version 1.5.2 is available. Run pi update
+ Changelog: https://pi.dev/changelog
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/u8a-fixture/cwd/pi-trust    
+$0.000 (sub) 0.0%/272k (auto)                                                                           gpt-6-luna • low
+bash-5.3$

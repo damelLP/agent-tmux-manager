@@ -556,7 +556,8 @@ mod reconciliation {
             "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
         );
         assert_ne!(
-            atm_pi_adapter::screen::observe_screen(dialog, None).dialog,
+            atm_pi_adapter::screen::observe_screen(atm_core::ScreenInput::Plain(dialog), None)
+                .dialog,
             atm_core::DialogState::None
         );
         for bound in [true, false] {

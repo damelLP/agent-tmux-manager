@@ -168,15 +168,10 @@ fn header<'a>(lines: &[&'a str]) -> Option<(usize, &'a str)> {
 
 fn known_dialog(lines: &[&str]) -> bool {
     let body = nonblank(lines);
+    if update_prompt(&body) {
+        return true;
+    }
     match body.as_slice() {
-        [update, "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
-            if update
-                .strip_prefix("Update available · ")
-                .and_then(|s| s.split_once(" → "))
-                .is_some_and(|(old, new)| version(old) && version(new)) =>
-        {
-            true
-        }
         [.., title, message, "k keep & next · esc dismiss & close · ^o copy · ←/→ warning"]
             if !message.is_empty()
                 && title
@@ -191,6 +186,16 @@ fn known_dialog(lines: &[&str]) -> bool {
         }
         _ => false,
     }
+}
+
+fn update_prompt(body: &[&str]) -> bool {
+    matches!(body,
+        [update, "Release notes: https://github.com/openai/codex/releases/latest", "› 1. Update now (runs `npm install -g @openai/codex`)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
+            if update
+                .strip_prefix("Update available · ")
+                .and_then(|s| s.split_once(" → "))
+                .is_some_and(|(old, new)| version(old) && version(new))
+    )
 }
 
 fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {

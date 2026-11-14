@@ -1120,6 +1120,7 @@ mod reconciliation {
             .await
             .unwrap();
         let mut committed = rig.org.committed.subscribe();
+        let mut observations = agents.observation_events();
         for _ in 0..80 {
             rig.events
                 .send(crate::registry::SessionEvent::Updated {
@@ -1148,11 +1149,37 @@ mod reconciliation {
         .await
         .unwrap();
         // The FIFO event receiver consumed the entire flood before this other
-        // agent's ready report; the held delivery is still unreleased.
+        // agent's ready report; count attempts too, so Busy cannot hide extras.
+        let mut attempts = 0;
+        let mut entries = 0;
+        while let Ok(event) = observations.try_recv() {
+            if event
+                .agent
+                .as_ref()
+                .is_some_and(|id| id.to_string() == "p/lead")
+            {
+                attempts += usize::from(event.phase == "started");
+                entries += usize::from(event.phase == "entered");
+            }
+        }
+        assert_eq!(attempts, 1);
+        assert_eq!(entries, 0);
         cancel.cancel();
         release.send(()).unwrap();
         delivery.await.unwrap();
         task.await.unwrap();
+        while let Ok(event) = observations.try_recv() {
+            if event
+                .agent
+                .as_ref()
+                .is_some_and(|id| id.to_string() == "p/lead")
+            {
+                attempts += usize::from(event.phase == "started");
+                entries += usize::from(event.phase == "entered");
+            }
+        }
+        assert_eq!(attempts, 1);
+        assert_eq!(entries, 1);
         assert_eq!(
             rig.client
                 .pending_reads(&PaneId::parse("%1").unwrap())
@@ -1230,8 +1257,11 @@ mod reconciliation {
                 .unwrap();
         });
         entry.await.unwrap();
-        // One Observe parks, another wake becomes its coalesced dirty candidate.
+        // Wait for admission, not a delay: pacing may initially coalesce wakes.
+        let mut observations = agents.observation_events();
         rig.row("early", "%1", false).await;
+        progress(&mut observations, "started", Some("p/lead")).await;
+        // One Observe parks, another wake becomes its coalesced dirty candidate.
         for _ in 0..5 {
             rig.events
                 .send(crate::registry::SessionEvent::Registered {

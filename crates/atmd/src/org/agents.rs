@@ -20,7 +20,7 @@ use crate::{
 use atm_core::{DialogState, Harness, InputState, ScreenFacts, SessionId, SessionView, TurnState};
 use atm_org::{Agent, OrgCommand, OrgState};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::Duration,
 };
@@ -33,6 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 const LIST_BUDGET: Duration = Duration::from_secs(5);
 const OBSERVE_BUDGET: Duration = Duration::from_secs(30);
+const MIN_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
+// U8c has 32 active+parked slots. Observers use at most a quarter, leaving
+// headroom for lifecycle work and deliveries even during restart or event lag.
+const OBSERVER_CONCURRENCY: usize = 8;
 
 // A wake may wait both in the coalescer and in control admission. Retain only
 // its identity context, never a readiness decision or an event-history mirror.
@@ -506,12 +510,16 @@ impl AgentRuntime {
         initial: bool,
     ) -> Result<(), AgentError> {
         // Registry failure is never evidence that every agent is gone.
-        let rows = self.rows().await?;
+        self.rows().await?;
+        let mut in_mode = false;
         let gone = match &agent.pane {
             None => true,
             Some(pane) => match r.inspect(&PaneId::parse(pane)?).await? {
                 None => true,
-                Some(p) => p.dead || p.local_agent_tag.as_deref() != Some(&agent.id.to_string()),
+                Some(p) => {
+                    in_mode = p.in_mode;
+                    p.dead || p.local_agent_tag.as_deref() != Some(&agent.id.to_string())
+                }
             },
         };
         if gone {
@@ -529,6 +537,7 @@ impl AgentRuntime {
         if agent.status == AgentStatus::Clearing {
             return Ok(());
         }
+        let rows = self.rows().await?;
         let expected = harness(state, agent, &rows);
         let eligible: Vec<_> = rows
             .iter()
@@ -539,7 +548,8 @@ impl AgentRuntime {
             })
             .collect();
         if let Some(candidate) = bind.as_mut() {
-            if eligible.len() == 1
+            if !in_mode
+                && eligible.len() == 1
                 && eligible
                     .first()
                     .is_some_and(|row| row.id == candidate.session)
@@ -774,6 +784,98 @@ async fn dispatch_lifecycle(mut requests: mpsc::Receiver<LifecycleJob>, cancel: 
     }
 }
 
+// Routing only: no OrgState/message history or cached readiness authority.
+#[derive(Default)]
+struct AgentRoutes {
+    agents: BTreeMap<AgentId, (Option<String>, Vec<SessionId>)>,
+    rows: HashMap<SessionId, String>,
+    dirty: bool,
+}
+
+impl AgentRoutes {
+    fn refresh(&mut self, state: &OrgState) {
+        self.agents = state
+            .agents()
+            .filter(|a| a.status != AgentStatus::Down)
+            .map(|a| {
+                (
+                    a.id.clone(),
+                    (
+                        a.pane.clone(),
+                        a.session_id
+                            .iter()
+                            .chain(a.excluded_session_id.iter())
+                            .cloned()
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        self.rows
+            .retain(|_, pane| self.agents.values().any(|(p, _)| p.as_ref() == Some(pane)));
+        self.dirty = false;
+    }
+
+    fn affected(&mut self, id: &SessionId, row: Option<&SessionView>) -> BTreeSet<AgentId> {
+        let old = self.rows.remove(id);
+        let pane = row.and_then(|row| row.tmux_pane.as_ref());
+        let affected = self
+            .agents
+            .iter()
+            .filter(|(_, (p, ids))| {
+                ids.contains(id)
+                    || p.as_ref()
+                        .is_some_and(|p| Some(p) == old.as_ref() || Some(p) == pane)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Some(pane) =
+            pane.filter(|pane| self.agents.values().any(|(p, _)| p.as_ref() == Some(pane)))
+        {
+            self.rows.insert(id.clone(), pane.clone());
+        }
+        affected
+    }
+
+    async fn rebuild(&mut self, rt: &AgentRuntime) -> Result<BTreeSet<AgentId>, AgentError> {
+        self.dirty = true;
+        let state = rt.org.snapshot().await?;
+        let rows = rt.rows().await?;
+        self.refresh(&state);
+        self.rows.clear();
+        for row in rows {
+            self.affected(&row.id, Some(&row));
+        }
+        Ok(self.agents.keys().cloned().collect())
+    }
+
+    async fn wake(
+        &mut self,
+        rt: &AgentRuntime,
+        event: Result<SessionEvent, broadcast::error::RecvError>,
+    ) -> Result<BTreeSet<AgentId>, AgentError> {
+        if self.dirty || matches!(event, Err(broadcast::error::RecvError::Lagged(_))) {
+            return self.rebuild(rt).await;
+        }
+        match event {
+            Ok(SessionEvent::Updated { session }) => Ok(self.affected(&session.id, Some(&session))),
+            Ok(SessionEvent::Removed { session_id, .. }) => Ok(self.affected(&session_id, None)),
+            Ok(SessionEvent::Registered { session_id, .. }) => {
+                if self.agents.is_empty() {
+                    return Ok(BTreeSet::new());
+                }
+                // Registered has no pane. Look up only this row, before cloning
+                // any organisation state or dumping the entire registry.
+                let row = timeout(LIST_BUDGET, rt.registry.get_session(session_id.clone()))
+                    .await
+                    .map_err(|_| AgentError::Timeout)?;
+                Ok(self.affected(&session_id, row.as_ref()))
+            }
+            Err(_) => Ok(BTreeSet::new()),
+        }
+    }
+}
+
 async fn observer(
     rt: AgentRuntime,
     mut events: broadcast::Receiver<SessionEvent>,
@@ -803,12 +905,28 @@ async fn observer(
     let mut active = BTreeSet::new();
     let mut jobs = JoinSet::new();
     let mut restart = initial.clone();
+    let mut next_observation = BTreeMap::new();
+    let mut routes = AgentRoutes::default();
+    routes.refresh(&state);
+    if let Ok(rows) = rt.rows().await {
+        for row in rows {
+            routes.affected(&row.id, Some(&row));
+        }
+    }
     loop {
         if initial.is_empty() && ready.borrow().is_none() {
             ready.send_replace(Some(Ok(())));
         }
-        while active.len() < 32 {
-            let next = pending.keys().find(|id| !active.contains(*id)).cloned();
+        while active.len() < OBSERVER_CONCURRENCY {
+            let next = pending
+                .keys()
+                .find(|id| {
+                    !active.contains(*id)
+                        && next_observation
+                            .get(*id)
+                            .is_none_or(|at| *at <= Instant::now())
+                })
+                .cloned();
             let Some(id) = next else {
                 break;
             };
@@ -824,6 +942,12 @@ async fn observer(
                 (id, result)
             });
         }
+        let next_wake = pending
+            .keys()
+            .filter(|id| !active.contains(*id))
+            .filter_map(|id| next_observation.get(id).copied())
+            .filter(|at| *at > Instant::now())
+            .min();
         #[cfg(test)]
         rt.progress("dispatched", None);
         #[cfg(test)]
@@ -837,6 +961,7 @@ async fn observer(
                 match result {
                     Some(Ok((id, result))) => {
                         active.remove(&id);
+                        next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
                         #[cfg(test)]
                         rt.progress("finished", Some(id.clone()));
                         initial.remove(&id);
@@ -855,17 +980,15 @@ async fn observer(
                     None => {},
                 }
             }
+            _ = async { if let Some(at) = next_wake { tokio::time::sleep_until(at).await; } }, if next_wake.is_some() => {},
             event = events.recv() => {
-                let (id, bind) = match event {
-                    Ok(SessionEvent::Registered { session_id, .. }) => (Some(session_id), true),
-                    Ok(SessionEvent::Updated { session }) => (Some(session.id), true),
-                    Ok(SessionEvent::Removed { session_id, .. }) => (Some(session_id), false),
-                    Err(broadcast::error::RecvError::Lagged(_)) => (None, true),
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
+                if matches!(event, Err(broadcast::error::RecvError::Closed)) { break; }
                 #[cfg(test)]
                 rt.progress("scheduling", None);
-                let result = schedule(&rt, &mut pending, id, bind).await;
+                let result = match routes.wake(&rt, event).await {
+                    Ok(ids) => schedule(&rt, &mut pending, ids, true).await,
+                    Err(error) => Err(error),
+                };
                 #[cfg(test)]
                 rt.progress(if result.is_ok() { "scheduled" } else { "schedule_failed" }, None);
                 if let Err(error) = result {
@@ -874,18 +997,29 @@ async fn observer(
             }
             event = committed.recv() => {
                 match event {
-                    Ok(event) if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") => {
-                        if let Err(error) = schedule(&rt, &mut pending, None, false).await {
-                            tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
+                    Ok(event) if event.kind.starts_with("agent.") => {
+                        routes.dirty = true;
+                        match rt.org.snapshot().await {
+                            Ok(state) => routes.refresh(&state),
+                            Err(error) => tracing::warn!(%error, "Agent routing refresh deferred"),
                         }
-                        #[cfg(test)]
-                        rt.progress("committed_scheduled", None);
+                        if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") {
+                            if let Some(id) = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok()) {
+                                if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id]), false).await {
+                                    tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
+                                }
+                            }
+                            #[cfg(test)]
+                            rt.progress("committed_scheduled", None);
+                        }
                     },
                     Ok(_) => {},
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Err(error) = schedule(&rt, &mut pending, None, false).await {
-                            tracing::warn!(%error, "Agent rescan deferred until next wake");
-                        }
+                        let result = match routes.rebuild(&rt).await {
+                            Ok(ids) => schedule(&rt, &mut pending, ids, true).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result { tracing::warn!(%error, "Agent rescan deferred until next wake"); }
                     },
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -900,29 +1034,19 @@ async fn observer(
 async fn schedule(
     rt: &AgentRuntime,
     pending: &mut BTreeMap<AgentId, Option<BindingCandidate>>,
-    event: Option<SessionId>,
+    ids: BTreeSet<AgentId>,
     bind: bool,
 ) -> Result<(), AgentError> {
-    let state = rt.org.snapshot().await?;
-    let rows = rt.rows().await?;
-    for agent in state.agents().filter(|a| a.status != AgentStatus::Down) {
-        if event.as_ref().is_some_and(|id| {
-            agent.session_id.as_ref() != Some(id)
-                && !rows
-                    .iter()
-                    .any(|row| &row.id == id && matches_agent(agent, row))
-        }) {
+    for id in ids {
+        // Subscribe before the FIFO snapshot. A complete clear can leave the
+        // identity tuple unchanged, and equal timestamps are not a fence.
+        let events = rt.org.committed.subscribe();
+        let cursor = rt.org.status()?;
+        let current = rt.org.snapshot().await?;
+        let Some(agent) = current.agent(&id).filter(|a| a.status != AgentStatus::Down) else {
             continue;
-        }
+        };
         let candidate = if bind {
-            // Subscribe before the FIFO snapshot. A complete clear can leave the
-            // identity tuple unchanged, and equal timestamps are not a fence.
-            let events = rt.org.committed.subscribe();
-            let cursor = rt.org.status()?;
-            let current = rt.org.snapshot().await?;
-            let Some(agent) = current.agent(&agent.id) else {
-                continue;
-            };
             let current_rows = rt.rows().await?;
             let expected = harness(&current, agent, &current_rows);
             let eligible: Vec<_> = current_rows

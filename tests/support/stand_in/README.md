@@ -355,8 +355,9 @@ This is a source splice from P1's gpt-5.4 session into the U5 lifecycle; resizin
 that capture to other compact sizes is Synthetic. The adapter contract pins
 all lifecycle facts at 100x30, 80x24 (Codex), 100x24, 120x19 and the supported minima: **Codex 80x19,
 pi 86x19**. A 60x40 split is too narrow for their captured interrupt/startup chrome:
-scene rendering explicitly refuses it, and the rig immediately reports the minimum
-rather than waiting for a misleading ready frame. Use a wider pane for these modes.
+scene rendering explicitly refuses it. Only `launch`, `wait_ready` and `wait_event`
+surface the scene error immediately rather than waiting for a misleading ready
+frame; `observe_pane` and `wait_for_row` do not surface scene errors. Use a wider pane for these modes.
 Source-only replay remains native-size evidence. This is not real-harness resize
 fidelity. Other long transcript lines may clip; drafts cell-wrap.
 Optional `config.folder` substitutes
@@ -427,7 +428,12 @@ Captured: Claude Code 2.1.325 and Codex 0.167.0, 2026-11-14, P1 private proxy
 permission probes. Claude's appended PostToolUse is raw record 52; Codex's
 appended PreToolUse, PermissionRequest and PostToolUse are raw records 39–41.
 They preserve payload shapes and tool results, with the identifier/path
-sanitization below. The stand-in replays these events rather than executing tools.
+sanitization below. These are source splices, not one continuous captured tool
+flow: Codex permission events carry P1's gpt-5.4 rather than U5's gpt-6-luna,
+so the daemon's model changes during permission handling. Claude's P1 PostToolUse
+closes U5's PreToolUse/PermissionRequest with a matching sanitized tool_use_id but
+different tool_input and permission_mode. The stand-in replays these events
+rather than executing tools.
 
 Captured: pi 1.5.0, 2026-11-14, U5 real TUI with pi-atm through the same proxy.
 `pi_1.5.0.jsonl` selects lines 1, 2, 3, 5, 6, 7, 8, 18, 19. agent_end retains only

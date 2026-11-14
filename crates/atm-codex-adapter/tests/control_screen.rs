@@ -213,6 +213,152 @@ fn synthetic_plain_hook_page_without_trailing_padding_preserves_the_list() {
     );
 }
 
+fn assert_synthetic_clipped_page_preserves_list(stem: &str, width: usize) {
+    // Synthetic: narrow a real P2 frame by characters, including a trailing
+    // space at the clipping edge. Live Codex below 100 columns is unverified.
+    let (_, text, _) = p2_frames()
+        .into_iter()
+        .find(|(name, _, _)| name.contains(stem))
+        .unwrap_or_else(|| panic!("missing P2 fixture: {stem}"));
+    let expected = observe(&text).dialog;
+    assert!(matches!(expected, ControlDialog::HookList { .. }));
+    let clipped = plain(&text)
+        .lines()
+        .map(|line| line.chars().take(width).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = clipped
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for text in [&clipped, &trimmed] {
+        for input in [ScreenInput::Plain(text), ScreenInput::Styled(text)] {
+            assert_eq!(
+                observe_control_screen(input, None).dialog,
+                expected,
+                "{stem}: {width}"
+            );
+        }
+    }
+}
+
+#[test]
+fn p2_synthetic_pending_bottom_clipped_on_space_preserves_list() {
+    assert_synthetic_clipped_page_preserves_list("11-pending-sweep-down13-100x32", 96);
+}
+
+#[test]
+fn p2_synthetic_pending_top_clipped_on_space_preserves_list() {
+    assert_synthetic_clipped_page_preserves_list("11-pending-sweep-open-100x32", 84);
+}
+
+#[test]
+fn p2_synthetic_trusted_page_clipped_on_space_preserves_list() {
+    assert_synthetic_clipped_page_preserves_list("11-trusted-down13-100x32", 81);
+}
+
+#[test]
+fn p2_synthetic_every_trimmed_page_preserves_list() {
+    // Synthetic: remove capture-pane -N allocation padding from every P2
+    // page, including clipped bottom rows absent from the a04-only regression.
+    let frames = p2_frames();
+    assert_eq!(frames.len(), 263);
+    for (name, text, _) in frames {
+        let expected = observe(&text).dialog;
+        assert!(matches!(expected, ControlDialog::HookList { .. }), "{name}");
+        let trimmed = plain(&text)
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            observe_control_screen(ScreenInput::Plain(&trimmed), None).dialog,
+            expected,
+            "{name}"
+        );
+    }
+}
+
+fn pending_clipped_pages() -> Vec<(String, String)> {
+    let pages: Vec<_> = p2_frames()
+        .into_iter()
+        .filter(|(name, _, first)| {
+            name.contains("-pending-") && name.contains("100x") && *first == 6
+        })
+        .map(|(name, text, _)| (name, plain(&text)))
+        .collect();
+    assert_eq!(pages.len(), 31);
+    pages
+}
+
+#[test]
+fn p2_synthetic_short_description_right_aligned_to_edge_stays_unknown() {
+    // Synthetic: shorten Interrupt's real clipped description, then shift it
+    // right to the same edge. Reaching the edge alone must not validate it.
+    for (name, text) in pending_clipped_pages() {
+        let row = text
+            .lines()
+            .find(|line| line.contains("Interrupt"))
+            .unwrap();
+        for prefix in ["Right", "Right before an interrupted turn"] {
+            let replacement = format!("{}{prefix:>40}", row.chars().take(60).collect::<String>());
+            let mutated = text.replace(row, &replacement);
+            let trimmed = mutated
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for text in [&mutated, &trimmed] {
+                for input in [ScreenInput::Plain(text), ScreenInput::Styled(text)] {
+                    assert_eq!(
+                        observe_control_screen(input, None).dialog,
+                        ControlDialog::Unknown,
+                        "{name}: {prefix}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn p2_synthetic_both_clipped_rows_pushed_past_edge_stay_unknown() {
+    // Synthetic: move both clipped descriptions four columns past the real
+    // edge without restoring their missing text. A wider edge must not hide it.
+    for (name, text) in pending_clipped_pages() {
+        let mutated = text
+            .lines()
+            .map(|line| {
+                if line.contains("Interrupt") || line.contains("PostModelRequest") {
+                    format!(
+                        "{}    {}",
+                        line.chars().take(60).collect::<String>(),
+                        line.chars().skip(60).collect::<String>()
+                    )
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = mutated
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [&mutated, &trimmed] {
+            for input in [ScreenInput::Plain(text), ScreenInput::Styled(text)] {
+                assert_eq!(
+                    observe_control_screen(input, None).dialog,
+                    ControlDialog::Unknown,
+                    "{name}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn p2_synthetic_page_damage_stays_unknown() {
     // Synthetic: mutate EVERY accepted real shape, including selected extras,

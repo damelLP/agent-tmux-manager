@@ -323,6 +323,21 @@ fn synthetic_column_zero_shell_prompt_before_header_vetoes_freshness() {
 }
 
 #[test]
+fn synthetic_column_zero_service_status_before_header_vetoes_freshness() {
+    // Synthetic: no captured shell preamble has this shape. A systemctl-style
+    // status line above A-auto-ready's real header resembles transcript chrome
+    // and conservatively vetoes freshness without blocking the ready editor.
+    let auto = plain(AUTO);
+    let fresh = &auto[auto.find(" ▐▛███▛█   Claude Code v").unwrap()..];
+    let text = format!("● example.service - Example service\n{fresh}");
+    for input in [ScreenInput::Plain(&text), ScreenInput::Styled(&text)] {
+        let observed = observe_control_screen(input, None);
+        assert_eq!(observed.dialog, ControlDialog::None);
+        assert_eq!(observed.facts.fresh_editor, FreshEditorEvidence::Unknown);
+    }
+}
+
+#[test]
 fn synthetic_headers_and_footer_damage_do_not_manufacture_freshness() {
     let auto = plain(AUTO);
     for text in [

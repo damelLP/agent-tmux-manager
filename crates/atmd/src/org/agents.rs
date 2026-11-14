@@ -562,8 +562,11 @@ impl AgentRuntime {
                     task: None,
                 };
                 // Repair a partial Stuck/Note prefix, without duplicating a note
-                // whose append completed after its caller timed out.
-                if !state.messages().any(|message| message.content == content) {
+                // whose append completed after its caller timed out. A note sent
+                // before the agent's last change belongs to an earlier incident.
+                if !state.messages().any(|message| {
+                    message.content == content && message.sent_at >= agent.updated_at
+                }) {
                     self.org
                         .execute(OrgCommand::SendMessage(content), chrono::Utc::now())
                         .await?;

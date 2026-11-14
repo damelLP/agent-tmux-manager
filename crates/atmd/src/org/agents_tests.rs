@@ -1143,6 +1143,40 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn review_second_interrupted_clear_sends_its_own_note() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        for round in 1..=2 {
+            rig.command(OrgCommand::Clear {
+                agent_id: "p/lead".parse().unwrap(),
+            })
+            .await;
+            // Two restarts per incident: the second must not repeat the Note.
+            for _ in 0..2 {
+                rig.inspect_only("%1", "p/lead");
+                let cancel = rig.cancel.child_token();
+                let (agents, task) = spawn_agents(
+                    rig.org.clone(),
+                    rig.registry.clone(),
+                    rig.control.clone(),
+                    cancel.clone(),
+                );
+                agents.reconciled().await.unwrap();
+                assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+                assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), round);
+                cancel.cancel();
+                task.await.unwrap();
+            }
+            // The owner fixes the pane: a new session binds and the agent is Ready.
+            rig.command(OrgCommand::SessionBound {
+                agent_id: "p/lead".parse().unwrap(),
+                session_id: SessionId::new(format!("s{}", round + 1)),
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
     async fn review_failed_restart_note_retries_on_next_wake() {
         let rig = Rig::gated_with_failure(None, Some("msg.sent")).await;
         rig.agent("lead", Some("%1"), Some("old")).await;

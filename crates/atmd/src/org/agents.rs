@@ -603,7 +603,11 @@ impl AgentRuntime {
                 return Ok(());
             }
         }
-        if agent.status == AgentStatus::Stuck || (!initial && agent.status == AgentStatus::Ready) {
+        // A capture can change nothing for a Ready agent on an ordinary wake, or
+        // for a session-less one at the restart check: don't read, or fail on, it.
+        if agent.status == AgentStatus::Stuck
+            || (agent.status == AgentStatus::Ready && (!initial || agent.session_id.is_none()))
+        {
             return Ok(());
         }
         let Some(pane) = &agent.pane else {

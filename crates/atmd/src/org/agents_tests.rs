@@ -247,6 +247,37 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn review_restart_ready_unbound_reads_no_screen() {
+        // No outcome of a capture can change a session-less Ready agent, so the
+        // restart check must not read its screen, or fail when it can't.
+        for capture in [true, false] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), None).await;
+            rig.row("pending-100", "%1", false).await;
+            if capture {
+                rig.frame("%1", "p/lead", "unknown\n");
+            } else {
+                rig.inspect_only("%1", "p/lead");
+            }
+            let before = rig.org.status().unwrap();
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+            assert_eq!(rig.org.status().unwrap(), before);
+            assert_eq!(
+                rig.client
+                    .pending_reads(&PaneId::parse("%1").unwrap())
+                    .unwrap(),
+                if capture { 3 } else { 0 }
+            );
+            assert_eq!(
+                agents.list(ListParams::default()).await.unwrap()[0].reason,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn review_safe_restart_ready_has_zero_writes() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
@@ -349,7 +380,7 @@ mod reconciliation {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), None).await;
         rig.row("pending-100", "%1", false).await;
-        rig.frame("%1", "p/lead", IDLE);
+        rig.inspect_only("%1", "p/lead");
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
         let mut events = agents.observation_events();
@@ -409,7 +440,7 @@ mod reconciliation {
         rig.agent("lead", Some("%1"), None).await;
         // Registered before the service subscribes: no Registered wake exists.
         rig.row("fresh", "%1", false).await;
-        rig.frame("%1", "p/lead", IDLE);
+        rig.inspect_only("%1", "p/lead");
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
         assert_eq!(rig.state("lead").await.session_id, None);
@@ -430,7 +461,7 @@ mod reconciliation {
             let rig = Rig::new().await;
             rig.agent("lead", Some("%1"), None).await;
             rig.row("pending-100", "%1", false).await;
-            rig.frame("%1", "p/lead", IDLE);
+            rig.inspect_only("%1", "p/lead");
             let (agents, _) = rig.start();
             agents.reconciled().await.unwrap();
             let before = rig.org.status().unwrap();

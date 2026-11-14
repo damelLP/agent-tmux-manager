@@ -1000,15 +1000,42 @@ async fn scenario_control_server_identity_and_start_directory(env: &E2eEnv) {
         vec!["send", "%0", "must not arrive"],
         vec!["spawn", "-t", "%0"],
     ] {
-        let output = command_output(
-            Command::new(&env.atm_path)
-                .args(args)
-                .env("ATM_SOCKET", &env.daemon.socket_path)
-                .env("XDG_STATE_HOME", &env.daemon.state_dir)
-                .env("ATM_TMUX_SOCKET", other.label())
-                .env("TMUX", "private-test")
-                .env("ATM_SPAWN_BIN", "true"),
+        let config_home = env.daemon.state_dir.join("config");
+        let mut command = Command::new(&env.atm_path);
+        command
+            .args(args)
+            .env("ATM_SOCKET", &env.daemon.socket_path)
+            .env("XDG_STATE_HOME", &env.daemon.state_dir)
+            .env("ATM_TMUX_SOCKET", other.label())
+            .env("TMUX", "private-test")
+            .env("ATM_SPAWN_BIN", "true")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("ATM_SPAWN_ARGS")
+            .env_remove("ATM_SPAWN_CLAUDE_BIN")
+            .env_remove("ATM_SPAWN_CLAUDE_ARGS");
+        // Even if server refusal regresses, no ambient harness may launch.
+        let command_env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value)
+        };
+        assert_eq!(
+            command_env("XDG_CONFIG_HOME"),
+            Some(Some(config_home.as_os_str()))
         );
+        assert_eq!(
+            command_env("ATM_SPAWN_BIN"),
+            Some(Some(std::ffi::OsStr::new("true")))
+        );
+        for key in [
+            "ATM_SPAWN_ARGS",
+            "ATM_SPAWN_CLAUDE_BIN",
+            "ATM_SPAWN_CLAUDE_ARGS",
+        ] {
+            assert_eq!(command_env(key), Some(None), "must remove {key}");
+        }
+        let output = command_output(&mut command);
         assert!(!output.status.success(), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("atmd controls tmux server"),
@@ -1798,7 +1825,8 @@ async fn scenario_atm_spawn_defaults_to_tmux_pane(env: &E2eEnv, probe_pane: &str
 
 /// Scenario 5a — `atm workspace create` should install the same long-lived
 /// hooks as attach. In particular, after-new-window must inject a sidebar into
-/// windows opened after creation.
+/// windows opened after creation. An isolated config names the pi stand-in,
+/// whose launch in the agent pane is checked before the hooks.
 async fn scenario_workspace_create(env: &E2eEnv) {
     let create_session_name = format!("jghcrt{}", std::process::id());
     let create_socket_label = format!("atm-{create_session_name}");
@@ -1807,13 +1835,7 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     let standin_dir = tempfile::tempdir().expect("create workspace stand-in tempdir");
     let log = standin_dir.path().join("pi.log");
     let pi = write_pi_standin(standin_dir.path(), &log);
-    write_atm_config(
-        config_home.path(),
-        &format!(
-            "[harness]\ndefault = 'pi'\n\n[harness.pi]\nbinary = '{}'\n",
-            pi.display()
-        ),
-    );
+    write_pi_default_config(config_home.path(), &pi);
     // Own cleanup before create can fail, and before its directories disappear.
     let create_tmux = PrivateTmux {
         socket_label: create_socket_label,
@@ -1834,9 +1856,7 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     );
 
     let agent_pane = top_non_sidebar_pane(create_tmux.label(), &create_session_name);
-    wait_for_signal(create_tmux.label(), "pi-recorded", deadline)
-        .expect("workspace agent must run the configured stand-in");
-    let recorded = std::fs::read_to_string(&log).expect("read completed workspace stand-in record");
+    let recorded = read_pi_record(create_tmux.label(), &agent_pane, &log, deadline);
     assert_eq!(
         recorded,
         format!("{agent_pane}\n\n"),
@@ -2517,13 +2537,7 @@ async fn create_workspace_with_pi_default(
     };
     let log = standin_dir.path().join("pi.log");
     let pi = write_pi_standin(standin_dir.path(), &log);
-    write_atm_config(
-        config_home.path(),
-        &format!(
-            "[harness]\ndefault = 'pi'\n\n[harness.pi]\nbinary = '{}'\n",
-            pi.display()
-        ),
-    );
+    write_pi_default_config(config_home.path(), &pi);
 
     let mut create =
         workspace_create_command(env, &session_name, config_home.path(), data_dir.path());
@@ -2540,17 +2554,7 @@ async fn create_workspace_with_pi_default(
     );
 
     let agent_pane = top_non_sidebar_pane(tmux.label(), &session_name);
-    // Latched even if the stand-in completes before this client starts.
-    if let Err(error) = wait_for_signal(tmux.label(), "pi-recorded", deadline) {
-        let screen = tmux_run_capture(tmux.label(), &["capture-pane", "-p", "-t", &agent_pane])
-            .unwrap_or_default();
-        let stages = std::fs::read_to_string(log.with_extension("stages")).unwrap_or_default();
-        panic!(
-            "pi record completion: {error}; stages:\n{stages}\nagent pane {agent_pane}:\n{screen}"
-        );
-    }
-    let recorded =
-        std::fs::read_to_string(&log).expect("pi signalled after atomically writing its record");
+    let recorded = read_pi_record(tmux.label(), &agent_pane, &log, deadline);
     let mut lines = recorded.lines();
     assert_eq!(
         lines.next(),
@@ -2558,6 +2562,21 @@ async fn create_workspace_with_pi_default(
         "the configured pi should run in the agent pane"
     );
     lines.next().unwrap_or_default().to_string()
+}
+
+/// Waits for the stand-in's atomic record, diagnosing a missing signal with
+/// its stage log and the agent pane's actual contents.
+fn read_pi_record(socket_label: &str, agent_pane: &str, log: &Path, deadline: Instant) -> String {
+    // Latched even if the stand-in completes before this client starts.
+    if let Err(error) = wait_for_signal(socket_label, "pi-recorded", deadline) {
+        let screen = tmux_run_capture(socket_label, &["capture-pane", "-p", "-t", agent_pane])
+            .unwrap_or_default();
+        let stages = std::fs::read_to_string(log.with_extension("stages")).unwrap_or_default();
+        panic!(
+            "pi record completion: {error}; stages:\n{stages}\nagent pane {agent_pane}:\n{screen}"
+        );
+    }
+    std::fs::read_to_string(log).expect("pi signalled after atomically writing its record")
 }
 
 /// `atm workspace create --name <session> --isolate`, without attaching,
@@ -2666,6 +2685,17 @@ async fn scenario_workspace_create_rejects_unknown_harness(env: &E2eEnv) {
         !scripts.exists(),
         "no workspace script should be written; found {:?}",
         std::fs::read_dir(&scripts).map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+}
+
+/// Selects the absolute pi stand-in as the default in the isolated config.
+fn write_pi_default_config(config_home: &Path, pi: &Path) {
+    write_atm_config(
+        config_home,
+        &format!(
+            "[harness]\ndefault = 'pi'\n\n[harness.pi]\nbinary = '{}'\n",
+            pi.display()
+        ),
     );
 }
 

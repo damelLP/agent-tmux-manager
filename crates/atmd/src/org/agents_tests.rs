@@ -386,6 +386,210 @@ mod reconciliation {
         );
     }
 
+    async fn recipient_of(agents: &AgentHandle, name: &str) -> Result<Recipient, AgentError> {
+        agents
+            .recipient(&format!("p/{name}").parse().unwrap())
+            .await
+    }
+
+    #[tokio::test]
+    async fn recipient_registry_unavailable_is_an_error() {
+        // A stopped registry.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        let (send, receive) = mpsc::channel(1);
+        drop(receive);
+        let (events, _) = broadcast::channel(1);
+        let (agents, _) = spawn_agents(
+            rig.org.clone(),
+            RegistryHandle::new(send, events),
+            rig.control.clone(),
+            rig.cancel.child_token(),
+        );
+        agents.reconciled().await.unwrap();
+        assert!(matches!(
+            recipient_of(&agents, "lead").await,
+            Err(AgentError::Unavailable(_))
+        ));
+
+        // A registry that takes the request and drops it. Its other reads
+        // answer, so the unchecked list sees the same failure as "no rows".
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        let (send, mut receive) = mpsc::channel(16);
+        let (events, _) = broadcast::channel(16);
+        let (asked, mut asks) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = receive.recv().await {
+                match command {
+                    crate::registry::RegistryCommand::GetAllSessions { respond_to } => {
+                        let _ = respond_to.send(Vec::new());
+                    }
+                    crate::registry::RegistryCommand::PaneSessions { pane, respond_to } => {
+                        drop(respond_to);
+                        asked.send(pane).unwrap();
+                    }
+                    other => panic!("unexpected registry command: {other:?}"),
+                }
+            }
+        });
+        rig.inspect_only("%1", "p/lead");
+        let (agents, _) = spawn_agents(
+            rig.org.clone(),
+            RegistryHandle::new(send, events),
+            rig.control.clone(),
+            rig.cancel.child_token(),
+        );
+        agents.reconciled().await.unwrap();
+        assert!(matches!(
+            recipient_of(&agents, "lead").await,
+            Err(AgentError::Unavailable(_))
+        ));
+        assert_eq!(asks.recv().await.as_deref(), Some("%1"));
+        assert_eq!(agents.list(ListParams::default()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recipient_ambiguous_rows_is_an_error() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.row("one", "%1", false).await;
+        rig.inspect_only("%1", "p/lead");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        // The twin: exactly one eligible row is the recipient's session.
+        let recipient = recipient_of(&agents, "lead").await.unwrap();
+        assert_eq!(
+            recipient.session.map(|row| row.id),
+            Some(SessionId::new("one"))
+        );
+        rig.row("two", "%1", false).await;
+        match recipient_of(&agents, "lead").await {
+            Err(AgentError::Conflict(reason)) => {
+                assert!(
+                    reason.contains("more than one eligible session"),
+                    "{reason}"
+                );
+            }
+            other => panic!("an ambiguous pane must not read as no session: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recipient_excludes_old_child_and_pending_rows() {
+        let rig = Rig::new().await;
+        // A cleared agent that is Ready with no session yet: its old session
+        // is excluded until a new one binds.
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.command(OrgCommand::EditorReady {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        for (id, pane, child, harness) in [
+            ("old", "%1", false, Harness::Pi),
+            ("child", "%1", true, Harness::Pi),
+            ("pending-100", "%1", false, Harness::Pi),
+            ("other-harness", "%1", false, Harness::Codex),
+            ("other-pane", "%2", false, Harness::Pi),
+        ] {
+            rig.row_of(id, pane, child, harness).await;
+        }
+        rig.inspect_only("%1", "p/lead");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let recipient = recipient_of(&agents, "lead").await.unwrap();
+        assert_eq!(recipient.pane, PaneId::parse("%1").unwrap());
+        assert_eq!(recipient.harness, Harness::Pi);
+        assert_eq!(recipient.excluded, Some(SessionId::new("old")));
+        assert!(recipient.session.is_none(), "{:?}", recipient.session);
+        // The twin: a new parent session of the agent's harness on its pane.
+        rig.row("new", "%1", false).await;
+        let recipient = recipient_of(&agents, "lead").await.unwrap();
+        assert_eq!(
+            recipient.session.map(|row| row.id),
+            Some(SessionId::new("new"))
+        );
+        assert_eq!(recipient.excluded, Some(SessionId::new("old")));
+    }
+
+    #[tokio::test]
+    async fn recipient_without_baseline_refuses_every_read() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.row("s1", "%1", false).await;
+        rig.inspect_only("%1", "p/lead");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let id: AgentId = "p/lead".parse().unwrap();
+        // A real idle pi editor with pi in the pane's foreground.
+        let capture = PaneCapture::new(
+            IDLE.into(),
+            Rig::inspection("%1", "p/lead", false).with_foreground_process(None, Some("pi".into())),
+            CaptureFormat::Ansi,
+        );
+        let idle =
+            atm_pi_adapter::screen::observe_screen(atm_core::ScreenInput::Styled(IDLE), None);
+        assert_eq!(idle.input, atm_core::InputState::Empty);
+
+        let recipient = recipient_of(&agents, "lead").await.unwrap();
+        assert_eq!(recipient.baseline, PaneBaseline::unproven());
+        assert_eq!(
+            recipient.screen.facts(&capture, &recipient.baseline),
+            atm_core::ScreenFacts::default()
+        );
+        assert_eq!(
+            recipient.screen.staged(&capture, &recipient.baseline, "x"),
+            None
+        );
+        // A baseline recorded for another pane is not this pane's.
+        let pinned = PaneBaseline::adopted(100)
+            .with_harness("pi".into())
+            .unwrap();
+        agents.record_baseline(id.clone(), "%9", pinned.clone());
+        let recipient = recipient_of(&agents, "lead").await.unwrap();
+        assert_eq!(recipient.baseline, PaneBaseline::unproven());
+        // The twin: with this pane's baseline the same capture is read.
+        agents.record_baseline(id, "%1", pinned.clone());
+        let recipient = recipient_of(&agents, "lead").await.unwrap();
+        assert_eq!(recipient.baseline, pinned);
+        assert_eq!(recipient.screen.facts(&capture, &recipient.baseline), idle);
+    }
+
+    #[tokio::test]
+    async fn recipient_refuses_what_it_cannot_name() {
+        let rig = Rig::new().await;
+        rig.agent("lead", None, None).await;
+        rig.agent_of("guest", "gemini", Some("%3"), None).await;
+        rig.inspect_only("%3", "p/guest");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert!(matches!(
+            recipient_of(&agents, "nobody").await,
+            Err(AgentError::NotFound(_))
+        ));
+        match recipient_of(&agents, "lead").await {
+            Err(AgentError::Refused(reason)) => assert!(reason.contains("no pane"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        // No adapter reads this harness's screen.
+        match recipient_of(&agents, "guest").await {
+            Err(AgentError::Refused(reason)) => {
+                assert!(reason.contains("no screen reader"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            AgentHandle::disabled("off")
+                .recipient(&"p/lead".parse().unwrap())
+                .await,
+            Err(AgentError::Unavailable(_))
+        ));
+    }
+
     // Adapted from the A1 review probes: assertions describe the desired behavior.
     async fn progress(
         events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,

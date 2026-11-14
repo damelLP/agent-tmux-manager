@@ -125,8 +125,49 @@ pub(super) struct AgentRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
+    /// Each agent's pane and what was recorded about its processes. In memory
+    /// only; written under the agent's reservation.
+    baselines: Arc<std::sync::Mutex<HashMap<AgentId, (String, PaneBaseline)>>>,
     #[cfg(test)]
     progress: broadcast::Sender<ObservationProgress>,
+}
+
+impl AgentRuntime {
+    /// The baseline recorded for `agent` on `pane`, or one that refuses every
+    /// read: none was recorded, or it belongs to a pane the agent has left.
+    fn baseline(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
+        self.baselines
+            .lock()
+            .ok()
+            .and_then(|baselines| baselines.get(agent).cloned())
+            .filter(|(recorded, _)| recorded == pane)
+            .map_or_else(PaneBaseline::unproven, |(_, baseline)| baseline)
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
+        self.baselines
+            .lock()
+            .unwrap()
+            .insert(agent, (pane.into(), baseline));
+    }
+}
+
+/// What a delivery needs to know about its recipient, read in one call.
+#[derive(Debug, Clone)]
+pub struct Recipient {
+    pub pane: PaneId,
+    pub harness: Harness,
+    /// The harness's screen dispatch, for use with `baseline`.
+    pub screen: &'static AgentScreen,
+    /// What was recorded about the pane's processes. When nothing was, this is
+    /// [`PaneBaseline::unproven`] and every read through `screen` refuses.
+    pub baseline: PaneBaseline,
+    /// The agent's excluded (old) session: a session that appears later must
+    /// not be this one.
+    pub excluded: Option<SessionId>,
+    /// The single eligible parent session on the pane; `None` when there is none.
+    pub session: Option<SessionView>,
 }
 
 #[cfg(test)]
@@ -178,6 +219,12 @@ impl AgentHandle {
     #[cfg(test)]
     pub(super) fn observation_events(&self) -> broadcast::Receiver<ObservationProgress> {
         self.inner.runtime.as_ref().unwrap().progress.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
+        let rt = self.inner.runtime.as_ref().unwrap();
+        rt.record_baseline(agent, pane, baseline);
     }
 
     #[must_use]
@@ -443,6 +490,63 @@ impl AgentHandle {
         .await
         .map_err(|_| AgentError::Timeout)?
     }
+    /// The recipient's pane, screen dispatch, baseline and session, for a
+    /// delivery. Call it inside the caller's reservation for `agent`, so no
+    /// lifecycle job changes the answer before it is used.
+    ///
+    /// A registry that cannot answer, and a pane with more than one eligible
+    /// session, are errors: neither is ever reported as "no session".
+    pub async fn recipient(&self, agent: &AgentId) -> Result<Recipient, AgentError> {
+        const OPERATION: &str = "agent recipient";
+        if !matches!(*self.inner.ready.borrow(), Some(Ok(()))) {
+            return Err(self.unavailable(OPERATION));
+        }
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let state = rt.org.snapshot().await?;
+        let found = state
+            .agent(agent)
+            .ok_or_else(|| AgentError::NotFound(format!("agent {agent} was not found")))?;
+        let pane = found
+            .pane
+            .as_ref()
+            .ok_or_else(|| AgentError::Refused(format!("agent {agent} has no pane")))?;
+        let rows: Vec<SessionView> = timeout(LIST_BUDGET, rt.registry.pane_sessions(pane))
+            .await
+            .map_err(|_| AgentError::Timeout)?
+            .map_err(|error| AgentError::Unavailable(format!("session registry: {error}")))?
+            .into_iter()
+            .map(|row| row.view)
+            .collect();
+        let harness = harness(&state, found, &rows);
+        let screen = agent_screen(harness).ok_or_else(|| {
+            AgentError::Refused(format!(
+                "agent {agent}: no screen reader for harness {}",
+                harness.short_tag()
+            ))
+        })?;
+        let mut eligible = rows.into_iter().filter(|row| {
+            matches_agent(found, row) && !row.id.is_pending() && row.harness == harness.short_tag()
+        });
+        let session = eligible.next();
+        if eligible.next().is_some() {
+            return Err(AgentError::Conflict(format!(
+                "agent {agent} has more than one eligible session on {pane}"
+            )));
+        }
+        Ok(Recipient {
+            pane: PaneId::parse(pane)?,
+            harness,
+            screen,
+            baseline: rt.baseline(agent, pane),
+            excluded: found.excluded_session_id.clone(),
+            session,
+        })
+    }
+
     pub async fn reconciled(&self) -> Result<(), AgentError> {
         if let Some(reason) = &self.inner.disabled {
             return Err(AgentError::Unavailable(reason.clone()));
@@ -823,6 +927,7 @@ pub fn spawn_agents(
         org,
         registry,
         control,
+        baselines: Arc::default(),
         #[cfg(test)]
         progress: broadcast::channel(4096).0,
     };

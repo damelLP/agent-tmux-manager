@@ -85,7 +85,8 @@
 //! | Wait IdleStabilizing/InputStabilizing/PaneGoneGrace | Start/continue |
 //! | Wait OwnerFocused/SessionBusy/AgentNotReady/OtherDelivery | Reset |
 //! | PasteNow | Reset on serialized consumption; reset pane readiness after paste |
-//! | Blocked (any reason) | Retain; never restart because a notice was emitted |
+//! | Blocked AgentUnavailable/AgentNotReadyTimeout | Reset (agent state) |
+//! | Blocked (any other reason) | Retain a running hold; never start or restart one |
 //! | RetryAt/AwaitConfirmation | Preserve an existing hold; do not start one for scheduling |
 //! | Confirm/Complete/Fail | Discard after consumption ends the message lifecycle |
 //! | Error | Do not advance continuity based on an unsuccessful decision |
@@ -255,8 +256,10 @@ pub struct RecipientLiveView {
     pub last_paste_at: Option<DateTime<Utc>>,
     /// Start of the continuous inability to paste, including stabilization and
     /// pane-gone grace. Preserve across blocker/source changes and brief empty
-    /// samples. Reset on paste or a non-hold wait (focus, busy row, agent state,
-    /// other delivery); see the module's table. None starts now, never sent_at.
+    /// samples. Reset on paste, a non-hold wait (focus, busy row, agent state,
+    /// other delivery), or Blocked(AgentUnavailable/AgentNotReadyTimeout).
+    /// Other Blocked steps retain but never start a hold. See the module's table.
+    /// None starts now on a hold wait, never sent_at.
     pub hold_since: Option<DateTime<Utc>>,
     /// Start of continuous observation of this effective draft/dialog on a stale
     /// non-idle row. Reset on blocker change/clear/unknown, row freshness, or a
@@ -883,6 +886,9 @@ mod tests {
             | DeliveryStep::Confirm { .. }
             | DeliveryStep::Complete
             | DeliveryStep::Fail { .. }
+            | DeliveryStep::Blocked {
+                reason: FailureReason::AgentUnavailable | FailureReason::AgentNotReadyTimeout,
+            }
             | DeliveryStep::Wait {
                 reason:
                     WaitReason::OwnerFocused
@@ -891,7 +897,7 @@ mod tests {
                     | WaitReason::OtherDelivery,
                 ..
             } => live.hold_since = None,
-            DeliveryStep::Wait { .. } | DeliveryStep::Blocked { .. } => {
+            DeliveryStep::Wait { .. } => {
                 live.hold_since.get_or_insert(now);
             }
             _ => {}
@@ -953,6 +959,66 @@ mod tests {
                     );
                 }
                 track_hold(&mut live, &step, time(now));
+            }
+        }
+    }
+
+    #[test]
+    fn agent_state_blocks_do_not_spend_the_recovery_hold() {
+        let h = History::new(false);
+        for status in [
+            AgentStatus::Stuck,
+            AgentStatus::Down,
+            AgentStatus::Starting,
+            AgentStatus::Clearing,
+        ] {
+            for previous_hold in [None, Some(time(-50))] {
+                let mut live = ready();
+                live.hold_since = previous_hold;
+                live.agent_status = status;
+                live.agent_not_ready_since = Some(time(0));
+                let recovery = if matches!(status, AgentStatus::Stuck | AgentStatus::Down) {
+                    1000
+                } else {
+                    300
+                };
+                for now in 0..recovery {
+                    let step = h.step(&live, now);
+                    track_hold(&mut live, &step, time(now));
+                }
+                live.agent_status = AgentStatus::Ready;
+                live.agent_not_ready_since = None;
+                live.session.as_mut().unwrap().status_since = time(recovery);
+                live.input_line = InputLine::EmptySince(time(recovery));
+                for now in recovery..recovery + 10 {
+                    let step = h.step(&live, now);
+                    assert_eq!(
+                        wait(step.clone(), WaitReason::IdleStabilizing),
+                        time(recovery + 10)
+                    );
+                    track_hold(&mut live, &step, time(now));
+                }
+                assert_eq!(
+                    h.step(&live, recovery + 10),
+                    DeliveryStep::PasteNow { attempt: 1 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_agent_blocks_never_start_or_restart_holds() {
+        for reason in [
+            FailureReason::ReadinessTimeout,
+            FailureReason::DraftPresent,
+            FailureReason::Restarted,
+            FailureReason::ProbablyDelivered,
+        ] {
+            for since in [None, Some(time(0))] {
+                let mut live = ready();
+                live.hold_since = since;
+                track_hold(&mut live, &DeliveryStep::Blocked { reason }, time(1000));
+                assert_eq!(live.hold_since, since);
             }
         }
     }

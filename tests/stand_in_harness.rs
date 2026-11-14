@@ -126,6 +126,10 @@ fn claude_stand_in_lifecycle() {
     config.clear_gap_ms = 1200;
     let pane = rig.launch(&config);
     let original = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+    assert!(rig
+        .journal(&pane)
+        .iter()
+        .any(|e| e["kind"] == "status" && e["data"]["session_id"] == original.id.as_str()));
     let text = "Unicode λ, quote ' and \"\n/clear\ntrailing semicolon;";
     success(rig.atm(&["send", &pane.pane_id, text]));
     let working = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
@@ -137,11 +141,35 @@ fn claude_stand_in_lifecycle() {
         rig.journal(&pane).iter().any(|e| e["state"] == "clearing")
     });
     rig.wait_for_absent(&original.id);
+    rig.wait("Claude clearing screen", || {
+        rig.capture(&pane).contains(": clearing")
+    });
+    assert!(
+        rig.pane_rows(&pane).is_empty(),
+        "SessionEnd must remove the row during the gap"
+    );
+    // Synthetic: replay a captured-shaped status after SessionEnd but before the new start.
+    rig.paste(&pane, &format!("/atm/status {}", original.id));
+    rig.wait("late status sent", || {
+        rig.capture(&pane).contains("status sent")
+    });
+    assert!(
+        rig.pane_rows(&pane).is_empty(),
+        "late status must not resurrect the old row"
+    );
     let new = rig.wait_for_row(&pane, |r| {
         r.id != original.id && r.status == SessionStatus::Idle
     });
     rig.wait_ready(&pane, Some(new.id.as_str()));
+    assert_ne!(original.id, new.id);
     assert!(new.first_prompt.is_none());
+    assert!(
+        rig.journal(&pane)
+            .iter()
+            .filter(|e| e["kind"] == "status")
+            .count()
+            >= 4
+    );
 
     rig.paste(&pane, "/atm/dialog");
     rig.wait_for_row(&pane, |r| r.status == SessionStatus::AttentionNeeded);
@@ -221,7 +249,20 @@ fn codex_stand_in_lazy_session() {
     rig.wait_ready(&pane, None);
     let before = event_names(&rig, &pane);
     rig.paste(&pane, "/new");
-    let next = format!("{}2", old.id.as_str().strip_suffix('1').unwrap());
+    rig.wait("fresh internal Codex ID", || {
+        rig.journal(&pane)
+            .iter()
+            .any(|e| e["state"] == "clearing" && e["session_id"] != old.id.as_str())
+    });
+    let next = rig
+        .journal(&pane)
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "render")
+        .unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     rig.wait_ready(&pane, Some(&next));
     assert_eq!(
         event_names(&rig, &pane),
@@ -257,6 +298,7 @@ fn pi_stand_in_abort() {
     let mut rig = StandInRig::start();
     let mut config = StandInConfig::new(StandInMode::Pi);
     config.work_ms = 1000;
+    config.clear_gap_ms = 1200;
     let pane = rig.launch(&config);
     rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
     rig.paste(&pane, "pi replay\nexact text");
@@ -283,8 +325,16 @@ fn pi_stand_in_abort() {
     );
     rig.paste(&pane, "/new");
     rig.wait_for_absent(&old.id);
+    rig.wait("pi clearing screen", || {
+        rig.capture(&pane).contains(": clearing")
+    });
+    assert!(
+        rig.pane_rows(&pane).is_empty(),
+        "shutdown must remove the row in the clear gap"
+    );
     let new = rig.wait_for_row(&pane, |r| r.id != old.id && r.status == SessionStatus::Idle);
     rig.wait_ready(&pane, Some(new.id.as_str()));
+    assert_ne!(old.id, new.id);
     rig.paste(&pane, "normal pi turn");
     rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
     rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
@@ -326,7 +376,15 @@ fn stand_in_spawn_prompt() {
     let text = "spawn 'quote', \"double quote\", $literal;";
     let mut command = rig.command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
     command
-        .args(["spawn", "--target-pane", &target, "--prompt", text])
+        .args([
+            "spawn",
+            "--target-pane",
+            &target,
+            "--model",
+            "fixture-model",
+            "--prompt",
+            text,
+        ])
         .env("TMUX", rig.tmux_env())
         .env("ATM_SPAWN_BIN", rig.launcher(StandInMode::Claude));
     let pane_id = success(rig.run(&mut command));
@@ -346,14 +404,11 @@ fn stand_in_spawn_prompt() {
 fn stand_in_observes_restarted_process() {
     let mut rig = StandInRig::start();
     let first = rig.launch(&StandInConfig::new(StandInMode::Claude));
+    let old = rig.wait_for_row(&first, |r| r.status == SessionStatus::Idle);
     rig.paste(&first, "/atm/exit");
     rig.wait_for_shell(&first);
-    // Reuse the existing pane's exported fixture env and journal, as respawn does.
-    let launcher = first.launcher.to_str().unwrap().replace('\'', "'\\''");
-    rig.paste(
-        &first,
-        &format!("ATM_STANDIN_ID_PREFIX=respawn '{launcher}'"),
-    );
+    // tmux reruns the original launch command without shell-exported config.
+    success(rig.tmux(&["respawn-pane", "-k", "-t", &first.pane_id]));
     let second = rig.observe_pane(
         first.pane_id.clone(),
         StandInMode::Claude,
@@ -363,8 +418,138 @@ fn stand_in_observes_restarted_process() {
         second.pid, first.pid,
         "must not return the old journal identity"
     );
-    rig.wait_ready(&second, Some("respawn-1"));
-    rig.wait_for_row(&second, |r| r.id.as_str() == "respawn-1");
+    rig.wait_ready(&second, None);
+    let new = rig.wait_for_row(&second, |r| r.status == SessionStatus::Idle);
+    assert_ne!(old.id, new.id);
+    // Also relaunch in the retained shell, using exactly the same config/prefix.
+    rig.paste(&second, "/atm/exit");
+    rig.wait_for_shell(&second);
+    rig.paste(
+        &second,
+        &format!(
+            "'{}' --atm-config '{}'",
+            second.launcher.display(),
+            second.log.with_extension("config.json").display()
+        ),
+    );
+    let third = rig.observe_pane(
+        second.pane_id.clone(),
+        StandInMode::Claude,
+        second.log.clone(),
+    );
+    rig.wait_ready(&third, None);
+    let newest = rig.wait_for_row(&third, |r| r.status == SessionStatus::Idle);
+    assert_ne!(newest.id, old.id);
+    assert_ne!(newest.id, new.id);
+    rig.close();
+}
+
+#[test]
+fn stand_in_visible_draft_queue_and_interrupt() {
+    let mut rig = StandInRig::start();
+    let mut config = StandInConfig::new(StandInMode::Claude);
+    config.work_ms = 1200;
+    let pane = rig.launch(&config);
+    rig.key(&pane, "typed draft");
+    rig.wait("visible typed draft", || {
+        rig.capture(&pane).contains("❯ typed draft")
+    });
+    success(rig.tmux(&["set-buffer", "-b", "draft", " + pasted"]));
+    success(rig.tmux(&[
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        "draft",
+        "-t",
+        &pane.pane_id,
+    ]));
+    rig.wait("visible pasted draft", || {
+        rig.capture(&pane).contains("❯ typed draft + pasted")
+    });
+    rig.key(&pane, "C-u");
+    rig.paste(&pane, "interrupt me");
+    rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
+    success(rig.atm(&["interrupt", &pane.pane_id]));
+    rig.wait("restored draft", || {
+        rig.capture(&pane).contains("❯ interrupt me")
+    });
+    rig.key(&pane, "C-c");
+    rig.wait("empty draft", || {
+        rig.capture(&pane)
+            .lines()
+            .any(|line| line.trim_end() == "❯")
+    });
+    rig.paste(&pane, "first queued test");
+    rig.wait("first submitted", || {
+        rig.journal(&pane)
+            .iter()
+            .any(|e| e["event"] == "UserPromptSubmit" && e["data"]["prompt"] == "first queued test")
+    });
+    rig.paste(&pane, "second queued test");
+    rig.wait("queued", || {
+        rig.journal(&pane)
+            .iter()
+            .any(|e| e["kind"] == "queued" && e["text"] == "second queued test")
+    });
+    assert!(!rig
+        .journal(&pane)
+        .iter()
+        .any(|e| e["event"] == "UserPromptSubmit" && e["data"]["prompt"] == "second queued test"));
+    rig.wait("late confirmation", || {
+        rig.journal(&pane).iter().any(|e| {
+            e["event"] == "UserPromptSubmit" && e["data"]["prompt"] == "second queued test"
+        })
+    });
+    rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+    rig.wait_ready(&pane, None);
+    rig.paste(&pane, "/atm/dialog");
+    rig.wait_for_row(&pane, |r| r.status == SessionStatus::AttentionNeeded);
+    success(rig.atm(&["reply", &pane.pane_id, "--option", "2"]));
+    rig.wait("second dialog option", || {
+        rig.journal(&pane)
+            .iter()
+            .any(|e| e["kind"] == "selection" && e["option"] == 2)
+    });
+    rig.paste(&pane, "/atm/exit");
+    rig.wait_for_shell(&pane);
+    rig.close();
+}
+
+#[test]
+fn pi_stand_in_reconnects_without_reconnecting_on_clear() {
+    let mut rig = StandInRig::start();
+    let pane = rig.launch(&StandInConfig::new(StandInMode::Pi));
+    let old = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+    rig.paste(&pane, "/new");
+    let new = rig.wait_for_row(&pane, |r| r.id != old.id);
+    rig.wait_ready(&pane, Some(new.id.as_str()));
+    let connections = || {
+        rig.journal(&pane)
+            .iter()
+            .filter(|e| e["kind"] == "connected")
+            .count()
+    };
+    assert_eq!(connections(), 1, "one socket across /new");
+    rig.stop_daemon();
+    rig.paste(&pane, "while daemon stopped");
+    rig.wait("buffered input", || {
+        rig.journal(&pane).iter().any(|e| e["event"] == "input")
+    });
+    rig.start_daemon();
+    rig.wait_for_row(&pane, |r| {
+        r.first_prompt.as_deref() == Some("while daemon stopped")
+    });
+    rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+    assert_eq!(
+        rig.journal(&pane)
+            .iter()
+            .filter(|e| e["kind"] == "connected")
+            .count(),
+        2
+    );
+    rig.paste(&pane, "/atm/exit");
+    rig.wait_for_shell(&pane);
     rig.close();
 }
 
@@ -432,6 +617,53 @@ fn stand_in_daemon_control_and_auto_start_cleanup() {
         .unwrap_or_default()
         .split(|b| *b == 0)
         .any(|v| v.starts_with(b"ATM_SOCKET=")));
+}
+
+#[test]
+fn stand_in_invalid_arguments_do_not_announce() {
+    let mut rig = StandInRig::start();
+    let log = rig.root().join("invalid.jsonl");
+    let mut cmd = rig.command(&rig.launcher(StandInMode::Claude));
+    cmd.env("ATM_STANDIN_LOG", &log)
+        .env("ATM_STANDIN_ID_PREFIX", "invalid")
+        .env("TMUX", rig.tmux_env())
+        .env("TMUX_PANE", "%0")
+        .args(["one", "two"]);
+    let output = rig.run(&mut cmd);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at most one positional"));
+    assert!(
+        !log.exists(),
+        "invalid arguments must fail before identity or SessionStart"
+    );
+    rig.close();
+}
+
+#[test]
+fn stand_in_symlinked_tmpdir_cleanup() {
+    if std::env::var_os("STANDIN_SYMLINK_CHILD").is_some() {
+        let mut rig = StandInRig::start();
+        let pane = rig.launch(&StandInConfig::new(StandInMode::Claude));
+        rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+        rig.close();
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    let alias = dir.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    success(bounded::run(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stand_in_symlinked_tmpdir_cleanup",
+                "--nocapture",
+            ])
+            .env("STANDIN_SYMLINK_CHILD", "1")
+            .env("TMPDIR", &alias),
+    ));
+    assert_eq!(std::fs::read_dir(real).unwrap().count(), 0);
 }
 
 #[test]

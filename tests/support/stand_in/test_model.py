@@ -36,8 +36,22 @@ class InputTests(unittest.TestCase):
         self.assertEqual(parser.feed(b"draft\x15new\x7f!\r"), [("submit", "ne!")])
         self.assertEqual(parser.feed(b"\x1b"), [])
         self.assertEqual(parser.flush_escape(), [("escape", "")])
-        self.assertEqual(parser.feed(b"\x03"), [("exit", "")])
+        self.assertEqual(parser.feed(b"\x03"), [("ctrl_c", "")])
         self.assertEqual(parser.feed(b"\r"), [("submit", "")])
+
+    def test_arrow_sequences_are_atomic_and_preserve_draft(self):
+        parser = model.InputParser()
+        self.assertEqual(parser.feed(b"draft\x1b["), [])
+        self.assertEqual(parser.feed(b"B\x1b[A"), [("down", ""), ("up", "")])
+        self.assertEqual(parser.feed(b"\r"), [("submit", "draft")])
+
+    def test_harness_arguments_accept_flags_and_validate_before_start(self):
+        self.assertEqual(model.parse_args(["--model", "X", "--unknown=Y", "--no-tools", "prompt"]), (None, "prompt"))
+        self.assertEqual(model.parse_args(["--atm-config", "/fixture/config", "--", "-prompt"]), ("/fixture/config", "-prompt"))
+        self.assertEqual(model.parse_args(["--unknown"]), (None, None))
+        for args in [["one", "two"], ["--atm-config"], ["--model"], ["--model", "--no-tools"]]:
+            with self.assertRaises(ValueError):
+                model.parse_args(args)
 
     def test_escape_inside_paste_is_data(self):
         parser = model.InputParser()
@@ -55,6 +69,19 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(events(m.tick(509)), [])
         self.assertEqual(events(m.tick(510)), ["Stop"])
         self.assertEqual(events(m.tick(999)), [])
+
+    def test_claude_status_at_start_completion_and_late_replay(self):
+        m = make()
+        def statuses(effects):
+            return [e["data"] for e in effects if e["kind"] == "status"]
+        self.assertEqual(statuses(m.start())[0]["session_id"], "test-1")
+        m.handle(("submit", "turn"), 0)
+        self.assertEqual(statuses(m.tick(500))[0]["model"]["id"], "claude-haiku-5-5")
+        m.handle(("submit", "/clear"), 501, "test-2")
+        self.assertEqual(statuses(m.handle(("submit", "/atm/status test-1"), 502))[0]["session_id"], "test-1")
+        self.assertEqual(statuses(m.tick(601))[0]["session_id"], "test-2")
+        for mode in ["codex", "pi"]:
+            self.assertEqual(statuses(make(mode).start()), [])
 
     def test_clear_gap_new_id_and_no_old_timer(self):
         m = make(work_ms=500, gap_ms=100)
@@ -116,14 +143,42 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(events(m.handle(("submit", "two"), 601)), [])
         self.assertEqual(events(m.tick(1101)), ["Stop"])
 
-    def test_invalid_control_and_busy_input_do_not_mutate_turn(self):
+    def test_busy_input_is_confirmed_only_when_dequeued(self):
         m = make()
         m.start()
         self.assertEqual(events(m.handle(("submit", "/atm/drop-next Bogus"), 0)), [])
         self.assertIsNone(m.drop_next)
         m.handle(("submit", "first"), 1)
         self.assertEqual(events(m.handle(("submit", "second"), 2)), [])
-        self.assertEqual(events(m.tick(501)), ["Stop"])
+        finished = m.tick(501)
+        self.assertEqual(events(finished), ["Stop", "UserPromptSubmit"])
+        self.assertEqual(data(finished)[1]["prompt"], "second")
+        self.assertEqual(events(m.tick(1001)), ["Stop"])
+
+    def test_interrupt_restores_claude_prompt_and_ctrl_c_clears_then_exits(self):
+        m = make()
+        m.start()
+        m.handle(("submit", "restore me"), 0)
+        for key in ["escape", "ctrl_c"]:
+            m.handle(("submit", "restore me"), 0)
+            effects = m.handle((key, ""), 1)
+            self.assertIn({"kind": "draft", "text": "restore me"}, effects)
+            self.assertEqual(events(effects), [])
+        self.assertIn({"kind": "draft", "text": ""}, m.handle(("ctrl_c", ""), 1100))
+        self.assertEqual(m.state, "idle")
+        self.assertEqual(events(m.handle(("ctrl_c", ""), 2099)), ["SessionEnd"])
+        self.assertEqual(m.state, "exited")
+
+    def test_dialog_arrows_select_without_denying(self):
+        m = make()
+        m.start()
+        m.handle(("submit", "/atm/dialog"), 0)
+        self.assertEqual(events(m.handle(("down", ""), 1)), [])
+        self.assertEqual(m.state, "dialog")
+        selected = m.handle(("submit", ""), 2)
+        self.assertIn({"kind": "selection", "text": "", "option": 2}, selected)
+        self.assertEqual(events(selected), [])
+        self.assertEqual(m.handle(("up", ""), 3), [])
 
     def test_dialog_denial_and_enter_are_not_prompt_submission(self):
         for action in [("escape", ""), ("submit", "oops")]:

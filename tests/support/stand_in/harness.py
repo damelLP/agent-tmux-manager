@@ -11,10 +11,11 @@ import sys
 import termios
 import time
 import tty
+import uuid
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from model import InputParser, Model
+from model import InputParser, Model, parse_args
 
 VERSIONS = {"claude": "2.1.325", "codex": "0.167.0", "pi": "1.5.0"}
 
@@ -49,10 +50,19 @@ class Runtime:
             raise ValueError("ATM_STANDIN_ROOT must name a private directory")
         self.root = Path(root).resolve()
         self.socket_path = private_path("ATM_SOCKET", self.root)
+        config_path, self.prompt = parse_args(sys.argv[1:])
+        if config_path:
+            path = Path(config_path).resolve()
+            if not path.is_relative_to(self.root):
+                raise ValueError("config must be inside ATM_STANDIN_ROOT")
+            config = json.loads(path.read_text())
+            for key in ("LOG", "ID_PREFIX", "WORK_MS", "CLEAR_GAP_MS"):
+                if key in config:
+                    os.environ["ATM_STANDIN_" + key] = str(config[key])
         self.log_path = private_path("ATM_STANDIN_LOG", self.root)
         if not os.environ.get("TMUX_PANE") or not os.environ.get("TMUX", "").startswith(str(self.root) + "/"):
             raise ValueError("stand-in requires its private tmux pane")
-        self.prefix = os.environ["ATM_STANDIN_ID_PREFIX"]
+        self.prefix = os.environ["ATM_STANDIN_ID_PREFIX"] + "-" + uuid.uuid4().hex
         self.generation = 1
         frames = [json.loads(line) for line in
                   (HERE / "fixtures" / f"{self.mode}_{VERSIONS[self.mode]}.jsonl").read_text().splitlines()]
@@ -60,6 +70,9 @@ class Runtime:
                            int(os.environ.get("ATM_STANDIN_WORK_MS", "500")),
                            int(os.environ.get("ATM_STANDIN_CLEAR_GAP_MS", "100")))
         self.stream = None
+        self.outbox = []
+        self.retry_at = 0
+        self.parser = InputParser()
         self.running = True
         self.log = self.log_path.open("a", buffering=1)
         Path("/proc/self/comm").write_text(self.mode)
@@ -67,13 +80,14 @@ class Runtime:
             raise RuntimeError("failed to set process comm")
         start_time = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
         self.record({"kind": "identity", "pid": os.getpid(), "pane": os.environ["TMUX_PANE"],
-                     "mode": self.mode, "argv": sys.argv, "start_time": start_time})
+                     "mode": self.mode, "argv": sys.argv, "start_time": start_time,
+                     "session_id": self.model.session_id})
 
     def next_id(self):
         return f"{self.prefix}-{self.generation}"
 
     def record(self, effect):
-        self.log.write(json.dumps(dict(effect, at_ms=int(time.monotonic()*1000))) + "\n")
+        self.log.write(json.dumps(dict(effect, pid=os.getpid(), at_ms=int(time.monotonic()*1000))) + "\n")
 
     def forward(self, data):
         data = patch_paths(data, self.root)
@@ -81,28 +95,46 @@ class Runtime:
             hook = "atm-hook" if self.mode == "claude" else "atm-codex-hook"
             script = HERE.parents[2] / "crates" / "atm" / "scripts" / hook
             # No injected pid/pane: the real forwarder must enrich these.
-            subprocess.run(["/bin/bash", str(script)], input=json.dumps(data),
+            subprocess.run(["/bin/sh", "-c", '/bin/bash "$1"; result=$?; exit "$result"', "stand-in-hook", str(script)], input=json.dumps(data),
                            text=True, timeout=3, check=True, env=dict(os.environ, ATM_DEBUG="0"))
             return
-        if self.stream is None:
-            self.stream = socket.socket(socket.AF_UNIX)
-            self.stream.settimeout(3)
-            self.stream.connect(str(self.socket_path))
-            self.send({"protocol_version": {"major": 1, "minor": 0},
-                       "type": "connect", "client_id": f"stand-in-pi-{os.getpid()}"})
-            reply = bytearray()
-            while not reply.endswith(b"\n"):
-                byte = self.stream.recv(1)
-                if not byte or len(reply) >= 65536:
-                    raise RuntimeError("missing pi replay handshake")
-                reply.extend(byte)
-            if json.loads(reply).get("type") != "connected":
-                raise RuntimeError("pi replay handshake refused")
         data.update(pid=os.getpid(), tmux_pane=os.environ["TMUX_PANE"])
-        self.send({"protocol_version": {"major": 1, "minor": 0}, "type": "pi_event", "data": data})
-        if data["event"] == "session_shutdown":
-            self.stream.close()
-            self.stream = None
+        self.outbox.append({"protocol_version": {"major": 1, "minor": 0}, "type": "pi_event", "data": data})
+        self.flush_pi()
+
+    def flush_pi(self):
+        if self.mode != "pi" or time.monotonic() < self.retry_at:
+            return
+        try:
+            if self.stream is not None and select.select([self.stream], [], [], 0)[0]:
+                if not self.stream.recv(65536):
+                    self.stream.close()
+                    self.stream = None
+            if self.stream is None:
+                self.stream = socket.socket(socket.AF_UNIX)
+                self.stream.settimeout(.2)
+                self.stream.connect(str(self.socket_path))
+                self.send({"protocol_version": {"major": 1, "minor": 0},
+                           "type": "connect", "client_id": f"pi-atm-{os.getpid()}"})
+                reply = bytearray()
+                deadline = time.monotonic() + 3
+                while not reply.endswith(b"\n"):
+                    byte = self.stream.recv(1)
+                    if not byte or len(reply) >= 65536 or time.monotonic() > deadline:
+                        raise OSError("missing pi replay handshake")
+                    reply.extend(byte)
+                if json.loads(reply).get("type") != "connected":
+                    raise OSError("pi replay handshake refused")
+                self.record({"kind": "connected"})
+            while self.outbox:
+                self.send(self.outbox[0])
+                self.outbox.pop(0)
+        except (OSError, ValueError) as error:
+            if self.stream is not None:
+                self.stream.close()
+                self.stream = None
+            self.retry_at = time.monotonic() + .1
+            self.record({"kind": "reconnecting", "error": str(error)})
 
     def send(self, frame):
         self.stream.sendall((json.dumps(frame) + "\n").encode())
@@ -110,15 +142,24 @@ class Runtime:
     def effects(self, effects):
         for effect in effects:
             self.record(effect)
-            if effect["kind"] == "event":
+            if effect["kind"] in ("event", "status"):
                 self.forward(effect["data"])
+            elif effect["kind"] == "draft":
+                self.parser.draft = bytearray(effect["text"].encode())
             elif effect["kind"] == "render":
+                self.last_render = effect
                 state = effect["state"]
                 text = f"stand-in {self.mode} {self.model.session_id}: {state}\n"
                 if state == "dialog":
-                    text += (HERE / "fixtures/claude_permission_2.1.325.txt").read_text()
+                    dialog = (HERE / "fixtures/claude_permission_2.1.325.txt").read_text()
+                    if effect["selection"] == 2:
+                        dialog = dialog.replace("❯ 1.", "  1.").replace("  2.", "❯ 2.")
+                    text += dialog
                 else:
-                    text += effect["detail"] + "\n❯ "
+                    draft = self.parser.draft.decode("utf-8", errors="replace")
+                    # Render control bytes visibly; submitted text never controls the terminal.
+                    draft = "".join(c if c.isprintable() or c == "\n" else repr(c)[1:-1] for c in draft)
+                    text += effect["detail"] + "\n❯ " + draft
                 print("\x1b[2J\x1b[H" + text.replace("\n", "\r\n"), end="", flush=True)
                 if state == "idle":
                     self.record({"kind": "ready", "session_id": self.model.session_id})
@@ -132,7 +173,6 @@ class Runtime:
 
     def run(self):
         saved = termios.tcgetattr(sys.stdin.fileno())
-        parser = InputParser()
         try:
             tty.setraw(sys.stdin.fileno())
             # tmux paste-buffer maps LF to CR; restore the tty's usual input
@@ -142,10 +182,8 @@ class Runtime:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, settings)
             print("\x1b[?2004h", end="", flush=True)
             self.effects(self.model.start())
-            if len(sys.argv) > 2:
-                raise ValueError("stand-in accepts at most one positional initial prompt")
-            if len(sys.argv) == 2:
-                self.action(("submit", sys.argv[1]))
+            if self.prompt is not None:
+                self.action(("submit", self.prompt))
             while self.running:
                 readable, _, _ = select.select([sys.stdin], [], [], .02)
                 if readable:
@@ -153,12 +191,16 @@ class Runtime:
                     if not data:
                         self.action(("exit", ""))
                         break
-                    for action in parser.feed(data):
-                        self.action(action)
+                    # Process each action before subsequent input changes the draft.
+                    for byte in data:
+                        for action in self.parser.feed(bytes([byte])):
+                            self.action(action)
+                    self.effects([self.last_render])
                 else:
-                    for action in parser.flush_escape():
+                    for action in self.parser.flush_escape():
                         self.action(action)
                 self.effects(self.model.tick(int(time.monotonic()*1000)))
+                self.flush_pi()
         finally:
             print("\x1b[?2004l\r\n", end="", flush=True)
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)

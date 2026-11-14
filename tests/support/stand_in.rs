@@ -170,6 +170,10 @@ impl StandInRig {
     /// Extra environment survives restarts; sealing variables cannot be overridden.
     pub fn set_daemon_env(&mut self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
         assert!(
+            !matches!(key, "TMUX" | "TMUX_PANE"),
+            "cannot override rig seal"
+        );
+        assert!(
             !self
                 .command(Path::new("true"))
                 .get_envs()
@@ -341,10 +345,21 @@ impl StandInRig {
             self.root().file_name().unwrap().to_string_lossy(),
             self.serial
         );
+        let config_path = log.with_extension("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "WORK_MS": config.work_ms, "CLEAR_GAP_MS": config.clear_gap_ms,
+                "ID_PREFIX": prefix, "LOG": log,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let command = format!(
-            "export ATM_STANDIN_WORK_MS={} ATM_STANDIN_CLEAR_GAP_MS={} ATM_STANDIN_ID_PREFIX={} ATM_STANDIN_LOG={}; {}; exec /bin/bash --noprofile --norc",
-            config.work_ms, config.clear_gap_ms, quote(&prefix), quote(log.to_str().unwrap()),
-            quote(self.launcher(config.mode).to_str().unwrap()));
+            "{} --atm-config {}; exec /bin/bash --noprofile --norc",
+            quote(self.launcher(config.mode).to_str().unwrap()),
+            quote(config_path.to_str().unwrap())
+        );
         let pane_id = checked(self.tmux(&[
             "new-window",
             "-d",
@@ -404,14 +419,14 @@ impl StandInRig {
     }
     pub fn capture(&self, pane: &StandInPane) -> String {
         self.owns(pane);
-        checked(self.tmux(&["capture-pane", "-p", "-t", &pane.pane_id]))
+        checked(self.tmux(&["capture-pane", "-p", "-J", "-t", &pane.pane_id]))
     }
     pub fn wait_ready(&self, pane: &StandInPane, session_id: Option<&str>) {
         self.wait("stand-in ready", || {
             self.journal(pane)
                 .iter()
                 .rev()
-                .find(|e| e["kind"] == "render")
+                .find(|e| e["kind"] == "render" && e["pid"] == pane.pid)
                 .is_some_and(|e| {
                     let Some(id) = e["session_id"].as_str() else {
                         return false;

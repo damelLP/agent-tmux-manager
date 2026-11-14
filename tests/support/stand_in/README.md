@@ -92,10 +92,29 @@ rig.close();
   Commands and `wait_for_shell` wait on Linux pidfd exit notification with a
   30-second hang guard, not repeated `try_wait`/procfs polling. Command output
   goes through temporary files so large output cannot fill a pipe.
+  `wait_for_shell` additionally awaits the retained bash prompt's event, keyed by
+  the exited harness PID/start time so a prior prompt cannot satisfy a relaunch.
+  The rig's `PROMPT_COMMAND` prints synthetic `stand-in-shell$` chrome and waits
+  for tmux's cursor-position reply before publishing that event; `PS1` is cleared
+  in the hook itself (bash resets an inherited empty PS1). New shells without an
+  exited harness do not read a cursor reply, leaving queued spawn input to bash.
+  Verified with tmux 3.8 and bash 5.3.20; no model CLI is involved.
   `command(path)` supplies the same sealed environment to custom invocations;
   execute with `rig.run(&mut command)`. `tmux` supplies the private `-L` label.
   If also using role support, import `stand_in::bounded` rather than including
   `support/role.rs` twice.
+- `stand_in_forwarder_identity` names its failed step and dumps its journal,
+  fresh rows and daemon diagnostics. It enables `ATM_STANDIN_TRACE_HOOKS=1` on
+  its private server: real hook bash xtrace goes to the pane's `.hook-trace.log`,
+  including previous command exit status, without enabling `/tmp/atm-hook.log`.
+  This observes send attempts, not delivery guarantees, and adds tracing overhead.
+  Failure diagnostics can include discovered host sessions; keep them local.
+  Concurrent loaded runs reproduced a Codex pending-row timeout before any hook:
+  daemon logs rejected that exact PID at the registry's 100-session cap. Private
+  sockets do not isolate `/proc` discovery from other rigs or host harnesses.
+  Run a failing binary alone and report both results; do not extend waits or
+  infer hook loss from a row timeout. A socat timeout status alone also does not
+  prove a dropped hook (the daemon may already have accepted its messages).
 - `journal(pane)` is diagnostic JSONL: identity, accepted/rejected/queued input,
   event/dropped, status, draft, render, ready, selection, connected/disconnected,
   transport_dropped.

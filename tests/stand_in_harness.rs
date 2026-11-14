@@ -13,30 +13,82 @@ use stand_in::{bounded, StandInConfig, StandInMode, StandInRig};
 #[test]
 fn stand_in_forwarder_identity() {
     let mut rig = StandInRig::start();
+    assert!(rig
+        .tmux(&["set-environment", "-g", "ATM_STANDIN_TRACE_HOOKS", "1"])
+        .status
+        .success());
     for mode in [StandInMode::Claude, StandInMode::Codex] {
         let mut config = StandInConfig::new(mode);
         config.manual_clock = true;
+        eprintln!("identity {}: launch", mode.name());
         let pane = rig.launch(&config);
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pane.pid)).unwrap();
-        assert_eq!(comm.trim(), mode.name());
-        rig.discover();
-        if mode == StandInMode::Codex {
-            let pending = rig.wait_for_row(&pane, |_| true);
-            assert_eq!(pending.id.as_str(), format!("pending-{}", pane.pid));
-            rig.paste(&pane, "identity prompt");
+        let mut step = "process identity";
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", pane.pid)).unwrap();
+            assert_eq!(comm.trim(), mode.name());
+            step = "initial discovery";
+            rig.discover();
+            if mode == StandInMode::Codex {
+                step = "Codex pending row with pane";
+                let pending = rig.wait_for_row(&pane, |_| true);
+                assert_eq!(pending.id.as_str(), format!("pending-{}", pane.pid));
+                rig.paste(&pane, "identity prompt");
+            }
+            step = "hook promotion to non-pending pane row";
+            let row = rig.wait_for_row(&pane, |r| !r.id.is_pending());
+            assert_eq!(row.tmux_pane.as_deref(), Some(pane.pane_id.as_str()));
+            step = "rediscovery deduplication";
+            rig.discover();
+            assert_eq!(
+                rig.pane_rows(&pane).len(),
+                1,
+                "hook and discovery must share a PID"
+            );
+            step = "SessionEnd row removal";
+            rig.paste(&pane, "/atm/exit");
+            rig.wait_for_absent(&row.id);
+            step = "retained shell prompt";
+            rig.wait_for_shell(&pane);
+        }));
+        if let Err(error) = result {
+            eprintln!(
+                "identity {} failed at {step}; pid={} pane={}\njournal={:?}\nhook trace:\n{}",
+                mode.name(),
+                pane.pid,
+                pane.pane_id,
+                rig.journal(&pane),
+                std::fs::read_to_string(pane.log.with_extension("hook-trace.log"))
+                    .unwrap_or_default()
+            );
+            eprintln!("fresh rows={:?}\n{}", rig.rows(), rig.diagnostics());
+            std::panic::resume_unwind(error);
         }
-        let row = rig.wait_for_row(&pane, |r| !r.id.is_pending());
-        assert_eq!(row.tmux_pane.as_deref(), Some(pane.pane_id.as_str()));
-        rig.discover();
-        assert_eq!(
-            rig.pane_rows(&pane).len(),
-            1,
-            "hook and discovery must share a PID"
-        );
-        rig.paste(&pane, "/atm/exit");
-        rig.wait_for_absent(&row.id);
-        rig.wait_for_shell(&pane);
     }
+    rig.close();
+}
+
+#[test]
+fn stand_in_shell_wait_observes_prompt_after_each_exit() {
+    let mut rig = StandInRig::start();
+    let first = rig.launch(&StandInConfig::new(StandInMode::Pi));
+    rig.paste(&first, "/atm/exit");
+    rig.wait_for_shell(&first);
+    let screen = rig.capture_plain(&first);
+    assert!(screen.trim_end().ends_with("stand-in-shell$"), "{screen:?}");
+    // Relaunch in the same shell: its earlier prompt must not satisfy this wait.
+    let command = format!(
+        "{} --atm-config {}",
+        first.launcher.display(),
+        first.log.with_extension("config.json").display()
+    );
+    rig.paste(&first, &command);
+    let second = rig.observe_pane(first.pane_id.clone(), StandInMode::Pi, first.log.clone());
+    assert_ne!(first.pid, second.pid);
+    rig.wait_ready(&second, None);
+    rig.paste(&second, "/atm/exit");
+    rig.wait_for_shell(&second);
+    let screen = rig.capture_plain(&second);
+    assert!(screen.trim_end().ends_with("stand-in-shell$"), "{screen:?}");
     rig.close();
 }
 
@@ -789,6 +841,7 @@ fn stand_in_model_contract() {
                 "-v",
                 "test_model",
                 "test_runtime",
+                "test_shell_prompt",
                 "test_screens",
                 "test_dialogs",
                 "test_scene",

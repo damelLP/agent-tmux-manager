@@ -307,10 +307,11 @@ async fn message_clock_deadline_uses_the_same_origin_and_exact_boundary() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn history_live_constructor_and_fold_barrier_are_unavailable_until_a1() {
+async fn history_live_snapshot_waits_for_startup_replay_gate() {
+    let live = MessageHistoryHandle::new(8, utc(), Default::default()).unwrap();
     unavailable(
-        MessageHistoryHandle::new(8, utc(), Default::default()),
-        "message history is not configured",
+        live.snapshot(MessageId::new(7), utc()),
+        "message history replay is incomplete",
     );
     let history = MessageHistoryHandle::disabled("not folded");
     fn assert_send<T: Send>(value: T) -> T {

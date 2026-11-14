@@ -87,6 +87,9 @@ pub struct DaemonServer {
     /// Handle to the session registry
     registry: RegistryHandle,
 
+    /// Cloneable method dependencies, injectable without changing callers.
+    method_services: methods::MethodServices,
+
     /// Cancellation token for graceful shutdown
     cancel_token: CancellationToken,
 
@@ -110,9 +113,23 @@ impl DaemonServer {
         registry: RegistryHandle,
         cancel_token: CancellationToken,
     ) -> Self {
+        Self::with_services(
+            socket_path,
+            methods::MethodServices::new(registry),
+            cancel_token,
+        )
+    }
+
+    /// Creates a server with explicitly supplied services (including test fakes).
+    pub fn with_services(
+        socket_path: impl Into<PathBuf>,
+        services: methods::MethodServices,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             socket_path: socket_path.into(),
-            registry,
+            registry: services.registry.clone(),
+            method_services: services,
             cancel_token,
             connection_counter: AtomicU64::new(0),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
@@ -134,7 +151,7 @@ impl DaemonServer {
     /// Listens for connections until the cancellation token is triggered.
     /// This method does not return until shutdown.
     pub async fn run(&self) -> Result<(), ServerError> {
-        let methods = Arc::new(methods::router()?);
+        let methods = Arc::new(methods::router(self.method_services.clone())?);
         // Remove existing socket file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path).map_err(|e| ServerError::SocketSetup {

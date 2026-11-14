@@ -2,17 +2,38 @@
 //!
 //! Register methods in [`router`], capturing only their required service handles.
 //! Each handler owns its parameter schema; mutation handlers must tolerate being
-//! dropped on timeout or disconnect (already performed effects are not undone).
+//! dropped on timeout or daemon shutdown (already performed effects are not undone).
+//! Client EOF/disconnect drains accepted calls instead of cancelling them.
 
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use atm_protocol::{error_code, ResponseError};
-use serde::Deserialize;
+use crate::registry::RegistryHandle;
+use atm_protocol::{error_code, ProtocolVersion, ResponseError};
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
+
+/// Cloneable daemon dependencies shared by method registrations. Add a service
+/// field here rather than changing the router or server constructor signatures.
+#[derive(Clone)]
+pub struct MethodServices {
+    pub registry: RegistryHandle,
+    /// None while persistent state is unavailable; tests can inject a private path.
+    pub state_dir: Option<PathBuf>,
+}
+
+impl MethodServices {
+    pub fn new(registry: RegistryHandle) -> Self {
+        Self {
+            registry,
+            state_dir: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CallerId(pub String);
@@ -101,7 +122,9 @@ impl MethodRouter {
 #[serde(deny_unknown_fields)]
 struct InfoParams {}
 
-fn info_params(params: Value) -> Result<InfoParams, MethodError> {
+/// Object-only typed params, with null treated as an empty object. Parameter
+/// structs must use `#[serde(deny_unknown_fields)]` to reject misspelled fields.
+pub fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, MethodError> {
     let params = if params.is_null() {
         serde_json::json!({})
     } else {
@@ -119,20 +142,35 @@ fn info_params(params: Value) -> Result<InfoParams, MethodError> {
 
 /// The single registration point. Later handlers capture registry/control handles
 /// here; their addition never requires another connection dispatch arm.
-pub(crate) fn router() -> Result<MethodRouter, MethodError> {
+pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     let mut router = MethodRouter::default();
-    router.register(
-        "daemon.info",
-        Duration::from_secs(5),
-        |_, params| async move {
-            info_params(params)?;
-            // U2's state_dir resolver must land before the success result is wired.
-            Err(MethodError::new(
-                error_code::UNAVAILABLE,
-                "daemon information is not available yet",
-            ))
-        },
-    )?;
+
+    // Add service-backed registrations above this finalization. The factory,
+    // not callers, owns the complete capability snapshot used by daemon.info.
+    let mut names = router.names();
+    names.push("daemon.info".into());
+    names.sort();
+    let info = services.state_dir.map(|state_dir| {
+        serde_json::json!({
+            "protocol": ProtocolVersion::CURRENT.to_string(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "methods": names,
+            "state_dir": state_dir,
+        })
+    });
+    router.register("daemon.info", Duration::from_secs(5), move |_, params| {
+        let info = info.clone();
+        async move {
+            parse_params::<InfoParams>(params)?;
+            // U2 will provide the default state_dir; injected services work now.
+            info.ok_or_else(|| {
+                MethodError::new(
+                    error_code::UNAVAILABLE,
+                    "daemon information is not available yet",
+                )
+            })
+        }
+    })?;
     Ok(router)
 }
 
@@ -215,10 +253,39 @@ mod tests {
         assert!(rx.await.is_err(), "handler future leaked after timeout");
     }
 
+    #[test]
+    fn typed_params_share_object_null_and_unknown_field_rules() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            #[serde(default)]
+            count: usize,
+        }
+        assert_eq!(
+            parse_params::<Params>(Value::Null).unwrap(),
+            Params { count: 0 }
+        );
+        assert_eq!(
+            parse_params::<Params>(json!({"count":2})).unwrap(),
+            Params { count: 2 }
+        );
+        for value in [
+            json!([]),
+            json!([2]),
+            json!(true),
+            json!({"typo":2}),
+            json!({"count":"bad"}),
+        ] {
+            assert_eq!(
+                parse_params::<Params>(value).unwrap_err().0.code,
+                "invalid_params"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn info_rejects_every_nonempty_or_nonobject_params_shape() {
-        let router = router().unwrap();
-        assert_eq!(router.names(), ["daemon.info"]);
+        let router = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
         for params in [
             json!({"unexpected":true}),
             json!([]),

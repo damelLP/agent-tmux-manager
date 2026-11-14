@@ -5,7 +5,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use atm_protocol::{ClientMessage, DaemonMessage};
-use atmd::{registry::spawn_registry, server::DaemonServer};
+use atmd::{
+    registry::spawn_registry,
+    server::{
+        methods::{router, MethodServices},
+        DaemonServer,
+    },
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,10 +28,14 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::with_services(MethodServices::new(spawn_registry())).await
+    }
+
+    async fn with_services(services: MethodServices) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let cancel = CancellationToken::new();
-        let server = DaemonServer::new(&socket, spawn_registry(), cancel.clone());
+        let server = DaemonServer::with_services(&socket, services, cancel.clone());
         let task = tokio::spawn(async move { server.run().await });
         timeout(Duration::from_secs(5), async {
             while !socket.exists() {
@@ -88,6 +98,16 @@ impl Client {
         println!("wire: {}", line.trim());
         serde_json::from_str(&line).unwrap()
     }
+    async fn require_next_pong(&mut self) {
+        self.send(serde_json::to_value(ClientMessage::ping(987)).unwrap())
+            .await;
+        assert_eq!(
+            self.recv().await,
+            json!({"type":"pong","seq":987}),
+            "fixture emitted an extra reply"
+        );
+    }
+
     async fn connect(&mut self) -> Value {
         self.send(json!({"protocol_version":{"major":1,"minor":0},"type":"connect","client_id":"conformance"})).await;
         self.recv().await
@@ -162,6 +182,7 @@ async fn replay_all_protocol_fixtures() {
         client.send(fixture.request).await;
         let actual = client.recv().await;
         let compared = compare(actual, fixture.response, &fixture.ignore);
+        client.require_next_pong().await;
         server.stop().await;
         assert!(compared.is_ok(), "{}: {compared:?}", path.display());
     }
@@ -189,12 +210,57 @@ async fn watch_refused_unwatch_noop_and_legacy_traffic_unchanged() {
 }
 
 #[tokio::test]
+async fn info_methods_match_handshake_and_registered_names_with_injected_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut services = MethodServices::new(spawn_registry());
+    services.state_dir = Some(dir.path().to_owned());
+    let names = router(services.clone()).unwrap().names();
+    assert!(names.iter().any(|name| name == "daemon.info"));
+    let server = Server::with_services(services).await;
+    let mut client = server.client().await;
+    let connected = client.connect().await;
+    client
+        .send(
+            serde_json::to_value(ClientMessage::request(
+                "info".into(),
+                "daemon.info".into(),
+                json!({}),
+                None,
+            ))
+            .unwrap(),
+        )
+        .await;
+    let response = client.recv().await;
+    assert_eq!(response["result"]["methods"], connected["methods"]);
+    assert_eq!(connected["methods"], json!(names));
+    assert_eq!(response["result"]["protocol"], "1.1");
+    assert_eq!(response["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(response["result"]["state_dir"], json!(dir.path()));
+    client.require_next_pong().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "fixture emitted an extra reply")]
+async fn fixture_barrier_rejects_an_extra_response() {
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.write_all(b"{\"type\":\"response\",\"id\":\"extra\",\"result\":null}\n")
+        .await
+        .unwrap();
+    let (read, write) = ours.into_split();
+    let mut client = Client {
+        read: BufReader::new(read),
+        write,
+    };
+    client.require_next_pong().await;
+}
+
+#[tokio::test]
 async fn legacy_session_client_needs_no_requests() {
     let server = Server::start().await;
     let mut client = server.client().await;
     let connected = client.connect().await;
     assert_eq!(connected["client_id"], "conformance");
-    assert_eq!(connected["methods"], json!(["daemon.info"]));
     for message in [
         ClientMessage::list_sessions(),
         ClientMessage::subscribe(None),

@@ -119,7 +119,7 @@
 //! a measured maximum automatic-retry gap: the executor's real integration
 //! check must measure that gap and tune the setting.
 
-use crate::{Address, AgentId, AgentStatus, DeliveryReceipt, DeliveryStatus, Message};
+use crate::{Address, Agent, AgentId, AgentStatus, DeliveryReceipt, DeliveryStatus, Message};
 use atm_core::SessionStatus;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -305,6 +305,124 @@ pub struct RecipientLiveView {
     /// A restart loses the latch: set last_attempt_before_start for ALL replayed
     /// messages with prior attempts, including queued ones with late evidence.
     pub probably_landed: bool,
+}
+
+impl RecipientLiveView {
+    /// Start with applied agent status and the recipient's reservation veto.
+    /// All live observations are unknown; the executor must supply positive
+    /// observations and reconstruct continuity/restart history before deciding.
+    #[must_use]
+    pub fn new<'a>(
+        message: &Message,
+        agent: &Agent,
+        others: impl IntoIterator<Item = &'a Message>,
+    ) -> Self {
+        Self {
+            session: None,
+            pane: PaneLiveness::Unknown,
+            agent_status: agent.status,
+            agent_not_ready_since: None,
+            other_delivery_in_flight: others
+                .into_iter()
+                .any(|other| other.id != message.id && delivery_in_flight(other, &agent.id)),
+            last_paste_at: None,
+            hold_since: None,
+            stale_blocker_since: None,
+            last_attempt_before_start: false,
+            copy_mode: None,
+            dialog_open: None,
+            owner_focused: true,
+            input_line: InputLine::Unknown,
+            send_now: false,
+            confirmation: None,
+            probably_landed: false,
+        }
+    }
+}
+
+/// Fold an applied agent transition into its independent readiness clock.
+/// Metadata and Starting/Clearing transitions preserve the current window;
+/// recovery from Stuck/Down receives a new window. Time is supplied by the caller.
+pub fn track_agent_not_ready(
+    since: &mut Option<DateTime<Utc>>,
+    before: Option<AgentStatus>,
+    after: AgentStatus,
+    now: DateTime<Utc>,
+) {
+    if after == AgentStatus::Ready {
+        *since = None;
+    } else if before.is_none_or(|status| status == AgentStatus::Ready)
+        || (matches!(before, Some(AgentStatus::Stuck | AgentStatus::Down))
+            && matches!(after, AgentStatus::Starting | AgentStatus::Clearing))
+    {
+        *since = Some(now);
+    }
+}
+
+/// Consume a successful policy step once, updating hold continuity rather than
+/// restarting it when a guard changes. Scheduling alone never starts a hold.
+pub fn track_hold(live: &mut RecipientLiveView, step: &DeliveryStep, now: DateTime<Utc>) {
+    match step {
+        DeliveryStep::PasteNow { .. }
+        | DeliveryStep::Confirm { .. }
+        | DeliveryStep::Complete
+        | DeliveryStep::Fail { .. }
+        | DeliveryStep::Blocked {
+            reason: FailureReason::AgentUnavailable | FailureReason::AgentNotReadyTimeout,
+        }
+        | DeliveryStep::Wait {
+            reason:
+                WaitReason::OwnerFocused
+                | WaitReason::SessionBusy
+                | WaitReason::AgentNotReady
+                | WaitReason::OtherDelivery,
+            ..
+        } => {
+            live.hold_since = None;
+            live.stale_blocker_since = None;
+        }
+        DeliveryStep::Wait { .. } => {
+            live.hold_since.get_or_insert(now);
+        }
+        _ => {}
+    }
+}
+
+/// Track only the effective stale-row draft/dialog, after earlier guards.
+/// The caller resets source-identity continuity. An arithmetic error leaves both
+/// clocks and the previous blocker unchanged; the overall hold is never reset.
+pub fn track_stale_blocker(
+    live: &mut RecipientLiveView,
+    previous: &mut Option<WaitReason>,
+    now: DateTime<Utc>,
+    policy: &DeliveryPolicy,
+) -> Result<(), DeliveryPolicyError> {
+    let stale = match &live.session {
+        Some(row) if row.status != SessionStatus::Idle => {
+            now >= deadline(row.last_event_at, policy.settings().stale_after)?
+        }
+        _ => false,
+    };
+    let blocker = if stale
+        && live.pane == PaneLiveness::Alive
+        && live.agent_status == AgentStatus::Ready
+        && !live.owner_focused
+        && !live.other_delivery_in_flight
+        && live.copy_mode == Some(false)
+    {
+        match (live.dialog_open, live.input_line) {
+            (Some(true), _) => Some(WaitReason::DialogOpen),
+            (Some(false), InputLine::NonEmpty) => Some(WaitReason::InputNotEmpty),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if blocker != *previous || live.stale_blocker_since.is_none() {
+        live.stale_blocker_since = blocker.map(|_| now);
+    }
+    *previous = blocker;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -889,33 +1007,59 @@ mod tests {
         }
     }
 
-    // Synthetic executor model: update continuity by the consumed decision,
-    // never by a changing guard tuple. Scheduling alone does not start a hold.
-    fn track_hold(live: &mut RecipientLiveView, step: &DeliveryStep, now: DateTime<Utc>) {
-        match step {
-            DeliveryStep::PasteNow { .. }
-            | DeliveryStep::Confirm { .. }
-            | DeliveryStep::Complete
-            | DeliveryStep::Fail { .. }
-            | DeliveryStep::Blocked {
-                reason: FailureReason::AgentUnavailable | FailureReason::AgentNotReadyTimeout,
-            }
-            | DeliveryStep::Wait {
-                reason:
-                    WaitReason::OwnerFocused
-                    | WaitReason::SessionBusy
-                    | WaitReason::AgentNotReady
-                    | WaitReason::OtherDelivery,
-                ..
-            } => {
-                live.hold_since = None;
-                live.stale_blocker_since = None;
-            }
-            DeliveryStep::Wait { .. } => {
-                live.hold_since.get_or_insert(now);
-            }
-            _ => {}
+    #[test]
+    fn new_live_view_does_not_invent_observations_or_reserve_itself() {
+        let mut h = History::new(false);
+        h.attempt(1, 0);
+        for status in [
+            AgentStatus::Ready,
+            AgentStatus::Starting,
+            AgentStatus::Clearing,
+            AgentStatus::Stuck,
+            AgentStatus::Down,
+        ] {
+            let mut agent = h.state.agent(&"p/worker".parse().unwrap()).unwrap().clone();
+            agent.status = status;
+            let live = RecipientLiveView::new(h.message(), &agent, h.state.messages());
+            assert_eq!(live.agent_status, status);
+            assert!(!live.other_delivery_in_flight);
+            assert_eq!(live.session, None);
+            assert_eq!(live.pane, PaneLiveness::Unknown);
+            assert_eq!(live.input_line, InputLine::Unknown);
+            assert_eq!(live.copy_mode, None);
+            assert_eq!(live.dialog_open, None);
+            assert!(live.owner_focused);
+            assert_eq!(live.agent_not_ready_since, None);
+            assert_eq!(live.last_paste_at, None);
+            assert_eq!(live.hold_since, None);
+            assert_eq!(live.stale_blocker_since, None);
+            assert!(!live.last_attempt_before_start);
+            assert!(!live.send_now);
+            assert_eq!(live.confirmation, None);
+            assert!(!live.probably_landed);
         }
+    }
+
+    #[test]
+    fn stale_blocker_overflow_leaves_continuity_unchanged() {
+        let mut live = ready();
+        live.session.as_mut().unwrap().status = SessionStatus::Working;
+        live.session.as_mut().unwrap().last_event_at = DateTime::<Utc>::MAX_UTC;
+        live.stale_blocker_since = Some(time(-1));
+        live.input_line = InputLine::NonEmpty;
+        let before = live.clone();
+        let mut previous = Some(WaitReason::InputNotEmpty);
+        assert_eq!(
+            track_stale_blocker(
+                &mut live,
+                &mut previous,
+                time(0),
+                &DeliveryPolicy::default()
+            ),
+            Err(DeliveryPolicyError::TimeOverflow)
+        );
+        assert_eq!(live, before);
+        assert_eq!(previous, Some(WaitReason::InputNotEmpty));
     }
 
     #[test]
@@ -1078,23 +1222,6 @@ mod tests {
             wait(h.step(&live, 100000), WaitReason::AgentNotReady);
             live.agent_not_ready_since = Some(time(100100));
             wait(h.step(&live, 100000), WaitReason::AgentNotReady);
-        }
-    }
-
-    // Synthetic executor transition model, not policy-owned state.
-    fn track_agent_not_ready(
-        since: &mut Option<DateTime<Utc>>,
-        before: Option<AgentStatus>,
-        after: AgentStatus,
-        now: DateTime<Utc>,
-    ) {
-        if after == AgentStatus::Ready {
-            *since = None;
-        } else if before.is_none_or(|status| status == AgentStatus::Ready)
-            || (matches!(before, Some(AgentStatus::Stuck | AgentStatus::Down))
-                && matches!(after, AgentStatus::Starting | AgentStatus::Clearing))
-        {
-            *since = Some(now);
         }
     }
 
@@ -2706,38 +2833,6 @@ mod tests {
 
     use proptest::prelude::*;
 
-    // Synthetic executor model: observe only the effective stale editor blocker.
-    fn track_stale_blocker(
-        live: &mut RecipientLiveView,
-        previous: &mut Option<WaitReason>,
-        now: DateTime<Utc>,
-        policy: &DeliveryPolicy,
-    ) {
-        let stale = live.session.as_ref().is_some_and(|row| {
-            row.status != SessionStatus::Idle
-                && now >= deadline(row.last_event_at, policy.settings().stale_after).unwrap()
-        });
-        let blocker = if stale
-            && live.pane == PaneLiveness::Alive
-            && live.agent_status == AgentStatus::Ready
-            && !live.owner_focused
-            && !live.other_delivery_in_flight
-            && live.copy_mode == Some(false)
-        {
-            match (live.dialog_open, live.input_line) {
-                (Some(true), _) => Some(WaitReason::DialogOpen),
-                (Some(false), InputLine::NonEmpty) => Some(WaitReason::InputNotEmpty),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if blocker != *previous || live.stale_blocker_since.is_none() {
-            live.stale_blocker_since = blocker.map(|_| now);
-        }
-        *previous = blocker;
-    }
-
     #[test]
     fn no_two_pastes_without_recorded_failure_and_none_after_confirmation() {
         use proptest::test_runner::{Config, RngSeed, TestRunner};
@@ -2779,7 +2874,7 @@ mod tests {
             live.hold_since = None;
             for poll in 0..polls {
                 let at = time(0) + TimeDelta::milliseconds(i64::from(poll) * 250);
-                track_stale_blocker(&mut live, &mut previous_stale_blocker, at, &policy);
+                track_stale_blocker(&mut live, &mut previous_stale_blocker, at, &policy).unwrap();
                 let step = next_delivery(h.message(), &live, at, &policy).unwrap();
                 if poll < 3 {
                     prop_assert!(matches!(step, DeliveryStep::Wait { .. }), "before short confirmation");
@@ -2798,7 +2893,7 @@ mod tests {
             live.input_line = InputLine::EmptySince(time(2));
             live.session.as_mut().unwrap().status = SessionStatus::Idle;
             live.session.as_mut().unwrap().status_since = time(2);
-            track_stale_blocker(&mut live, &mut previous_stale_blocker, time(2), &policy);
+            track_stale_blocker(&mut live, &mut previous_stale_blocker, time(2), &policy).unwrap();
             prop_assert!(matches!(h.step(&live, 2), DeliveryStep::Wait { reason: WaitReason::IdleStabilizing, .. }), "cleared editor must stabilize");
             let step = h.step(&live, 12);
             prop_assert_eq!(&step, &DeliveryStep::PasteNow { attempt: 1 });
@@ -2889,7 +2984,7 @@ mod tests {
                 } else if action < 10 {
                     live.confirmation = Some(receipt());
                 }
-                track_stale_blocker(&mut live, &mut previous_stale_blocker, time(now), &policy);
+                track_stale_blocker(&mut live, &mut previous_stale_blocker, time(now), &policy).unwrap();
                 let step = h.step(&live, now);
                 if matches!(step, DeliveryStep::Blocked { reason: FailureReason::DraftPresent | FailureReason::DialogOpen })
                     && matches!(h.step(&RecipientLiveView { stale_blocker_since: None, ..live.clone() }, now), DeliveryStep::Wait { .. }) {

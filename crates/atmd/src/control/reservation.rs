@@ -107,9 +107,10 @@
 //! unavailable. Org projection catch-up also parks outside tmux turns, within the
 //! same deadline. Parked legacy input yields to reservation waiters on its pane,
 //! even later arrivals; a steady stream of them can starve it until Timeout.
-//! A dropped caller does not cancel admitted parked input: it can still start
-//! within its original deadline. After the first effect, Enter is completed under
-//! the tmux client's timeout, even if the caller's response budget has expired.
+//! A legacy send whose caller is gone before its first effect is discarded,
+//! including after pre-effect reads. Spawn typing retains daemon-owned admission.
+//! After the first effect, Enter is completed under the tmux client's timeout,
+//! even if the caller disconnects or its response budget expires.
 //! An excluded old session
 //! prefix becomes NoSession after clear, never input redirected to the new editor.
 //! Quarantine and unavailable org state on tagged/unknown-ownership panes fail

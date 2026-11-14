@@ -118,6 +118,25 @@ class DialogTests(unittest.TestCase):
                     self.assertEqual(m.state, "idle")
                     self.assertEqual(events(m.tick(1000)), [])
 
+    def test_abandoned_approval_cannot_complete_in_a_later_turn(self):
+        for mode, clear in [("claude", "/clear"), ("codex", "/new")]:
+            for cancel in ["clear", "escape", "deny-next-modal"]:
+                with self.subTest(mode=mode, cancel=cancel):
+                    m = make(mode, permission_dialog=True)
+                    m.start()
+                    m.handle(("submit", "/atm/dialog"), 0)
+                    m.handle(("submit", ""), 1)
+                    if cancel == "clear":
+                        m.handle(("submit", clear), 2, "test-2")
+                        m.tick(102)
+                    elif cancel == "escape":
+                        m.handle(("escape", ""), 2)
+                    else:
+                        m.handle(("submit", "/atm/dialog"), 2)
+                        m.handle(("escape", ""), 3)
+                    m.handle(("submit", "unrelated turn"), 103)
+                    self.assertEqual(events(m.tick(603)), ["Stop"])
+
     def test_optional_codex_permission_consumes_keys_and_never_submits(self):
         for action in [("escape", ""), ("submit", "ignored")]:
             m = make("codex", permission_dialog=True)

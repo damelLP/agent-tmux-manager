@@ -169,6 +169,7 @@ class Model:
         return ([] if self.mode == "codex" else self.announce()) + self.status() + self.render()
 
     def open_dialog(self, name):
+        self.approved_tool = False
         self.before_dialog = self.frame
         self.state, self.deadline, self.dialog, self.selection = "dialog", None, name, 1
         return self.render()
@@ -303,6 +304,7 @@ class Model:
         return [{"kind": "accepted", "text": text}] + effects + self.render()
 
     def begin_clear(self, now_ms, next_id):
+        self.approved_tool = False
         effects = []
         if self.mode == "claude":
             effects = self.emit("SessionEnd", "clear")

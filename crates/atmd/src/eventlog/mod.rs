@@ -14,8 +14,16 @@
 //! lines are errors. Replay validates the older segments it reads, including
 //! increasing sequence order across files; it never repairs files.
 //!
-//! Events are synced before acknowledgement and retained forever. Raw records
-//! are not individually synced; their segment is synced when closed. Subscribers
+//! Segments rotate before a record would exceed 16 MiB in a nonempty file; an
+//! oversized record occupies its own segment and is never split. Events are
+//! synced before acknowledgement and retained forever. Raw records are not
+//! individually synced; their segment is synced when rotated or normally closed.
+//! On open, raw segments with filesystem mtimes strictly older than 14 days are
+//! pruned. Before deleting a nonempty newest segment, an empty successor named
+//! by the next sequence is created and the directory synced. The empty newest
+//! segment is never pruned: its name preserves the high-water mark even if every
+//! old record is removed. No checkpoint file or second metadata format is used.
+//! Subscribers
 //! receive committed envelopes in sequence order (not historical records).
 //! A bounded live channel can return `Lagged`; use replay to recover a gap.
 //!

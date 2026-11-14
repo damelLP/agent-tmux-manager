@@ -209,6 +209,171 @@ fn repair_warns_with_path_line_and_dropped_byte_count() {
     drop(log);
 }
 
+#[tokio::test]
+async fn public_rotation_keeps_oversized_records_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = EventLog::open(dir.path(), Stream::Raw).unwrap();
+    let body = serde_json::json!("x".repeat(16 * 1024 * 1024));
+    assert_eq!(log.append(ts(), "large", body.clone()).await.unwrap(), 1);
+    assert_eq!(
+        log.append(ts(), "small", serde_json::Value::Null)
+            .await
+            .unwrap(),
+        2
+    );
+    let files = reader::segments(&Stream::Raw.directory(dir.path())).unwrap();
+    assert_eq!(files.iter().map(|f| f.first).collect::<Vec<_>>(), [1, 2]);
+    let rows: Vec<_> = read_from(dir.path(), Stream::Raw, 0)
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].body, body);
+    assert_eq!(
+        read_from(dir.path(), Stream::Raw, 1)
+            .next()
+            .unwrap()
+            .unwrap()
+            .seq,
+        2
+    );
+}
+
+#[tokio::test]
+async fn rotation_io_failure_stops_writer_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = record(1);
+    bytes.pop();
+    bytes.resize(16 * 1024 * 1024, b' ');
+    bytes.push(b'\n');
+    segment(dir.path(), Stream::Raw, 1, &bytes);
+    let log = EventLog::open(dir.path(), Stream::Raw).unwrap();
+    let mut live = log.subscribe();
+    // Plant only after open so failure occurs on the actual writer thread.
+    fs::create_dir(dir.path().join("log/raw/00000002.jsonl")).unwrap();
+    assert!(matches!(
+        log.append(ts(), "fail", serde_json::Value::Null).await,
+        Err(EventLogError::Io { .. })
+    ));
+    assert!(live.try_recv().is_err(), "published a failed append");
+    assert!(matches!(
+        log.append(ts(), "later", serde_json::Value::Null).await,
+        Err(EventLogError::Closed)
+    ));
+    drop(log);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), live.recv())
+            .await
+            .unwrap(),
+        Err(broadcast::error::RecvError::Closed)
+    ));
+    assert_eq!(
+        fs::read(dir.path().join("log/raw/00000001.jsonl")).unwrap(),
+        bytes
+    );
+}
+
+fn expire(path: &Path) {
+    fs::File::open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn raw_pruning_preserves_high_water_even_when_all_expire() {
+    for keep_older in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let old = segment(dir.path(), Stream::Raw, 1, &record(1));
+        let newest = segment(dir.path(), Stream::Raw, 2, &record(2));
+        if !keep_older {
+            expire(&old);
+        }
+        expire(&newest);
+        let log = EventLog::open(dir.path(), Stream::Raw).unwrap();
+        assert!(!newest.exists());
+        assert_eq!(old.exists(), keep_older);
+        let marker = dir.path().join("log/raw/00000003.jsonl");
+        assert_eq!(fs::metadata(&marker).unwrap().len(), 0);
+        drop(log);
+        let log = reopen(dir.path(), Stream::Raw);
+        assert_eq!(
+            log.append(ts(), "continued", serde_json::Value::Null)
+                .await
+                .unwrap(),
+            3
+        );
+        drop(log);
+        let log = reopen(dir.path(), Stream::Raw);
+        assert_eq!(
+            log.append(ts(), "continued", serde_json::Value::Null)
+                .await
+                .unwrap(),
+            4
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_newest_marker_survives_age_and_interrupted_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = segment(dir.path(), Stream::Raw, 1, &record(1));
+    let marker = segment(dir.path(), Stream::Raw, 9, b"");
+    expire(&old);
+    expire(&marker);
+    let log = EventLog::open(dir.path(), Stream::Raw).unwrap();
+    assert!(!old.exists());
+    assert!(marker.exists());
+    assert_eq!(
+        log.append(ts(), "continued", serde_json::Value::Null)
+            .await
+            .unwrap(),
+        9
+    );
+}
+
+#[test]
+fn event_files_are_never_pruned_and_raw_delete_errors_are_not_hidden() {
+    let dir = tempfile::tempdir().unwrap();
+    let event = segment(dir.path(), Stream::Events, 1, &record(1));
+    expire(&event);
+    let _events = EventLog::open(dir.path(), Stream::Events).unwrap();
+    assert!(event.exists());
+    let old = segment(dir.path(), Stream::Raw, 1, b"");
+    fs::remove_file(&old).unwrap();
+    fs::create_dir(&old).unwrap();
+    expire(&old);
+    segment(dir.path(), Stream::Raw, 2, &record(2));
+    let error = EventLog::open(dir.path(), Stream::Raw).expect_err("delete directory must fail");
+    assert!(error.to_string().contains(&old.display().to_string()));
+}
+
+#[test]
+fn replay_uses_numeric_names_and_can_start_within_a_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    segment(dir.path(), Stream::Events, 99_999_999, &record(99_999_999));
+    segment(
+        dir.path(),
+        Stream::Events,
+        100_000_000,
+        &[record(100_000_000), record(100_000_001)].concat(),
+    );
+    let rows: Vec<_> = read_from(dir.path(), Stream::Events, 0)
+        .map(|r| r.unwrap().seq)
+        .collect();
+    assert_eq!(rows, [99_999_999, 100_000_000, 100_000_001]);
+    assert_eq!(
+        read_from(dir.path(), Stream::Events, 100_000_000)
+            .next()
+            .unwrap()
+            .unwrap()
+            .seq,
+        100_000_001
+    );
+    assert!(read_from(dir.path(), Stream::Events, u64::MAX)
+        .next()
+        .is_none());
+}
+
 fn ts() -> DateTime<Utc> {
     DateTime::from_timestamp(1_700_000_000, 0).unwrap()
 }

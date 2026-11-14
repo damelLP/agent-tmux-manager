@@ -4,6 +4,39 @@ use chrono::{DateTime, Utc};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+const SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+const RAW_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+fn prune_candidates(
+    files: &[(PathBuf, SystemTime)],
+    now: SystemTime,
+    max_age: Duration,
+) -> Vec<PathBuf> {
+    files
+        .iter()
+        .filter(|(_, modified)| now.duration_since(*modified).is_ok_and(|age| age > max_age))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+fn create_segment(directory: &Path, seq: u64) -> Result<(File, PathBuf), EventLogError> {
+    let path = directory.join(format!("{seq:08}.jsonl"));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| io_error(&path, e))?;
+    sync_directory(directory)?;
+    Ok((file, path))
+}
+
+fn sync_directory(directory: &Path) -> Result<(), EventLogError> {
+    File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| io_error(directory, e))
+}
 
 pub(super) struct Writer {
     _lock: File,
@@ -11,6 +44,9 @@ pub(super) struct Writer {
     path: PathBuf,
     next: Option<u64>,
     stream: Stream,
+    directory: PathBuf,
+    size: u64,
+    max_bytes: u64,
 }
 
 impl Writer {
@@ -21,6 +57,20 @@ impl Writer {
             .map_err(|e| io_error(&lock_path, e))?
             .ok_or(EventLogError::Locked(lock_path))?;
         let files = segments(directory)?;
+        // Snapshot ages before repairing the tail changes the newest mtime.
+        let ages = if stream == Stream::Raw {
+            files
+                .iter()
+                .map(|segment| {
+                    let modified = fs::metadata(&segment.path)
+                        .and_then(|m| m.modified())
+                        .map_err(|e| io_error(&segment.path, e))?;
+                    Ok((segment.path.clone(), modified))
+                })
+                .collect::<Result<Vec<_>, EventLogError>>()?
+        } else {
+            Vec::new()
+        };
         let (file, path, next) = if let Some(newest) = files.last() {
             let mut reader = SegmentReader::new(newest.clone(), true)?;
             while reader.next_record()?.is_some() {}
@@ -42,24 +92,35 @@ impl Writer {
                     .map_or(Some(newest.first), |last| last.checked_add(1)),
             )
         } else {
-            let path = directory.join("00000001.jsonl");
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|e| io_error(&path, e))?;
-            File::open(directory)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|e| io_error(directory, e))?;
+            let (file, path) = create_segment(directory, 1)?;
             (file, path, Some(1))
         };
-        Ok(Self {
+        let size = file.metadata().map_err(|e| io_error(&path, e))?.len();
+        let mut writer = Self {
             _lock: lock,
             file,
             path,
             next,
             stream,
-        })
+            directory: directory.to_owned(),
+            size,
+            max_bytes: SEGMENT_BYTES,
+        };
+        let expired = prune_candidates(&ages, SystemTime::now(), RAW_MAX_AGE);
+        if writer.size > 0 && expired.contains(&writer.path) {
+            // Preserve the high-water mark even if an older file has a newer
+            // mtime. A crash before/during deletion leaves this empty successor.
+            writer.rotate()?;
+        }
+        for path in &expired {
+            if *path != writer.path {
+                fs::remove_file(path).map_err(|e| io_error(path, e))?;
+            }
+        }
+        if !expired.is_empty() {
+            sync_directory(directory)?;
+        }
+        Ok(writer)
     }
 
     pub fn append(
@@ -78,14 +139,30 @@ impl Writer {
         let mut bytes = serde_json::to_vec(&envelope)
             .map_err(|e| io_error(&self.path, std::io::Error::other(e)))?;
         bytes.push(b'\n');
+        if self.size > 0 && self.size.saturating_add(bytes.len() as u64) > self.max_bytes {
+            self.rotate()?;
+        }
         self.file
             .write_all(&bytes)
             .map_err(|e| io_error(&self.path, e))?;
         if self.stream.sync_each_record() {
             self.file.sync_data().map_err(|e| io_error(&self.path, e))?;
         }
+        self.size = self.size.saturating_add(bytes.len() as u64);
         self.next = seq.checked_add(1);
         Ok(envelope)
+    }
+
+    fn rotate(&mut self) -> Result<(), EventLogError> {
+        let next = self.next.ok_or(EventLogError::SequenceExhausted)?;
+        // Raw is synced at segment boundaries, never per record. Events have
+        // already synced each append; syncing here also covers an empty marker.
+        self.file.sync_data().map_err(|e| io_error(&self.path, e))?;
+        let (file, path) = create_segment(&self.directory, next)?;
+        self.file = file;
+        self.path = path;
+        self.size = 0;
+        Ok(())
     }
 
     pub fn close(&self) -> Result<(), EventLogError> {
@@ -99,6 +176,66 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruning_is_strictly_older_than_limit_and_ignores_future_times() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let limit = Duration::from_secs(14 * 24 * 60 * 60);
+        let files = vec![
+            (PathBuf::from("old"), now - limit - Duration::from_secs(1)),
+            (PathBuf::from("boundary"), now - limit),
+            (PathBuf::from("new"), now),
+            (PathBuf::from("future"), now + Duration::from_secs(1)),
+        ];
+        assert_eq!(prune_candidates(&files, now, limit), [PathBuf::from("old")]);
+    }
+
+    #[test]
+    fn exact_rotation_limit_reopen_and_failed_rotation_keep_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Stream::Raw.directory(dir.path());
+        let ts = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut writer = Writer::open(&path, Stream::Raw).unwrap();
+        writer
+            .append(ts, "same".into(), serde_json::Value::Null)
+            .unwrap();
+        let one = writer.file.metadata().unwrap().len();
+        writer.max_bytes = one * 2;
+        writer
+            .append(ts, "same".into(), serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(segments(&path).unwrap().len(), 1, "rotated at exact limit");
+        drop(writer);
+        let mut writer = Writer::open(&path, Stream::Raw).unwrap();
+        writer.max_bytes = one * 2;
+        // Existing destination must not be overwritten; failed rotation sync
+        // or create must leave the committed old file and next seq intact.
+        fs::write(path.join("00000003.jsonl"), "do not overwrite").unwrap();
+        assert!(writer
+            .append(ts, "same".into(), serde_json::Value::Null)
+            .is_err());
+        assert_eq!(writer.next, Some(3));
+        assert_eq!(
+            fs::read_to_string(path.join("00000003.jsonl")).unwrap(),
+            "do not overwrite"
+        );
+        fs::remove_file(path.join("00000003.jsonl")).unwrap();
+        writer
+            .append(ts, "same".into(), serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(
+            segments(&path)
+                .unwrap()
+                .iter()
+                .map(|s| s.first)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        let rows: Vec<_> = super::super::read_from(dir.path(), Stream::Raw, 1)
+            .map(|r| r.unwrap().seq)
+            .collect();
+        assert_eq!(rows, [2, 3]);
+    }
 
     #[test]
     fn stream_sync_policy_and_write_errors_are_observable() {

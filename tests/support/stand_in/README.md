@@ -98,6 +98,7 @@ rig.close();
   for tmux's cursor-position reply before publishing that event; `PS1` is cleared
   in the hook itself (bash resets an inherited empty PS1). New shells without an
   exited harness do not read a cursor reply, leaving queued spawn input to bash.
+  Send nothing to a retained shell until `wait_for_shell` returns.
   Verified with tmux 3.8 and bash 5.3.20; no model CLI is involved.
   `command(path)` supplies the same sealed environment to custom invocations;
   execute with `rig.run(&mut command)`. `tmux` supplies the private `-L` label.

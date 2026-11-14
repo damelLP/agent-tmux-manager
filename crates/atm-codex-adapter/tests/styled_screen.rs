@@ -155,6 +155,16 @@ fn partial_faint_placeholder_and_missing_chrome_never_empty() {
     );
 }
 #[test]
+fn expected_trailing_spaces_cannot_turn_padding_into_exactness() {
+    // Synthetic: expected text could accidentally equal the renderer's padding.
+    let padded = capture!("u5b_poor-different-draft").replace("baseline draft 123", "/clear   ");
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(&padded), "/clear   "),
+        None
+    );
+}
+
+#[test]
 fn leading_spaces_after_blank_draft_paste_never_match_command() {
     // Synthetic: whitespace-only draft plus paste; compare exact leading whitespace.
     let draft = capture!("u5b_poor-different-draft");

@@ -183,6 +183,26 @@ fn whitespace_only_draft_plus_paste_preserves_leading_spaces() {
     );
 }
 #[test]
+fn expected_trailing_spaces_cannot_turn_padding_into_exactness() {
+    // Synthetic: expected text could accidentally equal the renderer's padding.
+    let padded = capture!("B-fresh-120x40")
+        .lines()
+        .map(|line| {
+            if line.contains("\x1b[0;7m \x1b[0m") {
+                "\x1b[0m/clear   "
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(&padded), "/clear   "),
+        None
+    );
+}
+
+#[test]
 fn synthetic_unsafe_chrome_and_controls_refuse() {
     let blank = capture!("B-fresh-120x40");
     for text in [

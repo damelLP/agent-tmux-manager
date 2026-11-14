@@ -20,9 +20,9 @@
 //! probes show `-N` retains allocated grid padding, not only authored spaces.
 //! Only a single visible row can be compared; trailing-padding-only differences
 //! and multiline/wrapped input cannot prove exact equality and return unknown.
-//! Only the captured `/new` completion is a known draft; U5b's real free-text
-//! drafts lack shortcut chrome and remain Unknown. No permission/trust dialog
-//! was captured; no speculative recognizer is added.
+//! Under Plain only the captured `/new` completion is a known draft; free-text
+//! drafts lack shortcut chrome and remain Unknown. P1 permission/trust dialogs
+//! remain unsupported; no speculative action/selection recognizer is added.
 //!
 //! Captured: codex-cli 0.167.0, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
 //! Fresh means a header and otherwise blank history, with optional startup help
@@ -121,10 +121,15 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 }
 
 /// Compare only a reconstructable active single-line draft, never history.
+///
+/// Requires Styled. Preserves leading whitespace, refuses multiline/controls and
+/// expected trailing spaces. An exact unpadded row can match; trailing-padding
+/// differences return None. Consumers must refuse both Some(false) and None.
 #[must_use]
 pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
     if !matches!(input, ScreenInput::Styled(_))
         || expected.is_empty()
+        || expected.ends_with(' ')
         || expected.chars().any(char::is_control)
     {
         return None;

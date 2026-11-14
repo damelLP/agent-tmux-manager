@@ -17,7 +17,7 @@ const BLANK: &str = capture!("u5b_poor-enabled-after-clear-settled");
 fn body(input: ScreenInput<'_>) -> ScreenInput<'_> {
     match input {
         ScreenInput::Styled(s) if s.starts_with("Captured:") => {
-            ScreenInput::Styled(s.split_once('\n').unwrap().1)
+            ScreenInput::Styled(s.split_once('\n').map_or(s, |(_, body)| body))
         }
         other => other,
     }
@@ -176,6 +176,30 @@ fn captured_dialogs_and_unsupported_modes() {
             TurnState::Unknown,
             FreshEditorEvidence::Unknown,
         ),
+    );
+}
+
+#[test]
+fn expected_trailing_spaces_cannot_turn_padding_into_exactness() {
+    // Synthetic: expected text could accidentally equal the renderer's padding.
+    let padded = BLANK.replace("\x1b[7m \x1b[0m", "/clear   ");
+    assert_eq!(
+        staged_draft_matches(ScreenInput::Styled(&padded), "/clear   "),
+        None
+    );
+}
+
+#[test]
+fn placeholder_first_cell_requires_exact_intensity() {
+    // Synthetic: faint + inverse on T is not the captured placeholder evidence.
+    let faint_cursor = FRESH.replace("[7mT", "[2;7mT");
+    assert_ne!(
+        observe_screen(ScreenInput::Styled(&faint_cursor), None).input,
+        InputState::Empty
+    );
+    check(
+        capture!("u5b_rich-enabled-same-text-draft"),
+        ScreenFacts::default(),
     );
 }
 

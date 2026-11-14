@@ -10,7 +10,7 @@
 //! text. They remain Unknown: consumers cannot deliver into a freshly started
 //! Claude editor until a later evidence-backed implementation resolves this.
 //! U5b also captured cursors and confirmed that Home-position drafts collide with
-//! empty editors. Supplying a cursor still returns all Unknown, not emptiness.
+//! empty editors. Supplying a cursor with Plain returns all Unknown, not emptiness.
 //! Unknown layouts, modes, overlays and incomplete dialogs also fail closed.
 //! Plain capture drops trailing spaces: a whitespace-only draft may read Empty.
 //! Styled input requires the full `capture-pane -p -e -N` viewport. The shared
@@ -100,10 +100,15 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 }
 
 /// Compare only a reconstructable active single-line draft, never history.
+///
+/// Requires Styled. Preserves leading whitespace, refuses multiline/controls and
+/// expected trailing spaces. An exact unpadded row can match; trailing-padding
+/// differences return None. Consumers must refuse both Some(false) and None.
 #[must_use]
 pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
     if !matches!(input, ScreenInput::Styled(_))
         || expected.is_empty()
+        || expected.ends_with(' ')
         || expected.chars().any(char::is_control)
     {
         return None;
@@ -237,6 +242,7 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
         match styled.zip(offset) {
             Some((screen, offset))
                 if screen.inverse_at(offset) == Some(true)
+                    && screen.faint_at(offset) == Some(false)
                     && input
                         .char_indices()
                         .skip(1)

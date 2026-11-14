@@ -85,10 +85,15 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 }
 
 /// Compare only a reconstructable active single-line draft, never history.
+///
+/// Requires Styled. Preserves leading whitespace, refuses multiline/controls and
+/// expected trailing spaces. An exact unpadded row can match; trailing-padding
+/// differences return None. Consumers must refuse both Some(false) and None.
 #[must_use]
 pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
     if !matches!(input, ScreenInput::Styled(_))
         || expected.is_empty()
+        || expected.ends_with(' ')
         || expected.chars().any(char::is_control)
     {
         return None;

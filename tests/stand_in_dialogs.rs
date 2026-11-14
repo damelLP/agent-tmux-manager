@@ -189,7 +189,17 @@ fn codex_start_dialogs_hook_list_and_worktree_default_are_real_frames() {
     rig.key(&pane, "not a prompt");
     rig.key(&pane, "Down");
     rig.key(&pane, "Enter");
-    frame(&rig, &pane, after, "interrupted");
+    frame(&rig, &pane, after, "working"); // Option 2 is Yes, not denial.
+    let after = rig.event_cursor(&pane);
+    rig.control(
+        &pane,
+        serde_json::json!({"command":"advance_to", "now_ms":600}),
+    );
+    frame(&rig, &pane, after, "idle");
+    assert!(rig
+        .journal(&pane)
+        .iter()
+        .any(|e| e["event"] == "PostToolUse"));
     assert!(!rig
         .journal(&pane)
         .iter()

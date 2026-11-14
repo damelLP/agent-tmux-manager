@@ -69,6 +69,31 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(data(effects)[0]["session_id"], "test-2")
         self.assertEqual(events(m.tick(500)), [])
 
+    def test_multiline_control_prefix_is_a_prompt(self):
+        m = make()
+        m.start()
+        effects = m.handle(("submit", "/atm/drop-next Stop\nordinary text"), 0)
+        self.assertEqual(events(effects), ["UserPromptSubmit"])
+        self.assertIsNone(m.drop_next)
+
+    def test_fixtures_contain_only_sanitized_paths(self):
+        def strings(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    yield from strings(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from strings(item)
+            elif isinstance(value, str):
+                yield value
+        for path in FIXTURES.glob("*.jsonl"):
+            for line in path.read_text().splitlines():
+                for text in strings(json.loads(line)):
+                    self.assertNotIn("/home/", text)
+                    self.assertNotIn("/dev/shm/", text)
+                    if text.startswith("/"):
+                        self.assertTrue(text.startswith("/fixture"), text)
+
     def test_escape_cancels_completion_but_emits_nothing(self):
         for mode in ["claude", "codex"]:
             with self.subTest(mode=mode):

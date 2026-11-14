@@ -131,7 +131,7 @@ class Model:
                 return self.render("unsupported control: dialog")
             self.state, self.deadline = "dialog", None
             return self.emit("PreToolUse") + self.emit("PermissionRequest") + self.render()
-        if text == "/atm/drop-next" or text.startswith("/atm/drop-next "):
+        if text == "/atm/drop-next" or (text.startswith("/atm/drop-next ") and not any(c in text for c in "\r\n")):
             name = text.partition(" ")[2] or "*"
             known = {f["data"].get("event", f["data"].get("hook_event_name")) for f in self.frames}
             if name not in known and name != "*":

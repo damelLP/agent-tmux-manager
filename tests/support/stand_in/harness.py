@@ -134,6 +134,11 @@ class Runtime:
         parser = InputParser()
         try:
             tty.setraw(sys.stdin.fileno())
+            # tmux paste-buffer maps LF to CR; restore the tty's usual input
+            # translation while retaining noncanonical/no-echo/no-signal input.
+            settings = termios.tcgetattr(sys.stdin.fileno())
+            settings[0] |= termios.ICRNL
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, settings)
             print("\x1b[?2004h", end="", flush=True)
             self.effects(self.model.start())
             if len(sys.argv) > 2:

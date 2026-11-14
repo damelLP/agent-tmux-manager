@@ -1,8 +1,6 @@
 //! Shared real-daemon/private-tmux fixture. See stand_in/README.md for its contract.
 #![allow(dead_code)] // Consumers intentionally use different subsets of test support.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
@@ -12,7 +10,7 @@ use atm_protocol::{ClientMessage, DaemonMessage};
 use serde_json::Value;
 
 #[path = "role.rs"]
-mod bounded;
+pub(crate) mod bounded;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
@@ -246,14 +244,30 @@ impl StandInRig {
             "#{pane_id}",
             &format!("/bin/bash --noprofile --norc -c {}", quote(&command)),
         ]));
+        let pane = self.observe_pane(pane_id, config.mode, log);
+        self.wait_ready(&pane, None);
+        pane
+    }
+
+    /// Observe a stand-in started by atm spawn; unlike launch, it may already be working.
+    pub fn observe_pane(&self, pane_id: String, mode: StandInMode, log: PathBuf) -> StandInPane {
+        assert_eq!(
+            log.parent(),
+            Some(self.root()),
+            "journal must be in this rig"
+        );
         let mut pane = StandInPane {
             pane_id,
             pid: 0,
-            launcher: self.launcher(config.mode),
+            launcher: self.launcher(mode),
             log,
             owner: self.root().into(),
         };
-        self.wait_ready(&pane, None);
+        self.wait("stand-in identity", || {
+            self.journal(&pane)
+                .iter()
+                .any(|e| e["kind"] == "identity" && e["pane"] == pane.pane_id)
+        });
         pane.pid = self
             .journal(&pane)
             .iter()
@@ -331,24 +345,7 @@ impl StandInRig {
     }
 
     fn request(&self, request: ClientMessage) -> DaemonMessage {
-        let mut stream = UnixStream::connect(self.socket()).expect("connect private atmd");
-        stream.set_read_timeout(Some(DEADLINE)).unwrap();
-        stream.set_write_timeout(Some(DEADLINE)).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut send = |msg: ClientMessage| {
-            writeln!(stream, "{}", serde_json::to_string(&msg).unwrap()).unwrap();
-        };
-        send(ClientMessage::connect(Some("stand-in-test".into())));
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        assert!(matches!(
-            serde_json::from_str::<DaemonMessage>(&line).unwrap(),
-            DaemonMessage::Connected { .. }
-        ));
-        send(request);
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
+        protocol_request(&self.socket(), request, DEADLINE).expect("private daemon request")
     }
     pub fn rows(&self) -> Vec<SessionView> {
         match self.request(ClientMessage::list_sessions()) {
@@ -485,6 +482,65 @@ impl Drop for StandInRig {
             );
         }
     }
+}
+
+// A synchronous test API with one deadline covering connect, handshake and reply.
+fn protocol_request(
+    path: &Path,
+    request: ClientMessage,
+    timeout: Duration,
+) -> anyhow::Result<DaemonMessage> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        tokio::time::timeout(timeout, async {
+            let stream = tokio::net::UnixStream::connect(path).await?;
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            for (index, message) in [
+                ClientMessage::connect(Some("stand-in-test".into())),
+                request,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                write
+                    .write_all(format!("{}\n", serde_json::to_string(&message)?).as_bytes())
+                    .await?;
+                line.clear();
+                reader.read_line(&mut line).await?;
+                if index == 0
+                    && !matches!(
+                        serde_json::from_str::<DaemonMessage>(&line)?,
+                        DaemonMessage::Connected { .. }
+                    )
+                {
+                    anyhow::bail!("private daemon handshake refused");
+                }
+            }
+            Ok(serde_json::from_str(&line)?)
+        })
+        .await?
+    })
+}
+
+#[test]
+fn protocol_request_is_bounded_when_listener_never_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("silent.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let before = Instant::now();
+    let error = protocol_request(
+        &socket,
+        ClientMessage::list_sessions(),
+        Duration::from_millis(30),
+    )
+    .expect_err("a silent peer must time out");
+    assert!(error.to_string().contains("deadline"), "{error}");
+    assert!(before.elapsed() < Duration::from_secs(2));
 }
 
 use std::os::unix::fs::FileTypeExt;

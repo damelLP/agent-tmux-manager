@@ -304,6 +304,13 @@ impl DaemonServer {
             .with_raw(raw)
             .with_org(org)
             .with_message_evidence(evidence, history);
+            let handler = match handler.with_disconnect_monitor() {
+                Ok(handler) => handler,
+                Err(error) => {
+                    warn!(%error, "Cannot monitor client disconnect; rejecting connection");
+                    return;
+                }
+            };
 
             // Run the handler and get the client_id when done
             let client_id = handler.run().await;

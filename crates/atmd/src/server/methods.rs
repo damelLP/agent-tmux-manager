@@ -3,7 +3,9 @@
 //! Register methods in [`router`], capturing only their required service handles.
 //! Each handler owns its parameter schema; mutation handlers must tolerate being
 //! dropped on timeout or daemon shutdown (already performed effects are not undone).
-//! Client EOF/disconnect drains accepted calls instead of cancelling them.
+//! Client EOF/protocol Disconnect drains accepted calls. A full socket closure
+//! drops only session.send's wait: the control actor discards pre-effect input
+//! but still finishes Enter after an already-started paste.
 
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::future::Future;

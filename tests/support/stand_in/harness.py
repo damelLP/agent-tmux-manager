@@ -249,12 +249,20 @@ class Runtime:
                     continue
                 self.render_sequence += 1
                 draft = self.parser.draft.decode("utf-8", errors="replace")
-                if "replay_spec" in effect:
-                    screen = render_screen(effect["replay_spec"], self.screen_assets)
-                else:
-                    screen = render_state(self.screen_catalog, self.screen_assets, self.mode,
-                                          effect["frame"], draft, self.screen_variant,
-                                          self.columns, self.rows, effect["selection"], self.screen_folder)
+                try:
+                    if "replay_spec" in effect:
+                        screen = render_screen(effect["replay_spec"], self.screen_assets)
+                    else:
+                        screen = render_state(self.screen_catalog, self.screen_assets, self.mode,
+                                              effect["frame"], draft, self.screen_variant,
+                                              self.columns, self.rows, effect["selection"], self.screen_folder)
+                except ValueError as error:
+                    self.last_render = effect
+                    self.draft_dirty = False
+                    self.pending_renders.clear()
+                    self.record(dict(effect, kind="scene_error", error=str(error)))
+                    print("\x1b[0m\x1b[2J\x1b[Hstand-in scene error: " + str(error), end="", flush=True)
+                    continue
                 effect = dict(effect, sequence=self.render_sequence, draft=draft,
                               source=screen.source)
             self.record(effect)

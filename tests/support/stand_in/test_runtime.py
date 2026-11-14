@@ -188,6 +188,19 @@ class PiTransportTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_scene_error_is_reported_without_exiting_or_claiming_readiness(self):
+        r = runtime()
+        r.model.frame = "missing-capture"
+        with redirect_stdout(io.StringIO()) as output:
+            r.effects(r.model.render())
+            r.input(b"still alive")
+        self.assertTrue(r.running)
+        self.assertIn("stand-in scene error", output.getvalue())
+        errors = [e for e in journal(r) if e["kind"] == "scene_error"]
+        self.assertTrue(errors)
+        self.assertIn("missing-capture", errors[-1]["error"])
+        self.assertFalse(any(e["kind"] in ("ready", "rendered") for e in journal(r)))
+
     def test_render_uses_capture_not_diagnostic_or_identity_chrome(self):
         r = runtime()
         with redirect_stdout(io.StringIO()) as output:

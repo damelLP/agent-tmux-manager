@@ -5,6 +5,7 @@ movement without a captured selected frame, and uncaptured viewport sizes are
 synthetic, not claims about a real harness's wrapping or resize algorithm.
 """
 from dataclasses import replace
+import re
 
 from screens import cell_width, render_screen
 
@@ -44,13 +45,17 @@ def wrap(text, columns):
 
 def editor_slot(lines, mode):
     if mode == "pi":
-        rules = [i for i, line in enumerate(lines) if line.startswith("─" * 10)]
+        rules = [i for i, line in enumerate(lines)
+                 if re.fullmatch(r"─+(?: [\u2800-\u28ff] Working ─+)?", line.rstrip())]
         if len(rules) < 2:
             raise ValueError("pi capture missing editor rules")
         return rules[-2] + 1, rules[-1], ""
     marker = "❯" if mode == "claude" else "›"
     slots = [i for i, line in enumerate(lines) if line.startswith(marker)]
     if not slots:
+        if mode == "codex" and not any(line.strip() for line in lines):
+            # P1's clearing gap has no editor; retain input until it returns.
+            return None
         raise ValueError("capture missing active editor")
     return slots[-1], slots[-1] + 1, "❯\u00a0" if mode == "claude" else "› "
 
@@ -90,14 +95,16 @@ def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, se
                     if styled is not None:
                         styled[i] = lines[i]
     elif draft or (mode == "claude" and frame == "interrupted"):
-        start, end, prefix = editor_slot(lines, mode)
-        inserted = wrap(prefix + visible(draft), columns)
-        # Preserve original SGR (including normal/dim/cursor cells) for an exact
-        # captured draft. Otherwise only the synthetic editor loses its styling.
-        if [line.rstrip(" ") for line in lines[start:end]] != [line.rstrip(" ") for line in inserted]:
-            lines[start:end] = inserted
-            if styled is not None:
-                styled[start:end] = inserted
+        slot = editor_slot(lines, mode)
+        if slot is not None:
+            start, end, prefix = slot
+            inserted = wrap(prefix + visible(draft), columns)
+            # Preserve SGR for an exact captured draft; only synthetic editor
+            # substitutions lose styling.
+            if [line.rstrip(" ") for line in lines[start:end]] != [line.rstrip(" ") for line in inserted]:
+                lines[start:end] = inserted
+                if styled is not None:
+                    styled[start:end] = inserted
     # Synthetic viewport fit: consume blank padding before dropping transcript,
     # and clip long chrome rather than causing terminal auto-wrap/scroll.
     while len(lines) > rows:

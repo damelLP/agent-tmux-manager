@@ -29,6 +29,20 @@ class SceneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             render("pi", "invented")
 
+    def test_drafts_render_on_every_lifecycle_frame_at_catalog_sizes(self):
+        frames = ["fresh", "working", "idle", "clearing", "clear-complete", "interrupted"]
+        sizes = {(s["columns"], s["rows"]) for s in SPECS}
+        for mode in ["claude", "codex", "pi"]:
+            for frame in frames:
+                for columns, rows in sizes:
+                    with self.subTest(mode=mode, frame=frame, size=(columns, rows)):
+                        result = render(mode, frame, "busy draft", columns=columns, rows=rows)
+                        text = "\n".join(result.lines)
+                        if mode == "codex" and frame == "clearing":
+                            self.assertEqual(text.strip(), "")
+                        else:
+                            self.assertIn("busy draft", text)
+
     def test_native_source_is_exact_even_when_model_has_diagnostic_detail(self):
         for mode, variant in [("claude", "rich-enabled"), ("codex", "rich")]:
             result = render(mode, "fresh", variant=variant, columns=100, rows=30)

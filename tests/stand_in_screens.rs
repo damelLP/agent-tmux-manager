@@ -281,6 +281,44 @@ fn key_driven_lifecycle_matches_sources_and_repeated_clear_is_only_a_snapshot() 
 }
 
 #[test]
+fn typing_during_pi_work_and_codex_clear_keeps_the_process_and_draft() {
+    let mut rig = StandInRig::start();
+    for (mode, command, frame, deadline) in [
+        (StandInMode::Pi, "held turn", "working", 500),
+        (StandInMode::Codex, "/new", "clearing", 100),
+    ] {
+        let mut config = StandInConfig::new(mode);
+        config.manual_clock = true;
+        let pane = rig.launch(&config);
+        let after = rig.event_cursor(&pane);
+        rig.paste(&pane, command);
+        rendered(&rig, &pane, after, frame);
+        let after = rig.event_cursor(&pane);
+        rig.key(&pane, "busy draft");
+        rig.wait_event(&pane, after, |e| {
+            e["kind"] == "rendered" && e["frame"] == frame && e["draft"] == "busy draft"
+        });
+        let text = rig.capture_plain(&pane);
+        if mode == StandInMode::Pi {
+            assert!(text.contains("busy draft"));
+            assert_eq!(observe(mode, &text).turn, TurnState::Running);
+        } else {
+            assert!(text.trim().is_empty(), "clear gap has no editor: {text}");
+        }
+        let after = rig.event_cursor(&pane);
+        rig.control(
+            &pane,
+            serde_json::json!({"command":"advance_to", "now_ms":deadline}),
+        );
+        rig.wait_event(&pane, after, |e| {
+            e["kind"] == "rendered" && e["state"] == "idle" && e["draft"] == "busy draft"
+        });
+        assert!(rig.capture_plain(&pane).contains("busy draft"));
+    }
+    rig.close();
+}
+
+#[test]
 fn native_placeholders_and_identical_drafts_never_manufacture_empty_input() {
     let mut rig = StandInRig::start();
     for (mode, variant, placeholder, want_draft) in [

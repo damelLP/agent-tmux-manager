@@ -407,7 +407,7 @@ pub type AuditAcknowledgement =
 #[derive(Debug)]
 enum Audit {
     Record {
-        command: OrgCommand,
+        command: Box<OrgCommand>,
         now: chrono::DateTime<chrono::Utc>,
         acknowledgement: Option<AuditAcknowledgement>,
     },
@@ -482,7 +482,7 @@ impl AuditQueue {
         acknowledgement: Option<AuditAcknowledgement>,
     ) {
         self.enqueue(Audit::Record {
-            command,
+            command: Box::new(command),
             now,
             acknowledgement,
         });
@@ -661,7 +661,7 @@ where
                         now,
                         acknowledgement,
                     } => {
-                        let result = persist(command, now).await;
+                        let result = persist(*command, now).await;
                         if let Err(error) = &result {
                             tracing::warn!(%error, "control audit failed; action result unchanged, not retrying");
                         }
@@ -939,7 +939,7 @@ async fn execute(
         }
     };
     audit.filter(|_| !expired).map(|command| Audit::Record {
-        command,
+        command: Box::new(command),
         now: chrono::Utc::now(),
         acknowledgement: None,
     })

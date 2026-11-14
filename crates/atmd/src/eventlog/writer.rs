@@ -142,11 +142,15 @@ impl Writer {
         if self.size > 0 && self.size.saturating_add(bytes.len() as u64) > self.max_bytes {
             self.rotate()?;
         }
-        self.file
-            .write_all(&bytes)
-            .map_err(|e| io_error(&self.path, e))?;
+        let unknown = |source| EventLogError::WriteOutcomeUnknown {
+            path: self.path.clone(),
+            source,
+        };
+        // write_all can fail after a partial write; a failed sync can leave a
+        // complete record visible to replay. Neither is a known-unwritten error.
+        self.file.write_all(&bytes).map_err(unknown)?;
         if self.stream.sync_each_record() {
-            self.file.sync_data().map_err(|e| io_error(&self.path, e))?;
+            self.file.sync_data().map_err(unknown)?;
         }
         self.size = self.size.saturating_add(bytes.len() as u64);
         self.next = seq.checked_add(1);
@@ -258,17 +262,18 @@ mod tests {
             // Real Unix devices: /dev/full fails write; /dev/null accepts write
             // but rejects sync_data. Replace only the low-level I/O boundary.
             writer.file = OpenOptions::new().write(true).open("/dev/full").unwrap();
-            assert!(writer
+            let error = writer
                 .append(ts, "full".into(), serde_json::Value::Null)
-                .is_err());
+                .unwrap_err();
+            assert!(error.to_string().contains("outcome unknown"), "{error}");
+            assert!(!matches!(error, EventLogError::Io { .. }));
             assert_eq!(writer.next, Some(1));
             writer.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
             let result = writer.append(ts, "sync".into(), serde_json::Value::Null);
             if stream == Stream::Events {
-                assert!(
-                    result.is_err(),
-                    "events acknowledged without a successful sync"
-                );
+                let error = result.expect_err("events acknowledged without a successful sync");
+                assert!(error.to_string().contains("outcome unknown"), "{error}");
+                assert!(!matches!(error, EventLogError::Io { .. }));
                 assert_eq!(writer.next, Some(1));
             } else {
                 assert_eq!(result.unwrap().seq, 1, "raw attempted per-record sync");

@@ -76,11 +76,21 @@ impl Stream {
     }
 }
 
-/// Persistence errors are explicit, including whether a timeout may have written.
+/// Persistence errors distinguish known-unwritten appends from unknown outcomes.
+/// `WriteOutcomeUnknown` and `TimeoutAfterHandover` both mean the record may be
+/// in the log (including visible to replay). Do not blindly retry either one.
+/// An `Io` error from append means this append wrote nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum EventLogError {
     #[error("{path}: {source}")]
     Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A write was attempted, possibly partially, or its subsequent sync failed.
+    #[error("{path}: append outcome unknown (may be in the log): {source}")]
+    WriteOutcomeUnknown {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -189,7 +199,8 @@ impl EventLog {
     }
 
     /// Persists an envelope, bounded by five seconds including admission.
-    /// After-hand-over timeout or cancellation can still commit; do not auto-retry.
+    /// `WriteOutcomeUnknown`, after-hand-over timeout, or cancellation can leave
+    /// a record in the log; do not auto-retry. `Io` means this append wrote nothing.
     pub async fn append(
         &self,
         ts: DateTime<Utc>,

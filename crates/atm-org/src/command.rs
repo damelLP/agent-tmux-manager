@@ -1,0 +1,427 @@
+//! Command policy. Reports are commands too: decide, append, then apply.
+
+use crate::*;
+use atm_core::SessionId;
+use chrono::{DateTime, Utc};
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrgCommand {
+    RegisterProject {
+        project_id: ProjectId,
+        root: String,
+    },
+    Up {
+        agent_id: AgentId,
+        role: RoleSpec,
+    },
+    Adopt {
+        agent_id: AgentId,
+        pane: String,
+        session_id: Option<SessionId>,
+    },
+    Clear {
+        agent_id: AgentId,
+    },
+    Down {
+        agent_id: AgentId,
+        reason: String,
+    },
+    Respawn {
+        agent_id: AgentId,
+        role: RoleSpec,
+        reason: String,
+    },
+    PaneCreated {
+        agent_id: AgentId,
+        pane: String,
+    },
+    SessionBound {
+        agent_id: AgentId,
+        session_id: SessionId,
+    },
+    SessionLost {
+        agent_id: AgentId,
+    },
+    Stuck {
+        agent_id: AgentId,
+        reason: String,
+    },
+    SendMessage(MessageContent),
+    DeliveryAttempted {
+        message_id: MessageId,
+        attempt: u32,
+        pane: String,
+    },
+    Delivered {
+        message_id: MessageId,
+        session_id: SessionId,
+        confirmation: String,
+    },
+    DeliveryFailed {
+        message_id: MessageId,
+        reason: String,
+        final_failure: bool,
+    },
+    ReadMessages {
+        who: Address,
+        message_ids: Vec<MessageId>,
+    },
+    RecordSummary(SessionSummary),
+    ControlSent(ControlAudit),
+    ControlSpawned(ControlAudit),
+    ControlKilled(ControlAudit),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum Refusal {
+    #[error(transparent)]
+    Invariant(#[from] ApplyError),
+    #[error("cannot {operation} agent {agent_id} while {state:?}")]
+    InvalidAgentState {
+        agent_id: AgentId,
+        state: AgentStatus,
+        operation: &'static str,
+    },
+    #[error("agent {agent_id} already holds pane {pane}")]
+    AgentAlreadyBound { agent_id: AgentId, pane: String },
+    #[error("role name {role_name:?} differs from agent {agent_id}")]
+    RoleNameMismatch {
+        agent_id: AgentId,
+        role_name: String,
+    },
+    #[error("cannot {operation} message {message_id} while {state:?}")]
+    InvalidDeliveryState {
+        message_id: MessageId,
+        state: DeliveryStatus,
+        operation: &'static str,
+    },
+    #[error("message {message_id} is not addressed to {who}")]
+    WrongRecipient { message_id: MessageId, who: Address },
+    #[error("invalid recipient {0}")]
+    InvalidRecipient(Address),
+    #[error("invalid {field}: {reason}")]
+    InvalidValue { field: &'static str, reason: String },
+}
+
+impl OrgCommand {
+    // The candidate shares validation with apply before policy can emit it.
+    fn event(&self) -> OrgEvent {
+        match self.clone() {
+            Self::RegisterProject { project_id, root } => {
+                OrgEvent::ProjectRegistered { project_id, root }
+            }
+            Self::Up { agent_id, role } | Self::Respawn { agent_id, role, .. } => {
+                OrgEvent::AgentUpRequested { agent_id, role }
+            }
+            Self::Adopt {
+                agent_id,
+                pane,
+                session_id,
+            } => OrgEvent::AgentAdopted {
+                agent_id,
+                pane,
+                session_id,
+            },
+            Self::Clear { agent_id } => OrgEvent::AgentClearRequested { agent_id },
+            Self::Down { agent_id, reason } => OrgEvent::AgentDown { agent_id, reason },
+            Self::PaneCreated { agent_id, pane } => OrgEvent::AgentPaneCreated { agent_id, pane },
+            Self::SessionBound {
+                agent_id,
+                session_id,
+            } => OrgEvent::AgentSessionBound {
+                agent_id,
+                session_id,
+            },
+            Self::SessionLost { agent_id } => OrgEvent::AgentSessionLost { agent_id },
+            Self::Stuck { agent_id, reason } => OrgEvent::AgentStuck { agent_id, reason },
+            Self::SendMessage(content) => OrgEvent::MessageSent(content),
+            Self::DeliveryAttempted {
+                message_id,
+                attempt,
+                pane,
+            } => OrgEvent::MessageDeliveryAttempted {
+                message_id,
+                attempt,
+                pane,
+            },
+            Self::Delivered {
+                message_id,
+                session_id,
+                confirmation,
+            } => OrgEvent::MessageDelivered {
+                message_id,
+                session_id,
+                confirmation,
+            },
+            Self::DeliveryFailed {
+                message_id,
+                reason,
+                final_failure,
+            } => OrgEvent::MessageDeliveryFailed {
+                message_id,
+                reason,
+                final_failure,
+            },
+            Self::ReadMessages { message_ids, .. } => OrgEvent::MessageRead { message_ids },
+            Self::RecordSummary(summary) => OrgEvent::SessionSummary(summary),
+            Self::ControlSent(audit) => OrgEvent::ControlSent(audit),
+            Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
+            Self::ControlKilled(audit) => OrgEvent::ControlKilled(audit),
+        }
+    }
+}
+
+impl OrgState {
+    /// Validate intent without changing state or assigning event sequences.
+    /// `now` is explicit for future timed policy; event timestamps come from the
+    /// log writer, and today's decisions need no clock or time comparison.
+    pub fn decide(
+        &self,
+        command: &OrgCommand,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<OrgEvent>, Refusal> {
+        let event = command.event();
+        self.validate_event(&event)?;
+        let changed = match command {
+            OrgCommand::RegisterProject { project_id, root } => {
+                nonempty("root", root)?;
+                self.project(project_id).is_none_or(|p| &p.root != root)
+            }
+            OrgCommand::Up { agent_id, role } => {
+                matching_role(agent_id, role)?;
+                if let Some(agent) = self.agent(agent_id) {
+                    if matches!(
+                        agent.status,
+                        AgentStatus::Starting | AgentStatus::Ready | AgentStatus::Clearing
+                    ) || (agent.status == AgentStatus::Stuck && agent.pane.is_some())
+                    {
+                        return Err(agent_refusal(agent, "up"));
+                    }
+                }
+                true
+            }
+            OrgCommand::Adopt {
+                agent_id,
+                pane,
+                session_id,
+            } => {
+                if let Some(agent) = self.agent(agent_id) {
+                    same_pane_or_unbound(agent, pane)?;
+                    agent.pane.as_ref() != Some(pane) || &agent.session_id != session_id
+                } else {
+                    true
+                }
+            }
+            OrgCommand::PaneCreated { agent_id, pane } => {
+                let agent = self.require_agent(agent_id)?;
+                if agent.status != AgentStatus::Starting {
+                    return Err(agent_refusal(agent, "record pane"));
+                }
+                same_pane_or_unbound(agent, pane)?;
+                agent.pane.as_ref() != Some(pane)
+            }
+            OrgCommand::SessionBound {
+                agent_id,
+                session_id,
+            } => {
+                let agent = self.require_agent(agent_id)?;
+                if agent.status == AgentStatus::Down || agent.pane.is_none() {
+                    return Err(agent_refusal(agent, "bind session"));
+                }
+                agent.status != AgentStatus::Ready || agent.session_id.as_ref() != Some(session_id)
+            }
+            OrgCommand::SessionLost { agent_id } => {
+                let agent = self.require_agent(agent_id)?;
+                !matches!(agent.status, AgentStatus::Clearing | AgentStatus::Down)
+                    && !(agent.status == AgentStatus::Starting && agent.session_id.is_none())
+            }
+            OrgCommand::Clear { agent_id } => {
+                let agent = self.require_agent(agent_id)?;
+                if agent.status != AgentStatus::Ready {
+                    return Err(agent_refusal(agent, "clear"));
+                }
+                true
+            }
+            OrgCommand::Stuck { agent_id, reason } => {
+                let agent = self.require_agent(agent_id)?;
+                if agent.status == AgentStatus::Down {
+                    return Err(agent_refusal(agent, "mark stuck"));
+                }
+                agent.status != AgentStatus::Stuck || agent.reason.as_ref() != Some(reason)
+            }
+            OrgCommand::Down { agent_id, .. } => {
+                self.require_agent(agent_id)?.status != AgentStatus::Down
+            }
+            OrgCommand::Respawn {
+                agent_id,
+                role,
+                reason,
+            } => {
+                matching_role(agent_id, role)?;
+                if self.require_agent(agent_id)?.status != AgentStatus::Down {
+                    return Ok(vec![
+                        OrgEvent::AgentDown {
+                            agent_id: agent_id.clone(),
+                            reason: reason.clone(),
+                        },
+                        event,
+                    ]);
+                }
+                true
+            }
+            OrgCommand::SendMessage(content) => {
+                if content.to == Address::System {
+                    return Err(Refusal::InvalidRecipient(Address::System));
+                }
+                true
+            }
+            OrgCommand::DeliveryAttempted {
+                message_id,
+                attempt,
+                pane,
+            } => {
+                let message = self.require_message(message_id)?;
+                let same = message
+                    .last_attempt
+                    .as_ref()
+                    .is_some_and(|a| a.attempt == *attempt && &a.pane == pane);
+                if message.status == DeliveryStatus::Delivering && same {
+                    false
+                } else {
+                    if message.status != DeliveryStatus::Queued {
+                        return Err(delivery_refusal(message, "attempt delivery"));
+                    }
+                    if *attempt == 0
+                        || message
+                            .last_attempt
+                            .as_ref()
+                            .is_some_and(|a| *attempt <= a.attempt)
+                    {
+                        return Err(Refusal::InvalidValue {
+                            field: "attempt",
+                            reason: "must be positive and increase".into(),
+                        });
+                    }
+                    true
+                }
+            }
+            OrgCommand::Delivered { message_id, .. } => {
+                let message = self.require_message(message_id)?;
+                if terminal(message) {
+                    false
+                } else {
+                    if message.status != DeliveryStatus::Delivering {
+                        return Err(delivery_refusal(message, "confirm delivery"));
+                    }
+                    true
+                }
+            }
+            OrgCommand::DeliveryFailed {
+                message_id,
+                reason,
+                final_failure,
+            } => {
+                let message = self.require_message(message_id)?;
+                if terminal(message)
+                    || (!final_failure
+                        && message.status == DeliveryStatus::Queued
+                        && message.failure.as_ref() == Some(reason))
+                {
+                    false
+                } else {
+                    if message.status != DeliveryStatus::Delivering {
+                        return Err(delivery_refusal(message, "fail delivery"));
+                    }
+                    true
+                }
+            }
+            OrgCommand::ReadMessages { who, message_ids } => {
+                self.validate_address(who)?;
+                let mut unread = false;
+                for id in message_ids {
+                    let message = self.require_message(id)?;
+                    if &message.content.to != who {
+                        return Err(Refusal::WrongRecipient {
+                            message_id: *id,
+                            who: who.clone(),
+                        });
+                    }
+                    if message.status != DeliveryStatus::Delivered {
+                        return Err(delivery_refusal(message, "read"));
+                    }
+                    unread |= message.read_at.is_none();
+                }
+                unread
+            }
+            OrgCommand::RecordSummary(summary) => {
+                if summary.ended.is_some_and(|ended| ended < summary.started) {
+                    return Err(Refusal::InvalidValue {
+                        field: "ended",
+                        reason: "precedes started".into(),
+                    });
+                }
+                self.session_summary(&summary.session_id) != Some(summary)
+            }
+            OrgCommand::ControlSent(audit)
+            | OrgCommand::ControlSpawned(audit)
+            | OrgCommand::ControlKilled(audit) => {
+                nonempty("pane", &audit.pane)?;
+                true
+            }
+        };
+        Ok(if changed { vec![event] } else { vec![] })
+    }
+}
+
+fn matching_role(id: &AgentId, role: &RoleSpec) -> Result<(), Refusal> {
+    if role.name != id.name {
+        Err(Refusal::RoleNameMismatch {
+            agent_id: id.clone(),
+            role_name: role.name.clone(),
+        })
+    } else {
+        Ok(())
+    }
+}
+fn same_pane_or_unbound(agent: &Agent, pane: &str) -> Result<(), Refusal> {
+    if let Some(held) = &agent.pane {
+        if held != pane {
+            return Err(Refusal::AgentAlreadyBound {
+                agent_id: agent.id.clone(),
+                pane: held.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+fn agent_refusal(agent: &Agent, operation: &'static str) -> Refusal {
+    Refusal::InvalidAgentState {
+        agent_id: agent.id.clone(),
+        state: agent.status,
+        operation,
+    }
+}
+fn delivery_refusal(message: &Message, operation: &'static str) -> Refusal {
+    Refusal::InvalidDeliveryState {
+        message_id: message.id,
+        state: message.status,
+        operation,
+    }
+}
+fn terminal(message: &Message) -> bool {
+    matches!(
+        message.status,
+        DeliveryStatus::Delivered | DeliveryStatus::Failed
+    )
+}
+fn nonempty(field: &'static str, value: &str) -> Result<(), Refusal> {
+    if value.is_empty() {
+        Err(Refusal::InvalidValue {
+            field,
+            reason: "must not be empty".into(),
+        })
+    } else {
+        Ok(())
+    }
+}

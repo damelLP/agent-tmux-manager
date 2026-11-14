@@ -366,18 +366,43 @@ fn codex_setup_upgrades_existing_session_end_timeouts() {
         fs::read_to_string(CODEX.path(home)).unwrap(),
         pretty(&expected)
     );
-    assert!(stdout.contains("Codex configuration written."), "{stdout}");
+    assert_eq!(
+        stdout,
+        CODEX.setup_stdout(
+            home,
+            &event_lines(CODEX.events, "already configured"),
+            CODEX.written,
+            "created"
+        )
+    );
 
     // The migration is idempotent, including an existing shorter timeout.
     let bytes = unwritable_by_atm(&expected);
     fs::write(CODEX.path(home), &bytes).unwrap();
     let stdout = run_atm_ok(home, "setup");
-    assert!(stdout.contains("Codex already configured."), "{stdout}");
+    assert_eq!(
+        stdout,
+        CODEX.setup_stdout(
+            home,
+            &event_lines(CODEX.events, "already configured"),
+            CODEX.unchanged,
+            "already present (preserved)"
+        )
+    );
     assert_eq!(fs::read_to_string(CODEX.path(home)).unwrap(), bytes);
 
     // Uninstall still identifies the updated commands and leaves the user's
     // shared entry, its matcher and the similarly named wrapper alone.
-    run_atm_ok(home, "uninstall");
+    let stdout = run_atm_ok(home, "uninstall");
+    assert_eq!(
+        stdout,
+        CODEX.uninstall_stdout(
+            home,
+            &event_lines(CODEX.events, "removed").replace("    ", "  "),
+            "statusLine - not configured by atm",
+            "done"
+        )
+    );
     assert_eq!(
         fs::read_to_string(CODEX.path(home)).unwrap(),
         pretty(&json!({"userKey": "kept", "hooks": {"SessionEnd": [

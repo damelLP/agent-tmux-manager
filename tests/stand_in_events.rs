@@ -32,7 +32,7 @@ fn manual_time_holds_real_pane_work_and_clear() {
     let reply = rig.control(&pane, json!({"command": "advance_to", "now_ms": 499}));
     assert_eq!(reply["state"], "working");
     let capture = rig.capture_plain(&pane);
-    assert!(capture.contains(": working"), "{capture:?}");
+    assert!(capture.contains("Levitating…"), "{capture:?}");
     rig.control(&pane, json!({"command": "advance_to", "now_ms": 500}));
     let idle = rig.wait_event(&pane, working["event_sequence"].as_u64().unwrap(), |e| {
         e["kind"] == "rendered" && e["state"] == "idle"
@@ -43,14 +43,14 @@ fn manual_time_holds_real_pane_work_and_clear() {
         e["kind"] == "rendered" && e["state"] == "clearing"
     });
     rig.control(&pane, json!({"command": "advance_to", "now_ms": 599}));
-    assert!(rig.capture_plain(&pane).contains(": clearing"));
+    assert!(rig.capture_plain(&pane).contains("running SessionEnd hook"));
     rig.control(&pane, json!({"command": "advance_to", "now_ms": 600}));
     let fresh = rig.wait_event(&pane, clear["event_sequence"].as_u64().unwrap(), |e| {
         e["kind"] == "rendered" && e["state"] == "idle"
     });
     assert_ne!(fresh["session_id"], idle["session_id"]);
     let output = rig.capture_plain(&pane);
-    assert!(output.starts_with("stand-in claude "));
+    assert!(output.contains("Claude Code v2.1.325"));
     assert!(
         output.ends_with('\n'),
         "capture must retain viewport line structure"

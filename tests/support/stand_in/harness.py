@@ -16,6 +16,7 @@ import uuid
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from model import InputParser, Model, parse_args
+from scene import render_state
 
 VERSIONS = {"claude": "2.1.325", "codex": "0.167.0", "pi": "1.5.0"}
 
@@ -56,7 +57,9 @@ class Runtime:
             if not path.is_relative_to(self.root):
                 raise ValueError("config must be inside ATM_STANDIN_ROOT")
             config = json.loads(path.read_text())
-            for key in ("LOG", "ID_PREFIX", "WORK_MS", "CLEAR_GAP_MS", "MANUAL_CLOCK"):
+            for key in ("LOG", "ID_PREFIX", "WORK_MS", "CLEAR_GAP_MS", "MANUAL_CLOCK",
+                        "FOLDER_TRUST", "UPDATE_PROMPT", "WORKTREE_CHOICE", "HOOKS_REVIEW",
+                        "PERMISSION_DIALOG", "SCREEN_VARIANT", "FOLDER"):
                 if key in config:
                     os.environ["ATM_STANDIN_" + key] = str(config[key])
         self.log_path = private_path("ATM_STANDIN_LOG", self.root)
@@ -68,7 +71,16 @@ class Runtime:
                   (HERE / "fixtures" / f"{self.mode}_{VERSIONS[self.mode]}.jsonl").read_text().splitlines()]
         self.model = Model(self.mode, frames, self.next_id(),
                            int(os.environ.get("ATM_STANDIN_WORK_MS", "500")),
-                           int(os.environ.get("ATM_STANDIN_CLEAR_GAP_MS", "100")))
+                           int(os.environ.get("ATM_STANDIN_CLEAR_GAP_MS", "100")),
+                           **{key.lower(): os.environ.get("ATM_STANDIN_" + key, "0") == "1"
+                              for key in ("FOLDER_TRUST", "UPDATE_PROMPT", "WORKTREE_CHOICE",
+                                          "HOOKS_REVIEW", "PERMISSION_DIALOG")})
+        self.screen_catalog = json.loads((HERE / "screens.json").read_text())
+        self.screen_assets = {spec[key]: (HERE.parents[2] / spec[key]).read_text()
+                              for spec in self.screen_catalog for key in ("source", "style") if key in spec}
+        self.screen_variant = os.environ.get("ATM_STANDIN_SCREEN_VARIANT", "u5")
+        self.screen_folder = os.environ.get("ATM_STANDIN_FOLDER") or None
+        self.columns, self.rows = os.get_terminal_size(sys.stdin.fileno())
         self.stream = None
         self.outbox = []
         self.retry_at = 0
@@ -211,8 +223,12 @@ class Runtime:
                     self.draft_dirty = True
                     continue
                 self.render_sequence += 1
-                effect = dict(effect, sequence=self.render_sequence,
-                              draft=self.parser.draft.decode("utf-8", errors="replace"))
+                draft = self.parser.draft.decode("utf-8", errors="replace")
+                screen = render_state(self.screen_catalog, self.screen_assets, self.mode,
+                                      effect["frame"], draft, self.screen_variant,
+                                      self.columns, self.rows, effect["selection"], self.screen_folder)
+                effect = dict(effect, sequence=self.render_sequence, draft=draft,
+                              source=screen.source)
             self.record(effect)
             if effect["kind"] in ("event", "status"):
                 self.forward(effect["data"])
@@ -221,22 +237,10 @@ class Runtime:
             elif effect["kind"] == "render":
                 self.last_render = effect
                 self.draft_dirty = False
-                state = effect["state"]
-                text = f"stand-in {self.mode} {self.model.session_id}: {state}\n"
-                if state == "dialog":
-                    dialog = (HERE / "fixtures/claude_permission_2.1.325.txt").read_text()
-                    if effect["selection"] == 2:
-                        dialog = dialog.replace("❯ 1.", "  1.").replace("  2.", "❯ 2.")
-                    text += dialog
-                else:
-                    draft = self.parser.draft.decode("utf-8", errors="replace")
-                    # Render control bytes visibly; submitted text never controls the terminal.
-                    draft = "".join(c if c.isprintable() or c == "\n" else repr(c)[1:-1] for c in draft)
-                    text += effect["detail"] + "\n❯ " + draft
                 # DSR is answered after tmux parses the preceding frame. A flush
                 # alone only proves bytes reached the tty, not the captured pane.
                 self.pending_renders.append(effect)
-                print("\x1b[2J\x1b[H" + text.replace("\n", "\r\n") + "\x1b[6n", end="", flush=True)
+                print(screen.terminal + "\x1b[6n", end="", flush=True)
             elif effect["kind"] == "exit":
                 self.running = False
                 self.pending_renders.clear()
@@ -247,7 +251,14 @@ class Runtime:
             if not self.running:
                 break
             before = bytes(self.parser.draft)
+            modal = self.model.dialog is not None
+            hotkey = (self.model.dialog == "hooks-list" and byte == ord("t")
+                      and not self.parser.pasting and not self.parser.pending)
             actions = self.parser.feed(bytes([byte]))
+            if modal:
+                self.parser.draft.clear()
+                if hotkey:
+                    actions.append(("key", "t"))
             self.draft_dirty |= self.parser.draft != before
             for action in actions:
                 if action[0] != "cursor_report":
@@ -264,7 +275,7 @@ class Runtime:
             self.effects([self.last_render])
 
     def action(self, action):
-        if action == ("submit", "/clear" if self.mode == "claude" else "/new"):
+        if self.model.dialog is None and action == ("submit", "/clear" if self.mode == "claude" else "/new"):
             self.generation += 1
         self.effects(self.model.handle(action, self.now_ms(), self.next_id()))
 
@@ -277,7 +288,7 @@ class Runtime:
             settings = termios.tcgetattr(sys.stdin.fileno())
             settings[0] |= termios.ICRNL
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, settings)
-            print("\x1b[?2004h", end="", flush=True)
+            print(("\x1b[?1049h" if self.mode != "pi" else "") + "\x1b[?2004h", end="", flush=True)
             self.effects(self.model.start())
             if self.prompt is not None:
                 self.action(("submit", self.prompt))
@@ -304,7 +315,8 @@ class Runtime:
                         self.effects(self.model.tick(self.now_ms()))
                     self.flush_pi()
         finally:
-            print("\x1b[?2004l\r\n", end="", flush=True)
+            print("\x1b[?2004l" + ("\x1b[?1049l" if self.mode != "pi" else
+                                     f"\x1b[{self.rows};1H") + "\r\n", end="", flush=True)
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)
             if self.stream is not None:
                 self.stream.close()

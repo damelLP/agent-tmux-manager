@@ -569,5 +569,140 @@
     "source": "crates/atm-pi-adapter/tests/fixtures/screen_pi-extra-working-2_1.5.0.txt",
     "columns": 116,
     "rows": 28
+  },
+  {
+    "key": "claude.folder-trust.p1-80",
+    "mode": "claude",
+    "state": "folder-trust",
+    "variant": "p1-80",
+    "source": "tests/support/stand_in/fixtures/screens/p1_claude_A80-default-80x40_2.1.325.txt",
+    "columns": 80,
+    "rows": 40
+  },
+  {
+    "key": "claude.folder-trust-selected.p1-80",
+    "mode": "claude",
+    "state": "folder-trust-selected",
+    "variant": "p1-80",
+    "source": "tests/support/stand_in/fixtures/screens/p1_claude_A80-selected-80x40_2.1.325.txt",
+    "columns": 80,
+    "rows": 40
+  },
+  {
+    "key": "claude.folder-trust.p1-120",
+    "mode": "claude",
+    "state": "folder-trust",
+    "variant": "p1-120",
+    "source": "tests/support/stand_in/fixtures/screens/p1_claude_A120-default-120x40_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.folder-trust-selected.p1-120",
+    "mode": "claude",
+    "state": "folder-trust-selected",
+    "variant": "p1-120",
+    "source": "tests/support/stand_in/fixtures/screens/p1_claude_A120-selected-120x40_2.1.325.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "claude.folder-trust.p1-200",
+    "mode": "claude",
+    "state": "folder-trust",
+    "variant": "p1-200",
+    "source": "tests/support/stand_in/fixtures/screens/p1_claude_A200-default-200x40_2.1.325.txt",
+    "columns": 200,
+    "rows": 40
+  },
+  {
+    "key": "claude.folder-trust-selected.p1-200",
+    "mode": "claude",
+    "state": "folder-trust-selected",
+    "variant": "p1-200",
+    "source": "tests/support/stand_in/fixtures/screens/p1_claude_A200-selected-200x40_2.1.325.txt",
+    "columns": 200,
+    "rows": 40
+  },
+  {
+    "key": "codex.folder-trust.p1",
+    "mode": "codex",
+    "state": "folder-trust",
+    "variant": "p1",
+    "source": "tests/support/stand_in/fixtures/screens/p1_codex_a16-default-fresh-folder-trust-100x24_0.167.0.txt",
+    "columns": 100,
+    "rows": 24
+  },
+  {
+    "key": "codex.hooks-review.p1",
+    "mode": "codex",
+    "state": "hooks-review",
+    "variant": "p1",
+    "source": "tests/support/stand_in/fixtures/screens/p1_codex_a17-default-fresh-hook-trust-100x24_0.167.0.txt",
+    "columns": 100,
+    "rows": 24
+  },
+  {
+    "key": "codex.hooks-list.p1",
+    "mode": "codex",
+    "state": "hooks-list",
+    "variant": "p1",
+    "source": "tests/support/stand_in/fixtures/screens/p1_codex_a04-review-detail-100x32_0.167.0.txt",
+    "columns": 100,
+    "rows": 32
+  },
+  {
+    "key": "codex.worktree.p1",
+    "mode": "codex",
+    "state": "worktree",
+    "variant": "p1",
+    "source": "tests/support/stand_in/fixtures/screens/p1_codex_b31-nodaemon-clear-dialog-100x32_0.167.0.txt",
+    "columns": 100,
+    "rows": 32
+  },
+  {
+    "key": "codex.worktree.p1-short",
+    "mode": "codex",
+    "state": "worktree",
+    "variant": "p1-short",
+    "source": "tests/support/stand_in/fixtures/screens/p1_codex_b35-default-repo-clear-dialog-100x24_0.167.0.txt",
+    "columns": 100,
+    "rows": 24
+  },
+  {
+    "key": "codex.permission.p1",
+    "mode": "codex",
+    "state": "permission",
+    "variant": "p1",
+    "source": "tests/support/stand_in/fixtures/screens/p1_codex_c16-permission-visible-100x32_0.167.0.txt",
+    "columns": 100,
+    "rows": 32
+  },
+  {
+    "key": "codex.clearing.p1",
+    "mode": "codex",
+    "state": "clearing",
+    "variant": "p1",
+    "source": "tests/support/stand_in/fixtures/screens/p1_codex_b13-after-completed-new-100x32_0.167.0.txt",
+    "columns": 100,
+    "rows": 32
+  },
+  {
+    "key": "pi.draft.p1",
+    "mode": "pi",
+    "state": "draft",
+    "variant": "p1",
+    "source": "tests/support/stand_in/fixtures/screens/p1_pi_C4-one-draft-120x40_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
+  },
+  {
+    "key": "pi.draft.p1-multi",
+    "mode": "pi",
+    "state": "draft",
+    "variant": "p1-multi",
+    "source": "tests/support/stand_in/fixtures/screens/p1_pi_C4-multi-draft-120x40_1.5.0.txt",
+    "columns": 120,
+    "rows": 40
   }
 ]

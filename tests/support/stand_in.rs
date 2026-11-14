@@ -45,6 +45,15 @@ pub struct StandInConfig {
     pub clear_gap_ms: u64,
     pub manual_clock: bool,
     pub id_prefix: String,
+    pub folder_trust: bool,
+    pub update_prompt: bool,
+    pub worktree_choice: bool,
+    pub hooks_review: bool,
+    pub permission_dialog: bool,
+    pub screen_variant: String,
+    pub folder: Option<String>,
+    pub columns: u16,
+    pub rows: u16,
 }
 impl StandInConfig {
     pub fn new(mode: StandInMode) -> Self {
@@ -54,6 +63,15 @@ impl StandInConfig {
             clear_gap_ms: 100,
             manual_clock: false,
             id_prefix: "stand-in".into(),
+            folder_trust: false,
+            update_prompt: false,
+            worktree_choice: false,
+            hooks_review: false,
+            permission_dialog: false,
+            screen_variant: "u5".into(),
+            folder: None,
+            columns: 120,
+            rows: 40,
         }
     }
 }
@@ -171,6 +189,8 @@ impl StandInRig {
         assert_eq!(Path::new(socket), rig.tmux_identity.as_ref().unwrap().0);
         rig.tmux_identity = Some((socket.into(), Some(pid.parse().unwrap())));
         checked(rig.tmux(&["set-option", "-g", "default-shell", "/bin/bash"]));
+        checked(rig.tmux(&["set-option", "-g", "status", "off"]));
+        checked(rig.tmux(&["set-option", "-g", "default-size", "120x40"]));
         checked(rig.tmux(&[
             "set-option",
             "-g",
@@ -369,6 +389,13 @@ impl StandInRig {
                 "WORK_MS": config.work_ms, "CLEAR_GAP_MS": config.clear_gap_ms,
                 "MANUAL_CLOCK": u8::from(config.manual_clock),
                 "ID_PREFIX": prefix, "LOG": log,
+                "FOLDER_TRUST": u8::from(config.folder_trust),
+                "UPDATE_PROMPT": u8::from(config.update_prompt),
+                "WORKTREE_CHOICE": u8::from(config.worktree_choice),
+                "HOOKS_REVIEW": u8::from(config.hooks_review),
+                "PERMISSION_DIALOG": u8::from(config.permission_dialog),
+                "SCREEN_VARIANT": config.screen_variant,
+                "FOLDER": config.folder.as_deref().unwrap_or(""),
             }))
             .unwrap(),
         )
@@ -378,6 +405,12 @@ impl StandInRig {
             quote(self.launcher(config.mode).to_str().unwrap()),
             quote(config_path.to_str().unwrap())
         );
+        checked(self.tmux(&[
+            "set-option",
+            "-g",
+            "default-size",
+            &format!("{}x{}", config.columns, config.rows),
+        ]));
         let pane_id = checked(self.tmux(&[
             "new-window",
             "-d",

@@ -27,6 +27,11 @@ def runtime():
     r.event_stream = None
     r.start_time = "test-start"
     r.pane = "%test"
+    from test_scene import SPECS, ASSETS
+    r.screen_catalog, r.screen_assets = SPECS, ASSETS
+    r.screen_variant = "u5"
+    r.screen_folder = None
+    r.columns, r.rows = 120, 40
     return r
 
 
@@ -118,6 +123,53 @@ class ControlTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_render_uses_capture_not_diagnostic_or_identity_chrome(self):
+        r = runtime()
+        with redirect_stdout(io.StringIO()) as output:
+            r.effects(r.model.render("status sent"))
+        self.assertIn("Claude Code v2.1.325", output.getvalue())
+        self.assertNotIn("stand-in", output.getvalue())
+        self.assertNotIn("test-1", output.getvalue())
+        self.assertNotIn("status sent", output.getvalue())
+        self.assertIn("screen_claude-ready", journal(r)[-1]["source"])
+
+    def test_startup_modal_acknowledges_frame_but_never_ready(self):
+        r = runtime()
+        r.model = make(folder_trust=True)
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.start())
+            r.input(b"\x1b[1;1R")
+        self.assertEqual([e["kind"] for e in journal(r)], ["render", "rendered"])
+        self.assertEqual(journal(r)[-1]["frame"], "folder-trust")
+
+    def test_fragmented_modal_paste_cannot_leak_into_editor(self):
+        r = runtime()
+        r.model = make(folder_trust=True)
+        r.forward = lambda data: None
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.start())
+            r.input(b"\x1b[1;1R")
+            for part in [b"\x1b[20", b"0~ignored", b"\n/exit", b"\x1b[201~"]:
+                r.input(part)
+            r.input(b"\x1b[B\r")
+        self.assertEqual(r.model.state, "idle")
+        self.assertEqual(r.parser.draft, b"")
+        self.assertFalse(any(e.get("event") == "UserPromptSubmit" for e in journal(r)))
+
+    def test_hook_list_t_is_key_but_pasted_t_is_not(self):
+        r = runtime()
+        r.mode = "codex"
+        r.model = make("codex", hooks_review=True)
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.start())
+            r.input(b"\r")
+            r.input(b"\x1b[200~t\x1b[201~")
+            self.assertEqual(r.model.dialog, "hooks-list")
+            self.assertEqual(r.parser.draft, b"")
+            r.input(b"t")
+        self.assertEqual(r.model.state, "idle")
+        self.assertEqual(r.parser.draft, b"")
+
     def test_ready_requires_terminal_reply_not_stdout_flush(self):
         r = runtime()
         with redirect_stdout(io.StringIO()) as output:

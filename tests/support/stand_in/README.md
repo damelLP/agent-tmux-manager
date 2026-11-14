@@ -60,7 +60,7 @@ rig.close();
   bound before launch. Every record has `pid`, procfs `start_time`, `pane`, and
   `event_sequence`; respawn cannot reuse an old process's ready record.
   `sequence` remains the separate per-process frame counter. Frame records also
-  carry the draft, so fragmented input can be awaited before capture, without
+  carry `frame` (scene), `source` (capture path), and the draft, so fragmented input can be awaited before capture, without
   polling for text. Take a cursor
   **before** an action, then await its `rendered` event before capture. A control
   barrier alone does not prove that earlier tmux key input has been consumed.
@@ -177,7 +177,8 @@ time as well as PID; readiness ignores old-process renders.
 `--atm-config <path>` in the original pane command. `respawn-pane -k -t <pane>`
 therefore retains configuration without shell exports. A retained-shell relaunch
 can use `pane.launcher --atm-config <that-path>`. The file has `LOG`, `ID_PREFIX`,
-`WORK_MS`, `CLEAR_GAP_MS`, `MANUAL_CLOCK` (0/1) keys; it and the log/socket must resolve inside
+`WORK_MS`, `CLEAR_GAP_MS`, `MANUAL_CLOCK` (0/1), `SCREEN_VARIANT`, `FOLDER`, and
+optional dialog flags described below; it and the log/socket must resolve inside
 `ATM_STANDIN_ROOT`. Defaults for the timers are 500ms/100ms; negatives fail before
 announcement. Direct launch also requires the private TMUX/PANE and root; never
 unset ATM_SOCKET to use a default.
@@ -194,12 +195,14 @@ Codex discovery may create `pending-{pid}` and its old row remains across clear.
 Waiting for its new-ID hook before the next prompt deadlocks: wait for the new
 render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
 
-- `/atm/dialog` (Claude only) sends PreToolUse and PermissionRequest and displays
+- `/atm/dialog` in Claude sends PreToolUse and PermissionRequest and displays
   the captured permission question/Yes/No/Esc screen. Up/Down select, Enter records
   a 1-based `selection.option`, Escape denies. Selection emits no hook and executes
   nothing (Synthetic: safe selection, not actual tool approval). Denial erases the
   dialog but leaves the daemon attention_needed. `atm reply --option 2` and
-  `peek --prompt` exercise the real parser/key path.
+  `peek --prompt` exercise the real parser/key path. Codex supports `/atm/dialog`
+  only with `permission_dialog = true`: it renders P1's actual three-option modal,
+  consumes Down/Enter or Escape, and executes nothing/emits no fabricated hooks.
 - `/atm/drop-next [EVENT]` suppresses the next matching hook, or literally the next
   hook if omitted. Names are case-sensitive; invalid names don't arm loss. Status
   frames are separate and do not consume this hook-drop control.
@@ -231,27 +234,66 @@ render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
   real unacknowledged writes, a disconnect during a write can lose/duplicate a
   frame; process exit does not guarantee flushing while the daemon is unavailable.
 
-Remaining gaps: no Codex/pi native dialogs, trust/update prompts, permission
-Notification hook or post-denial status timing, provider errors/resumptions,
-real tokens/usage evolution, subagents, tool execution, or paid model calls.
-Input-line rendering is deliberately simple, not a pixel-perfect vendor TUI.
+Remaining gaps: pi native selectors, permission Notification hook or post-denial
+status timing, provider errors/resumptions, real tokens/usage evolution, subagents,
+tool execution, or paid model calls. Input editing and uncaptured viewport sizes
+are synthetic, not a complete vendor TUI.
 
-## Fixture renderer (staged; lifecycle integration pending)
+## Captured screens and optional dialogs
 
-`screens.json` catalogs 59 native-size source variants; `screens.py` is a pure
-renderer taking a catalog entry and preloaded asset strings. It reuses adapter
-plain captures and carries 20 selected U5b SGR/cursor pairs (provenance in
-`fixtures/screens/README.md`). It preserves rows, NBSP and padding, refuses unsafe
-non-SGR controls or oversized geometry, and emits absolute row positions rather
-than a bottom-row newline that would scroll the screen. It neither guesses parser
-facts nor reconstructs styles. Styled cursor spaces are preserved even when the
-paired plain capture drops them.
+The runtime renders `screens.json`'s 74 source variants through the pure
+`screens.py` renderer and `scene.py` lifecycle mapping. Sources reuse adapter plain
+captures, 20 U5b SGR/cursor pairs, and 15 sanitized P1 captures (provenance in
+`fixtures/screens/README.md`). No runtime ID or diagnostic status text is visible.
+`frame` distinguishes fresh, working, idle after a turn, clearing, clear-complete,
+interrupted and modal scenes. Claude clear shows the real SessionEnd hook spinner;
+pi retains a captured old conversation; Codex can show the captured blank
+transition. Completed clear uses genuine fresh captures, not the misleading
+post-turn `after-clear` fixtures. These scenes are snapshots, not transcript replay.
 
-The standalone renderer is covered by `test_screens.py` through the Cargo Python
-contract test. **It is not yet wired into `harness.py`; the pane still uses the old
-placeholder renderer.** Lifecycle frame selection, synthetic draft insertion,
-new P1 dialog captures/keys, and actual pane/parser conformance remain the next
-steps. Consumers must not infer that this catalog alone makes readiness work.
+Native output preserves rows, NBSP and padding. Trusted SGR is validated against
+plain text; styled cursor spaces survive even when plain capture drops them.
+Absolute row positioning avoids bottom-row newline scrolling. Synthetic runtime
+drafts replace only the active editor slot and render control bytes visibly.
+Capture-specific draft styling is preserved for an exact captured draft; other
+drafts use normal attributes. Modal text never becomes an editor draft. Diagnostics
+and suppressed hooks remain in event records, not invented screen chrome.
+
+`config.columns/rows` default to 120x40 and establish the private window size
+before launch. `screen_variant` defaults to `u5`; choose `rich-enabled`/`poor`
+for Claude or `rich`/`poor` for Codex at 100x30. Native geometry wins over a variant
+from another size. P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
+Uncaptured combinations are explicitly synthetic: blank padding is removed first,
+then leading transcript if needed; long chrome is clipped, drafts cell-wrapped.
+This is not real-harness resize fidelity. Optional `config.folder` substitutes
+only the trust path (control bytes escaped); omission preserves the capture.
+
+All dialog flags default false, survive respawn, and reject incompatible modes
+before identity or lifecycle announcement. Config JSON/environment flags use
+`FOLDER_TRUST`, `UPDATE_PROMPT`, `WORKTREE_CHOICE`, `HOOKS_REVIEW`,
+`PERMISSION_DIALOG` with 0/1 values (environment prefix `ATM_STANDIN_`).
+
+| Flag | Modes | Keys and behavior |
+|---|---|---|
+| `folder_trust` | Claude | Default No; Down selects Yes, Enter accepts and only then emits SessionStart. No/Enter or Esc exits without lifecycle hooks. |
+| `folder_trust` | Codex | Default Trust and continue; Enter advances. Option 2/Back is explicitly refused in place: Command Center is not modeled. |
+| `update_prompt` | Codex | Esc skips for this launch; update execution is refused. |
+| `hooks_review` | Codex | Enter opens the captured hook list; `t` trusts, Esc returns. Down/Enter trusts all; option 3 continues but suppresses hooks as advertised. |
+| `worktree_choice` | Codex | `/new` holds old generation at the modal; Enter on default commits clear, Esc restores old scene/ID. Creating a checkout is refused. |
+| `permission_dialog` | Codex | Enables the safe `/atm/dialog` control described above. |
+
+When combined, Codex start order is update → folder → hooks → editor. Pi has no
+start dialog. `launch` returns on the first **rendered modal**, without waiting
+for ready or a daemon row. Use `wait_event` after keys; no `ready` is emitted for
+a modal. Selecting it cannot confirm delivery. Claude/Codex restore the normal
+terminal screen on exit; pi retains history and puts the shell below it. No
+frame/ready event is emitted after exit.
+
+Pure source/scene/key tests run through the Cargo Python contract; private tmux
+integration tests cover native fresh replay, modal keys and retained shells.
+Adapter conformance is a separate contract: a real-looking placeholder, selected
+trust option or Codex draft may still be Unknown to the current parsers. Neither
+the journal nor a rendered frame is permission to deliver a prompt.
 
 ## Captured templates
 

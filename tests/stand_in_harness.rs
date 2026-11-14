@@ -162,7 +162,7 @@ fn claude_stand_in_lifecycle() {
     rig.wait_ready(&pane, None);
     paste_frame(&rig, &pane, "/clear", "clearing");
     rig.wait_for_absent(&original.id);
-    assert!(rig.capture(&pane).contains(": clearing"));
+    assert!(rig.capture(&pane).contains("running SessionEnd hook"));
     assert!(
         rig.pane_rows(&pane).is_empty(),
         "SessionEnd must remove the row during the gap"
@@ -337,7 +337,9 @@ fn pi_stand_in_abort() {
     );
     paste_frame(&rig, &pane, "/new", "clearing");
     rig.wait_for_absent(&old.id);
-    assert!(rig.capture(&pane).contains(": clearing"));
+    assert!(rig
+        .capture(&pane)
+        .contains("[fixture1] reply with the word ok"));
     assert!(
         rig.pane_rows(&pane).is_empty(),
         "shutdown must remove the row in the clear gap"
@@ -471,7 +473,7 @@ fn stand_in_visible_draft_queue_and_interrupt() {
     rig.wait_event(&pane, after, |e| {
         e["kind"] == "rendered" && e["draft"] == "typed draft"
     });
-    assert!(rig.capture(&pane).contains("❯ typed draft"));
+    assert!(rig.capture(&pane).contains("❯\u{a0}typed draft"));
     let after = rig.event_cursor(&pane);
     success(rig.tmux(&["set-buffer", "-b", "draft", " + pasted"]));
     success(rig.tmux(&[
@@ -486,7 +488,7 @@ fn stand_in_visible_draft_queue_and_interrupt() {
     rig.wait_event(&pane, after, |e| {
         e["kind"] == "rendered" && e["draft"] == "typed draft + pasted"
     });
-    assert!(rig.capture(&pane).contains("❯ typed draft + pasted"));
+    assert!(rig.capture(&pane).contains("❯\u{a0}typed draft + pasted"));
     rig.key(&pane, "C-u");
     rig.paste(&pane, "interrupt me");
     rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
@@ -495,7 +497,7 @@ fn stand_in_visible_draft_queue_and_interrupt() {
     rig.wait_event(&pane, after, |e| {
         e["kind"] == "rendered" && e["draft"] == "interrupt me"
     });
-    assert!(rig.capture(&pane).contains("❯ interrupt me"));
+    assert!(rig.capture(&pane).contains("❯\u{a0}interrupt me"));
     let after = rig.event_cursor(&pane);
     rig.key(&pane, "C-c");
     rig.wait_event(&pane, after, |e| {
@@ -727,6 +729,8 @@ fn stand_in_model_contract() {
                 "test_model",
                 "test_runtime",
                 "test_screens",
+                "test_dialogs",
+                "test_scene",
             ])
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")

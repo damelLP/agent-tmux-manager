@@ -613,7 +613,7 @@ pub fn next_delivery(
             let confirmation = settings
                 .guard_poll_interval
                 .checked_mul(3)
-                .ok_or(DeliveryPolicyError::InvalidConfiguration)?;
+                .ok_or(DeliveryPolicyError::TimeOverflow)?;
             Some(deadline(
                 live.stale_blocker_since.unwrap_or(now),
                 confirmation,
@@ -1835,6 +1835,26 @@ mod tests {
         for (setting, settings) in settings_with_duration(maximum + Duration::from_nanos(1)) {
             assert_invalid_duration(setting, settings);
         }
+    }
+
+    #[test]
+    fn unvalidated_stale_confirmation_overflow_is_a_time_error() {
+        // Deliberately bypass the public constructor to exercise its unreachable
+        // arithmetic fallback; no caller can construct this policy normally.
+        let policy = DeliveryPolicy {
+            settings: DeliverySettings {
+                guard_poll_interval: Duration::MAX,
+                ..DeliverySettings::default()
+            },
+        };
+        let h = History::new(false);
+        let mut live = ready();
+        live.session.as_mut().unwrap().status = SessionStatus::Working;
+        live.dialog_open = Some(true);
+        assert_eq!(
+            next_delivery(h.message(), &live, time(120), &policy),
+            Err(DeliveryPolicyError::TimeOverflow)
+        );
     }
 
     #[test]

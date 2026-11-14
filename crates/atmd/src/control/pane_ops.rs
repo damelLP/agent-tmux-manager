@@ -26,6 +26,7 @@ const END: &str = "ATM-END\t#{pane_id}";
 pub(in crate::control) type Guard = Box<dyn FnOnce(&PaneCapture) -> bool + Send>;
 pub(in crate::control) enum Input {
     Key(PaneKey),
+    LiteralKey(char),
     Paste(String),
 }
 pub(in crate::control) enum Action {
@@ -230,6 +231,19 @@ pub(super) async fn execute(
                         )
                         .await
                 }
+                Input::LiteralKey(key) => {
+                    // tmux parses a bare semicolon as a command separator even
+                    // after --. Verified with a raw receiver on private tmux 3.8.
+                    let encoded = if key == ';' {
+                        "\\;".into()
+                    } else {
+                        key.to_string()
+                    };
+                    client
+                        .raw_command("send-keys", &["-l", "-t", pane.as_str(), "--", &encoded])
+                        .await
+                        .map(|_| ())
+                }
                 Input::Paste(text) => client.paste_text(pane.as_str(), &text).await,
             }
             .map_err(|source| tmux(&pane, "send reserved input", source))?;
@@ -244,7 +258,7 @@ fn check_input(
 ) -> Result<(), ReservationError> {
     let text = match input {
         Input::Paste(text) => Some(text.as_str()),
-        Input::Key(_) => None,
+        Input::Key(_) | Input::LiteralKey(_) => None,
     };
     if text.is_some_and(crate::control::send::unsafe_paste) {
         return Err(ReservationError::UnsafePaste { pane: pane.clone() });

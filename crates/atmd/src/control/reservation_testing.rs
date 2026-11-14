@@ -17,7 +17,7 @@
 //! | inspect, missing pane | successful empty filtered metadata only (1) | script_inspect(None) |
 //! | tag / untag / unguarded keys / paste / kill | filtered metadata; pane-local tag (2), then effect | script_tag_check |
 //! | capture / observe | filtered metadata; single metadata/capture/clients/end command list; pane-local tag (3) | script_capture / script_observe |
-//! | keys_guarded / paste_guarded | same 3 reads as capture, pure check, then effect if approved | script_capture |
+//! | keys_guarded / literal_key_guarded / paste_guarded | same 3 reads as capture, pure check, then effect if approved | script_capture |
 //! | split | no observation reads; SplitWindow, then claim before replying | mock().set_next_pane_id |
 //! | legacy send / spawn_type, unavailable org | ownership: filtered metadata; pane-local tag (2), before input | script_tag_check |
 //!
@@ -31,7 +31,8 @@
 //! Script each operation separately. Scripts are FIFO **within a pane**; other
 //! panes can interleave freely. A missing script, wrong read order/format, or
 //! unsupported raw command returns TmuxError, never a plausible empty answer.
-//! Non-raw effects delegate to mock(); use its calls/errors/unique split IDs,
+//! Non-raw effects and the fixed literal send-keys argv delegate to mock();
+//! literal input is recorded as RawCommand, not SendKeys. Use calls/errors/unique split IDs,
 //! not set_next_raw_output, which cannot script these reserved reads.
 //!
 //! Legacy ownership is the only legacy read this client serves. It cannot serve
@@ -396,6 +397,16 @@ impl TmuxClient for ScriptedTmuxClient {
                     | ("set-option", ["-p", "-u", "-t", _, "@atm-agent"])
             ) {
                 return Ok(output);
+            }
+            if let ("send-keys", ["-l", "-t", pane, "--", key]) = (subcommand, args) {
+                pane_id(pane)?;
+                if *key == "\\;"
+                    || (*key != ";"
+                        && key.len() == 1
+                        && key.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+                {
+                    return Ok(output);
+                }
             }
             self.read(subcommand, args)
         })

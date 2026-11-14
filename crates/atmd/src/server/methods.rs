@@ -24,6 +24,8 @@ pub struct MethodServices {
     pub registry: RegistryHandle,
     /// Supplied at server startup, or injected by tests/in-process clients.
     pub control: Option<crate::control::service::ControlHandle>,
+    /// Named-agent service; None advertises explicitly unavailable operations.
+    pub agents: Option<crate::org::agents::AgentHandle>,
     /// Production resolves this before daemonization; tests can inject a path.
     /// daemon.info displays non-UTF-8 paths lossily; filesystem use stays exact.
     pub state_dir: PathBuf,
@@ -38,6 +40,7 @@ impl MethodServices {
         Self {
             registry,
             control: None,
+            agents: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
             raw: crate::org::RawHandle::default(),
@@ -177,6 +180,12 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     })?;
 
     register_control(&mut router, services.control)?;
+    crate::org::agents::register_agent_methods(
+        &mut router,
+        services.agents.unwrap_or_else(|| {
+            crate::org::agents::AgentHandle::disabled("named-agent operations are not configured")
+        }),
+    )?;
 
     // Add service-backed registrations above this finalization. The factory,
     // not callers, owns the complete capability snapshot used by daemon.info.
@@ -235,7 +244,7 @@ struct TypeParams {
     command: String,
 }
 
-fn control_error(error: crate::control::service::ServiceError) -> MethodError {
+pub(crate) fn control_error(error: crate::control::service::ServiceError) -> MethodError {
     use crate::control::{service::ServiceError, ControlError};
     use std::error::Error;
     let code = match &error {

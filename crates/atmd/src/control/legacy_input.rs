@@ -1,6 +1,8 @@
 //! Legacy input joins the same actor ordering as reserved pane effects.
 //! Parked input yields to reservation waiters on its pane, including later
 //! arrivals. A steady stream of reservations can starve it until its deadline.
+//! Dropping a caller does not cancel admitted parked input: it can still start
+//! within that deadline. Once input starts, finish Enter under tmux's timeout.
 use super::org_mirror::{Mirror, View};
 use super::*;
 use crate::control::reservation::{pane_ops, state::InputGate, PaneId};

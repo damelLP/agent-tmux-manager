@@ -907,7 +907,10 @@ mod tests {
                     | WaitReason::AgentNotReady
                     | WaitReason::OtherDelivery,
                 ..
-            } => live.hold_since = None,
+            } => {
+                live.hold_since = None;
+                live.stale_blocker_since = None;
+            }
             DeliveryStep::Wait { .. } => {
                 live.hold_since.get_or_insert(now);
             }
@@ -2683,6 +2686,38 @@ mod tests {
 
     use proptest::prelude::*;
 
+    // Synthetic executor model: observe only the effective stale editor blocker.
+    fn track_stale_blocker(
+        live: &mut RecipientLiveView,
+        previous: &mut Option<WaitReason>,
+        now: DateTime<Utc>,
+        policy: &DeliveryPolicy,
+    ) {
+        let stale = live.session.as_ref().is_some_and(|row| {
+            row.status != SessionStatus::Idle
+                && now >= deadline(row.last_event_at, policy.settings().stale_after).unwrap()
+        });
+        let blocker = if stale
+            && live.pane == PaneLiveness::Alive
+            && live.agent_status == AgentStatus::Ready
+            && !live.owner_focused
+            && !live.other_delivery_in_flight
+            && live.copy_mode == Some(false)
+        {
+            match (live.dialog_open, live.input_line) {
+                (Some(true), _) => Some(WaitReason::DialogOpen),
+                (Some(false), InputLine::NonEmpty) => Some(WaitReason::InputNotEmpty),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if blocker != *previous || live.stale_blocker_since.is_none() {
+            live.stale_blocker_since = blocker.map(|_| now);
+        }
+        *previous = blocker;
+    }
+
     #[test]
     fn no_two_pastes_without_recorded_failure_and_none_after_confirmation() {
         use proptest::test_runner::{Config, RngSeed, TestRunner};
@@ -2697,6 +2732,7 @@ mod tests {
         let evidence_vetoes = Cell::new(0usize);
         let restart_vetoes = Cell::new(0usize);
         let last_paste_vetoes = Cell::new(0usize);
+        let short_stale_blocks = Cell::new(0usize);
         let mut runner = TestRunner::new(Config {
             cases: 512,
             rng_seed: RngSeed::Fixed(0x9a02),
@@ -2709,10 +2745,47 @@ mod tests {
             let policy = DeliveryPolicy::default();
             let mut h = History::new(false);
             let mut live = ready();
-            prop_assert_eq!(h.step(&live, 0), DeliveryStep::PasteNow { attempt: 1 });
-            h.attempt(1, 0);
-            live.last_paste_at = Some(time(0));
-            let mut now = 0;
+            let mut previous_stale_blocker = None;
+            // Random ordinary ticks almost always leave the busy row before it
+            // becomes stale. Generate a real stale-editor phase in every history,
+            // varying draft/dialog and poll count without changing the retry ticks.
+            let (_, flags) = ticks.first().unwrap();
+            let dialog = flags[2] % 2 == 0;
+            let polls = 4 + flags[3] % 5;
+            live.session.as_mut().unwrap().status = SessionStatus::Working;
+            live.session.as_mut().unwrap().last_event_at = time(-120);
+            live.dialog_open = Some(dialog);
+            live.input_line = InputLine::NonEmpty;
+            live.hold_since = None;
+            for poll in 0..polls {
+                let at = time(0) + TimeDelta::milliseconds(i64::from(poll) * 250);
+                track_stale_blocker(&mut live, &mut previous_stale_blocker, at, &policy);
+                let step = next_delivery(h.message(), &live, at, &policy).unwrap();
+                if poll < 3 {
+                    prop_assert!(matches!(step, DeliveryStep::Wait { .. }), "before short confirmation");
+                } else {
+                    prop_assert_eq!(&step, &DeliveryStep::Blocked {
+                        reason: if dialog { FailureReason::DialogOpen } else { FailureReason::DraftPresent },
+                    });
+                    let without_clock = RecipientLiveView { stale_blocker_since: None, ..live.clone() };
+                    prop_assert!(matches!(next_delivery(h.message(), &without_clock, at, &policy).unwrap(), DeliveryStep::Wait { .. }), "short clock must be decisive");
+                    short_stale_blocks.set(short_stale_blocks.get() + 1);
+                }
+                track_hold(&mut live, &step, at);
+            }
+            // Freshly empty at two seconds, then a full idle stability window.
+            live.dialog_open = Some(false);
+            live.input_line = InputLine::EmptySince(time(2));
+            live.session.as_mut().unwrap().status = SessionStatus::Idle;
+            live.session.as_mut().unwrap().status_since = time(2);
+            track_stale_blocker(&mut live, &mut previous_stale_blocker, time(2), &policy);
+            prop_assert!(matches!(h.step(&live, 2), DeliveryStep::Wait { reason: WaitReason::IdleStabilizing, .. }), "cleared editor must stabilize");
+            let step = h.step(&live, 12);
+            prop_assert_eq!(&step, &DeliveryStep::PasteNow { attempt: 1 });
+            track_hold(&mut live, &step, time(12));
+            h.attempt(1, 12);
+            live.last_paste_at = Some(time(12));
+            let mut now = 12;
             let mut failure_since_paste = false;
             let mut confirmed = false;
             let mut landed_any = false; // oracle survives restart, executor latch does not
@@ -2796,7 +2869,12 @@ mod tests {
                 } else if action < 10 {
                     live.confirmation = Some(receipt());
                 }
+                track_stale_blocker(&mut live, &mut previous_stale_blocker, time(now), &policy);
                 let step = h.step(&live, now);
+                if matches!(step, DeliveryStep::Blocked { reason: FailureReason::DraftPresent | FailureReason::DialogOpen })
+                    && matches!(h.step(&RecipientLiveView { stale_blocker_since: None, ..live.clone() }, now), DeliveryStep::Wait { .. }) {
+                    short_stale_blocks.set(short_stale_blocks.get() + 1);
+                }
                 // Count only counterfactuals where removing this one veto
                 // would actually paste; merely generating the flag is not coverage.
                 if !matches!(step, DeliveryStep::PasteNow { .. }) {
@@ -2863,6 +2941,11 @@ mod tests {
             "retry assertions must run in at least 25% of histories"
         );
         assert!(four.get() > 0 && restarts.get() > 0 && evidence.get() > 0 && receipts.get() > 0);
+        println!("short stale-block coverage: {}", short_stale_blocks.get());
+        assert!(
+            short_stale_blocks.get() >= 100,
+            "generated histories must exercise short stale-editor blocks"
+        );
         println!(
             "counterfactual veto coverage: evidence={}, restart={}, last_paste={}",
             evidence_vetoes.get(),

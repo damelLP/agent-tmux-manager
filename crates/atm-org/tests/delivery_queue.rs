@@ -434,6 +434,7 @@ fn two_messages_never_overlap_unconfirmed_attempts() {
     let receipts = Cell::new(0usize);
     let restarts = Cell::new(0usize);
     let evidence = Cell::new(0usize);
+    let pending_retry_vetoes = Cell::new(0usize);
     let mut runner = TestRunner::new(Config {
         cases: 256,
         rng_seed: RngSeed::Fixed(0x9a0202),
@@ -513,7 +514,21 @@ fn two_messages_never_overlap_unconfirmed_attempts() {
                     }
                     live.probably_landed = landed[i];
                     live.last_attempt_before_start = restarted[i];
-                    match q.step(id, &live, now, &policy) {
+                    let step = q.step(id, &live, now, &policy);
+                    if id == b
+                        && q.message(a).status == DeliveryStatus::Queued
+                        && q.message(a).last_attempt.is_some()
+                        && matches!(
+                            step,
+                            DeliveryStep::Wait {
+                                reason: WaitReason::OtherDelivery,
+                                ..
+                            }
+                        )
+                    {
+                        pending_retry_vetoes.set(pending_retry_vetoes.get() + 1);
+                    }
+                    match step {
                         DeliveryStep::PasteNow { attempt } => {
                             prop_assert!(
                                 owner.is_none() || owner == Some(id),
@@ -571,6 +586,14 @@ fn two_messages_never_overlap_unconfirmed_attempts() {
             Ok(())
         })
         .unwrap();
+    println!(
+        "pending-retry veto coverage: {}",
+        pending_retry_vetoes.get()
+    );
+    assert!(
+        pending_retry_vetoes.get() >= 100,
+        "generated histories must exercise B waiting for A's queued retry"
+    );
     assert!(retried.get() > 0 && receipts.get() > 0 && restarts.get() > 0 && evidence.get() > 0);
     println!(
         "two-message coverage: retries={}, receipts={}, restarts={}, evidence={}",

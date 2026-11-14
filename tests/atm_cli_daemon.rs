@@ -160,6 +160,25 @@ esac
     control_support::assert_owned(guard.pid(), dir.path());
     drop(guard);
     assert!(!dir.path().join("atmd.sock").exists());
+    // Exercise production server -> real actor -> real org wiring, not an
+    // injected control handle. Shutdown is the audit-drain barrier.
+    let events = atmd::eventlog::read_from(
+        &dir.path().join("events"),
+        atmd::eventlog::Stream::Events,
+        0,
+    )
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let kinds: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind.starts_with("control."))
+        .map(|e| e.kind.as_str())
+        .collect();
+    if args.first() == Some(&"send") {
+        assert_eq!(kinds, ["control.sent"]);
+    } else {
+        assert_eq!(kinds, ["control.spawned", "control.sent"]);
+    }
 }
 
 #[test]
@@ -206,13 +225,7 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
     let server =
         DaemonServer::with_services(dir.path().join("atmd.sock"), services, cancel.clone());
     let server = tokio::spawn(async move { server.run().await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !dir.path().join("atmd.sock").exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
+    control_support::wait_for_socket(&dir.path().join("atmd.sock")).await;
     let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
     mock.set_next_raw_output("0 1");
     let out = atm(exe, dir.path(), &["send", "abc", "hello;"]);

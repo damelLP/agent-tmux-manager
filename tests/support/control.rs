@@ -1,7 +1,53 @@
 //! Private real daemon for control CLI tests. Never inherits live sockets or tmux.
 #![allow(dead_code)]
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+
+/// Register before probing so binding between probe and wait cannot be missed.
+/// Readiness means an accepting socket, not merely a filesystem entry.
+pub async fn wait_for_socket(socket: &Path) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let parent =
+            std::ffi::CString::new(socket.parent().unwrap().as_os_str().as_bytes()).unwrap();
+        assert!(
+            unsafe {
+                libc::inotify_add_watch(
+                    fd.as_raw_fd(),
+                    parent.as_ptr(),
+                    libc::IN_CREATE | libc::IN_MOVED_TO,
+                )
+            } >= 0
+        );
+        let fd = tokio::io::unix::AsyncFd::new(fd).unwrap();
+        loop {
+            if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                break;
+            }
+            let mut ready = fd.readable().await.unwrap();
+            let _ = ready.try_io(|fd| {
+                let mut events = [0_u8; 4096];
+                let n =
+                    unsafe { libc::read(fd.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    })
+    .await
+    .expect("private daemon did not accept a connection");
+}
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -26,7 +72,8 @@ pub struct Daemon {
 impl Daemon {
     pub fn start(dir: &Path, path: &Path) -> Self {
         let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_atmd"));
+        let mut command =
+            Command::new(option_env!("CARGO_BIN_EXE_atmd").expect("root test binary"));
         isolated(&mut command, dir)
             .env("PATH", path)
             .args(["start"])
@@ -74,6 +121,16 @@ impl Drop for Daemon {
     }
 }
 
+#[test]
+fn autostart_cleanup_does_not_panic_on_invalid_or_unowned_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("state/atm")).unwrap();
+    for pid in ["invalid".to_string(), std::process::id().to_string()] {
+        std::fs::write(dir.path().join("state/atm/atmd.pid"), pid).unwrap();
+        drop(Autostarted(dir.path().to_owned()));
+    }
+}
+
 pub struct Autostarted(pub PathBuf);
 
 impl Autostarted {
@@ -91,32 +148,77 @@ impl Drop for Autostarted {
         let Ok(contents) = std::fs::read_to_string(self.0.join("state/atm/atmd.pid")) else {
             return;
         };
-        let pid: u32 = contents.trim().parse().unwrap();
-        if !Path::new(&format!("/proc/{pid}/exe")).exists() {
+        let Ok(pid) = contents.trim().parse::<u32>() else {
+            eprintln!("skipping daemon cleanup: invalid pid");
+            return;
+        };
+        if !owned(pid, &self.0) {
+            eprintln!("skipping daemon cleanup: pid {pid} is gone or not ours");
             return;
         }
-        assert_owned(pid, &self.0);
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Path::new(&format!("/proc/{pid}/exe")).exists() {
-            assert!(
-                Instant::now() < deadline,
-                "owned daemon failed to stop: {pid}"
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        if fd < 0 {
+            eprintln!(
+                "skipping daemon cleanup: pidfd_open: {}",
+                std::io::Error::last_os_error()
             );
-            std::thread::sleep(Duration::from_millis(10));
+            return;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if !owned(pid, &self.0) {
+            return;
+        }
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                libc::SIGTERM,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+        let mut ready = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut ready, 1, 30_000) } != 1 {
+            eprintln!("daemon {pid} did not stop; rechecking ownership before SIGKILL");
+            if owned(pid, &self.0) {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                if unsafe { libc::poll(&mut ready, 1, 30_000) } != 1 {
+                    eprintln!("daemon {pid} still not reaped after SIGKILL");
+                }
+            }
         }
     }
 }
 
 pub fn assert_owned(pid: u32, dir: &Path) {
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
-    assert_eq!(
-        exe,
-        std::fs::canonicalize(env!("CARGO_BIN_EXE_atmd")).unwrap()
-    );
-    let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(owned(pid, dir), "daemon {pid} is not owned by this test");
+}
+
+fn owned(pid: u32, dir: &Path) -> bool {
+    let Some(binary) = option_env!("CARGO_BIN_EXE_atmd") else {
+        return false;
+    };
+    let Ok(expected) = std::fs::canonicalize(binary) else {
+        return false;
+    };
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
     let socket = format!("ATM_SOCKET={}", dir.join("atmd.sock").display());
-    assert!(env.split(|b| *b == 0).any(|v| v == socket.as_bytes()));
+    exe == expected && env.split(|b| *b == 0).any(|v| v == socket.as_bytes())
 }

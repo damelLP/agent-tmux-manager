@@ -237,34 +237,42 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn queue_admission_and_stalled_action_share_a_bounded_budget() {
-        let (sender, _receiver) = mpsc::channel(CAPACITY);
-        for _ in 0..CAPACITY {
-            let (reply, _) = oneshot::channel();
-            sender
-                .try_send(Pending {
-                    deadline: Instant::now() + ACTION_TIMEOUT,
-                    caller: None,
-                    request: Request::Type {
-                        pane: "%7".into(),
-                        command: "queued".into(),
-                        reply,
-                    },
-                })
-                .ok()
-                .unwrap();
-        }
-        let handle = ControlHandle {
-            sender,
-            caller: None,
-        };
-        assert!(matches!(
-            handle.send("%7".into(), "blocked".into()).await,
-            Err(ServiceError::Timeout)
-        ));
-        assert!(matches!(
-            outcome::<()>(Instant::now() + ACTION_TIMEOUT, std::future::pending()).await,
-            Err(ServiceError::Timeout)
-        ));
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let (sender, _receiver) = mpsc::channel(CAPACITY);
+            for _ in 0..CAPACITY {
+                let (reply, _) = oneshot::channel();
+                sender
+                    .try_send(Pending {
+                        deadline: Instant::now() + ACTION_TIMEOUT,
+                        caller: None,
+                        request: Request::Type {
+                            pane: "%7".into(),
+                            command: "queued".into(),
+                            reply,
+                        },
+                    })
+                    .ok()
+                    .unwrap();
+            }
+            let handle = ControlHandle {
+                sender,
+                caller: None,
+            };
+            let start = Instant::now();
+            assert!(matches!(
+                handle.send("%7".into(), "blocked".into()).await,
+                Err(ServiceError::Timeout)
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(30));
+            let start = Instant::now();
+            assert!(matches!(
+                outcome::<()>(Instant::now() + ACTION_TIMEOUT, std::future::pending()).await,
+                Err(ServiceError::Timeout)
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(30));
+        })
+        .await
+        .expect("admission and execution must have bounded budgets");
     }
 }
 

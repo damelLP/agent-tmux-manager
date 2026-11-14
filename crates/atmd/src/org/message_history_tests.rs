@@ -1685,3 +1685,67 @@ async fn failed_record_leaves_the_fold_cursor_unchanged() {
     history.record(applied(2, None), at(0)).unwrap();
     wait.await.unwrap();
 }
+
+#[test]
+fn veto_sees_every_other_message_in_flight() {
+    // Two attempted messages for one recipient: each is the other's veto,
+    // including for the one that is first in the queue.
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    let second = MessageId::new(f.seq);
+    f.attempt(1_000);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: second,
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        2_000,
+    );
+    for (id, other) in [(f.id, second), (second, f.id)] {
+        let view = f.history.snapshot(id, at(3_000)).unwrap();
+        assert!(view.live.other_delivery_in_flight, "{id}");
+        assert_eq!(view.blocked_by, Some(other));
+    }
+    // A third, unattempted one waits behind the oldest of them.
+    f.apply(OrgEvent::MessageSent(content(agent())), 3_000);
+    let third = f
+        .history
+        .snapshot(MessageId::new(f.seq), at(3_000))
+        .unwrap();
+    assert!(third.live.other_delivery_in_flight);
+    assert_eq!(third.blocked_by, Some(f.id));
+}
+
+#[test]
+fn stale_evidence_copy_before_the_new_arm_does_not_pin_the_old_latch() {
+    let mut f = Fixture::new(0);
+    let scope = f.attempt(0);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        0,
+    );
+    evidence_latch(&mut f, 1_000);
+    fail_for_retry(&mut f, 2_000);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: f.id,
+            attempt: 2,
+            pane: "%1".into(),
+        },
+        5_000,
+    );
+    // The evidence store keeps its latch until it is armed again, so a copy
+    // taken now still says true. It is the first attempt's latch.
+    evidence_latch(&mut f, 5_000);
+    assert!(f.snapshot(5_000).live.probably_landed);
+    let mut new_scope = scope;
+    new_scope.attempt_seq = f.seq;
+    f.record(HistoryUpdate::Armed { scope: new_scope }, 5_000);
+    assert!(!f.snapshot(5_000).live.probably_landed);
+    // A latch copied after the arm is the new attempt's.
+    evidence_latch(&mut f, 6_000);
+    assert!(f.snapshot(6_000).live.probably_landed);
+}

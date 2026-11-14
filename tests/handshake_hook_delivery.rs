@@ -12,7 +12,7 @@ fn hook_event_survives_failed_handshake_reply() {
         std::fs::create_dir(root.path().join(dir)).unwrap();
     }
     let output = Command::new("timeout")
-        .args(["--kill-after=10s", "180s", "python3", "-u", "-c", RIG])
+        .args(["--kill-after=10s", "180s", "python3", "-I", "-u", "-c", RIG])
         .arg(root.path())
         .arg(env!("CARGO_BIN_EXE_atmd"))
         .arg(concat!(
@@ -57,7 +57,7 @@ import sys
 import threading
 
 root, binary, hook = map(Path, sys.argv[1:])
-for tool in ('socat', 'jq', 'tmux'):
+for tool in ('socat', 'jq'):
     assert shutil.which(tool), f'handshake regression requires {tool} on PATH'
 assert Path('/bin/bash').is_file(), 'handshake regression requires /bin/bash'
 address = os.environ['ATM_SOCKET']
@@ -78,25 +78,35 @@ def collect(stream):
         lines.put(line)
     lines.put(None)
 
-def verify(proc, executable):
+identities = {}
+def executable_identity(proc):
+    stat = Path(f'/proc/{proc.pid}/exe').stat()
+    return stat.st_dev, stat.st_ino
+
+def verify(proc):
     assert proc.poll() is None, f'child {proc.pid} exited early: {proc.returncode}'
-    assert os.path.samefile(f'/proc/{proc.pid}/exe', executable)
+    assert executable_identity(proc) == identities[proc.pid]
     environ = Path(f'/proc/{proc.pid}/environ').read_bytes().split(b'\0')
     assert f'ATM_SOCKET={address}'.encode() in environ
 
-def send_signal(proc, executable, sig):
-    verify(proc, executable)
-    os.kill(proc.pid, sig)
+def send_signal(proc, sig, group=False):
+    verify(proc)
+    if group:
+        assert os.getpgid(proc.pid) == proc.pid
+        os.killpg(proc.pid, sig)
+    else:
+        os.kill(proc.pid, sig)
 
-def stop_child(proc, executable):
+def stop_child(proc, group=False):
     if proc is None or proc.poll() is not None:
         return
-    send_signal(proc, executable, signal.SIGCONT)
-    send_signal(proc, executable, signal.SIGTERM)
+    # In particular, a stopped daemon must resume before termination.
+    send_signal(proc, signal.SIGCONT, group)
+    send_signal(proc, signal.SIGTERM, group)
     try:
         proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
-        send_signal(proc, executable, signal.SIGKILL)
+        send_signal(proc, signal.SIGKILL, group)
         proc.wait(timeout=30)
 
 def connect():
@@ -120,6 +130,7 @@ log_thread = None
 try:
     daemon = subprocess.Popen([str(binary), 'start'], start_new_session=True,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    identities[daemon.pid] = executable_identity(daemon)
     log_thread = threading.Thread(target=collect, args=(daemon.stdout,), daemon=True)
     log_thread.start()
     while True:
@@ -154,9 +165,11 @@ exit "$rc"
     parent = subprocess.Popen([str(launcher), '-c', script, '--', str(hook), str(payload)],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, start_new_session=True)
-    assert parent.stdout.readline().strip() == f'READY {parent.pid}'
+    identities[parent.pid] = executable_identity(parent)
+    ready = parent.stdout.readline().strip()
+    assert ready == f'READY {parent.pid}'
     assert Path(f'/proc/{parent.pid}/comm').read_text().strip() == 'claude'
-    send_signal(daemon, binary, signal.SIGSTOP)
+    send_signal(daemon, signal.SIGSTOP)
     pid, status = os.waitpid(daemon.pid, os.WUNTRACED)
     assert pid == daemon.pid and os.WIFSTOPPED(status)
     assert os.WSTOPSIG(status) == signal.SIGSTOP
@@ -166,15 +179,27 @@ exit "$rc"
     parent.stdin.flush()
     # This marker is emitted only AFTER the unchanged hook exits. Any hook
     # stdout/stderr would appear before it and fail the equality assertion.
-    assert parent.stdout.readline().strip() == 'HOOK_EXIT 0', 'hook must exit silently with status 0'
+    hook_exit = parent.stdout.readline().strip()
+    assert hook_exit == 'HOOK_EXIT 0', 'hook must exit silently with status 0'
     print('real atm-hook exited while daemon remained stopped')
-    send_signal(daemon, binary, signal.SIGCONT)
+    send_signal(daemon, signal.SIGCONT)
     pid, status = os.waitpid(daemon.pid, os.WCONTINUED)
     assert pid == daemon.pid and os.WIFCONTINUED(status)
     print('daemon SIGCONT confirmed by waitpid')
 
     while True:
-        event = receive(reader)
+        try:
+            event = receive(reader)
+        except TimeoutError as error:
+            # The observer is connection 0; any later connection before the
+            # snapshot query is the hook. Processing logs carry its session id.
+            hook_connected = sum('New client connected' in line for line in logs) > 1
+            hook_processed = any('Processing hook event' in line and session_id in line for line in logs)
+            if not hook_connected and not hook_processed:
+                cause = 'the hook did not deliver within its 0.1 s transport timeout (load?), not a daemon drop'
+            else:
+                cause = 'the daemon dropped it'
+            raise AssertionError(cause + '\n' + '\n'.join(logs)) from error
         if event['type'] == 'session_updated' and event['session']['id'] == session_id:
             row = event['session']
             assert row['harness'] == 'claude', row
@@ -198,7 +223,7 @@ exit "$rc"
     assert parent.wait(timeout=30) == 0
     reader.close()
     subscriber.close()
-    send_signal(daemon, binary, signal.SIGTERM)
+    send_signal(daemon, signal.SIGTERM)
     assert daemon.wait(timeout=30) == 0
     log_thread.join(timeout=30)
     assert not log_thread.is_alive()
@@ -210,9 +235,16 @@ exit "$rc"
                for line in logs), 'hook did not carry the stand-in pid'
     print('verified private daemon and stand-in reaped')
 finally:
-    stop_child(parent, '/bin/bash')
-    stop_child(daemon, binary)
+    cleanup_errors = []
+    # An identity/cleanup failure for one child must not strand the other.
+    for child, group in ((parent, True), (daemon, False)):
+        try:
+            stop_child(child, group)
+        except Exception as error:
+            cleanup_errors.append(f'child {child.pid}: {error}')
     if log_thread:
         log_thread.join(timeout=30)
     print('daemon log:\n' + '\n'.join(logs))
+    if cleanup_errors:
+        raise RuntimeError('cleanup failed: ' + '; '.join(cleanup_errors))
 "#;

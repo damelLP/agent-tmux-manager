@@ -25,8 +25,10 @@ Required hook/skill/extension assets are checked at the ref **before** building;
 older refs missing any of them are refused with the missing source path.
 `--debug` selects debug instead. One kit-owned target directory is reused under
 the kit lock, never a repository worktree's target. The real toolchain Cargo is
-used with installed user binaries excluded from build PATH. The detached source
-worktree is removed afterward. Build commands have a 30-minute hang guard.
+used with installed user binaries excluded from build PATH. Git ref/asset and
+worktree commands, plus build children, receive no inherited `GIT_*` variables:
+hook-provided repository/index overrides cannot redirect them to another repo.
+The detached source worktree is removed afterward. Build commands have a 30-minute hang guard.
 Installs are immutable SHA/profile-named binary pairs, published atomically;
 reinstalling an existing ID is refused. The manifest records hashes/toolchain.
 

@@ -37,6 +37,11 @@ def run(args, env=None, cwd=None, timeout=30):
                           capture_output=True, text=True, timeout=timeout).stdout.strip()
 
 
+def git_env(env):
+    """A cwd cannot override Git's inherited repository/index/config selectors."""
+    return {k: v for k, v in env.items() if not k.startswith('GIT_')}
+
+
 def clean_env():
     return {k: v for k, v in os.environ.items() if k not in ('TMUX', 'TMUX_PANE')}
 
@@ -129,7 +134,7 @@ def asset_manifest(repo, sha):
     for source in set(pairs.values()):
         try:
             content = subprocess.check_output(['git', 'show', sha + ':' + source], cwd=repo,
-                                              stderr=subprocess.PIPE, timeout=30)
+                                              env=git_env(os.environ), stderr=subprocess.PIPE, timeout=30)
         except subprocess.CalledProcessError as error:
             raise Refused(f'missing required asset at ref {sha}: {source}') from error
         hashes[source] = hashlib.sha256(content).hexdigest()
@@ -198,7 +203,9 @@ class Kit:
 
     def install(self, args):
         repo = Path(__file__).resolve().parent.parent
-        sha = run(['git', 'rev-parse', '--verify', '--end-of-options', args.ref + '^{commit}'], cwd=repo)
+        git_environment = git_env(os.environ)
+        sha = run(['git', 'rev-parse', '--verify', '--end-of-options', args.ref + '^{commit}'],
+                  env=git_environment, cwd=repo)
         require(re.fullmatch('[0-9a-f]{40}', sha) is not None, 'not a commit SHA')
         profile = 'prebuilt' if args.prebuilt else 'debug' if args.debug else 'release'
         name = sha + '-' + profile
@@ -214,14 +221,14 @@ class Kit:
                 binaries = Path(args.prebuilt).resolve(strict=True)
             else:
                 cargo = Path(run(['rustup', 'which', 'cargo'])).resolve(strict=True)
-                env = clean_env()
+                env = git_env(clean_env())
                 env['PATH'] = str(cargo.parent) + ':/usr/local/bin:/usr/bin:/bin'
                 target = self.build / 'target'
                 target.mkdir(mode=0o700, exist_ok=True)
                 private_dir(target)
                 env['CARGO_TARGET_DIR'] = str(target)
                 added = True  # git may register the worktree before timeout/interrupt
-                run(['git', 'worktree', 'add', '--detach', worktree, sha], cwd=repo)
+                run(['git', 'worktree', 'add', '--detach', worktree, sha], env=git_environment, cwd=repo)
                 toolchain = run([cargo, '--version'], env=env)
                 command = [cargo, 'build', '--locked', '--bin', 'atm', '--bin', 'atmd']
                 if not args.debug:
@@ -248,15 +255,15 @@ class Kit:
             try:
                 if added:
                     try:
-                        run(['git', 'worktree', 'remove', '--force', worktree], cwd=repo)
+                        run(['git', 'worktree', 'remove', '--force', worktree], env=git_environment, cwd=repo)
                     except (OSError, subprocess.SubprocessError):
                         # Remove only our unique staging tree, then deregister it
                         # if add completed. Never prune another worktree's records.
                         if worktree.exists():
                             shutil.rmtree(worktree)
-                        registered = run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
+                        registered = run(['git', 'worktree', 'list', '--porcelain'], env=git_environment, cwd=repo)
                         if 'worktree ' + str(worktree) in registered.splitlines():
-                            run(['git', 'worktree', 'remove', '--force', worktree], cwd=repo)
+                            run(['git', 'worktree', 'remove', '--force', worktree], env=git_environment, cwd=repo)
             except (OSError, subprocess.SubprocessError) as error:
                 if original_error is None:
                     raise

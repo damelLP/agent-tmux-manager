@@ -12,6 +12,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+from atm_candidate import git_env
+
 SCRIPT = Path(__file__).with_name('atm-candidate')
 
 
@@ -65,30 +67,101 @@ class CandidateKit(unittest.TestCase):
             self.assertEqual(out.returncode == 0, ok, out.stdout + out.stderr)
         return out
 
+    def git(self, repo, *args):
+        return subprocess.check_output(
+            ['git', '-C', str(repo), '-c', 'user.name=Candidate kit fixture',
+             '-c', 'user.email=candidate-kit@example.invalid', *args],
+            env=git_env(self.env), text=True, timeout=30).strip()
+
+    def init_repo(self, repo):
+        repo.mkdir()
+        # Bootstrap is explicitly pinned; rev-parse needs an initialized repo.
+        self.git(repo, '--git-dir', str(repo / '.git'), '--work-tree', str(repo), 'init', '-q')
+        git_dir = Path(self.git(repo, 'rev-parse', '--absolute-git-dir'))
+        self.assertTrue(git_dir.is_relative_to(self.root))
+        self.assertEqual(git_dir, repo / '.git')  # before staging or committing any files
+
     def fixture_repo(self):
         import shutil
         repo = self.root / 'repo'
-        repo.mkdir()
+        self.init_repo(repo)
         source = SCRIPT.parent.parent
         for relative in ('scripts', 'crates/atm/scripts', 'crates/atm/assets/pi-atm',
                          'crates/atm/assets/atm-skills'):
             shutil.copytree(source / relative, repo / relative)
-        def git(*args):
-            return subprocess.check_output(['git', '-C', str(repo), *args],
-                                           env=self.env, text=True, timeout=30).strip()
-        git('init', '-q')
-        # Synthetic fixture identity: CI has no configured commit author.
-        # This config belongs only to the disposable repository, never the checkout.
-        git('config', 'user.name', 'Candidate kit fixture')
-        git('config', 'user.email', 'candidate-kit@example.invalid')
-        git('add', '.')
-        git('commit', '-qm', 'test: first fixture revision')
-        first = git('rev-parse', 'HEAD')
+        self.git(repo, 'add', '.')
+        self.git(repo, 'commit', '-qm', 'test: first fixture revision')
+        first = self.git(repo, 'rev-parse', 'HEAD')
         (repo / 'revision').write_text('second')
-        git('add', '.')
-        git('commit', '-qm', 'test: second fixture revision')
+        self.git(repo, 'add', '.')
+        self.git(repo, 'commit', '-qm', 'test: second fixture revision')
         self.script = repo / 'scripts/atm-candidate'
         return repo, first
+
+    def decoy_repo(self):
+        repo = self.root / 'decoy-repo'
+        self.init_repo(repo)
+        (repo / 'sentinel').write_text('committed decoy')
+        self.git(repo, 'add', '.')
+        self.git(repo, 'commit', '-qm', 'test: decoy revision')
+        (repo / 'sentinel').write_text('staged decoy')
+        self.git(repo, 'add', '.')
+        return repo
+
+    def repository_snapshot(self, repo):
+        git_dir = repo / '.git'
+        paths = [git_dir / name for name in ('HEAD', 'index', 'config', 'packed-refs')]
+        paths.extend((git_dir / 'refs').rglob('*'))
+        return {str(path.relative_to(git_dir)): path.read_bytes() for path in paths if path.is_file()}
+
+    # Strip every Git override, including future ones, without changing routing.
+    def test_git_environment_removes_all_git_overrides(self):
+        import atm_candidate
+        env = dict(ATM_SOCKET='private.sock', PATH='/usr/bin',
+                   GIT_DIR='foreign', GIT_WORK_TREE='foreign', GIT_INDEX_FILE='foreign',
+                   GIT_COMMON_DIR='foreign', GIT_OBJECT_DIRECTORY='foreign',
+                   GIT_ALTERNATE_OBJECT_DIRECTORIES='foreign', GIT_FUTURE_OVERRIDE='foreign')
+        self.assertEqual(atm_candidate.git_env(env), {'ATM_SOCKET': 'private.sock', 'PATH': '/usr/bin'})
+        self.assertIn('GIT_DIR', env, 'do not mutate the caller environment')
+
+    # Hook Git overrides must not redirect fixture commits/config/index to a decoy.
+    def test_fixture_ignores_inherited_git_repository(self):
+        from unittest.mock import patch
+        decoy = self.decoy_repo()
+        before = self.repository_snapshot(decoy)
+        original = self.env.copy()
+        injected = {'GIT_DIR': str(decoy / '.git'), 'GIT_INDEX_FILE': str(decoy / '.git/index')}
+        try:
+            self.env.update(injected)
+            with patch.dict(os.environ, injected):
+                repo, _ = self.fixture_repo()
+            self.assertEqual(self.repository_snapshot(decoy), before)
+            self.assertTrue((repo / '.git/HEAD').is_file())
+            self.assertNotIn(b'[user]', (repo / '.git/config').read_bytes())
+        finally:
+            self.env = original
+
+    # The kit's ref/assets/worktree operations must ignore hook Git overrides too.
+    def test_kit_git_ignores_inherited_repository(self):
+        decoy = self.decoy_repo()
+        before = self.repository_snapshot(decoy)
+        repo, _ = self.fixture_repo()
+        env = dict(self.env, GIT_DIR=str(decoy / '.git'), GIT_WORK_TREE=str(decoy),
+                   GIT_INDEX_FILE=str(decoy / '.git/index'), GIT_COMMON_DIR=str(decoy / '.git'),
+                   GIT_OBJECT_DIRECTORY=str(decoy / '.git/objects'),
+                   GIT_ALTERNATE_OBJECT_DIRECTORIES=str(decoy / '.git/objects'))
+        out = self.call('install', 'HEAD', '--prebuilt', self.bin, env=env)
+        self.assertTrue((repo / '.git/HEAD').is_file())
+        self.assertEqual(self.repository_snapshot(decoy), before)
+        tools_env = self.build_fault_tools('remove-error')
+        tools_env.update({k: v for k, v in env.items() if k.startswith('GIT_')})
+        failed = self.call('install', 'HEAD', env=tools_env, ok=False)
+        self.assertIn('returned non-zero exit status 17.', failed.stderr)
+        self.assertEqual(self.repository_snapshot(decoy), before)
+        self.assertEqual(list((self.root / 'build').glob('source-*')), [])
+        self.assertEqual(list((self.root / 'kit/installs').glob('.install-*')), [])
+        self.assertEqual(out.stdout.strip(), self.git(repo, 'rev-parse', 'HEAD') + '-prebuilt')
+        self.assertEqual(self.git(repo, 'worktree', 'list', '--porcelain').count('worktree '), 1)
 
     def install(self, ref='HEAD'):
         return self.call('install', ref, '--prebuilt', self.bin).stdout.strip()
@@ -325,7 +398,8 @@ class CandidateKit(unittest.TestCase):
         tools = self.root / 'tools'
         tools.mkdir()
         cargo = tools / 'cargo'
-        cargo.write_text('#!/bin/sh\nif [ "$1" = --version ]; then echo test-cargo; exit; fi\n'
+        cargo.write_text('#!/bin/sh\nif env | grep -q "^GIT_"; then exit 23; fi\n'
+                         'if [ "$1" = --version ]; then echo test-cargo; exit; fi\n'
                          'touch "' + str(self.root / 'build-attempt') + '"\nexit 17\n')
         rustup = tools / 'rustup'
         rustup.write_text('#!/bin/sh\necho "' + str(cargo) + '"\n')
@@ -350,8 +424,7 @@ class CandidateKit(unittest.TestCase):
         self.assertIn('candidate:', out.stderr)
         self.assertEqual(list((self.root / 'build').glob('source-*')), [])
         self.assertEqual(list((self.root / 'kit/installs').glob('.install-*')), [])
-        trees = subprocess.check_output(['git', '-C', str(repo), 'worktree', 'list', '--porcelain'],
-                                        text=True, timeout=30)
+        trees = self.git(repo, 'worktree', 'list', '--porcelain')
         self.assertEqual(trees.count('worktree '), 1)
 
     # A cleanup error must not mask the build error or strand staging/worktrees.
@@ -363,17 +436,15 @@ class CandidateKit(unittest.TestCase):
         self.assertTrue((self.root / 'build-attempt').exists())
         self.assertEqual(list((self.root / 'build').glob('source-*')), [])
         self.assertEqual(list((self.root / 'kit/installs').glob('.install-*')), [])
-        trees = subprocess.check_output(['git', '-C', str(repo), 'worktree', 'list', '--porcelain'],
-                                        text=True, timeout=30)
+        trees = self.git(repo, 'worktree', 'list', '--porcelain')
         self.assertEqual(trees.count('worktree '), 1)
 
     # Missing assets must refuse before even attempting an expensive source build.
     def test_missing_ref_assets_refuse_before_build(self):
         repo, _ = self.fixture_repo()
         asset = 'crates/atm/scripts/atm-hook'
-        subprocess.run(['git', '-C', str(repo), 'rm', '-q', asset], check=True, timeout=30)
-        subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'test: ref without hook'],
-                       env=self.env, check=True, timeout=30)
+        self.git(repo, 'rm', '-q', asset)
+        self.git(repo, 'commit', '-qm', 'test: ref without hook')
         out = self.call('install', 'HEAD', env=self.build_fault_tools('build-error'), ok=False)
         self.assertIn('missing required asset at ref', out.stderr)
         self.assertIn(asset, out.stderr)

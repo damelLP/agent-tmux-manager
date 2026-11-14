@@ -116,7 +116,7 @@ impl Rig {
         let out = stand_in::bounded::run(self.atmd(side, state).arg("status"));
         assert_eq!(out.status.success(), pid.is_some(), "{out:?}");
         if let Some(pid) = pid {
-            assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("PID {pid}")));
+            assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("(PID {pid})")));
         }
     }
 
@@ -132,20 +132,26 @@ impl Rig {
                 == Some(Path::new(env!("CARGO_BIN_EXE_atmd")))
     }
 
-    fn stop(&self, side: &str, state: &Path) {
-        let pid = std::fs::read_to_string(self.root.path().join(state).join("atmd.pid"))
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
+    fn stop(&self, side: &str, state: Option<&Path>) {
+        let legacy = self.xdg_state.join("atm");
+        let pid = std::fs::read_to_string(
+            self.root
+                .path()
+                .join(state.unwrap_or(&legacy))
+                .join("atmd.pid"),
+        )
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
         assert!(self.owns(pid), "refusing an unowned PID");
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
         assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
         // SAFETY: pidfd_open returned a valid, uniquely owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         assert!(self.owns(pid), "ownership changed before stop");
-        let out = stand_in::bounded::run(self.atmd(side, Some(state)).arg("stop"));
+        let out = stand_in::bounded::run(self.atmd(side, state).arg("stop"));
         assert!(out.status.success(), "{out:?}");
-        assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("PID {pid}")));
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("(PID {pid})")));
         // Exit, not reaping: a non-reaping parent may retain /proc/<pid>.
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
@@ -162,7 +168,11 @@ impl Drop for Rig {
     fn drop(&mut self) {
         // Also covers failed assertions and detached autostarts; never trust only
         // the PID-file path whose resolution is precisely what these tests break.
-        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let entries = std::fs::read_dir("/proc");
+        if let Err(error) = &entries {
+            eprintln!("cleanup could not read /proc: {error}");
+        }
+        for entry in entries.into_iter().flatten().flatten() {
             let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
                 continue;
             };
@@ -183,17 +193,55 @@ impl Drop for Rig {
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    assert_eq!(libc::poll(&mut poll, 1, 30_000), 1, "daemon did not exit");
+                    if libc::poll(&mut poll, 1, 30_000) != 1 || poll.revents & libc::POLLIN == 0 {
+                        eprintln!("daemon {pid} did not exit on SIGTERM; sending SIGKILL");
+                        libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, 0usize, 0);
+                        if libc::poll(&mut poll, 1, 30_000) != 1 || poll.revents & libc::POLLIN == 0
+                        {
+                            eprintln!("daemon {pid} did not exit on SIGKILL");
+                        }
+                    }
                 }
             }
             unsafe { libc::close(fd) };
         }
         for reaper in &self.reapers {
-            reaper
-                .recv_timeout(DEADLINE)
-                .expect("foreground daemon exit");
+            if let Err(error) = reaper.recv_timeout(DEADLINE) {
+                eprintln!("foreground daemon reaper failed: {error}");
+            }
         }
     }
+}
+
+// A PID prefix must not let a status assertion pass for the wrong daemon.
+#[test]
+fn status_rejects_a_prefix_of_the_daemons_pid() {
+    let mut rig = Rig::new();
+    let state = Path::new("pid-state");
+    let pid = rig.start("pid", Some(state));
+    rig.status("pid", Some(state), Some(pid));
+    let wrong_pid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rig.status("pid", Some(state), Some(pid / 10));
+    }));
+    rig.stop("pid", Some(state));
+    assert!(wrong_pid.is_err(), "status accepted a PID prefix");
+}
+
+// A failed reaper must not panic in Drop and abort cleanup during unwinding.
+#[test]
+fn rig_drop_cleans_up_even_with_a_disconnected_reaper() {
+    let mut rig = Rig::new();
+    rig.start("drop", Some(Path::new("drop-state")));
+    let reaped = rig.reapers.pop().unwrap();
+    let (tx, rx) = mpsc::channel();
+    drop(tx);
+    rig.reapers.push(rx);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(rig)));
+    assert!(
+        reaped.recv_timeout(DEADLINE).is_ok(),
+        "daemon was not reaped"
+    );
+    assert!(dropped.is_ok(), "Drop panicked on a failed reaper");
 }
 
 // Counting /proc/<pid> existence as liveness makes stop time out on this
@@ -205,7 +253,7 @@ fn stop_succeeds_before_the_parent_reaps_the_daemon() {
     let (release, reap_after) = mpsc::channel();
     let state = Path::new("unreaped-state");
     let pid = rig.start_reaping_after("unreaped", Some(state), reap_after);
-    rig.stop("unreaped", state);
+    rig.stop("unreaped", Some(state));
     assert!(Path::new(&format!("/proc/{pid}")).exists());
     drop(release);
 }
@@ -225,11 +273,11 @@ fn separate_state_dirs_isolate_start_status_and_stop() {
     let b_pid = rig.start("b", Some(b));
     assert_ne!(a_pid, b_pid);
     rig.status("b", Some(b), Some(b_pid));
-    rig.stop("b", b);
+    rig.stop("b", Some(b));
     rig.ready("a");
     rig.status("a", Some(a), Some(a_pid));
     rig.status("b", Some(b), None);
-    rig.stop("a", a);
+    rig.stop("a", Some(a));
 }
 
 // The client's legacy PID lookup incorrectly treats A as B's running daemon
@@ -251,10 +299,10 @@ fn client_autostarts_its_daemon_despite_a_live_legacy_pid() {
     assert!(out.status.success(), "autostart B: {out:?}");
     rig.ready("b");
     assert!(rig.root.path().join(b).join("atm.log").is_file());
-    rig.stop("b", b);
+    rig.stop("b", Some(b));
     rig.ready("a");
     rig.status("a", Some(a), Some(a_pid));
-    rig.stop("a", a);
+    rig.stop("a", Some(a));
 }
 
 // Reusing the eventlog resolver for PID/log state would redirect these files
@@ -278,7 +326,21 @@ fn relative_xdg_without_override_keeps_legacy_pid_and_log_paths() {
         .join("relative-xdg/atm/log/events/00000001.jsonl")
         .is_file());
     rig.status("legacy", None, Some(pid));
-    rig.stop("legacy", &state);
+    rig.stop("legacy", Some(&state));
+}
+
+// Stop must find the legacy PID when ATM_STATE_DIR is absent, not just when
+// the caller explicitly points an override at the legacy directory.
+#[test]
+fn stop_without_override_uses_the_private_legacy_state_dir() {
+    let mut rig = Rig::new();
+    let pid = rig.start("legacy-stop", None);
+    let pid_file = rig.xdg_state.join("atm/atmd.pid");
+    assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), pid.to_string());
+    rig.status("legacy-stop", None, Some(pid));
+    rig.stop("legacy-stop", None);
+    assert!(!pid_file.exists());
+    rig.status("legacy-stop", None, None);
 }
 
 // Promotion compatibility: without an override (or with an empty override),
@@ -293,6 +355,6 @@ fn unset_and_empty_override_keep_the_legacy_pid_path() {
             pid.to_string()
         );
         rig.status("legacy", state, Some(pid));
-        rig.stop("legacy", Path::new("xdg/atm"));
+        rig.stop("legacy", Some(Path::new("xdg/atm")));
     }
 }

@@ -453,16 +453,40 @@ fn value_only_variants_keep_lifecycle_facts_without_pinning_literals() {
 #[test]
 fn narrow_split_reports_minimum_through_the_rig() {
     let mut rig = StandInRig::start();
-    for mode in [StandInMode::Codex, StandInMode::Pi] {
+    for (mode, columns, minimum) in [
+        (StandInMode::Claude, 52, "53x2"),
+        (StandInMode::Codex, 60, "80x19"),
+        (StandInMode::Pi, 60, "86x19"),
+    ] {
         let mut config = StandInConfig::new(mode);
-        config.columns = 60;
+        config.columns = columns;
         config.rows = 40;
         let failure =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.launch(&config)))
-                .expect_err("60-column split must refuse misleading chrome");
+                .expect_err("narrow split must refuse misleading chrome");
         let message = failure.downcast_ref::<String>().unwrap();
-        assert!(message.contains("requires at least"), "{message}");
-        assert!(message.contains("60x40"), "{message}");
+        assert!(
+            message.contains(&format!("requires at least {minimum}")),
+            "{message}"
+        );
+        assert!(message.contains(&format!("{columns}x40")), "{message}");
+    }
+    rig.close();
+}
+
+#[test]
+fn claude_minimum_width_keeps_fresh_facts() {
+    let mut rig = StandInRig::start();
+    for rows in [19, 24, 30, 40] {
+        let mut config = StandInConfig::new(StandInMode::Claude);
+        config.columns = 53;
+        config.rows = rows;
+        let pane = rig.launch(&config);
+        assert_eq!(
+            observe(StandInMode::Claude, &rig.capture_plain(&pane)),
+            expected("claude.fresh.u5"),
+            "fresh at 53x{rows}"
+        );
     }
     rig.close();
 }

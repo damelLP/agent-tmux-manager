@@ -355,8 +355,10 @@ deleted text` lines are dropped whole if they would be clipped. Codex fresh pane
 This is a source splice from P1's gpt-5.4 session into the U5 lifecycle; resizing
 that capture to other compact sizes is Synthetic. The adapter contract pins
 all lifecycle facts at 100x30, 80x24 (Codex), 100x24, 120x19 and the supported minima: **Codex 80x19,
-pi 86x19**. A 60x40 split is too narrow for their captured interrupt/startup chrome:
-scene rendering explicitly refuses it. Only `launch`, `wait_ready` and `wait_event`
+pi 86x19**. Claude requires **53 columns** (its existing two-row floor is unchanged,
+not a claim of lifecycle fidelity at that height); fresh facts are pinned at
+53x19/24/30/40. A 52-column Claude pane or 60-column Codex/pi split is too narrow
+for captured chrome: scene rendering explicitly refuses it. Only `launch`, `wait_ready` and `wait_event`
 surface the scene error immediately rather than waiting for a misleading ready
 frame; `observe_pane` and `wait_for_row` do not surface scene errors. Use a wider pane for these modes.
 Source-only replay remains native-size evidence. This is not real-harness resize

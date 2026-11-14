@@ -80,7 +80,7 @@ def vary_values(line, mode, frame):
 
 
 def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, selection, folder=None):
-    minimum = {"codex": (80, 19), "pi": (86, 19)}.get(mode, (2, 2))
+    minimum = {"claude": (53, 2), "codex": (80, 19), "pi": (86, 19)}.get(mode, (2, 2))
     if columns < minimum[0] or rows < minimum[1]:
         raise ValueError(f"{mode} viewport {columns}x{rows} requires at least {minimum[0]}x{minimum[1]}")
     if mode == "claude" and frame == "folder-trust":

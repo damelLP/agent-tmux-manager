@@ -19,8 +19,8 @@ SCRIPT = Path(__file__).with_name('atm-candidate')
 
 class CandidateKit(unittest.TestCase):
     def setUp(self):
-        self.lock_cleanups = []
         self.temp = tempfile.TemporaryDirectory(prefix='kit-')
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.script = SCRIPT
         self.env = dict(os.environ)
@@ -47,21 +47,24 @@ class CandidateKit(unittest.TestCase):
         self.bin.mkdir()
         for name in ('atm', 'atmd'):
             (self.bin / name).symlink_to(os.environ['CANDIDATE_TEST_' + name.upper()])
+        self.addCleanup(self.cleanup_candidate)
 
-    def tearDown(self):
-        for cleanup in reversed(self.lock_cleanups):
-            cleanup()
-        if self.script.exists():
-            out = self.call('stop', ok=None)
-            self.assertEqual(out.returncode, 0, out.stderr)
+    def cleanup_candidate(self):
+        out = None
         try:
-            connection, _ = self.decoy.accept()
-        except BlockingIOError:
-            pass
-        else:
-            connection.close()
-            self.fail('candidate connected to inherited decoy socket')
-        self.temp.cleanup()
+            if self.script.exists():
+                out = self.call('stop', ok=None)
+            try:
+                connection, _ = self.decoy.accept()
+            except BlockingIOError:
+                pass
+            else:
+                connection.close()
+                self.fail('candidate connected to inherited decoy socket')
+        finally:
+            self.temp.cleanup()
+        if out is not None:
+            self.assertEqual(out.returncode, 0, out.stderr)
 
     def call(self, *args, ok=True, env=None):
         out = subprocess.run(['bash', str(self.script), *map(str, args)],
@@ -589,12 +592,14 @@ class CandidateKit(unittest.TestCase):
                                  env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
         def cleanup():
-            if child.poll() is None:
-                child.stdin.close()  # release stand-in/barrier, even after failure
-                child.wait(timeout=35)
-            for stream in (child.stdin, child.stdout, child.stderr):
-                stream.close()
-        self.lock_cleanups.append(cleanup)
+            try:
+                if child.poll() is None:
+                    child.kill()  # EOF alone need not release a blocked lock holder
+                    child.wait(timeout=35)
+            finally:
+                for stream in (child.stdin, child.stdout, child.stderr):
+                    stream.close()
+        self.addCleanup(cleanup)
         return child
 
     def child_line(self, child, expected):
@@ -905,6 +910,52 @@ class CandidateKit(unittest.TestCase):
             self.assertEqual(comm, 'Z')  # exited orphan may await the host reaper
         except FileNotFoundError:
             pass
+
+
+class CleanupContracts(unittest.TestCase):
+    # A failed lock assertion must kill its wrapper, then stop owned resources,
+    # even when another cleanup raises. Closing stdin alone is not cancellation.
+    def test_failed_lock_test_kills_child_and_stops_candidate(self):
+        class FailedLock(CandidateKit):
+            def runTest(self):
+                self.running = self.lock_fixture()
+                self.child = self.lock_child('atm', 'list')
+                self.child_line(self.child, 'running')
+                self.addCleanup(lambda: self.fail('injected cleanup failure'))
+                self.fail('injected lock assertion failure')
+
+        case = FailedLock()
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(len(result.failures), 2, result.errors)
+        self.assertEqual(case.child.returncode, -signal.SIGKILL)
+        self.assertFalse(case.root.exists())
+        from atm_candidate import identity
+        for record in ('server', 'daemon'):
+            self.assertIsNone(identity(case.running[record]['pid']))
+
+    # A nonzero stop result must not skip temporary-root cleanup.
+    def test_stop_failure_still_removes_temporary_root(self):
+        class FailedStop(CandidateKit):
+            def runTest(self):
+                original = self.call
+                def failed_stop(*args, **kwargs):
+                    out = original(*args, **kwargs)
+                    if args == ('stop',):
+                        out.returncode = 1
+                        out.stderr = 'injected stop failure after real cleanup'
+                    return out
+                self.call = failed_stop
+
+        case = FailedStop()
+        result = unittest.TestResult()
+        try:
+            case.run(result)
+            self.assertEqual(len(result.failures), 1, result.errors)
+            self.assertIn('injected stop failure', result.failures[0][1])
+            self.assertFalse(case.root.exists())
+        finally:
+            case.temp.cleanup()
 
 
 if __name__ == '__main__':

@@ -68,10 +68,7 @@ pub fn observe_control_screen(
     let body = nonblank(&lines);
     result.facts = observe_screen(input, cursor);
     if known_dialog(&lines) {
-        result.dialog = if body
-            .first()
-            .is_some_and(|s| s.starts_with("Update available · "))
-        {
+        result.dialog = if update_prompt(&body) {
             ControlDialog::LaunchSkip {
                 key: ControlKey::Escape,
             }

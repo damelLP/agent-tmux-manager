@@ -357,6 +357,28 @@ fn real_update_is_skippable_but_warnings_are_blocked() {
 }
 
 #[test]
+fn synthetic_update_titled_warning_is_never_a_launch_skip() {
+    // Synthetic: a title or transcript continuation above the real Warnings
+    // modal must not turn its dismiss key into an update-skip authorization.
+    let warning = include_str!("fixtures/screen_codex-warning_0.167.0.txt");
+    for prefix in [
+        "  Update available · 0.167.0 → 0.169.0",
+        "  Update available · 1.0 → 2.0 is what the doc said",
+        "  \x1b[1mUpdate available · 0.167.0 → 0.169.0\x1b[0m",
+    ] {
+        let text = format!("{prefix}\n{warning}");
+        let decoded = plain(&text);
+        for input in [ScreenInput::Plain(&decoded), ScreenInput::Styled(&text)] {
+            assert_eq!(
+                observe_control_screen(input, None).dialog,
+                ControlDialog::Blocked,
+                "{prefix}"
+            );
+        }
+    }
+}
+
+#[test]
 fn captured_worktree_folder_and_hook_review_defaults() {
     for text in [
         capture!("b27-nodaemon-new-result-100x32"),

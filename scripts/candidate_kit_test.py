@@ -634,6 +634,15 @@ class CandidateKit(unittest.TestCase):
         self.call('stop')
         os.kill(os.getpid(), 0)
 
+    def cat_ready(self, child):
+        import select
+        # Popen can return while procfs still shows the pre-exec Python image.
+        # An echoed line proves cat is executing before we inspect its identity.
+        child.stdin.write(b'ready\n')
+        child.stdin.flush()
+        self.assertTrue(select.select([child.stdout], [], [], 30)[0], 'cat did not echo readiness')
+        self.assertEqual(child.stdout.readline(), b'ready\n')
+
     # Deleted binaries remain identifiable and included in the token scan.
     def test_stop_finds_deleted_executables(self):
         import shutil
@@ -651,17 +660,19 @@ class CandidateKit(unittest.TestCase):
         self.assertTrue(os.readlink(f'/proc/{status["daemon"]["pid"]}/exe').endswith(' (deleted)'))
         binary = tools / 'cat'
         shutil.copy2('/bin/cat', binary)
-        child = subprocess.Popen([str(binary)], stdin=subprocess.PIPE,
+        child = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  env=dict(self.env, ATM_SOCKET=status['socket'],
                                           TMUX_TMPDIR=str(Path(status['run']) / 't'),
                                           ATM_CANDIDATE_RUN=status['token']))
         try:
+            self.cat_ready(child)
             binary.unlink()
             self.assertEqual(os.readlink(f'/proc/{child.pid}/exe'), str(binary) + ' (deleted)')
             self.assertIsNotNone(atm_candidate.identity(child.pid))
             self.call('stop')
             child.wait(timeout=30)
         finally:
+            child.stdout.close()
             child.stdin.close()
             child.wait(timeout=30)
             # RED cleanup: the old strict exe lookup cannot see this live tmux.
@@ -713,7 +724,7 @@ class CandidateKit(unittest.TestCase):
                    TMUX_TMPDIR=str(Path(status['run']) / 't'),
                    ATM_CANDIDATE_RUN=status['token'])
         child = subprocess.Popen(['/bin/cat'], env=env, stdin=subprocess.PIPE,
-                                 stdout=subprocess.DEVNULL)
+                                 stdout=subprocess.PIPE)
         kit = object.__new__(atm_candidate.Kit)
         original = kit.owns
         def exit_at_environment_read(active, pid):
@@ -724,8 +735,10 @@ class CandidateKit(unittest.TestCase):
             return original(active, pid)
         kit.owns = exit_at_environment_read
         try:
+            self.cat_ready(child)
             kit.signal_process(status, atm_candidate.identity(child.pid))
         finally:
+            child.stdout.close()
             if child.poll() is None:
                 child.stdin.close()
                 child.wait(timeout=30)

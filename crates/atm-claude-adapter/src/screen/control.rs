@@ -53,6 +53,10 @@ pub fn observe_control_screen(
         result.dialog = ControlDialog::Blocked;
         return result;
     }
+    if styled.and_then(completion_draft).is_some() {
+        result.dialog = ControlDialog::None;
+        return result;
+    }
     let header = lines.iter().enumerate().find_map(|(i, line)| {
         line.starts_with(" ▐▛███▛█   Claude Code v")
             .then(|| lines.get(i..).and_then(header_end).map(|end| i + end))
@@ -107,6 +111,68 @@ pub fn observe_control_screen(
         }
     }
     result
+}
+
+/// The one captured completion layout: a single selected command and its
+/// possibly wrapped description. Description wording is not command identity.
+pub(super) fn completion_draft(screen: &StyledScreen) -> Option<(&str, &str)> {
+    let lines: Vec<_> = screen
+        .text()
+        .lines()
+        .map(|s| s.trim_end_matches(' '))
+        .collect();
+    let lower = lines.iter().rposition(|s| rule(s, '─'))?;
+    let top = lines.get(..lower)?.iter().rposition(|s| rule(s, '─'))?;
+    if lines.get(top) != lines.get(lower) {
+        return None;
+    }
+    let [row] = lines.get(top + 1..lower)? else {
+        return None;
+    };
+    let draft = row.strip_prefix("❯\u{a0}")?;
+    if draft.is_empty() {
+        return None;
+    }
+    let offset = screen
+        .text()
+        .split_inclusive('\n')
+        .take(top + 1)
+        .map(str::len)
+        .sum::<usize>()
+        + "❯\u{a0}".len();
+    if draft
+        .char_indices()
+        .any(|(i, c)| !c.is_whitespace() && screen.faint_at(offset + i) != Some(false))
+    {
+        return None;
+    }
+    let menu: Vec<_> = lines
+        .get(lower + 1..)?
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect();
+    let (selected, continuation) = menu.split_first()?;
+    let name_and_description = selected.strip_prefix("  ❯ ")?;
+    let (command, description) = name_and_description.split_once("  ")?;
+    if !command.strip_prefix('/').is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    }) || description.trim().is_empty()
+    {
+        return None;
+    }
+    let description_start = selected.chars().count() - description.trim_start().chars().count();
+    if !continuation.iter().all(|s| {
+        s.len() - s.trim_start_matches(' ').len() == description_start
+            && !s.trim().is_empty()
+            && !s.contains('❯')
+    }) {
+        return None;
+    }
+    Some((draft, command))
 }
 
 fn trust_dialog(lines: &[&str]) -> Option<ControlDialog> {

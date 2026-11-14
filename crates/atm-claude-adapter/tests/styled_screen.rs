@@ -204,7 +204,11 @@ fn real_slash_menu_and_manual_queued_frame_remain_unknown() {
         check(text, ScreenFacts::default());
         assert_eq!(
             staged_draft_matches(ScreenInput::Styled(text), expected),
-            None
+            if expected == "/clear" {
+                Some(true)
+            } else {
+                None
+            }
         );
     }
 }

@@ -30,6 +30,55 @@ fn plain(text: &str) -> String {
 }
 
 #[test]
+fn captured_completion_verifies_editor_and_selected_command() {
+    let menu = body(capture!("B-clear-001-120x40"));
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(menu), "/clear"),
+        Some(true)
+    );
+    assert_eq!(observe(menu).dialog, ControlDialog::None);
+    assert_eq!(
+        screen::observe_screen(ScreenInput::Styled(menu), None),
+        Default::default()
+    );
+    // Synthetic: selected names compare exactly, descriptions are not command identity.
+    let text = plain(menu);
+    for changed in [
+        text.replace("❯ /clear", "❯ /other"),
+        text.replace("❯ /clear  ", "❯ /clear-x"),
+        text.replace("❯\u{a0}/clear", "❯\u{a0} /clear"),
+    ] {
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(&changed), "/clear"),
+            Some(false)
+        );
+    }
+    let description = text.replace(
+        "Start a new session with empty context; previous session stays on disk (resumable with",
+        "A different description",
+    );
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(&description), "/clear"),
+        Some(true)
+    );
+    // Synthetic: absent/doubled selection, missing editor, malformed layout and faint draft refuse.
+    for changed in [
+        text.replace("❯ /clear", "  /clear"),
+        text.replace("  ❯ /clear", "  ❯ /clear   First\n  ❯ /other"),
+        text.replace("❯\u{a0}/clear", ""),
+        text.replace("❯\u{a0}/clear", "❯\u{a0}\x1b[2m/clear\x1b[22m"),
+        format!("{menu}\nunknown footer"),
+        format!("{menu}\x1b[8m"),
+    ] {
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Styled(&changed), "/clear"),
+            None
+        );
+        assert_eq!(observe(&changed).dialog, ControlDialog::Unknown);
+    }
+}
+
+#[test]
 fn policy_reuses_existing_constants() {
     assert_eq!(CONTROL_POLICY.capture, screen::SCREEN_TEXT_FORMAT);
     assert_eq!(CONTROL_POLICY.clear_command, screen::CLEAR_COMMAND);

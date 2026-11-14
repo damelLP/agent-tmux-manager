@@ -10,6 +10,14 @@ fn all_eighteen_golden_event_bodies() {
     for (kind, body) in cases {
         let event = OrgEvent::from_parts(kind, &body).unwrap().unwrap();
         assert_eq!(event.kind(), kind);
+        assert!(
+            event.to_body().is_object(),
+            "{kind} must take the derive's object path"
+        );
+        assert_eq!(
+            event.to_body(),
+            serde_json::to_value(&event).unwrap()["body"]
+        );
         assert_eq!(event.to_body(), body, "{kind}");
         assert_eq!(
             OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(),

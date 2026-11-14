@@ -179,54 +179,15 @@ impl OrgEvent {
 
     #[must_use]
     pub fn to_body(&self) -> Value {
-        // Every value below has infallible JSON serialization: strings, integers,
-        // enums, timestamps, arrays and structs, with no non-string map keys or
-        // fallible user serializers. Money uses the integer codec above.
-        match self {
-            Self::ProjectRegistered { project_id, root } => {
-                json!({"project_id":project_id,"root":root})
-            }
-            Self::AgentUpRequested { agent_id, role } => json!({"agent_id":agent_id,"role":role}),
-            Self::AgentPaneCreated { agent_id, pane } => json!({"agent_id":agent_id,"pane":pane}),
-            Self::AgentAdopted {
-                agent_id,
-                pane,
-                session_id,
-            } => json!({"agent_id":agent_id,"pane":pane,"session_id":session_id}),
-            Self::AgentSessionBound {
-                agent_id,
-                session_id,
-            } => json!({"agent_id":agent_id,"session_id":session_id}),
-            Self::AgentSessionLost { agent_id } | Self::AgentClearRequested { agent_id } => {
-                json!({"agent_id":agent_id})
-            }
-            Self::AgentStuck { agent_id, reason } | Self::AgentDown { agent_id, reason } => {
-                json!({"agent_id":agent_id,"reason":reason})
-            }
-            Self::MessageSent(content) => json!(content),
-            Self::MessageDeliveryAttempted {
-                message_id,
-                attempt,
-                pane,
-            } => json!({"message_id":message_id,"attempt":attempt,"pane":pane}),
-            Self::MessageDelivered {
-                message_id,
-                session_id,
-                confirmation,
-            } => {
-                json!({"message_id":message_id,"session_id":session_id,"confirmation":confirmation})
-            }
-            Self::MessageDeliveryFailed {
-                message_id,
-                reason,
-                final_failure,
-            } => json!({"message_id":message_id,"reason":reason,"final":final_failure}),
-            Self::MessageRead { message_ids } => json!({"message_ids":message_ids}),
-            Self::SessionSummary(summary) => json!(summary),
-            Self::ControlSent(audit) | Self::ControlSpawned(audit) | Self::ControlKilled(audit) => {
-                json!(audit)
-            }
-        }
+        // Serialization cannot fail for these strings, integers, enums,
+        // timestamps, arrays and structs (no fallible serializers or non-string
+        // map keys; Money uses the exact integer codec). Every variant has a
+        // body in the adjacent-tag derive. Null is only a defensive fallback;
+        // all-variant object/roundtrip tests prove the normal path is taken.
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|mut tagged| tagged.as_object_mut()?.remove("body"))
+            .unwrap_or(Value::Null)
     }
 
     pub fn from_parts(kind: &str, body: &Value) -> Result<Option<Self>, OrgError> {

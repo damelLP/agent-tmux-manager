@@ -59,8 +59,8 @@ account identifiers, home names or local infrastructure paths are retained.
   **no delivery into a freshly started Claude editor under this contract.**
 - Supplied cursor metadata currently refuses observation (all Unknown); fake
   coordinates in tests are explicitly synthetic refusal tests, not captures.
-- Other versions, themes, permission modes, terminal widths with wrapped dialog
-  UI, alternate trust selection, other dialogs, multiline/whitespace-only drafts
+- Other versions, themes, permission modes, alternate trust selection,
+  other dialogs, multiline/whitespace-only drafts
   and incomplete/scrollback layouts have no positive real coverage here. U5b
   adds real free-text drafts and 100-column editors; U5 has the restored Escape
   draft. Adversarial draft/path/control alterations are marked Synthetic.
@@ -148,6 +148,24 @@ and the known `Ctrl+Y to paste deleted text` hint below. Unknown footer rows
 still refuse. Synthetic tests cover each independent layout change, shifted
 spinners, 80/100/120/200-column borders, and damaged notices/footer chrome.
 All tests are pure, with no waits or terminal operations.
+
+## Review regressions and remaining limits
+
+- Trust paragraph matching joins wrapped lines between the single absolute
+  folder line and fixed capability/options chrome. Synthetic rewraps of the
+  real capture at 80, 100, 120 and 200 columns preserve FolderTrust; modified
+  wording, wrapped/truncated paths and changed selection still refuse.
+- Linux's `*` spinner frame is recognized along with the prior frame set.
+- A `/clear` echo below old conversation gives turn Unknown, not idle. Only
+  an otherwise empty recognized fresh history may retain that echo as idle.
+- **F2:** `capture-pane -p` drops trailing spaces. A spaces-only draft can
+  therefore read Empty; ASCII-space synthetic tests exercise preservation of
+  supplied text, not protection in the real capture pipeline. Styled capture
+  with `-N` is deferred to U8d; no plain-text fix is claimed here.
+- **F9:** permission recognition still requires the captured Bash auto-mode
+  ask-rule wording. Editor footer modes other than auto (accept-edits, plan,
+  bypass-permissions, shortcut-only, background shell/agents) remain Unknown.
+  Configuration-specific dialogs need more real captures before generalizing.
 
 The unit adds no RPC method. These capture tables and synthetic refusals are
 parser conformance coverage; launch/clear constants have exact policy tests.

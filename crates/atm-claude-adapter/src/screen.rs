@@ -11,8 +11,9 @@
 //! Claude editor until a later evidence-backed implementation resolves this.
 //! U5b also captured cursors and confirmed that Home-position drafts collide with
 //! empty editors. Supplying a cursor still returns all Unknown, not emptiness.
-//! Ordinary unknown
-//! layouts, versions, modes, overlays and incomplete dialogs also fail closed.
+//! Unknown layouts, modes, overlays and incomplete dialogs also fail closed.
+//! Plain capture drops trailing spaces: a whitespace-only draft may read Empty.
+//! Styled capture with retained spaces is deferred; these facts cannot solve it.
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
 //! Header, bordered input and footer are found by chrome, not absolute rows.
@@ -92,12 +93,11 @@ fn dialog(lines: &[&str]) -> Option<DialogState> {
         .filter(|line| !line.is_empty())
         .collect();
     match body.as_slice() {
-        ["Accessing workspace:", folder, question, continuation,
+        ["Accessing workspace:", folder, paragraph @ ..,
             "Claude Code'll be able to read, edit, and execute files here.",
             "Security guide", "❯ No, exit", "Yes, I trust this folder",
             "Enter to confirm · Esc to cancel"]
-            if *question == "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source"
-                && *continuation == "project, or work from your team). If not, take a moment to review what's in this folder first."
+            if paragraph.join(" ") == "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first."
                 && folder.starts_with('/') && !folder.contains(['…', '⤶']) && !folder.contains("...") =>
         {
             Some(DialogState::FolderTrust { folder: (*folder).into() })
@@ -149,7 +149,8 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     }
     let (first, continuation) = lines.get(top + 1..lower)?.split_first()?;
     let input = first.strip_prefix("❯\u{a0}")?;
-    // Don't trim editor content: even a whitespace-only draft belongs to the user.
+    // Preserve any spaces supplied by the caller, though capture-pane -p drops
+    // trailing spaces and cannot distinguish a spaces-only draft from empty.
     let input = if !continuation.is_empty() {
         InputState::Draft
     } else if input.is_empty() {
@@ -178,9 +179,9 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
         [.., last] => Some(*last),
         [] => None,
     };
-    let idle_history = match history.last() {
-        None | Some(&"❯ /clear") => header_end.is_some(),
-        Some(line) => spinner_body(line)
+    let idle_history = match history.as_slice() {
+        [] | ["❯ /clear"] => header_end.is_some(),
+        [.., line] => spinner_body(line)
             .is_some_and(|body| body.contains(" for ") && body.contains(" · done ")),
     };
     let turn = if status.is_some_and(running_status) {
@@ -230,7 +231,7 @@ fn skip_startup_notice(history: &mut Vec<&str>) {
 
 fn spinner_body(line: &str) -> Option<&str> {
     let (frame, body) = line.split_once(' ')?;
-    (frame.chars().count() == 1 && "·✢✳✶✻✽".contains(frame)).then_some(body)
+    (frame.chars().count() == 1 && "·✢*✳✶✻✽".contains(frame)).then_some(body)
 }
 
 fn running_status(line: &str) -> bool {
@@ -623,7 +624,7 @@ mod tests {
             DialogState::Permission
         );
         // Synthetic: value variation of before-escape, with optional tip omitted.
-        for frame in "·✢✳✶✻✽".chars() {
+        for frame in "·✢*✳✶✻✽".chars() {
             let varied =
                 capture!("before-escape").replace("✶ Levitating…", &format!("{frame} Generating…"));
             let varied = varied
@@ -709,6 +710,62 @@ mod tests {
     }
 
     #[test]
+    fn trust_paragraph_wraps_do_not_change_the_dialog() {
+        // Synthetic: re-wrap the real U5 trust paragraph at 80, 100, 120 and 200 columns.
+        let start = TRUST.find(" Quick safety check:").unwrap();
+        let end = TRUST.find(" Claude Code'll").unwrap();
+        let paragraph = TRUST[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for width in [80, 100, 120, 200] {
+            let mut wrapped = String::from(" ");
+            let mut column = 1;
+            for word in paragraph.split(' ') {
+                if column > 1 && column + word.len() + 1 > width {
+                    wrapped.push_str("\n ");
+                    column = 1;
+                } else if column > 1 {
+                    wrapped.push(' ');
+                    column += 1;
+                }
+                wrapped.push_str(word);
+                column += word.len();
+            }
+            let text = format!("{}{}\n\n{}", &TRUST[..start], wrapped, &TRUST[end..]);
+            assert_eq!(
+                observe_screen(&text, None).dialog,
+                DialogState::FolderTrust {
+                    folder: "/tmp/u8a-fixture/cwd/claude".into(),
+                },
+                "width={width}"
+            );
+            assert_eq!(
+                observe_screen(
+                    &text.replace("Quick safety check:", "Other question:"),
+                    None
+                ),
+                ScreenFacts::default()
+            );
+        }
+    }
+
+    #[test]
+    fn clear_echo_below_old_conversation_is_not_idle() {
+        // Synthetic: U5 clear-poll-01 before its SessionEnd hook spinner appears.
+        let text = capture!("clear-poll-01")
+            .lines()
+            .filter(|line| !line.contains("Sketching…") && !line.contains("Tip: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let facts = observe_screen(&text, None);
+        assert_eq!(facts.input, InputState::Empty);
+        assert_eq!(facts.turn, TurnState::Unknown);
+        assert_eq!(facts.fresh_editor, FreshEditorEvidence::Unknown);
+        assert_eq!(observe_screen(FRESH, None).turn, TurnState::NotRunning);
+    }
+
+    #[test]
     fn wrapped_or_truncated_trust_path_is_not_trusted() {
         // Synthetic: an incomplete displayed path must never become allowlist evidence.
         for path in [
@@ -764,6 +821,8 @@ mod tests {
     #[test]
     fn whitespace_and_multiline_drafts_are_not_empty() {
         // Synthetic: captured empty composer with significant user input inserted.
+        // ASCII trailing-space cases check parser preservation only: capture-pane -p
+        // drops those spaces, so they do NOT prove end-to-end spaces-only draft safety.
         for draft in [
             " ",
             "  ",

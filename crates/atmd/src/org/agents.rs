@@ -688,6 +688,7 @@ fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> Harness {
 // adding vendor branches. This base's adapters accept Plain/None; consuming their
 // styled capture policy waits for the adapter contract, not a local guess.
 fn screen(harness: Harness, text: &str) -> ScreenFacts {
+    let text = atm_core::ScreenInput::Plain(text);
     match harness {
         Harness::ClaudeCode => atm_claude_adapter::screen::observe_screen(text, None),
         Harness::Codex => atm_codex_adapter::screen::observe_screen(text, None),

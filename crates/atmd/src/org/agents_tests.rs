@@ -1225,7 +1225,8 @@ mod reconciliation {
             "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
         );
         assert_eq!(
-            atm_pi_adapter::screen::observe_screen(running, None).turn,
+            atm_pi_adapter::screen::observe_screen(atm_core::ScreenInput::Plain(running), None)
+                .turn,
             atm_core::TurnState::Running
         );
         rig.frame("%1", "p/lead", running);

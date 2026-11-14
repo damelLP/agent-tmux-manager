@@ -101,6 +101,9 @@ pub struct ConnectionHandler {
     /// Unique client identifier (assigned after handshake)
     client_id: Option<ClientId>,
 
+    /// Connect was accepted, but its reply failed: drain only one-way events.
+    one_way_only: bool,
+
     /// Whether this client is subscribed to events
     subscribed: bool,
 
@@ -149,6 +152,7 @@ impl ConnectionHandler {
             registry,
             subscribers,
             client_id: None,
+            one_way_only: false,
             subscribed: false,
             subscription_filter: None,
             connection_number,
@@ -176,7 +180,8 @@ impl ConnectionHandler {
             Ok(()) => {
                 debug!(
                     client_id = ?self.client_id,
-                    "Client handshake completed"
+                    one_way_only = self.one_way_only,
+                    "Client Connect accepted"
                 );
             }
             Err(e) => {
@@ -246,12 +251,25 @@ impl ConnectionHandler {
                 self.client_id = Some(assigned_id.clone());
 
                 // Send success response
-                self.send_message(DaemonMessage::Connected {
-                    protocol_version: ProtocolVersion::CURRENT,
-                    client_id: assigned_id,
-                    methods: self.methods.names(),
-                })
-                .await?;
+                let reply = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return Err(ConnectionError::Eof),
+                    reply = self.send_message(DaemonMessage::Connected {
+                        protocol_version: ProtocolVersion::CURRENT,
+                        client_id: assigned_id,
+                        methods: self.methods.names(),
+                    }) => reply,
+                };
+                if let Err(error) = reply {
+                    if !matches!(
+                        error,
+                        ConnectionError::Io(_) | ConnectionError::WriteTimeout
+                    ) {
+                        return Err(error);
+                    }
+                    debug!(client_id = ?self.client_id, %error, "Handshake reply failed; draining one-way events");
+                    self.one_way_only = true;
+                }
 
                 Ok(())
             }
@@ -361,8 +379,10 @@ impl ConnectionHandler {
 
                 // Send error response but continue processing, unless the
                 // reply itself failed
-                self.send_message(DaemonMessage::error(&e.to_string()))
-                    .await?;
+                if !self.one_way_only {
+                    self.send_message(DaemonMessage::error(&e.to_string()))
+                        .await?;
+                }
             }
         }
     }
@@ -373,6 +393,19 @@ impl ConnectionHandler {
         msg: ClientMessage,
         requests: &mut JoinSet<DaemonMessage>,
     ) -> Result<(), ConnectionError> {
+        if self.one_way_only
+            && !matches!(
+                msg.message,
+                MessageType::HookEvent { .. }
+                    | MessageType::StatusUpdate { .. }
+                    | MessageType::PiEvent { .. }
+                    | MessageType::CodexEvent { .. }
+            )
+        {
+            debug!(client_id = ?self.client_id, message_type = ?std::mem::discriminant(&msg.message), "Skipping message after failed handshake reply");
+            return Ok(());
+        }
+
         match msg.message {
             MessageType::Connect { .. } => {
                 // Already connected - send error
@@ -1111,6 +1144,386 @@ mod tests {
     use tokio::net::UnixStream;
 
     use crate::registry::RemovalReason;
+
+    fn handshake_pair() -> (ConnectionHandler, UnixStream) {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let (read, write) = ours.into_split();
+        let handler = ConnectionHandler::new(
+            read,
+            write,
+            crate::registry::spawn_registry(),
+            Arc::new(RwLock::new(HashMap::new())),
+            1,
+            CancellationToken::new(),
+            Arc::new(MethodRouter::default()),
+        );
+        (handler, peer)
+    }
+
+    fn handshake_hook() -> ClientMessage {
+        // Synthetic: only fields needed to create a session; no harness is run.
+        ClientMessage::hook_event(serde_json::json!({
+            "session_id": "closed-hook", "hook_event_name": "SessionStart",
+            "pid": std::process::id()
+        }))
+    }
+
+    async fn queue_messages(peer: &mut UnixStream, messages: Vec<ClientMessage>) {
+        for message in messages {
+            timeout(
+                Duration::from_secs(30),
+                peer.write_all(
+                    format!("{}\n", serde_json::to_string(&message).unwrap()).as_bytes(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_hook_registers_after_failed_connected_reply() {
+        timeout(Duration::from_secs(30), async {
+            let (handler, mut peer) = handshake_pair();
+            let registry = handler.registry.clone();
+            queue_messages(
+                &mut peer,
+                vec![ClientMessage::connect(None), handshake_hook()],
+            )
+            .await;
+            // Full close, before run: Connected must fail, but the event is readable.
+            drop(peer);
+            handler.run().await;
+            assert!(
+                registry
+                    .get_session(SessionId::new("closed-hook"))
+                    .await
+                    .is_some(),
+                "buffered SessionStart was dropped after failed handshake reply"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_hook_payload_is_valid_and_buffered() {
+        timeout(Duration::from_secs(30), async {
+            let (mut handler, mut peer) = handshake_pair();
+            queue_messages(
+                &mut peer,
+                vec![ClientMessage::connect(None), handshake_hook()],
+            )
+            .await;
+            drop(peer);
+            let error = handler
+                .send_message(DaemonMessage::pong(0))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ConnectionError::Io(ref message) if message.contains("Broken pipe"))
+            );
+            assert!(matches!(
+                handler.read_message().await.unwrap().message,
+                MessageType::Connect { .. }
+            ));
+            let event = handler.read_message().await.unwrap();
+            handler
+                .handle_message(event, &mut JoinSet::new())
+                .await
+                .unwrap();
+            assert!(handler
+                .registry
+                .get_session(SessionId::new("closed-hook"))
+                .await
+                .is_some());
+            assert!(matches!(
+                handler.read_message().await,
+                Err(ConnectionError::Eof)
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_connected_reply_drains_all_one_way_envelopes() {
+        timeout(Duration::from_secs(30), async {
+            // Synthetic: minimal payloads using the shapes in server_integration.rs.
+            let pid = std::process::id();
+            let cases = [
+                (handshake_hook(), "claude"),
+                (
+                    ClientMessage::status_update(serde_json::json!({
+                        "session_id": "closed-hook", "pid": pid,
+                        "model": {"id": "claude-sonnet-4-20250514"}
+                    })),
+                    "claude",
+                ),
+                (
+                    ClientMessage::pi_event(serde_json::json!({
+                        "session_id": "closed-hook", "pid": pid,
+                        "event": "session_start", "payload": {"type": "session_start"}
+                    })),
+                    "pi",
+                ),
+                (
+                    ClientMessage::codex_event(serde_json::json!({
+                        "session_id": "closed-hook", "pid": pid,
+                        "hook_event_name": "SessionStart", "source": "startup"
+                    })),
+                    "codex",
+                ),
+            ];
+            for (event, harness) in cases {
+                let (handler, mut peer) = handshake_pair();
+                let registry = handler.registry.clone();
+                // Batch multiple one-way envelopes on the same closed connection.
+                queue_messages(
+                    &mut peer,
+                    vec![ClientMessage::connect(None), event.clone(), event],
+                )
+                .await;
+                drop(peer);
+                handler.run().await;
+                let row = registry
+                    .get_session(SessionId::new("closed-hook"))
+                    .await
+                    .unwrap();
+                assert_eq!(row.harness, harness);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_connected_reply_skips_controls_without_starting_work() {
+        timeout(Duration::from_secs(30), async {
+            let (mut handler, mut peer) = handshake_pair();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let mut router = MethodRouter::default();
+            router
+                .register("count", Duration::from_secs(30), move |_, _| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Ok(serde_json::Value::Null) }
+                })
+                .unwrap();
+            handler.methods = Arc::new(router);
+            queue_messages(
+                &mut peer,
+                vec![
+                    ClientMessage::connect(None),
+                    ClientMessage::request(
+                        "1".into(),
+                        "count".into(),
+                        serde_json::Value::Null,
+                        None,
+                    ),
+                    ClientMessage::subscribe(None),
+                    ClientMessage::watch(vec![], 0),
+                    ClientMessage::list_sessions(),
+                    ClientMessage::ping(1),
+                    ClientMessage::discover(),
+                    ClientMessage::connect(None),
+                    ClientMessage::new(MessageType::Unsubscribe),
+                    ClientMessage::unwatch(),
+                    ClientMessage::disconnect(),
+                    handshake_hook(),
+                ],
+            )
+            .await;
+            drop(peer);
+            handler.handle_handshake().await.unwrap();
+            let mut requests = JoinSet::new();
+            handler.process_message_loop(&mut requests).await.unwrap();
+            assert!(requests.is_empty(), "a request was admitted");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(handler.subscribers.read().await.is_empty());
+            assert!(!handler.subscribed);
+            assert!(handler.forwarder.is_none());
+            assert!(handler
+                .registry
+                .get_session(SessionId::new("closed-hook"))
+                .await
+                .is_some());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_way_drain_never_reacquires_reply_writer() {
+        timeout(Duration::from_secs(30), async {
+            let (mut handler, mut peer) = handshake_pair();
+            queue_messages(
+                &mut peer,
+                vec![
+                    ClientMessage::connect(None),
+                    ClientMessage::ping(1),
+                    ClientMessage::hook_event(serde_json::Value::Null),
+                    ClientMessage::status_update(serde_json::Value::Null),
+                    ClientMessage::pi_event(serde_json::Value::Null),
+                    ClientMessage::codex_event(serde_json::Value::Null),
+                    handshake_hook(),
+                ],
+            )
+            .await;
+            drop(peer);
+            handler.handle_handshake().await.unwrap();
+            let writer = handler.writer_handle();
+            let _held = writer.lock().await;
+            handler.process_messages().await.unwrap();
+            assert!(handler
+                .registry
+                .get_session(SessionId::new("closed-hook"))
+                .await
+                .is_some());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_connect_does_not_drain_events() {
+        timeout(Duration::from_secs(30), async {
+            let mut incompatible = ClientMessage::connect(None);
+            incompatible.protocol_version = ProtocolVersion::new(99, 0);
+            let cases = [
+                serde_json::to_string(&incompatible).unwrap(),
+                "not json".into(),
+                serde_json::to_string(&ClientMessage::ping(1)).unwrap(),
+            ];
+            for (case, first) in cases.iter().enumerate() {
+                for closed in [false, true] {
+                    let (handler, mut peer) = handshake_pair();
+                    let registry = handler.registry.clone();
+                    peer.write_all(format!("{first}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    queue_messages(&mut peer, vec![handshake_hook()]).await;
+                    if closed {
+                        drop(peer);
+                        assert!(handler.run().await.is_none());
+                    } else {
+                        peer.shutdown().await.unwrap();
+                        assert!(handler.run().await.is_none());
+                        let mut replies = String::new();
+                        peer.read_to_string(&mut replies).await.unwrap();
+                        match case {
+                            0 => assert!(matches!(
+                                serde_json::from_str::<DaemonMessage>(&replies).unwrap(),
+                                DaemonMessage::Rejected { .. }
+                            )),
+                            1 => assert!(replies.is_empty()),
+                            _ => assert!(matches!(
+                                serde_json::from_str::<DaemonMessage>(&replies).unwrap(),
+                                DaemonMessage::Error { .. }
+                            )),
+                        }
+                    }
+                    assert!(registry
+                        .get_session(SessionId::new("closed-hook"))
+                        .await
+                        .is_none());
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_handshake_still_services_controls() {
+        timeout(Duration::from_secs(30), async {
+            let (handler, mut peer) = handshake_pair();
+            queue_messages(
+                &mut peer,
+                vec![
+                    ClientMessage::connect(None),
+                    ClientMessage::subscribe(None),
+                    ClientMessage::ping(23),
+                ],
+            )
+            .await;
+            // Half-close is not full close: queued controls still receive replies.
+            peer.shutdown().await.unwrap();
+            let run = tokio::spawn(handler.run());
+            let (read, _write) = peer.into_split();
+            let mut read = BufReader::new(read);
+            assert!(matches!(
+                receive(&mut read).await,
+                DaemonMessage::Connected { .. }
+            ));
+            assert!(matches!(
+                receive(&mut read).await,
+                DaemonMessage::SessionList { .. }
+            ));
+            assert!(matches!(
+                receive(&mut read).await,
+                DaemonMessage::Pong { seq: 23 }
+            ));
+            assert!(run.await.unwrap().is_some());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_handshake_reply_does_not_override_shutdown() {
+        timeout(Duration::from_secs(30), async {
+            let (handler, mut peer) = handshake_pair();
+            let registry = handler.registry.clone();
+            queue_messages(
+                &mut peer,
+                vec![ClientMessage::connect(None), handshake_hook()],
+            )
+            .await;
+            drop(peer);
+            handler.cancel.cancel();
+            assert!(handler.run().await.is_none());
+            assert!(registry
+                .get_session(SessionId::new("closed-hook"))
+                .await
+                .is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connected_reply_timeout_drains_without_writing() {
+        let (mut handler, mut peer) = handshake_pair();
+        queue_messages(
+            &mut peer,
+            vec![ClientMessage::connect(None), handshake_hook()],
+        )
+        .await;
+        drop(peer);
+        // Prime the reader before pausing: no real socket I/O is pending when
+        // the clock auto-advances to the deadline on the held writer mutex.
+        timeout(Duration::from_secs(30), handler.reader.fill_buf())
+            .await
+            .unwrap()
+            .unwrap();
+        let writer = handler.writer_handle();
+        let held = writer.lock().await;
+        tokio::time::pause();
+        handler.handle_handshake().await.unwrap();
+        tokio::time::resume();
+        drop(held);
+        timeout(Duration::from_secs(30), handler.process_messages())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(handler
+            .registry
+            .get_session(SessionId::new("closed-hook"))
+            .await
+            .is_some());
+    }
 
     fn request_router() -> Arc<super::super::methods::MethodRouter> {
         let mut router = super::super::methods::MethodRouter::default();

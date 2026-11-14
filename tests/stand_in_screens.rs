@@ -47,6 +47,7 @@ fn normalize(text: &str) -> String {
 }
 
 fn observe(mode: StandInMode, text: &str) -> ScreenFacts {
+    let text = atm_core::ScreenInput::Plain(text);
     match mode {
         StandInMode::Claude => atm_claude_adapter::screen::observe_screen(text, None),
         StandInMode::Codex => atm_codex_adapter::screen::observe_screen(text, None),

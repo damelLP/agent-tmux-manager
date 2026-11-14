@@ -45,7 +45,9 @@
 //! B waits for U8c focus/read-only observe and U8's single screen dispatch; this
 //! boundary neither adds vendor parsing nor implements a second input path.
 
-use super::message_history::{HistoryUpdate, RecipientObservation, SessionObservation};
+use super::message_history::{
+    HistoryUpdate, PanePresence, RecipientObservation, SessionObservation,
+};
 use super::message_inbox::{caller_address, inbox, Progress};
 pub use super::message_methods::register_message_methods;
 pub use super::message_types::*;
@@ -197,16 +199,33 @@ impl MessageRuntime {
 
 /// A2 owns the one capture converter; B calls it while reserved. Facts come
 /// from U8's single adapter dispatch and session is already uniquely eligible.
-/// Unknown focus stays unknown, failed capture uses ObservationLost instead.
-/// Unavailable until A2 integrates U8c's focus-bearing capture; never guess it.
+///
+/// A pure mapping of what one capture positively shows. The pane is the
+/// capture's own canonical pane; a capture without one is an error, and the
+/// caller records ObservationLost for it, as for a failed capture. A dead pane
+/// (its process exited, the pane retained) is Gone: nothing there can take
+/// input. Copy mode is the inspected flag. Focus is the capture's sample and
+/// stays unknown when the capture could not tell; it is never guessed. The
+/// session and the screen facts pass through unchanged: this function reads
+/// no screen text and knows no harness.
 pub fn recipient_observation(
-    _capture: &PaneCapture,
-    _session: Option<SessionObservation>,
-    _facts: ScreenFacts,
+    capture: &PaneCapture,
+    session: Option<SessionObservation>,
+    facts: ScreenFacts,
 ) -> Result<RecipientObservation, MessageError> {
-    Err(MessageError::Unavailable(
-        "message observation converter is not configured".into(),
-    ))
+    let pane = PaneId::parse(capture.inspection.pane.pane_id.as_str())?;
+    Ok(RecipientObservation {
+        pane: Some(pane),
+        session,
+        presence: if capture.inspection.dead {
+            PanePresence::Gone
+        } else {
+            PanePresence::Alive
+        },
+        facts,
+        copy_mode: Some(capture.inspection.in_mode),
+        focused: capture.focused,
+    })
 }
 
 const FOCUS_NOTICE_SUFFIX: &str =

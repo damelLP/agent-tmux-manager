@@ -8,7 +8,7 @@ use crate::control::reservation::{CaptureFormat, PaneCapture, PaneInspection};
 use atm_core::harness_control::{ControlDialog, ControlScreen, HookListEntry};
 use atm_core::{DialogState, Harness, InputState, ScreenFacts, ScreenInput};
 
-const ROOT: u32 = 4100;
+pub(super) const ROOT: u32 = 4100;
 
 const CLAUDE_FRESH: &str = include_str!(
     "../../../atm-claude-adapter/tests/fixtures/screen_styled_u5b_rich-enabled-fresh_2.1.325.txt"
@@ -68,7 +68,7 @@ pub(super) fn body(fixture: &str) -> &str {
     }
 }
 
-fn capture(
+pub(super) fn capture(
     text: &str,
     format: CaptureFormat,
     root: Option<u32>,
@@ -96,7 +96,7 @@ fn capture(
     PaneCapture::new(text.into(), inspection, format)
 }
 
-fn pinned(command: &str) -> PaneBaseline {
+pub(super) fn pinned(command: &str) -> PaneBaseline {
     PaneBaseline::shell(ROOT, "zsh".into())
         .with_harness(command.into())
         .unwrap()

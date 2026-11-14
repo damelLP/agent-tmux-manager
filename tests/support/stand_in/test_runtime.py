@@ -46,6 +46,23 @@ def journal(r):
 
 
 class ControlTests(unittest.TestCase):
+    def test_status_record_follows_forwarding_not_the_draft_redraw(self):
+        r = runtime()
+        sent = []
+        def forward(data):
+            self.assertFalse(any(e["kind"] == "status" for e in journal(r)))
+            sent.append(data["session_id"])
+        r.forward = forward
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.render())
+            r.input(b"/atm/status old-id")
+            self.assertEqual(sent, [])
+            r.input(b"\r")
+        self.assertEqual(sent, ["old-id"])
+        status = next(e for e in journal(r) if e["kind"] == "status")
+        self.assertEqual(status["data"]["session_id"], "old-id")
+        self.assertEqual(journal(r)[-1]["draft"], "")
+
     def test_source_replay_uses_terminal_barrier_without_model_readiness(self):
         r = runtime()
         with redirect_stdout(io.StringIO()) as output:

@@ -128,7 +128,7 @@ fn paste_frame(
     let after = rig.event_cursor(pane);
     rig.paste(pane, text);
     rig.wait_event(pane, after, |e| {
-        e["kind"] == "rendered" && e["state"] == state
+        e["kind"] == "rendered" && e["state"] == state && e["draft"] == ""
     })
 }
 
@@ -168,12 +168,20 @@ fn claude_stand_in_lifecycle() {
         "SessionEnd must remove the row during the gap"
     );
     // Synthetic: replay a captured-shaped status after SessionEnd but before the new start.
-    paste_frame(
+    let after = rig.event_cursor(&pane);
+    let submitted = paste_frame(
         &rig,
         &pane,
         &format!("/atm/status {}", original.id),
         "clearing",
     );
+    assert_eq!(
+        submitted["draft"], "",
+        "must await submission, not its draft redraw"
+    );
+    rig.wait_event(&pane, after, |e| {
+        e["kind"] == "status" && e["data"]["session_id"] == original.id.as_str()
+    });
     assert!(
         rig.pane_rows(&pane).is_empty(),
         "late status must not resurrect the old row"

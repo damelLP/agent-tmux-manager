@@ -269,9 +269,12 @@ class Runtime:
                     continue
                 effect = dict(effect, sequence=self.render_sequence, draft=draft,
                               source=screen.source)
-            self.record(effect)
+            if effect["kind"] != "status":
+                self.record(effect)
             if effect["kind"] in ("event", "status"):
                 self.forward(effect["data"])
+                if effect["kind"] == "status":
+                    self.record(effect)
             elif effect["kind"] == "draft":
                 self.parser.draft = bytearray(effect["text"].encode())
             elif effect["kind"] == "render":

@@ -77,23 +77,12 @@ impl Queue {
             } else {
                 PaneLiveness::Unknown
             },
-            agent_status: agent.status,
-            agent_not_ready_since: None,
-            other_delivery_in_flight: self
-                .state
-                .messages()
-                .any(|m| m.id != id && delivery_in_flight(m, self.recipient(id))),
             last_paste_at: self.last_paste_at,
-            hold_since: None,
-            stale_blocker_since: None,
-            last_attempt_before_start: false,
             copy_mode: Some(false),
             dialog_open: Some(false),
             owner_focused: false,
             input_line: InputLine::EmptySince(at(-10)),
-            send_now: false,
-            confirmation: None,
-            probably_landed: false,
+            ..RecipientLiveView::new(self.message(id), agent, self.state.messages())
         }
     }
     fn step(

@@ -1,0 +1,1011 @@
+//! Synthetic neutral observations and committed org facts; no harness payloads.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use super::{message_evidence::AttemptScope, message_history::*};
+use crate::control::reservation::PaneId;
+use atm_core::{DialogState, Harness, InputState, ScreenFacts, SessionStatus, TurnState};
+use atm_org::{
+    delivery::{
+        next_delivery, DeliveryPolicy, DeliveryStep, FailureReason, InputLine, PaneLiveness,
+        WaitReason,
+    },
+    Address, AgentId, DeliveryReceipt, MessageContent, MessageId, MessageKind, OrgEvent,
+};
+use chrono::{DateTime, TimeDelta, Utc};
+use std::collections::HashSet;
+
+fn at(ms: i64) -> DateTime<Utc> {
+    "2026-11-14T12:00:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::milliseconds(ms)
+}
+fn agent() -> AgentId {
+    "p/worker".parse().unwrap()
+}
+fn pane() -> PaneId {
+    PaneId::parse("%1").unwrap()
+}
+fn content(to: AgentId) -> MessageContent {
+    MessageContent {
+        from: Address::Owner,
+        to: Address::Agent(to),
+        kind: MessageKind::Note,
+        body: "brief".into(),
+        attachments: vec![],
+        task: None,
+    }
+}
+fn observation(status: SessionStatus) -> RecipientObservation {
+    let mut facts = ScreenFacts::default();
+    facts.input = InputState::Empty;
+    facts.turn = TurnState::NotRunning;
+    facts.dialog = DialogState::None;
+    RecipientObservation {
+        pane: Some(pane()),
+        session: Some(SessionObservation {
+            id: "s1".into(),
+            harness: Harness::Pi,
+            status,
+            last_event_at: Some(at(0)),
+        }),
+        presence: PanePresence::Alive,
+        facts,
+        copy_mode: Some(false),
+        focused: Some(false),
+    }
+}
+
+struct Fixture {
+    history: MessageHistory,
+    seq: u64,
+    id: MessageId,
+}
+impl Fixture {
+    fn new(high_water: u64) -> Self {
+        let mut f = Self {
+            history: MessageHistory::new(high_water, at(0), DeliveryPolicy::default()),
+            seq: 0,
+            id: MessageId::new(3),
+        };
+        f.apply(
+            OrgEvent::ProjectRegistered {
+                project_id: "p".parse().unwrap(),
+                root: "/project".into(),
+            },
+            0,
+        );
+        f.apply(
+            OrgEvent::AgentAdopted {
+                agent_id: agent(),
+                pane: "%1".into(),
+                session_id: Some("s1".into()),
+            },
+            0,
+        );
+        f.apply(OrgEvent::MessageSent(content(agent())), 0);
+        f
+    }
+    fn apply(&mut self, event: OrgEvent, ms: i64) {
+        self.seq += 1;
+        self.history
+            .record(
+                HistoryUpdate::Applied {
+                    seq: self.seq,
+                    at: at(ms),
+                    event: Some(event),
+                },
+                at(ms),
+            )
+            .unwrap();
+    }
+    fn record(&mut self, update: HistoryUpdate, ms: i64) {
+        self.history.record(update, at(ms)).unwrap();
+    }
+    fn observe(&mut self, observation: RecipientObservation, ms: i64) {
+        self.record(
+            HistoryUpdate::Observed {
+                recipient: agent(),
+                observation,
+            },
+            ms,
+        );
+    }
+    fn snapshot(&self, ms: i64) -> DeliverySnapshot {
+        self.history.snapshot(self.id, at(ms)).unwrap()
+    }
+    fn step(&self, ms: i64) -> DeliveryStep {
+        let s = self.snapshot(ms);
+        next_delivery(&s.message, &s.live, at(ms), &DeliveryPolicy::default()).unwrap()
+    }
+    fn consume(&mut self, ms: i64) -> DeliveryStep {
+        let step = self.step(ms);
+        self.record(
+            HistoryUpdate::Consumed {
+                id: self.id,
+                step: step.clone(),
+            },
+            ms,
+        );
+        step
+    }
+    fn attempt(&mut self, ms: i64) -> AttemptScope {
+        self.apply(
+            OrgEvent::MessageDeliveryAttempted {
+                message_id: self.id,
+                attempt: 1,
+                pane: "%1".into(),
+            },
+            ms,
+        );
+        AttemptScope {
+            message_id: self.id,
+            attempt_seq: self.seq,
+            recipient: agent(),
+            pane: pane(),
+            harness: Harness::Pi,
+            session_id: Some("s1".into()),
+            excluded_sessions: HashSet::new(),
+        }
+    }
+}
+fn wait(step: DeliveryStep, expected: WaitReason) {
+    assert!(
+        matches!(step, DeliveryStep::Wait { reason, .. } if reason == expected),
+        "{step:?}"
+    );
+}
+fn blocked(step: DeliveryStep, expected: FailureReason) {
+    assert_eq!(step, DeliveryStep::Blocked { reason: expected });
+}
+
+#[test]
+fn changing_blockers_keep_hold() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    wait(f.consume(0), WaitReason::InputNotEmpty);
+    obs.facts.dialog = DialogState::Permission;
+    f.observe(obs, 60_000);
+    wait(f.consume(60_000), WaitReason::DialogOpen);
+    assert_eq!(f.snapshot(60_000).live.hold_since, Some(at(0)));
+    blocked(f.step(120_000), FailureReason::DialogOpen);
+}
+
+#[test]
+fn flapping_empty_is_bounded() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    for ms in [0, 30_000, 60_000, 90_000] {
+        obs.facts.input = InputState::Draft;
+        f.observe(obs.clone(), ms);
+        wait(f.consume(ms), WaitReason::InputNotEmpty);
+        obs.facts.input = InputState::Empty;
+        f.observe(obs.clone(), ms + 1);
+        wait(f.consume(ms + 1), WaitReason::IdleStabilizing);
+    }
+    obs.facts.input = InputState::Draft;
+    f.observe(obs, 120_000);
+    assert_eq!(f.snapshot(120_000).live.hold_since, Some(at(0)));
+    blocked(f.step(120_000), FailureReason::DraftPresent);
+}
+
+#[test]
+fn agent_outage_resets_hold_on_recovery() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    f.consume(0);
+    f.apply(
+        OrgEvent::AgentStuck {
+            agent_id: agent(),
+            reason: "outage".into(),
+        },
+        100_000,
+    );
+    blocked(f.consume(100_000), FailureReason::AgentUnavailable);
+    f.apply(OrgEvent::AgentEditorReady { agent_id: agent() }, 200_000);
+    f.observe(obs, 200_000);
+    wait(f.consume(200_000), WaitReason::InputNotEmpty);
+    assert_eq!(f.snapshot(200_000).live.hold_since, Some(at(200_000)));
+    blocked(f.step(320_000), FailureReason::DraftPresent);
+}
+
+#[test]
+fn starting_clearing_preserve_clock() {
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::AgentSessionLost { agent_id: agent() }, 10_000);
+    f.apply(OrgEvent::AgentClearRequested { agent_id: agent() }, 50_000);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.session = None;
+    f.observe(obs, 100_000);
+    assert_eq!(
+        f.snapshot(100_000).live.agent_not_ready_since,
+        Some(at(10_000))
+    );
+    wait(f.step(129_999), WaitReason::AgentNotReady);
+    blocked(f.step(130_000), FailureReason::AgentNotReadyTimeout);
+}
+
+#[test]
+fn down_to_starting_gets_new_budget() {
+    let mut f = Fixture::new(0);
+    f.apply(
+        OrgEvent::AgentDown {
+            agent_id: agent(),
+            reason: "down".into(),
+        },
+        1_000,
+    );
+    f.apply(
+        OrgEvent::AgentAdopted {
+            agent_id: agent(),
+            pane: "%1".into(),
+            session_id: None,
+        },
+        200_000,
+    );
+    let mut obs = observation(SessionStatus::Idle);
+    obs.session = None;
+    f.observe(obs, 200_000);
+    assert_eq!(
+        f.snapshot(200_000).live.agent_not_ready_since,
+        Some(at(200_000))
+    );
+    wait(f.step(319_999), WaitReason::AgentNotReady);
+    blocked(f.step(320_000), FailureReason::AgentNotReadyTimeout);
+}
+
+#[test]
+fn stale_blocker_masking_resets_short_clock() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Working);
+    obs.session.as_mut().unwrap().last_event_at = Some(at(-120_000));
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    wait(f.consume(0), WaitReason::InputNotEmpty);
+    obs.copy_mode = Some(true);
+    f.observe(obs.clone(), 500);
+    wait(f.consume(500), WaitReason::CopyMode);
+    assert_eq!(f.snapshot(500).live.stale_blocker_since, None);
+    obs.copy_mode = Some(false);
+    f.observe(obs, 1_000);
+    assert_eq!(f.snapshot(1_000).live.stale_blocker_since, Some(at(1_000)));
+    assert_eq!(f.snapshot(1_000).live.hold_since, Some(at(0)));
+    wait(f.step(1_749), WaitReason::InputNotEmpty);
+    blocked(f.step(1_750), FailureReason::DraftPresent);
+}
+
+#[test]
+fn unknown_query_not_pane_death() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.presence = PanePresence::Gone;
+    f.observe(obs.clone(), 0);
+    wait(f.consume(0), WaitReason::PaneGoneGrace);
+    obs.presence = PanePresence::Unknown;
+    f.observe(obs.clone(), 1_999);
+    assert_eq!(f.snapshot(2_000).live.pane, PaneLiveness::Unknown);
+    obs.presence = PanePresence::Gone;
+    f.observe(obs, 3_000);
+    assert_eq!(
+        f.snapshot(3_000).live.pane,
+        PaneLiveness::GoneSince(at(3_000))
+    );
+    wait(f.step(4_999), WaitReason::PaneGoneGrace);
+    assert_eq!(
+        f.step(5_000),
+        DeliveryStep::Fail {
+            reason: FailureReason::PaneGone
+        }
+    );
+}
+
+#[test]
+fn working_to_working_counts_in_receive_order() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Working), 0);
+    let scope = f.attempt(10_000);
+    f.record(HistoryUpdate::Armed { scope }, 10_000);
+    f.record(
+        HistoryUpdate::Activity {
+            session_id: "s1".into(),
+            pane: Some(pane()),
+            at: at(-1_000),
+        },
+        20_000,
+    );
+    let live = f.snapshot(20_000).live;
+    assert_eq!(live.session.as_ref().unwrap().last_event_at, at(-1_000));
+    assert_eq!(live.session.unwrap().status_since, at(0));
+    // Evidence's receive-order latch is copied by the slot holder, not inferred
+    // from row status by history. A1 has no second evidence implementation.
+    f.record(
+        HistoryUpdate::Evidence {
+            id: f.id,
+            receipt: None,
+            probably_landed: true,
+        },
+        20_000,
+    );
+    blocked(f.step(20_000), FailureReason::ProbablyDelivered);
+    let mut poll = observation(SessionStatus::Working);
+    poll.session.as_mut().unwrap().last_event_at = Some(at(50_000));
+    f.observe(poll, 50_000);
+    assert_eq!(
+        f.snapshot(50_000).live.session.unwrap().last_event_at,
+        at(-1_000)
+    );
+}
+
+#[test]
+fn clock_backwards_not_process_restart() {
+    let mut f = Fixture::new(3);
+    f.observe(observation(SessionStatus::Idle), 0);
+    f.attempt(-10_000);
+    assert!(!f.snapshot(0).live.last_attempt_before_start);
+    assert!(matches!(f.step(0), DeliveryStep::RetryAt { .. }));
+}
+
+#[test]
+fn queued_attempt_replay_is_restarted() {
+    let mut f = Fixture::new(5);
+    f.attempt(100_000);
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "timeout".into(),
+            final_failure: false,
+        },
+        101_000,
+    );
+    f.observe(observation(SessionStatus::Idle), 200_000);
+    assert!(f.snapshot(300_000).live.last_attempt_before_start);
+    assert_eq!(f.snapshot(300_000).last_attempt_seq, Some(4));
+    blocked(f.step(300_000), FailureReason::Restarted);
+}
+
+#[test]
+fn retry_follows_recipient_not_reused_pane() {
+    let mut f = Fixture::new(0);
+    f.attempt(0);
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        3_000,
+    );
+    f.apply(OrgEvent::MessageSent(content(agent())), 4_000);
+    let follower = MessageId::new(f.seq);
+    f.apply(
+        OrgEvent::AgentAdopted {
+            agent_id: agent(),
+            pane: "%2".into(),
+            session_id: Some("s2".into()),
+        },
+        5_000,
+    );
+    let other: AgentId = "p/other".parse().unwrap();
+    f.apply(
+        OrgEvent::AgentAdopted {
+            agent_id: other.clone(),
+            pane: "%1".into(),
+            session_id: Some("s3".into()),
+        },
+        5_000,
+    );
+    f.apply(OrgEvent::MessageSent(content(other.clone())), 5_000);
+    let other_message = MessageId::new(f.seq);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.pane = Some(PaneId::parse("%2").unwrap());
+    obs.session.as_mut().unwrap().id = "s2".into();
+    f.observe(obs, 5_000);
+    let follower_view = f.history.snapshot(follower, at(20_000)).unwrap();
+    assert!(follower_view.live.other_delivery_in_flight);
+    assert_eq!(follower_view.blocked_by, Some(f.id));
+    wait(
+        next_delivery(
+            &follower_view.message,
+            &follower_view.live,
+            at(20_000),
+            &DeliveryPolicy::default(),
+        )
+        .unwrap(),
+        WaitReason::OtherDelivery,
+    );
+    let mut obs = observation(SessionStatus::Idle);
+    obs.session.as_mut().unwrap().id = "s3".into();
+    f.record(
+        HistoryUpdate::Observed {
+            recipient: other,
+            observation: obs,
+        },
+        5_000,
+    );
+    let free = f.history.snapshot(other_message, at(20_000)).unwrap();
+    assert!(!free.live.other_delivery_in_flight);
+    assert_eq!(free.blocked_by, None);
+    assert_eq!(
+        next_delivery(
+            &free.message,
+            &free.live,
+            at(20_000),
+            &DeliveryPolicy::default()
+        )
+        .unwrap(),
+        DeliveryStep::PasteNow { attempt: 1 }
+    );
+}
+
+#[test]
+fn input_turn_dialog_truth_table_and_unknown_focus() {
+    for input in [InputState::Empty, InputState::Draft, InputState::Unknown] {
+        for turn in [
+            TurnState::NotRunning,
+            TurnState::Running,
+            TurnState::Unknown,
+        ] {
+            for dialog in [
+                DialogState::None,
+                DialogState::Permission,
+                DialogState::Unknown,
+            ] {
+                let mut f = Fixture::new(0);
+                let mut obs = observation(SessionStatus::Idle);
+                obs.facts.input = input;
+                obs.facts.turn = turn;
+                obs.facts.dialog = dialog.clone();
+                f.observe(obs, 0);
+                let live = f.snapshot(20_000).live;
+                let expected = if input == InputState::Draft {
+                    InputLine::NonEmpty
+                } else if input == InputState::Empty
+                    && turn == TurnState::NotRunning
+                    && dialog == DialogState::None
+                {
+                    InputLine::EmptySince(at(0))
+                } else {
+                    InputLine::Unknown
+                };
+                assert_eq!(live.input_line, expected);
+                assert_eq!(
+                    live.dialog_open,
+                    match dialog {
+                        DialogState::None => Some(false),
+                        DialogState::Permission => Some(true),
+                        _ => None,
+                    }
+                );
+                assert_eq!(
+                    matches!(f.step(20_000), DeliveryStep::PasteNow { .. }),
+                    expected == InputLine::EmptySince(at(0))
+                );
+            }
+        }
+    }
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.focused = None;
+    f.observe(obs, 0);
+    wait(f.step(20_000), WaitReason::OwnerFocused);
+}
+
+#[test]
+fn loss_identity_and_paste_reset_continuity_without_fabricating_landing() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Idle), 0);
+    assert_eq!(f.step(10_000), DeliveryStep::PasteNow { attempt: 1 });
+    f.record(
+        HistoryUpdate::ObservationLost { recipient: agent() },
+        10_000,
+    );
+    assert_eq!(f.snapshot(10_000).live.input_line, InputLine::Unknown);
+    assert_eq!(f.snapshot(10_000).live.pane, PaneLiveness::Unknown);
+    f.observe(observation(SessionStatus::Idle), 20_000);
+    assert_eq!(
+        f.snapshot(20_000).live.input_line,
+        InputLine::EmptySince(at(20_000))
+    );
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "s2".into(),
+        },
+        21_000,
+    );
+    let mut obs = observation(SessionStatus::Idle);
+    obs.session.as_mut().unwrap().id = "s2".into();
+    f.observe(obs.clone(), 22_000);
+    assert_eq!(
+        f.snapshot(22_000).live.session.unwrap().status_since,
+        at(22_000)
+    );
+    let scope = f.attempt(23_000);
+    f.record(HistoryUpdate::Armed { scope }, 23_000);
+    let before = f.snapshot(23_000).live;
+    f.record(
+        HistoryUpdate::Paste {
+            id: f.id,
+            pane: pane(),
+            certainty: EffectCertainty::NotStarted,
+        },
+        24_000,
+    );
+    assert_eq!(f.snapshot(24_000).live, before);
+    for certainty in [EffectCertainty::Applied, EffectCertainty::Unknown] {
+        f.record(
+            HistoryUpdate::Paste {
+                id: f.id,
+                pane: pane(),
+                certainty,
+            },
+            25_000,
+        );
+        let live = f.snapshot(25_000).live;
+        assert_eq!(live.input_line, InputLine::Unknown);
+        assert_eq!(live.last_paste_at, Some(at(25_000)));
+        assert!(!live.probably_landed);
+        f.observe(obs.clone(), 26_000);
+        assert_eq!(
+            f.snapshot(26_000).live.session.unwrap().status_since,
+            at(26_000)
+        );
+    }
+}
+
+#[test]
+fn post_paste_and_unknown_presence_restart_status_once_then_stabilize() {
+    let mut f = Fixture::new(0);
+    let obs = observation(SessionStatus::Idle);
+    f.observe(obs.clone(), 0);
+    f.attempt(10_000);
+    f.record(
+        HistoryUpdate::Paste {
+            id: f.id,
+            pane: pane(),
+            certainty: EffectCertainty::Applied,
+        },
+        11_000,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "no submit".into(),
+            final_failure: false,
+        },
+        12_000,
+    );
+    f.observe(obs.clone(), 13_000);
+    f.observe(obs.clone(), 14_000);
+    assert_eq!(
+        f.snapshot(23_000).live.session.unwrap().status_since,
+        at(13_000)
+    );
+    assert_eq!(f.step(23_000), DeliveryStep::PasteNow { attempt: 2 });
+    let mut unknown = obs.clone();
+    unknown.presence = PanePresence::Unknown;
+    f.observe(unknown, 24_000);
+    f.observe(obs, 25_000);
+    assert_eq!(
+        f.snapshot(35_000).live.session.unwrap().status_since,
+        at(25_000)
+    );
+    assert_eq!(f.step(35_000), DeliveryStep::PasteNow { attempt: 2 });
+}
+
+#[test]
+fn missing_provenance_and_repeated_polls_never_make_a_busy_row_stale() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Working);
+    obs.session.as_mut().unwrap().last_event_at = None;
+    f.observe(obs.clone(), 0);
+    f.observe(obs, 1_000_000);
+    wait(f.step(1_000_000), WaitReason::SessionBusy);
+    assert_eq!(
+        f.snapshot(1_000_000).live.session.unwrap().status_since,
+        at(0)
+    );
+    f.record(
+        HistoryUpdate::Activity {
+            session_id: "replacement".into(),
+            pane: Some(pane()),
+            at: at(-200_000),
+        },
+        1_000_000,
+    );
+    wait(f.step(1_000_000), WaitReason::SessionBusy);
+}
+
+#[test]
+fn applied_duplicates_and_gaps_never_reapply_or_skip_state() {
+    let mut f = Fixture::new(0);
+    f.record(
+        HistoryUpdate::Applied {
+            seq: 3,
+            at: at(0),
+            event: Some(OrgEvent::MessageSent(content(agent()))),
+        },
+        1_000,
+    );
+    assert_eq!(f.history.cursor(), 3);
+    assert!(f
+        .history
+        .record(
+            HistoryUpdate::Applied {
+                seq: 5,
+                at: at(0),
+                event: None
+            },
+            at(0)
+        )
+        .is_err());
+    assert_eq!(f.history.cursor(), 3);
+    f.record(
+        HistoryUpdate::Applied {
+            seq: 4,
+            at: at(0),
+            event: None,
+        },
+        0,
+    );
+    assert_eq!(f.history.cursor(), 4);
+    assert!(f.history.snapshot(MessageId::new(4), at(0)).is_err());
+}
+
+#[test]
+fn executor_holds_and_retry_are_attempt_scoped_and_receipt_wins() {
+    for hold in [
+        ExecutorHold::StagedMismatch,
+        ExecutorHold::InputOutcomeUnknown,
+        ExecutorHold::TokenVisible,
+    ] {
+        let mut f = Fixture::new(0);
+        let scope = f.attempt(0);
+        f.record(
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            0,
+        );
+        f.record(
+            HistoryUpdate::Held {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+                hold,
+            },
+            1_000,
+        );
+        f.record(
+            HistoryUpdate::Evidence {
+                id: f.id,
+                receipt: None,
+                probably_landed: false,
+            },
+            2_000,
+        );
+        f.record(
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            2_000,
+        );
+        assert_eq!(f.snapshot(3_000).hold, Some(hold));
+        blocked(f.step(3_000), FailureReason::ProbablyDelivered);
+        assert!(f
+            .history
+            .record(
+                HistoryUpdate::OwnerRetry {
+                    id: f.id,
+                    attempt_seq: scope.attempt_seq + 1
+                },
+                at(3_000)
+            )
+            .is_err());
+        assert_eq!(f.snapshot(3_000).hold, Some(hold));
+        let receipt = DeliveryReceipt {
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        };
+        f.record(
+            HistoryUpdate::Evidence {
+                id: f.id,
+                receipt: Some(receipt.clone()),
+                probably_landed: false,
+            },
+            3_000,
+        );
+        f.record(
+            HistoryUpdate::OwnerRetry {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+            },
+            3_000,
+        );
+        assert_eq!(f.snapshot(3_000).hold, None);
+        assert!(!f.snapshot(3_000).live.probably_landed);
+        assert_eq!(f.snapshot(3_000).message.last_attempt.unwrap().attempt, 1);
+        assert_eq!(f.step(3_000), DeliveryStep::Confirm { receipt });
+    }
+}
+
+#[test]
+fn snapshots_do_not_consume_steps_and_errors_leave_history_unchanged() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    wait(f.step(0), WaitReason::InputNotEmpty);
+    assert_eq!(f.snapshot(1_000).live.hold_since, None);
+    f.consume(1_000);
+    assert_eq!(f.snapshot(2_000).live.hold_since, Some(at(1_000)));
+    let before = f.snapshot(2_000).live;
+    obs.session.as_mut().unwrap().status = SessionStatus::Working;
+    obs.session.as_mut().unwrap().last_event_at = Some(DateTime::<Utc>::MAX_UTC);
+    // A new source may supply initial provenance; an existing source's polls
+    // cannot replace its activity clock. Lose observation first.
+    f.record(HistoryUpdate::ObservationLost { recipient: agent() }, 2_000);
+    let lost = f.snapshot(2_000).live;
+    assert!(f
+        .history
+        .record(
+            HistoryUpdate::Observed {
+                recipient: agent(),
+                observation: obs
+            },
+            at(2_000)
+        )
+        .is_err());
+    assert_eq!(f.snapshot(2_000).live, lost);
+    assert_eq!(lost.hold_since, before.hold_since);
+    assert!(f
+        .history
+        .record(
+            HistoryUpdate::Consumed {
+                id: f.id,
+                step: DeliveryStep::PasteNow { attempt: 99 }
+            },
+            at(2_000)
+        )
+        .is_err());
+    assert_eq!(f.snapshot(2_000).live, lost);
+}
+
+#[test]
+fn replay_gate_owner_messages_and_fifo_are_explicit() {
+    let mut f = Fixture::new(4);
+    assert!(matches!(
+        f.history.snapshot(f.id, at(0)),
+        Err(super::messages::MessageError::Unavailable(_))
+    ));
+    f.record(
+        HistoryUpdate::Applied {
+            seq: 4,
+            at: at(0),
+            event: None,
+        },
+        0,
+    );
+    assert_eq!(f.snapshot(0).live.last_paste_at, Some(at(0)));
+    assert_eq!(f.snapshot(0).live.hold_since, Some(at(0)));
+    f.seq = 4;
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    assert_eq!(
+        f.history
+            .snapshot(MessageId::new(5), at(0))
+            .unwrap()
+            .blocked_by,
+        Some(f.id)
+    );
+    let mut owner = content(agent());
+    owner.to = Address::Owner;
+    f.apply(OrgEvent::MessageSent(owner), 0);
+    assert!(matches!(
+        f.history.snapshot(MessageId::new(6), at(0)),
+        Err(super::messages::MessageError::Refused(_))
+    ));
+}
+
+#[test]
+fn matching_retry_releases_restart_but_not_attempt_budget_or_late_receipt() {
+    let mut f = Fixture::new(4);
+    let scope = f.attempt(0);
+    assert!(f
+        .history
+        .record(
+            HistoryUpdate::Armed {
+                scope: scope.clone()
+            },
+            at(0)
+        )
+        .is_err());
+    blocked(f.step(10_000), FailureReason::Restarted);
+    f.record(
+        HistoryUpdate::OwnerRetry {
+            id: f.id,
+            attempt_seq: 4,
+        },
+        10_000,
+    );
+    assert!(!f.snapshot(10_000).live.last_attempt_before_start);
+    assert_eq!(f.snapshot(10_000).message.last_attempt.unwrap().attempt, 1);
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "gave up".into(),
+            final_failure: true,
+        },
+        10_000,
+    );
+    assert_eq!(f.step(10_000), DeliveryStep::Complete);
+    let receipt = DeliveryReceipt {
+        session_id: "s1".into(),
+        confirmation: "late exact".into(),
+    };
+    f.record(
+        HistoryUpdate::Evidence {
+            id: f.id,
+            receipt: Some(receipt.clone()),
+            probably_landed: false,
+        },
+        11_000,
+    );
+    assert_eq!(f.step(11_000), DeliveryStep::Confirm { receipt });
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: f.id,
+            session_id: "s1".into(),
+            confirmation: "late exact".into(),
+        },
+        11_000,
+    );
+    assert_eq!(f.step(11_000), DeliveryStep::Complete);
+}
+
+#[test]
+fn only_a_new_attempt_arm_releases_executor_hold() {
+    let mut f = Fixture::new(0);
+    let scope = f.attempt(0);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        0,
+    );
+    f.record(
+        HistoryUpdate::Held {
+            id: f.id,
+            attempt_seq: 4,
+            hold: ExecutorHold::TokenVisible,
+        },
+        1_000,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        3_000,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: f.id,
+            attempt: 2,
+            pane: "%1".into(),
+        },
+        5_000,
+    );
+    assert_eq!(f.snapshot(5_000).hold, Some(ExecutorHold::TokenVisible));
+    let mut new_scope = scope;
+    new_scope.attempt_seq = f.seq;
+    f.record(HistoryUpdate::Armed { scope: new_scope }, 5_000);
+    assert_eq!(f.snapshot(5_000).hold, None);
+    assert!(!f.snapshot(5_000).live.probably_landed);
+}
+
+#[test]
+fn metadata_preserves_clocks_and_activity_requires_current_session_and_pane() {
+    let mut f = Fixture::new(0);
+    let obs = observation(SessionStatus::Working);
+    f.observe(obs.clone(), 0);
+    f.apply(
+        OrgEvent::AgentPaneCreated {
+            agent_id: agent(),
+            pane: "%1".into(),
+        },
+        50_000,
+    );
+    assert_eq!(f.snapshot(50_000).live.session.unwrap().status_since, at(0));
+    f.record(
+        HistoryUpdate::Activity {
+            session_id: "s1".into(),
+            pane: Some(PaneId::parse("%9").unwrap()),
+            at: at(50_000),
+        },
+        50_000,
+    );
+    assert_eq!(
+        f.snapshot(50_000).live.session.unwrap().last_event_at,
+        at(0)
+    );
+    f.record(
+        HistoryUpdate::Activity {
+            session_id: "s1".into(),
+            pane: Some(pane()),
+            at: at(80_000),
+        },
+        90_000,
+    );
+    f.observe(obs, 100_000);
+    assert_eq!(
+        f.snapshot(100_000).live.session.unwrap().last_event_at,
+        at(80_000)
+    );
+    wait(f.step(199_999), WaitReason::SessionBusy);
+    assert_eq!(f.step(200_000), DeliveryStep::PasteNow { attempt: 1 });
+}
+
+#[test]
+fn invalid_identity_scope_and_applied_reference_leave_state_unchanged() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Idle), 0);
+    let before = f.snapshot(0).live;
+    let mut obs = observation(SessionStatus::Idle);
+    obs.pane = Some(PaneId::parse("%9").unwrap());
+    assert!(f
+        .history
+        .record(
+            HistoryUpdate::Observed {
+                recipient: agent(),
+                observation: obs
+            },
+            at(0)
+        )
+        .is_err());
+    assert_eq!(f.snapshot(0).live, before);
+    assert!(f
+        .history
+        .record(
+            HistoryUpdate::Applied {
+                seq: 4,
+                at: at(0),
+                event: Some(OrgEvent::AgentDown {
+                    agent_id: "p/missing".parse().unwrap(),
+                    reason: "invalid".into()
+                })
+            },
+            at(0)
+        )
+        .is_err());
+    assert_eq!(f.history.cursor(), 3);
+    let mut scope = f.attempt(0);
+    scope.pane = PaneId::parse("%9").unwrap();
+    assert!(f
+        .history
+        .record(HistoryUpdate::Armed { scope }, at(0))
+        .is_err());
+    assert!(!f.snapshot(0).live.probably_landed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn handle_fold_barrier_and_clones_share_applied_progress() {
+    let history = MessageHistoryHandle::new(1, at(0), DeliveryPolicy::default()).unwrap();
+    let copy = history.clone();
+    let wait = history.folded(1);
+    tokio::pin!(wait);
+    use std::{future::Future, task::Poll};
+    assert!(std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await);
+    copy.record(
+        HistoryUpdate::Applied {
+            seq: 1,
+            at: at(0),
+            event: None,
+        },
+        at(0),
+    )
+    .unwrap();
+    wait.await.unwrap();
+    history.folded(0).await.unwrap();
+    history.folded(1).await.unwrap();
+}

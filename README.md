@@ -60,6 +60,8 @@ default_args = ["x", "pi"]
 
 Environment overrides still take precedence when set (`ATM_SPAWN_PI_BIN/ARGS`, then legacy `ATM_SPAWN_BIN/ARGS`); otherwise config values are used, then built-in defaults.
 
+Codex launches through atm require codex-cli 0.158.0 or later for `--no-daemon` support.
+
 A `BIN` override drops ordinary configured `default_args`, but keeps adapter-required arguments (Codex's `--no-daemon`) and role/extra arguments. The command order is: binary, eligible defaults, raw `ARGS`, required arguments, role/extra arguments, model, then prompt. For example, `ATM_SPAWN_CODEX_BIN=mise ATM_SPAWN_CODEX_ARGS='x codex'` produces `mise x codex '--no-daemon'`.
 
 Required arguments appear exactly once across the builder's typed defaults, required and role/extra inputs: exact matching tokens move to the required block, in policy order. Other repeated tokens keep their order and multiplicity. This is token matching, not an option/value parser: a token equal to a required argument is reserved even in a value position.

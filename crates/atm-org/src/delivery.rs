@@ -557,6 +557,41 @@ mod tests {
     }
 
     #[test]
+    fn queued_final_failure_ends_a_hold_and_accepts_late_receipt() {
+        let mut h = History::new(false);
+        assert!(h
+            .state
+            .decide(
+                &OrgCommand::DeliveryFailed {
+                    message_id: h.id,
+                    reason: "give up".into(),
+                    final_failure: false,
+                },
+                time(0)
+            )
+            .is_err());
+        h.failure(true, 0);
+        assert_eq!(h.message().status, DeliveryStatus::Failed);
+        assert_eq!(
+            h.command(
+                OrgCommand::DeliveryFailed {
+                    message_id: h.id,
+                    reason: "timeout".into(),
+                    final_failure: true,
+                },
+                time(1)
+            ),
+            0
+        );
+        let mut live = ready();
+        live.confirmation = Some(receipt());
+        assert_eq!(
+            h.step(&live, 2),
+            DeliveryStep::Confirm { receipt: receipt() }
+        );
+    }
+
+    #[test]
     fn stable_idle_boundary_and_retry_window() {
         let h = History::new(false);
         let mut live = ready();
@@ -955,17 +990,20 @@ mod tests {
                 reason: FailureReason::PaneGone
             }
         );
-        assert!(h
-            .state
-            .decide(
-                &OrgCommand::DeliveryFailed {
-                    message_id: h.id,
-                    reason: "gone".into(),
-                    final_failure: true
-                },
-                time(0)
-            )
-            .is_err());
+        assert_eq!(
+            h.state
+                .decide(
+                    &OrgCommand::DeliveryFailed {
+                        message_id: h.id,
+                        reason: "gone".into(),
+                        final_failure: true
+                    },
+                    time(0)
+                )
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(h.step(&ready(), 0), DeliveryStep::PasteNow { attempt: 1 });
         h.attempt(1, 0);
         assert_eq!(

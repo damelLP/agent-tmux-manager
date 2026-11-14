@@ -40,8 +40,9 @@
 //! otherwise it requires queued and a positive increasing attempt. Delivered
 //! records confirmations from queued, delivering or failed, and is a no-op only
 //! when already delivered (unknown messages refuse). DeliveryFailed requires
-//! delivering, except terminal messages and identical retryable failures already
-//! queued are no-ops. Read requires delivered messages addressed to the caller;
+//! delivering, or queued for a final failure (giving up on a held message).
+//! Terminal messages and identical retryable failures already queued are no-ops.
+//! Read requires delivered messages addressed to the caller;
 //! an entirely read/empty batch is a no-op. Summary reports replace complete
 //! snapshots, require a known agent when bound, and deduplicate identical facts.
 //! They accept ended before started: wall-clock steps must not drop last cost.

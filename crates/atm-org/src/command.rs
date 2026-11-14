@@ -355,7 +355,9 @@ impl OrgState {
                 {
                     false
                 } else {
-                    if message.status != DeliveryStatus::Delivering {
+                    if message.status != DeliveryStatus::Delivering
+                        && !(message.status == DeliveryStatus::Queued && *final_failure)
+                    {
                         return Err(delivery_refusal(message, "fail delivery"));
                     }
                     true

@@ -72,17 +72,30 @@ pub(super) async fn dispatch(
             text,
             reply,
         } => {
-            let result = outcome(pending.deadline, async {
-                let ready = prepared?;
-                Ok(crate::control::send::send_resolved(
-                    client,
-                    &ready.sessions,
-                    &target,
-                    ready.pane.as_str(),
-                    &text,
+            let result = async {
+                let ready = outcome(pending.deadline, async {
+                    let ready = prepared?;
+                    crate::control::send::check_send(
+                        client,
+                        &ready.sessions,
+                        &target,
+                        ready.pane.as_str(),
+                        &text,
+                    )
+                    .await?;
+                    Ok(ready)
+                })
+                .await?;
+                if Instant::now() >= pending.deadline {
+                    return Err(ServiceError::Timeout);
+                }
+                // Admission expires before the first effect, never between paste
+                // and Enter. Each tmux call retains its own bounded timeout.
+                Ok(
+                    crate::control::send::paste_and_submit(client, ready.pane.as_str(), &text)
+                        .await?,
                 )
-                .await?)
-            })
+            }
             .await;
             respond(reply, result, |result| {
                 pane.as_deref().map(|pane| {
@@ -91,13 +104,16 @@ pub(super) async fn dispatch(
             })
         }
         Request::Type { command, reply, .. } => {
-            let result = outcome(pending.deadline, async {
+            let result = async {
                 let ready = prepared?;
+                if Instant::now() >= pending.deadline {
+                    return Err(ServiceError::Timeout);
+                }
                 Ok(
                     crate::control::type_spawn_command(client, ready.pane.as_str(), &command)
                         .await?,
                 )
-            })
+            }
             .await;
             respond(reply, result, |result| {
                 pane.as_deref().map(|pane| {

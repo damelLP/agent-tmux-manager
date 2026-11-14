@@ -1,4 +1,6 @@
 //! Legacy input must share the reservation fence, including aliases and restart.
+#[path = "legacy_deadline_tests.rs"]
+mod deadline_tests;
 #[path = "legacy_wait_tests.rs"]
 mod wait_tests;
 use super::*;

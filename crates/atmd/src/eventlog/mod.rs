@@ -26,15 +26,43 @@
 //! pruned. Before deleting a nonempty newest segment, an empty successor named
 //! by the next sequence is created and the directory synced. The empty newest
 //! segment is never pruned: its name preserves the high-water mark even if every
-//! old record is removed. No checkpoint file or second metadata format is used.
-//! Subscribers
-//! receive committed envelopes in sequence order (not historical records).
+//! old record is removed. Prune failures warn with the affected path rather than
+//! prevent raw opening; failed successor preparation keeps all old segments.
+//!
+//! # Durability and watching
+//! Subscribers receive successful appends in order, not historical records.
 //! A bounded live channel can return `Lagged`; use replay to recover a gap.
+//! To watch without leaving a gap: subscribe first, then `read_from(.., cursor)`,
+//! then discard live envelopes with `seq <=` the last replayed sequence. Continue
+//! advancing the cursor as live envelopes are delivered. Replaying before
+//! subscribing leaves a gap. If the receiver lags during catch-up, replay again.
+//!
+//! Replay is not bounded by acknowledgements: it can return a record before its
+//! append was acknowledged, including while an events sync is pending or after
+//! it failed. `WriteOutcomeUnknown` and `TimeoutAfterHandover` both mean a record
+//! may be in the log; lack of an acknowledgement is not evidence of absence.
+//! Raw sequence numbers are unique per OS boot: after a power cut, unsynced raw
+//! records can vanish and their numbers can be reused. The same applies to an
+//! events record observed by replay before its sync completed. A cursor kept
+//! across reboot can therefore skip new records; consumers must account for this.
 //!
 //! Open and replay perform blocking work with no internal timeout. Async callers
 //! must run them on detached threads, never `spawn_blocking` (a hung filesystem
 //! would otherwise prevent runtime shutdown). They remain safe to call on any
 //! thread, including a Tokio worker, but can block that caller.
+//!
+//! # Daemon lifecycle
+//! Resolve a relative state directory to an absolute path before daemonization
+//! changes the working directory, but open the log only after `daemonize()`.
+//! The lock fd/handle is not fork-safe: a forked child inherits the lock and
+//! handles, but not the writer thread. Dropping the last handle releases the
+//! lock only when the writer ends, so an immediate reopen in the same process
+//! can briefly return `Locked`; a hung writer holds it until process exit.
+//! Append's deadline uses Tokio time. Tests using a paused clock must not use a
+//! real log: clock auto-advance races the real writer's filesystem I/O.
+//! Subscribers do not see `Closed` while any handle lives, even if the writer
+//! stopped. A stopped writer is detected through append errors; the owner must
+//! tear down its watchers when appropriate.
 
 mod format;
 mod lock;

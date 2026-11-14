@@ -2,6 +2,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -60,6 +61,17 @@ impl Rig {
     }
 
     fn start(&mut self, side: &str, state: Option<&Path>) -> u32 {
+        let (release, reap_after) = mpsc::channel();
+        drop(release);
+        self.start_reaping_after(side, state, reap_after)
+    }
+
+    fn start_reaping_after(
+        &mut self,
+        side: &str,
+        state: Option<&Path>,
+        reap_after: Receiver<()>,
+    ) -> u32 {
         let log = std::fs::File::create(self.root.path().join(format!("{side}.stderr"))).unwrap();
         let mut child = self
             .atmd(side, state)
@@ -71,8 +83,11 @@ impl Rig {
             .unwrap();
         let pid = child.id();
         let (tx, rx) = mpsc::channel();
-        // Reap concurrently: `atmd stop` waits for /proc/<pid> to disappear.
-        std::thread::spawn(move || tx.send(child.wait().unwrap()).ok());
+        // A held sender delays reaping; dropping it also releases on panic.
+        std::thread::spawn(move || {
+            let _ = reap_after.recv();
+            tx.send(child.wait().unwrap()).ok()
+        });
         self.reapers.push(rx);
         self.ready(side);
         pid
@@ -123,10 +138,22 @@ impl Rig {
             .parse::<u32>()
             .unwrap();
         assert!(self.owns(pid), "refusing an unowned PID");
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        // SAFETY: pidfd_open returned a valid, uniquely owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert!(self.owns(pid), "ownership changed before stop");
         let out = stand_in::bounded::run(self.atmd(side, Some(state)).arg("stop"));
         assert!(out.status.success(), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("PID {pid}")));
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        // Exit, not reaping: a non-reaping parent may retain /proc/<pid>.
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 1);
+        assert_ne!(poll.revents & libc::POLLIN, 0, "daemon has not exited");
         assert!(!self.socket(side).exists());
     }
 }
@@ -167,6 +194,20 @@ impl Drop for Rig {
                 .expect("foreground daemon exit");
         }
     }
+}
+
+// Counting /proc/<pid> existence as liveness makes stop time out on this
+// already-exited child, independently of whether the host's PID 1 reaps.
+#[test]
+fn stop_succeeds_before_the_parent_reaps_the_daemon() {
+    let mut rig = Rig::new();
+    // Declared after the rig: on panic this drops before Rig::drop joins reapers.
+    let (release, reap_after) = mpsc::channel();
+    let state = Path::new("unreaped-state");
+    let pid = rig.start_reaping_after("unreaped", Some(state), reap_after);
+    rig.stop("unreaped", state);
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    drop(release);
 }
 
 // Ignoring ATM_STATE_DIR would put A's PID in the shared XDG location and

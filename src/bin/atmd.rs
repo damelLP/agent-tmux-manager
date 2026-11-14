@@ -106,8 +106,21 @@ fn remove_pid_file(state_dir: &Path) {
     let _ = fs::remove_file(path);
 }
 
+fn proc_stat_has_exited(stat: &str) -> bool {
+    // comm may contain spaces and ')'; the state follows its final delimiter.
+    matches!(
+        stat.rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().next()),
+        Some("Z" | "X" | "x")
+    )
+}
+
 fn is_process_running(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    let path = PathBuf::from(format!("/proc/{pid}"));
+    // An exited process retains procfs until reaped. If its state cannot be
+    // read or recognized, keep the old, conservative existence answer.
+    path.exists()
+        && !fs::read_to_string(path.join("stat")).is_ok_and(|stat| proc_stat_has_exited(&stat))
 }
 
 /// Read-only: `stop` and `status` call this without the lock, so a stale
@@ -524,6 +537,56 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // Counting zombies as running breaks stop; counting stopped tasks as dead
+    // would let startup ignore a still-live daemon's PID.
+    #[test]
+    fn proc_stat_distinguishes_exited_from_live_and_stopped_states() {
+        for (state, exited) in [
+            ("Z", true),
+            ("X", true),
+            ("x", true),
+            ("R", false),
+            ("S", false),
+            ("D", false),
+            ("T", false),
+            ("t", false),
+            ("I", false),
+            ("?", false),
+        ] {
+            assert_eq!(
+                proc_stat_has_exited(&format!("123 (atmd) {state} 1 2 3")),
+                exited,
+                "state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn proc_stat_state_follows_the_last_name_delimiter() {
+        for (stat, exited) in [
+            ("123 (name with spaces) Z 1 2 3", true),
+            ("123 ((name) with spaces) X 1 2 3", true),
+            ("123 (name) Z still name) S 1 2 3", false),
+            ("123 (name\nwith ) parentheses) x 1 2 3", true),
+        ] {
+            assert_eq!(proc_stat_has_exited(stat), exited, "{stat:?}");
+        }
+    }
+
+    #[test]
+    fn incomplete_or_unknown_proc_stat_does_not_prove_exit() {
+        for stat in [
+            "",
+            "123 (atmd Z 1 2 3",
+            "123 (atmd)",
+            "123 (atmd)   \n",
+            "123 (atmd) unknown 1 2 3",
+            "123 (atmd) Zombie 1 2 3",
+        ] {
+            assert!(!proc_stat_has_exited(stat), "{stat:?}");
+        }
+    }
 
     #[test]
     fn pid_and_log_state_use_the_override_or_legacy_fallback() {

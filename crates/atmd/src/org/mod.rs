@@ -14,6 +14,9 @@
 mod actor;
 mod agent_methods;
 mod agent_project;
+mod agent_screen;
+#[cfg(test)]
+mod agent_screen_tests;
 mod agent_types;
 pub mod agents;
 #[cfg(test)]

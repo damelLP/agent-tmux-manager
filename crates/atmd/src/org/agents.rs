@@ -9,10 +9,12 @@
 //! Lifecycle effects remain unavailable until the flow slice is installed.
 
 pub use super::agent_methods::register_agent_methods;
+pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
 pub use super::agent_types::*;
 use super::{agent_project::AgentProjects, OrgHandle, OrgServiceError};
 use crate::control::reservation::{
-    CaptureFormat, PaneId, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
+    CaptureFormat, PaneCapture, PaneId, Reservation, ReservationKind, ReservationRequest,
+    WaitPolicy,
 };
 use crate::server::methods::CallContext;
 use crate::{
@@ -656,11 +658,17 @@ impl AgentRuntime {
         };
         #[cfg(test)]
         self.progress("capture", Some(agent.id.clone()));
-        let capture = r
-            .capture(&PaneId::parse(pane)?, CaptureFormat::Plain)
-            .await?;
         let harness = harness(state, agent, &rows);
-        let facts = screen(harness, &capture.text);
+        let screen = agent_screen(harness);
+        let capture = r
+            .capture(
+                &PaneId::parse(pane)?,
+                screen.map_or(CaptureFormat::Plain, AgentScreen::capture_format),
+            )
+            .await?;
+        let facts = screen
+            .map(|screen| unchecked_facts(screen, &capture))
+            .unwrap_or_default();
         let rows = self.rows().await?;
         let live: Vec<_> = rows
             .iter()
@@ -744,17 +752,18 @@ fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> Harness {
         })
 }
 
-// One adapter dispatch boundary; future lifecycle flows reuse this rather than
-// adding vendor branches. This base's adapters accept Plain/None; consuming their
-// styled capture policy waits for the adapter contract, not a local guess.
-fn screen(harness: Harness, text: &str) -> ScreenFacts {
-    let text = atm_core::ScreenInput::Plain(text);
-    match harness {
-        Harness::ClaudeCode => atm_claude_adapter::screen::observe_screen(text, None),
-        Harness::Codex => atm_codex_adapter::screen::observe_screen(text, None),
-        Harness::Pi => atm_pi_adapter::screen::observe_screen(text, None),
-        _ => ScreenFacts::default(),
-    }
+// Verdict off: the observer records no pane baseline yet, so it reads the screen
+// against the capture's own process facts (Unknown when tmux reports no root
+// process or command). The flow slice replaces this with the recorded baseline;
+// until then nothing here tells a harness from a shell showing a stale frame.
+fn unchecked_facts(screen: &AgentScreen, capture: &PaneCapture) -> ScreenFacts {
+    let inspection = &capture.inspection;
+    inspection
+        .pane_root_pid()
+        .zip(inspection.foreground_command.clone())
+        .and_then(|(root, command)| PaneBaseline::adopted(root).with_harness(command))
+        .map(|baseline| screen.facts(capture, &baseline))
+        .unwrap_or_default()
 }
 
 fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentListEntry {

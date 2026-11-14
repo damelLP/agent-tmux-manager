@@ -20,6 +20,10 @@ mod reconciliation {
 
     const IDLE: &str =
         include_str!("../../../atm-pi-adapter/tests/fixtures/screen_pi-after-clear_1.5.0.txt");
+    // Captured: codex-cli 0.167.0; see the Codex adapter's fixture README (U5b).
+    const CODEX_IDLE: &str = include_str!(
+        "../../../atm-codex-adapter/tests/fixtures/screen_styled_u5b_rich-fresh_0.167.0.txt"
+    );
     struct Rig {
         org: super::super::OrgHandle,
         registry: RegistryHandle,
@@ -121,10 +125,20 @@ mod reconciliation {
             self.org.execute(command, chrono::Utc::now()).await.unwrap();
         }
         async fn agent(&self, name: &str, pane: Option<&str>, session: Option<&str>) {
+            self.agent_of(name, "pi", pane, session).await;
+        }
+        async fn agent_of(
+            &self,
+            name: &str,
+            harness: &str,
+            pane: Option<&str>,
+            session: Option<&str>,
+        ) {
             let id = format!("p/{name}").parse().unwrap();
             self.command(OrgCommand::Up {
                 agent_id: id,
-                role: atm_org::parse_role(name, "+++\nharness='pi'\n+++\n").unwrap(),
+                role: atm_org::parse_role(name, &format!("+++\nharness='{harness}'\n+++\n"))
+                    .unwrap(),
             })
             .await;
             if let Some(pane) = pane {
@@ -148,12 +162,15 @@ mod reconciliation {
             }
         }
         async fn row(&self, id: &str, pane: &str, child: bool) {
+            self.row_of(id, pane, child, Harness::Pi).await;
+        }
+        async fn row_of(&self, id: &str, pane: &str, child: bool, harness: Harness) {
             let mut row = SessionDomain::new(
                 SessionId::new(id),
                 AgentType::GeneralPurpose,
                 Model::default(),
             );
-            row.harness = Harness::Pi;
+            row.harness = harness;
             row.tmux_pane = Some(pane.into());
             if child {
                 row.parent_session_id = Some(SessionId::new("parent"));
@@ -188,7 +205,13 @@ mod reconciliation {
                 .unwrap();
         }
         fn frame(&self, pane: &str, tag: &str, text: &str) {
-            let mut inspection = Self::inspection(pane, tag, false);
+            self.frame_of(pane, tag, text, "pi");
+        }
+        // A capture as tmux reports it while `command` is the pane's foreground program.
+        // Every adapter reads a styled capture, so that is what the observer asks for.
+        fn frame_of(&self, pane: &str, tag: &str, text: &str, command: &str) {
+            let mut inspection = Self::inspection(pane, tag, false)
+                .with_foreground_process(None, Some(command.into()));
             inspection.pane.height = text.lines().count() as u16;
             self.client
                 .script_inspect(&PaneId::parse(pane).unwrap(), Some(&inspection))
@@ -197,7 +220,7 @@ mod reconciliation {
                 .script_capture(&PaneCapture::new(
                     text.into(),
                     inspection,
-                    CaptureFormat::Plain,
+                    CaptureFormat::Ansi,
                 ))
                 .unwrap();
         }
@@ -290,6 +313,76 @@ mod reconciliation {
         assert_eq!(
             rig.state("lead").await.session_id,
             Some(SessionId::new("recorded"))
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_bound_codex_agent_stays_ready_on_styled_editor() {
+        // A1 review G4: Codex's empty editor is only readable in a styled capture
+        // (its placeholder is plain text otherwise), so a bound Codex agent used
+        // to be suspended at every daemon restart.
+        let rig = Rig::new().await;
+        rig.agent_of("lead", "codex", Some("%1"), Some("recorded"))
+            .await;
+        rig.row_of("pending-100", "%1", false, Harness::Codex).await;
+        rig.frame_of("%1", "p/lead", CODEX_IDLE, "codex");
+        let before = rig.org.status().unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        // The capture was read (a refused or failed read would also write nothing).
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            agents.list(ListParams::default()).await.unwrap()[0].reason,
+            None
+        );
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.session_id, Some(SessionId::new("recorded")));
+        assert_eq!(rig.org.status().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn stuck_codex_agent_recovers_on_styled_safe_editor() {
+        // A1 review G2/G4: leaving Stuck takes this observation's own capture of
+        // a safe editor, which the plain Codex read could never show.
+        let rig = Rig::new().await;
+        rig.agent_of("lead", "codex", Some("%1"), Some("s1")).await;
+        rig.row_of("s1", "%1", false, Harness::Codex).await;
+        let reason = "unexpected screen in %1; inspect the pane";
+        rig.command(OrgCommand::Stuck {
+            agent_id: "p/lead".parse().unwrap(),
+            reason: reason.into(),
+        })
+        .await;
+        rig.inspect_only("%1", "p/lead");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        let before = rig.org.status().unwrap();
+        // An unknown screen keeps Stuck: the twin that differs only in the frame.
+        rig.frame_of("%1", "p/lead", "unknown\n", "codex");
+        update(&rig, "s1").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+        assert_eq!(rig.org.status().unwrap(), before);
+        rig.frame_of("%1", "p/lead", CODEX_IDLE, "codex");
+        update(&rig, "s1").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.reason, None);
+        assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+        assert_eq!(rig.org.status().unwrap(), before + 1);
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
         );
     }
 

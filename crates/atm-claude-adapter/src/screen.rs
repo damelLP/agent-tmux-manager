@@ -112,8 +112,10 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 ///
 /// Requires Styled and a nonempty expected string without controls or trailing
 /// whitespace. Compares after removing trailing ASCII spaces from the draft only;
-/// leading whitespace stays exact. Other differences return Some(false); unknown
-/// layouts, faint text and multiline/wrapped drafts return None. A match proves
+/// leading whitespace stays exact. The known single-command completion menu also
+/// matches when both the editor draft and selected command equal expected exactly;
+/// its description is not command identity. Other differences return Some(false);
+/// unknown layouts, faint text and multiline/wrapped drafts return None. A match proves
 /// visible text only, not that Enter submits it: consumers must handle popups
 /// and refuse both Some(false) and None.
 #[must_use]

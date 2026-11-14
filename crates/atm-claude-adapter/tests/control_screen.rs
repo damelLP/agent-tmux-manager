@@ -159,6 +159,52 @@ fn captured_launch_and_clear_are_fresh_without_conversation() {
 }
 
 #[test]
+fn real_u5b_settled_clear_is_fresh_without_conversation() {
+    let text =
+        include_str!("fixtures/screen_styled_u5b_poor-enabled-after-clear-settled_2.1.325.txt");
+    let observed = observe(text);
+    assert_eq!(observed.dialog, ControlDialog::None);
+    assert_eq!(observed.facts.input, InputState::Empty);
+    assert_eq!(observed.facts.turn, TurnState::NotRunning);
+    assert_eq!(observed.facts.fresh_editor, FreshEditorEvidence::Present);
+    assert!(!observed.conversation);
+}
+
+#[test]
+fn synthetic_live_suffix_on_every_captured_trust_selection_cannot_authorize_keys() {
+    for text in [
+        NO,
+        capture!("A120-default-120x40"),
+        capture!("A200-default-200x40"),
+        YES,
+        capture!("A120-selected-120x40"),
+        capture!("A200-selected-200x40"),
+        capture!("A80-reset-after-enter-80x40"),
+        capture!("A120-reset-after-enter-120x40"),
+        capture!("A200-reset-after-enter-200x40"),
+        capture!("A-race-0-yes-120x40"),
+        capture!("A-race-1-yes-120x40"),
+    ] {
+        assert!(matches!(
+            observe(text).dialog,
+            ControlDialog::FolderTrust { .. }
+        ));
+        // Synthetic: real actionable chrome is now history, with a current
+        // fresh editor, conversation editor or shell below it.
+        for suffix in [AUTO, capture!("B-baseline-conversation-120x40"), "shell$ "] {
+            let mutated = format!("{}\n{}", body(text), body(suffix));
+            let decoded = plain(&mutated);
+            for input in [ScreenInput::Styled(&mutated), ScreenInput::Plain(&decoded)] {
+                assert!(matches!(
+                    observe_control_screen(input, None).dialog,
+                    ControlDialog::None | ControlDialog::Unknown | ControlDialog::Blocked
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn conversation_is_not_a_draft_or_clear_echo() {
     for text in [
         capture!("B-baseline-conversation-120x40"),

@@ -583,6 +583,60 @@ fn synthetic_malformed_dialogs_refuse_and_history_does_not_act() {
 }
 
 #[test]
+fn synthetic_live_suffix_on_every_captured_actionable_dialog_cannot_authorize_keys() {
+    let mut frames: Vec<_> = [
+        include_str!("fixtures/screen_codex-startup_0.167.0.txt"),
+        include_str!("fixtures/screen_codex-restart-startup_0.167.0.txt"),
+        capture!("b27-nodaemon-new-result-100x32"),
+        capture!("b31-nodaemon-clear-dialog-100x32"),
+        capture!("b35-default-repo-clear-dialog-100x24"),
+        capture!("b38-poor-repeat-dialog-100x24"),
+        capture!("a14-nodaemon-later-100x32"),
+        capture!("a16-default-fresh-folder-trust-100x24"),
+        capture!("a02-startup-100x32"),
+        capture!("a10-corrected-hooks-review-100x32"),
+        capture!("a17-default-fresh-hook-trust-100x24"),
+        PENDING,
+        TRUSTED,
+        capture!("a06-hooks-command-corrected-100x32"),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    frames.extend(p2_frames().into_iter().map(|(_, text, _)| text));
+    assert_eq!(frames.len(), 277);
+    for (index, text) in frames.iter().enumerate() {
+        assert!(matches!(
+            observe(text).dialog,
+            ControlDialog::LaunchSkip { .. }
+                | ControlDialog::CurrentWorktree { .. }
+                | ControlDialog::FolderTrust { .. }
+                | ControlDialog::HookReview { .. }
+                | ControlDialog::HookList { .. }
+        ));
+        // Synthetic: a current editor or shell below a real dialog makes the
+        // dialog historical, regardless of its selection, width or page.
+        for suffix in [
+            FRESH,
+            capture!("b12-completed-before-new-100x32"),
+            "shell$ ",
+        ] {
+            let mutated = format!("{}\n{}", body(text), body(suffix));
+            let decoded = plain(&mutated);
+            for input in [ScreenInput::Styled(&mutated), ScreenInput::Plain(&decoded)] {
+                assert!(
+                    matches!(
+                        observe_control_screen(input, None).dialog,
+                        ControlDialog::None | ControlDialog::Unknown | ControlDialog::Blocked
+                    ),
+                    "frame {index}, suffix {suffix}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn synthetic_hook_table_damage_never_creates_complete_or_actionable_list() {
     let pending = plain(PENDING);
     let trusted = plain(TRUSTED);

@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -37,19 +39,19 @@ use crate::discovery::{DiscoveryResult, DiscoveryService};
 use crate::registry::{RegistryHandle, SessionEvent};
 
 /// Type alias for subscriber writer handle
-pub type SubscriberWriter = Arc<Mutex<BufWriter<OwnedWriteHalf>>>;
+pub type SubscriberWriter<W = OwnedWriteHalf> = Arc<Mutex<BufWriter<W>>>;
 
 /// Information about a subscribed client
-pub struct Subscriber {
+pub struct Subscriber<W = OwnedWriteHalf> {
     /// Writer for sending events
-    pub writer: SubscriberWriter,
+    pub writer: SubscriberWriter<W>,
 
     /// Optional filter for session-specific subscriptions
     pub filter: Option<SessionId>,
 }
 
 /// Type alias for the subscribers map, keyed by [`subscriber_key`]
-pub type SubscribersMap = Arc<RwLock<HashMap<String, Subscriber>>>;
+pub type SubscribersMap<W = OwnedWriteHalf> = Arc<RwLock<HashMap<String, Subscriber<W>>>>;
 
 /// Key of a connection's entry in the [`SubscribersMap`].
 ///
@@ -105,18 +107,18 @@ fn is_one_way(message: &MessageType) -> bool {
 /// - Message processing loop
 /// - Event subscription (for TUI clients)
 /// - Graceful shutdown
-pub struct ConnectionHandler {
+pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     /// Buffered reader for incoming messages
-    reader: BufReader<OwnedReadHalf>,
+    reader: BufReader<R>,
 
     /// Buffered writer for outgoing messages (shared for event broadcast)
-    writer: SubscriberWriter,
+    writer: SubscriberWriter<W>,
 
     /// Handle to the session registry
     registry: RegistryHandle,
 
     /// Shared subscribers map for event broadcasting
-    subscribers: SubscribersMap,
+    subscribers: SubscribersMap<W>,
 
     /// Unique client identifier (assigned after handshake)
     client_id: Option<ClientId>,
@@ -148,7 +150,11 @@ pub struct ConnectionHandler {
     watcher: Option<Forwarder>,
 }
 
-impl ConnectionHandler {
+impl<R, W> ConnectionHandler<R, W>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     /// Creates a new connection handler.
     ///
     /// # Arguments
@@ -161,10 +167,10 @@ impl ConnectionHandler {
     /// * `cancel` - Closes the connection when cancelled
     /// * `methods` - Shared, immutable control-plane method registry
     pub fn new(
-        reader: OwnedReadHalf,
-        writer: OwnedWriteHalf,
+        reader: R,
+        writer: W,
         registry: RegistryHandle,
-        subscribers: SubscribersMap,
+        subscribers: SubscribersMap<W>,
         connection_number: u64,
         cancel: CancellationToken,
         methods: Arc<MethodRouter>,
@@ -200,7 +206,7 @@ impl ConnectionHandler {
     }
 
     /// Returns a clone of the writer for event broadcasting.
-    pub fn writer_handle(&self) -> SubscriberWriter {
+    pub fn writer_handle(&self) -> SubscriberWriter<W> {
         Arc::clone(&self.writer)
     }
 
@@ -1111,10 +1117,10 @@ struct Forwarder {
 
 impl Forwarder {
     /// Spawns [`forward_events`] for one subscription on `connection`.
-    fn spawn(
+    fn spawn<W: AsyncWrite + Unpin + Send + 'static>(
         client_id: ClientId,
         events: broadcast::Receiver<SessionEvent>,
-        writer: SubscriberWriter,
+        writer: SubscriberWriter<W>,
         filter: Option<SessionId>,
         connection: &CancellationToken,
     ) -> Self {
@@ -1131,9 +1137,9 @@ impl Forwarder {
         Self { stop, task }
     }
 
-    fn watch(
+    fn watch<W: AsyncWrite + Unpin + Send + 'static>(
         mut events: crate::org::EventWatch,
-        writer: SubscriberWriter,
+        writer: SubscriberWriter<W>,
         connection: &CancellationToken,
     ) -> Self {
         let stop = connection.child_token();
@@ -1191,10 +1197,10 @@ fn watch_error(error: crate::org::OrgServiceError) -> DaemonMessage {
 /// line on the socket, and a receiver that lagged past the channel's
 /// capacity has missed events. The client recovers by reconnecting, which
 /// re-subscribes and fetches a full session list.
-async fn forward_events(
+async fn forward_events<W: AsyncWrite + Unpin>(
     client_id: ClientId,
     mut events: broadcast::Receiver<SessionEvent>,
-    writer: SubscriberWriter,
+    writer: SubscriberWriter<W>,
     filter: Option<SessionId>,
     connection: CancellationToken,
     stop: CancellationToken,
@@ -1250,8 +1256,8 @@ async fn forward_events(
 /// Sends an event to a subscribed client.
 ///
 /// This is used by each subscription's forwarder.
-pub async fn send_event(
-    writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+pub async fn send_event<W: AsyncWrite + Unpin>(
+    writer: &SubscriberWriter<W>,
     event: &SessionEvent,
 ) -> Result<(), ConnectionError> {
     let msg = match event {
@@ -1274,8 +1280,8 @@ fn fits_response(message: &DaemonMessage) -> bool {
 }
 
 /// Serializes one complete reply under the connection's shared writer lock.
-async fn write_message(
-    writer: &SubscriberWriter,
+async fn write_message<W: AsyncWrite + Unpin>(
+    writer: &SubscriberWriter<W>,
     msg: &DaemonMessage,
 ) -> Result<(), ConnectionError> {
     let json =

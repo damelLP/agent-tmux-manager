@@ -18,6 +18,7 @@ sys.path.insert(0, str(HERE))
 from model import InputParser, Model, parse_args
 from scene import render_state
 from screens import render_screen
+from pi_replay import BACKOFF_MS, enqueue
 
 VERSIONS = {"claude": "2.1.325", "codex": "0.167.0", "pi": "1.5.0"}
 
@@ -169,9 +170,6 @@ class Runtime:
         if self.parser.pending == b"\x1b" and not self.parser.pasting:
             # Only the ambiguous standalone Escape key needs a terminal timeout.
             deadlines.append(.02)
-        if self.mode == "pi" and self.stream is None:
-            # Existing replay retry behavior; fidelity is addressed separately.
-            deadlines.append(max(0, self.retry_at - time.monotonic()))
         return min(deadlines) if deadlines else None
 
     def forward(self, data):
@@ -180,21 +178,40 @@ class Runtime:
             hook = "atm-hook" if self.mode == "claude" else "atm-codex-hook"
             script = HERE.parents[2] / "crates" / "atm" / "scripts" / hook
             # No injected pid/pane: the real forwarder must enrich these.
-            subprocess.run(["/bin/sh", "-c", '/bin/bash "$1"; result=$?; exit "$result"', "stand-in-hook", str(script)], input=json.dumps(data),
+            subprocess.run(["/bin/bash", str(script)], input=json.dumps(data),
                            text=True, timeout=3, check=True, env=dict(os.environ, ATM_DEBUG="0"))
             return
-        data.update(pid=os.getpid(), tmux_pane=os.environ["TMUX_PANE"])
-        self.outbox.append({"protocol_version": {"major": 1, "minor": 0}, "type": "pi_event", "data": data})
+        self.observe_pi()
+        data.update(pid=os.getpid(), tmux_pane=self.pane)
+        frame = {"protocol_version": {"major": 1, "minor": 0}, "type": "pi_event", "data": data}
+        self.outbox, accepted = enqueue(self.outbox, frame, self.now_ms(), self.retry_at)
+        if not accepted:
+            self.record({"kind": "transport_dropped", "event": data.get("event"), "reason": "close backoff"})
+            return
         self.flush_pi()
 
-    def flush_pi(self):
-        if self.mode != "pi" or time.monotonic() < self.retry_at:
+    def disconnect_pi(self, error):
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+        self.retry_at = self.now_ms() + BACKOFF_MS
+        self.record({"kind": "disconnected", "error": str(error), "retry_at": self.retry_at})
+
+    def observe_pi(self):
+        if self.mode != "pi" or self.stream is None:
             return
         try:
-            if self.stream is not None and select.select([self.stream], [], [], 0)[0]:
-                if not self.stream.recv(65536):
-                    self.stream.close()
-                    self.stream = None
+            if select.select([self.stream], [], [], 0)[0] and not self.stream.recv(65536):
+                self.disconnect_pi("EOF")
+        except OSError as error:
+            self.disconnect_pi(error)
+
+    def flush_pi(self):
+        # Only a new accepted send invokes this. Missing sockets leave a bounded
+        # FIFO for a future event; no timer or clock advancement opens a socket.
+        if self.mode != "pi" or (self.stream is None and not self.socket_path.exists()):
+            return
+        try:
             if self.stream is None:
                 self.stream = socket.socket(socket.AF_UNIX)
                 self.stream.settimeout(.2)
@@ -212,14 +229,11 @@ class Runtime:
                     raise OSError("pi replay handshake refused")
                 self.record({"kind": "connected"})
             while self.outbox:
-                self.send(self.outbox[0])
-                self.outbox.pop(0)
+                # Once a write is attempted its delivery is unknown; don't turn
+                # a transport exception into a promise to replay the same input.
+                self.send(self.outbox.pop(0))
         except (OSError, ValueError) as error:
-            if self.stream is not None:
-                self.stream.close()
-                self.stream = None
-            self.retry_at = time.monotonic() + .1
-            self.record({"kind": "reconnecting", "error": str(error)})
+            self.disconnect_pi(error)
 
     def send(self, frame):
         self.stream.sendall((json.dumps(frame) + "\n").encode())
@@ -328,7 +342,8 @@ class Runtime:
                         self.receive_controls()
                     if not self.manual_clock:
                         self.effects(self.model.tick(self.now_ms()))
-                    self.flush_pi()
+                    if self.stream in readable:
+                        self.observe_pi()
         finally:
             print("\x1b[?2004l" + ("\x1b[?1049l" if self.mode != "pi" else
                                      f"\x1b[{self.rows};1H") + "\r\n", end="", flush=True)

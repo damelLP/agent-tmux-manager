@@ -97,7 +97,8 @@ rig.close();
   If also using role support, import `stand_in::bounded` rather than including
   `support/role.rs` twice.
 - `journal(pane)` is diagnostic JSONL: identity, accepted/rejected/queued input,
-  event/dropped, status, draft, render, ready, selection, connected/reconnecting.
+  event/dropped, status, draft, render, ready, selection, connected/disconnected,
+  transport_dropped.
   Render entries carry a per-process `sequence`. A subsequent `rendered` entry
   acknowledges tmux's cursor-position reply to a DSR query following that frame;
   `ready` follows only for the latest idle frame, not merely a stdout flush.
@@ -135,10 +136,11 @@ Stop also finds detached daemons. With the daemon stopped, `rig.atm(...)` can
 exercise the real CLI auto-start path, which cleanup owns too.
 
 `set_daemon_env(key, value)` sets extra environment for **subsequent explicit
-starts**, e.g. set `ATM_SPAWN_BIN` to `rig.launcher(mode)` and then restart. It
-cannot override sealing variables or TMUX/PANE. It does not change environment
-inside an already-running daemon or in CLI-auto-started daemons; for the latter,
-set the extra variable on `rig.command(...)` before invoking the CLI.
+starts**. It cannot override sealing variables or TMUX/PANE. It does not change
+environment inside an already-running daemon or CLI-auto-started daemons; for
+the latter set the extra variable on `rig.command(...)` before invoking the CLI.
+**ATM_SPAWN_BIN is CLI-only at this tip**: setting it in the daemon's environment
+does not change daemon command construction.
 
 ### Spawn, arguments, IDs and respawn
 
@@ -175,6 +177,27 @@ let id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
 let pane = rig.observe_pane(id, StandInMode::Claude, log);
 // observe_pane waits for live identity, not idle: initial prompt may be working.
 ```
+
+For a **daemon-built command**, put the explicit absolute `rig.launcher(mode)`
+in the role/config command accepted by that consumer, with `--atm-config` pointing
+to a private JSON file containing `LOG` and `ID_PREFIX`. Alternatively configure
+those values in the private tmux server environment as above. Do not rely on
+ATM_SPAWN_BIN or weaken the sealed PATH. For example, the command builder's argv
+can be `[rig.launcher(mode), "--atm-config", rig.root().join("role.json")]`:
+
+```rust,ignore
+let config_path = rig.root().join("role.json");
+std::fs::write(&config_path, serde_json::json!({
+    "LOG": rig.root().join("role.jsonl"), "ID_PREFIX": "role", "MANUAL_CLOCK": 1
+}).to_string()).unwrap();
+let command = [rig.launcher(StandInMode::Claude).into_os_string(),
+               "--atm-config".into(), config_path.into_os_string()];
+// Supply command to the consumer's role/command builder, not ATM_SPAWN_BIN.
+```
+
+`stand_in_explicit_launcher_without_cli_spawn_override` exercises that executable
+and config through a private tmux pane without the CLI override. It verifies the
+launch route, not a future consumer's command builder.
 
 Current `atm spawn --prompt` rejects control characters: use single-line prompts
 there and multiline `atm send` for delivery tests.
@@ -228,23 +251,35 @@ render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
   is cancelled. Claude restores the interrupted prompt as a visible draft (U5 C5).
   At idle Ctrl-C clears the draft; a second within one second exits. Ctrl-U clears
   the draft without submitting it. Up/Down are ignored outside dialogs.
-- Claude submits busy input into a FIFO and emits UserPromptSubmit **only when the
-  preceding turn ends**. This reproduces late confirmation/double-delivery risks.
-  Clear discards queued input. Synthetic: queuing was not captured by U5; abort
-  while a queue exists is not a faithful queue-cancellation model (pending entries
-  remain until another turn completes). Codex/pi busy input is still rejected.
+- **Synthetic adversarial FIFO, not current Claude fidelity:** busy input is
+  queued and emits UserPromptSubmit only when the preceding turn ends. P1's real
+  Claude Code 2.1.325 capture (2026-11-14) instead observed accepted/queued prompt
+  receipt **before** the held turn completed. Do not use this FIFO as evidence of
+  real receipt timing, and never infer execution from receipt. Clear discards
+  the synthetic queue; abort leaves entries until another turn completes, also
+  not a faithful cancellation model. Existing queue tests deliberately retain
+  this adversarial contract. Codex/pi busy input remains rejected.
 - Whole-line controls only: multiline text containing a control is an ordinary
   prompt. Input during the clear gap is rejected and journalled, not submitted.
 - Bracketed paste handles fragmented UTF-8/delimiters. CR becomes LF as in normal
   tty input. Lone ESC resolves after a 20ms gap; CSI arrows are parsed atomically.
   This is not a full editor/terminal emulator (no cursor editing/history).
-- Claude/Codex use `/bin/sh -c` to run the real repository hook scripts and socat,
-  exercising their parent-process walk; PID/pane fields aren't injected.
-- Pi **replays envelopes**, never loads pi-atm. One socket spans `/new`; after
-  disconnect it retries and buffers unsent frames while the daemon is down.
-  Buffering/backoff are synthetic, not an SDK transport conformance test. As with
-  real unacknowledged writes, a disconnect during a write can lose/duplicate a
-  frame; process exit does not guarantee flushing while the daemon is unavailable.
+- Claude/Codex launch `/bin/bash <real repository hook>` directly, matching U5's
+  Claude Code 2.1.325/Codex 0.167.0 ancestry: socat ← timeout ← hook ← harness.
+  A private Bash-startup barrier checks the actual child's PID/PPID; existing real
+  daemon tests still check forwarded identity. PID/pane fields aren't injected.
+- Pi **replays envelopes**, never loads pi-atm. One socket spans `/new`. Observed
+  EOF triggers a 1000ms close backoff on the supplied model clock; sends inside
+  it are dropped, not replayed. Advancing time never reconnects: a later send
+  initiates the next connection. With no socket outside backoff, a 256-entry
+  drop-oldest FIFO waits for a later send. A write attempt is unacknowledged and
+  is not retried as if delivery were known. The daemon-restart test awaits EOF,
+  proves outage input dropped, then sends a new event after explicit clock
+  advancement. It never asserts recovery of outage input.
+  This models the repository pi-atm send/close/outbox rules, not SDK conformance:
+  Python performs bounded synchronous connect/handshake/write, not Node's
+  pending-socket/drain callbacks or high-water-mark behavior. Process exit does
+  not guarantee flushing while the daemon is unavailable.
 
 Remaining gaps: pi native selectors, permission Notification hook or post-denial
 status timing, provider errors/resumptions, real tokens/usage evolution, subagents,

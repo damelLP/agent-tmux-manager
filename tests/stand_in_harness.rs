@@ -550,20 +550,34 @@ fn pi_stand_in_reconnects_without_reconnecting_on_clear() {
     advance(&rig, &pane, 100);
     let new = rig.wait_for_row(&pane, |r| r.id != old.id);
     rig.wait_ready(&pane, Some(new.id.as_str()));
-    let connections = || {
+    let connections = |rig: &StandInRig| {
         rig.journal(&pane)
             .iter()
             .filter(|e| e["kind"] == "connected")
             .count()
     };
-    assert_eq!(connections(), 1, "one socket across /new");
+    assert_eq!(connections(&rig), 1, "one socket across /new");
+    let after = rig.event_cursor(&pane);
     rig.stop_daemon();
+    rig.wait_event(&pane, after, |e| e["kind"] == "disconnected");
     let after = rig.event_cursor(&pane);
     rig.paste(&pane, "while daemon stopped");
-    rig.wait_event(&pane, after, |e| e["event"] == "input");
+    rig.wait_event(&pane, after, |e| {
+        e["kind"] == "transport_dropped" && e["event"] == "input"
+    });
+    // Finish this turn while still inside the close-backoff drop window.
+    advance(&rig, &pane, 500);
+    rig.wait_ready(&pane, None);
     rig.start_daemon();
+    advance(&rig, &pane, 500);
+    assert_eq!(connections(&rig), 1, "time alone must not reconnect");
+    assert!(rig
+        .pane_rows(&pane)
+        .iter()
+        .all(|r| r.first_prompt.as_deref() != Some("while daemon stopped")));
+    rig.paste(&pane, "new event after backoff");
     rig.wait_for_row(&pane, |r| {
-        r.first_prompt.as_deref() == Some("while daemon stopped")
+        r.first_prompt.as_deref() == Some("new event after backoff")
     });
     advance(&rig, &pane, 500);
     rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
@@ -659,6 +673,42 @@ fn stand_in_daemon_control_and_auto_start_cleanup() {
 }
 
 #[test]
+fn stand_in_explicit_launcher_without_cli_spawn_override() {
+    let mut rig = StandInRig::start();
+    let log = rig.root().join("explicit-launcher.jsonl");
+    let config = rig.root().join("explicit-launcher.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "LOG": log, "ID_PREFIX": "explicit-launcher", "MANUAL_CLOCK": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // Same explicit executable/config route a daemon command builder can use;
+    // no atm CLI, installed launcher, PATH override or ATM_SPAWN_BIN involved.
+    let pane_id = success(rig.tmux(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        rig.launcher(StandInMode::Claude).to_str().unwrap(),
+        "--atm-config",
+        config.to_str().unwrap(),
+    ]));
+    let pane = rig.observe_pane(pane_id, StandInMode::Claude, log);
+    rig.wait_ready(&pane, None);
+    let row = rig.wait_for_row(&pane, |r| r.status == SessionStatus::Idle);
+    assert_eq!(row.tmux_pane.as_deref(), Some(pane.pane_id.as_str()));
+    let env = std::fs::read(format!("/proc/{}/environ", pane.pid)).unwrap();
+    assert!(!env
+        .split(|b| *b == 0)
+        .any(|entry| entry.starts_with(b"ATM_SPAWN_BIN=")));
+    rig.close();
+}
+
+#[test]
 fn stand_in_invalid_arguments_do_not_announce() {
     let mut rig = StandInRig::start();
     let log = rig.root().join("invalid.jsonl");
@@ -731,6 +781,8 @@ fn stand_in_model_contract() {
                 "test_screens",
                 "test_dialogs",
                 "test_scene",
+                "test_pi_replay",
+                "test_hook",
             ])
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")

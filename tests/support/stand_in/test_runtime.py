@@ -12,6 +12,7 @@ def runtime():
     """Keep the real input/effect path; only constructor I/O is omitted."""
     r = harness.Runtime.__new__(harness.Runtime)
     r.mode = "claude"
+    r.root = harness.Path("/fixture")
     r.model = make()
     r.parser = InputParser()
     r.running = True
@@ -140,6 +141,49 @@ class ControlTests(unittest.TestCase):
         r.model.deadline = None
         r.parser.pending.extend(b"\x1b")
         self.assertGreater(r.next_timeout(9), 0)
+
+
+class PiTransportTests(unittest.TestCase):
+    def test_close_drops_backoff_input_and_time_alone_never_connects(self):
+        import socket
+        r = runtime()
+        r.mode = "pi"
+        r.outbox = []
+        r.retry_at = 0
+        writer, reader = socket.socketpair()
+        r.stream = reader
+        writer.close()
+        r.observe_pi()
+        self.assertIsNone(r.stream)
+        self.assertEqual(r.retry_at, 1000)
+        r.forward({"event": "input", "payload": {"text": "outage"}})
+        self.assertEqual(r.outbox, [])
+        self.assertEqual(journal(r)[-1]["kind"], "transport_dropped")
+        self.assertIsNone(r.next_timeout(0), "no autonomous reconnect deadline")
+        r.clock_ms = 1000
+        self.assertIsNone(r.next_timeout(1000))
+        self.assertIsNone(r.stream)
+
+    def test_missing_socket_queues_bounded_fifo_until_a_later_send(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.dict(harness.os.environ, {"TMUX_PANE": "%test"}):
+            r = runtime()
+            r.mode = "pi"
+            r.root = Path(directory)
+            r.socket_path = r.root / "absent.sock"
+            r.stream = None
+            r.outbox = []
+            r.retry_at = 0
+            for number in range(260):
+                r.forward({"event": "input", "number": number})
+            self.assertEqual(len(r.outbox), 256)
+            self.assertEqual(r.outbox[0]["data"]["number"], 4)
+            self.assertEqual(r.outbox[-1]["data"]["number"], 259)
+            self.assertIsNone(r.next_timeout(10000))
+            r.clock_ms = 10000
+            self.assertIsNone(r.stream)
 
 
 class RenderTests(unittest.TestCase):

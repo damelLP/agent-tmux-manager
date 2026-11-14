@@ -12,7 +12,7 @@
     "result": {
       "protocol": "1.1",
       "version": "ignored",
-      "methods": [],
+      "methods": "ignored: checked against connected.methods separately",
       "state_dir": "ignored"
     }
   },

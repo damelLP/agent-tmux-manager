@@ -22,7 +22,8 @@ use serde_json::Value;
 #[derive(Clone)]
 pub struct MethodServices {
     pub registry: RegistryHandle,
-    /// Resolved once at server setup; tests can inject a private path.
+    /// Production resolves this before daemonization; tests can inject a path.
+    /// daemon.info displays non-UTF-8 paths lossily; filesystem use stays exact.
     pub state_dir: PathBuf,
 }
 
@@ -154,7 +155,7 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         "protocol": ProtocolVersion::CURRENT.to_string(),
         "version": env!("CARGO_PKG_VERSION"),
         "methods": names,
-        "state_dir": services.state_dir,
+        "state_dir": services.state_dir.to_string_lossy(),
     });
     router.register("daemon.info", Duration::from_secs(5), move |_, params| {
         let info = info.clone();
@@ -273,6 +274,19 @@ mod tests {
                 "invalid_params"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn info_reports_non_utf8_state_dir_lossily_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        services.state_dir = PathBuf::from(std::ffi::OsString::from_vec(b"/state/\xff".to_vec()));
+        let router = router(services).unwrap();
+        let info = router
+            .call(context(), "daemon.info", Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(info["state_dir"], "/state/\u{fffd}");
     }
 
     #[tokio::test]

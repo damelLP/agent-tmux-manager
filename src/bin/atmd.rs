@@ -38,7 +38,7 @@ use atmd::discovery::DiscoveryService;
 use atmd::monitor::spawn_monitor_task;
 use atmd::notify::{parse_notify_command, spawn_notifier, NotifyConfig};
 use atmd::registry::{spawn_registry_with_cancel, supervise_actor};
-use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
+use atmd::server::{methods::MethodServices, DaemonServer, DEFAULT_SOCKET_PATH};
 
 /// ATM daemon - coding-agent session manager
 #[derive(Parser, Debug)]
@@ -219,13 +219,17 @@ fn main() -> Result<()> {
                 exit_already_running(Some(pid));
             }
 
+            // Resolve before daemonize changes cwd. Persistence opens only
+            // afterward: event-log lock descriptors must not cross the fork.
+            let state_dir = std::path::absolute(atmd::eventlog::state_dir())
+                .context("Failed to resolve the event-log state directory")?;
             if daemon {
                 daemonize()?;
             }
 
             write_pid()?;
 
-            let result = run_daemon(socket_path);
+            let result = run_daemon(socket_path, state_dir);
 
             remove_pid_file();
 
@@ -317,7 +321,7 @@ fn open_log(log_path: &Path) -> std::io::Result<File> {
 }
 
 #[tokio::main]
-async fn run_daemon(socket_path: PathBuf) -> Result<()> {
+async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
@@ -381,7 +385,9 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     let _monitor_handle = spawn_monitor_task(cancel_token.clone());
     info!("Process monitor started");
 
-    let server = DaemonServer::new(&socket_path, registry, cancel_token);
+    let mut services = MethodServices::new(registry);
+    services.state_dir = state_dir;
+    let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
 

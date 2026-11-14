@@ -717,28 +717,29 @@ where
         let session_id = SessionId::new(status.session_id.clone());
 
         // Send to registry for processing
-        let harness = atm_core::Harness::ClaudeCode;
         let applied = self
             .registry
-            .update_from_status_line(session_id.clone(), pid, status, harness)
+            .update_from_status_line(
+                session_id.clone(),
+                pid,
+                status,
+                atm_core::Harness::ClaudeCode,
+            )
             .await;
         // Status lines have no original pane: activity only, never repair one
-        // from the current row to manufacture prompt evidence.
-        if self.message_tapped(&session_id) {
-            let proven =
-                applied.is_ok() && self.message_parent_proven(&session_id, None, harness).await;
-            self.record_message_event(&session_id, None, None, None, proven);
+        // from the current row to manufacture prompt evidence. Activity can
+        // neither bind nor confirm, so it needs no parent proof.
+        if self.message_tapped() {
+            self.record_message_event(&session_id, None, None, None, false);
         }
         applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
     }
 
-    /// Evidence is installed and usable, and the session ID is a real one.
-    fn message_tapped(&self, session: &SessionId) -> bool {
-        !session.is_pending()
-            && self
-                .message_evidence
-                .as_ref()
-                .is_some_and(|evidence| evidence.available())
+    /// Evidence is installed and usable. A disabled one costs a hook nothing.
+    fn message_tapped(&self) -> bool {
+        self.message_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.available())
     }
 
     /// Apply once and tap only parent events. Generated metadata never uses
@@ -759,14 +760,10 @@ where
                 atm_core::LifecycleEvent::ChildSessionStart { .. }
                     | atm_core::LifecycleEvent::ChildSessionEnd { .. }
             )
-            && self.message_tapped(&session);
-        // A SessionEnd removes its row on success: take its proof first.
+            && self.message_tapped();
+        // A SessionEnd removes its row, so no snapshot can prove it afterwards.
+        // It needs none: it is activity of a session that can bind no more.
         let ends = matches!(event, atm_core::LifecycleEvent::SessionEnd { .. });
-        let proven_before = tapped
-            && ends
-            && self
-                .message_parent_proven(&session, pane.as_deref(), harness)
-                .await;
         let applied = self
             .registry
             .apply_lifecycle_event_with_context(
@@ -780,11 +777,10 @@ where
             .await;
         if tapped {
             let proven = applied.is_ok()
-                && (proven_before
-                    || (!ends
-                        && self
-                            .message_parent_proven(&session, pane.as_deref(), harness)
-                            .await));
+                && !ends
+                && self
+                    .message_parent_proven(&session, pane.as_deref(), harness)
+                    .await;
             self.record_message_event(
                 &session,
                 pane.as_deref(),
@@ -843,14 +839,15 @@ where
         let Some(evidence) = &self.message_evidence else {
             return;
         };
-        // An unparsable pane is an unknown pane, and proves nothing.
-        let known = pane.filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
+        // An unparsable pane is an unknown pane. Without a pane no event can
+        // bind or confirm, whatever its proof.
+        let pane = pane.filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
         let observed = evidence.tap(
             session,
-            known,
+            pane,
             harness,
             event,
-            proven && known == pane,
+            proven,
             self.message_history.as_ref(),
         );
         if let Err(error) = observed {
@@ -2406,6 +2403,54 @@ mod tests {
         assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_held_without_receipt(&evidence);
         assert_untouched(&evidence, other);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_failed_apply_is_never_proven() {
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        // The snapshot would prove the parent, but the event was not applied.
+        let row = evidence_row(&handler).await;
+        let snapshots = fake_registry(
+            &mut handler,
+            Err(crate::registry::RegistryError::RegistryFull { max: 100 }),
+            FakeSnapshot::Rows(vec![row]),
+        );
+        assert!(handler
+            .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
+            .await
+            .is_err());
+        assert_held_without_receipt(&evidence);
+        assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_activity_only_events_take_no_snapshot() {
+        // A status line and a SessionEnd can neither bind nor confirm.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![]));
+        let mut end = captured_prompt(atm_core::Harness::Pi);
+        end["event"] = serde_json::json!("session_shutdown");
+        end["payload"] = serde_json::json!({"type":"session_shutdown"});
+        handler.handle_pi_event(end).await.unwrap();
+        assert_held_without_receipt(&evidence);
+
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::ClaudeCode).await;
+        let status_snapshots = fake_registry(&mut handler, Ok(()), FakeSnapshot::Rows(vec![]));
+        let mut data: serde_json::Value = serde_json::from_str(
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_status_line_2.1.310.jsonl"
+            )
+            .lines()
+            .next()
+            .unwrap(),
+        )
+        .unwrap();
+        data["session_id"] = serde_json::json!("evidence-session");
+        handler.handle_status_update(data).await.unwrap();
+        assert_held_without_receipt(&evidence);
+        for count in [snapshots, status_snapshots] {
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ const GUARD: Duration = Duration::from_secs(30);
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+        if matches!(self.0.try_wait(), Ok(None)) {
             unsafe {
                 libc::kill(self.0.id() as i32, libc::SIGCONT);
                 libc::kill(self.0.id() as i32, libc::SIGKILL);
@@ -122,12 +122,20 @@ fn held_daemon_stop(remove_files: bool) {
         },
         0
     );
-    let mut status = 0;
+    let mut status = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    // Observe exit too, but leave all reaping to Child so its guard retains ownership.
     assert_eq!(
-        unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED) },
-        pid as i32
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut status,
+                libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0
     );
-    assert!(libc::WIFSTOPPED(status));
+    assert_eq!(status.si_code, libc::CLD_STOPPED);
 
     let mut stop = ChildGuard(
         command(root.path())

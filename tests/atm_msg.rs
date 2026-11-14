@@ -245,7 +245,8 @@ async fn inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls() {
                 "/brief\\u{1b}",
                 "t1",
                 "delivered",
-                "after",
+                "sent=2026-11-14T00:00:00+00:00 read=-",
+                "next: --for owner --unread --after m3",
             ] {
                 assert!(text.contains(s), "{text}");
             }

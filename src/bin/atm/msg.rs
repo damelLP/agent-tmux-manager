@@ -289,7 +289,12 @@ pub async fn cmd_msg(action: MsgAction) -> Result<()> {
     }
 }
 
-fn render_inbox(result: &InboxResult, out: &mut impl Write) -> Result<()> {
+fn render_inbox(
+    result: &InboxResult,
+    recipient: Option<&Address>,
+    unread: bool,
+    out: &mut impl Write,
+) -> Result<()> {
     for entry in &result.messages {
         let c = &entry.content;
         writeln!(
@@ -300,7 +305,7 @@ fn render_inbox(result: &InboxResult, out: &mut impl Write) -> Result<()> {
             c.to,
             serde_json::to_value(c.kind)?.as_str().unwrap_or("unknown"),
             status_text(entry.status)?,
-            entry.sent_at,
+            entry.sent_at.to_rfc3339(),
             entry
                 .read_at
                 .map(|t| t.to_rfc3339())
@@ -324,7 +329,14 @@ fn render_inbox(result: &InboxResult, out: &mut impl Write) -> Result<()> {
     }
     writeln!(out, "{} unread", result.unread_count)?;
     if let Some(id) = result.next_after {
-        writeln!(out, "next: --after {id}")?;
+        write!(out, "next:")?;
+        if let Some(recipient) = recipient {
+            write!(out, " --for {recipient}")?;
+        }
+        if unread {
+            write!(out, " --unread")?;
+        }
+        writeln!(out, " --after {id}")?;
     }
     Ok(())
 }
@@ -332,7 +344,7 @@ pub async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     let (result, raw): (InboxResult, _) = request(
         "msg.inbox",
         InboxParams {
-            recipient: args.recipient,
+            recipient: args.recipient.clone(),
             unread_only: args.unread,
             count_only: false,
             id: args.id,
@@ -345,7 +357,9 @@ pub async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     let mut out = io::stdout().lock();
     match args.format {
         MessageFormat::Json => output(&raw, args.format, "", &mut out),
-        MessageFormat::Text => render_inbox(&result, &mut out),
+        MessageFormat::Text => {
+            render_inbox(&result, args.recipient.as_ref(), args.unread, &mut out)
+        }
     }
 }
 
@@ -375,6 +389,8 @@ mod tests {
                 unread_count: 0,
                 next_after: None
             },
+            None,
+            false,
             &mut Broken
         )
         .is_err());

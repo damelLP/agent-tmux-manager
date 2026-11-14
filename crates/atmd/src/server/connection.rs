@@ -1764,13 +1764,13 @@ mod tests {
     async fn request_connection(
         router: Arc<super::super::methods::MethodRouter>,
     ) -> (
-        BufReader<OwnedReadHalf>,
-        OwnedWriteHalf,
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
         CancellationToken,
         tokio::task::JoinHandle<Option<String>>,
     ) {
-        let (ours, peer) = UnixStream::pair().unwrap();
-        let (read, write) = ours.into_split();
+        let (ours, peer) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(ours);
         let cancel = CancellationToken::new();
         let handler = ConnectionHandler::new(
             read,
@@ -1782,7 +1782,7 @@ mod tests {
             router,
         );
         let run = tokio::spawn(handler.run());
-        let (read, mut write) = peer.into_split();
+        let (read, mut write) = tokio::io::split(peer);
         let mut read = BufReader::new(read);
         send_client(&mut write, ClientMessage::connect(Some("caller".into()))).await;
         assert!(matches!(
@@ -1792,9 +1792,9 @@ mod tests {
         (read, write, cancel, run)
     }
 
-    async fn send_client(writer: &mut OwnedWriteHalf, msg: ClientMessage) {
+    async fn send_client<W: AsyncWrite + Unpin>(writer: &mut W, msg: ClientMessage) {
         timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             writer.write_all(format!("{}\n", serde_json::to_string(&msg).unwrap()).as_bytes()),
         )
         .await
@@ -1802,7 +1802,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn receive(reader: &mut BufReader<OwnedReadHalf>) -> DaemonMessage {
+    async fn receive<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> DaemonMessage {
         let mut line = String::new();
         timeout(Duration::from_secs(1200), reader.read_line(&mut line))
             .await
@@ -1879,8 +1879,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn watch_only_survives_idle_timeout_then_unwatch_restores_it() {
-        let (ours, peer) = UnixStream::pair().unwrap();
-        let (read, write) = ours.into_split();
+        let (ours, peer) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(ours);
         let cancel = CancellationToken::new();
         let mut handler = ConnectionHandler::new(
             read,
@@ -1901,14 +1901,14 @@ mod tests {
         });
         handler.watcher = Some(Forwarder { stop, task });
         let run = tokio::spawn(handler.run());
-        let (read, mut write) = peer.into_split();
+        let (read, mut write) = tokio::io::split(peer);
         let mut read = BufReader::new(read);
         send_client(&mut write, ClientMessage::connect(None)).await;
         assert!(matches!(
             receive(&mut read).await,
             DaemonMessage::Connected { .. }
         ));
-        tokio::time::sleep(READ_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::advance(READ_TIMEOUT + Duration::from_secs(1)).await;
         send_client(&mut write, ClientMessage::ping(1)).await;
         assert!(matches!(
             receive(&mut read).await,
@@ -1920,19 +1920,21 @@ mod tests {
             receive(&mut read).await,
             DaemonMessage::Pong { seq: 2 }
         ));
-        let start = tokio::time::Instant::now();
+        tokio::time::advance(READ_TIMEOUT - Duration::from_secs(1)).await;
+        send_client(&mut write, ClientMessage::ping(3)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 3 }
+        ));
+        tokio::time::advance(READ_TIMEOUT).await;
         let mut line = String::new();
         assert_eq!(
-            timeout(
-                READ_TIMEOUT + Duration::from_secs(1),
-                read.read_line(&mut line)
-            )
-            .await
-            .unwrap()
-            .unwrap(),
+            timeout(Duration::from_secs(60), read.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap(),
             0
         );
-        assert!(start.elapsed() >= READ_TIMEOUT);
         run.await.unwrap();
     }
 
@@ -1956,11 +1958,11 @@ mod tests {
         run.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn tail_response_limit_also_applies_when_request_queue_is_full() {
         let (mut read, mut write, cancel, run) = request_connection(request_router()).await;
         for n in 0..64 {
-            send_client(&mut write, request(&n.to_string(), 100)).await;
+            send_client(&mut write, request(&n.to_string(), 10)).await;
         }
         send_client(&mut write, ClientMessage::ping(42)).await;
         assert!(matches!(
@@ -1978,13 +1980,20 @@ mod tests {
             *id = "i".repeat(MAX_MESSAGE_SIZE - base);
         }
         send_client(&mut write, message).await;
-        let byte = timeout(Duration::from_millis(50), read.read_u8()).await;
-        cancel.cancel();
-        timeout(Duration::from_secs(1), run).await.unwrap().unwrap();
-        assert!(
-            byte.is_err() || matches!(byte, Ok(Err(_))),
+        let mut bytes = Vec::new();
+        assert_eq!(
+            timeout(Duration::from_secs(60), read.read_to_end(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
             "oversized capacity error started a frame"
         );
+        cancel.cancel();
+        timeout(Duration::from_secs(60), run)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -2070,28 +2079,46 @@ mod tests {
                     }
                 })
                 .unwrap();
-            let (mut read, mut write, cancel, mut run) = request_connection(Arc::new(router)).await;
-            send_client(&mut write, request("blocked", 0)).await;
-            if disconnect {
-                send_client(&mut write, ClientMessage::disconnect()).await;
-            }
-            release.notify_one();
-            // The first byte proves a reply write started; leaving the rest
-            // unread fills the real socket, not a mocked writer.
-            timeout(Duration::from_secs(5), read.read_u8())
-                .await
-                .unwrap()
-                .unwrap();
-            cancel.cancel();
-            let stopped = timeout(Duration::from_millis(500), &mut run).await;
-            if stopped.is_err() {
-                run.abort();
-            }
-            assert!(
-                stopped.is_ok(),
-                "shutdown waited for a blocked reply (disconnect={disconnect})"
+            let (ours, peer) = tokio::io::duplex(4096);
+            let (read, write) = tokio::io::split(ours);
+            let cancel = CancellationToken::new();
+            let handler = ConnectionHandler::new(
+                read,
+                write,
+                crate::registry::spawn_registry(),
+                Arc::new(RwLock::new(HashMap::new())),
+                1,
+                cancel.clone(),
+                Arc::new(router),
             );
-            stopped.unwrap().unwrap();
+            let mut run = Box::pin(handler.run());
+            let (read, mut write) = tokio::io::split(peer);
+            let mut read = BufReader::new(read);
+            let probe = async {
+                send_client(&mut write, ClientMessage::connect(None)).await;
+                assert!(matches!(
+                    receive(&mut read).await,
+                    DaemonMessage::Connected { .. }
+                ));
+                send_client(&mut write, request("blocked", 0)).await;
+                if disconnect {
+                    send_client(&mut write, ClientMessage::disconnect()).await;
+                }
+                release.notify_one();
+                // The first byte proves the reply write started. Keep the rest
+                // unread; cancellation must complete without polling the peer.
+                read.read_u8().await.unwrap();
+            };
+            tokio::select! {
+                _ = &mut run => panic!("handler exited before its reply"),
+                result = timeout(Duration::from_secs(60), probe) => result.unwrap(),
+            }
+            cancel.cancel();
+            tokio::select! {
+                biased;
+                _ = &mut run => {},
+                _ = std::future::ready(()) => panic!("shutdown waited for a blocked reply (disconnect={disconnect})"),
+            }
         }
     }
 
@@ -2123,18 +2150,16 @@ mod tests {
         }
         tx.send(event).unwrap();
         let mut peer = BufReader::new(peer);
-        timeout(Duration::from_secs(5), peer.read_u8())
+        timeout(Duration::from_secs(60), peer.read_u8())
             .await
             .unwrap()
             .unwrap();
-        let mut run = tokio::spawn(async move { handler.process_messages().await });
         cancel.cancel();
-        let stopped = timeout(Duration::from_millis(500), &mut run).await;
-        if stopped.is_err() {
-            run.abort();
+        tokio::select! {
+            biased;
+            result = handler.process_messages() => result.unwrap(),
+            _ = std::future::ready(()) => panic!("shutdown waited for a blocked forwarder"),
         }
-        assert!(stopped.is_ok(), "shutdown waited for a blocked forwarder");
-        stopped.unwrap().unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]

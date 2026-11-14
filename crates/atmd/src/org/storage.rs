@@ -225,13 +225,11 @@ mod tests {
         release.send(()).unwrap();
         // Timed-out queued jobs are skipped. Once drained, the same reader
         // remains usable; no abandoned operation needs a replacement thread.
-        let page = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match reader.page(7, 8, &[]).await {
-                    Ok(page) => break page,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
+        let page = tokio::time::timeout(Duration::from_secs(60), async {
+            // Queue capacity is the synchronization point; no other callers
+            // can take this slot after we release the reservation.
+            drop(reader.requests.reserve().await.unwrap());
+            reader.page(7, 8, &[]).await.unwrap()
         })
         .await
         .unwrap();
@@ -272,11 +270,11 @@ mod tests {
             drop(runtime);
             finished.send(()).unwrap();
         });
-        let stopped = finish_received.recv_timeout(Duration::from_secs(2));
+        let stopped = finish_received.recv_timeout(Duration::from_secs(60));
         release.send(()).unwrap();
         thread.join().unwrap();
         assert!(stopped.is_ok(), "runtime waited for a hung reader");
-        exit_received.recv_timeout(Duration::from_secs(2)).unwrap();
+        exit_received.recv_timeout(Duration::from_secs(60)).unwrap();
     }
 
     #[test]
@@ -321,13 +319,13 @@ mod tests {
             drop(runtime);
             finished.send(()).unwrap();
         });
-        let stopped = finish_received.recv_timeout(Duration::from_secs(2));
+        let stopped = finish_received.recv_timeout(Duration::from_secs(60));
         release.send(()).unwrap();
         thread.join().unwrap();
         assert!(
             stopped.is_ok(),
             "runtime waited on a hung filesystem worker"
         );
-        drop_received.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop_received.recv_timeout(Duration::from_secs(60)).unwrap();
     }
 }

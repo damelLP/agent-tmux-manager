@@ -3,11 +3,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use atm_protocol::ClientMessage;
 use atmd::eventlog::{read_from, Envelope, EventLog, Stream};
@@ -46,6 +46,9 @@ impl Daemon {
         if daemonized {
             command.arg("-d");
         }
+        let log_dir = self.dir.path().join("xdg/atm");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let changes = directory_changes(&log_dir);
         self.child = Some(
             command
                 .current_dir(self.dir.path())
@@ -57,26 +60,59 @@ impl Daemon {
                 .env("TMUX_TMPDIR", self.dir.path().join("tmux"))
                 .env("XDG_STATE_HOME", self.dir.path().join("xdg"))
                 .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
-        wait_until(|| self.socket().exists());
         if daemonized {
-            let child = self.child.as_mut().unwrap();
-            wait_until(|| child.try_wait().unwrap().is_some());
-            assert!(child.wait().unwrap().success());
+            let mut child = self.child.take().unwrap();
+            assert!(blocking(move || child.wait().unwrap()).success());
+            let log = log_dir.join("atm.log");
+            blocking(move || loop {
+                if std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains("Daemon server listening")
+                {
+                    break;
+                }
+                readable(&changes);
+                let mut bytes = [0u8; 4096];
+                assert!(
+                    unsafe {
+                        libc::read(changes.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len())
+                    } > 0
+                );
+            });
+        } else {
+            let output = self.child.as_mut().unwrap().stdout.take().unwrap();
+            let (ready, receive) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .spawn(move || {
+                    let mut ready = Some(ready);
+                    for line in BufReader::new(output).lines() {
+                        let Ok(line) = line else {
+                            break;
+                        };
+                        if line.contains("Daemon server listening") {
+                            if let Some(ready) = ready.take() {
+                                let _ = ready.send(());
+                            }
+                        }
+                    }
+                })
+                .unwrap();
+            receive.recv_timeout(Duration::from_secs(60)).unwrap();
         }
     }
 
     fn info(&self) -> Value {
         let mut stream = UnixStream::connect(self.socket()).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
+            .set_write_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
@@ -129,11 +165,13 @@ impl Daemon {
                 self.owns(pid),
                 "refusing to signal a daemon outside this rig"
             );
-            // Rechecked immediately before signaling; no shared PID/socket state.
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            wait_until(|| !self.pid_file().exists());
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            assert!(fd >= 0);
+            let exited = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+            assert!(self.owns(pid), "daemon identity changed before signaling");
+            assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+            readable(&exited); // kernel process-exit notification, including daemonized children
+            assert!(!self.pid_file().exists());
         }
         if let Some(mut child) = self.child.take() {
             if child.try_wait().unwrap().is_none() && self.owns(child.id()) {
@@ -142,7 +180,7 @@ impl Daemon {
                     libc::kill(child.id() as i32, libc::SIGTERM);
                 }
             }
-            wait_until(|| child.try_wait().unwrap().is_some());
+            blocking(move || child.wait().unwrap());
         }
     }
 }
@@ -162,10 +200,10 @@ impl Client {
     fn connect(daemon: &Daemon) -> Self {
         let stream = UnixStream::connect(daemon.socket()).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
+            .set_write_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let reader = BufReader::new(stream.try_clone().unwrap());
         let mut client = Self { stream, reader };
@@ -272,7 +310,10 @@ fn wait_for_log_close(daemon: &Daemon) {
     // Drop of EventLog doesn't join its worker; wait for its actual lock release
     // before starting a daemon. This never opens/retries another log worker.
     let file = std::fs::File::open(daemon.state().join("log/events/.lock")).unwrap();
-    wait_until(|| unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0);
+    blocking(move || {
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        drop(file);
+    });
 }
 
 fn seed(daemon: &Daemon) -> Vec<Envelope> {
@@ -307,12 +348,46 @@ fn latest<'a>(history: &'a [Envelope], id: &str) -> &'a Value {
         .body
 }
 
-fn wait_until(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready() {
-        assert!(Instant::now() < deadline, "private daemon timed out");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let _ = send.send(work());
+        })
+        .unwrap();
+    receive.recv_timeout(Duration::from_secs(60)).unwrap()
+}
+
+fn readable(file: &std::fs::File) {
+    let mut fd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut fd, 1, 60_000) },
+        1,
+        "kernel event did not arrive"
+    );
+    assert_ne!(fd.revents & libc::POLLIN, 0);
+}
+
+fn directory_changes(path: &std::path::Path) -> std::fs::File {
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    assert!(fd >= 0);
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert!(
+        unsafe {
+            libc::inotify_add_watch(
+                fd,
+                path.as_ptr(),
+                libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO,
+            )
+        } >= 0
+    );
+    file
 }
 
 #[test]
@@ -328,19 +403,21 @@ fn real_daemon_restart_keeps_history_cost_prompt_and_org_state() {
         if !finish {
             client.assert_live_cost(&id);
         }
-        let mut saved = Vec::new();
-        // Watch/tail is the persistence barrier, not just connection ping.
-        wait_until(|| {
-            saved = client.tail(0);
-            saved.iter().rev().any(|record| {
-                record.kind == "session.summary"
-                    && record.body["session_id"] == id
-                    && record.body["first_prompt"] == "Read note.txt and reply."
-                    && (!finish
-                        || (record.body["cost"]["microdollars"] == 10650
-                            && !record.body["ended"].is_null()))
-            })
-        });
+        let mut events = Client::connect(&daemon);
+        events.send(ClientMessage::watch(vec!["session".into()], 0));
+        loop {
+            let event = events.recv();
+            assert_eq!(event["type"], "event");
+            let body = &event["body"];
+            if body["session_id"] == id
+                && body["first_prompt"] == "Read note.txt and reply."
+                && (!finish || (body["cost"]["microdollars"] == 10650 && !body["ended"].is_null()))
+            {
+                break;
+            }
+        }
+        drop(events);
+        let saved = client.tail(0);
         let cursor = saved.last().unwrap().seq;
         client.replay(0, &saved);
         drop(client);
@@ -467,17 +544,20 @@ fn real_daemon_clear_and_end_summaries_survive_restart() {
         })
         .collect();
     assert_eq!(ids.len(), 2);
-    let mut saved = Vec::new();
-    wait_until(|| {
-        saved = client.tail(0);
-        ids.iter().all(|id| {
-            saved.iter().any(|record| {
-                record.kind == "session.summary"
-                    && record.body["session_id"] == *id
-                    && !record.body["ended"].is_null()
-            })
-        })
-    });
+    let mut events = Client::connect(&daemon);
+    events.send(ClientMessage::watch(vec!["session".into()], 0));
+    let mut ended = std::collections::BTreeSet::new();
+    while ended != ids {
+        let event = events.recv();
+        assert_eq!(event["type"], "event");
+        if !event["body"]["ended"].is_null() {
+            let id = event["body"]["session_id"].as_str().unwrap().to_owned();
+            assert!(ids.contains(&id));
+            ended.insert(id);
+        }
+    }
+    drop(events);
+    let saved = client.tail(0);
     client.replay(0, &saved);
     drop(client);
     daemon.stop();

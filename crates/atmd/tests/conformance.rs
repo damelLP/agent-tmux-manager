@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 struct Server {
@@ -36,14 +36,16 @@ impl Server {
         let socket = dir.path().join("daemon.sock");
         let cancel = CancellationToken::new();
         let server = DaemonServer::with_services(&socket, services, cancel.clone());
-        let task = tokio::spawn(async move { server.run().await });
-        timeout(Duration::from_secs(5), async {
-            while !socket.exists() {
-                sleep(Duration::from_millis(5)).await;
-            }
+        let mut run = Box::pin(async move { server.run().await });
+        // run binds synchronously before its first Pending accept.
+        std::future::poll_fn(|cx| {
+            use std::{future::Future, task::Poll};
+            assert!(run.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
         })
-        .await
-        .unwrap();
+        .await;
+        use tracing::instrument::WithSubscriber;
+        let task = tokio::spawn(run.with_current_subscriber());
         Self {
             socket,
             cancel,
@@ -273,6 +275,16 @@ async fn fixture_barrier_rejects_an_extra_response() {
 
 #[tokio::test]
 async fn server_shutdown_does_not_wait_for_stuck_subscriber_drain_limit() {
+    let logs = tempfile::tempdir().unwrap();
+    let log = logs.path().join("shutdown.log");
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
+            .finish(),
+    )
+    .unwrap();
     let registry = spawn_registry();
     let mut server = Server::with_services(MethodServices::new(registry.clone())).await;
     let mut client = server.client().await;
@@ -281,28 +293,43 @@ async fn server_shutdown_does_not_wait_for_stuck_subscriber_drain_limit() {
         .send(serde_json::to_value(ClientMessage::subscribe(None)).unwrap())
         .await;
     assert_eq!(client.recv().await["type"], "session_list");
+    let id = atm_core::SessionId::new("stuck-reader");
+    let mut session = atm_core::SessionDomain::new(
+        id.clone(),
+        atm_core::AgentType::GeneralPurpose,
+        atm_core::Model::Unknown,
+    );
+    // Working directories are shortened in SessionView; they cannot stall a
+    // writer reliably. First prompts retain their full contents on the wire.
+    session.first_prompt = Some("x".repeat(4 * 1024 * 1024));
+    registry.register(session).await.unwrap();
     registry
-        .register_discovered(
-            atm_core::SessionId::new("stuck-reader"),
-            1234,
-            PathBuf::from("x".repeat(4 * 1024 * 1024)),
-            None,
-            atm_core::Harness::Pi,
-        )
+        .update_from_status_line(id.clone(), None, Default::default(), atm_core::Harness::Pi)
         .await
         .unwrap();
+    assert!(
+        serde_json::to_vec(&registry.get_session(id).await.unwrap())
+            .unwrap()
+            .len()
+            > 4 * 1024 * 1024
+    );
     // At least one byte arrived: the forwarder is writing the oversized view.
-    timeout(Duration::from_secs(5), client.read.read_u8())
+    timeout(Duration::from_secs(60), client.read.read_u8())
         .await
         .unwrap()
         .unwrap();
     server.cancel.cancel();
-    let stopped = timeout(Duration::from_millis(500), &mut server.task).await;
+    let stopped = timeout(Duration::from_secs(60), &mut server.task).await;
     if stopped.is_err() {
         server.task.abort();
     }
     assert!(stopped.is_ok(), "shutdown hit the connection drain limit");
     stopped.unwrap().unwrap().unwrap();
+    // Completion alone could hide the fallback abort after the drain deadline.
+    // Observe that branch directly instead of asserting elapsed wall time.
+    let trace = std::fs::read_to_string(log).unwrap();
+    assert!(trace.contains("Server cleanup complete"), "{trace}");
+    assert!(!trace.contains("Aborting connection handlers"), "{trace}");
 }
 
 #[tokio::test]

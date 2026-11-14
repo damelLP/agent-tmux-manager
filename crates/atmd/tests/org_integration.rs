@@ -31,17 +31,19 @@ impl SocketServer {
         let path = dir.path().join("atm.sock");
         let cancel = CancellationToken::new();
         let server = DaemonServer::with_services(&path, services, cancel.clone());
-        let task = tokio::spawn(async move { server.run().await });
-        let stream = timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(stream) = UnixStream::connect(&path).await {
-                    break stream;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+        let mut run = Box::pin(async move { server.run().await });
+        std::future::poll_fn(|cx| {
+            use std::{future::Future, task::Poll};
+            assert!(run.as_mut().poll(cx).is_pending()); // bound before first accept
+            Poll::Ready(())
         })
-        .await
-        .unwrap();
+        .await;
+        use tracing::instrument::WithSubscriber;
+        let task = tokio::spawn(run.with_current_subscriber());
+        let stream = timeout(Duration::from_secs(60), UnixStream::connect(&path))
+            .await
+            .unwrap()
+            .unwrap();
         let (read, write) = stream.into_split();
         let mut server = Self {
             _dir: dir,
@@ -59,7 +61,7 @@ impl SocketServer {
     }
     async fn send(&mut self, frame: ClientMessage) {
         timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             self.write
                 .write_all(format!("{}\n", serde_json::to_string(&frame).unwrap()).as_bytes()),
         )
@@ -69,7 +71,7 @@ impl SocketServer {
     }
     async fn recv(&mut self) -> DaemonMessage {
         let mut line = String::new();
-        timeout(Duration::from_secs(5), self.read.read_line(&mut line))
+        timeout(Duration::from_secs(60), self.read.read_line(&mut line))
             .await
             .unwrap()
             .unwrap();
@@ -85,7 +87,7 @@ impl SocketServer {
     }
     async fn stop(self) {
         self.cancel.cancel();
-        timeout(Duration::from_secs(5), self.task)
+        timeout(Duration::from_secs(60), self.task)
             .await
             .unwrap()
             .unwrap()
@@ -395,7 +397,7 @@ async fn tail_id_with_no_room_for_even_an_error_closes_without_partial_frame() {
     server.send(request).await;
     let mut frame = String::new();
     assert_eq!(
-        timeout(Duration::from_secs(2), server.read.read_line(&mut frame))
+        timeout(Duration::from_secs(60), server.read.read_line(&mut frame))
             .await
             .unwrap()
             .unwrap(),
@@ -407,6 +409,16 @@ async fn tail_id_with_no_room_for_even_an_error_closes_without_partial_frame() {
 
 #[tokio::test]
 async fn watch_unwatch_keeps_frame_boundaries_but_shutdown_cancels_blocked_write() {
+    let logs = tempfile::tempdir().unwrap();
+    let log = logs.path().join("shutdown.log");
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
+            .finish(),
+    )
+    .unwrap();
     for shutdown in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
@@ -419,7 +431,7 @@ async fn watch_unwatch_keeps_frame_boundaries_but_shutdown_cancels_blocked_write
             .unwrap();
         server.send(ClientMessage::watch(vec![], 0)).await;
         assert_eq!(
-            timeout(Duration::from_secs(2), server.read.read_u8())
+            timeout(Duration::from_secs(60), server.read.read_u8())
                 .await
                 .unwrap()
                 .unwrap(),
@@ -427,16 +439,19 @@ async fn watch_unwatch_keeps_frame_boundaries_but_shutdown_cancels_blocked_write
         );
         if shutdown {
             server.cancel.cancel();
-            timeout(Duration::from_millis(500), server.task)
+            timeout(Duration::from_secs(60), server.task)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
+            let trace = std::fs::read_to_string(&log).unwrap();
+            assert!(trace.contains("Server cleanup complete"));
+            assert!(!trace.contains("Aborting connection handlers"), "{trace}");
         } else {
             server.send(ClientMessage::unwatch()).await;
             server.send(ClientMessage::ping(42)).await;
             let mut frame = String::from("{");
-            timeout(Duration::from_secs(2), server.read.read_line(&mut frame))
+            timeout(Duration::from_secs(60), server.read.read_line(&mut frame))
                 .await
                 .unwrap()
                 .unwrap();
@@ -499,7 +514,7 @@ async fn watch_replay_live_overlap_reconnect_and_prefixes() {
     org.execute(audit("three"), now()).await.unwrap();
     for seq in 1..=3 {
         assert_eq!(
-            timeout(Duration::from_secs(2), watch.next())
+            timeout(Duration::from_secs(60), watch.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -515,9 +530,11 @@ async fn watch_replay_live_overlap_reconnect_and_prefixes() {
         .unwrap();
     assert_eq!(reconnect.next().await.unwrap().unwrap().seq, 3);
     assert_eq!(reconnect.next().await.unwrap().unwrap().seq, 4);
-    assert!(timeout(Duration::from_millis(30), reconnect.next())
-        .await
-        .is_err());
+    tokio::select! {
+        biased;
+        event = reconnect.next() => panic!("unexpected event: {event:?}"),
+        _ = std::future::ready(()) => {},
+    }
     // Cancelling an idle next must not lose the next event.
     org.execute(audit("five"), now()).await.unwrap();
     assert_eq!(reconnect.next().await.unwrap().unwrap().seq, 5);
@@ -532,13 +549,13 @@ async fn watch_lag_replays_without_gap() {
     let mut watch = org.watch(vec![], 0).unwrap();
     org.execute(audit("first"), now()).await.unwrap();
     assert_eq!(watch.next().await.unwrap().unwrap().seq, 1);
-    // Exceed the actual EventLog broadcast capacity while not polling watch.
+    // Exceed the committed broadcast capacity while not polling watch.
     for n in 2..=1100 {
         org.execute(audit(n.to_string()), now()).await.unwrap();
     }
     for seq in 2..=1100 {
         assert_eq!(
-            timeout(Duration::from_secs(2), watch.next())
+            timeout(Duration::from_secs(60), watch.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -547,9 +564,8 @@ async fn watch_lag_replays_without_gap() {
             seq
         );
     }
-    assert!(timeout(Duration::from_millis(30), watch.next())
-        .await
-        .is_err());
+    org.execute(audit("sentinel"), now()).await.unwrap();
+    assert_eq!(watch.next().await.unwrap().unwrap().seq, 1101);
     cancel.cancel();
 }
 
@@ -641,17 +657,24 @@ fn project() -> OrgCommand {
 }
 
 async fn reopen(path: &Path, cancel: CancellationToken) -> OrgHandle {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let org = OrgHandle::open(path.to_owned(), cancel.clone()).await;
-            if org.status().is_ok() {
-                return org;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("writer released the lock")
+    use std::os::fd::AsRawFd;
+    let lock = path.join("log/events/.lock");
+    let (send, done) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let file = std::fs::File::open(lock).unwrap();
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+            drop(file);
+            let _ = send.send(());
+        })
+        .unwrap();
+    timeout(Duration::from_secs(60), done)
+        .await
+        .unwrap()
+        .unwrap();
+    let org = OrgHandle::open(path.to_owned(), cancel).await;
+    org.status().unwrap();
+    org
 }
 
 // Missing apply/replay or an incorrectly encoded cost loses these facts.

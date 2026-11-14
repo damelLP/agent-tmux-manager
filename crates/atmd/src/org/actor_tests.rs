@@ -297,7 +297,7 @@ async fn failed_or_hung_events_append_keeps_socket_tracking_and_ping_live() {
                 Some("Read note.txt and reply.")
             );
         };
-        tokio::time::timeout(Duration::from_secs(1), probe)
+        tokio::time::timeout(Duration::from_secs(60), probe)
             .await
             .unwrap();
         release.add_permits(1);

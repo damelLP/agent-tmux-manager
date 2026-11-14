@@ -418,19 +418,95 @@ mod reconciliation {
             let (agents, _) = rig.start();
             agents.reconciled().await.unwrap();
             let mut events = agents.observation_events();
-            rig.client
-                .script_inspect(
-                    &PaneId::parse("%1").unwrap(),
-                    Some(&Rig::inspection("%1", "p/lead", false)),
-                )
-                .unwrap();
+            // Stuck ends only when this observation's own capture shows a safe editor.
+            rig.frame("%1", "p/lead", IDLE);
             rig.row(session, "%1", false).await;
             progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(
+                rig.client
+                    .pending_reads(&PaneId::parse("%1").unwrap())
+                    .unwrap(),
+                0
+            );
             assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
             assert_eq!(
                 rig.state("lead").await.session_id,
                 Some(SessionId::new(session))
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn review_stuck_needs_a_safe_screen_to_recover() {
+        let dialog = include_str!(
+            "../../../atm-pi-adapter/tests/fixtures/screen_pi-dialog-confirm_1.5.0.txt"
+        )
+        .split_once('\n')
+        .unwrap()
+        .1;
+        let running = include_str!(
+            "../../../atm-pi-adapter/tests/fixtures/screen_pi-before-escape_1.5.0.txt"
+        );
+        assert_ne!(
+            atm_pi_adapter::screen::observe_screen(dialog, None).dialog,
+            atm_core::DialogState::None
+        );
+        for bound in [true, false] {
+            for unsafe_screen in [dialog, running, "unknown\n"] {
+                let rig = Rig::new().await;
+                if bound {
+                    rig.agent("lead", Some("%1"), Some("s1")).await;
+                } else {
+                    // An up that failed after the harness registered its session.
+                    rig.command(OrgCommand::Up {
+                        agent_id: "p/lead".parse().unwrap(),
+                        role: atm_org::parse_role("lead", "+++\nharness='pi'\n+++\n").unwrap(),
+                    })
+                    .await;
+                    rig.command(OrgCommand::PaneCreated {
+                        agent_id: "p/lead".parse().unwrap(),
+                        pane: "%1".into(),
+                    })
+                    .await;
+                }
+                rig.row("s1", "%1", false).await;
+                let reason = "unexpected screen in %1; inspect the pane";
+                rig.command(OrgCommand::Stuck {
+                    agent_id: "p/lead".parse().unwrap(),
+                    reason: reason.into(),
+                })
+                .await;
+                rig.inspect_only("%1", "p/lead");
+                let (agents, _) = rig.start();
+                agents.reconciled().await.unwrap();
+                let mut events = agents.observation_events();
+                let before = rig.org.status().unwrap();
+                // The harness keeps sending hooks while the bad screen is up.
+                for _ in 0..2 {
+                    rig.frame("%1", "p/lead", unsafe_screen);
+                    update(&rig, "s1").await;
+                    progress(&mut events, "finished", Some("p/lead")).await;
+                    let agent = rig.state("lead").await;
+                    assert_eq!(agent.status, AgentStatus::Stuck);
+                    assert_eq!(agent.reason.as_deref(), Some(reason));
+                    assert_eq!(rig.org.status().unwrap(), before);
+                }
+                // The owner fixes the pane; the next hook shows a safe editor.
+                rig.frame("%1", "p/lead", IDLE);
+                update(&rig, "s1").await;
+                progress(&mut events, "finished", Some("p/lead")).await;
+                let agent = rig.state("lead").await;
+                assert_eq!(agent.status, AgentStatus::Ready);
+                assert_eq!(agent.reason, None);
+                assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+                assert_eq!(rig.org.status().unwrap(), before + 1);
+                assert_eq!(
+                    rig.client
+                        .pending_reads(&PaneId::parse("%1").unwrap())
+                        .unwrap(),
+                    0
+                );
+            }
         }
     }
 

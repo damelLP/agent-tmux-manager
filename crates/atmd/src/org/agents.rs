@@ -4,6 +4,8 @@
 //! bound Ready agents, preserving their binding; ordinary wakes never do. A
 //! session-less Ready agent retains its lifecycle state even on an unsafe screen.
 //! Delivery must independently check the screen before input.
+//! A Stuck agent recovers only when one observation finds its session row and
+//! captures a safe editor; a binding alone never clears Stuck.
 //! Lifecycle effects remain unavailable until the flow slice is installed.
 
 pub use super::agent_methods::register_agent_methods;
@@ -506,7 +508,7 @@ impl AgentRuntime {
         r: &Reservation,
         state: &OrgState,
         agent: &Agent,
-        mut bind: Option<BindingCandidate>,
+        bind: Option<BindingCandidate>,
         initial: bool,
     ) -> Result<(), AgentError> {
         // Registry failure is never evidence that every agent is gone.
@@ -586,29 +588,37 @@ impl AgentRuntime {
                     && row.harness == expected.short_tag()
             })
             .collect();
-        if let Some(candidate) = bind.as_mut() {
-            if !in_mode
+        // The single eligible row this wake may bind, checked again at the write.
+        let mut binding = bind.filter(|candidate| {
+            !in_mode
                 && eligible.len() == 1
                 && eligible
                     .first()
                     .is_some_and(|row| row.id == candidate.session)
-                && candidate.valid(agent)
-            {
-                self.org
-                    .execute(
-                        OrgCommand::SessionBound {
-                            agent_id: agent.id.clone(),
-                            session_id: candidate.session.clone(),
-                        },
-                        chrono::Utc::now(),
-                    )
-                    .await?;
-                return Ok(());
+        });
+        // Binding is an identity event and needs no screen read, except to leave
+        // Stuck: that takes this observation's own capture of a safe editor.
+        let stuck = agent.status == AgentStatus::Stuck;
+        if !stuck {
+            if let Some(candidate) = binding.as_mut() {
+                if candidate.valid(agent) {
+                    self.org
+                        .execute(
+                            OrgCommand::SessionBound {
+                                agent_id: agent.id.clone(),
+                                session_id: candidate.session.clone(),
+                            },
+                            chrono::Utc::now(),
+                        )
+                        .await?;
+                    return Ok(());
+                }
             }
+            binding = None;
         }
         // A capture can change nothing for a Ready agent on an ordinary wake, or
         // for a session-less one at the restart check: don't read, or fail on, it.
-        if agent.status == AgentStatus::Stuck
+        if (stuck && binding.is_none())
             || (agent.status == AgentStatus::Ready && (!initial || agent.session_id.is_none()))
         {
             return Ok(());
@@ -629,17 +639,32 @@ impl AgentRuntime {
             .filter(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
             .collect();
         let parents = live.iter().filter(|row| !row.id.is_pending()).count();
-        let revalidating = agent.status == AgentStatus::Ready || agent.session_id.is_some();
-        if revalidating
-            && !capture.inspection.dead
+        let safe = !capture.inspection.dead
             && !capture.inspection.in_mode
             && capture.inspection.local_agent_tag.as_deref() == Some(&agent.id.to_string())
             && !live.is_empty()
             && parents <= 1
             && facts.input == InputState::Empty
             && facts.turn == TurnState::NotRunning
-            && facts.dialog == DialogState::None
-        {
+            && facts.dialog == DialogState::None;
+        if let Some(mut candidate) = binding {
+            // A dialog, a running turn or an unknown screen keeps Stuck and its reason.
+            if safe && live.iter().any(|row| row.id == candidate.session) && candidate.valid(agent)
+            {
+                self.org
+                    .execute(
+                        OrgCommand::SessionBound {
+                            agent_id: agent.id.clone(),
+                            session_id: candidate.session.clone(),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        let revalidating = agent.status == AgentStatus::Ready || agent.session_id.is_some();
+        if revalidating && safe {
             if agent.status != AgentStatus::Ready {
                 self.org
                     .execute(

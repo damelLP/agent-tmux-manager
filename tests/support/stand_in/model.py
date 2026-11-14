@@ -261,8 +261,6 @@ class Model:
             effects = self.end_turn(aborted=True) if working else []
             if working and self.mode == "claude":
                 effects += [{"kind": "draft", "text": self.active_prompt}]
-            if self.state == "dialog":
-                self.state = "idle"
             return effects + self.render("interrupted")
         self.last_ctrl_c = None
         if text == "/atm/status" or (text.startswith("/atm/status ") and not any(c in text for c in "\r\n")):

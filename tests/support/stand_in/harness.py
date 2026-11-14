@@ -149,6 +149,8 @@ class Runtime:
                          and s["mode"] == self.mode), None)
             if spec is None:
                 reply["error"] = "unknown source for this mode"
+            elif self.parser.pasting or self.parser.pending:
+                reply["error"] = "source replay requires complete terminal input"
             else:
                 # Supplementary exact source conformance, not a lifecycle or
                 # readiness claim. The ordinary editor state remains unchanged.

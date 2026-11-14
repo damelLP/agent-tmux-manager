@@ -74,6 +74,19 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(journal(r)[-1]["state"], "source-replay")
         self.assertFalse(any(e["kind"] == "ready" for e in journal(r)))
 
+    def test_source_replay_during_fragmented_paste_cannot_replace_lifecycle(self):
+        r = runtime()
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.render())
+            r.input(b"\x1b[200~my ")
+            r.control({"id": 1, "command": "render_source", "key": "claude.permission.u5"})
+            self.assertIn("error", journal(r)[-1])
+            r.input(b"draft\x1b[201~")
+            r.input(b" more")
+        self.assertEqual(journal(r)[-1]["frame"], "fresh")
+        self.assertEqual(journal(r)[-1]["draft"], "my draft more")
+        self.assertNotIn("permission", journal(r)[-1]["source"])
+
     def test_source_replay_rejects_unknown_and_foreign_mode_without_output(self):
         r = runtime()
         for key in ["missing", "pi.fresh.u5", None, {}]:

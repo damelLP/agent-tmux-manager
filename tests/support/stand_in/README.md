@@ -374,8 +374,13 @@ When combined, Codex start order is update → folder → hooks → editor. Pi h
 start dialog. `launch` returns on the first **rendered modal**, without waiting
 for ready or a daemon row. Use `wait_event` after keys; no `ready` is emitted for
 a modal. Selecting it cannot confirm delivery. Claude/Codex restore the normal
-terminal screen on exit; pi retains history and puts the shell below it. No
-frame/ready event is emitted after exit.
+terminal screen on exit; pi retains history and puts the shell below it. Claude
+follows U5's clean-shell capture (without its resume hint); P1 captured the same
+2.1.325 version leaving the UI inline above the shell instead. Exit-display
+fidelity is therefore not universal. P1 also saw the first quick Down/Enter on
+Claude trust reset to No; the stand-in models stable selection, not that reset.
+No frame/ready event is emitted after exit. Codex hook-review Esc and permission
+`y`/`p` shortcuts are not modeled: use the documented arrows/Enter or modal Escape.
 
 Pure source/scene/key tests run through the Cargo Python contract; private tmux
 integration tests cover native fresh replay, modal keys and retained shells.
@@ -394,7 +399,8 @@ For supplementary source-only conformance, `control(pane, json!({"command":
 that pane's mode. Set the private window to its catalog geometry first and hold
 model time. Await `rendered` with `state == "source-replay"`; this uses the same
 renderer and terminal barrier but does not change the model or emit `ready`.
-Unknown/cross-mode keys refuse. This diagnostic control never proves a lifecycle
+Unknown/cross-mode keys and replay during incomplete terminal input/paste refuse.
+This diagnostic control never proves a lifecycle
 transition; the key-driven tests are the independent transition evidence.
 
 A real-looking placeholder, selected trust option or Codex draft may still be
@@ -424,6 +430,7 @@ The capture carries `/new` on one persistent connection.
 
 Sanitization: paths become `/fixture/...`; identifiers become `fixture-*`;
 timestamps become zero. PID/pane are removed for the real forwarder to derive.
-Model names, source/reason/stopReason and usage shapes are retained. The permission
-screen is an excerpt with marker text replaced. Synthetic: runtime IDs, paths,
-prompt and timing substitutions construct controlled scenarios, not new captures.
+Model names, source/reason/stopReason and usage shapes are retained. Permission
+screens use the full catalog captures; synthetic selection changes only the
+selected marker. Synthetic: runtime IDs, paths, prompt and timing substitutions
+construct controlled scenarios, not new captures.

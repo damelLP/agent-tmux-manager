@@ -110,8 +110,8 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// an exit between try_wait and recv is retained. Every wake uses the same guard.
 fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
     let result = std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
@@ -133,12 +133,13 @@ fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
                             }
                         }
                     })
-            })
+            })?
             .join()
-            .expect("child waiter thread")
+            .unwrap_or_else(|_| Err(io::Error::other("child waiter thread panicked")))
     });
     // Setup/signal errors must reap too, not only the normal timeout branch.
-    if result.is_err() {
+    if let Err(error) = &result {
+        eprintln!("child {} waiter: {error}; killing and reaping", child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -147,32 +148,38 @@ fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
 
 /// Files avoid a full stdout/stderr pipe preventing the exit we await.
 fn command_output(command: &mut Command) -> Output {
+    try_command_output(command).unwrap_or_else(|error| panic!("{command:?}: {error}"))
+}
+
+fn try_command_output(command: &mut Command) -> io::Result<Output> {
     let deadline = Instant::now() + HANG_GUARD;
-    let mut stdout = tempfile::tempfile().expect("command stdout");
-    let mut stderr = tempfile::tempfile().expect("command stderr");
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
     let mut child = command
-        .stdout(stdout.try_clone().unwrap())
-        .stderr(stderr.try_clone().unwrap())
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn {command:?}: {e}"));
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .spawn()?;
     let status = wait_child(&mut child, deadline);
-    stdout.seek(SeekFrom::Start(0)).unwrap();
-    stderr.seek(SeekFrom::Start(0)).unwrap();
+    stdout.seek(SeekFrom::Start(0))?;
+    stderr.seek(SeekFrom::Start(0))?;
     let mut out = Vec::new();
     let mut err = Vec::new();
-    stdout.read_to_end(&mut out).unwrap();
-    stderr.read_to_end(&mut err).unwrap();
-    Output {
-        status: status.unwrap_or_else(|e| {
-            panic!(
-                "{command:?}: {e}\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&out),
-                String::from_utf8_lossy(&err)
+    stdout.read_to_end(&mut out)?;
+    stderr.read_to_end(&mut err)?;
+    Ok(Output {
+        status: status.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&err)
+                ),
             )
-        }),
+        })?,
         stdout: out,
         stderr: err,
-    }
+    })
 }
 
 /// Kernel fd readiness is an event; poll(2) blocks, without a timer retry loop.
@@ -213,8 +220,8 @@ fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
         return Err(io::ErrorKind::TimedOut.into());
     }
     std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
@@ -229,9 +236,9 @@ fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
                         stream.set_nonblocking(false)?;
                         Ok(stream)
                     })
-            })
+            })?
             .join()
-            .expect("socket connector thread")
+            .unwrap_or_else(|_| Err(io::Error::other("socket connector thread panicked")))
     })
 }
 
@@ -244,7 +251,17 @@ fn read_frame(reader: &mut BufReader<UnixStream>, deadline: Instant) -> io::Resu
             .filter(|left| !left.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "frame guard expired"))?;
         reader.get_ref().set_read_timeout(Some(remaining))?;
-        let available = reader.fill_buf()?;
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "frame guard timed out",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         if available.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -269,7 +286,17 @@ fn write_bytes(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> 
             .filter(|left| !left.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "write guard expired"))?;
         stream.set_write_timeout(Some(remaining))?;
-        let written = stream.write(bytes)?;
+        let written = match stream.write(bytes) {
+            Ok(written) => written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "write guard timed out",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         if written == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
@@ -313,23 +340,30 @@ impl ByteSink {
         }
     }
 
-    fn read_through(&mut self, want: usize) -> Vec<u8> {
+    fn read_through(&mut self, want: &[u8]) -> Vec<u8> {
         let deadline = Instant::now() + HANG_GUARD;
         let mut buffer = [0; 4096];
         loop {
             assert!(
                 Instant::now() < deadline,
-                "pane byte guard expired after {} bytes",
-                self.bytes.len()
+                "pane byte guard timed out; expected: {}; actual: {}",
+                want.escape_ascii(),
+                self.bytes.escape_ascii()
             );
             match self.reader.read(&mut buffer) {
                 Ok(0) => panic!("FIFO unexpectedly closed"),
                 Ok(count) => self.bytes.extend_from_slice(&buffer[..count]),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if self.bytes.len() >= want {
+                    if self.bytes.len() >= want.len() {
                         return self.bytes.clone();
                     }
-                    readable(self.reader.as_raw_fd(), deadline).expect("pane bytes before guard");
+                    readable(self.reader.as_raw_fd(), deadline).unwrap_or_else(|error| {
+                        panic!(
+                            "pane byte guard: {error}; expected: {}; actual: {}",
+                            want.escape_ascii(),
+                            self.bytes.escape_ascii()
+                        );
+                    });
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => panic!("read pane bytes: {error}"),
@@ -400,6 +434,28 @@ fn shim_connection_failure_records_its_stage() {
 }
 
 #[test]
+fn cleanup_capture_spawn_failure_returns_none() {
+    // A NUL makes spawn fail without changing the process-wide PATH or
+    // contacting any server. Cleanup must remain safe while unwinding.
+    assert!(tmux_run_capture("invalid\0label", &["display-message"]).is_none());
+}
+
+#[test]
+fn protocol_write_preserves_all_bytes() {
+    let (mut writer, reader) = UnixStream::pair().unwrap();
+    write_bytes(&mut writer, b"first\nsecond\n", Instant::now() + HANG_GUARD).unwrap();
+    let mut reader = BufReader::new(reader);
+    assert_eq!(
+        read_frame(&mut reader, Instant::now() + HANG_GUARD).unwrap(),
+        "first\n"
+    );
+    assert_eq!(
+        read_frame(&mut reader, Instant::now() + HANG_GUARD).unwrap(),
+        "second\n"
+    );
+}
+
+#[test]
 fn protocol_frames_share_the_operation_deadline() {
     let (mut writer, reader) = UnixStream::pair().unwrap();
     writer.write_all(b"first\nsecond\n").unwrap();
@@ -422,10 +478,10 @@ fn fifo_reader_preserves_accumulated_and_extra_bytes() {
     let mut sink = ByteSink::new(&path);
     let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     writer.write_all(b"a;\nb").unwrap();
-    assert_eq!(sink.read_through(4), b"a;\nb");
+    assert_eq!(sink.read_through(b"a;\nb"), b"a;\nb");
     writer.write_all(b"\nextra").unwrap();
     assert_eq!(
-        sink.read_through(5),
+        sink.read_through(b"a;\nb\n"),
         b"a;\nb\nextra",
         "do not truncate unexpected bytes"
     );
@@ -1249,10 +1305,10 @@ async fn scenario_paste_text_and_atm_send(env: &E2eEnv) {
     let mut bracketed_sink = ByteSink::new(&bracketed_file);
     let mut read_when = |path: &Path, want: &[u8]| {
         if path == plain_file {
-            plain_sink.read_through(want.len())
+            plain_sink.read_through(want)
         } else {
             assert_eq!(path, bracketed_file);
-            bracketed_sink.read_through(want.len())
+            bracketed_sink.read_through(want)
         }
     };
 
@@ -2792,14 +2848,17 @@ fn shell_word(text: &str) -> String {
 }
 
 fn quiet_tmux(label: &str, args: &[&str]) {
-    if let Ok(mut child) = Command::new("tmux")
+    match Command::new("tmux")
         .args(["-L", label])
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     {
-        let _ = wait_child(&mut child, Instant::now() + HANG_GUARD);
+        Ok(mut child) => {
+            let _ = wait_child(&mut child, Instant::now() + HANG_GUARD);
+        }
+        Err(error) => eprintln!("cleanup tmux -L {label} {args:?}: {error}"),
     }
 }
 
@@ -2839,6 +2898,7 @@ impl Drop for PreviewRig {
                 match daemon.read(&mut buf) {
                     Ok(0) => break,
                     Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
                         eprintln!("the TUI outlived its pane: {e}");
                         break;
@@ -3373,16 +3433,15 @@ struct ControlClient {
 }
 
 impl ControlClient {
-    fn until(&mut self, done: impl Fn(&str) -> bool) -> String {
+    fn until(&mut self, done: impl Fn(&str) -> bool) -> io::Result<String> {
         loop {
-            let line = read_frame(&mut self.reader, self.deadline)
-                .expect("control-mode completion before the operation guard");
+            let line = read_frame(&mut self.reader, self.deadline)?;
             assert!(
                 !line.starts_with("%error ") && !line.starts_with("%exit"),
                 "{line}"
             );
             if done(&line) {
-                return line;
+                return Ok(line);
             }
         }
     }
@@ -3425,7 +3484,9 @@ async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: im
         reader: BufReader::new(reader),
         deadline,
     };
-    client.until(|line| line.starts_with("%session-changed "));
+    client
+        .until(|line| line.starts_with("%session-changed "))
+        .expect("control client attached before guard");
     // Query through the attached client, not list-clients polling from outside.
     client
         .child
@@ -3434,9 +3495,13 @@ async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: im
         .unwrap()
         .write_all(b"list-clients -F \"#{client_control_mode} #{client_name}\"\n")
         .unwrap();
-    let name = client.until(|line| line.starts_with("1 "));
+    let name = client
+        .until(|line| line.starts_with("1 "))
+        .expect("control client name before guard");
     let name = name.trim().strip_prefix("1 ").unwrap();
-    client.until(|line| line.starts_with("%end "));
+    client
+        .until(|line| line.starts_with("%end "))
+        .expect("control client list completed before guard");
     // The server may have loaded the developer's ~/.tmux.conf.
     let prefix = tmux_run_capture(socket_label, &["show-options", "-gv", "prefix"])
         .expect("read the prefix key");
@@ -3448,7 +3513,23 @@ async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: im
     // Layout events are retained in the socket even if the key completed
     // before we started reading. Recheck the semantic condition on each event.
     while !done() {
-        client.until(|line| line.starts_with("%layout-change "));
+        client
+            .until(|line| line.starts_with("%layout-change "))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "prefix-{key} layout guard: {error}; actual pane widths: {:?}",
+                    tmux_run_capture(
+                        socket_label,
+                        &[
+                            "list-panes",
+                            "-t",
+                            &format!("={session}:"),
+                            "-F",
+                            "#{pane_id}=#{pane_width}"
+                        ]
+                    )
+                );
+            });
     }
 }
 
@@ -3482,7 +3563,11 @@ fn tmux_run_capture(socket_label: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("tmux");
     cmd.args(["-L", socket_label]);
     cmd.args(args);
-    let output = command_output(&mut cmd);
+    let output = try_command_output(&mut cmd)
+        .map_err(|error| {
+            eprintln!("{cmd:?}: {error}");
+        })
+        .ok()?;
     if !output.status.success() {
         return None;
     }

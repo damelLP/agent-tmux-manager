@@ -237,6 +237,35 @@ impl MessageEvidence {
         self.observe_inner(session, pane, Some(harness), prompt)
     }
 
+    /// The tap forwards retained receive-time provenance through the same short
+    /// ordering lock. A coalesced/newer observation may subsume an earlier one;
+    /// never substitute the later drain time for its receive timestamp.
+    pub(crate) fn record_activity(
+        &self,
+        session: &SessionId,
+        history: &super::message_history::MessageHistoryHandle,
+    ) -> Result<(), MessageError> {
+        let mut state = self.state()?;
+        if let Some((at, pane)) = state.sessions.get(session) {
+            let update = super::message_history::HistoryUpdate::Activity {
+                at: *at,
+                session_id: session.clone(),
+                pane: pane.clone(),
+            };
+            if history.record(update, *at).is_err() {
+                return Err(self.disable(&mut state, "message activity history unavailable"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate(&self, reason: &str) -> MessageError {
+        match self.state() {
+            Ok(mut state) => self.disable(&mut state, reason),
+            Err(error) => error,
+        }
+    }
+
     /// Genuine accepted status-line activity cannot create a receipt or bind a
     /// lazy scope (it lacks that scope's positive harness identity).
     pub fn observe_activity(

@@ -157,6 +157,10 @@ pub fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, MethodError
 /// here; their addition never requires another connection dispatch arm.
 pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     let mut router = MethodRouter::default();
+    let agent_unavailable = services.org.status().err().map_or_else(
+        || "named-agent operations are not configured".into(),
+        |error| error.to_string(),
+    );
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();
@@ -182,9 +186,9 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     register_control(&mut router, services.control)?;
     crate::org::agents::register_agent_methods(
         &mut router,
-        services.agents.unwrap_or_else(|| {
-            crate::org::agents::AgentHandle::disabled("named-agent operations are not configured")
-        }),
+        services
+            .agents
+            .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable)),
     )?;
 
     // Add service-backed registrations above this finalization. The factory,

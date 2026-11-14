@@ -2147,6 +2147,19 @@ mod agent_project {
 }
 
 #[tokio::test]
+async fn agent_unavailable_org_preserves_actual_reason() {
+    let mut services = MethodServices::new(crate::registry::spawn_registry());
+    services.org = super::OrgHandle::disabled("storage could not be opened");
+    let router = router(services).unwrap();
+    let error = router
+        .call(caller(), "agent.list", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.0.code, "unavailable");
+    assert!(error.0.message.contains("storage could not be opened"));
+}
+
+#[tokio::test]
 async fn agent_contract_disabled_has_no_effects() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -2159,13 +2172,39 @@ async fn agent_contract_disabled_has_no_effects() {
         org.clone(),
         cancel.clone(),
     );
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join(".atm/roles")).unwrap();
+    let role = "+++\nharness='pi'\n+++\n";
+    std::fs::write(root.join(".atm/roles/lead.md"), role).unwrap();
+    for command in [
+        atm_org::OrgCommand::RegisterProject {
+            project_id: "project".parse().unwrap(),
+            root: root.to_str().unwrap().into(),
+            move_root: false,
+        },
+        atm_org::OrgCommand::Up {
+            agent_id: "project/lead".parse().unwrap(),
+            role: atm_org::parse_role("lead", role).unwrap(),
+        },
+        atm_org::OrgCommand::PaneCreated {
+            agent_id: "project/lead".parse().unwrap(),
+            pane: "%7".into(),
+        },
+    ] {
+        org.execute(command, chrono::Utc::now()).await.unwrap();
+    }
     let before = org.status().unwrap();
+    let state = org.snapshot().await.unwrap();
     let agents = AgentHandle::disabled("off");
-    drop((registry, control));
-    let mut services = MethodServices::new(crate::registry::spawn_registry());
+    let mut services = MethodServices::new(registry);
+    services.org = org.clone();
+    services.control = Some(control);
     services.agents = Some(agents.clone());
     let router = router(services).unwrap();
-    for (method, params) in requests() {
+    for (method, mut params) in requests() {
+        if params.get("project_root").is_some() {
+            params["project_root"] = json!(root);
+        }
         let error = router.call(caller(), method, params).await.unwrap_err();
         assert_eq!(error.0.code, "unavailable");
         assert_eq!(error.0.message, "agent service unavailable: off");
@@ -2174,12 +2213,14 @@ async fn agent_contract_disabled_has_no_effects() {
         agents.reconciled().await,
         Err(AgentError::Unavailable(_))
     ));
-    assert!(
-        matches!(AgentHandle::disabled("off").reconciled().await, Err(AgentError::Unavailable(reason)) if reason == "off")
-    );
     assert!(mock.calls().is_empty());
     assert_eq!(org.status().unwrap(), before);
-    assert!(org.snapshot().await.unwrap().agents().next().is_none());
+    assert_eq!(org.snapshot().await.unwrap(), state);
+    assert!(!root.join(".atm/project.toml").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join(".atm/roles/lead.md")).unwrap(),
+        role
+    );
     cancel.cancel();
     control_task.await.unwrap();
 }
@@ -2347,7 +2388,7 @@ async fn agent_contract_advertises_six_disabled_methods() {
         assert_eq!(error.0.code, "unavailable", "{method}");
         assert_eq!(
             error.0.message,
-            "agent service unavailable: named-agent operations are not configured"
+            "agent service unavailable: organisation service unavailable: organisation service not configured"
         );
     }
 }

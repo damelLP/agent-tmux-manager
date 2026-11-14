@@ -28,6 +28,9 @@
 //! Blocking I/O, including Tokio blocking-pool work at runtime drop, can outlast
 //! that allowance. A stop timeout leaves the daemon potentially still shutting
 //! down; successful exit does not promise every pending write was persisted.
+//! Known limit (unverified in a filtered runtime): if seccomp denies pidfd_open
+//! with EPERM, stop fails before signaling. Only ENOSYS enables the old-kernel
+//! numeric-PID fallback; a seccomp denial does not.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

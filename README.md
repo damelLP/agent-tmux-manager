@@ -39,6 +39,8 @@ An open TUI restarts the daemon within a few seconds if it goes away, including 
 
 `atmd stop` waits for the daemon's real process exit, not just removal of its socket or PID file. After 5 seconds it prints one progress line and continues waiting, up to 75 seconds from signaling. Nominal shutdown drains can take 64 seconds: connections (2), admitted control work (30 total under its original deadlines), audits (30), then concurrent summary/raw flushes (2). Blocking I/O, including work that Tokio waits for at runtime shutdown, can take longer without a finite bound. On timeout, stop exits non-zero and names the PID that may still be shutting down; it neither force-kills the daemon nor removes its state. Successful stop confirms exit, not that every pending write was persisted.
 
+Known limit (unverified in a seccomp-filtered runtime): if a filter rejects Linux `pidfd_open` with `EPERM`, `atmd stop` fails before signaling the daemon. Only `ENOSYS` enables the old-kernel numeric-PID fallback; a seccomp denial does not.
+
 ## CLI at a glance
 
 ```bash

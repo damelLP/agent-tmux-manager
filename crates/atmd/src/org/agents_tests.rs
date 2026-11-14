@@ -867,13 +867,82 @@ mod reconciliation {
             .unwrap();
         let (agents, _) = rig.start();
         let rows = agents.list(ListParams::default()).await.unwrap();
-        assert_eq!(rows[0].state, AgentStatus::Clearing);
+        assert_eq!(rows[0].state, AgentStatus::Stuck);
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some("clear interrupted by daemon restart; inspect %1")
+        );
+        let state = rig.org.snapshot().await.unwrap();
+        let notes: Vec<_> = state.messages().collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content.from, atm_org::Address::System);
+        assert_eq!(notes[0].content.to, atm_org::Address::Owner);
+        assert_eq!(notes[0].content.kind, atm_org::MessageKind::Note);
+        assert!(notes[0].content.body.contains("p/lead"));
         assert!(rows[0].session_id.is_none());
         assert!(rows[0].activity.is_none());
         assert_eq!(
             rig.state("lead").await.excluded_session_id,
             Some(SessionId::new("old"))
         );
+    }
+
+    #[tokio::test]
+    async fn review_restart_clear_note_repairs_partial_prefix_without_duplicates() {
+        for partial in [false, true] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("old")).await;
+            rig.command(OrgCommand::Clear {
+                agent_id: "p/lead".parse().unwrap(),
+            })
+            .await;
+            if partial {
+                // Durable prefix left by a crash/failure after Stuck, before Note.
+                rig.command(OrgCommand::Stuck {
+                    agent_id: "p/lead".parse().unwrap(),
+                    reason: "clear interrupted by daemon restart; inspect %1".into(),
+                })
+                .await;
+            }
+            for _ in 0..2 {
+                rig.inspect_only("%1", "p/lead");
+                let cancel = rig.cancel.child_token();
+                let (agents, task) = spawn_agents(
+                    rig.org.clone(),
+                    rig.registry.clone(),
+                    rig.control.clone(),
+                    cancel.clone(),
+                );
+                agents.reconciled().await.unwrap();
+                let state = rig.org.snapshot().await.unwrap();
+                assert_eq!(
+                    state.agent(&"p/lead".parse().unwrap()).unwrap().status,
+                    AgentStatus::Stuck
+                );
+                assert_eq!(state.messages().count(), 1);
+                cancel.cancel();
+                task.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn review_missing_stuck_pane_preserves_original_diagnostic() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        rig.command(OrgCommand::Stuck {
+            agent_id: "p/lead".parse().unwrap(),
+            reason: "original clear failure".into(),
+        })
+        .await;
+        rig.client
+            .script_inspect(&PaneId::parse("%1").unwrap(), None)
+            .unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Down);
+        assert!(agent.reason.unwrap().contains("original clear failure"));
     }
 
     #[tokio::test]

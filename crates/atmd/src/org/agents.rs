@@ -527,12 +527,48 @@ impl AgentRuntime {
                 .execute(
                     OrgCommand::Down {
                         agent_id: agent.id.clone(),
-                        reason: "recorded pane is absent, dead or no longer owned".into(),
+                        reason: match agent.reason.as_ref().filter(|_| agent.status == AgentStatus::Stuck) {
+                            Some(reason) => format!("recorded pane is absent, dead or no longer owned; previous: {reason}"),
+                            None => "recorded pane is absent, dead or no longer owned".into(),
+                        },
                     },
                     chrono::Utc::now(),
                 )
                 .await?;
             return Ok(());
+        }
+        if let Some(pane) = &agent.pane {
+            let reason = format!("clear interrupted by daemon restart; inspect {pane}");
+            if (initial && agent.status == AgentStatus::Clearing)
+                || (agent.status == AgentStatus::Stuck && agent.reason.as_ref() == Some(&reason))
+            {
+                if agent.status == AgentStatus::Clearing {
+                    self.org
+                        .execute(
+                            OrgCommand::Stuck {
+                                agent_id: agent.id.clone(),
+                                reason: reason.clone(),
+                            },
+                            chrono::Utc::now(),
+                        )
+                        .await?;
+                }
+                let content = atm_org::MessageContent {
+                    from: atm_org::Address::System,
+                    to: atm_org::Address::Owner,
+                    kind: atm_org::MessageKind::Note,
+                    body: format!("agent {}: {reason}", agent.id),
+                    attachments: Vec::new(),
+                    task: None,
+                };
+                // Repair a partial Stuck/Note prefix, without duplicating a note
+                // whose append completed after its caller timed out.
+                if !state.messages().any(|message| message.content == content) {
+                    self.org
+                        .execute(OrgCommand::SendMessage(content), chrono::Utc::now())
+                        .await?;
+                }
+            }
         }
         if agent.status == AgentStatus::Clearing {
             return Ok(());

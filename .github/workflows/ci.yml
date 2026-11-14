@@ -52,6 +52,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Install hook transport
+        run: sudo apt-get update && sudo apt-get install -y socat
+
       - name: cargo test
         run: cargo test --workspace
 

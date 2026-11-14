@@ -1009,3 +1009,97 @@ async fn handle_fold_barrier_and_clones_share_applied_progress() {
     history.folded(0).await.unwrap();
     history.folded(1).await.unwrap();
 }
+
+/// A Working row whose event time overflows the stale deadline: any message
+/// evaluated against it fails the update.
+fn overflowing_observation() -> RecipientObservation {
+    let mut obs = observation(SessionStatus::Working);
+    obs.session.as_mut().unwrap().last_event_at = Some(DateTime::<Utc>::MAX_UTC);
+    obs
+}
+fn try_observe(f: &mut Fixture, observation: RecipientObservation, ms: i64) -> bool {
+    f.history
+        .record(
+            HistoryUpdate::Observed {
+                recipient: agent(),
+                observation,
+            },
+            at(ms),
+        )
+        .is_ok()
+}
+
+#[test]
+fn observed_for_a_recipient_with_no_open_message_evaluates_nothing() {
+    // Work is counted, not timed: the observation fails as soon as one message
+    // is evaluated against it.
+    let mut f = Fixture::new(0);
+    assert!(!try_observe(&mut f, overflowing_observation(), 0));
+    f.attempt(0);
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: f.id,
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        },
+        1_000,
+    );
+    // Its only message is delivered: nothing is evaluated.
+    assert!(try_observe(&mut f, overflowing_observation(), 2_000));
+    // A new message is open and is evaluated again.
+    f.apply(OrgEvent::MessageSent(content(agent())), 3_000);
+    let second = MessageId::new(f.seq);
+    assert!(!try_observe(&mut f, overflowing_observation(), 4_000));
+    // A final failure closes it; a failure that queues a retry would not.
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: second,
+            reason: "gave up".into(),
+            final_failure: true,
+        },
+        5_000,
+    );
+    assert!(try_observe(&mut f, overflowing_observation(), 6_000));
+    f.apply(OrgEvent::MessageSent(content(agent())), 7_000);
+    let third = MessageId::new(f.seq);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: third,
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        8_000,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: third,
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        9_000,
+    );
+    assert!(!try_observe(&mut f, overflowing_observation(), 10_000));
+}
+
+#[test]
+fn failed_activity_changes_no_clock_and_is_not_remembered() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Working), 0);
+    let before = f.snapshot(1_000).live;
+    assert!(f
+        .history
+        .record(
+            HistoryUpdate::Activity {
+                session_id: "s1".into(),
+                pane: Some(pane()),
+                at: DateTime::<Utc>::MAX_UTC,
+            },
+            at(1_000),
+        )
+        .is_err());
+    assert_eq!(f.snapshot(1_000).live, before);
+    // A new source would pick a remembered activity time up again.
+    f.record(HistoryUpdate::ObservationLost { recipient: agent() }, 2_000);
+    f.observe(observation(SessionStatus::Working), 3_000);
+    assert_eq!(f.snapshot(3_000).live.session.unwrap().last_event_at, at(0));
+}

@@ -38,15 +38,16 @@ use atm_core::{
 };
 use atm_org::{
     delivery::{
-        next_delivery, track_agent_not_ready, track_hold, track_stale_blocker, DeliveryPolicy,
-        DeliveryStep, InputLine, LiveSession, PaneLiveness, RecipientLiveView, WaitReason,
+        delivery_in_flight, next_delivery, track_agent_not_ready, track_hold, track_stale_blocker,
+        DeliveryPolicy, DeliveryStep, InputLine, LiveSession, PaneLiveness, RecipientLiveView,
+        WaitReason,
     },
     Address, Agent, AgentId, AgentStatus, DeliveryReceipt, DeliveryStatus, Message, MessageId,
     OrgEvent, OrgState,
 };
 use chrono::{DateTime, Utc};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Mutex},
 };
 use tokio::sync::watch;
@@ -214,9 +215,98 @@ struct MessageContinuity {
     stale_blocker: Option<WaitReason>,
 }
 
+impl MessageContinuity {
+    /// This message's own clocks and evidence, on top of its recipient's view.
+    fn apply(&self, live: &mut RecipientLiveView) {
+        live.hold_since = self.hold_since;
+        live.stale_blocker_since = self.stale_since;
+        live.last_attempt_before_start = self.restarted;
+        live.confirmation = self.receipt.clone();
+        live.probably_landed = self.probably_landed;
+    }
+}
+
+/// A recipient's open messages as any one of them sees the others.
+#[derive(Debug, Clone, Copy, Default)]
+struct Queue {
+    /// The first two attempted, unconfirmed messages: enough to find one that
+    /// is not the message asking.
+    in_flight: [Option<MessageId>; 2],
+    head: Option<MessageId>,
+}
+
+impl Queue {
+    /// The policy's reservation veto.
+    fn other_in_flight(&self, id: MessageId) -> Option<MessageId> {
+        self.in_flight
+            .iter()
+            .flatten()
+            .copied()
+            .find(|other| *other != id)
+    }
+
+    /// The veto first, else the FIFO head while it is older than `id`.
+    fn blocked_by(&self, id: MessageId) -> Option<MessageId> {
+        self.other_in_flight(id)
+            .or(self.head.filter(|head| *head < id))
+    }
+}
+
+/// New stale-blocker clocks, computed before any of them is written.
+type ShortClocks = Vec<(MessageId, Option<DateTime<Utc>>, Option<WaitReason>)>;
+
+/// The one agent an applied event can change. Exhaustive on purpose: a new
+/// event kind must say here whether it names an agent.
+fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
+    match event {
+        OrgEvent::AgentUpRequested { agent_id, .. }
+        | OrgEvent::AgentPaneCreated { agent_id, .. }
+        | OrgEvent::AgentAdopted { agent_id, .. }
+        | OrgEvent::AgentSessionBound { agent_id, .. }
+        | OrgEvent::AgentSessionLost { agent_id }
+        | OrgEvent::AgentEditorReady { agent_id }
+        | OrgEvent::AgentClearRequested { agent_id }
+        | OrgEvent::AgentStuck { agent_id, .. }
+        | OrgEvent::AgentDown { agent_id, .. } => Some(agent_id),
+        OrgEvent::ProjectRegistered { .. }
+        | OrgEvent::MessageSent(_)
+        | OrgEvent::MessageDeliveryAttempted { .. }
+        | OrgEvent::MessageDelivered { .. }
+        | OrgEvent::MessageDeliveryFailed { .. }
+        | OrgEvent::MessageRead { .. }
+        | OrgEvent::SessionSummary(_)
+        | OrgEvent::ControlSent(_)
+        | OrgEvent::ControlSpawned(_)
+        | OrgEvent::ControlKilled(_) => None,
+    }
+}
+
+/// The applied facts of an agent that its live continuity depends on.
+type AgentFacts = (
+    AgentStatus,
+    Option<String>,
+    Option<SessionId>,
+    Option<SessionId>,
+);
+
+fn agent_facts(agent: &Agent) -> AgentFacts {
+    (
+        agent.status,
+        agent.pane.clone(),
+        agent.session_id.clone(),
+        agent.excluded_session_id.clone(),
+    )
+}
+
 /// Pure projection, not an org command writer. Every clock and replay boundary
 /// is supplied. Updates are transactional: invalid input/arithmetic cannot leave
 /// partially updated continuity or advance the applied cursor.
+///
+/// An update costs what it touches, not what the log holds. `Applied` is
+/// validated and then folded in place. Every other update computes what can
+/// fail first, on a staged copy of the one recipient entry it changes, and
+/// writes afterwards. Clocks are refreshed only for a recipient's open
+/// messages (queued or delivering), never for delivered or failed ones.
 #[derive(Debug, Clone)]
 pub struct MessageHistory {
     state: Arc<OrgState>,
@@ -225,6 +315,8 @@ pub struct MessageHistory {
     recovery_time: DateTime<Utc>,
     policy: DeliveryPolicy,
     recipients: BTreeMap<AgentId, RecipientHistory>,
+    /// Per recipient, in FIFO order: its messages that can still be scheduled.
+    open: BTreeMap<AgentId, BTreeSet<MessageId>>,
     messages: BTreeMap<MessageId, MessageContinuity>,
     activity: HashMap<SessionId, (Option<PaneId>, DateTime<Utc>)>,
     pastes: HashMap<PaneId, DateTime<Utc>>,
@@ -244,6 +336,7 @@ impl MessageHistory {
             recovery_time,
             policy,
             recipients: BTreeMap::new(),
+            open: BTreeMap::new(),
             messages: BTreeMap::new(),
             activity: HashMap::new(),
             pastes: HashMap::new(),
@@ -255,35 +348,42 @@ impl MessageHistory {
         self.cursor
     }
 
-    pub fn snapshot(
-        &self,
-        id: MessageId,
-        now: DateTime<Utc>,
-    ) -> Result<DeliverySnapshot, MessageError> {
+    fn replayed(&self) -> Result<(), MessageError> {
         if self.cursor < self.startup_high_water {
             return Err(MessageError::Unavailable(
                 "message history replay is incomplete".into(),
             ));
         }
-        let message = self
-            .state
-            .message(&id)
-            .ok_or_else(|| MessageError::NotFound(format!("message {id} was not found")))?;
-        let Address::Agent(recipient) = &message.content.to else {
-            return Err(MessageError::Refused(
-                "only agent messages have delivery snapshots".into(),
-            ));
+        Ok(())
+    }
+
+    fn queue(&self, recipient: &AgentId) -> Queue {
+        let Some(open) = self.open.get(recipient) else {
+            return Queue::default();
         };
-        let agent = self
-            .state
-            .agent(recipient)
-            .ok_or_else(|| MessageError::NotFound(format!("agent {recipient} was not found")))?;
-        let track = self
-            .messages
-            .get(&id)
-            .ok_or_else(|| MessageError::Internal("message continuity missing".into()))?;
-        let mut live = RecipientLiveView::new(message, agent, self.state.messages());
-        if let Some(history) = self.recipients.get(recipient) {
+        let mut in_flight = open.iter().copied().filter(|id| {
+            self.state
+                .message(id)
+                .is_some_and(|message| delivery_in_flight(message, recipient))
+        });
+        Queue {
+            in_flight: [in_flight.next(), in_flight.next()],
+            head: open.first().copied(),
+        }
+    }
+
+    /// The live view all of a recipient's messages share at `now`; the veto
+    /// and each message's own continuity are added by the caller. `history`
+    /// may be a staged copy.
+    fn shared_live(
+        &self,
+        message: &Message,
+        agent: &Agent,
+        history: Option<&RecipientHistory>,
+        now: DateTime<Utc>,
+    ) -> RecipientLiveView {
+        let mut live = RecipientLiveView::new(message, agent, std::iter::empty());
+        if let Some(history) = history {
             live.agent_not_ready_since = history.not_ready_since;
             live.pane = history.pane;
             live.input_line = history.input;
@@ -311,48 +411,53 @@ impl MessageHistory {
             .and_then(|pane| PaneId::parse(pane).ok())
             .and_then(|pane| self.pastes.get(&pane).copied())
             .or(Some(self.recovery_time));
-        live.hold_since = track.hold_since;
-        live.stale_blocker_since = track.stale_since;
-        live.last_attempt_before_start = track.restarted;
-        live.confirmation = track.receipt.clone();
-        live.probably_landed = track.probably_landed;
-        let blocked_by = self
+        live
+    }
+
+    pub fn snapshot(
+        &self,
+        id: MessageId,
+        now: DateTime<Utc>,
+    ) -> Result<DeliverySnapshot, MessageError> {
+        self.replayed()?;
+        let message = self
             .state
-            .messages()
-            .find(|other| other.id != id && atm_org::delivery::delivery_in_flight(other, recipient))
-            .or_else(|| {
-                self.state.messages().find(|other| {
-                    other.id < id
-                        && other.content.to == message.content.to
-                        && matches!(
-                            other.status,
-                            DeliveryStatus::Queued | DeliveryStatus::Delivering
-                        )
-                })
-            })
-            .map(|other| other.id);
+            .message(&id)
+            .ok_or_else(|| MessageError::NotFound(format!("message {id} was not found")))?;
+        let Address::Agent(recipient) = &message.content.to else {
+            return Err(MessageError::Refused(
+                "only agent messages have delivery snapshots".into(),
+            ));
+        };
+        let agent = self
+            .state
+            .agent(recipient)
+            .ok_or_else(|| MessageError::NotFound(format!("agent {recipient} was not found")))?;
+        let track = self
+            .messages
+            .get(&id)
+            .ok_or_else(|| MessageError::Internal("message continuity missing".into()))?;
+        let queue = self.queue(recipient);
+        let mut live = self.shared_live(message, agent, self.recipients.get(recipient), now);
+        live.other_delivery_in_flight = queue.other_in_flight(id).is_some();
+        track.apply(&mut live);
         Ok(DeliverySnapshot {
             message: message.clone(),
             recipient: agent.clone(),
             live,
             last_attempt_seq: track.last_attempt_seq,
-            blocked_by,
+            blocked_by: queue.blocked_by(id),
             hold: track.hold,
         })
     }
 
+    /// All-or-nothing without copying the history: see the type's docs.
     pub fn record(
         &mut self,
         update: HistoryUpdate,
         now: DateTime<Utc>,
     ) -> Result<(), MessageError> {
-        // Stage pure state so even multi-message/recipient updates are all-or-none.
-        // Share durable message bodies across observation updates; only Applied
-        // uses copy-on-write for the org projection.
-        let mut next = self.clone();
-        next.update(update, now)?;
-        *self = next;
-        Ok(())
+        self.update(update, now)
     }
 
     fn track(&mut self, id: MessageId) -> Result<&mut MessageContinuity, MessageError> {
@@ -375,38 +480,145 @@ impl MessageHistory {
         Ok(track)
     }
 
-    fn reset_short_clock(&mut self, recipient: &AgentId) {
-        for message in self
-            .state
-            .messages()
-            .filter(|m| m.content.to == Address::Agent(recipient.clone()))
-        {
-            if let Some(track) = self.messages.get_mut(&message.id) {
+    /// Restart the stale-blocker clocks of the recipient's open messages, and
+    /// their holds too when `hold` is set.
+    fn reset_clocks(&mut self, recipient: &AgentId, hold: bool) {
+        for id in self.open.get(recipient).into_iter().flatten() {
+            if let Some(track) = self.messages.get_mut(id) {
+                if hold {
+                    track.hold_since = None;
+                }
                 track.stale_since = None;
                 track.stale_blocker = None;
             }
         }
     }
 
-    fn refresh_short_clocks(
-        &mut self,
+    /// The stale-blocker clocks of the recipient's open messages under
+    /// `history`, which may be a staged copy. `reset` restarts them first.
+    /// Nothing is written, so a failure changes no clock, and a recipient with
+    /// no open message evaluates nothing.
+    fn short_clocks(
+        &self,
         recipient: &AgentId,
+        history: &RecipientHistory,
+        reset: bool,
         now: DateTime<Utc>,
-    ) -> Result<(), MessageError> {
-        let ids: Vec<_> = self
+    ) -> Result<ShortClocks, MessageError> {
+        let Some(open) = self.open.get(recipient).filter(|open| !open.is_empty()) else {
+            return Ok(vec![]);
+        };
+        self.replayed()?;
+        let agent = self
             .state
-            .messages()
-            .filter(|m| m.content.to == Address::Agent(recipient.clone()))
-            .map(|m| m.id)
-            .collect();
-        for id in ids {
-            let mut live = self.snapshot(id, now)?.live;
-            let mut previous = self.messages.get(&id).and_then(|track| track.stale_blocker);
+            .agent(recipient)
+            .ok_or_else(|| MessageError::NotFound(format!("agent {recipient} was not found")))?;
+        let queue = self.queue(recipient);
+        let mut shared = None;
+        let mut clocks = Vec::with_capacity(open.len());
+        for id in open {
+            let (Some(message), Some(track)) = (self.state.message(id), self.messages.get(id))
+            else {
+                continue;
+            };
+            let mut live: RecipientLiveView = shared
+                .get_or_insert_with(|| self.shared_live(message, agent, Some(history), now))
+                .clone();
+            live.other_delivery_in_flight = queue.other_in_flight(*id).is_some();
+            track.apply(&mut live);
+            let mut previous = track.stale_blocker;
+            if reset {
+                live.stale_blocker_since = None;
+                previous = None;
+            }
             track_stale_blocker(&mut live, &mut previous, now, &self.policy)
                 .map_err(|error| MessageError::Internal(error.to_string()))?;
-            let track = self.track(id)?;
-            track.stale_since = live.stale_blocker_since;
-            track.stale_blocker = previous;
+            clocks.push((*id, live.stale_blocker_since, previous));
+        }
+        Ok(clocks)
+    }
+
+    fn set_short_clocks(&mut self, clocks: ShortClocks) {
+        for (id, since, blocker) in clocks {
+            if let Some(track) = self.messages.get_mut(&id) {
+                track.stale_since = since;
+                track.stale_blocker = blocker;
+            }
+        }
+    }
+
+    /// Fold one applied event. `OrgState::apply` validates before it changes
+    /// anything and this history holds the only reference to the state, so
+    /// nothing is copied; nothing after the apply can fail.
+    fn fold(&mut self, seq: u64, at: DateTime<Utc>, event: &OrgEvent) -> Result<(), MessageError> {
+        let named = named_agent(event);
+        let before = named.and_then(|id| self.state.agent(id)).map(agent_facts);
+        Arc::make_mut(&mut self.state)
+            .apply(seq, at, event)
+            .map_err(|error| MessageError::Internal(error.to_string()))?;
+        if let Some((id, after)) =
+            named.and_then(|id| Some((id, agent_facts(self.state.agent(id)?))))
+        {
+            let history = self.recipients.entry(id.clone()).or_default();
+            track_agent_not_ready(
+                &mut history.not_ready_since,
+                before.as_ref().map(|old| old.0),
+                after.0,
+                at,
+            );
+            let moved = before
+                .as_ref()
+                .is_none_or(|old| (&old.1, &old.2, &old.3) != (&after.1, &after.2, &after.3));
+            if moved {
+                history.lose();
+            }
+            let status_changed = before.as_ref().is_some_and(|old| old.0 != after.0)
+                && (after.0 != AgentStatus::Ready
+                    || before
+                        .as_ref()
+                        .is_some_and(|old| old.0 != AgentStatus::Ready));
+            if moved || status_changed {
+                self.reset_clocks(id, status_changed);
+            }
+        }
+        let id = match event {
+            OrgEvent::MessageSent(_) => MessageId::new(seq),
+            OrgEvent::MessageDeliveryAttempted { message_id, .. }
+            | OrgEvent::MessageDelivered { message_id, .. }
+            | OrgEvent::MessageDeliveryFailed { message_id, .. } => *message_id,
+            _ => return Ok(()),
+        };
+        let Some(message) = self.state.message(&id) else {
+            return Ok(());
+        };
+        if let Address::Agent(recipient) = &message.content.to {
+            let open = self.open.entry(recipient.clone()).or_default();
+            if matches!(
+                message.status,
+                DeliveryStatus::Queued | DeliveryStatus::Delivering
+            ) {
+                open.insert(id);
+            } else {
+                open.remove(&id);
+            }
+        }
+        let replayed = seq <= self.startup_high_water;
+        match event {
+            OrgEvent::MessageSent(_) => {
+                self.messages.insert(
+                    id,
+                    MessageContinuity {
+                        hold_since: replayed.then_some(self.recovery_time),
+                        ..MessageContinuity::default()
+                    },
+                );
+            }
+            OrgEvent::MessageDeliveryAttempted { .. } => {
+                let track = self.messages.entry(id).or_default();
+                track.last_attempt_seq = Some(seq);
+                track.restarted = replayed;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -423,76 +635,7 @@ impl MessageHistory {
                     ));
                 }
                 if let Some(event) = event {
-                    let previous: BTreeMap<_, _> = self
-                        .state
-                        .agents()
-                        .map(|agent| (agent.id.clone(), agent.clone()))
-                        .collect();
-                    Arc::make_mut(&mut self.state)
-                        .apply(seq, at, &event)
-                        .map_err(|error| MessageError::Internal(error.to_string()))?;
-                    for agent in self.state.agents() {
-                        let before = previous.get(&agent.id);
-                        let history = self.recipients.entry(agent.id.clone()).or_default();
-                        track_agent_not_ready(
-                            &mut history.not_ready_since,
-                            before.map(|a| a.status),
-                            agent.status,
-                            at,
-                        );
-                        if before.is_none_or(|old| {
-                            old.pane != agent.pane
-                                || old.session_id != agent.session_id
-                                || old.excluded_session_id != agent.excluded_session_id
-                        }) {
-                            history.lose();
-                            for message in self
-                                .state
-                                .messages()
-                                .filter(|m| m.content.to == Address::Agent(agent.id.clone()))
-                            {
-                                if let Some(track) = self.messages.get_mut(&message.id) {
-                                    track.stale_since = None;
-                                    track.stale_blocker = None;
-                                }
-                            }
-                        }
-                        if before.is_some_and(|old| old.status != agent.status)
-                            && (agent.status != AgentStatus::Ready
-                                || before.is_some_and(|old| old.status != AgentStatus::Ready))
-                        {
-                            for message in self
-                                .state
-                                .messages()
-                                .filter(|m| m.content.to == Address::Agent(agent.id.clone()))
-                            {
-                                if let Some(track) = self.messages.get_mut(&message.id) {
-                                    track.hold_since = None;
-                                    track.stale_since = None;
-                                    track.stale_blocker = None;
-                                }
-                            }
-                        }
-                    }
-                    match event {
-                        OrgEvent::MessageSent(_) => {
-                            self.messages.insert(
-                                MessageId::new(seq),
-                                MessageContinuity {
-                                    hold_since: (seq <= self.startup_high_water)
-                                        .then_some(self.recovery_time),
-                                    ..MessageContinuity::default()
-                                },
-                            );
-                        }
-                        OrgEvent::MessageDeliveryAttempted { message_id, .. } => {
-                            let restarted = seq <= self.startup_high_water;
-                            let track = self.track(message_id)?;
-                            track.last_attempt_seq = Some(seq);
-                            track.restarted = restarted;
-                        }
-                        _ => {}
-                    }
+                    self.fold(seq, at, &event)?;
                 }
                 self.cursor = seq;
             }
@@ -517,7 +660,8 @@ impl MessageHistory {
                         "observation does not match recipient identity".into(),
                     ));
                 }
-                let history = self.recipients.entry(recipient.clone()).or_default();
+                // Staged: the stored entry changes only after the clocks are known.
+                let mut history = self.recipients.get(&recipient).cloned().unwrap_or_default();
                 let same_source = history.observation.as_ref().is_some_and(|old| {
                     old.pane == observation.pane
                         && old.session.as_ref().map(|s| (&s.id, s.harness))
@@ -577,37 +721,41 @@ impl MessageHistory {
                     }
                 };
                 history.observation = Some(observation);
-                if !same_status {
-                    self.reset_short_clock(&recipient);
-                }
-                self.refresh_short_clocks(&recipient, now)?;
+                let clocks = self.short_clocks(&recipient, &history, !same_status, now)?;
+                self.recipients.insert(recipient, history);
+                self.set_short_clocks(clocks);
             }
             HistoryUpdate::ObservationLost { recipient } => {
                 let history = self.recipients.get_mut(&recipient).ok_or_else(|| {
                     MessageError::NotFound(format!("agent {recipient} was not found"))
                 })?;
                 history.lose();
-                self.reset_short_clock(&recipient);
+                self.reset_clocks(&recipient, false);
             }
             HistoryUpdate::Activity {
                 session_id,
                 pane,
                 at,
             } => {
-                self.activity.insert(session_id.clone(), (pane.clone(), at));
-                let mut changed = vec![];
-                for (recipient, history) in &mut self.recipients {
+                // Staged per matching recipient: all clocks are known before
+                // any entry is written.
+                let mut staged = vec![];
+                for (recipient, history) in &self.recipients {
                     if history.observation.as_ref().is_some_and(|obs| {
                         obs.pane == pane
                             && obs.session.as_ref().is_some_and(|row| row.id == session_id)
                     }) {
+                        let mut history = history.clone();
                         history.last_event_at = Some(at);
-                        changed.push(recipient.clone());
+                        let clocks = self.short_clocks(recipient, &history, false, now)?;
+                        staged.push((recipient.clone(), history, clocks));
                     }
                 }
-                for recipient in changed {
-                    self.refresh_short_clocks(&recipient, now)?;
+                for (recipient, history, clocks) in staged {
+                    self.recipients.insert(recipient, history);
+                    self.set_short_clocks(clocks);
                 }
+                self.activity.insert(session_id, (pane, at));
             }
             HistoryUpdate::Armed { scope } => {
                 let message = self.state.message(&scope.message_id).ok_or_else(|| {
@@ -696,7 +844,6 @@ impl MessageHistory {
                     ));
                 }
                 if certainty != EffectCertainty::NotStarted {
-                    self.pastes.insert(pane.clone(), now);
                     let mut changed = vec![];
                     for (recipient, history) in &mut self.recipients {
                         if history
@@ -710,8 +857,9 @@ impl MessageHistory {
                         }
                     }
                     for recipient in changed {
-                        self.reset_short_clock(&recipient);
+                        self.reset_clocks(&recipient, false);
                     }
+                    self.pastes.insert(pane, now);
                 }
             }
             HistoryUpdate::Held {

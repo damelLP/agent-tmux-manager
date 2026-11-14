@@ -323,6 +323,25 @@ mod reconciliation {
         .unwrap();
     }
 
+    // One registry event handled by the observer, without a failed state read.
+    // The hang guard is the outer timeout; a stalled read fails after 5 s first.
+    async fn scheduled_without_reading(
+        events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+        context: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                assert_ne!(event.phase, "schedule_failed", "{context}");
+                if event.phase == "scheduled" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     async fn update(rig: &Rig, id: &str) {
         let row = rig.registry.get_session(SessionId::new(id)).await.unwrap();
         rig.events
@@ -1173,32 +1192,18 @@ mod reconciliation {
                     reason: crate::registry::RemovalReason::Explicit,
                 })
                 .unwrap();
-            loop {
-                let event = events.recv().await.unwrap();
-                assert_ne!(
-                    event.phase, "schedule_failed",
-                    "unrelated wake read stalled org"
-                );
-                if event.phase == "scheduled" {
-                    break;
-                }
-            }
+            scheduled_without_reading(&mut events, "unrelated wake read stalled org").await;
             for registered in [true, false] {
                 if registered {
                     rig.row("unrelated", "%99", false).await;
                 } else {
                     update(&rig, "unrelated").await;
                 }
-                loop {
-                    let event = events.recv().await.unwrap();
-                    assert_ne!(
-                        event.phase, "schedule_failed",
-                        "unrelated registration/update read stalled org"
-                    );
-                    if event.phase == "scheduled" {
-                        break;
-                    }
-                }
+                scheduled_without_reading(
+                    &mut events,
+                    "unrelated registration/update read stalled org",
+                )
+                .await;
             }
             release.send(()).unwrap();
             held.await.unwrap().unwrap();
@@ -1248,16 +1253,11 @@ mod reconciliation {
             row.tmux_pane = Some("%1".into());
             row.parent_session_id = child.then(|| SessionId::new("parent"));
             rig.registry.register(row).await.unwrap();
-            loop {
-                let event = events.recv().await.unwrap();
-                assert_ne!(
-                    event.phase, "schedule_failed",
-                    "ineligible {id} row read stalled org"
-                );
-                if event.phase == "scheduled" {
-                    break;
-                }
-            }
+            scheduled_without_reading(
+                &mut events,
+                &format!("ineligible {id} row read stalled org"),
+            )
+            .await;
             release.send(()).unwrap();
             held.await.unwrap().unwrap();
         }
@@ -1321,16 +1321,20 @@ mod reconciliation {
         }
         let (agents, _) = rig.start();
         let mut events = agents.observation_events();
-        let mut attempts = 0;
-        loop {
-            let event = events.recv().await.unwrap();
-            if event.phase == "started" {
-                attempts += 1;
+        let attempts = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut attempts = 0;
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.phase == "started" {
+                    attempts += 1;
+                }
+                if event.phase == "dispatched" {
+                    return attempts;
+                }
             }
-            if event.phase == "dispatched" {
-                break;
-            }
-        }
+        })
+        .await
+        .unwrap();
         assert_eq!(attempts, 8);
         rig.control
             .run_reserved(

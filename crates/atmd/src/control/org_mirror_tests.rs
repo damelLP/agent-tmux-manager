@@ -41,6 +41,65 @@ async fn reservation_mirror_stall_parks_input_not_the_actor() {
 }
 
 #[tokio::test]
+async fn reservation_last_caller_drop_still_drains_admitted_input_after_projection() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+        let (updates, projection) = watch::channel(Projection::Loading);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            released.await.unwrap();
+            updates.send_replace(Projection::Ready {
+                through: 0,
+                state: Arc::new(OrgState::default()),
+            });
+            std::future::pending::<()>().await;
+        });
+        let mirror = Mirror {
+            org,
+            projection,
+            worker,
+            open: true,
+        };
+        let mock = MockTmuxClient::new();
+        let (control, actor) = super::super::spawn_control_with_audit(
+            Box::new(mock.clone()),
+            crate::registry::spawn_registry(),
+            mirror,
+            CancellationToken::new(),
+            |_, _| async { Ok(Vec::new()) },
+        );
+        let mut input = Box::pin(control.type_spawn_command("%1".into(), "once".into()));
+        std::future::poll_fn(|cx| {
+            assert!(input.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        control
+            .prepare_spawn(Some("%999".into()), Some("/private".into()), None, None)
+            .await
+            .unwrap();
+        drop(input);
+        drop(control);
+        // Publication follows caller EOF; neither is permission to discard the
+        // already-admitted action. No external I/O or elapsed-time assumption.
+        let _ = release.send(());
+        actor.await.unwrap();
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| matches!(call, MockCall::SendKeys { .. }))
+                .count(),
+            2
+        );
+        cancel.cancel();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn reservation_mirror_never_authorizes_a_snapshot_with_an_old_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();

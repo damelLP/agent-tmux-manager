@@ -754,6 +754,7 @@ where
         #[cfg(test)]
         let mut audit_barriers = Vec::new();
         let mut stopping = false;
+        let mut input_closed = false;
         loop {
             if stopping && jobs.is_empty() {
                 requests.close();
@@ -778,6 +779,9 @@ where
                     let _ = audits.sender.send(Audit::Barrier(reply)).await;
                 }
             }
+            if input_closed && parked.is_empty() && jobs.is_empty() {
+                break;
+            }
             let deadline = jobs
                 .next_deadline()
                 .into_iter()
@@ -792,8 +796,13 @@ where
                 () = jobs.join_next(), if !jobs.is_empty() => {}
                 () = mirror.changed() => {}
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {}
-                pending = requests.recv() => {
-                    let Some(pending) = pending else { break };
+                pending = requests.recv(), if !input_closed => {
+                    let Some(pending) = pending else {
+                        // Last caller EOF is not cancellation of admitted input.
+                        // Keep mirror/deadline/job progress alive until it drains.
+                        input_closed = true;
+                        continue;
+                    };
                     match pending {
                         #[cfg(test)]
                         self::Pending { request: Request::FlushAudit(reply), .. } if !parked.is_empty() => {

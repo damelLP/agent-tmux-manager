@@ -3,8 +3,10 @@
 
 #[test]
 fn candidate_kit_contract() {
+    // Outer hang guard: allow three 120 s inner guards (including cleanup)
+    // plus normal suite work, so a failure can report and stop owned resources.
     let output = std::process::Command::new("timeout")
-        .args(["240", "python3", "scripts/candidate_kit_test.py"])
+        .args(["420", "python3", "scripts/candidate_kit_test.py"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")

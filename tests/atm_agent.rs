@@ -26,20 +26,20 @@ async fn exchange(
     .await
 }
 
-// Sentinels prove a rejected RPC never turns into a local tmux/daemon command.
+// The tmux sentinel detects local fallback. A live listener handles startup
+// probes; EOF and post-exit accept checks detect extra requests/connections.
+// A PATH atmd sentinel would not catch the preferred sibling executable.
 fn command(args: &[&str], dir: &Path, socket: &Path) -> Command {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for name in ["tmux", "atmd"] {
-        let path = bin.join(name);
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nprintf 'fallback\\n' >> \"$ATM_AGENT_FALLBACK_MARKER\"\nexit 99\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    let path = bin.join("tmux");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nprintf 'fallback\\n' >> \"$ATM_AGENT_FALLBACK_MARKER\"\nexit 99\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let mut command = Command::new(env!("CARGO_BIN_EXE_atm"));
@@ -48,6 +48,8 @@ fn command(args: &[&str], dir: &Path, socket: &Path) -> Command {
         .current_dir(dir)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("RUST_LIB_BACKTRACE")
         .env("ATM_SOCKET", socket)
         .env("ATM_TMUX_SOCKET", "agent-cli-test")
         .env("TMUX_TMPDIR", dir.join("tmux"))
@@ -507,13 +509,22 @@ async fn agent_cli_daemon_errors_are_not_success_or_a_local_fallback() {
 }
 
 #[tokio::test]
-async fn agent_cli_json_keeps_null_and_table_escapes_reason() {
-    // A1 owns sorting. The CLI renders these already-sorted daemon rows as received.
+async fn agent_cli_table_keeps_daemon_order_and_escapes_reason() {
+    assert_list_output(false).await;
+}
+
+#[tokio::test]
+async fn agent_cli_json_keeps_daemon_order_and_nulls() {
+    assert_list_output(true).await;
+}
+
+async fn assert_list_output(json_output: bool) {
+    // Deliberately out of id order: sorting belongs to A1, never the CLI.
     let entries = json!([
-        {"agent_id":"project/lead","state":"stuck","activity":"working","pane":"%7","session_id":"full-session-id-0123456789","harness":"pi","model":"full-model-name","cost_usd":0.000123,"reason":"line\nnext\tcell\rreturn\\slash"},
-        {"agent_id":"project/worker","state":"down","activity":null,"pane":null,"session_id":null,"harness":null,"model":null,"cost_usd":null,"reason":null}
+        {"agent_id":"project/worker","state":"down","activity":null,"pane":null,"session_id":null,"harness":null,"model":null,"cost_usd":null,"reason":null},
+        {"agent_id":"project/lead","state":"stuck","activity":"working","pane":"%7","session_id":"full-session-id-0123456789","harness":"pi","model":"full-model-name","cost_usd":0.000123,"reason":"line\nnext\tcell\rreturn\\slash"}
     ]);
-    for json_output in [false, true] {
+    {
         let args = if json_output {
             vec!["agent", "list", "--format", "json"]
         } else {
@@ -533,7 +544,7 @@ async fn agent_cli_json_keeps_null_and_table_escapes_reason() {
                 entries
             );
         } else {
-            assert_eq!(String::from_utf8(output.stdout).unwrap(), "AGENT\tSTATE\tACTIVITY\tPANE\tSESSION\tHARNESS\tMODEL\tCOST\tREASON\nproject/lead\tstuck\tworking\t%7\tfull-session-id-0123456789\tpi\tfull-model-name\t0.000123\tline\\nnext\\tcell\\rreturn\\\\slash\nproject/worker\tdown\t-\t-\t-\t-\t-\t-\t-\n");
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), "AGENT\tSTATE\tACTIVITY\tPANE\tSESSION\tHARNESS\tMODEL\tCOST\tREASON\nproject/worker\tdown\t-\t-\t-\t-\t-\t-\t-\nproject/lead\tstuck\tworking\t%7\tfull-session-id-0123456789\tpi\tfull-model-name\t0.000123\tline\\nnext\\tcell\\rreturn\\\\slash\n");
         }
     }
 }

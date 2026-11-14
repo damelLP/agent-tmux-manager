@@ -1,7 +1,9 @@
 //! Pure delivery policy; observations and time belong to the executor.
 //!
 //! Consume each decision once, serialized per recipient pane: at most one
-//! message may be delivering to that pane. Decide/append/apply `DeliveryAttempted`
+//! message may have an unconfirmed attempt there, including a queued retry.
+//! Use [`delivery_in_flight`] for all other messages to compute the pane veto.
+//! Decide/append/apply `DeliveryAttempted`
 //! before paste + Enter; never paste if append fails or the command produces no
 //! event. Recheck live guards immediately before I/O and update the pane's last
 //! paste/observation continuity before releasing serialization. If a reserved
@@ -15,6 +17,9 @@
 //! `RetryAt` while queued only schedules. `Fail` requires final `DeliveryFailed`
 //! (accepted from queued or delivering). `Blocked` emits no message event:
 //! retain state, notify the owner once per reason, and reevaluate on changes.
+//! A blocked attempt keeps its pane reservation until receipt or owner give-up.
+//! `Wait(OtherDelivery)` is unbounded: the blocked predecessor's notice must
+//! list the messages queued behind it, rather than send separate timeout notices.
 //! `Wait(OwnerFocused)` also shows a deduplicated notice, with no timeout.
 //! An owner can give up on any held message via final `DeliveryFailed`.
 //! Continue listening for late receipts even after a final failure.
@@ -55,7 +60,7 @@
 //! | Queued, owner focused (unknown focus is focused) | Wait(OwnerFocused), notice, no timeout |
 //! | Queued, agent starting/clearing | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after continuous non-ready + readiness_timeout |
 //! | Queued, agent stuck/down | Blocked(AgentUnavailable); ready resumes |
-//! | Queued, another message delivering to pane | Wait(OtherDelivery) |
+//! | Queued, another message delivering or retry-pending on pane | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
 //! | Queued, fresh non-idle row, no send_now | Wait(SessionBusy) until stale or new observation |
 //! | Copy mode, dialog, draft, unknown guards/input | Wait; Blocked after continuous hold + readiness_timeout |
@@ -230,8 +235,9 @@ pub struct RecipientLiveView {
     /// clock (even recording a pane changes it). Without history, start at the
     /// first observation; None starts now and must be retained on later polls.
     pub agent_not_ready_since: Option<DateTime<Utc>>,
-    /// Another message is delivering to this pane. Serialize reservations per
-    /// pane, not just per message; exclude this message from the observation.
+    /// Another message has an unconfirmed attempt on this pane, including queued
+    /// retries and blocked attempts. Compute with delivery_in_flight over other
+    /// messages, excluding this message by ID. Serialize reservations per pane.
     pub other_delivery_in_flight: bool,
     /// Last paste to this pane (any message). Reset readiness after every paste.
     /// On restart use recovery time if the last paste cannot be reconstructed.
@@ -362,6 +368,21 @@ pub enum DeliveryPolicyError {
     InvalidState,
     #[error("delivery deadline is outside the timestamp range")]
     TimeOverflow,
+}
+
+/// Whether an unconfirmed attempt reserves this pane, including a queued retry.
+/// The caller excludes the current message by ID before computing its live-view
+/// veto over other messages. Blocked emits no event and retains the reservation;
+/// a receipt or final failure releases it. Inputs are applied message state.
+#[must_use]
+pub fn delivery_in_flight(message: &Message, pane: &str) -> bool {
+    matches!(
+        message.status,
+        DeliveryStatus::Queued | DeliveryStatus::Delivering
+    ) && message
+        .last_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.pane == pane)
 }
 
 /// Decide without mutation. Caller must apply commands before another decision.

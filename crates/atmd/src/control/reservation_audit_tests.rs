@@ -132,7 +132,7 @@ async fn reserved_kill_dropped_future_retains_audit_and_ownership_without_stalli
         let (entered,mut entering)=mpsc::unbounded_channel();
         let cancel=CancellationToken::new();
         let held=gate.clone();
-        let (control,actor)=spawn_control_with_audit(Box::new(client.clone()),crate::registry::spawn_registry(),cancel.clone(),move |command,time| {
+        let (control,actor)=spawn_control_with_audit(Box::new(client.clone()),crate::registry::spawn_registry(),org_mirror::Mirror::start(OrgHandle::disabled("audit test")),cancel.clone(),move |command,time| {
             let gate=held.clone(); let entered=entered.clone();
             async move { entered.send((command,time)).unwrap(); let _permit=gate.acquire().await.unwrap(); Ok(Vec::new()) }
         });
@@ -177,6 +177,7 @@ async fn reserved_stalled_kill_audit_quarantines_after_cleanup_budget() {
     let (control, actor) = spawn_control_with_audit(
         Box::new(client),
         crate::registry::spawn_registry(),
+        org_mirror::Mirror::start(OrgHandle::disabled("audit test")),
         cancel.clone(),
         move |_, _| {
             let entered = entered.clone();
@@ -224,6 +225,7 @@ async fn reserved_failed_audit_does_not_fail_or_repeat_kill_and_failed_effect_is
     let (control, actor) = spawn_control_with_audit(
         Box::new(client.clone()),
         crate::registry::spawn_registry(),
+        org_mirror::Mirror::start(OrgHandle::disabled("audit test")),
         cancel.clone(),
         move |command, time| {
             let submitted = submitted.clone();

@@ -1,12 +1,5 @@
 //! Exclusive, fenced control for an agent's lifecycle or one delivery.
 //!
-//! # Implementation checkpoint — fenced pane effects
-//!
-//! Ownership, supervision, pane effects, guarded input and kill audit are
-//! implemented. Legacy send/spawn isolation still awaits integration: **existing
-//! legacy send/spawn bypass reservations at this checkpoint**. The legacy-path
-//! recipes below are the remaining contract, not guarantees of this checkpoint.
-//!
 //! # Ownership and ordering
 //!
 //! [`ControlHandle::run_reserved`] owns admission, acquisition, cleanup and
@@ -97,10 +90,15 @@
 //! the actor-queue gap, not races with external harness redraws or tmux clients.
 //!
 //! Do not call legacy `send` or `type_spawn_command` inside a reservation: those
-//! paths wait behind its ownership. Use reserved guarded paste/keys instead. Raw send
-//! during Clear (including durable Clearing after restart) refuses immediately;
-//! other reservation kinds make legacy send/spawn_type wait within their original
-//! action budget and re-resolve/recheck, without retry. An excluded old session
+//! paths wait behind its ownership. Use reserved guarded paste/keys instead.
+//! Both raw send and spawn_type refuse during Clear (including durable Clearing
+//! after restart). Other reservation kinds make them wait within their original
+//! action budget and re-resolve/recheck, without retry. Noncanonical tmux targets
+//! (including `%05` aliases and spawn_type's named targets) resolve to `#{pane_id}`
+//! before every gate; an empty/invalid result never authorizes input. The parked
+//! legacy queue has 32 slots independent of reservation jobs; overflow returns
+//! unavailable. Org projection catch-up also parks outside tmux turns, within the
+//! same deadline. An excluded old session
 //! prefix becomes NoSession after clear, never input redirected to the new editor.
 //! Quarantine and unavailable org state on tagged/unknown-ownership panes fail
 //! unavailable; positively untagged legacy panes retain their existing behavior.

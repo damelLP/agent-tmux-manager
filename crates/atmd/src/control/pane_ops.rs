@@ -270,7 +270,7 @@ async fn tag(client: &dyn TmuxClient, pane: &PaneId) -> Result<Option<String>, R
         .map(|s| Some(s.to_owned()))
         .ok_or_else(|| observation(pane, "unterminated local tag"))
 }
-async fn inspect(
+pub(in crate::control) async fn inspect(
     client: &dyn TmuxClient,
     pane: &PaneId,
 ) -> Result<Option<PaneInspection>, ReservationError> {

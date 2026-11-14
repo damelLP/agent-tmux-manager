@@ -291,6 +291,7 @@ async fn consumer_scripted_client_works_with_real_control_handle() {
     let client = ScriptedTmuxClient::new();
     let mock = client.mock();
     mock.set_next_pane_id("%42");
+    client.script_tag_check(&inspection("%42", None)).unwrap();
     let cancel = CancellationToken::new();
     let (control, task) = spawn_control(
         Box::new(client),

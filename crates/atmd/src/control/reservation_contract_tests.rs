@@ -141,6 +141,8 @@ async fn contract_expired_job_is_not_admitted_and_never_invokes_callbacks() {
 #[tokio::test]
 async fn contract_org_constructor_preserves_existing_control_calls() {
     let mock = MockTmuxClient::new();
+    mock.set_next_raw_output("ATM-PANE-v1\t%7\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+    mock.set_next_raw_output(""); // positively present, pane-local tag unset
     mock.set_next_raw_output("0 1");
     let cancel = CancellationToken::new();
     let (control, task) = spawn_control_with_org(

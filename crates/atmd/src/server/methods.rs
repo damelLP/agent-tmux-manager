@@ -466,8 +466,9 @@ mod tests {
         std::fs::write(&own, "").unwrap();
         std::fs::write(&other, "").unwrap();
         std::os::unix::fs::symlink(&own, &alias).unwrap();
-        let (router, mock, cancel, task, _) =
-            control_router(crate::org::OrgHandle::disabled("test")).await;
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().join("state"), org_cancel.clone()).await;
+        let (router, mock, cancel, task, _) = control_router(org).await;
         for (method, params) in [
             ("session.send", json!({"target":"%7","text":"hello"})),
             ("session.spawn_prepare", json!({"target_pane":"%7"})),
@@ -503,6 +504,7 @@ mod tests {
         }
         cancel.cancel();
         task.await.unwrap();
+        org_cancel.cancel();
     }
 
     #[tokio::test]
@@ -523,6 +525,11 @@ mod tests {
     async fn disabled_organisation_does_not_change_or_repeat_control_actions() {
         let (router, mock, cancel, task, control) =
             control_router(crate::org::OrgHandle::disabled("test disabled")).await;
+        mock.set_next_raw_output("ATM-PANE-v1\t%7\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+        mock.set_next_raw_output(""); // untagged send pane
+        mock.set_next_raw_output("0 1");
+        mock.set_next_raw_output("ATM-PANE-v1\t%42\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
+        mock.set_next_raw_output(""); // untagged spawn_type pane
         successful_control_actions(&router).await;
         control.flush_audits().await;
         assert_eq!(

@@ -48,29 +48,35 @@ pub async fn send(
     text: &str,
 ) -> Result<String, ControlError> {
     let pane_id = resolve_pane_id(sessions, target)?;
+    send_resolved(client, sessions, target, &pane_id, text).await
+}
+
+/// The actor resolves, fences and projects rows before entering this same turn.
+pub(super) async fn send_resolved(
+    client: &(impl TmuxClient + ?Sized),
+    sessions: &[SessionView],
+    target: &str,
+    pane_id: &str,
+    text: &str,
+) -> Result<String, ControlError> {
     let pane_state = client
         .raw_command(
             "display-message",
-            &[
-                "-p",
-                "-t",
-                &pane_id,
-                "#{pane_in_mode} #{bracket_paste_flag}",
-            ],
+            &["-p", "-t", pane_id, "#{pane_in_mode} #{bracket_paste_flag}"],
         )
         .await
         .map_err(|source| ControlError::Tmux {
             context: format!("Failed to read the state of pane {pane_id}"),
             source,
         })?;
-    if let Some(reason) = send_refusal(sessions, target, &pane_id, &pane_state, text) {
+    if let Some(reason) = send_refusal(sessions, target, pane_id, &pane_state, text) {
         return Err(ControlError::SendRefused {
-            pane: pane_id,
+            pane: pane_id.into(),
             reason,
         });
     }
     client
-        .paste_text(&pane_id, text)
+        .paste_text(pane_id, text)
         .await
         .map_err(|source| ControlError::Tmux {
             context: format!("Failed to paste into pane {pane_id}"),
@@ -79,13 +85,13 @@ pub async fn send(
     // Send Enter to submit the text, on its own call: tmux reads an
     // argument ending in `;` as a command separator.
     client
-        .send_keys(&pane_id, "Enter")
+        .send_keys(pane_id, "Enter")
         .await
         .map_err(|source| ControlError::Tmux {
             context: format!("Failed to send Enter to pane {pane_id}"),
             source,
         })?;
-    Ok(pane_id)
+    Ok(pane_id.into())
 }
 
 /// Why `atm send` must not paste `text` into `pane` for `target`, if it

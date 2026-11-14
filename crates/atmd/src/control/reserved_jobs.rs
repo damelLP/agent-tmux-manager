@@ -332,6 +332,10 @@ impl Jobs {
         }
     }
 
+    pub(in crate::control) fn input_gate(&self, pane: &super::PaneId) -> super::state::InputGate {
+        self.state.input_gate(pane)
+    }
+
     pub(in crate::control) fn next_deadline(&self) -> Option<Instant> {
         self.state.next_deadline()
     }

@@ -16,7 +16,7 @@ pub struct SpawnContext {
 /// Prefer the explicit target, caller pane, first active pane, then `%0`.
 /// Cwd lookup failures fall back to the caller-supplied directory.
 pub async fn prepare_spawn(
-    client: &impl TmuxClient,
+    client: &(impl TmuxClient + ?Sized),
     cwd: Option<&str>,
     target_pane: Option<&str>,
     caller_pane: Option<&str>,
@@ -60,7 +60,7 @@ pub async fn prepare_spawn(
 /// Split without a command so the pane gets an interactive shell, with the
 /// user's PATH and aliases. Return its id before any command is typed.
 pub async fn split_spawn(
-    client: &impl TmuxClient,
+    client: &(impl TmuxClient + ?Sized),
     context: &SpawnContext,
     direction: PaneDirection,
     size: &str,
@@ -84,7 +84,7 @@ pub async fn split_spawn(
 
 /// Type an already-built command, then Enter in a separate tmux call.
 pub async fn type_spawn_command(
-    client: &impl TmuxClient,
+    client: &(impl TmuxClient + ?Sized),
     pane: &str,
     command: &str,
 ) -> Result<(), ControlError> {

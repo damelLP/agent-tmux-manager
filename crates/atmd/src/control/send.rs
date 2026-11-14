@@ -42,7 +42,7 @@ pub fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String,
 /// Read the target pane's state, refuse unsafe input, then paste and submit.
 /// Returns the pane id for the caller to report; never prints.
 pub async fn send(
-    client: &impl TmuxClient,
+    client: &(impl TmuxClient + ?Sized),
     sessions: &[SessionView],
     target: &str,
     text: &str,

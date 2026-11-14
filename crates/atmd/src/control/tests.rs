@@ -91,6 +91,35 @@ async fn send_reads_state_then_pastes_and_submits_separately() {
 }
 
 #[tokio::test]
+async fn send_accepts_trait_objects() {
+    let mock = MockTmuxClient::new();
+    mock.set_next_raw_output("0 1\n");
+    let client: &dyn atm_tmux::TmuxClient = &mock;
+
+    assert_eq!(send(client, &[], "%7", "hello").await.unwrap(), "%7");
+    assert_eq!(mock.call_count(), 3);
+}
+
+#[tokio::test]
+async fn spawn_accepts_trait_objects() {
+    let mock = MockTmuxClient::new();
+    mock.set_next_pane_id("%42");
+    let client: &dyn atm_tmux::TmuxClient = &mock;
+
+    let context = prepare_spawn(client, Some("/work"), Some("%7"), None, None)
+        .await
+        .unwrap();
+    let new_pane = split_spawn(client, &context, PaneDirection::Below, "30%")
+        .await
+        .unwrap();
+    assert_eq!(new_pane, "%42");
+    type_spawn_command(client, &new_pane, "agent")
+        .await
+        .unwrap();
+    assert_eq!(mock.call_count(), 4);
+}
+
+#[tokio::test]
 async fn resolution_and_state_failures_never_paste() {
     let client = MockTmuxClient::new();
     assert!(send(&client, &[], "absent", "hi").await.is_err());

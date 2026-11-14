@@ -601,17 +601,15 @@ fn pi_stand_in_reconnects_without_reconnecting_on_clear() {
 #[test]
 fn startup_diagnostics_include_private_pane_errors() {
     let mut rig = StandInRig::start();
-    let pane = success(rig.tmux(&[
-        "new-window",
-        "-d",
-        "-P",
-        "-F",
-        "#{pane_id}",
-        "printf 'stand-in-startup-error\\n'; exec /bin/bash --noprofile --norc",
-    ]));
-    rig.wait("error marker", || {
-        success(rig.tmux(&["capture-pane", "-p", "-t", &pane])).contains("stand-in-startup-error")
-    });
+    let tmux = rig.tmux_env();
+    let socket = tmux.split(',').next().unwrap();
+    assert!(std::path::Path::new(socket).starts_with(rig.root()));
+    let command = format!(
+        "printf 'stand-in-startup-error\\n'; tmux -S '{}' wait-for -S startup-error; exec /bin/bash --noprofile --norc",
+        socket.replace('\'', "'\\''")
+    );
+    success(rig.tmux(&["new-window", "-d", &command]));
+    success(rig.tmux(&["wait-for", "startup-error"]));
     assert!(rig.diagnostics().contains("stand-in-startup-error"));
     // Synthetic: exercise the diagnostic for a lost real-forwarder handshake.
     std::fs::write(rig.root().join("lost.log"), "Handshake failed: Broken pipe").unwrap();
@@ -619,33 +617,30 @@ fn startup_diagnostics_include_private_pane_errors() {
     rig.close();
 }
 
-#[test]
-fn protocol_request_is_bounded_when_listener_never_answers() {
+#[tokio::test(start_paused = true)]
+async fn protocol_request_is_bounded_when_listener_never_answers() {
     use std::time::Duration;
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("silent.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let (accepted, wait_accepted) = std::sync::mpsc::channel();
-    let (release, wait_release) = std::sync::mpsc::channel();
-    let peer = std::thread::spawn(move || {
-        let (_stream, _) = listener.accept().unwrap();
-        accepted.send(()).unwrap();
-        wait_release.recv_timeout(Duration::from_secs(60)).unwrap();
-    });
-    let request = std::thread::spawn(move || {
-        stand_in::protocol_request(
-            &socket,
-            atm_protocol::ClientMessage::list_sessions(),
-            Duration::from_secs(30),
-        )
-    });
-    wait_accepted.recv_timeout(Duration::from_secs(30)).unwrap();
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let (client, peer) = tokio::io::duplex(4096);
+    let request = tokio::spawn(stand_in::protocol_request_on(
+        async { Ok(client) },
+        atm_protocol::ClientMessage::list_sessions(),
+        Duration::from_secs(30),
+    ));
+    // Synchronize on the actual connect message, retaining the silent peer.
+    // Paused time uses only memory I/O; no real socket can auto-advance it.
+    let mut peer = BufReader::new(peer);
+    let mut line = String::new();
+    peer.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["type"],
+        "connect"
+    );
+    tokio::time::advance(Duration::from_secs(30)).await;
     let error = request
-        .join()
+        .await
         .unwrap()
-        .expect_err("a stalled accepted peer must time out");
-    release.send(()).unwrap();
-    peer.join().unwrap();
+        .expect_err("a stalled peer must time out");
     assert!(error.to_string().contains("deadline"), "{error}");
 }
 

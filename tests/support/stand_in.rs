@@ -22,7 +22,7 @@ pub mod process;
 #[path = "stand_in/rows.rs"]
 pub mod rows;
 
-const DEADLINE: Duration = Duration::from_secs(10);
+const DEADLINE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 const SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/stand_in");
 

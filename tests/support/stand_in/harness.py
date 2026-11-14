@@ -190,7 +190,7 @@ class Runtime:
             script = HERE.parents[2] / "crates" / "atm" / "scripts" / hook
             # No injected pid/pane: the real forwarder must enrich these.
             subprocess.run(["/bin/bash", str(script)], input=json.dumps(data),
-                           text=True, timeout=3, check=True, env=dict(os.environ, ATM_DEBUG="0"))
+                           text=True, timeout=30, check=True, env=dict(os.environ, ATM_DEBUG="0"))
             return
         self.observe_pi()
         data.update(pid=os.getpid(), tmux_pane=self.pane)

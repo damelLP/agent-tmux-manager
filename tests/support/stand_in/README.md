@@ -71,6 +71,15 @@ rig.close();
   `support/role.rs` twice.
 - `journal(pane)` is diagnostic JSONL: identity, accepted/rejected/queued input,
   event/dropped, status, draft, render, ready, selection, connected/reconnecting.
+  Render entries carry a per-process `sequence`. A subsequent `rendered` entry
+  acknowledges tmux's cursor-position reply to a DSR query following that frame;
+  `ready` follows only for the latest idle frame, not merely a stdout flush.
+  Replies for superseded frames are discarded; replies never trigger a redraw.
+  Frame output is deferred during fragmented paste/escape sequences. Exit stops
+  input processing and discards pending frame acknowledgements, so no later
+  render/ready can describe the exited process. These are rig milestones, not
+  evidence of empty input or confirmed hook delivery. The Rust rig's migration
+  from polling to these events is tracked separately.
   Every entry includes PID and monotonic time. Events/status are **send attempts**,
   not acknowledgments. Hook exit zero cannot prove delivery. Timeout diagnostics
   include journals, daemon logs and panes, and name possible lost handshakes.

@@ -55,6 +55,11 @@ class InputParser:
                 arrow = {b"\x1b[A": "up", b"\x1b[B": "down", b"\x1bOA": "up", b"\x1bOB": "down"}.get(sequence)
                 if arrow:
                     actions.append((arrow, ""))
+                elif sequence.startswith(b"\x1b[") and sequence.endswith(b"R"):
+                    position = sequence[2:-1].decode("ascii", errors="replace")
+                    coordinates = position.split(";")
+                    if len(coordinates) == 2 and all(c.isascii() and c.isdecimal() and int(c) > 0 for c in coordinates):
+                        actions.append(("cursor_report", position))
                 continue
             byte = self.pending.pop(0)
             if self.pasting:

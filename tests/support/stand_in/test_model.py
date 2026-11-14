@@ -53,6 +53,18 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 model.parse_args(args)
 
+    def test_terminal_cursor_reply_is_atomic_and_not_editor_input(self):
+        parser = model.InputParser()
+        self.assertEqual(parser.feed(b"draft\x1b[12;"), [])
+        self.assertEqual(parser.feed(b"34R"), [("cursor_report", "12;34")])
+        self.assertEqual(parser.feed(b"\r"), [("submit", "draft")])
+        self.assertEqual(parser.feed(b"\x1b[?12;34R\x1b[0;0R\x1b[12R"), [])
+
+    def test_cursor_reply_inside_paste_remains_literal_draft(self):
+        parser = model.InputParser()
+        self.assertEqual(parser.feed(b"\x1b[200~\x1b[12;34R\x1b[201~\r"),
+                         [("submit", "\x1b[12;34R")])
+
     def test_escape_inside_paste_is_data(self):
         parser = model.InputParser()
         self.assertEqual(parser.feed(b"\x1b[200~a\x1bb\x1b[201~\r"),

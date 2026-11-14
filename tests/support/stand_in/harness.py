@@ -74,6 +74,9 @@ class Runtime:
         self.retry_at = 0
         self.parser = InputParser()
         self.running = True
+        self.pending_renders = []
+        self.render_sequence = 0
+        self.draft_dirty = False
         self.log = self.log_path.open("a", buffering=1)
         Path("/proc/self/comm").write_text(self.mode)
         if Path("/proc/self/comm").read_text().strip() != self.mode:
@@ -141,6 +144,15 @@ class Runtime:
 
     def effects(self, effects):
         for effect in effects:
+            if not self.running:
+                break
+            if effect["kind"] == "render":
+                if self.parser.pasting or self.parser.pending:
+                    self.last_render = effect
+                    self.draft_dirty = True
+                    continue
+                self.render_sequence += 1
+                effect = dict(effect, sequence=self.render_sequence)
             self.record(effect)
             if effect["kind"] in ("event", "status"):
                 self.forward(effect["data"])
@@ -148,6 +160,7 @@ class Runtime:
                 self.parser.draft = bytearray(effect["text"].encode())
             elif effect["kind"] == "render":
                 self.last_render = effect
+                self.draft_dirty = False
                 state = effect["state"]
                 text = f"stand-in {self.mode} {self.model.session_id}: {state}\n"
                 if state == "dialog":
@@ -160,11 +173,35 @@ class Runtime:
                     # Render control bytes visibly; submitted text never controls the terminal.
                     draft = "".join(c if c.isprintable() or c == "\n" else repr(c)[1:-1] for c in draft)
                     text += effect["detail"] + "\n❯ " + draft
-                print("\x1b[2J\x1b[H" + text.replace("\n", "\r\n"), end="", flush=True)
-                if state == "idle":
-                    self.record({"kind": "ready", "session_id": self.model.session_id})
+                # DSR is answered after tmux parses the preceding frame. A flush
+                # alone only proves bytes reached the tty, not the captured pane.
+                self.pending_renders.append(effect)
+                print("\x1b[2J\x1b[H" + text.replace("\n", "\r\n") + "\x1b[6n", end="", flush=True)
             elif effect["kind"] == "exit":
                 self.running = False
+                self.pending_renders.clear()
+
+    def input(self, data):
+        # Process each action before subsequent input changes the draft.
+        for byte in data:
+            if not self.running:
+                break
+            before = bytes(self.parser.draft)
+            actions = self.parser.feed(bytes([byte]))
+            self.draft_dirty |= self.parser.draft != before
+            for action in actions:
+                if action[0] != "cursor_report":
+                    self.action(action)
+                elif self.pending_renders:
+                    effect = self.pending_renders.pop(0)
+                    # A newer frame may already be on screen by the time this
+                    # reply is read; never acknowledge the superseded frame.
+                    if effect["sequence"] == self.render_sequence:
+                        self.record(dict(effect, kind="rendered"))
+                        if effect["state"] == "idle":
+                            self.record(dict(effect, kind="ready"))
+        if self.draft_dirty and self.running and not self.parser.pasting and not self.parser.pending:
+            self.effects([self.last_render])
 
     def action(self, action):
         if action == ("submit", "/clear" if self.mode == "claude" else "/new"):
@@ -191,16 +228,13 @@ class Runtime:
                     if not data:
                         self.action(("exit", ""))
                         break
-                    # Process each action before subsequent input changes the draft.
-                    for byte in data:
-                        for action in self.parser.feed(bytes([byte])):
-                            self.action(action)
-                    self.effects([self.last_render])
+                    self.input(data)
                 else:
                     for action in self.parser.flush_escape():
                         self.action(action)
-                self.effects(self.model.tick(int(time.monotonic()*1000)))
-                self.flush_pi()
+                if self.running:
+                    self.effects(self.model.tick(int(time.monotonic()*1000)))
+                    self.flush_pi()
         finally:
             print("\x1b[?2004l\r\n", end="", flush=True)
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)

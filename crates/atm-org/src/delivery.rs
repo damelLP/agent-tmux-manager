@@ -16,14 +16,18 @@
 //! receipts even after a final failure. Wait/AwaitConfirmation/Complete emit no
 //! events. Deadlines are inclusive; events can wake a timer earlier.
 
-use crate::{DeliveryReceipt, DeliveryStatus, Message};
+use crate::{Address, AgentStatus, DeliveryReceipt, DeliveryStatus, Message};
 use atm_core::SessionStatus;
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeliveryPolicy {
+/// Config-file settings. Durations serialize as `{secs, nanos}`; omitted fields
+/// take defaults, unknown keys are errors. Validate via `DeliveryPolicy::new`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeliverySettings {
     pub stable_idle: Duration,
     pub stable_empty_input: Duration,
     pub confirmation_timeout: Duration,
@@ -33,9 +37,49 @@ pub struct DeliveryPolicy {
     pub stale_after: Duration,
     pub readiness_timeout: Duration,
     pub guard_poll_interval: Duration,
+    pub pane_gone_grace: Duration,
 }
 
-impl Default for DeliveryPolicy {
+/// Immutable, validated settings; deserialization uses the same validation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct DeliveryPolicy {
+    settings: DeliverySettings,
+}
+
+impl DeliveryPolicy {
+    pub fn new(settings: DeliverySettings) -> Result<Self, DeliveryPolicyError> {
+        validate_settings(&settings)?;
+        Ok(Self { settings })
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> &DeliverySettings {
+        &self.settings
+    }
+
+    /// Use when a reserved attempt cannot execute: final iff no attempts remain.
+    #[must_use]
+    pub fn is_final_attempt(&self, attempt: u32) -> bool {
+        self.retry_delay(attempt).is_none()
+    }
+
+    fn retry_delay(&self, attempt: u32) -> Option<Duration> {
+        attempt
+            .checked_sub(1)
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| self.settings.retry_delays.get(n))
+            .copied()
+    }
+}
+
+impl<'de> Deserialize<'de> for DeliveryPolicy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(DeliverySettings::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Default for DeliverySettings {
     fn default() -> Self {
         Self {
             // Observed automatic retries can follow a transient idle row. This
@@ -52,6 +96,7 @@ impl Default for DeliveryPolicy {
             stale_after: Duration::from_secs(120),
             readiness_timeout: Duration::from_secs(120),
             guard_poll_interval: Duration::from_millis(250),
+            pane_gone_grace: Duration::from_secs(2),
         }
     }
 }
@@ -76,13 +121,36 @@ pub enum InputLine {
     EmptySince(DateTime<Utc>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneLiveness {
+    Alive,
+    /// Positive evidence of absence, continuously since this time. Reset after
+    /// alive OR unknown; a failed query is Unknown, never GoneSince.
+    GoneSince(DateTime<Utc>),
+    Unknown,
+}
+
 /// Fresh, neutral observations for this message's resolved recipient pane.
 /// Deliberately has no Default: missing observations must not grant permission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientLiveView {
     /// None is a missing row, not a dead pane.
     pub session: Option<LiveSession>,
-    pub pane_alive: bool,
+    pub pane: PaneLiveness,
+    pub agent_status: AgentStatus,
+    /// Another message is delivering to this pane. Serialize reservations per
+    /// pane, not just per message; exclude this message from the observation.
+    pub other_delivery_in_flight: bool,
+    /// Last paste to this pane (any message). Reset readiness after every paste.
+    /// On restart use recovery time if the last paste cannot be reconstructed.
+    pub last_paste_at: Option<DateTime<Utc>>,
+    /// Start of the CURRENT effective copy/draft/dialog/unknown hold. Reset on
+    /// recovery, blocker/source change, focus, or a fresh busy-row wait. Unknown
+    /// must persist for this whole window. None starts now, never at sent_at.
+    pub hold_since: Option<DateTime<Utc>>,
+    /// Set when replay finds this message delivering: lost evidence cannot be
+    /// reconstructed from timestamps. Keep set until a receipt or owner action.
+    pub restarted_mid_delivery: bool,
     /// Unknown guards block just as positive unsafe guards do.
     pub copy_mode: Option<bool>,
     pub dialog_open: Option<bool>,
@@ -91,21 +159,23 @@ pub struct RecipientLiveView {
     /// A turn end only triggers a recheck, never overrides focus.
     pub owner_focused: bool,
     pub input_line: InputLine,
-    /// Bypass idle status/stability only, never input or other safety guards.
+    /// Bypass row status/stability only, never empty-input/post-paste stability.
     pub send_now: bool,
     /// Executor validated this message's token in a prompt-submitted event for
     /// its target pane/session. Latch until Delivered is applied. The receipt
     /// may name an earlier session/attempt; current live guards cannot veto it.
     pub confirmation: Option<DeliveryReceipt>,
-    /// Latched evidence that ANY attempt of this message probably landed:
-    /// busy transition after its last_attempt_at, or its token seen in the pane.
-    /// Not a receipt. Retain across polls, timeout/retry scheduling and recovery;
-    /// never clear merely because the row went idle or the token scrolled away.
-    /// Recovery must reconstruct it or hold delivery for owner inspection.
+    /// A session event or non-idle status RECEIVED after DeliveryAttempted was
+    /// applied (receive order, NOT timestamp comparison), or token seen in pane.
+    /// Includes working -> working activity. Not a receipt. Latch across polls
+    /// and failure/retry scheduling; reset only on a new reserved attempt.
+    /// A restart loses the latch: set restarted_mid_delivery for replayed
+    /// delivering messages instead of silently assuming no activity occurred.
     pub probably_landed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeliveryStep {
     Complete,
     Wait {
@@ -134,7 +204,14 @@ pub enum DeliveryStep {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum WaitReason {
+    #[error("another delivery is in flight on this pane")]
+    OtherDelivery,
+    #[error("recipient agent is starting or clearing")]
+    AgentNotReady,
+    #[error("waiting to establish that the pane is gone")]
+    PaneGoneGrace,
     #[error("owner is focused on this pane")]
     OwnerFocused,
     #[error("pane is in copy mode")]
@@ -156,14 +233,21 @@ pub enum WaitReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum FailureReason {
+    #[error("recipient agent is stuck or down")]
+    AgentUnavailable,
+    #[error("daemon restarted mid-delivery; inspect before resending")]
+    Restarted,
+    #[error("pane remained in copy mode")]
+    CopyMode,
     #[error("prompt token was not confirmed before the deadline")]
     ConfirmationTimeout,
     #[error("recipient pane is not alive")]
     PaneGone,
-    #[error("stale session has a draft")]
+    #[error("input draft persisted past readiness timeout")]
     DraftPresent,
-    #[error("stale session has a dialog")]
+    #[error("dialog persisted past readiness timeout")]
     DialogOpen,
     #[error("recipient readiness could not be established")]
     ReadinessTimeout,
@@ -184,7 +268,7 @@ pub enum DeliveryPolicyError {
 }
 
 /// Decide without mutation. Caller must apply commands before another decision.
-/// Terminal/receipt decisions take precedence even over invalid configuration.
+/// Policy is already valid; terminal/receipt decisions precede live guards.
 /// Status and log ordering, not wall-clock timestamp ordering, identify attempts.
 #[must_use = "consume the decision through the serialized delivery executor"]
 pub fn next_delivery(
@@ -193,7 +277,7 @@ pub fn next_delivery(
     now: DateTime<Utc>,
     policy: &DeliveryPolicy,
 ) -> Result<DeliveryStep, DeliveryPolicyError> {
-    if message.status == DeliveryStatus::Delivered {
+    if message.status == DeliveryStatus::Delivered || message.content.to == Address::Owner {
         return Ok(DeliveryStep::Complete);
     }
     if let Some(receipt) = &live.confirmation {
@@ -204,7 +288,7 @@ pub fn next_delivery(
     if message.status == DeliveryStatus::Failed {
         return Ok(DeliveryStep::Complete);
     }
-    let max_attempts = validate_policy(policy)?;
+    let settings = policy.settings();
     let attempt = match (&message.last_attempt, message.last_attempt_at) {
         (Some(attempt), Some(_)) if attempt.attempt > 0 => attempt.attempt,
         (None, None) if message.status == DeliveryStatus::Queued => 0,
@@ -213,38 +297,82 @@ pub fn next_delivery(
     if live.probably_landed && attempt == 0 {
         return Err(DeliveryPolicyError::InvalidState);
     }
-    let retry_delay = attempt
-        .checked_sub(1)
-        .and_then(|index| usize::try_from(index).ok())
-        .and_then(|index| policy.retry_delays.get(index))
-        .copied();
+    let retry_delay = policy.retry_delay(attempt);
+    let max_attempts = settings.retry_delays.len().saturating_add(1);
+    if usize::try_from(attempt).map_or(true, |n| n > max_attempts)
+        || (message.status == DeliveryStatus::Queued && attempt > 0 && retry_delay.is_none())
+    {
+        return Ok(DeliveryStep::Fail {
+            reason: FailureReason::AttemptLimit,
+        });
+    }
+    let poll = |reason| {
+        Ok(DeliveryStep::Wait {
+            until: deadline(now, settings.guard_poll_interval)?,
+            reason,
+        })
+    };
+    let hold = |reason, blocked_reason| {
+        let until = deadline(live.hold_since.unwrap_or(now), settings.readiness_timeout)?;
+        Ok(if now >= until {
+            DeliveryStep::Blocked {
+                reason: blocked_reason,
+            }
+        } else {
+            DeliveryStep::Wait {
+                until: deadline(now, settings.guard_poll_interval)?.min(until),
+                reason,
+            }
+        })
+    };
+    let pane_guard = || match live.pane {
+        PaneLiveness::Alive => Ok(None),
+        PaneLiveness::Unknown => {
+            hold(WaitReason::UnknownGuards, FailureReason::ReadinessTimeout).map(Some)
+        }
+        PaneLiveness::GoneSince(since) => {
+            let until = deadline(since, settings.pane_gone_grace)?;
+            Ok(Some(if now < until {
+                DeliveryStep::Wait {
+                    until,
+                    reason: WaitReason::PaneGoneGrace,
+                }
+            } else if message.status == DeliveryStatus::Delivering {
+                failed_attempt(now, retry_delay, FailureReason::PaneGone)?
+            } else {
+                DeliveryStep::Fail {
+                    reason: FailureReason::PaneGone,
+                }
+            }))
+        }
+    };
     if message.status == DeliveryStatus::Delivering {
         let started = message
             .last_attempt_at
             .ok_or(DeliveryPolicyError::InvalidState)?;
-        let until = deadline(started, policy.confirmation_timeout)?;
-        if now >= until && live.probably_landed {
+        if live.restarted_mid_delivery {
             return Ok(DeliveryStep::Blocked {
-                reason: FailureReason::ProbablyDelivered,
+                reason: FailureReason::Restarted,
             });
         }
-        if !live.pane_alive {
-            return Ok(DeliveryStep::Fail {
-                reason: FailureReason::PaneGone,
+        let until = deadline(started, settings.confirmation_timeout)?;
+        if live.probably_landed {
+            return Ok(if now < until {
+                DeliveryStep::AwaitConfirmation { until }
+            } else {
+                DeliveryStep::Blocked {
+                    reason: FailureReason::ProbablyDelivered,
+                }
             });
         }
-        return Ok(if now < until {
-            DeliveryStep::AwaitConfirmation { until }
-        } else if let Some(delay) = retry_delay {
-            DeliveryStep::RetryAt {
-                at: deadline(now, delay)?,
-                reason: FailureReason::ConfirmationTimeout,
-            }
+        if let Some(step) = pane_guard()? {
+            return Ok(step);
+        }
+        return if now < until {
+            Ok(DeliveryStep::AwaitConfirmation { until })
         } else {
-            DeliveryStep::Fail {
-                reason: FailureReason::ConfirmationTimeout,
-            }
-        });
+            failed_attempt(now, retry_delay, FailureReason::ConfirmationTimeout)
+        };
     }
     if attempt > 0 {
         let failed = message.failed_at.ok_or(DeliveryPolicyError::InvalidState)?;
@@ -253,11 +381,7 @@ pub fn next_delivery(
                 reason: FailureReason::ProbablyDelivered,
             });
         }
-        let Some(delay) = retry_delay else {
-            return Ok(DeliveryStep::Blocked {
-                reason: FailureReason::AttemptLimit,
-            });
-        };
+        let delay = retry_delay.ok_or(DeliveryPolicyError::InvalidState)?;
         let at = deadline(failed, delay)?;
         if now < at {
             return Ok(DeliveryStep::RetryAt {
@@ -266,79 +390,56 @@ pub fn next_delivery(
             });
         }
     }
-    if !live.pane_alive {
-        return Ok(DeliveryStep::Blocked {
-            reason: FailureReason::PaneGone,
-        });
-    }
-    let poll = |reason| {
-        Ok(DeliveryStep::Wait {
-            until: deadline(now, policy.guard_poll_interval)?,
-            reason,
-        })
-    };
     if live.owner_focused {
         return poll(WaitReason::OwnerFocused);
+    }
+    match live.agent_status {
+        AgentStatus::Starting | AgentStatus::Clearing => return poll(WaitReason::AgentNotReady),
+        AgentStatus::Stuck | AgentStatus::Down => {
+            return Ok(DeliveryStep::Blocked {
+                reason: FailureReason::AgentUnavailable,
+            })
+        }
+        AgentStatus::Ready => {}
+    }
+    if live.other_delivery_in_flight {
+        return poll(WaitReason::OtherDelivery);
+    }
+    if let Some(step) = pane_guard()? {
+        return Ok(step);
     }
     let stale_at = live
         .session
         .as_ref()
         .filter(|row| row.status != SessionStatus::Idle)
-        .map(|row| deadline(row.last_event_at, policy.stale_after))
+        .map(|row| deadline(row.last_event_at, settings.stale_after))
         .transpose()?;
     let stale = stale_at.is_some_and(|at| now >= at);
-    // Allow bounded pane inspection after a row becomes stale. A missing row
-    // has no event anchor, so its unknown-readiness budget starts at msg.sent.
-    let readiness_start = stale_at
-        .filter(|_| stale)
-        .unwrap_or(message.sent_at)
-        .max(message.sent_at);
-    let unknown = |reason| {
-        let until = deadline(readiness_start, policy.readiness_timeout)?;
-        Ok(if now >= until {
-            DeliveryStep::Blocked {
-                reason: FailureReason::ReadinessTimeout,
-            }
-        } else {
-            DeliveryStep::Wait {
-                until: deadline(now, policy.guard_poll_interval)?.min(until),
-                reason,
-            }
-        })
-    };
-    match live.copy_mode {
-        Some(true) => return poll(WaitReason::CopyMode),
-        None => return unknown(WaitReason::UnknownGuards),
-        Some(false) => {}
-    }
-    match live.dialog_open {
-        Some(true) if stale => {
-            return Ok(DeliveryStep::Blocked {
-                reason: FailureReason::DialogOpen,
-            })
-        }
-        Some(true) => return poll(WaitReason::DialogOpen),
-        None => return unknown(WaitReason::UnknownGuards),
-        Some(false) => {}
-    }
+
     if !live.send_now && !stale {
         if let Some(at) = stale_at {
             return Ok(DeliveryStep::Wait {
-                until: deadline(now, policy.guard_poll_interval)?.min(at),
+                until: deadline(now, settings.guard_poll_interval)?.min(at),
                 reason: WaitReason::SessionBusy,
             });
         }
     }
+    match live.copy_mode {
+        Some(true) => return hold(WaitReason::CopyMode, FailureReason::CopyMode),
+        None => return hold(WaitReason::UnknownGuards, FailureReason::ReadinessTimeout),
+        Some(false) => {}
+    }
+    match live.dialog_open {
+        Some(true) => return hold(WaitReason::DialogOpen, FailureReason::DialogOpen),
+        None => return hold(WaitReason::UnknownGuards, FailureReason::ReadinessTimeout),
+        Some(false) => {}
+    }
     let empty_since = match live.input_line {
-        InputLine::NonEmpty if stale => {
-            return Ok(DeliveryStep::Blocked {
-                reason: FailureReason::DraftPresent,
-            })
+        InputLine::NonEmpty => return hold(WaitReason::InputNotEmpty, FailureReason::DraftPresent),
+        InputLine::Unknown => {
+            return hold(WaitReason::InputUnknown, FailureReason::ReadinessTimeout)
         }
-        InputLine::NonEmpty if live.session.is_none() => return unknown(WaitReason::InputNotEmpty),
-        InputLine::NonEmpty => return poll(WaitReason::InputNotEmpty),
-        InputLine::Unknown => return unknown(WaitReason::InputUnknown),
-        InputLine::EmptySince(since) => since,
+        InputLine::EmptySince(since) => since.max(live.last_paste_at.unwrap_or(since)),
     };
     if now < empty_since {
         return Ok(DeliveryStep::Wait {
@@ -348,7 +449,7 @@ pub fn next_delivery(
     }
     match &live.session {
         None => {
-            let until = deadline(empty_since, policy.stable_empty_input)?;
+            let until = deadline(empty_since, settings.stable_empty_input)?;
             if now < until {
                 return Ok(DeliveryStep::Wait {
                     until,
@@ -356,8 +457,13 @@ pub fn next_delivery(
                 });
             }
         }
-        Some(row) if row.status == SessionStatus::Idle && !live.send_now => {
-            let until = deadline(row.status_since, policy.stable_idle)?;
+        Some(row) => {
+            let since = if row.status == SessionStatus::Idle && !live.send_now {
+                row.status_since.max(empty_since)
+            } else {
+                empty_since
+            };
+            let until = deadline(since, settings.stable_idle)?;
             if now < until {
                 return Ok(DeliveryStep::Wait {
                     until,
@@ -365,13 +471,26 @@ pub fn next_delivery(
                 });
             }
         }
-        _ => {}
     }
     let attempt = attempt
         .checked_add(1)
-        .filter(|n| *n <= max_attempts)
         .ok_or(DeliveryPolicyError::InvalidState)?;
     Ok(DeliveryStep::PasteNow { attempt })
+}
+
+fn failed_attempt(
+    now: DateTime<Utc>,
+    retry_delay: Option<Duration>,
+    reason: FailureReason,
+) -> Result<DeliveryStep, DeliveryPolicyError> {
+    Ok(if let Some(delay) = retry_delay {
+        DeliveryStep::RetryAt {
+            at: deadline(now, delay)?,
+            reason,
+        }
+    } else {
+        DeliveryStep::Fail { reason }
+    })
 }
 
 fn deadline(at: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>, DeliveryPolicyError> {
@@ -381,7 +500,7 @@ fn deadline(at: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>, Deli
         .ok_or(DeliveryPolicyError::TimeOverflow)
 }
 
-fn validate_policy(policy: &DeliveryPolicy) -> Result<u32, DeliveryPolicyError> {
+fn validate_settings(policy: &DeliverySettings) -> Result<u32, DeliveryPolicyError> {
     let durations = [
         policy.stable_idle,
         policy.stable_empty_input,
@@ -389,6 +508,7 @@ fn validate_policy(policy: &DeliveryPolicy) -> Result<u32, DeliveryPolicyError> 
         policy.stale_after,
         policy.readiness_timeout,
         policy.guard_poll_interval,
+        policy.pane_gone_grace,
     ];
     if durations
         .iter()
@@ -527,7 +647,12 @@ mod tests {
                 status_since: time(-10),
                 last_event_at: time(0),
             }),
-            pane_alive: true,
+            pane: PaneLiveness::Alive,
+            agent_status: AgentStatus::Ready,
+            other_delivery_in_flight: false,
+            last_paste_at: None,
+            hold_since: Some(time(0)),
+            restarted_mid_delivery: false,
             copy_mode: Some(false),
             dialog_open: Some(false),
             owner_focused: false,
@@ -589,6 +714,296 @@ mod tests {
             h.step(&live, 2),
             DeliveryStep::Confirm { receipt: receipt() }
         );
+    }
+
+    #[test]
+    fn row_readiness_requires_stable_empty_input_even_when_status_is_old() {
+        let h = History::new(false);
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::AttentionNeeded,
+        ] {
+            let mut live = ready();
+            live.session.as_mut().unwrap().status = status;
+            live.session.as_mut().unwrap().last_event_at = time(-500);
+            live.input_line = InputLine::EmptySince(time(31));
+            assert!(matches!(h.step(&live, 31), DeliveryStep::Wait { .. }));
+            assert!(matches!(h.step(&live, 40), DeliveryStep::Wait { .. }));
+            assert_eq!(h.step(&live, 41), DeliveryStep::PasteNow { attempt: 1 });
+        }
+    }
+
+    #[test]
+    fn pane_serialization_and_last_paste_reset_readiness() {
+        let h = History::new(false);
+        let mut live = ready();
+        live.other_delivery_in_flight = true;
+        wait(h.step(&live, 0), WaitReason::OtherDelivery);
+        live.other_delivery_in_flight = false;
+        live.last_paste_at = Some(time(0));
+        for send_now in [false, true] {
+            live.send_now = send_now;
+            assert!(matches!(h.step(&live, 9), DeliveryStep::Wait { .. }));
+            assert_eq!(h.step(&live, 10), DeliveryStep::PasteNow { attempt: 1 });
+        }
+        live.session = None;
+        wait(h.step(&live, 4), WaitReason::InputStabilizing);
+        assert_eq!(h.step(&live, 5), DeliveryStep::PasteNow { attempt: 1 });
+    }
+
+    #[test]
+    fn agent_state_gates_and_recovers_without_message_events() {
+        let h = History::new(false);
+        let mut live = ready();
+        for status in [AgentStatus::Starting, AgentStatus::Clearing] {
+            live.agent_status = status;
+            wait(h.step(&live, 1000), WaitReason::AgentNotReady);
+        }
+        for status in [AgentStatus::Stuck, AgentStatus::Down] {
+            live.agent_status = status;
+            assert_eq!(
+                h.step(&live, 1000),
+                DeliveryStep::Blocked {
+                    reason: FailureReason::AgentUnavailable
+                }
+            );
+        }
+        live.agent_status = AgentStatus::Ready;
+        assert_eq!(h.step(&live, 1000), DeliveryStep::PasteNow { attempt: 1 });
+        assert_eq!(History::new(true).step(&live, 1000), DeliveryStep::Complete);
+    }
+
+    #[test]
+    fn holds_are_bounded_from_current_observation_not_message_age() {
+        let h = History::new(false);
+        for which in 0..7 {
+            let mut live = ready();
+            live.hold_since = Some(time(600));
+            let (wait_reason, blocked_reason) = match which {
+                0 => {
+                    live.copy_mode = Some(true);
+                    (WaitReason::CopyMode, FailureReason::CopyMode)
+                }
+                1 => {
+                    live.dialog_open = Some(true);
+                    (WaitReason::DialogOpen, FailureReason::DialogOpen)
+                }
+                2 => {
+                    live.input_line = InputLine::NonEmpty;
+                    (WaitReason::InputNotEmpty, FailureReason::DraftPresent)
+                }
+                3 => {
+                    live.input_line = InputLine::Unknown;
+                    (WaitReason::InputUnknown, FailureReason::ReadinessTimeout)
+                }
+                4 => {
+                    live.copy_mode = None;
+                    (WaitReason::UnknownGuards, FailureReason::ReadinessTimeout)
+                }
+                5 => {
+                    live.dialog_open = None;
+                    (WaitReason::UnknownGuards, FailureReason::ReadinessTimeout)
+                }
+                _ => {
+                    live.pane = PaneLiveness::Unknown;
+                    (WaitReason::UnknownGuards, FailureReason::ReadinessTimeout)
+                }
+            };
+            wait(h.step(&live, 600), wait_reason);
+            wait(h.step(&live, 719), wait_reason);
+            assert_eq!(
+                h.step(&live, 720),
+                DeliveryStep::Blocked {
+                    reason: blocked_reason
+                }
+            );
+            // One good sample ends the hold. A new bad sample gets a new window.
+            assert_eq!(h.step(&ready(), 721), DeliveryStep::PasteNow { attempt: 1 });
+            live.hold_since = Some(time(722));
+            wait(h.step(&live, 722), wait_reason);
+            live.owner_focused = true;
+            wait(h.step(&live, 100000), WaitReason::OwnerFocused);
+        }
+    }
+
+    #[test]
+    fn gone_pane_requires_grace_unknown_never_fails_an_attempt() {
+        let mut h = History::new(false);
+        let mut live = ready();
+        live.pane = PaneLiveness::GoneSince(time(0));
+        wait(h.step(&live, 1), WaitReason::PaneGoneGrace);
+        assert_eq!(
+            h.step(&live, 2),
+            DeliveryStep::Fail {
+                reason: FailureReason::PaneGone
+            }
+        );
+        h.attempt(1, 0);
+        wait(h.step(&live, 1), WaitReason::PaneGoneGrace);
+        assert_eq!(
+            h.step(&live, 2),
+            DeliveryStep::RetryAt {
+                at: time(3),
+                reason: FailureReason::PaneGone
+            }
+        );
+        live.pane = PaneLiveness::Unknown;
+        live.hold_since = Some(time(2));
+        wait(h.step(&live, 3), WaitReason::UnknownGuards);
+        assert_eq!(
+            h.step(&live, 122),
+            DeliveryStep::Blocked {
+                reason: FailureReason::ReadinessTimeout
+            }
+        );
+        live.pane = PaneLiveness::Alive;
+        assert!(matches!(h.step(&live, 123), DeliveryStep::RetryAt { .. }));
+    }
+
+    #[test]
+    fn restart_after_late_queued_evidence_must_not_authorize_another_paste() {
+        let mut h = History::new(false);
+        h.attempt(1, 0);
+        h.failure(false, 3);
+        let mut live = ready();
+        live.probably_landed = true; // late activity after the timeout was logged
+        assert_eq!(
+            h.step(&live, 4),
+            DeliveryStep::Blocked {
+                reason: FailureReason::ProbablyDelivered
+            }
+        );
+        let mut replayed = OrgState::default();
+        for (index, (ts, event)) in h.log.iter().enumerate() {
+            replayed.apply(index as u64 + 1, *ts, event).unwrap();
+        }
+        h.state = replayed;
+        live.probably_landed = false;
+        live.confirmation = None;
+        live.restarted_mid_delivery = h.message().status == DeliveryStatus::Delivering;
+        live.last_paste_at = Some(time(5));
+        live.input_line = InputLine::EmptySince(time(5));
+        live.session.as_mut().unwrap().status_since = time(5);
+        assert!(!matches!(h.step(&live, 15), DeliveryStep::PasteNow { .. }));
+    }
+
+    #[test]
+    fn restart_loses_latches_and_blocks_until_receipt() {
+        let mut h = History::new(false);
+        h.attempt(1, 0);
+        let mut live = ready();
+        live.restarted_mid_delivery = true;
+        for now in [1, 3, 10000] {
+            assert_eq!(
+                h.step(&live, now),
+                DeliveryStep::Blocked {
+                    reason: FailureReason::Restarted
+                }
+            );
+        }
+        live.confirmation = Some(receipt());
+        assert_eq!(
+            h.step(&live, 10000),
+            DeliveryStep::Confirm { receipt: receipt() }
+        );
+    }
+
+    #[test]
+    fn stale_working_activity_in_receive_order_prevents_retry_despite_backward_clock() {
+        let mut h = History::new(false);
+        let mut live = ready();
+        live.session.as_mut().unwrap().status = SessionStatus::Working;
+        live.session.as_mut().unwrap().last_event_at = time(-500);
+        assert_eq!(h.step(&live, 0), DeliveryStep::PasteNow { attempt: 1 });
+        h.attempt(1, 0);
+        // Executor received another working event after applying the attempt,
+        // despite its timestamp preceding it: arrival order sets the latch.
+        live.session.as_mut().unwrap().last_event_at = time(-1);
+        live.probably_landed = true;
+        live.pane = PaneLiveness::GoneSince(time(0));
+        assert_eq!(
+            h.step(&live, 2),
+            DeliveryStep::AwaitConfirmation { until: time(3) }
+        );
+        assert_eq!(
+            h.step(&live, 3),
+            DeliveryStep::Blocked {
+                reason: FailureReason::ProbablyDelivered
+            }
+        );
+        live.session.as_mut().unwrap().status = SessionStatus::Idle;
+        assert_eq!(
+            h.step(&live, 70),
+            DeliveryStep::Blocked {
+                reason: FailureReason::ProbablyDelivered
+            }
+        );
+    }
+
+    #[test]
+    fn shrinking_budget_finalizes_queued_or_over_budget_delivering() {
+        for queued in [false, true] {
+            let mut h = History::new(false);
+            h.attempt(2, 0);
+            if queued {
+                h.failure(false, 1);
+            }
+            let policy = DeliveryPolicy::new(DeliverySettings {
+                retry_delays: vec![],
+                ..DeliverySettings::default()
+            })
+            .unwrap();
+            assert_eq!(
+                next_delivery(h.message(), &ready(), time(2), &policy).unwrap(),
+                DeliveryStep::Fail {
+                    reason: FailureReason::AttemptLimit
+                }
+            );
+            h.failure(true, 2);
+            assert_eq!(h.step(&ready(), 3), DeliveryStep::Complete);
+        }
+    }
+
+    #[test]
+    fn settings_validate_at_construction_and_deserialization() {
+        let settings = DeliverySettings::default();
+        let policy = DeliveryPolicy::new(settings.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DeliveryPolicy>(&serde_json::to_string(&policy).unwrap())
+                .unwrap(),
+            policy
+        );
+        for bad in [
+            DeliverySettings {
+                stable_idle: Duration::ZERO,
+                ..settings.clone()
+            },
+            DeliverySettings {
+                confirmation_timeout: Duration::MAX,
+                ..settings.clone()
+            },
+            DeliverySettings {
+                retry_delays: vec![Duration::from_secs(2), Duration::from_secs(1)],
+                ..settings.clone()
+            },
+            DeliverySettings {
+                pane_gone_grace: Duration::ZERO,
+                ..settings.clone()
+            },
+        ] {
+            assert_eq!(
+                DeliveryPolicy::new(bad.clone()),
+                Err(DeliveryPolicyError::InvalidConfiguration)
+            );
+            assert!(
+                serde_json::from_str::<DeliveryPolicy>(&serde_json::to_string(&bad).unwrap())
+                    .is_err()
+            );
+        }
+        assert!(serde_json::from_str::<DeliveryPolicy>(r#"{"stable_idel": 3}"#).is_err());
+        let minimal: DeliveryPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(minimal, policy);
     }
 
     #[test]
@@ -687,10 +1102,10 @@ mod tests {
                 blocked.input_line = input;
                 wait(h.step(&blocked, 0), reason);
             }
-            live.pane_alive = false;
+            live.pane = PaneLiveness::GoneSince(time(-2));
             assert_eq!(
                 h.step(&live, 0),
-                DeliveryStep::Blocked {
+                DeliveryStep::Fail {
                     reason: FailureReason::PaneGone
                 }
             );
@@ -707,6 +1122,7 @@ mod tests {
             assert_eq!(h.step(&live, 120), DeliveryStep::PasteNow { attempt: 1 });
             for send_now in [false, true] {
                 live.send_now = send_now;
+                live.hold_since = Some(time(0));
                 live.input_line = InputLine::NonEmpty;
                 assert_eq!(
                     h.step(&live, 120),
@@ -724,6 +1140,7 @@ mod tests {
                 );
                 live.dialog_open = Some(false);
                 live.input_line = InputLine::Unknown;
+                live.hold_since = Some(time(120));
                 wait(h.step(&live, 239), WaitReason::InputUnknown);
                 assert_eq!(
                     h.step(&live, 240),
@@ -783,6 +1200,7 @@ mod tests {
         live.input_line = InputLine::Unknown;
         wait(h.step(&live, 120), WaitReason::SessionBusy);
         wait(h.step(&live, 238), WaitReason::SessionBusy);
+        live.hold_since = Some(time(239));
         wait(h.step(&live, 239), WaitReason::InputUnknown);
         wait(h.step(&live, 358), WaitReason::InputUnknown);
         assert_eq!(
@@ -956,7 +1374,7 @@ mod tests {
             let mut live = ready();
             live.confirmation = Some(receipt());
             live.session = None;
-            live.pane_alive = false;
+            live.pane = PaneLiveness::GoneSince(time(0));
             live.owner_focused = true;
             live.probably_landed = true;
             assert_eq!(
@@ -980,13 +1398,13 @@ mod tests {
     }
 
     #[test]
-    fn lost_pane_fails_only_an_inflight_attempt_and_blocked_can_recover() {
+    fn lost_pane_finalizes_queued_and_last_attempt_after_grace() {
         let mut h = History::new(false);
         let mut live = ready();
-        live.pane_alive = false;
+        live.pane = PaneLiveness::GoneSince(time(-2));
         assert_eq!(
             h.step(&live, 0),
-            DeliveryStep::Blocked {
+            DeliveryStep::Fail {
                 reason: FailureReason::PaneGone
             }
         );
@@ -1005,7 +1423,7 @@ mod tests {
             1
         );
         assert_eq!(h.step(&ready(), 0), DeliveryStep::PasteNow { attempt: 1 });
-        h.attempt(1, 0);
+        h.attempt(4, 0);
         assert_eq!(
             h.step(&live, 0),
             DeliveryStep::Fail {
@@ -1018,11 +1436,12 @@ mod tests {
     #[test]
     fn configuration_controls_delays_and_budget_without_panics() {
         let mut h = History::new(false);
-        let mut policy = DeliveryPolicy {
+        let policy = DeliveryPolicy::new(DeliverySettings {
             stable_idle: Duration::from_secs(20),
             retry_delays: vec![],
-            ..DeliveryPolicy::default()
-        };
+            ..DeliverySettings::default()
+        })
+        .unwrap();
         assert_eq!(
             next_delivery(h.message(), &ready(), time(0), &policy).unwrap(),
             DeliveryStep::Wait {
@@ -1037,17 +1456,9 @@ mod tests {
                 reason: FailureReason::ConfirmationTimeout
             }
         );
-        policy.retry_delays = vec![Duration::from_secs(2), Duration::from_secs(1)];
-        assert!(matches!(
-            next_delivery(h.message(), &ready(), time(13), &policy),
-            Err(DeliveryPolicyError::InvalidConfiguration)
-        ));
-        policy = DeliveryPolicy::default();
-        policy.stable_idle = Duration::ZERO;
-        assert!(next_delivery(h.message(), &ready(), time(13), &policy).is_err());
-        policy = DeliveryPolicy::default();
-        policy.confirmation_timeout = Duration::MAX;
-        assert!(next_delivery(h.message(), &ready(), time(13), &policy).is_err());
+        assert!(policy.is_final_attempt(1));
+        assert!(!DeliveryPolicy::default().is_final_attempt(3));
+        assert!(DeliveryPolicy::default().is_final_attempt(4));
     }
 
     #[test]
@@ -1078,7 +1489,7 @@ mod tests {
         message.last_attempt.as_mut().unwrap().attempt = u32::MAX;
         assert_eq!(
             next_delivery(&message, &ready(), time(10), &DeliveryPolicy::default()).unwrap(),
-            DeliveryStep::Blocked {
+            DeliveryStep::Fail {
                 reason: FailureReason::AttemptLimit
             }
         );
@@ -1086,102 +1497,177 @@ mod tests {
 
     use proptest::prelude::*;
 
-    proptest! {
-        #[test]
-        fn no_two_pastes_without_recorded_failure_and_none_after_confirmation(
-            ticks in prop::collection::vec((-10i64..151, 0u8..4, 0u8..3, any::<[bool; 7]>(), 0u8..6), 0..200)
-        ) {
+    #[test]
+    fn no_two_pastes_without_recorded_failure_and_none_after_confirmation() {
+        use proptest::test_runner::{Config, RngSeed, TestRunner};
+        use std::cell::Cell;
+        let cases = Cell::new(0usize);
+        let multiple = Cell::new(0usize);
+        let four = Cell::new(0usize);
+        let restarts = Cell::new(0usize);
+        let evidence = Cell::new(0usize);
+        let receipts = Cell::new(0usize);
+        let failures = Cell::new(0usize);
+        let mut runner = TestRunner::new(Config {
+            cases: 512,
+            rng_seed: RngSeed::Fixed(0x9a02),
+            failure_persistence: None, // fixed seed reproduces this entire run
+            ..Config::default()
+        });
+        let ticks =
+            prop::collection::vec((-3i64..26, prop::array::uniform12(0u16..1000)), 100..200);
+        runner.run(&ticks, |ticks| {
+            let policy = DeliveryPolicy::default();
             let mut h = History::new(false);
             let mut live = ready();
-            // Every generated history reaches a real authorized attempt.
             prop_assert_eq!(h.step(&live, 0), DeliveryStep::PasteNow { attempt: 1 });
             h.attempt(1, 0);
+            live.last_paste_at = Some(time(0));
             let mut now = 0;
             let mut failure_since_paste = false;
             let mut confirmed = false;
+            let mut landed_any = false; // oracle survives restart, executor latch does not
             let mut previous_attempt = 1;
-            for (delta, status, input, flags, action) in ticks {
+            let mut previous_hold = None;
+            for (delta, flags) in ticks {
                 now += delta;
-                let [focus, copy, dialog, alive, event, send_now, landed] = flags;
-                live.owner_focused = focus;
-                live.copy_mode = if action == 5 { None } else { Some(copy) };
-                live.dialog_open = if action == 4 { None } else { Some(dialog) };
-                live.pane_alive = alive;
-                live.send_now = send_now;
-                live.probably_landed |= landed;
-                let next_status = match status {
-                    0 => None,
-                    1 => Some(SessionStatus::Idle),
-                    2 => Some(SessionStatus::Working),
-                    _ => Some(SessionStatus::AttentionNeeded),
+                let [focus, copy, dialog, pane, status, input, send, agent, other, activity, action, io] = flags;
+                live.owner_focused = focus < 50;
+                live.copy_mode = if copy < 25 { None } else { Some(copy < 50) };
+                live.dialog_open = if dialog < 25 { None } else { Some(dialog < 50) };
+                live.pane = match pane {
+                    0..5 => match live.pane {
+                        PaneLiveness::GoneSince(at) => PaneLiveness::GoneSince(at),
+                        _ => PaneLiveness::GoneSince(time(now)),
+                    },
+                    5..25 => PaneLiveness::Unknown,
+                    _ => PaneLiveness::Alive,
                 };
-                let old_status = live.session.as_ref().map(|s| s.status);
-                if old_status != next_status {
+                live.agent_status = match agent {
+                    0..10 => AgentStatus::Starting,
+                    10..20 => AgentStatus::Clearing,
+                    20..30 => AgentStatus::Stuck,
+                    30..40 => AgentStatus::Down,
+                    _ => AgentStatus::Ready,
+                };
+                live.other_delivery_in_flight = other < 30;
+                if other < 10 { live.last_paste_at = Some(time(now)); }
+                live.send_now = send < 100;
+                let next_status = match status {
+                    0..30 => None,
+                    30..60 => Some(SessionStatus::Working),
+                    60..90 => Some(SessionStatus::AttentionNeeded),
+                    _ => Some(SessionStatus::Idle),
+                };
+                if live.session.as_ref().map(|s| s.status) != next_status {
                     live.session = next_status.map(|status| LiveSession {
                         status, status_since: time(now), last_event_at: time(now),
                     });
                     live.input_line = InputLine::Unknown;
-                } else if event {
-                    if let Some(row) = &mut live.session { row.last_event_at = time(now); }
                 }
                 live.input_line = match input {
-                    0 => InputLine::Unknown,
-                    1 => InputLine::NonEmpty,
+                    0..40 => InputLine::Unknown,
+                    40..80 => InputLine::NonEmpty,
                     _ => match live.input_line {
                         InputLine::EmptySince(at) => InputLine::EmptySince(at),
                         _ => InputLine::EmptySince(time(now)),
                     },
                 };
-                if action == 1 && h.message().status == DeliveryStatus::Delivering
-                    && !live.probably_landed && !confirmed {
-                    h.failure(false, now); // explicit executor I/O failure
+                // Conservative continuity: a changed guard class starts a new hold.
+                let hold_key = (focus < 50, live.copy_mode, live.dialog_open,
+                    std::mem::discriminant(&live.pane), live.agent_status,
+                    live.other_delivery_in_flight, next_status,
+                    std::mem::discriminant(&live.input_line));
+                if previous_hold != Some(hold_key) {
+                    live.hold_since = Some(time(now));
+                    previous_hold = Some(hold_key);
+                }
+                // Rare receive-order evidence, including after a timeout was logged.
+                if activity < 5 && matches!(h.message().status, DeliveryStatus::Delivering | DeliveryStatus::Queued) {
+                    live.probably_landed = true;
+                    landed_any = true;
+                    evidence.set(evidence.get() + 1);
+                    if let Some(row) = &mut live.session { row.last_event_at = time(now); }
+                }
+                if io < 30 && h.message().status == DeliveryStatus::Delivering
+                    && !live.probably_landed && !live.restarted_mid_delivery {
+                    h.failure(policy.is_final_attempt(previous_attempt), now);
+                    failures.set(failures.get() + 1);
                     failure_since_paste = true;
                 }
-                if action == 2 { live.confirmation = Some(receipt()); }
-                if action == 3 {
+                if action < 5 {
                     let mut replayed = OrgState::default();
                     for (index, (ts, event)) in h.log.iter().enumerate() {
                         replayed.apply(index as u64 + 1, *ts, event).unwrap();
                     }
                     prop_assert_eq!(&replayed, &h.state);
                     h.state = replayed;
-                    // Restart loses continuity, never the latched landing evidence.
+                    live.confirmation = None;
+                    live.probably_landed = false;
+                    live.restarted_mid_delivery = h.message().status == DeliveryStatus::Delivering;
+                    if live.restarted_mid_delivery { restarts.set(restarts.get() + 1); }
                     if let Some(row) = &mut live.session { row.status_since = time(now); }
                     live.input_line = InputLine::Unknown;
+                    live.last_paste_at = Some(time(now));
+                    live.hold_since = None;
+                } else if action < 10 {
+                    live.confirmation = Some(receipt());
                 }
                 match h.step(&live, now) {
                     DeliveryStep::PasteNow { attempt } => {
                         prop_assert!(failure_since_paste);
-                        prop_assert!(!confirmed && live.confirmation.is_none() && !live.probably_landed);
-                        prop_assert!(alive && !focus && live.copy_mode == Some(false) && live.dialog_open == Some(false));
+                        prop_assert!(!confirmed && !landed_any && live.confirmation.is_none() && !live.probably_landed);
+                        prop_assert_eq!(live.pane, PaneLiveness::Alive);
+                        prop_assert!(!live.owner_focused && !live.other_delivery_in_flight);
+                        prop_assert_eq!(live.agent_status, AgentStatus::Ready);
+                        prop_assert!(live.copy_mode == Some(false) && live.dialog_open == Some(false));
                         prop_assert!(matches!(live.input_line, InputLine::EmptySince(_)));
                         prop_assert!(attempt > previous_attempt);
                         h.attempt(attempt, now);
+                        live.probably_landed = false; // reset per reserved attempt, not per tick
+                        live.restarted_mid_delivery = false;
+                        live.last_paste_at = Some(time(now));
                         previous_attempt = attempt;
                         failure_since_paste = false;
                     }
                     DeliveryStep::RetryAt { .. } if h.message().status == DeliveryStatus::Delivering => {
-                        prop_assert!(!live.probably_landed);
+                        prop_assert!(!live.probably_landed && !live.restarted_mid_delivery);
+                        prop_assert!(!policy.is_final_attempt(previous_attempt));
                         h.failure(false, now);
+                        failures.set(failures.get() + 1);
                         failure_since_paste = true;
                     }
                     DeliveryStep::Fail { .. } => {
-                        prop_assert_eq!(h.message().status, DeliveryStatus::Delivering);
                         h.failure(true, now);
+                        failures.set(failures.get() + 1);
                         failure_since_paste = true;
                     }
                     DeliveryStep::Confirm { receipt } => {
                         h.command(OrgCommand::Delivered {
                             message_id: h.id, session_id: receipt.session_id, confirmation: receipt.confirmation,
                         }, time(now));
+                        receipts.set(receipts.get() + 1);
                         confirmed = true;
                     }
                     _ => {}
                 }
                 if confirmed { prop_assert_eq!(h.message().status, DeliveryStatus::Delivered); }
             }
-        }
+            cases.set(cases.get() + 1);
+            if previous_attempt >= 2 { multiple.set(multiple.get() + 1); }
+            if previous_attempt == 4 { four.set(four.get() + 1); }
+            Ok(())
+        }).unwrap();
+        println!("delivery coverage: cases={}, >=2 pastes={}, 4 pastes={}, in-flight restarts={}, evidence={}, receipts={}, failures={}",
+            cases.get(), multiple.get(), four.get(), restarts.get(), evidence.get(), receipts.get(), failures.get());
+        assert!(
+            multiple.get() * 4 >= cases.get(),
+            "retry assertions must run in at least 25% of histories"
+        );
+        assert!(four.get() > 0 && restarts.get() > 0 && evidence.get() > 0 && receipts.get() > 0);
+    }
 
+    proptest! {
         #[test]
         fn landed_paste_with_lost_prompt_event_never_retries(
             times in prop::collection::vec(-30i64..10000, 1..200),

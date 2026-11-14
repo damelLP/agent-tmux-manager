@@ -1736,6 +1736,44 @@ fn veto_sees_every_other_message_in_flight() {
 }
 
 #[test]
+fn first_evidence_copy_between_attempt_fold_and_arm_belongs_to_the_old_scope() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Idle), 0);
+    let scope = f.attempt(1_000);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        1_000,
+    );
+    paste(&mut f, EffectCertainty::NotStarted, 1_000);
+    fail_for_retry(&mut f, 2_000);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: f.id,
+            attempt: 2,
+            pane: "%1".into(),
+        },
+        40_000,
+    );
+    // No latch was set yet. Evidence still carries attempt 1's activity,
+    // despite attempt 2 having been folded into the durable history.
+    evidence_latch(&mut f, 40_000);
+    let mut new_scope = scope;
+    new_scope.attempt_seq = f.seq;
+    f.record(HistoryUpdate::Armed { scope: new_scope }, 40_000);
+    paste(&mut f, EffectCertainty::Applied, 40_000);
+    assert_eq!(
+        f.step(60_000),
+        DeliveryStep::RetryAt {
+            at: at(62_000),
+            reason: FailureReason::ConfirmationTimeout,
+        }
+    );
+    assert!(!f.snapshot(60_000).live.probably_landed);
+}
+
+#[test]
 fn stale_evidence_copy_before_the_new_arm_does_not_pin_the_old_latch() {
     let mut f = Fixture::new(0);
     let scope = f.attempt(0);
@@ -1885,6 +1923,54 @@ fn consume_of(f: &mut Fixture, id: MessageId, ms: i64) -> DeliveryStep {
         ms,
     );
     step
+}
+
+#[test]
+fn attempted_follower_retries_without_stalling_the_unattempted_head() {
+    // A log from a writer that did not consume PasteNow can contain this
+    // ordering. The attempted follower owns the reservation, not the FIFO head.
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    let follower = MessageId::new(f.seq);
+    f.observe(observation(SessionStatus::Idle), 0);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: follower,
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        20_000,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: follower,
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        30_000,
+    );
+    for ms in [100_000, 1_000_000, 100_000_000] {
+        f.observe(observation(SessionStatus::Idle), ms);
+        wait(f.step(ms), WaitReason::OtherDelivery);
+        assert_eq!(f.snapshot(ms).blocked_by, Some(follower));
+        assert_eq!(
+            consume_of(&mut f, follower, ms),
+            DeliveryStep::PasteNow { attempt: 2 }
+        );
+        assert_eq!(
+            f.history.snapshot(follower, at(ms)).unwrap().blocked_by,
+            None
+        );
+    }
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: follower,
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        },
+        100_000_001,
+    );
+    assert_eq!(f.step(100_000_001), DeliveryStep::PasteNow { attempt: 1 });
 }
 
 #[test]

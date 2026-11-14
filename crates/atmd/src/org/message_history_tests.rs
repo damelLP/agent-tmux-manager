@@ -285,6 +285,8 @@ fn unknown_query_not_pane_death() {
     obs.presence = PanePresence::Unknown;
     f.observe(obs.clone(), 1_999);
     assert_eq!(f.snapshot(2_000).live.pane, PaneLiveness::Unknown);
+    // Past the grace the pane had as Gone: an unknown sample is not its death.
+    wait(f.step(2_000), WaitReason::UnknownGuards);
     obs.presence = PanePresence::Gone;
     f.observe(obs, 3_000);
     assert_eq!(
@@ -414,6 +416,10 @@ fn retry_follows_recipient_not_reused_pane() {
         .unwrap(),
         WaitReason::OtherDelivery,
     );
+    // The pending retry itself goes on, to the recipient's new pane.
+    assert_eq!(f.snapshot(20_000).recipient.pane.as_deref(), Some("%2"));
+    assert_eq!(f.snapshot(20_000).blocked_by, None);
+    assert_eq!(f.step(20_000), DeliveryStep::PasteNow { attempt: 2 });
     let mut obs = observation(SessionStatus::Idle);
     obs.session.as_mut().unwrap().id = "s3".into();
     f.record(
@@ -1504,4 +1510,178 @@ fn a_held_or_replayed_attempt_is_never_discounted() {
     paste(&mut f, EffectCertainty::NotStarted, 21_000);
     evidence_latch(&mut f, 21_000);
     assert!(f.snapshot(21_000).live.probably_landed);
+}
+
+#[test]
+fn held_before_the_first_arm_of_its_attempt_survives_that_arm() {
+    let mut f = Fixture::new(0);
+    let scope = f.attempt(0);
+    f.record(
+        HistoryUpdate::Held {
+            id: f.id,
+            attempt_seq: scope.attempt_seq,
+            hold: ExecutorHold::TokenVisible,
+        },
+        1_000,
+    );
+    // Only an arm for another attempt, or the owner's retry, releases a hold.
+    f.record(HistoryUpdate::Armed { scope }, 2_000);
+    assert_eq!(f.snapshot(2_000).hold, Some(ExecutorHold::TokenVisible));
+    assert!(f.snapshot(2_000).live.probably_landed);
+}
+
+#[test]
+fn landing_evidence_without_an_attempt_is_refused() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Idle), 0);
+    assert!(matches!(
+        f.history.record(
+            HistoryUpdate::Evidence {
+                id: f.id,
+                receipt: None,
+                probably_landed: true,
+            },
+            at(1_000),
+        ),
+        Err(super::messages::MessageError::Conflict(_))
+    ));
+    // Accepted, it would make the policy answer InvalidState for ever.
+    assert_eq!(f.step(20_000), DeliveryStep::PasteNow { attempt: 1 });
+    // "Nothing seen" is a valid copy for a message with no attempt.
+    f.record(
+        HistoryUpdate::Evidence {
+            id: f.id,
+            receipt: None,
+            probably_landed: false,
+        },
+        1_000,
+    );
+}
+
+#[test]
+fn applied_status_change_resets_the_hold_without_a_consumed_step() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    wait(f.consume(0), WaitReason::InputNotEmpty);
+    // The outage comes and goes with no step consumed in between.
+    f.apply(
+        OrgEvent::AgentStuck {
+            agent_id: agent(),
+            reason: "outage".into(),
+        },
+        100_000,
+    );
+    f.apply(OrgEvent::AgentEditorReady { agent_id: agent() }, 110_000);
+    f.observe(obs, 110_000);
+    assert_eq!(f.snapshot(110_000).live.hold_since, None);
+    wait(f.consume(110_000), WaitReason::InputNotEmpty);
+    wait(f.step(229_999), WaitReason::InputNotEmpty);
+    blocked(f.step(230_000), FailureReason::DraftPresent);
+}
+
+#[test]
+fn only_replay_and_activity_are_accepted_before_the_watermark() {
+    let mut f = Fixture::new(5);
+    activity(&mut f, "s1", Some(pane()), 0);
+    let scope = AttemptScope {
+        message_id: f.id,
+        attempt_seq: 4,
+        recipient: agent(),
+        pane: pane(),
+        harness: Harness::Pi,
+        session_id: Some("s1".into()),
+        excluded_sessions: HashSet::new(),
+    };
+    let id = f.id;
+    let live_inputs = || {
+        vec![
+            HistoryUpdate::Observed {
+                recipient: agent(),
+                observation: observation(SessionStatus::Idle),
+            },
+            HistoryUpdate::ObservationLost { recipient: agent() },
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            HistoryUpdate::Evidence {
+                id,
+                receipt: None,
+                probably_landed: false,
+            },
+            HistoryUpdate::Consumed {
+                id,
+                step: DeliveryStep::Complete,
+            },
+            HistoryUpdate::Paste {
+                id,
+                pane: pane(),
+                certainty: EffectCertainty::NotStarted,
+            },
+            HistoryUpdate::Held {
+                id,
+                attempt_seq: 4,
+                hold: ExecutorHold::TokenVisible,
+            },
+            HistoryUpdate::OwnerRetry { id, attempt_seq: 4 },
+        ]
+    };
+    for update in live_inputs() {
+        let kind = format!("{update:?}");
+        assert!(
+            matches!(
+                f.history.record(update, at(0)),
+                Err(super::messages::MessageError::Unavailable(_))
+            ),
+            "{kind}"
+        );
+    }
+    // The replay reaches the watermark: the same inputs are now judged on
+    // their own terms, none of them as "replay is incomplete".
+    f.attempt(0);
+    f.record(
+        HistoryUpdate::Applied {
+            seq: 5,
+            at: at(0),
+            event: None,
+        },
+        0,
+    );
+    assert_eq!(id, f.id);
+    for update in live_inputs() {
+        let kind = format!("{update:?}");
+        assert!(
+            !matches!(
+                f.history.record(update, at(0)),
+                Err(super::messages::MessageError::Unavailable(_))
+            ),
+            "{kind}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_record_leaves_the_fold_cursor_unchanged() {
+    use std::{future::Future, task::Poll};
+    let history = MessageHistoryHandle::new(0, at(0), DeliveryPolicy::default()).unwrap();
+    let applied = |seq, event| HistoryUpdate::Applied {
+        seq,
+        at: at(0),
+        event,
+    };
+    history.record(applied(1, None), at(0)).unwrap();
+    // A gap, and an event the org state refuses.
+    assert!(history.record(applied(3, None), at(0)).is_err());
+    let invalid = OrgEvent::AgentDown {
+        agent_id: "p/missing".parse().unwrap(),
+        reason: "invalid".into(),
+    };
+    assert!(history.record(applied(2, Some(invalid)), at(0)).is_err());
+    let wait = history.folded(2);
+    tokio::pin!(wait);
+    assert!(std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await);
+    history.folded(1).await.unwrap();
+    history.record(applied(2, None), at(0)).unwrap();
+    wait.await.unwrap();
 }

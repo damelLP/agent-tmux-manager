@@ -142,12 +142,17 @@ pub enum HistoryUpdate {
     Armed { scope: AttemptScope },
     /// Retained facts; absence/false is not permission to clear a prior latch.
     /// Only a new arm or explicit matching owner retry can release that latch.
+    /// probably_landed for a message with no attempt is a `Conflict`.
     Evidence {
         id: MessageId,
         receipt: Option<DeliveryReceipt>,
         probably_landed: bool,
     },
     /// Successful serialized policy consumption; PasteNow resets hold, not paste time.
+    /// Record it with the `now` of the snapshot the step was evaluated on: the
+    /// step is checked against the policy at that instant. `Conflict` means the
+    /// decision is no longer current (time moved, or an update arrived in
+    /// between): take a new snapshot and evaluate again.
     Consumed { id: MessageId, step: DeliveryStep },
     /// Applied/Unknown records now and resets pane readiness before job release.
     /// NotStarted must never manufacture a paste timestamp. Paste never latches
@@ -161,7 +166,8 @@ pub enum HistoryUpdate {
         certainty: EffectCertainty,
     },
     /// Latch probably_landed and this diagnostic for the matching attempted log
-    /// sequence. Only new Armed or matching OwnerRetry releases it.
+    /// sequence. Only an Armed for another attempt or a matching OwnerRetry
+    /// releases it; the first Armed of this same attempt does not.
     Held {
         id: MessageId,
         attempt_seq: u64,
@@ -211,7 +217,8 @@ struct MessageContinuity {
     restarted: bool,
     scope: Option<AttemptScope>,
     receipt: Option<DeliveryReceipt>,
-    probably_landed: bool,
+    /// probably_landed, as the attempt sequence the latch was set for.
+    latch: Option<u64>,
     hold: Option<ExecutorHold>,
     /// The attempt recorded `Paste { NotStarted }`: it typed nothing.
     no_effect_seq: Option<u64>,
@@ -240,7 +247,7 @@ impl MessageContinuity {
         let untyped = !self.effect_possible
             && self.no_effect_seq.is_some()
             && self.no_effect_seq == self.last_attempt_seq;
-        live.probably_landed = self.probably_landed && !untyped;
+        live.probably_landed = self.latch.is_some() && !untyped;
     }
 }
 
@@ -556,7 +563,6 @@ impl MessageHistory {
         let Some(open) = self.open.get(recipient).filter(|open| !open.is_empty()) else {
             return Ok(vec![]);
         };
-        self.replayed()?;
         let agent = self
             .state
             .agent(recipient)
@@ -628,11 +634,7 @@ impl MessageHistory {
                     }
                 }
             }
-            let status_changed = before.as_ref().is_some_and(|old| old.0 != after.0)
-                && (after.0 != AgentStatus::Ready
-                    || before
-                        .as_ref()
-                        .is_some_and(|old| old.0 != AgentStatus::Ready));
+            let status_changed = before.as_ref().is_some_and(|old| old.0 != after.0);
             if moved || status_changed {
                 self.reset_clocks(id, status_changed);
             }
@@ -683,6 +685,15 @@ impl MessageHistory {
     }
 
     fn update(&mut self, update: HistoryUpdate, now: DateTime<Utc>) -> Result<(), MessageError> {
+        // The replay itself and the tap, which runs from the first connection,
+        // come before the watermark. Every other update is a live input or a
+        // decision, and means nothing until the replay is complete.
+        if !matches!(
+            update,
+            HistoryUpdate::Applied { .. } | HistoryUpdate::Activity { .. }
+        ) {
+            self.replayed()?;
+        }
         match update {
             HistoryUpdate::Applied { seq, at, event } => {
                 if seq <= self.cursor {
@@ -860,8 +871,12 @@ impl MessageHistory {
                         "replayed attempt requires owner resolution".into(),
                     ));
                 }
-                track.probably_landed = false;
-                track.hold = None;
+                // An arm releases the latch of an earlier attempt. A latch set
+                // for this same attempt (Held before its first arm) stays.
+                if track.latch != Some(scope.attempt_seq) {
+                    track.latch = None;
+                    track.hold = None;
+                }
                 track.scope = Some(scope);
             }
             HistoryUpdate::Evidence {
@@ -870,10 +885,17 @@ impl MessageHistory {
                 probably_landed,
             } => {
                 let track = self.track(id)?;
+                if probably_landed {
+                    // Nothing can have landed before an attempt, and the policy
+                    // would refuse that state for ever with nothing to release it.
+                    let attempt = track.last_attempt_seq.ok_or_else(|| {
+                        MessageError::Conflict("message has no attempt that could land".into())
+                    })?;
+                    track.latch.get_or_insert(attempt);
+                }
                 if receipt.is_some() {
                     track.receipt = receipt;
                 }
-                track.probably_landed |= probably_landed;
             }
             HistoryUpdate::Consumed { id, step } => {
                 let snapshot = self.snapshot(id, now)?;
@@ -945,14 +967,14 @@ impl MessageHistory {
                 hold,
             } => {
                 let track = self.matching_attempt(id, attempt_seq)?;
-                track.probably_landed = true;
+                track.latch = Some(attempt_seq);
                 track.hold = Some(hold);
                 track.effect_possible = true;
             }
             HistoryUpdate::OwnerRetry { id, attempt_seq } => {
                 let track = self.matching_attempt(id, attempt_seq)?;
                 track.restarted = false;
-                track.probably_landed = false;
+                track.latch = None;
                 track.hold = None;
             }
         }

@@ -20,6 +20,8 @@ mod agents_tests;
 pub mod message_delivery;
 pub mod message_evidence;
 pub mod message_history;
+#[cfg(test)]
+mod message_history_tests;
 mod message_methods;
 #[cfg(test)]
 mod message_seam_tests;

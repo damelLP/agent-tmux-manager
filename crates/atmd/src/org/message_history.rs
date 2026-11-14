@@ -902,9 +902,16 @@ impl MessageHistory {
                 if probably_landed {
                     // Nothing can have landed before an attempt, and the policy
                     // would refuse that state for ever with nothing to release it.
-                    let attempt = track.last_attempt_seq.ok_or_else(|| {
-                        MessageError::Conflict("message has no attempt that could land".into())
-                    })?;
+                    // A copy before the new arm still belongs to the old scope,
+                    // even if the next attempt has already been folded.
+                    let attempt = track
+                        .scope
+                        .as_ref()
+                        .map(|scope| scope.attempt_seq)
+                        .or(track.last_attempt_seq)
+                        .ok_or_else(|| {
+                            MessageError::Conflict("message has no attempt that could land".into())
+                        })?;
                     track.latch.get_or_insert(attempt);
                 }
                 if receipt.is_some() {

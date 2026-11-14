@@ -36,6 +36,10 @@ class SceneTests(unittest.TestCase):
             for frame in frames:
                 for columns, rows in sizes:
                     with self.subTest(mode=mode, frame=frame, size=(columns, rows)):
+                        if mode == "pi" and columns < 86:
+                            with self.assertRaisesRegex(ValueError, "requires at least 86x19"):
+                                render(mode, frame, "busy draft", columns=columns, rows=rows)
+                            continue
                         result = render(mode, frame, "busy draft", columns=columns, rows=rows)
                         text = "\n".join(result.lines)
                         if mode == "codex" and frame == "clearing":
@@ -108,9 +112,16 @@ class SceneTests(unittest.TestCase):
 
     def test_synthetic_small_viewport_never_wraps_or_overflows(self):
         from screens import cell_width
-        result = render("pi", "idle", "界" * 100 + "\nsecond", columns=80, rows=24)
+        result = render("pi", "idle", "界" * 100 + "\nsecond", columns=86, rows=24)
         self.assertEqual(len(result.lines), 24)
-        self.assertTrue(all(cell_width(line) <= 80 for line in result.lines))
+        self.assertTrue(all(cell_width(line) <= 86 for line in result.lines))
+
+    def test_narrow_split_is_refused_instead_of_clipping_required_chrome(self):
+        for mode, minimum in [("codex", "80x19"), ("pi", "86x19")]:
+            for columns, rows in [(60, 40), (120, 18)]:
+                with self.subTest(mode=mode, size=(columns, rows)):
+                    with self.assertRaisesRegex(ValueError, f"requires at least {minimum}"):
+                        render(mode, "fresh", columns=columns, rows=rows)
 
 
 if __name__ == "__main__":

@@ -281,6 +281,82 @@ fn key_driven_lifecycle_matches_sources_and_repeated_clear_is_only_a_snapshot() 
 }
 
 #[test]
+fn lifecycle_facts_survive_documented_and_split_height_viewports() {
+    let mut rig = StandInRig::start();
+    for mode in [StandInMode::Codex, StandInMode::Pi] {
+        let minimum_width = if mode == StandInMode::Pi { 86 } else { 80 };
+        for (columns, rows) in [(100, 30), (120, 19), (minimum_width, 19)] {
+            let mut config = StandInConfig::new(mode);
+            config.manual_clock = true;
+            config.columns = columns;
+            config.rows = rows;
+            let pane = rig.launch(&config);
+            let check = |frame: &str| {
+                let want = if mode == StandInMode::Codex && frame == "clearing" {
+                    ScreenFacts::default()
+                } else {
+                    expected(&format!("{}.{frame}.u5", mode.name()))
+                };
+                assert_eq!(
+                    observe(mode, &rig.capture_plain(&pane)),
+                    want,
+                    "{} {frame} {columns}x{rows}",
+                    mode.name()
+                );
+            };
+            check("fresh");
+            let after = rig.event_cursor(&pane);
+            rig.paste(&pane, "held work");
+            rendered(&rig, &pane, after, "working");
+            check("working");
+            let after = rig.event_cursor(&pane);
+            rig.control(
+                &pane,
+                serde_json::json!({"command":"advance_to", "now_ms":500}),
+            );
+            rendered(&rig, &pane, after, "idle");
+            check("idle");
+            let after = rig.event_cursor(&pane);
+            rig.paste(&pane, "/new");
+            rendered(&rig, &pane, after, "clearing");
+            check("clearing");
+            let after = rig.event_cursor(&pane);
+            rig.control(
+                &pane,
+                serde_json::json!({"command":"advance_to", "now_ms":600}),
+            );
+            rendered(&rig, &pane, after, "clear-complete");
+            check("clear-complete");
+            let after = rig.event_cursor(&pane);
+            rig.paste(&pane, "interrupt me");
+            rendered(&rig, &pane, after, "working");
+            let after = rig.event_cursor(&pane);
+            rig.key(&pane, "Escape");
+            rendered(&rig, &pane, after, "interrupted");
+            check("interrupted");
+        }
+    }
+    rig.close();
+}
+
+#[test]
+fn narrow_split_reports_minimum_through_the_rig() {
+    let mut rig = StandInRig::start();
+    for mode in [StandInMode::Codex, StandInMode::Pi] {
+        let mut config = StandInConfig::new(mode);
+        config.columns = 60;
+        config.rows = 40;
+        let failure =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.launch(&config)))
+                .expect_err("60-column split must refuse misleading chrome");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("requires at least"), "{message}");
+        assert!(message.contains("60x40"), "{message}");
+    }
+    rig.close();
+}
+
+#[test]
 fn typing_during_pi_work_and_codex_clear_keeps_the_process_and_draft() {
     let mut rig = StandInRig::start();
     for (mode, command, frame, deadline) in [

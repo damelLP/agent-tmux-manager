@@ -17,6 +17,10 @@ def select_screen(catalog, mode, frame, variant, columns, rows):
     candidates = [s for s in catalog if s["mode"] == mode and s["state"] == frame]
     if not candidates:
         raise ValueError(f"no captured scene: {mode}/{frame}")
+    if mode == "codex" and frame in ("fresh", "clear-complete") and rows < 24:
+        # The captured U5 logo alone needs 17 rows. Use the captured compact
+        # startup-help layout, not a truncated logo masquerading as fresh.
+        candidates = [s for s in candidates if s["variant"] in ("rich", "poor")]
     # A native viewport wins over a requested variant at another size. Within
     # it prefer that variant, then the original U5 source, then catalog order.
     return min(candidates, key=lambda s: (
@@ -61,8 +65,9 @@ def editor_slot(lines, mode):
 
 
 def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, selection, folder=None):
-    if min(columns, rows) < 2:
-        raise ValueError("viewport too small")
+    minimum = {"codex": (80, 19), "pi": (86, 19)}.get(mode, (2, 2))
+    if columns < minimum[0] or rows < minimum[1]:
+        raise ValueError(f"{mode} viewport {columns}x{rows} requires at least {minimum[0]}x{minimum[1]}")
     if mode == "claude" and frame == "folder-trust":
         frame = "folder-trust-selected" if selection == 2 else frame
         variant = f"p1-{columns}"
@@ -105,10 +110,30 @@ def render_state(catalog, assets, mode, frame, draft, variant, columns, rows, se
                 lines[start:end] = inserted
                 if styled is not None:
                     styled[start:end] = inserted
-    # Synthetic viewport fit: consume blank padding before dropping transcript,
-    # and clip long chrome rather than causing terminal auto-wrap/scroll.
+    # Synthetic reflow preserves complete footer tokens and equal-width pi
+    # rules. Never clip a right-aligned footer through a warning/model label.
+    for i, line in enumerate(lines):
+        fitted = line
+        if mode == "pi" and re.fullmatch(r"─+(?: [\u2800-\u28ff] Working ─+)?", line):
+            label = line.rstrip("─")
+            fitted = label + "─" * (columns - cell_width(label))
+        elif mode == "pi" and i == len(lines) - 1 and cell_width(line) > columns:
+            left, gap, right = line.rstrip().partition("  ")
+            right = right.strip()
+            fitted = left + " " * max(2, columns - cell_width(left + right)) + right if gap else line
+        elif mode == "codex" and "← for agents" in line and cell_width(line) > columns:
+            fitted = "  " + " ".join(line.split())
+        if fitted != line:
+            lines[i] = fitted
+            if styled is not None:
+                styled[i] = fitted
+    # Remove redundant blank padding first. Preserve editor blanks and one
+    # separator per history block; only then crop old transcript from the top.
     while len(lines) > rows:
-        blank = next((i for i in reversed(range(len(lines))) if not lines[i].strip()), 0)
+        slot = editor_slot(lines, mode) if frame not in MODALS and mode == "pi" else None
+        protected = set(range(slot[0], slot[1])) if slot else set()
+        blank = next((i for i in range(len(lines) - 1)
+                      if i not in protected and not lines[i].strip() and not lines[i + 1].strip()), 0)
         del lines[blank]
         if styled is not None:
             del styled[blank]

@@ -501,11 +501,16 @@ impl StandInRig {
         predicate: impl Fn(&Value) -> bool,
     ) -> Value {
         self.owns(pane);
-        self.events.wait(|e| {
+        let event = self.events.wait(|e| {
             events::matches_process(e, pane.pid, &pane.start_time)
                 && e["event_sequence"].as_u64().is_some_and(|seq| seq > after)
-                && predicate(e)
-        })
+                && (e["kind"] == "scene_error" || predicate(e))
+        });
+        assert_ne!(
+            event["kind"], "scene_error",
+            "stand-in scene failed: {event}"
+        );
+        event
     }
     pub fn control(&self, pane: &StandInPane, command: Value) -> Value {
         self.owns(pane);

@@ -333,9 +333,18 @@ and suppressed hooks remain in event records, not invented screen chrome.
 before launch. `screen_variant` defaults to `u5`; choose `rich-enabled`/`poor`
 for Claude or `rich`/`poor` for Codex at 100x30. Native geometry wins over a variant
 from another size. P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
-Uncaptured combinations are explicitly synthetic: blank padding is removed first,
-then leading transcript if needed; long chrome is clipped, drafts cell-wrapped.
-This is not real-harness resize fidelity. Optional `config.folder` substitutes
+Uncaptured combinations are explicitly synthetic: redundant blank padding is
+removed before old transcript, preserving editor blanks and history separators.
+Pi rules reflow to equal widths and aligned usage/model and Codex shortcut/warning
+footers retain complete tokens. Short Codex fresh panes use the captured compact
+startup-help source instead of cropping the tall logo. The adapter contract pins
+all lifecycle facts at 100x30, 120x19 and the supported minima: **Codex 80x19,
+pi 86x19**. A 60x40 split is too narrow for their captured interrupt/startup chrome:
+scene rendering explicitly refuses it, and the rig immediately reports the minimum
+rather than waiting for a misleading ready frame. Use a wider pane for these modes.
+Source-only replay remains native-size evidence. This is not real-harness resize
+fidelity. Other long transcript lines may clip; drafts cell-wrap.
+Optional `config.folder` substitutes
 only the trust path (control bytes escaped); omission preserves the capture.
 
 All dialog flags default false, survive respawn, and reject incompatible modes

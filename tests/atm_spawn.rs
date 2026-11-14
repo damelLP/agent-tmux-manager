@@ -1,13 +1,13 @@
 //! `atm spawn`: which pane it splits, what it prints, and how `--prompt`
 //! reaches the harness's command line (#121, gap 1 of #130).
 //!
-//! `atm` runs with a cleared environment whose `PATH` holds only a
-//! stand-in `tmux`. The stand-in logs each call and answers like tmux:
+//! `atm` runs with a cleared environment and a forbidden `tmux` on PATH.
+//! A private real daemon owns the stand-in `tmux`, which logs calls and answers:
 //! `list-panes` lists an active `%1` in another session and the caller's
 //! inactive `%7` and `%9`, `display-message` gives the pane's path,
 //! `split-window` prints the new pane `%42`, and a split of any other pane
-//! fails with tmux's "can't find pane". Nothing reaches a real tmux server
-//! or harness: the typed command goes to the stand-in.
+//! fails with tmux's "can't find pane". All three spawn requests go through
+//! the daemon, but no real tmux server or harness runs the typed command.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 

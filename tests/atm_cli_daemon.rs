@@ -1,12 +1,9 @@
-//! The CLI commands that read the daemon's session list: `list`, `status`,
-//! `kill`, `interrupt`, `send`, `reply` and `peek`. Each one starts the
-//! daemon if needed and fetches the list, and the pane commands then
-//! resolve their target in it, all before any tmux call.
+//! Legacy CLI commands still fetch ListSessions from a fake daemon.
+//! Send instead exercises the real method router and an injected tmux client;
+//! send and spawn also autostart a real private daemon with a stand-in tmux.
 //!
-//! Nothing here reaches a real atmd or tmux server: `atm` runs with a
-//! cleared environment whose `ATM_SOCKET`, `XDG_STATE_HOME` and
-//! `TMUX_TMPDIR` sit in the test's temp dir, and whose `PATH` holds no
-//! `atmd` and at most a stand-in `tmux` that only logs its arguments.
+//! Every CLI child has a cleared environment with private socket/state/tmux
+//! paths. No test reaches a real tmux server or launches a model harness.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 

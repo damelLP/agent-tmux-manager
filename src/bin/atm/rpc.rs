@@ -32,8 +32,9 @@ pub enum RpcError {
     Connection(String),
 }
 
-/// Connect, check capabilities, and issue exactly one request. U7 is the first
-/// command caller; legacy session commands deliberately keep their current path.
+/// Connect, check capabilities, and issue exactly one request. Send uses one
+/// call; spawn uses separate prepare/split/type calls so it can print between
+/// split and type. Other session commands retain their legacy exchange.
 pub async fn call(method: &str, params: Value, budget: Duration) -> Result<Value, RpcError> {
     let socket = atm_tui::client::resolve_socket_path();
     let from_pane = super::spawn::non_empty_env("TMUX_PANE");

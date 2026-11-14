@@ -1256,6 +1256,21 @@ fn activity_of_a_bound_or_observed_session_survives_pruning() {
 }
 
 #[test]
+fn session_rebind_keeps_paste_time_while_the_agent_holds_the_same_pane() {
+    let mut f = Fixture::new(0);
+    f.attempt(1_000);
+    paste(&mut f, EffectCertainty::Applied, 1_500);
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "s2".into(),
+        },
+        2_000,
+    );
+    assert_eq!(f.snapshot(2_000).live.last_paste_at, Some(at(1_500)));
+}
+
+#[test]
 fn paste_time_is_dropped_when_no_agent_holds_the_pane() {
     let mut f = Fixture::new(0);
     f.attempt(10_000);
@@ -1447,6 +1462,25 @@ fn zero_effect_attempt_discounts_the_evidence_latch_in_either_order() {
         );
         assert_eq!(f.step(12_000), DeliveryStep::Confirm { receipt });
     }
+}
+
+#[test]
+fn no_effect_discount_ends_when_the_next_attempt_is_armed() {
+    let mut f = Fixture::new(0);
+    let scope = f.attempt(1_000);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        1_000,
+    );
+    paste(&mut f, EffectCertainty::NotStarted, 1_000);
+    fail_for_retry(&mut f, 2_000);
+    second_attempt(&mut f, &scope, 40_000);
+    // No paste record for attempt 2 yet: attempt 1's NotStarted must not
+    // discount activity received after the new arm.
+    evidence_latch(&mut f, 40_500);
+    blocked(f.step(43_000), FailureReason::ProbablyDelivered);
 }
 
 #[test]
@@ -1736,6 +1770,44 @@ fn veto_sees_every_other_message_in_flight() {
 }
 
 #[test]
+fn first_evidence_copy_between_attempt_fold_and_arm_belongs_to_the_old_scope() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Idle), 0);
+    let scope = f.attempt(1_000);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        1_000,
+    );
+    paste(&mut f, EffectCertainty::NotStarted, 1_000);
+    fail_for_retry(&mut f, 2_000);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: f.id,
+            attempt: 2,
+            pane: "%1".into(),
+        },
+        40_000,
+    );
+    // No latch was set yet. Evidence still carries attempt 1's activity,
+    // despite attempt 2 having been folded into the durable history.
+    evidence_latch(&mut f, 40_000);
+    let mut new_scope = scope;
+    new_scope.attempt_seq = f.seq;
+    f.record(HistoryUpdate::Armed { scope: new_scope }, 40_000);
+    paste(&mut f, EffectCertainty::Applied, 40_000);
+    assert_eq!(
+        f.step(60_000),
+        DeliveryStep::RetryAt {
+            at: at(62_000),
+            reason: FailureReason::ConfirmationTimeout,
+        }
+    );
+    assert!(!f.snapshot(60_000).live.probably_landed);
+}
+
+#[test]
 fn stale_evidence_copy_before_the_new_arm_does_not_pin_the_old_latch() {
     let mut f = Fixture::new(0);
     let scope = f.attempt(0);
@@ -1766,6 +1838,28 @@ fn stale_evidence_copy_before_the_new_arm_does_not_pin_the_old_latch() {
     // A latch copied after the arm is the new attempt's.
     evidence_latch(&mut f, 6_000);
     assert!(f.snapshot(6_000).live.probably_landed);
+}
+
+#[test]
+fn applied_identity_change_preserves_the_readiness_hold() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    wait(f.consume(0), WaitReason::InputNotEmpty);
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "s2".into(),
+        },
+        60_000,
+    );
+    obs.session.as_mut().unwrap().id = "s2".into();
+    f.observe(obs, 60_000);
+    wait(f.consume(60_000), WaitReason::InputNotEmpty);
+    assert_eq!(f.snapshot(60_000).live.hold_since, Some(at(0)));
+    wait(f.step(119_999), WaitReason::InputNotEmpty);
+    blocked(f.step(120_000), FailureReason::DraftPresent);
 }
 
 #[test]
@@ -1888,6 +1982,54 @@ fn consume_of(f: &mut Fixture, id: MessageId, ms: i64) -> DeliveryStep {
 }
 
 #[test]
+fn attempted_follower_retries_without_stalling_the_unattempted_head() {
+    // A log from a writer that did not consume PasteNow can contain this
+    // ordering. The attempted follower owns the reservation, not the FIFO head.
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    let follower = MessageId::new(f.seq);
+    f.observe(observation(SessionStatus::Idle), 0);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: follower,
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        20_000,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: follower,
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        30_000,
+    );
+    for ms in [100_000, 1_000_000, 100_000_000] {
+        f.observe(observation(SessionStatus::Idle), ms);
+        wait(f.step(ms), WaitReason::OtherDelivery);
+        assert_eq!(f.snapshot(ms).blocked_by, Some(follower));
+        assert_eq!(
+            consume_of(&mut f, follower, ms),
+            DeliveryStep::PasteNow { attempt: 2 }
+        );
+        assert_eq!(
+            f.history.snapshot(follower, at(ms)).unwrap().blocked_by,
+            None
+        );
+    }
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: follower,
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        },
+        100_000_001,
+    );
+    assert_eq!(f.step(100_000_001), DeliveryStep::PasteNow { attempt: 1 });
+}
+
+#[test]
 fn two_unattempted_messages_are_pasted_in_fifo_order() {
     let mut f = Fixture::new(0);
     f.apply(OrgEvent::MessageSent(content(agent())), 0);
@@ -1973,6 +2115,95 @@ fn follower_behind_an_unattempted_head_does_not_time_out_while_it_waits() {
     );
     wait(step_of(&f, follower, 619_999), WaitReason::InputNotEmpty);
     blocked(step_of(&f, follower, 620_000), FailureReason::DraftPresent);
+}
+
+#[test]
+fn replayed_follower_budget_starts_at_promotion_even_without_consumed_waits() {
+    for consume_follower in [false, true] {
+        for status in [SessionStatus::Idle, SessionStatus::Working] {
+            for delivered in [false, true] {
+                // Both messages precede startup. Include an attempted head to
+                // exercise promotion by delivery as well as by final failure.
+                let mut f = Fixture::new(if delivered { 5 } else { 4 });
+                f.apply(OrgEvent::MessageSent(content(agent())), 0);
+                let follower = MessageId::new(f.seq);
+                if delivered {
+                    f.attempt(0);
+                }
+                let mut obs = observation(status);
+                obs.session.as_mut().unwrap().last_event_at = Some(at(-120_000));
+                obs.facts.input = InputState::Draft;
+                for ms in [0, 60_000, 120_000, 300_000] {
+                    f.observe(obs.clone(), ms);
+                    f.consume(ms);
+                    if consume_follower {
+                        wait(consume_of(&mut f, follower, ms), WaitReason::OtherDelivery);
+                    }
+                }
+                let event = if delivered {
+                    OrgEvent::MessageDelivered {
+                        message_id: f.id,
+                        session_id: "s1".into(),
+                        confirmation: "exact".into(),
+                    }
+                } else {
+                    OrgEvent::MessageDeliveryFailed {
+                        message_id: f.id,
+                        reason: "gave up".into(),
+                        final_failure: true,
+                    }
+                };
+                f.apply(event, 300_000);
+                f.observe(obs, 300_000);
+                wait(
+                    consume_of(&mut f, follower, 300_000),
+                    WaitReason::InputNotEmpty,
+                );
+                let live = f.history.snapshot(follower, at(300_000)).unwrap().live;
+                assert_eq!(live.hold_since, Some(at(300_000)));
+                let budget = if status == SessionStatus::Working {
+                    750
+                } else {
+                    120_000
+                };
+                wait(
+                    step_of(&f, follower, 300_000 + budget - 1),
+                    WaitReason::InputNotEmpty,
+                );
+                blocked(
+                    step_of(&f, follower, 300_000 + budget),
+                    FailureReason::DraftPresent,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn replayed_head_keeps_its_recovery_time_budget() {
+    for promoted_in_replay in [false, true] {
+        let mut f = Fixture::new(if promoted_in_replay { 5 } else { 4 });
+        f.apply(OrgEvent::MessageSent(content(agent())), -300_000);
+        if promoted_in_replay {
+            f.apply(
+                OrgEvent::MessageDeliveryFailed {
+                    message_id: f.id,
+                    reason: "gave up before restart".into(),
+                    final_failure: true,
+                },
+                -200_000,
+            );
+            f.id = MessageId::new(4);
+        }
+        let mut obs = observation(SessionStatus::Idle);
+        obs.facts.input = InputState::Draft;
+        f.observe(obs, 60_000);
+        // No consumed step: the current head still starts at recovery, not at
+        // its first live evaluation. Replay must not reset its clock either.
+        assert_eq!(f.snapshot(60_000).live.hold_since, Some(at(0)));
+        wait(f.step(119_999), WaitReason::InputNotEmpty);
+        blocked(f.step(120_000), FailureReason::DraftPresent);
+    }
 }
 
 #[test]

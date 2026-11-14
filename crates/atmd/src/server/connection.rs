@@ -2190,16 +2190,31 @@ mod tests {
 
     #[tokio::test]
     async fn message_evidence_wrong_original_pane_does_not_borrow_row_pane() {
+        // The attempted session's hook names another pane than its row and its
+        // scope (%7). The tap never repairs the event from the row, so it
+        // cannot confirm; it is still that session's reference, so it holds.
         let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
+        let other = arm_other_message(&evidence);
         let mut payload = captured_prompt(atm_core::Harness::Pi);
         payload["tmux_pane"] = serde_json::json!("%8");
         handler.handle_pi_event(payload).await.unwrap();
-        assert!(
-            !evidence
-                .snapshot("m123".parse().unwrap())
-                .unwrap()
-                .probably_landed
-        );
+        assert_held_without_receipt(&evidence);
+        // m200 is armed on %8 for another session: the pane alone is no claim.
+        assert_untouched(&evidence, other);
+    }
+
+    #[tokio::test]
+    async fn message_evidence_attempted_session_activity_on_another_pane_holds() {
+        // Synthetic: the shape atm-codex-adapter's crate docs record for
+        // codex-cli 0.163.0 ("Known gaps"): a second TUI's hooks carry the
+        // pane of the TUI that started the shared daemon. The session runs in
+        // %7 and every hook of it says %8.
+        let (mut handler, evidence) = evidence_handler(atm_core::Harness::Codex).await;
+        let mut payload = captured_prompt(atm_core::Harness::Codex);
+        payload["tmux_pane"] = serde_json::json!("%8");
+        payload["prompt"] = serde_json::json!("an ordinary prompt");
+        handler.handle_codex_event(payload).await.unwrap();
+        assert_held_without_receipt(&evidence);
     }
 
     #[tokio::test]
@@ -2567,6 +2582,7 @@ mod tests {
         payload["session_id"] = serde_json::json!("unrelated-session");
         payload["tmux_pane"] = serde_json::json!("%9");
         payload["pid"] = serde_json::json!(4_000_000_000_u32);
+        payload["payload"]["text"] = serde_json::json!("an unrelated prompt");
         assert!(matches!(
             handler.handle_pi_event(payload).await,
             Err(ConnectionError::RegistryError(_))
@@ -2581,7 +2597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_evidence_old_session_with_occupant_pid_credits_nothing() {
+    async fn message_evidence_old_session_with_occupant_pid_holds_but_never_confirms() {
         let (mut handler, evidence) = evidence_handler(atm_core::Harness::Pi).await;
         // The occupant's row, keyed by a pid no process has.
         let pid = 4_000_000_000_u32;
@@ -2607,8 +2623,9 @@ mod tests {
             evidence_row(&handler).await.first_prompt.as_deref(),
             Some("[m123] Read: atm inbox --id m123")
         );
-        // ...and the tap credited the occupant with nothing.
-        assert_untouched(&evidence, m123());
+        // ...and the tap credited the occupant with no receipt. The reference
+        // itself was submitted by someone, so its message is held.
+        assert_held_without_receipt(&evidence);
         handler
             .handle_pi_event(captured_prompt(atm_core::Harness::Pi))
             .await

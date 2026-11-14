@@ -84,7 +84,7 @@
 //!
 //! **An unguarded Enter after a paste is never safe for U8/U9b.** A prior capture
 //! is not authorization: a dialog or shell may replace the editor while a key
-//! waits in the actor queue. Both guarded forms re-capture and invoke the caller's
+//! waits in the actor queue. All guarded forms re-capture and invoke the caller's
 //! pure, quick predicate in the same actor turn as the effect. Use predicates,
 //! not whole-frame equality: harmless counters/spinners may change. This closes
 //! the actor-queue gap, not races with external harness redraws or tmux clients.
@@ -260,7 +260,8 @@ fn optional_pane(pane: &Option<PaneId>) -> &str {
     pane.as_ref().map_or("no pane", PaneId::as_str)
 }
 
-/// The entire nonliteral-key surface. Text belongs in [`Reservation::paste`].
+/// The entire nonliteral-key surface. Single literal characters use
+/// [`Reservation::literal_key_guarded`]; text belongs in [`Reservation::paste`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneKey {
     Enter,
@@ -679,6 +680,43 @@ impl Reservation {
         .await
     }
 
+    /// Send one printable ASCII character (space through `~`), never an Enter
+    /// or a paste. Other characters return InvalidRequest before dispatch.
+    ///
+    /// Same fresh capture, pacing, fence, tag, input-safety and pure predicate
+    /// contract as [`Self::keys_guarded`]. The consumer must authorize the
+    /// foreground process, focus and screen on that capture; this effect does
+    /// not infer dialog permission. There is deliberately no unguarded form.
+    ///
+    /// Uses one `send-keys -l -t <pane> -- <character>` command (tmux's command
+    /// parser requires escaping a semicolon). Success acknowledges tmux, not
+    /// the application. Errors may leave the outcome unknown; never retry
+    /// blindly. No automatic retry or additional key is sent.
+    pub async fn literal_key_guarded<P>(
+        &self,
+        pane: &PaneId,
+        expected: AgentId,
+        key: char,
+        format: CaptureFormat,
+        check: P,
+    ) -> Result<(), ReservationError>
+    where
+        P: FnOnce(&PaneCapture) -> bool + Send + 'static,
+    {
+        if !(key.is_ascii_graphic() || key == ' ') {
+            return Err(ReservationError::InvalidRequest {
+                reason: "literal key must be one printable ASCII character".into(),
+            });
+        }
+        self.effect(pane_ops::Action::Input {
+            pane: pane.clone(),
+            expected,
+            input: pane_ops::Input::LiteralKey(key),
+            guard: Some((format, Box::new(check))),
+        })
+        .await
+    }
+
     /// Re-capture, run a caller-supplied pure screen check, then paste literal
     /// text without a separate Enter key (see [`Self::paste`] for the pre-3.7
     /// multiline limit). Same actor-turn, predicate and failure contract as
@@ -892,3 +930,58 @@ mod tests;
 #[cfg(test)]
 #[path = "reservation_tests.rs"]
 mod ownership_tests;
+
+#[cfg(test)]
+mod literal_fence_tests {
+    use super::*;
+    use atm_tmux::MockTmuxClient;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn literal_key_guarded_cannot_use_another_actors_fence() {
+        let cancel = CancellationToken::new();
+        let mock = MockTmuxClient::new();
+        let spawn = || {
+            super::super::service::spawn_control(
+                Box::new(mock.clone()),
+                crate::registry::spawn_registry(),
+                crate::org::OrgHandle::disabled("literal fence test"),
+                cancel.clone(),
+            )
+        };
+        let (control, actor) = spawn();
+        let (foreign, other_actor) = spawn();
+        control
+            .run_reserved(
+                ReservationRequest::new(
+                    "project/lead".parse().unwrap(),
+                    Some(PaneId::parse("%0").unwrap()),
+                    ReservationKind::Up,
+                    WaitPolicy::Wait,
+                    Instant::now() + std::time::Duration::from_secs(60),
+                ),
+                move |mut r| async move {
+                    // Only unit tests can forge this cross-actor capability.
+                    r.control = foreign;
+                    let result = r
+                        .literal_key_guarded(
+                            &PaneId::parse("%0")?,
+                            r.agent().clone(),
+                            't',
+                            CaptureFormat::Plain,
+                            |_| panic!("foreign fence reached predicate"),
+                        )
+                        .await;
+                    assert!(matches!(result, Err(ReservationError::StaleReservation)));
+                    Ok::<_, ReservationError>(())
+                },
+                |_, _| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        assert!(mock.calls().is_empty());
+        cancel.cancel();
+        actor.await.unwrap();
+        other_actor.await.unwrap();
+    }
+}

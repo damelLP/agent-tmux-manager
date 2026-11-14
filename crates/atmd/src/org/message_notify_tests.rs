@@ -95,7 +95,9 @@ async fn only_new_owner_commits_queue_and_overflow_is_observable() {
     );
     let first = rx.recv().await.unwrap();
     assert_eq!(first.id, MessageId::new(7));
-    assert!(first.message.contains(&inbox_reference(first.id)));
+    assert!(first
+        .message
+        .contains(&format!("{} --for owner", inbox_reference(first.id))));
     assert!(!first.message.contains("private body"));
 }
 #[tokio::test]
@@ -515,7 +517,13 @@ async fn committed_message_reaches_existing_runner_as_one_literal_argument() {
     })
     .await
     .unwrap();
-    assert!(message.contains(&inbox_reference(MessageId::new(committed[0].seq))));
+    assert!(
+        message.contains(&format!(
+            "{} --for owner",
+            inbox_reference(MessageId::new(committed[0].seq))
+        )),
+        "{message}"
+    );
     assert!(!message.contains("private body"));
     assert_eq!(
         org.snapshot().await.unwrap().messages().count(),

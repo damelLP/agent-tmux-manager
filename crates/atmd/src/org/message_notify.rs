@@ -53,7 +53,11 @@ fn enqueue(
     let due = now.checked_add(delay).ok_or_else(|| {
         OrgServiceError::Unavailable("notification delay exceeds clock range".into())
     })?;
-    let message = format!("{id} from {}: {}", content.from, inbox_reference(id));
+    let message = format!(
+        "{id} from {}: {} --for owner",
+        content.from,
+        inbox_reference(id)
+    );
     match tx.try_send(Pending { id, due, message }) {
         Ok(()) => Ok(Admission::Queued),
         Err(mpsc::error::TrySendError::Full(_)) => Ok(Admission::Overflow),

@@ -155,6 +155,10 @@ async fn resync(
     now: DateTime<Utc>,
 ) {
     let views = registry.get_all_sessions().await;
+    if !registry.is_connected() {
+        // The handle returns an empty list on actor loss, not a valid snapshot.
+        return;
+    }
     let present: HashSet<_> = views.iter().map(|v| v.id.clone()).collect();
     for view in views {
         update(entries, recovered, &view);

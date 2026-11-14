@@ -204,6 +204,59 @@ async fn full_actor_queue_keeps_dirty_summary_for_retry() {
     actor.await.unwrap();
 }
 
+async fn next_summary(watch: &mut crate::org::EventWatch) -> SessionSummary {
+    let record = tokio::time::timeout(Duration::from_secs(60), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match atm_org::OrgEvent::from_parts(&record.kind, &record.body)
+        .unwrap()
+        .unwrap()
+    {
+        atm_org::OrgEvent::SessionSummary(summary) => summary,
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn registry_death_does_not_invent_session_end_on_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let org_cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+    let registry_cancel = CancellationToken::new();
+    let (registry, tasks) = crate::registry::spawn_registry_with_cancel(registry_cancel.clone());
+    let observer = SummaryObserver::spawn(registry.clone(), org.clone());
+    let mut watch = org.watch(vec!["session".into()], 0).unwrap();
+    registry
+        .register(SessionDomain::new(
+            SessionId::new("live"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        ))
+        .await
+        .unwrap();
+    assert!(next_summary(&mut watch).await.ended.is_none());
+    registry_cancel.cancel();
+    tasks.actor.await.unwrap();
+    for task in tasks.maintenance {
+        task.await.unwrap();
+    }
+    assert!(!registry.is_connected());
+    observer.finish().await;
+    assert!(
+        org.snapshot()
+            .await
+            .unwrap()
+            .session_summary(&SessionId::new("live"))
+            .unwrap()
+            .ended
+            .is_none(),
+        "registry death is not an empty live registry"
+    );
+    org_cancel.cancel();
+}
+
 #[tokio::test]
 async fn observer_lag_resync_and_shutdown_flush_exact_cost_without_disabling_org() {
     let dir = tempfile::tempdir().unwrap();

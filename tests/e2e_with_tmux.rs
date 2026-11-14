@@ -309,11 +309,20 @@ impl Drop for PrivateTmux {
             return;
         };
         let Some((socket, pid)) = identity.trim().split_once('\t') else {
-            panic!("missing tmux identity");
+            eprintln!(
+                "skipping tmux cleanup: missing identity for {}",
+                self.socket_label
+            );
+            return;
         };
-        let private_root = std::env::var_os("TMUX_TMPDIR").expect("sealed TMUX_TMPDIR required");
-        assert!(Path::new(socket).starts_with(private_root));
-        assert!(pid.parse::<u32>().is_ok());
+        let private_root = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+        if !Path::new(socket).starts_with(private_root)
+            || Path::new(socket).file_name() != Some(self.socket_label.as_ref())
+            || !matches!(pid.parse::<u32>(), Ok(pid) if pid > 1)
+        {
+            eprintln!("skipping tmux cleanup: unexpected identity {identity:?}");
+            return;
+        }
         let _ = Command::new("tmux")
             .args(["-S", socket, "kill-server"])
             .stdout(Stdio::null())

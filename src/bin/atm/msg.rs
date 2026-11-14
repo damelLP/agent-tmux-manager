@@ -163,9 +163,9 @@ async fn recipient(to: &str, root: Option<PathBuf>) -> Result<Address> {
 fn escaped(text: &str, multiline: bool) -> String {
     text.chars()
         .flat_map(|c| {
-            if c == '\\' {
+            if c == '\\' && !multiline {
                 "\\\\".chars().collect::<Vec<_>>()
-            } else if c.is_control() && !(multiline && c == '\n') {
+            } else if c.is_control() && !(multiline && matches!(c, '\n' | '\t')) {
                 c.escape_debug().collect()
             } else {
                 vec![c]

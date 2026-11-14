@@ -179,6 +179,28 @@ async fn send_preserves_multiline_body_and_literal_attachments_and_all_six_kinds
     }
 }
 
+fn inbox_entry(body: &str) -> Value {
+    json!({"message_id":"m3","content":{"from":"p/lead","to":"owner","kind":"report","body":body,"attachments":[],"task":null},"sent_at":"2026-11-14T00:00:00Z","status":"delivered","read_at":null,"delivery":{"phase":"delivered","reason":null,"attempt":1,"pane":"%7","session_id":null,"confirmation":null,"retry_at":null,"blocked_by":null}})
+}
+
+#[tokio::test]
+async fn inbox_text_preserves_code_backslashes_newlines_and_tabs() {
+    let body = "printf 'a\\nb'\nregex \\d+\nC:\\path\n\tindented\n";
+    let out = run(
+        &["inbox"],
+        None,
+        vec![ok(
+            "msg.inbox",
+            inbox(),
+            json!({"messages":[inbox_entry(body)],"unread_count":1,"next_after":null}),
+        )],
+        true,
+    )
+    .await;
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(body), "{text}");
+}
+
 #[tokio::test]
 async fn inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls() {
     let body = "one\n\n雪\t\r\u{1b}[2J\u{7}\u{7f}\u{85}";
@@ -209,7 +231,7 @@ async fn inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls() {
         } else {
             let text = String::from_utf8(out.stdout).unwrap();
             assert!(
-                text.contains("one\n\n雪\\t\\r\\u{1b}[2J\\u{7}\\u{7f}\\u{85}"),
+                text.contains("one\n\n雪\t\\r\\u{1b}[2J\\u{7}\\u{7f}\\u{85}"),
                 "{text}"
             );
             for s in [
@@ -224,7 +246,9 @@ async fn inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls() {
             ] {
                 assert!(text.contains(s), "{text}");
             }
-            assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+            assert!(!text
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\t')));
         }
     }
     let mut params = inbox();

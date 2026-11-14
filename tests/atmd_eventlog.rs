@@ -161,6 +161,8 @@ fn info_resolves_relative_state_dir_before_foreground_or_daemonized_start() {
         let info = daemon.info();
         let expected = daemon.dir.path().join("relative-state");
         assert_eq!(info["result"]["state_dir"], json!(expected));
+        assert!(expected.join("log/events/00000001.jsonl").is_file());
+        assert!(expected.join("log/raw/00000001.jsonl").is_file());
         // Event-log state must not move the established PID/log locations.
         assert!(daemon.pid_file().exists());
         if daemonized {

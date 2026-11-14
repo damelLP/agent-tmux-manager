@@ -354,6 +354,15 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     let (registry, registry_tasks) = spawn_registry_with_cancel(registry_cancel.clone());
     info!("Session registry started");
 
+    // These locks/writers are opened only after daemonization. Independent
+    // detached startup means one broken stream cannot disable the other.
+    let org_cancel = CancellationToken::new();
+    let (org, raw) = tokio::join!(
+        atmd::org::OrgHandle::open(state_dir.clone(), org_cancel.clone()),
+        atmd::org::RawHandle::open(state_dir.clone()),
+    );
+    let summaries = atmd::org::SummaryObserver::spawn(registry.clone(), org.clone());
+
     // Subscribed before discovery, so the notifier sees every session.
     let _notify_handle = notify_config().await.map(|config| {
         // Only the program: the arguments may hold a webhook URL or topic.
@@ -387,6 +396,8 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
 
     let mut services = MethodServices::new(registry);
     services.state_dir = state_dir;
+    services.org = org;
+    services.raw = raw.clone();
     let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
@@ -396,7 +407,13 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     let (server_result, registry_result) = tokio::join!(
         async {
             let result = server.run().await;
-            // Connections have drained (or the server failed to start)
+            // Connections drained: preserve exact last live cost before
+            // cancelling either actor. Flush failures never hold shutdown.
+            let (_, raw_result) = tokio::join!(summaries.finish(), raw.flush());
+            if let Err(error) = raw_result {
+                warn!(%error, "Raw capture flush incomplete");
+            }
+            org_cancel.cancel();
             registry_cancel.cancel();
             result
         },

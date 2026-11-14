@@ -52,6 +52,7 @@ fn atm(exe: &Path, dir: &Path, args: &[&str]) -> Output {
             .env("HOME", dir)
             .env("ATM_SOCKET", dir.join("atmd.sock"))
             .env("XDG_STATE_HOME", dir.join("state"))
+            .env("ATM_STATE_DIR", dir.join("eventlog"))
             .env("TMUX_TMPDIR", dir)
             .output();
         match run {

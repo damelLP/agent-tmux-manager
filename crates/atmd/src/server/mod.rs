@@ -237,6 +237,7 @@ impl DaemonServer {
         let registry = self.registry.clone();
         let subscribers = Arc::clone(&self.subscribers);
         let cancel = self.cancel_token.child_token();
+        let raw = self.method_services.raw.clone();
 
         connections.spawn(async move {
             let handler = ConnectionHandler::new(
@@ -247,7 +248,8 @@ impl DaemonServer {
                 connection_number,
                 cancel,
                 methods,
-            );
+            )
+            .with_raw(raw);
 
             // Run the handler and get the client_id when done
             let client_id = handler.run().await;

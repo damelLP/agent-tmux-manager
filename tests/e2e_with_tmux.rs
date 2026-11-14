@@ -341,6 +341,7 @@ impl Daemon {
             .arg("start")
             .env("ATM_SOCKET", &socket_path)
             .env("XDG_STATE_HOME", &state_dir)
+            .env("ATM_STATE_DIR", state_dir.join("eventlog"))
             // atmd reads `[notify]` from atm's config.toml: never the developer's.
             .env("XDG_CONFIG_HOME", state_dir.join("config"))
             .env("ATM_TMUX_SOCKET", tmux_label)

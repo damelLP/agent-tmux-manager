@@ -25,6 +25,10 @@ pub struct MethodServices {
     /// Production resolves this before daemonization; tests can inject a path.
     /// daemon.info displays non-UTF-8 paths lossily; filesystem use stays exact.
     pub state_dir: PathBuf,
+    /// Sole durable organisation writer; U7 submits control audit commands here.
+    pub org: crate::org::OrgHandle,
+    /// Nonblocking pre-translation capture; disabled for legacy library callers.
+    pub raw: crate::org::RawHandle,
 }
 
 impl MethodServices {
@@ -32,6 +36,8 @@ impl MethodServices {
         Self {
             registry,
             state_dir: crate::eventlog::state_dir(),
+            org: crate::org::OrgHandle::disabled("organisation service not configured"),
+            raw: crate::org::RawHandle::default(),
         }
     }
 }

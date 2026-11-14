@@ -67,6 +67,21 @@ where
     F: FnMut(Envelope) -> Fut,
     Fut: Future<Output = Result<u64, EventLogError>>,
 {
+    // Bind against current actor state, not the observer's startup snapshot.
+    let bound;
+    let command = if let OrgCommand::RecordSummary(summary) = command {
+        let mut summary = summary.clone();
+        summary.agent_id = summary
+            .pane
+            .as_deref()
+            .and_then(|pane| state.agent_for_pane(pane))
+            .map(|agent| agent.id.clone())
+            .or(summary.agent_id);
+        bound = OrgCommand::RecordSummary(summary);
+        &bound
+    } else {
+        command
+    };
     let events = state.decide(command, now)?;
     let mut committed = Vec::with_capacity(events.len());
     for event in events {

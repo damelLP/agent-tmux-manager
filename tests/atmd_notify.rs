@@ -47,6 +47,7 @@ impl Daemon {
             .env("ATM_SOCKET", &socket)
             .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("XDG_STATE_HOME", dir.join("state"))
+            .env("ATM_STATE_DIR", dir.join("eventlog"))
             .env("HOME", dir.join("home"))
             .env("TMUX_TMPDIR", dir.join("tmux"))
             .env("RUST_LOG", "atmd=debug")

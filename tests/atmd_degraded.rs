@@ -19,6 +19,7 @@ fn atmd(dir: &Path) -> Command {
     cmd.arg("start")
         .env("ATM_SOCKET", dir.join("atmd.sock"))
         .env("XDG_STATE_HOME", dir.join("state"))
+        .env("ATM_STATE_DIR", dir.join("eventlog"))
         // atmd reads `[notify]` from atm's config.toml: never the developer's.
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("TMUX_TMPDIR", dir)

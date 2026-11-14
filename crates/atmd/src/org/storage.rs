@@ -43,23 +43,23 @@ pub(super) async fn open(state_dir: PathBuf) -> Result<Ready, String> {
     .await
 }
 
-async fn detached_open<T: Send + 'static>(
+pub(super) async fn detached_open<T: Send + 'static>(
     deadline: Duration,
     open: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let (send, receive) = oneshot::channel();
     std::thread::Builder::new()
-        .name("atmd-org-open".into())
+        .name("atmd-log-open".into())
         .spawn(move || {
             // If the deadline expired, dropping the late result releases all
             // its handles. No late transition from disabled to enabled.
             let _ = send.send(open());
         })
-        .map_err(|e| format!("cannot start events open: {e}"))?;
+        .map_err(|e| format!("cannot start log open: {e}"))?;
     tokio::time::timeout(deadline, receive)
         .await
-        .map_err(|_| "events open/replay timed out; restart to recover".to_string())?
-        .map_err(|_| "events open/replay worker stopped".to_string())?
+        .map_err(|_| "log open/replay timed out; restart to recover".to_string())?
+        .map_err(|_| "log open/replay worker stopped".to_string())?
 }
 
 #[cfg(test)]

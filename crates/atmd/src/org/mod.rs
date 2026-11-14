@@ -12,7 +12,12 @@
 //! its filesystem worker may still hold the stream lock. Restart to recover.
 
 mod actor;
+mod raw;
 mod storage;
+mod summary;
+
+pub use raw::RawHandle;
+pub use summary::SummaryObserver;
 
 use std::{path::PathBuf, time::Duration};
 

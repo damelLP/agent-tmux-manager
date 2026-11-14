@@ -143,6 +143,7 @@ pub struct ConnectionHandler {
     forwarder: Option<Forwarder>,
 
     methods: Arc<MethodRouter>,
+    raw: crate::org::RawHandle,
 }
 
 impl ConnectionHandler {
@@ -180,7 +181,13 @@ impl ConnectionHandler {
             peer_failed: CancellationToken::new(),
             forwarder: None,
             methods,
+            raw: crate::org::RawHandle::default(),
         }
+    }
+
+    pub fn with_raw(mut self, raw: crate::org::RawHandle) -> Self {
+        self.raw = raw;
+        self
     }
 
     /// Returns a clone of the writer for event broadcasting.
@@ -477,18 +484,29 @@ impl ConnectionHandler {
             MessageType::Unwatch => {}
 
             MessageType::StatusUpdate { data } => {
+                self.raw
+                    .capture(chrono::Utc::now(), "status_update", data.clone());
                 self.handle_status_update(data).await?;
             }
 
             MessageType::HookEvent { data } => {
+                self.raw
+                    .capture(chrono::Utc::now(), "hook_event", data.clone());
                 self.handle_hook_event(data).await?;
             }
 
             MessageType::PiEvent { data } => {
+                self.raw.capture(
+                    chrono::Utc::now(),
+                    "pi_event",
+                    atm_pi_adapter::wire::raw_log_body(&data),
+                );
                 self.handle_pi_event(data).await?;
             }
 
             MessageType::CodexEvent { data } => {
+                self.raw
+                    .capture(chrono::Utc::now(), "codex_event", data.clone());
                 self.handle_codex_event(data).await?;
             }
 

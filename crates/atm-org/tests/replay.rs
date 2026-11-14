@@ -105,6 +105,8 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::ControlSpawned(_) => 16,
         OrgEvent::ControlKilled(_) => 17,
         OrgEvent::AgentEditorReady { .. } => 18,
+        // New histories are covered in revalidation.rs; retain legacy generators.
+        OrgEvent::AgentRevalidationRequested { .. } => 19,
     }
 }
 
@@ -215,6 +217,8 @@ fn command_slot(command: &OrgCommand) -> usize {
         OrgCommand::ControlSpawned(_) => 17,
         OrgCommand::ControlKilled(_) => 18,
         OrgCommand::EditorReady { .. } => 19,
+        // Revalidation permits bound Starting; old-history assertions stay intact.
+        OrgCommand::Revalidate { .. } => 20,
     }
 }
 

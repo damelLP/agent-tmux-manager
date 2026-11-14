@@ -253,6 +253,7 @@ impl OrgState {
             }
             OrgEvent::AgentSessionLost { agent_id }
             | OrgEvent::AgentEditorReady { agent_id }
+            | OrgEvent::AgentRevalidationRequested { agent_id }
             | OrgEvent::AgentClearRequested { agent_id }
             | OrgEvent::AgentStuck { agent_id, .. }
             | OrgEvent::AgentDown { agent_id, .. } => {
@@ -367,6 +368,10 @@ impl OrgState {
             }
             OrgEvent::AgentEditorReady { agent_id } => {
                 self.agent_mut(agent_id)?.transition(AgentStatus::Ready, ts);
+            }
+            OrgEvent::AgentRevalidationRequested { agent_id } => {
+                self.agent_mut(agent_id)?
+                    .transition(AgentStatus::Starting, ts);
             }
             OrgEvent::AgentSessionLost { agent_id }
             | OrgEvent::AgentClearRequested { agent_id } => {

@@ -454,6 +454,147 @@ fn pure_builder_keeps_required_and_role_args_under_binary_overrides() {
     }
 }
 
+// Matching tokens in any typed input belong to the required block, not to
+// defaults or role args. Unrelated repeated flags/values must keep their order.
+#[test]
+fn pure_builder_normalizes_required_tokens_across_typed_inputs() {
+    for (defaults, extra, required) in [
+        (
+            vec!["--no-daemon", "--no-daemon"],
+            vec![],
+            vec!["--no-daemon"],
+        ),
+        (
+            vec![],
+            vec!["--no-daemon", "--no-daemon"],
+            vec!["--no-daemon"],
+        ),
+        (vec![], vec![], vec!["--no-daemon", "--no-daemon"]),
+        (
+            vec!["--no-daemon", "--no-daemon"],
+            vec!["--no-daemon", "--no-daemon"],
+            vec!["--no-daemon", "--no-daemon"],
+        ),
+    ] {
+        let defaults: Vec<String> = ["--tag", "same", "--tag", "same"]
+            .into_iter()
+            .chain(defaults)
+            .map(String::from)
+            .collect();
+        let extra: Vec<String> = [
+            "--label=--no-daemon",
+            "--profile",
+            "same",
+            "--profile",
+            "same",
+        ]
+        .into_iter()
+        .chain(extra)
+        .map(String::from)
+        .collect();
+        for (bin, expected) in [
+            (
+                None,
+                "codex '--tag' 'same' '--tag' 'same' '--no-daemon' '--label=--no-daemon' '--profile' 'same' '--profile' 'same' -m 'role model'",
+            ),
+            (
+                Some("/my stand-in"),
+                "'/my stand-in' '--no-daemon' '--label=--no-daemon' '--profile' 'same' '--profile' 'same' -m 'role model'",
+            ),
+        ] {
+            assert_eq!(
+                build_spawn_command(
+                    "codex", &defaults, Some("-m"), None, Some("role model"),
+                    bin, None, &extra, &required,
+                ),
+                expected,
+                "defaults={defaults:?}, extra={extra:?}, required={required:?}, bin={bin:?}"
+            );
+        }
+    }
+}
+
+// Requirements are generic tokens: preserve first-seen policy order, not a
+// sorted/set order, even when defaults or extras list them in another order.
+#[test]
+fn pure_builder_preserves_unique_required_token_order() {
+    assert_eq!(
+        build_spawn_command(
+            "agent",
+            &["--alpha".into(), "--zeta".into()],
+            None,
+            None,
+            None,
+            None,
+            Some("wrapper-prefix"),
+            &["--alpha".into(), "--zeta".into(), "tail".into()],
+            &["--zeta", "--alpha", "--zeta", "--alpha"],
+        ),
+        "agent wrapper-prefix '--zeta' '--alpha' 'tail'"
+    );
+}
+
+// The bounded contract reserves exact tokens, even in apparent value positions;
+// interpreting a preceding option here would invent a vendor argument grammar.
+#[test]
+fn pure_builder_reserves_required_tokens_without_parsing_option_values() {
+    assert_eq!(
+        build_spawn_command(
+            "codex",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &["--label".into(), "--no-daemon".into()],
+            &["--no-daemon"],
+        ),
+        "codex '--no-daemon' '--label'"
+    );
+}
+
+// Raw ARGS is caller-owned shell syntax. Parsing, deduplicating, rejecting or
+// escaping it would break this contract, even if it neutralizes a requirement.
+#[test]
+fn pure_builder_preserves_raw_shell_args_with_required_tokens() {
+    for (raw, expected) in [
+        ("x codex", "mise x codex '--no-daemon'"),
+        (
+            "x codex --no-daemon",
+            "mise x codex --no-daemon '--no-daemon'",
+        ),
+        (
+            "  x codex '--no-daemon'  ",
+            "mise x codex '--no-daemon' '--no-daemon'",
+        ),
+        (
+            "x\tcodex $FLAGS; next",
+            "mise x\tcodex $FLAGS; next '--no-daemon'",
+        ),
+        (
+            "x codex # caller comment",
+            "mise x codex # caller comment '--no-daemon'",
+        ),
+    ] {
+        assert_eq!(
+            build_spawn_command(
+                "codex",
+                &[],
+                None,
+                None,
+                None,
+                Some("mise"),
+                Some(raw),
+                &[],
+                &["--no-daemon"],
+            ),
+            expected,
+            "raw={raw:?}"
+        );
+    }
+}
+
 #[test]
 fn launch_policy_requirements_reach_the_shared_builder() {
     use atm_core::Harness;

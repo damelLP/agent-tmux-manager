@@ -66,7 +66,10 @@ fn shell_word(s: &str) -> String {
 /// config. Callers resolve empty-as-unset and harness/global precedence.
 /// A binary override replaces ordinary defaults, never required or extra args.
 /// Raw shell args (trimmed) precede quoted required and role/extra arguments;
-/// the model follows them. Cwd is shell-quoted.
+/// the model follows them. Cwd is shell-quoted. Exact required-token matches
+/// in defaults/extra args are emitted once in the required block, in first-seen
+/// policy order. This is token normalization, not option/value parsing; raw
+/// shell args are caller-owned and are never parsed, deduplicated or validated.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // Resolved fields avoid duplicating a harness type.
 pub fn build_spawn_command(
@@ -84,7 +87,10 @@ pub fn build_spawn_command(
     let mut cmd = shell_word(base);
 
     if bin_override.is_none() {
-        for arg in default_args {
+        for arg in default_args
+            .iter()
+            .filter(|arg| !required_args.contains(&arg.as_str()))
+        {
             cmd.push(' ');
             cmd.push_str(&shell_quote(arg));
         }
@@ -95,10 +101,17 @@ pub fn build_spawn_command(
         cmd.push_str(args.trim());
     }
 
+    let mut seen = std::collections::HashSet::new();
     for arg in required_args
         .iter()
         .copied()
-        .chain(extra_args.iter().map(String::as_str))
+        .filter(|arg| seen.insert(*arg))
+        .chain(
+            extra_args
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !required_args.contains(arg)),
+        )
     {
         cmd.push(' ');
         cmd.push_str(&shell_quote(arg));

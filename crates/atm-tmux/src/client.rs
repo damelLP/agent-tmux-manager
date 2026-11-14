@@ -186,6 +186,7 @@ impl TmuxClient for RealTmuxClient {
         direction: PaneDirection,
         command: Option<&str>,
         cwd: Option<&str>,
+        detached: bool,
     ) -> Result<String, TmuxError> {
         let (axis_flag, before) = match direction {
             PaneDirection::Left => ("-h", true),
@@ -205,6 +206,9 @@ impl TmuxClient for RealTmuxClient {
         ];
         if before {
             args.push("-b");
+        }
+        if detached {
+            args.push("-d");
         }
         if let Some(cwd) = cwd {
             args.extend(["-c", cwd]);

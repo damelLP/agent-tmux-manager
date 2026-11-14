@@ -252,6 +252,23 @@ async fn spawn_split_hint_only_identifies_a_missing_implicit_caller() {
 }
 
 #[tokio::test]
+async fn detached_split_is_opt_in_and_does_not_change_legacy_context_wire_shape() {
+    let client = MockTmuxClient::new();
+    let context = super::SpawnContext::new("%7".into(), Some("/work".into()), false);
+    let detached = context.clone().with_detached(true);
+    assert_eq!(
+        serde_json::to_value(&context).unwrap(),
+        serde_json::to_value(&detached).unwrap()
+    );
+    split_spawn(&client, &detached, PaneDirection::Right, "30%")
+        .await
+        .unwrap();
+    assert!(
+        matches!(client.calls().as_slice(), [MockCall::SplitWindow { target, cwd: Some(cwd), detached: true, .. }] if target == "%7" && cwd == "/work")
+    );
+}
+
+#[tokio::test]
 async fn split_returns_the_pane_before_typing_then_command_and_enter_are_separate() {
     let client = MockTmuxClient::new();
     let context = prepare_spawn(&client, None, Some("%7"), None, None)
@@ -271,6 +288,7 @@ async fn split_returns_the_pane_before_typing_then_command_and_enter_are_separat
             direction: PaneDirection::Left,
             command: None,
             cwd: None,
+            detached: false,
         }]
     );
     client.clear_calls();

@@ -588,6 +588,34 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
         .raw_command("new-session", &["-d", "-s", "linked", "-t", "private"])
         .await
         .unwrap();
+    let socket = client
+        .raw_command("display-message", &["-p", "#{socket_path}"])
+        .await
+        .unwrap();
+    let mut attached = tokio::process::Command::new("tmux")
+        .args(["-S", socket.trim(), "-C", "attach-session", "-t", "private"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while client
+            .raw_command("list-clients", &["-F", "#{client_flags}"])
+            .await
+            .unwrap()
+            .is_empty()
+        {}
+    })
+    .await
+    .unwrap();
+    let baseline = control
+        .observe(&PaneId::parse("%0").unwrap(), CaptureFormat::Plain)
+        .await
+        .unwrap();
+    assert!(baseline.inspection.pane.is_active);
+    assert_eq!(baseline.focused, Some(true));
     let observer = control.clone();
     let verifier = client.clone();
     let private_root = root.clone();
@@ -605,11 +633,17 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
                 assert!(r.inspect(&placement).await?.is_some());
                 let pane = r
                     .split(
-                        SpawnContext::new("%0".into(), None, false),
+                        SpawnContext::new("%0".into(), None, false).with_detached(true),
                         PaneDirection::Below,
                         "50%".into(),
                     )
                     .await?;
+                let after = observer.observe(&placement, CaptureFormat::Plain).await?;
+                assert!(
+                    after.inspection.pane.is_active,
+                    "detached split moved keyboard selection"
+                );
+                assert_eq!(after.focused, baseline.focused);
                 r.tag(&pane, ExpectedTag::Absent).await?;
                 assert_eq!(
                     r.inspect(&pane).await?.unwrap().local_agent_tag.as_deref(),
@@ -684,6 +718,11 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
     actor.await.unwrap();
     verify_private(&client, &root).await;
     client.raw_command("kill-server", &[]).await.unwrap();
+    drop(attached.stdin.take());
+    tokio::time::timeout(Duration::from_secs(30), attached.wait())
+        .await
+        .unwrap()
+        .unwrap();
     result.unwrap();
     let records = org.tail(atmd::org::TailParams::default()).await.unwrap();
     assert_eq!(records.len(), 1);

@@ -84,7 +84,7 @@ impl TmuxClient for DelayedClient {
             result
         })
     }
-    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>) -> String);
+    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
     forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
     forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
     forward!(kill_pane<'a>(pane: &'a str) -> ());

@@ -11,6 +11,9 @@ pub struct SpawnContext {
     pub target_pane: String,
     pub cwd: Option<String>,
     caller_pane_missing: bool,
+    // Rust lifecycle policy only; legacy RPC contexts retain their wire shape.
+    #[serde(skip)]
+    detached: bool,
 }
 
 impl SpawnContext {
@@ -20,7 +23,15 @@ impl SpawnContext {
             target_pane,
             cwd,
             caller_pane_missing,
+            detached: false,
         }
+    }
+
+    /// Keep keyboard selection on the existing pane. Defaults to false.
+    #[must_use]
+    pub fn with_detached(mut self, detached: bool) -> Self {
+        self.detached = detached;
+        self
     }
 
     #[must_use]
@@ -70,6 +81,7 @@ pub async fn prepare_spawn(
         caller_pane_missing: target_pane.is_none()
             && caller_pane.is_some()
             && !panes.iter().any(|p| p.pane_id == current_pane),
+        detached: false,
     })
 }
 
@@ -88,6 +100,7 @@ pub async fn split_spawn(
             direction,
             None,
             context.cwd.as_deref(),
+            context.detached,
         )
         .await
         .map_err(|source| ControlError::Tmux {

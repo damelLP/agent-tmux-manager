@@ -19,7 +19,6 @@
 //! ```
 
 use std::fs::{self, OpenOptions};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -268,21 +267,8 @@ enum ListFormat {
 // Logging Setup
 // ============================================================================
 
-fn get_log_dir() -> Option<PathBuf> {
-    if let Some(xdg_state) = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        return Some(PathBuf::from(xdg_state).join("atm"));
-    }
-    std::env::var("HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|home| PathBuf::from(home).join(".local/state/atm"))
-}
-
 fn create_log_file() -> Option<std::fs::File> {
-    let log_dir = get_log_dir()?;
+    let log_dir = atmd::eventlog::state_dir()?;
 
     if let Err(e) = fs::create_dir_all(&log_dir) {
         eprintln!("Warning: Failed to create log directory {log_dir:?}: {e}");

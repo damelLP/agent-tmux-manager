@@ -10,7 +10,7 @@ use atm_core::SessionView;
 use atm_protocol::{ClientMessage, DaemonMessage};
 use atm_tmux::{RealTmuxClient, TmuxClient};
 use atm_tui::{daemon, role};
-use atmd::control::{self, resolve_pane_id};
+use atmd::control::resolve_pane_id;
 
 use super::{spawn::non_empty_env, ListFormat};
 
@@ -159,15 +159,6 @@ pub(super) async fn cmd_send(target: String, text: String) -> Result<()> {
         .and_then(serde_json::Value::as_str)
         .context("Invalid session.send response: missing pane")?;
     println!("Sent to {pane} by tmux paste");
-    Ok(())
-}
-
-// Removed separately once daemon-path acceptance tests pass.
-#[allow(dead_code)]
-async fn direct_send(target: String, text: String) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    let pane_id = control::send(&RealTmuxClient::new(), &sessions, &target, &text).await?;
-    println!("Sent to {pane_id} by tmux paste");
     Ok(())
 }
 

@@ -920,6 +920,8 @@ async fn scenario_paste_text_and_atm_send(env: &E2eEnv) {
     let atm_send = |pane: &str, text: &str| {
         Command::new(&env.atm_path)
             .args(["send", pane, text])
+            // No tmux on CLI PATH: only the running daemon can control panes.
+            .env("PATH", env._shim_dir_guard.path())
             .env("ATM_SOCKET", &env.daemon.socket_path)
             .env("XDG_STATE_HOME", &env.daemon.state_dir)
             .env("ATM_TMUX_SOCKET", label)
@@ -999,6 +1001,7 @@ async fn scenario_atm_spawn(env: &E2eEnv) {
         .clone();
 
     let spawn_output = Command::new(&env.atm_path)
+        .env("PATH", env._shim_dir_guard.path())
         .args([
             "spawn",
             "--target-pane",
@@ -1193,6 +1196,7 @@ async fn scenario_atm_spawn_defaults_to_tmux_pane(env: &E2eEnv, probe_pane: &str
 
     let out = Command::new(&env.atm_path)
         .args(["spawn", "--direction", "below", "--size", "1"])
+        .env("PATH", env._shim_dir_guard.path())
         .env("TMUX", "atm-e2e-fixture-no-real-tmux-here")
         .env("TMUX_PANE", probe_pane)
         .env("ATM_TMUX_SOCKET", env.tmux_server.label())

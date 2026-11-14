@@ -12,7 +12,6 @@ use atm_core::{
     builtin_harnesses, default_harness_definition, find_harness_definition, HarnessDefinition,
     PromptMode,
 };
-use atm_tmux::RealTmuxClient;
 use atm_tui::setup;
 use atm_tui::tmux;
 use atmd::control;
@@ -331,83 +330,6 @@ pub(super) async fn cmd_spawn(
     )
     .await?;
     printed.context("Failed to print the new pane's id")?;
-    Ok(())
-}
-
-// Removed separately once daemon-path acceptance tests pass.
-#[allow(dead_code, clippy::too_many_arguments)]
-async fn direct_spawn(
-    harness_id: Option<String>,
-    model: Option<String>,
-    worktree: Option<String>,
-    direction: SpawnDirection,
-    size: String,
-    target_pane: Option<String>,
-    format: SpawnFormat,
-    prompt: Option<String>,
-) -> Result<()> {
-    let harness = resolve_spawn_harness(harness_id.as_deref())?;
-    if model.is_some() && harness.model_flag.is_none() {
-        bail!("harness '{}' does not support --model yet", harness.id);
-    }
-    let prompt = prompt
-        .map(|text| prompt_words(&harness, &text))
-        .transpose()?;
-
-    if !tmux::is_in_tmux() {
-        bail!("atm spawn requires running inside tmux");
-    }
-
-    let client = RealTmuxClient::new();
-
-    // Get current pane to split from.
-    // Prefer --target-pane (passed by tmux keybindings via #{pane_id}), then
-    // $TMUX_PANE, the pane atm runs in. A tmux run-shell job has no
-    // $TMUX_PANE, or one leaked from tmux's global environment (tmux 3.8),
-    // which is why the keybindings pass -t. Fall back to the is_active
-    // heuristic only when neither is set.
-    let caller_pane = non_empty_env("TMUX_PANE");
-    let fallback_cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    let context = control::prepare_spawn(
-        &client,
-        worktree.as_deref(),
-        target_pane.as_deref(),
-        caller_pane.as_deref(),
-        fallback_cwd.as_deref(),
-    )
-    .await?;
-    let cwd = &context.cwd;
-
-    let mut agent_cmd = build_spawn_command_for_harness(&harness, cwd.as_deref(), model.as_deref());
-    // Last, after ATM_SPAWN_*_ARGS and --model.
-    if let Some(words) = prompt {
-        agent_cmd.push(' ');
-        agent_cmd.push_str(&words);
-        // Only with a prompt: without one the command is as before.
-        if agent_cmd.len() > MAX_TYPED_LINE {
-            bail!("with --prompt, the command to type is {} bytes, more than the {MAX_TYPED_LINE} a starting shell reads as one line: put a long brief in a file and name the file in the prompt, or shorten -w or the harness's arguments", agent_cmd.len());
-        }
-    }
-
-    let new_pane = control::split_spawn(&client, &context, direction.into(), &size).await?;
-    // Print the pane as soon as it exists, so a caller can clean it up if
-    // starting the agent in it fails. A failed write (a closed pipe) is
-    // reported once the agent is started, not as a panic half-way.
-    let mut stdout = std::io::stdout();
-    let printed = match format {
-        SpawnFormat::Text => writeln!(stdout, "{new_pane}"),
-        SpawnFormat::Json => writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"pane": new_pane, "harness": harness.id, "cwd": cwd})
-        ),
-    };
-
-    control::type_spawn_command(&client, &new_pane, &agent_cmd).await?;
-    printed.context("Failed to print the new pane's id")?;
-
     Ok(())
 }
 

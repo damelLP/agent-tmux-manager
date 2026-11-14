@@ -92,7 +92,8 @@
 //! and multiline paste when bracketed paste is explicitly off (U7's rule).
 //! tmux before 3.7 reports no flag: unknown remains allowed, not a guarantee
 //! against line submission. Reserved paste rejects ASCII control bytes except
-//! tab, LF and CR, including injected bracketed-paste terminators on older tmux.
+//! tab, LF and CR, including injected bracketed-paste terminators: both tmux 3.6
+//! and 3.8 pass those bytes through unchanged.
 //!
 //! Do not call legacy `send` or `type_spawn_command` inside a reservation: those
 //! paths wait behind its ownership. Use reserved guarded paste/keys instead.
@@ -327,6 +328,7 @@ impl PaneInspection {
     }
 
     /// The tmux pane's root process, not necessarily its interactive shell.
+    /// None when unavailable; tmux 3.8 reports no PID for a dead pane.
     #[must_use]
     pub fn pane_root_pid(&self) -> Option<u32> {
         (self.pane.pane_pid != 0).then_some(self.pane.pane_pid)
@@ -360,7 +362,7 @@ impl PaneInspection {
 /// no bytes if the pane disappears after metadata; no external-client CAS is
 /// promised. Mutations of that missing canonical pane fail, never retarget.
 /// Grouped/linked metadata accepts agreeing pane fields, retaining the first
-/// line's session/window. Versions 3.6a and 3.4 remain unverified.
+/// line's session/window. tmux 3.4 remains unverified.
 ///
 /// Preserve meaningful whitespace and rows. A consumer may construct its
 /// shared ScreenCursor from the inspection's coordinates when its adapter
@@ -381,7 +383,11 @@ pub struct PaneCapture {
     pub text: String,
     pub inspection: PaneInspection,
     pub format: CaptureFormat,
-    /// Any client with the exact focused flag showing this canonical pane.
+    /// Any client with the exact focused flag selecting this canonical pane:
+    /// the active pane of its current window, not every visible pane. A visible
+    /// inactive pane can therefore be Some(false). Control-mode clients are always
+    /// focused. With focus-events off (tmux's default), tty clients stay focused;
+    /// focus-out is observed only when enabled and the terminal sends ESC[O.
     /// Some(false) is observed absence; None is unknown, never permission.
     /// Sampled in the frame's command list. A client may move before an effect.
     pub focused: Option<bool>,

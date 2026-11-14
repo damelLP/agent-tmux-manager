@@ -211,6 +211,90 @@ fn agent_outage_resets_hold_on_recovery() {
 }
 
 #[test]
+fn revalidation_starts_not_ready_clock_and_keeps_observation() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 0);
+    wait(f.consume(0), WaitReason::InputNotEmpty);
+    obs.facts.input = InputState::Empty;
+    f.observe(obs, 1_000);
+    wait(f.consume(1_000), WaitReason::IdleStabilizing);
+    let before = f.snapshot(5_000);
+    assert_eq!(before.live.hold_since, Some(at(0)));
+    assert_eq!(before.live.input_line, InputLine::EmptySince(at(1_000)));
+    assert_eq!(before.live.agent_not_ready_since, None);
+
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        5_000,
+    );
+    let snapshot = f.snapshot(5_000);
+    assert_eq!(snapshot.live.agent_status, atm_org::AgentStatus::Starting);
+    assert_eq!(snapshot.recipient.session_id, Some("s1".into()));
+    assert_eq!(snapshot.recipient.pane.as_deref(), Some("%1"));
+    // Revalidation names the agent: its not-ready window starts at the event.
+    assert_eq!(snapshot.live.agent_not_ready_since, Some(at(5_000)));
+    // The status change resets holds, but neither pane nor session moved.
+    assert_eq!(snapshot.live.hold_since, None);
+    assert_eq!(snapshot.live.stale_blocker_since, None);
+    assert_eq!(snapshot.live.input_line, InputLine::EmptySince(at(1_000)));
+    assert_eq!(snapshot.live.pane, PaneLiveness::Alive);
+    assert!(snapshot.live.session.is_some());
+    wait(f.consume(6_000), WaitReason::AgentNotReady);
+    wait(f.step(124_999), WaitReason::AgentNotReady);
+    blocked(f.step(125_000), FailureReason::AgentNotReadyTimeout);
+
+    f.apply(OrgEvent::AgentEditorReady { agent_id: agent() }, 200_000);
+    let snapshot = f.snapshot(200_000);
+    assert_eq!(snapshot.live.agent_status, atm_org::AgentStatus::Ready);
+    assert_eq!(snapshot.live.agent_not_ready_since, None);
+    assert_eq!(snapshot.live.input_line, InputLine::EmptySince(at(1_000)));
+    assert_eq!(f.step(200_000), DeliveryStep::PasteNow { attempt: 1 });
+}
+
+#[test]
+fn revalidation_leaves_an_attempt_in_flight_alone() {
+    let mut f = Fixture::new(0);
+    let id = f.id;
+    f.observe(observation(SessionStatus::Idle), 0);
+    let scope = f.attempt(20_000);
+    let attempt_seq = scope.attempt_seq;
+    f.record(HistoryUpdate::Armed { scope }, 20_000);
+    f.record(
+        HistoryUpdate::Paste {
+            id,
+            pane: pane(),
+            certainty: EffectCertainty::Applied,
+        },
+        20_000,
+    );
+    f.record(
+        HistoryUpdate::Evidence {
+            id,
+            receipt: None,
+            probably_landed: true,
+        },
+        20_500,
+    );
+    let before = f.step(21_000);
+    assert!(
+        matches!(before, DeliveryStep::AwaitConfirmation { .. }),
+        "{before:?}"
+    );
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        21_000,
+    );
+    assert_eq!(f.step(21_000), before);
+    let snapshot = f.snapshot(21_000);
+    assert!(snapshot.live.probably_landed);
+    assert_eq!(snapshot.last_attempt_seq, Some(attempt_seq));
+    assert_eq!(snapshot.live.agent_not_ready_since, Some(at(21_000)));
+    blocked(f.step(23_000), FailureReason::ProbablyDelivered);
+}
+
+#[test]
 fn starting_clearing_preserve_clock() {
     let mut f = Fixture::new(0);
     f.apply(OrgEvent::AgentSessionLost { agent_id: agent() }, 10_000);

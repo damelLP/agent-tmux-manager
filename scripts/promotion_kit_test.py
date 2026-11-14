@@ -76,9 +76,9 @@ class ProtectedFiles(Sealed):
         self.before = self.commit(self.repo)
         self.git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.before)
 
-    def report(self, *refs, env=None, ok=True):
+    def report(self, *refs, env=None, ok=True, cwd=None):
         result = self.command([sys.executable, SCRIPTS / 'atm-protected-files.py', *refs],
-                              cwd=self.repo, env=env)
+                              cwd=cwd or self.repo, env=env)
         self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
         changes = {}
         for line in result.stdout.splitlines():
@@ -135,6 +135,13 @@ class ProtectedFiles(Sealed):
                 changes, _ = self.report()
                 self.assertEqual(changes['judge/old'], 'M')
                 self.assertIn('scripts/protected-files.txt', changes)
+
+    def test_historical_rules_apply_from_subdirectory(self):
+        self.rules.write_text('scripts/*\n')
+        (self.repo / 'judge/old').write_text('changed')
+        self.commit(self.repo)
+        changes, _ = self.report(cwd=self.repo / 'scripts')
+        self.assertEqual(changes, {'judge/old': 'M', 'scripts/protected-files.txt': 'M'})
 
     def test_initial_list_introduction_and_future_fixture(self):
         self.rules.unlink()

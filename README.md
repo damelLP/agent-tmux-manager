@@ -35,7 +35,7 @@ atm                    # launch TUI (starts daemon automatically)
 
 Sessions appear as you use supported coding-agent harnesses. Press `Enter` to jump to any session, `q` to quit.
 
-An open TUI restarts the daemon within a few seconds if it goes away, including after `atmd stop`. Quit every TUI before you stop the daemon for good, or before you restart it by hand: a TUI may start it first, with the TUI's environment. The daemon log is `~/.local/state/atm/atm.log`; each start keeps the previous run's log as `atm.log.1`.
+An open TUI restarts the daemon within a few seconds if it goes away, including after `atmd stop`. Quit every TUI before you stop the daemon for good, or before you restart it by hand: a TUI may start it first, with the TUI's environment. The daemon log defaults to `~/.local/state/atm/atm.log` (or `$XDG_STATE_HOME/atm/atm.log` when `XDG_STATE_HOME` is absolute); each background start keeps the previous run's log as `atm.log.1`. Set `ATM_STATE_DIR` to a nonempty directory path to keep the daemon's PID file (`atmd.pid`) and logs (`atm.log`, `atm.log.1`) there instead.
 
 ## CLI at a glance
 

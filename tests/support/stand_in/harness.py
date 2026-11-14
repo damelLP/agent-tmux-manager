@@ -125,6 +125,15 @@ class Runtime:
     def now_ms(self):
         return self.clock_ms if self.manual_clock else int(time.monotonic() * 1000)
 
+    def transport_now_ms(self):
+        # pi-atm's setTimeout backoff is wall time, independent of model time.
+        return int(time.monotonic() * 1000)
+
+    def transport_tick(self):
+        if self.retry_at and self.transport_now_ms() >= self.retry_at:
+            self.retry_at = 0
+            self.record({"kind": "transport_retry_ready"})
+
     def control(self, message):
         """Private controls never pass through the simulated editor."""
         reply = {"kind": "control", "id": message.get("id")}
@@ -165,6 +174,8 @@ class Runtime:
 
     def next_timeout(self, now_ms):
         deadlines = []
+        if self.retry_at:
+            deadlines.append(max(0, (self.retry_at - self.transport_now_ms()) / 1000))
         if not self.manual_clock and self.model.deadline is not None:
             deadlines.append(max(0, (self.model.deadline - now_ms) / 1000))
         if self.parser.pending == b"\x1b" and not self.parser.pasting:
@@ -184,7 +195,7 @@ class Runtime:
         self.observe_pi()
         data.update(pid=os.getpid(), tmux_pane=self.pane)
         frame = {"protocol_version": {"major": 1, "minor": 0}, "type": "pi_event", "data": data}
-        self.outbox, accepted = enqueue(self.outbox, frame, self.now_ms(), self.retry_at)
+        self.outbox, accepted = enqueue(self.outbox, frame, self.transport_now_ms(), self.retry_at)
         if not accepted:
             self.record({"kind": "transport_dropped", "event": data.get("event"), "reason": "close backoff"})
             return
@@ -194,7 +205,7 @@ class Runtime:
         if self.stream is not None:
             self.stream.close()
             self.stream = None
-        self.retry_at = self.now_ms() + BACKOFF_MS
+        self.retry_at = self.transport_now_ms() + BACKOFF_MS
         self.record({"kind": "disconnected", "error": str(error), "retry_at": self.retry_at})
 
     def observe_pi(self):
@@ -214,19 +225,12 @@ class Runtime:
         try:
             if self.stream is None:
                 self.stream = socket.socket(socket.AF_UNIX)
-                self.stream.settimeout(.2)
+                self.stream.settimeout(30)
                 self.stream.connect(str(self.socket_path))
                 self.send({"protocol_version": {"major": 1, "minor": 0},
                            "type": "connect", "client_id": f"pi-atm-{os.getpid()}"})
-                reply = bytearray()
-                deadline = time.monotonic() + 3
-                while not reply.endswith(b"\n"):
-                    byte = self.stream.recv(1)
-                    if not byte or len(reply) >= 65536 or time.monotonic() > deadline:
-                        raise OSError("missing pi replay handshake")
-                    reply.extend(byte)
-                if json.loads(reply).get("type") != "connected":
-                    raise OSError("pi replay handshake refused")
+                # pi-atm flushes on socket connect without awaiting a reply.
+                # Incoming replies/EOF are consumed by observe_pi in select.
                 self.record({"kind": "connected"})
             while self.outbox:
                 # Once a write is attempted its delivery is unknown; don't turn
@@ -352,6 +356,7 @@ class Runtime:
                     for action in self.parser.flush_escape():
                         self.action(action)
                 if self.running:
+                    self.transport_tick()
                     if self.event_stream in readable:
                         self.receive_controls()
                     if not self.manual_clock:

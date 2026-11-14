@@ -25,6 +25,9 @@ def runtime():
     r.draft_dirty = False
     r.manual_clock = True
     r.clock_ms = 0
+    r.transport_clock_ms = 0
+    r.transport_now_ms = lambda: r.transport_clock_ms
+    r.retry_at = 0
     r.event_sequence = 0
     r.event_stream = None
     r.start_time = "test-start"
@@ -145,10 +148,40 @@ class ControlTests(unittest.TestCase):
 
 
 class PiTransportTests(unittest.TestCase):
+    def test_connect_flushes_events_without_any_handshake_reply(self):
+        import json
+        import socket
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory, socket.socket(socket.AF_UNIX) as listener:
+            r = runtime()
+            r.mode, r.root = "pi", Path(directory)
+            r.socket_path = r.root / "no-reply.sock"
+            r.stream, r.outbox = None, []
+            listener.bind(str(r.socket_path))
+            listener.listen(1)
+            listener.settimeout(30)
+            try:
+                r.forward({"event": "session_start"})
+                with listener.accept()[0] as peer:
+                    peer.settimeout(30)
+                    self.assertIsNotNone(r.stream, "an absent reply must not disconnect pi")
+                    r.forward({"event": "input", "payload": {"text": "later"}})
+                    with peer.makefile("r") as lines:
+                        frames = [json.loads(lines.readline()) for _ in range(3)]
+                    self.assertEqual([f["type"] for f in frames], ["connect", "pi_event", "pi_event"])
+                    self.assertEqual(frames[2]["data"]["payload"]["text"], "later")
+                    self.assertEqual(r.outbox, [])
+                    self.assertEqual(r.retry_at, 0)
+            finally:
+                if r.stream is not None:
+                    r.stream.close()
+
     def test_close_drops_backoff_input_and_time_alone_never_connects(self):
         import socket
         r = runtime()
         r.mode = "pi"
+        r.socket_path = r.root / "absent.sock"
         r.outbox = []
         r.retry_at = 0
         writer, reader = socket.socketpair()
@@ -160,10 +193,19 @@ class PiTransportTests(unittest.TestCase):
         r.forward({"event": "input", "payload": {"text": "outage"}})
         self.assertEqual(r.outbox, [])
         self.assertEqual(journal(r)[-1]["kind"], "transport_dropped")
-        self.assertIsNone(r.next_timeout(0), "no autonomous reconnect deadline")
-        r.clock_ms = 1000
-        self.assertIsNone(r.next_timeout(1000))
-        self.assertIsNone(r.stream)
+        r.clock_ms = 100000
+        r.forward({"event": "input", "payload": {"text": "model time is irrelevant"}})
+        self.assertEqual(journal(r)[-1]["kind"], "transport_dropped")
+        self.assertEqual(r.next_timeout(r.clock_ms), 1.0)
+        r.transport_clock_ms = 999
+        r.transport_tick()
+        self.assertEqual(r.retry_at, 1000)
+        r.transport_clock_ms = 1000
+        r.transport_tick()
+        self.assertEqual(r.retry_at, 0)
+        self.assertEqual(journal(r)[-1]["kind"], "transport_retry_ready")
+        self.assertIsNone(r.stream, "timer expiry must not reconnect")
+        self.assertIsNone(r.next_timeout(r.clock_ms))
 
     def test_missing_socket_queues_bounded_fifo_until_a_later_send(self):
         import tempfile

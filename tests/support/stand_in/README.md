@@ -288,15 +288,18 @@ render ID/editor instead. Pi turn_end reports usage; agent_end ends work.
   A private Bash-startup barrier checks the actual child's PID/PPID; existing real
   daemon tests still check forwarded identity. PID/pane fields aren't injected.
 - Pi **replays envelopes**, never loads pi-atm. One socket spans `/new`. Observed
-  EOF triggers a 1000ms close backoff on the supplied model clock; sends inside
-  it are dropped, not replayed. Advancing time never reconnects: a later send
+  EOF triggers a 1000ms close backoff on monotonic transport time, never the
+  manual model clock; sends inside it are dropped, not replayed. Timer expiry
+  emits `transport_retry_ready` for condition-based test synchronization but
+  never reconnects: a later send
   initiates the next connection. With no socket outside backoff, a 256-entry
   drop-oldest FIFO waits for a later send. A write attempt is unacknowledged and
-  is not retried as if delivery were known. The daemon-restart test awaits EOF,
-  proves outage input dropped, then sends a new event after explicit clock
-  advancement. It never asserts recovery of outage input.
+  is not retried as if delivery were known. The daemon-restart test awaits EOF
+  and the backoff-expired event, then sends a new event; pure supplied-clock
+  tests prove backoff drops without racing real input against a one-second timer.
+  Connect and outbox writes never wait for a handshake reply, matching pi-atm.
   This models the repository pi-atm send/close/outbox rules, not SDK conformance:
-  Python performs bounded synchronous connect/handshake/write, not Node's
+  Python performs bounded synchronous connect/write, not Node's
   pending-socket/drain callbacks or high-water-mark behavior. Process exit does
   not guarantee flushing while the daemon is unavailable.
 

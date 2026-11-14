@@ -1208,6 +1208,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_way_drain_applies_later_events_in_order() {
+        timeout(Duration::from_secs(30), async {
+            let (handler, mut peer) = handshake_pair();
+            let registry = handler.registry.clone();
+            // Synthetic: the second event changes the same session from idle to working.
+            let prompt = ClientMessage::hook_event(serde_json::json!({
+                "session_id": "closed-hook", "hook_event_name": "UserPromptSubmit",
+                "pid": std::process::id()
+            }));
+            queue_messages(
+                &mut peer,
+                vec![ClientMessage::connect(None), handshake_hook(), prompt],
+            )
+            .await;
+            drop(peer);
+            handler.run().await;
+            let row = registry
+                .get_session(SessionId::new("closed-hook"))
+                .await
+                .unwrap();
+            assert_eq!(
+                row.status_label, "working",
+                "second queued event was not drained"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn closed_hook_payload_is_valid_and_buffered() {
         timeout(Duration::from_secs(30), async {
             let (mut handler, mut peer) = handshake_pair();
@@ -1494,7 +1524,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connected_reply_timeout_drains_without_writing() {
+    async fn cancellation_during_connected_reply_does_not_enter_one_way_mode() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        timeout(Duration::from_secs(30), async {
+            let (mut handler, mut peer) = handshake_pair();
+            queue_messages(&mut peer, vec![ClientMessage::connect(None)]).await;
+            // Prime the real socket reader before polling the reply future.
+            handler.reader.fill_buf().await.unwrap();
+            let writer = handler.writer_handle();
+            let _held = writer.lock().await;
+            let cancel = handler.cancel.clone();
+            {
+                let handshake = handler.handle_handshake();
+                tokio::pin!(handshake);
+                poll_fn(|cx| {
+                    assert!(handshake.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                // The handshake has now reached the held writer mutex.
+                cancel.cancel();
+                assert!(matches!(handshake.await, Err(ConnectionError::Eof)));
+            }
+            assert!(!handler.one_way_only);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connected_reply_timeout_enters_one_way_mode() {
         let (mut handler, mut peer) = handshake_pair();
         queue_messages(
             &mut peer,

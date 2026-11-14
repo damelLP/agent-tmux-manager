@@ -62,30 +62,37 @@ enum Command {
     Status,
 }
 
-fn pid_file_path() -> PathBuf {
-    let state_dir = dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("atm");
+// Keep PID/log defaults aligned with crates/atm/src/daemon.rs, not the
+// eventlog resolver: its relative-XDG/HOME fallback deliberately differs.
+fn resolve_daemon_state_dir(
+    override_dir: Option<PathBuf>,
+    default_state_dir: Option<PathBuf>,
+) -> PathBuf {
+    override_dir.unwrap_or_else(|| {
+        default_state_dir
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("atm")
+    })
+}
+
+fn pid_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("atmd.pid")
 }
 
-fn log_file_path() -> PathBuf {
-    let state_dir = dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("atm");
+fn log_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("atm.log")
 }
 
-fn read_pid() -> Option<u32> {
-    let path = pid_file_path();
+fn read_pid(state_dir: &Path) -> Option<u32> {
+    let path = pid_file_path(state_dir);
     let mut file = File::open(&path).ok()?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).ok()?;
     contents.trim().parse().ok()
 }
 
-fn write_pid() -> Result<()> {
-    let path = pid_file_path();
+fn write_pid(state_dir: &Path) -> Result<()> {
+    let path = pid_file_path(state_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("Failed to create state directory")?;
     }
@@ -94,8 +101,8 @@ fn write_pid() -> Result<()> {
     Ok(())
 }
 
-fn remove_pid_file() {
-    let path = pid_file_path();
+fn remove_pid_file(state_dir: &Path) {
+    let path = pid_file_path(state_dir);
     let _ = fs::remove_file(path);
 }
 
@@ -105,8 +112,8 @@ fn is_process_running(pid: u32) -> bool {
 
 /// Read-only: `stop` and `status` call this without the lock, so a stale
 /// PID file is left for the next lock holder's write_pid() to replace.
-fn is_daemon_running() -> Option<u32> {
-    if let Some(pid) = read_pid() {
+fn is_daemon_running(state_dir: &Path) -> Option<u32> {
+    if let Some(pid) = read_pid(state_dir) {
         if is_process_running(pid) {
             return Some(pid);
         }
@@ -194,6 +201,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let command = args.command.unwrap_or(Command::Start { daemon: false });
+    // Freeze relative overrides before daemonize changes cwd, but keep the
+    // established dirs fallback byte-identical when no override is supplied.
+    let override_dir = env::var("ATM_STATE_DIR")
+        .ok()
+        .filter(|state| !state.is_empty())
+        .map(std::path::absolute)
+        .transpose()
+        .context("Failed to resolve the daemon state directory")?;
+    let state_dir = resolve_daemon_state_dir(override_dir, dirs::state_dir());
 
     match command {
         Command::Start { daemon } => {
@@ -211,32 +227,32 @@ fn main() -> Result<()> {
             // taken before daemonize() so a losing `atmd start -d` exits 1 in
             // the foreground; the daemonized child inherits the locked file.
             let Some(_lock) = lock_daemon(&socket_path)? else {
-                exit_already_running(read_pid().filter(|&pid| is_process_running(pid)));
+                exit_already_running(read_pid(&state_dir).filter(|&pid| is_process_running(pid)));
             };
 
             // Under the lock, so only the holder ever replaces a stale PID file.
-            if let Some(pid) = is_daemon_running() {
+            if let Some(pid) = is_daemon_running(&state_dir) {
                 exit_already_running(Some(pid));
             }
 
             // Resolve before daemonize changes cwd. Persistence opens only
             // afterward: event-log lock descriptors must not cross the fork.
-            let state_dir = std::path::absolute(atmd::eventlog::state_dir())
+            let eventlog_state_dir = std::path::absolute(atmd::eventlog::state_dir())
                 .context("Failed to resolve the event-log state directory")?;
             if daemon {
-                daemonize()?;
+                daemonize(&state_dir)?;
             }
 
-            write_pid()?;
+            write_pid(&state_dir)?;
 
-            let result = run_daemon(socket_path, state_dir);
+            let result = run_daemon(socket_path, eventlog_state_dir);
 
-            remove_pid_file();
+            remove_pid_file(&state_dir);
 
             result
         }
         Command::Stop => {
-            if let Some(pid) = is_daemon_running() {
+            if let Some(pid) = is_daemon_running(&state_dir) {
                 println!("Stopping daemon (PID {pid})...");
                 stop_daemon(pid)?;
 
@@ -256,7 +272,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Status => {
-            if let Some(pid) = is_daemon_running() {
+            if let Some(pid) = is_daemon_running(&state_dir) {
                 println!("Daemon is running (PID {pid})");
 
                 let socket_path = env::var("ATM_SOCKET")
@@ -276,10 +292,10 @@ fn main() -> Result<()> {
     }
 }
 
-fn daemonize() -> Result<()> {
+fn daemonize(state_dir: &Path) -> Result<()> {
     use daemonize::Daemonize;
 
-    let log_path = log_file_path();
+    let log_path = log_file_path(state_dir);
 
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).context("Failed to create log directory")?;
@@ -508,6 +524,51 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn pid_and_log_state_use_the_override_or_legacy_fallback() {
+        for (override_dir, default_dir, expected) in [
+            (Some("/candidate"), Some("/state"), "/candidate"),
+            (None, Some("/state"), "/state/atm"),
+            (None, None, "/tmp/atm"),
+        ] {
+            let state = resolve_daemon_state_dir(
+                override_dir.map(PathBuf::from),
+                default_dir.map(PathBuf::from),
+            );
+            assert_eq!(state, PathBuf::from(expected));
+            assert_eq!(
+                pid_file_path(&state),
+                PathBuf::from(format!("{expected}/atmd.pid"))
+            );
+            assert_eq!(
+                log_file_path(&state),
+                PathBuf::from(format!("{expected}/atm.log"))
+            );
+        }
+    }
+
+    #[test]
+    fn unset_override_keeps_legacy_state_bytes_including_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        for default in [
+            dirs::state_dir(),
+            Some(PathBuf::from(std::ffi::OsString::from_vec(
+                b"/state/\xff".to_vec(),
+            ))),
+            Some(PathBuf::from("relative-home/.local/state")),
+            None,
+        ] {
+            let legacy = default
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("atm");
+            assert_eq!(
+                resolve_daemon_state_dir(None, default).as_os_str(),
+                legacy.as_os_str()
+            );
+        }
+    }
 
     fn socket_in(dir: &Path) -> PathBuf {
         dir.join("run").join("atmd.sock")

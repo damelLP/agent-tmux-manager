@@ -98,9 +98,9 @@ fn assert_concurrent_daemonized_starts_leave_one_daemon(stale_pid_file: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("atmd.sock");
     let state = dir.path().join("state");
-    let pid_file = state.join("atm").join("atmd.pid");
+    let pid_file = state.join("eventlog").join("atmd.pid");
     if stale_pid_file {
-        std::fs::create_dir_all(state.join("atm")).expect("mkdir state");
+        std::fs::create_dir_all(state.join("eventlog")).expect("mkdir state");
         std::fs::write(&pid_file, dead_pid()).expect("write stale PID");
     }
 
@@ -145,7 +145,7 @@ fn test_losing_start_leaves_the_pid_file_alone() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("atmd.sock");
     let state = dir.path().join("state");
-    let pid_file = state.join("atm").join("atmd.pid");
+    let pid_file = state.join("eventlog").join("atmd.pid");
 
     let mut daemon = atmd(&socket, &state, &[]).spawn().expect("spawn atmd");
     wait_for("the socket", || socket.exists());
@@ -177,8 +177,8 @@ fn test_status_and_stop_leave_a_stale_pid_file_alone() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("atmd.sock");
     let state = dir.path().join("state");
-    let pid_file = state.join("atm").join("atmd.pid");
-    std::fs::create_dir_all(state.join("atm")).expect("mkdir state");
+    let pid_file = state.join("eventlog").join("atmd.pid");
+    std::fs::create_dir_all(state.join("eventlog")).expect("mkdir state");
     std::fs::write(&pid_file, dead_pid()).expect("write stale PID");
 
     for command in ["status", "stop"] {
@@ -186,6 +186,7 @@ fn test_status_and_stop_leave_a_stale_pid_file_alone() {
             .arg(command)
             .env("ATM_SOCKET", &socket)
             .env("XDG_STATE_HOME", &state)
+            .env("ATM_STATE_DIR", state.join("eventlog"))
             .output()
             .expect("run atmd");
 

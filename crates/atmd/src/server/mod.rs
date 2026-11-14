@@ -199,7 +199,7 @@ impl DaemonServer {
         &self,
         services: methods::MethodServices,
     ) -> Result<(), ServerError> {
-        let methods = Arc::new(methods::router(services)?);
+        let methods = Arc::new(methods::router(services.clone())?);
         // Remove existing socket file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path).map_err(|e| ServerError::SocketSetup {
@@ -247,7 +247,7 @@ impl DaemonServer {
                     match result {
                         Ok((stream, _addr)) => {
                             let conn_num = self.connection_counter.fetch_add(1, Ordering::Relaxed);
-                            self.handle_connection(&mut connections, stream, conn_num, Arc::clone(&methods));
+                            self.handle_connection(&mut connections, stream, conn_num, Arc::clone(&methods), &services);
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to accept connection");
@@ -280,13 +280,16 @@ impl DaemonServer {
         stream: tokio::net::UnixStream,
         connection_number: u64,
         methods: Arc<methods::MethodRouter>,
+        services: &methods::MethodServices,
     ) {
         let (reader, writer) = stream.into_split();
         let registry = self.registry.clone();
         let subscribers = Arc::clone(&self.subscribers);
         let cancel = self.cancel_token.child_token();
-        let raw = self.method_services.raw.clone();
-        let org = self.method_services.org.clone();
+        let raw = services.raw.clone();
+        let org = services.org.clone();
+        let evidence = services.message_evidence.clone();
+        let history = services.message_history.clone();
 
         connections.spawn(async move {
             let handler = ConnectionHandler::new(
@@ -299,7 +302,8 @@ impl DaemonServer {
                 methods,
             )
             .with_raw(raw)
-            .with_org(org);
+            .with_org(org)
+            .with_message_evidence(evidence, history);
 
             // Run the handler and get the client_id when done
             let client_id = handler.run().await;
@@ -405,6 +409,96 @@ pub enum ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn message_evidence_connections_use_enriched_services() {
+        use crate::org::{
+            message_evidence::{AttemptScope, MessageEvidence},
+            messages::MessageClock,
+        };
+        use atm_core::{AgentType, Harness, Model, SessionDomain};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let registry = crate::registry::spawn_registry();
+        let mut row = SessionDomain::new(
+            SessionId::new("wired"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+        row.harness = Harness::Pi;
+        row.tmux_pane = Some("%7".into());
+        registry.register(row).await.unwrap();
+        let mut services = methods::MethodServices::new(registry);
+        let cancel = CancellationToken::new();
+        let server = DaemonServer::with_services(
+            "unused-private-test-socket",
+            services.clone(),
+            cancel.clone(),
+        );
+        let evidence = MessageEvidence::new(MessageClock::new(
+            tokio::time::Instant::now(),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        ));
+        let id = "m123".parse().unwrap();
+        evidence
+            .register(id, "[m123] Read: atm inbox --id m123".into())
+            .unwrap();
+        evidence
+            .arm(AttemptScope {
+                message_id: id,
+                attempt_seq: 124,
+                recipient: "demo/worker".parse().unwrap(),
+                pane: crate::control::reservation::PaneId::parse("%7").unwrap(),
+                harness: Harness::Pi,
+                session_id: Some(SessionId::new("wired")),
+                excluded_sessions: Default::default(),
+            })
+            .unwrap();
+        // Runtime enriches its clone after DaemonServer construction.
+        services.message_evidence = Some(evidence.clone());
+        let (ours, peer) = tokio::net::UnixStream::pair().unwrap();
+        let mut tasks = JoinSet::new();
+        server.handle_connection(
+            &mut tasks,
+            ours,
+            1,
+            Arc::new(methods::router(services.clone()).unwrap()),
+            &services,
+        );
+        let (read, mut write) = peer.into_split();
+        let mut read = BufReader::new(read);
+        // Synthetic envelope, same schema as the captured pi input.
+        for message in [
+            atm_protocol::ClientMessage::connect(None),
+            atm_protocol::ClientMessage::pi_event(
+                serde_json::json!({"event":"input","session_id":"wired","tmux_pane":"%7","payload":{"type":"input","source":"interactive","text":"[m123] Read: atm inbox --id m123"}}),
+            ),
+            atm_protocol::ClientMessage::ping(19),
+        ] {
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&message).unwrap()).as_bytes())
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let mut line = String::new();
+            timeout(Duration::from_secs(60), read.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let message: atm_protocol::DaemonMessage = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                message,
+                atm_protocol::DaemonMessage::Connected { .. }
+                    | atm_protocol::DaemonMessage::Pong { seq: 19 }
+            ));
+        }
+        assert_eq!(
+            evidence.receipt(id).unwrap().unwrap().session_id.as_str(),
+            "wired"
+        );
+        cancel.cancel();
+        while tasks.join_next().await.is_some() {}
+    }
 
     #[test]
     fn test_default_socket_path() {

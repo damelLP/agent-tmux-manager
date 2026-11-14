@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"msg-send-system-refused","method":"msg.send","params":{"to":"system","body":"hi"}},
+  "response": {"type":"response","id":"msg-send-system-refused","error":{"code":"refused","message":"system is not a message recipient or inbox"}},
+  "ignore": []
+}

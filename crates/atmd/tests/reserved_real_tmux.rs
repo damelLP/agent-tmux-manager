@@ -400,11 +400,85 @@ async fn reserved_real_input_refuses_mode_and_unbracketed_multiline() {
             |_, _| async { Ok(()) },
         )
         .await;
+    let names = tokio::spawn(check_control_byte_process_names(
+        client.clone(),
+        control.clone(),
+    ))
+    .await;
     cancel.cancel();
     actor.await.unwrap();
     verify_private(&client, &root).await;
     client.raw_command("kill-server", &[]).await.unwrap();
     result.unwrap();
+    names.unwrap();
+}
+
+async fn check_control_byte_process_names(
+    client: RealTmuxClient,
+    control: atmd::control::service::ControlHandle,
+) {
+    for name in ["A\nB", "tab\there", "esc\u{1b}[31mred"] {
+        let command = format!("exec /bin/bash -c 'exec -a \"{name}\" sleep 300'");
+        let created = client
+            .raw_command("new-window", &["-d", "-P", "-F", "#{pane_id}", &command])
+            .await
+            .unwrap();
+        let pane = PaneId::parse(created.trim()).unwrap();
+        let pid = client
+            .raw_command(
+                "display-message",
+                &["-p", "-t", pane.as_str(), "#{pane_pid}"],
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let args = tokio::fs::read(format!("/proc/{}/cmdline", pid.trim()))
+                    .await
+                    .unwrap();
+                if args.split(|byte| *byte == 0).next() == Some(name.as_bytes()) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        client
+            .raw_command(
+                "set-option",
+                &["-p", "-t", pane.as_str(), "@atm-agent", "project/lead"],
+            )
+            .await
+            .unwrap();
+        let mut request = reservation(ReservationKind::Down);
+        request.pane = Some(pane.clone());
+        control
+            .run_reserved(
+                request,
+                move |r| async move {
+                    assert_eq!(r.inspect(&pane).await?.unwrap().foreground_command, None);
+                    assert_eq!(
+                        r.capture(&pane, CaptureFormat::Plain)
+                            .await?
+                            .inspection
+                            .foreground_command,
+                        None
+                    );
+                    r.kill(
+                        &pane,
+                        r.agent().clone(),
+                        serde_json::json!({"test":"control-byte-name"}),
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                    assert!(r.inspect(&pane).await?.is_none());
+                    Ok::<_, ReservationError>(())
+                },
+                |_, _| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+    }
 }
 
 async fn verify_private(client: &RealTmuxClient, root: &str) {

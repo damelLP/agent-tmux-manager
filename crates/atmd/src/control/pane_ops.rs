@@ -15,7 +15,11 @@ use atm_org::AgentId;
 use atm_tmux::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
 use tokio::time::Instant;
 
-pub(super) const FORMAT: &str = "ATM-PANE-v2\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}\t\t#{pane_current_command}";
+pub(super) const FORMAT: &str = "ATM-PANE-v2\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}\t\t#{?#{m/r:[[:cntrl:]],#{pane_current_command}},,#{pane_current_command}}";
+// tmux 3.6 prints argv[0] raw. Suppress control-bearing names inside tmux,
+// before they can escape the tab/newline record. Mutations omit this field.
+pub(super) const COMMAND: &str =
+    "#{?#{m/r:[[:cntrl:]],#{pane_current_command}},,#{pane_current_command}}";
 pub(super) const CLIENTS: &str = "#{client_flags}\t#{pane_id}";
 pub(super) const CLIENTS_MARKER: &str = "ATM-CLIENTS-v1";
 const END: &str = "ATM-END\t#{pane_id}";
@@ -287,10 +291,16 @@ fn check_tag(
 async fn metadata(
     client: &dyn TmuxClient,
     pane: &PaneId,
+    process: bool,
 ) -> Result<Option<PaneInspection>, ReservationError> {
     let filter = format!("#{{==:#{{pane_id}},{pane}}}");
+    let format = if process {
+        FORMAT.to_owned()
+    } else {
+        FORMAT.replace(COMMAND, "")
+    };
     let output = client
-        .raw_command("list-panes", &["-a", "-f", &filter, "-F", FORMAT])
+        .raw_command("list-panes", &["-a", "-f", &filter, "-F", &format])
         .await
         .map_err(|source| tmux(pane, "read pane metadata", source))?;
     if output.is_empty() {
@@ -319,7 +329,14 @@ pub(in crate::control) async fn inspect(
     client: &dyn TmuxClient,
     pane: &PaneId,
 ) -> Result<Option<PaneInspection>, ReservationError> {
-    let Some(mut inspection) = metadata(client, pane).await? else {
+    inspect_with_process(client, pane, true).await
+}
+async fn inspect_with_process(
+    client: &dyn TmuxClient,
+    pane: &PaneId,
+    process: bool,
+) -> Result<Option<PaneInspection>, ReservationError> {
+    let Some(mut inspection) = metadata(client, pane, process).await? else {
         return Ok(None);
     };
     inspection.local_agent_tag = tag(client, pane).await?;
@@ -329,7 +346,7 @@ async fn present(
     client: &dyn TmuxClient,
     pane: &PaneId,
 ) -> Result<PaneInspection, ReservationError> {
-    inspect(client, pane)
+    inspect_with_process(client, pane, false)
         .await?
         .ok_or_else(|| ReservationError::PaneGone { pane: pane.clone() })
 }
@@ -338,7 +355,7 @@ pub(super) async fn capture(
     pane: &PaneId,
     format: CaptureFormat,
 ) -> Result<PaneCapture, ReservationError> {
-    metadata(client, pane)
+    metadata(client, pane, false)
         .await?
         .ok_or_else(|| ReservationError::PaneGone { pane: pane.clone() })?;
     let mut args = vec![

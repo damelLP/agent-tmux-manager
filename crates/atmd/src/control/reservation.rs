@@ -296,7 +296,8 @@ pub struct PaneInspection {
     /// job control enabled. A dead pane can report its start command; immediately
     /// after creation the name can transiently be tmux or a wrapper shell.
     /// U8 reads procfs once for its baseline, outside any guard; these facts alone
-    /// cannot establish positive shell/editor identity.
+    /// cannot establish positive shell/editor identity. Empty or control-bearing
+    /// names are None; mutation prechecks do not read this process-controlled field.
     pub foreground_command: Option<String>,
 }
 

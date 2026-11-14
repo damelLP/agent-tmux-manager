@@ -42,7 +42,7 @@
 //! untagged ownership check when the org is unavailable); use MockTmuxClient for
 //! legacy sends or alias resolution.
 use super::{
-    pane_ops::{CLIENTS, CLIENTS_MARKER, FORMAT},
+    pane_ops::{CLIENTS, CLIENTS_MARKER, COMMAND, FORMAT},
     CaptureFormat, PaneCapture, PaneId, PaneInspection,
 };
 use atm_tmux::{MockTmuxClient, PaneDirection, PaneInfo, TmuxClient, TmuxError};
@@ -262,7 +262,8 @@ fn local_tag(inspection: &PaneInspection) -> Read {
 fn requested_read(subcommand: &str, args: &[&str]) -> Result<(PaneId, ReadKind), TmuxError> {
     match (subcommand, args) {
         ("list-panes", ["-a", "-f", filter, "-F", format])
-            if matches!(*format, FORMAT | LEGACY_FORMAT) =>
+            if matches!(*format, FORMAT | LEGACY_FORMAT)
+                || *format == FORMAT.replace(COMMAND, "") =>
         {
             let pane = filter
                 .strip_prefix("#{==:#{pane_id},")

@@ -1,7 +1,8 @@
 //! Serialized, deadline-bounded session control. Dropping a waiting caller does
 //! not cancel an admitted action or retry its possibly partial effects.
-//! Replies acknowledge control, not persistence: audit follows the reply, before
-//! the next queued operation. Failed audits warn once and never change the result.
+//! Replies acknowledge control, not persistence. A bounded FIFO forwards audits
+//! independently; failures warn per audit, and overflow counts drops without
+//! delaying or changing any control result.
 
 #[cfg(test)]
 mod tests {
@@ -99,7 +100,6 @@ mod tests {
         execute(
             &mock,
             &crate::registry::spawn_registry(),
-            &org,
             Pending {
                 deadline: Instant::now(),
                 caller: None,
@@ -148,11 +148,7 @@ mod tests {
             })
             .await
             .unwrap();
-        // This next actor operation cannot finish before the earlier audit.
-        control
-            .prepare_spawn(Some("%7".into()), None, None, None)
-            .await
-            .unwrap();
+        control.flush_audits().await;
         let records = org.tail(crate::org::TailParams::default()).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].kind, "control.sent");
@@ -172,6 +168,71 @@ mod tests {
         cancel.cancel();
         task.await.unwrap();
         org_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn stalled_audit_never_holds_either_control_reply_and_preserves_order() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let org_cancel = CancellationToken::new();
+            let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+            let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+            let cancel = CancellationToken::new();
+            let (control, task) = spawn_control_with_audit(
+                Box::new(MockTmuxClient::new()),
+                crate::registry::spawn_registry(),
+                cancel.clone(),
+                {
+                    let gate = gate.clone();
+                    let entered = entered.clone();
+                    let org = org.clone();
+                    move |audit| {
+                        let gate = gate.clone();
+                        let entered = entered.clone();
+                        let org = org.clone();
+                        async move {
+                            entered.notify_one();
+                            let _permit = gate.acquire().await.unwrap();
+                            org.execute(audit, chrono::Utc::now()).await.unwrap();
+                        }
+                    }
+                },
+            );
+            control
+                .type_spawn_command("%1".into(), "one".into())
+                .await
+                .unwrap();
+            entered.notified().await;
+            // The first audit is blocked, yet a second action must reply.
+            control
+                .type_spawn_command("%2".into(), "two".into())
+                .await
+                .unwrap();
+            // Fill and overflow the bounded FIFO while persistence is still held.
+            for pane in 3..=AUDIT_CAPACITY + 3 {
+                control
+                    .type_spawn_command(format!("%{pane}"), "overflow".into())
+                    .await
+                    .unwrap();
+            }
+            gate.add_permits(1);
+            drop(control);
+            task.await.unwrap();
+            let events = org.tail(crate::org::TailParams::default()).await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|e| e.body["pane"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+                (1..=AUDIT_CAPACITY + 1)
+                    .map(|pane| format!("%{pane}"))
+                    .collect::<Vec<_>>()
+            );
+            org_cancel.cancel();
+        })
+        .await
+        .expect("control replies must not wait for the held audit barrier");
     }
 
     #[tokio::test(start_paused = true)]
@@ -221,6 +282,15 @@ use crate::{org::OrgHandle, registry::RegistryHandle, server::methods::CallConte
 
 const CAPACITY: usize = 32;
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+// Absorb one full control-queue burst without unbounded log-backpressure memory.
+const AUDIT_CAPACITY: usize = CAPACITY;
+const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum Audit {
+    Record(OrgCommand),
+    #[cfg(test)]
+    Barrier(Reply<()>),
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -235,6 +305,8 @@ pub enum ServiceError {
 type Reply<T> = oneshot::Sender<Result<T, ServiceError>>;
 
 enum Request {
+    #[cfg(test)]
+    FlushAudit(Reply<()>),
     Send {
         target: String,
         text: String,
@@ -274,6 +346,11 @@ pub struct ControlHandle {
 }
 
 impl ControlHandle {
+    #[cfg(test)]
+    pub(crate) async fn flush_audits(&self) {
+        self.request(Request::FlushAudit).await.unwrap();
+    }
+
     /// Attribute subsequent calls; this client-supplied identity is not authentication.
     #[must_use]
     pub fn with_caller(mut self, caller: CallContext) -> Self {
@@ -362,8 +439,41 @@ pub fn spawn_control(
     org: OrgHandle,
     cancel: CancellationToken,
 ) -> (ControlHandle, JoinHandle<()>) {
+    spawn_control_with_audit(client, registry, cancel, move |audit| {
+        let org = org.clone();
+        async move {
+            if let Err(error) = org.execute(audit, chrono::Utc::now()).await {
+                tracing::warn!(%error, "control audit failed; action result unchanged, not retrying");
+            }
+        }
+    })
+}
+
+fn spawn_control_with_audit<F, Fut>(
+    client: Box<dyn TmuxClient>,
+    registry: RegistryHandle,
+    cancel: CancellationToken,
+    mut persist: F,
+) -> (ControlHandle, JoinHandle<()>)
+where
+    F: FnMut(OrgCommand) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     let (sender, mut requests) = mpsc::channel::<Pending>(CAPACITY);
     let task = tokio::spawn(async move {
+        let (audits, mut receive) = mpsc::channel(AUDIT_CAPACITY);
+        let mut forwarder = tokio::spawn(async move {
+            while let Some(audit) = receive.recv().await {
+                match audit {
+                    Audit::Record(audit) => persist(audit).await,
+                    #[cfg(test)]
+                    Audit::Barrier(reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let mut dropped = 0_u64;
         loop {
             tokio::select! {
                 biased;
@@ -373,10 +483,31 @@ pub fn spawn_control(
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => break,
-                        () = execute(&*client, &registry, &org, pending) => {}
+                        audit = execute(&*client, &registry, pending) => {
+                            match audit {
+                                #[cfg(test)]
+                                Some(Audit::Barrier(reply)) => { let _ = audits.send(Audit::Barrier(reply)).await; }
+                                Some(audit) => {
+                                    if audits.try_send(audit).is_err() {
+                                        dropped = dropped.saturating_add(1);
+                                        tracing::warn!(dropped, "control audit queue full or closed; dropping audit");
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
                     }
                 }
             }
+        }
+        drop(audits);
+        if tokio::time::timeout(AUDIT_DRAIN_TIMEOUT, &mut forwarder)
+            .await
+            .is_err()
+        {
+            tracing::warn!("control audit drain timed out; remaining audits dropped, not retried");
+            forwarder.abort();
+            let _ = forwarder.await;
         }
     });
     (
@@ -434,13 +565,14 @@ fn control_audit<T>(
 async fn execute(
     client: &dyn TmuxClient,
     registry: &RegistryHandle,
-    org: &OrgHandle,
     pending: Pending,
-) {
+) -> Option<Audit> {
     let deadline = pending.deadline;
     let expired = Instant::now() >= deadline;
     let caller = pending.caller.as_ref();
     let audit = match pending.request {
+        #[cfg(test)]
+        Request::FlushAudit(reply) => return Some(Audit::Barrier(reply)),
         Request::Send {
             target,
             text,
@@ -524,9 +656,5 @@ async fn execute(
             })
         }
     };
-    if let Some(audit) = audit.filter(|_| !expired) {
-        if let Err(error) = org.execute(audit, chrono::Utc::now()).await {
-            tracing::warn!(%error, "control audit failed; action result unchanged, not retrying");
-        }
-    }
+    audit.filter(|_| !expired).map(Audit::Record)
 }

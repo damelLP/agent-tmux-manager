@@ -349,6 +349,7 @@ mod tests {
         atm_tmux::MockTmuxClient,
         tokio_util::sync::CancellationToken,
         tokio::task::JoinHandle<()>,
+        crate::control::service::ControlHandle,
     ) {
         let mut services = MethodServices::new(crate::registry::spawn_registry());
         services
@@ -369,22 +370,9 @@ mod tests {
             org.clone(),
             cancel.clone(),
         );
-        services.control = Some(control);
+        services.control = Some(control.clone());
         services.org = org;
-        (router(services).unwrap(), mock, cancel, task)
-    }
-
-    // An actor request ordered after each mutation is a barrier for its audit.
-    // No timer or polling is used to infer completion.
-    async fn audit_barrier(router: &MethodRouter) {
-        router
-            .call(
-                context(),
-                "session.spawn_prepare",
-                json!({"target_pane":"%7"}),
-            )
-            .await
-            .unwrap();
+        (router(services).unwrap(), mock, cancel, task, control)
     }
 
     async fn successful_control_actions(router: &MethodRouter) {
@@ -414,7 +402,6 @@ mod tests {
                 .unwrap(),
             Value::Null
         );
-        audit_barrier(router).await;
     }
 
     #[tokio::test]
@@ -422,8 +409,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let org_cancel = tokio_util::sync::CancellationToken::new();
         let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
-        let (router, mock, cancel, task) = control_router(org).await;
+        let (router, mock, cancel, task, control) = control_router(org).await;
         successful_control_actions(&router).await;
+        control.flush_audits().await;
         let records = router
             .call(context(), "log.tail", json!({"topics":["control"]}))
             .await
@@ -459,9 +447,10 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_organisation_does_not_change_or_repeat_control_actions() {
-        let (router, mock, cancel, task) =
+        let (router, mock, cancel, task, control) =
             control_router(crate::org::OrgHandle::disabled("test disabled")).await;
         successful_control_actions(&router).await;
+        control.flush_audits().await;
         assert_eq!(
             mock.calls()
                 .iter()
@@ -492,7 +481,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let org_cancel = tokio_util::sync::CancellationToken::new();
         let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
-        let (router, mock, cancel, task) = control_router(org).await;
+        let (router, mock, cancel, task, control) = control_router(org).await;
         mock.set_next_raw_output("1 0");
         let error = router
             .call(
@@ -503,7 +492,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.0.code, "refused");
-        audit_barrier(&router).await;
+        control.flush_audits().await;
         mock.set_next_error(atm_tmux::TmuxError::NotFound);
         let error = router
             .call(
@@ -514,7 +503,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.0.code, "internal");
-        audit_barrier(&router).await;
+        control.flush_audits().await;
         mock.set_next_error(atm_tmux::TmuxError::NotFound);
         let error = router
             .call(
@@ -525,11 +514,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.0.code, "internal");
-        audit_barrier(&router).await;
+        control.flush_audits().await;
         mock.set_next_error(atm_tmux::TmuxError::NotFound);
         let error = router.call(context(), "session.spawn", json!({"target_pane":"%7","caller_pane_missing":false,"direction":"below","size":"50%"})).await.unwrap_err();
         assert_eq!(error.0.code, "internal");
-        audit_barrier(&router).await;
+        control.flush_audits().await;
         let error = router
             .call(
                 context(),
@@ -539,7 +528,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.0.code, "not_found");
-        audit_barrier(&router).await;
+        control.flush_audits().await;
         let records = router
             .call(context(), "log.tail", json!({"topics":["control"]}))
             .await

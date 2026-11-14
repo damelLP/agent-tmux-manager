@@ -180,7 +180,17 @@ def setup(bin_dir, socket_path):
             f'atm setup failed (exit {result.returncode}); see setup output above')
 
 
+def same_pair(left, right):
+    return all(filecmp.cmp(left / name, right / name, shallow=False)
+               and (left / name).stat().st_mode == (right / name).stat().st_mode
+               for name in NAMES)
+
+
 def promote(bin_dir, source, socket_path, metadata):
+    require(not any(bin_dir.glob('.atm-stage-*')),
+            'interrupted promotion; run atm-rollback first')
+    require(not same_pair(bin_dir, source), 'source pair already installed')
+    old_previous = previous(metadata) if (metadata / 'previous.json').exists() else None
     saved = backup(bin_dir, metadata)
     print(f'Previous pair: {saved}', flush=True)
     try:
@@ -190,6 +200,8 @@ def promote(bin_dir, source, socket_path, metadata):
         try:
             replace_pair(saved, bin_dir)
             setup(bin_dir, socket_path)
+            if old_previous is not None:
+                save_previous(metadata, old_previous)
         except (OSError, Refused, subprocess.SubprocessError, KeyboardInterrupt) as recovery:
             raise Refused(f'promotion failed: {error}; recovery failed: {recovery}; '
                           f'previous pair retained at {saved}; do not restart yet') from error
@@ -240,13 +252,12 @@ def main(operation):
                 promote(bin_dir, source, socket_path, metadata)
             else:
                 saved = previous(metadata)
-                if all((bin_dir / name).exists() for name in NAMES) and any(
-                        not filecmp.cmp(bin_dir / name, saved / name, shallow=False)
-                        or (bin_dir / name).stat().st_mode != (saved / name).stat().st_mode
-                        for name in NAMES):
+                if all((bin_dir / name).exists() for name in NAMES) and not same_pair(bin_dir, saved):
                     retained = backup(bin_dir, metadata, record=False)
                     print(f'Retained replaced pair: {retained}', flush=True)
                 replace_pair(saved, bin_dir)
+                for staged in bin_dir.glob('.atm-stage-*'):
+                    staged.unlink()
                 setup(bin_dir, socket_path)
                 print(f'Restored previous pair: {saved}')
             print('Pair installed and setup completed. Daemon remains stopped.')

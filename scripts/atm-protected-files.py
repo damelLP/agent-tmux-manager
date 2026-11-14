@@ -42,7 +42,7 @@ def main():
         rules = patterns(Path(__file__).with_name('protected-files.txt').read_text())
         for revision in (before, after):
             # An absent historical list is normal before this tool was introduced.
-            if git('ls-tree', '-z', revision, '--', MANIFEST):
+            if git('ls-tree', '--full-tree', '-z', revision, '--', MANIFEST):
                 rules.update(patterns(git('show', revision + ':' + MANIFEST).decode('utf-8')))
         fields = git('diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z',
                      '--no-renames', before, after, '--').split(b'\0')

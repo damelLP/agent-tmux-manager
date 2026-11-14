@@ -76,9 +76,9 @@ class ProtectedFiles(Sealed):
         self.before = self.commit(self.repo)
         self.git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.before)
 
-    def report(self, *refs, env=None, ok=True):
+    def report(self, *refs, env=None, ok=True, cwd=None):
         result = self.command([sys.executable, SCRIPTS / 'atm-protected-files.py', *refs],
-                              cwd=self.repo, env=env)
+                              cwd=cwd or self.repo, env=env)
         self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
         changes = {}
         for line in result.stdout.splitlines():
@@ -135,6 +135,13 @@ class ProtectedFiles(Sealed):
                 changes, _ = self.report()
                 self.assertEqual(changes['judge/old'], 'M')
                 self.assertIn('scripts/protected-files.txt', changes)
+
+    def test_historical_rules_apply_from_subdirectory(self):
+        self.rules.write_text('scripts/*\n')
+        (self.repo / 'judge/old').write_text('changed')
+        self.commit(self.repo)
+        changes, _ = self.report(cwd=self.repo / 'scripts')
+        self.assertEqual(changes, {'judge/old': 'M', 'scripts/protected-files.txt': 'M'})
 
     def test_initial_list_introduction_and_future_fixture(self):
         self.rules.unlink()
@@ -273,6 +280,52 @@ if mode == 'failure':
             self.assertIsNone(record['tmux'])
             self.assertIsNone(record['pane'])
         self.assertEqual((self.bin / 'unrelated').read_text(), 'keep')
+
+    def test_repeated_promotion_refuses_without_repointing_previous(self):
+        self.call()
+        marker = self.bin / '.atm-promotion/previous.json'
+        previous = marker.read_bytes()
+        archives = list(marker.parent.joinpath('pairs').iterdir())
+        result = self.call(ok=False)
+        self.assertIn('already installed', result.stderr)
+        self.assertEqual(marker.read_bytes(), previous)
+        self.assertEqual(list(marker.parent.joinpath('pairs').iterdir()), archives)
+        self.assertEqual([r['label'] for r in self.records()], ['new'])
+        self.call('rollback')
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+
+    def test_mode_only_difference_is_promoted(self):
+        self.call()
+        (self.source / 'atm').chmod(0o755)
+        self.call()
+        self.assertEqual(self.pair_bytes(self.bin), self.pair_bytes(self.source))
+        self.assertEqual(self.pair_bytes(self.previous()), self.new)
+        self.call('rollback')
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+
+    def test_failed_second_promotion_preserves_rollback_target(self):
+        self.call()
+        marker = self.bin / '.atm-promotion/previous.json'
+        previous = marker.read_bytes()
+        self.make_pair(self.source, 'third')
+        self.modes.write_text('{"third":"failure"}')
+        self.call(ok=False)
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
+        self.assertEqual(marker.read_bytes(), previous)
+        self.assertEqual([r['label'] for r in self.records()], ['new', 'third', 'new'])
+        self.call('rollback')
+        self.assertEqual(self.pair_bytes(self.bin), self.old)
+
+    def test_failed_second_recovery_retains_new_backup_for_rollback(self):
+        self.call()
+        self.make_pair(self.source, 'third')
+        self.modes.write_text('{"third":"failure","new":"failure"}')
+        result = self.call(ok=False)
+        self.assertIn('recovery failed', result.stderr)
+        self.assertEqual(self.pair_bytes(self.previous()), self.new)
+        self.modes.write_text('{}')
+        self.call('rollback')
+        self.assertEqual(self.pair_bytes(self.bin), self.new)
 
     def test_second_promotion_remembers_immediate_previous_pair(self):
         self.call()
@@ -482,6 +535,7 @@ if mode == 'failure':
         import atm_promotion
         self.call()
         previous = (self.bin / '.atm-promotion/previous.json').read_bytes()
+        self.make_pair(self.source, 'third')
         real_copy = shutil.copy2
         def copy(source, destination, *args, **kwargs):
             if Path(source) == self.bin / 'atmd':
@@ -495,11 +549,24 @@ if mode == 'failure':
 
     def test_rollback_repairs_accepted_interrupted_rename_window(self):
         self.call()
-        # Model SIGKILL after only atm was replaced: previous remains complete.
+        # Model SIGKILL after only atm was replaced: previous remains complete,
+        # and the staged atmd file has not yet been renamed into place.
         (self.bin / 'atmd').write_bytes(self.old['atmd'][0])
+        staged = self.bin / '.atm-stage-interrupted'
+        shutil.copy2(self.source / 'atmd', staged)
+        marker = self.bin / '.atm-promotion/previous.json'
+        previous = marker.read_bytes()
+        mixed = self.pair_bytes(self.bin)
+        result = self.call(ok=False)
+        self.assertIn('interrupted promotion', result.stderr)
+        self.assertIn('atm-rollback', result.stderr)
+        self.assertEqual(marker.read_bytes(), previous)
+        self.assertEqual(self.pair_bytes(self.bin), mixed)
+        self.assertTrue(staged.exists())
         self.call('rollback')
         self.assertEqual(self.pair_bytes(self.bin), self.old)
         self.assertEqual(self.pair_bytes(self.previous()), self.old)
+        self.assertEqual(list(self.bin.glob('.atm-stage-*')), [])
 
 
 class PromotionRealSetup(Sealed):
@@ -513,6 +580,8 @@ class PromotionRealSetup(Sealed):
             self.assertTrue(binary and Path(binary).is_file(), 'Cargo-built CANDIDATE_TEST_' + name.upper() + ' required')
             for directory in (self.bin, self.source):
                 shutil.copy2(binary, directory / name)
+        # Same build, distinct modes: exercise real setup without a no-op promotion.
+        (self.source / 'atm').chmod(0o751)
         for harness in ('.claude', '.codex', '.pi/agent'):
             (self.home / harness).mkdir(parents=True)
         (self.home / '.claude/settings.json').write_text('{"keep":"claude"}')

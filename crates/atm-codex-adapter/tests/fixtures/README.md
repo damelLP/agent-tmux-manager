@@ -1,5 +1,28 @@
 # Codex screen fixtures
 
+## Styled fixtures (U8d)
+
+Captured: codex-cli 0.167.0, 2026-11-14, U5b private tmux 100x30
+`capture-pane -p -e`, and P1 private tmux `capture-pane -p -e -N`.
+`screen_styled_u5b_<state>_0.167.0.txt` maps to
+`codex-<state>.sgr.txt`; `screen_styled_p1_<state>_0.167.0.txt` maps to
+`<state>.styled.txt` (P1 used -N despite the filename; dimensions are in the
+state name). Provenance headers are removed only at test load. U5b cursor
+sidecars are `codex-<state>.cursor.txt`, P1 sidecars `<state>.meta.json`.
+
+U5b bytes are unchanged; P1 replaces only private run roots outside composers
+with equal-width `/tmp/xxx…` tokens. All SGR, row/space geometry and visible
+composer text remain. Tests cover three terminal modes, 24/30/32 rows, logo
+and no-logo startup, Home drafts, working, submitted multiline history,
+slash completion and folder/hook/worktree/permission refusals.
+
+Styled evidence supersedes the plain-only limitations below: an all-faint
+placeholder in a complete regular editor reads Empty; typed text reads Draft.
+`-N` preserves allocated padding, not just authored spaces (tmux 3.8/3.6 probes).
+The exact staged matcher never removes leading whitespace. It refuses multiline
+reconstruction and trailing-padding ambiguity rather than authorizing Enter.
+New mutations are explicitly Synthetic in `tests/styled_screen.rs`.
+
 Fourteen distinct frames cover all 19 raw U5 Codex screens (40 rows, 120
 columns). Existing JSONL fixtures retain their crate-doc provenance. The
 screen parser's `captured_screens` table asserts all four facts for each frame.

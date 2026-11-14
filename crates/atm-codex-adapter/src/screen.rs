@@ -7,7 +7,19 @@
 //!
 //! The placeholder may also be an identical draft: it always remains Unknown.
 //! **Consumers cannot deliver into Codex under this plain-text contract yet.**
-//! U5b captured cursor/attribute collisions; styled inference remains a follow-up.
+//! Styled input instead requires `capture-pane -p -e -N`. Coordinates are ignored,
+//! never emptiness evidence. The strict decoder refuses unknown/malformed escapes
+//! and conceal without fallback. Only the complete regular footer plus the exact
+//! all-faint placeholder proves Empty; non-faint text is a draft, including the
+//! captured footer without shortcut help. Drafts never grant fresh-editor evidence.
+//!
+//! Captured: codex-cli 0.167.0, 2026-11-14, U5b styled and P1 styled-N private tmux.
+//! `staged_draft_matches` preserves leading whitespace exactly: ` /clear` differs
+//! from `/clear`. Consumers must verify the staged draft before Enter (unknown
+//! refuses too); padding/whitespace collisions alone are not safe. Tmux 3.8/3.6
+//! probes show `-N` retains allocated grid padding, not only authored spaces.
+//! Only a single visible row can be compared; trailing-padding-only differences
+//! and multiline/wrapped input cannot prove exact equality and return unknown.
 //! Only the captured `/new` completion is a known draft; U5b's real free-text
 //! drafts lack shortcut chrome and remain Unknown. No permission/trust dialog
 //! was captured; no speculative recognizer is added.
@@ -18,6 +30,7 @@
 //! captures from different operations are byte-identical. Consumers own operation
 //! transitions, pane/process identity, live viewport, copy-mode and temporal checks.
 
+use atm_core::styled_screen::StyledScreen;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
     ScreenInput, ScreenTextFormat, TurnState,
@@ -67,22 +80,64 @@ const LOGO: &[&str] = &[
 /// Recognize complete captured suffixes; unknown never authorizes input.
 #[must_use]
 pub fn observe_screen(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> ScreenFacts {
-    let ScreenInput::Plain(text) = input else {
-        return ScreenFacts::default();
+    inspect(input, cursor).0
+}
+
+fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts, Option<String>) {
+    let decoded;
+    let (text, styled) = match input {
+        ScreenInput::Plain(text) if cursor.is_none() => (text, None),
+        ScreenInput::Styled(text) => {
+            let Ok(screen) = StyledScreen::parse(text) else {
+                return Default::default();
+            };
+            decoded = screen;
+            (decoded.text(), Some(&decoded))
+        }
+        _ => return Default::default(),
     };
-    if cursor.is_some() || text.chars().any(|c| c.is_control() && c != '\n') {
-        return ScreenFacts::default();
+    if text.chars().any(|c| c.is_control() && c != '\n') {
+        return Default::default();
     }
-    let mut lines: Vec<_> = text.lines().collect();
+    let mut lines: Vec<_> = text
+        .lines()
+        .map(|line| {
+            if styled.is_some() {
+                line.trim_end_matches(' ')
+            } else {
+                line
+            }
+        })
+        .collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
     if known_dialog(&lines) {
         let mut facts = ScreenFacts::default();
         facts.dialog = DialogState::Other;
-        return facts;
+        return (facts, None);
     }
-    editor(&lines).unwrap_or_default()
+    editor(&lines, styled).unwrap_or_default()
+}
+
+/// Compare only a reconstructable active single-line draft, never history.
+#[must_use]
+pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
+    if !matches!(input, ScreenInput::Styled(_))
+        || expected.is_empty()
+        || expected.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let (_, draft) = inspect(input, None);
+    let draft = draft?;
+    if draft == expected {
+        Some(true)
+    } else if draft.trim_end_matches(' ') == expected.trim_end_matches(' ') {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 fn nonblank<'a>(lines: &[&'a str]) -> Vec<&'a str> {
@@ -130,7 +185,7 @@ fn known_dialog(lines: &[&str]) -> bool {
     }
 }
 
-fn editor(lines: &[&str]) -> Option<ScreenFacts> {
+fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {
     let header_index = header(lines).map(|(index, _)| index);
     let (last, before_last) = lines.split_last()?;
     let shortcuts = last.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -142,7 +197,16 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
             .is_some_and(|(count, label)| {
                 positive_integer(count) && matches!(label, "warning" | "warnings")
             });
-    let (model, before_model) = if regular {
+    // A typed composer drops shortcut help but may retain warning chrome.
+    let warning_only = styled.is_some()
+        && shortcuts
+            .strip_prefix("⚠ ")
+            .and_then(|s| s.strip_suffix(" · f2 to view"))
+            .and_then(|s| s.split_once(' '))
+            .is_some_and(|(count, label)| {
+                positive_integer(count) && matches!(label, "warning" | "warnings")
+            });
+    let (model, before_model) = if regular || warning_only {
         before_last.split_last()?
     } else {
         (last, before_last)
@@ -161,8 +225,39 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     if !separator.is_empty() {
         return None;
     }
+    let typed = composer.strip_prefix("› ");
+    let offset = styled.map(|screen| {
+        screen
+            .text()
+            .split_inclusive('\n')
+            .take(before_composer.len())
+            .map(str::len)
+            .sum::<usize>()
+            + "› ".len()
+    });
+    let normal_draft = styled
+        .zip(offset)
+        .zip(typed)
+        .is_some_and(|((screen, offset), text)| {
+            !text.is_empty()
+                && text
+                    .char_indices()
+                    .all(|(i, _)| screen.faint_at(offset + i) == Some(false))
+        });
     let (input, dialog, history) = if regular && *composer == "› Ask Codex to do anything" {
-        (InputState::Unknown, DialogState::None, before_composer)
+        let input = match styled.zip(offset).zip(typed) {
+            Some(((screen, offset), text))
+                if text.char_indices().all(|(i, _)| {
+                    screen.faint_at(offset + i) == Some(true)
+                        && screen.inverse_at(offset + i) == Some(false)
+                }) =>
+            {
+                InputState::Empty
+            }
+            _ if normal_draft => InputState::Draft,
+            _ => InputState::Unknown,
+        };
+        (input, DialogState::None, before_composer)
     } else if !regular && *composer == "› /new" {
         let (blank, before_blank) = before_composer.split_last()?;
         let (menu, history) = before_blank.split_last()?;
@@ -170,6 +265,8 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
             return None;
         }
         (InputState::Draft, DialogState::Other, history)
+    } else if normal_draft {
+        (InputState::Draft, DialogState::None, before_composer)
     } else {
         return None;
     };
@@ -202,10 +299,15 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     facts.input = input;
     facts.turn = turn;
     facts.dialog = dialog;
-    if fresh {
+    if fresh && input != InputState::Draft {
         facts.fresh_editor = FreshEditorEvidence::Present;
     }
-    Some(facts)
+    let draft = styled
+        .filter(|_| input == InputState::Draft)
+        .and_then(|screen| screen.text().lines().nth(before_composer.len()))
+        .and_then(|line| line.strip_prefix("› "))
+        .map(str::to_owned);
+    Some((facts, draft))
 }
 
 fn positive_integer(value: &str) -> bool {

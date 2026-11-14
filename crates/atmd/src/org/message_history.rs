@@ -146,10 +146,14 @@ pub enum HistoryUpdate {
         pane: Option<PaneId>,
     },
     /// After this attempted sequence is applied and before input dispatch.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     Armed { scope: AttemptScope },
     /// Retained facts; absence/false is not permission to clear a prior latch.
     /// Only a new arm or explicit matching owner retry can release that latch.
     /// probably_landed for a message with no attempt is a `Conflict`.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     Evidence {
         id: MessageId,
         receipt: Option<DeliveryReceipt>,
@@ -175,6 +179,8 @@ pub enum HistoryUpdate {
     /// Latch probably_landed and this diagnostic for the matching attempted log
     /// sequence. Only an Armed for another attempt or a matching OwnerRetry
     /// releases it; the first Armed of this same attempt does not.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     Held {
         id: MessageId,
         attempt_seq: u64,
@@ -182,6 +188,8 @@ pub enum HistoryUpdate {
     },
     /// Release only this matching attempt's transient hold, never its durable
     /// attempt count or late-receipt scopes. A stale attempt sequence refuses.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     OwnerRetry { id: MessageId, attempt_seq: u64 },
 }
 

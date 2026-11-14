@@ -392,11 +392,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::{ControlError, SpawnContext};
+use super::{reservation::{jobs::{Command, Jobs}, ReservationError}, ControlError, SpawnContext};
 use crate::{org::OrgHandle, registry::RegistryHandle, server::methods::CallContext};
 
 const CAPACITY: usize = 32;
-const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 // Absorb one full control-queue burst without unbounded log-backpressure memory.
 const AUDIT_CAPACITY: usize = CAPACITY;
 const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -433,6 +433,7 @@ type Reply<T> = oneshot::Sender<Result<T, ServiceError>>;
 enum Request {
     #[cfg(test)]
     FlushAudit(Reply<()>),
+    Reserved(Command),
     Send {
         target: String,
         text: String,
@@ -543,6 +544,38 @@ impl ControlHandle {
     pub fn with_caller(mut self, caller: CallContext) -> Self {
         self.caller = Some(caller);
         self
+    }
+
+    pub(super) async fn enqueue_reserved(
+        &self,
+        command: Command,
+        deadline: Instant,
+    ) -> Result<(), ReservationError> {
+        timeout_at(
+            deadline,
+            self.sender.send(Pending {
+                server: self.server.clone(),
+                caller: self.caller.clone(),
+                deadline,
+                request: Request::Reserved(command),
+            }),
+        )
+        .await
+        .map_err(|_| ReservationError::Timeout)?
+        .map_err(|_| ReservationError::Unavailable)
+    }
+
+    pub(super) async fn reservation_request<T>(
+        &self,
+        deadline: Instant,
+        make: impl FnOnce(oneshot::Sender<Result<T, ReservationError>>) -> Command,
+    ) -> Result<T, ReservationError> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue_reserved(make(reply), deadline).await?;
+        timeout_at(deadline, response)
+            .await
+            .map_err(|_| ReservationError::Timeout)?
+            .map_err(|_| ReservationError::Unavailable)?
     }
 
     async fn request<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, ServiceError> {
@@ -677,19 +710,37 @@ where
                 }
             }
         });
+        let mut jobs = Jobs::new(cancel.clone());
+        let mut stopping = false;
         loop {
+            if stopping && jobs.is_empty() {
+                requests.close();
+            }
+            jobs.ready(Instant::now());
+            let deadline = jobs.next_deadline();
             tokio::select! {
                 biased;
-                _ = cancel.cancelled(), if !requests.is_closed() => requests.close(),
+                _ = cancel.cancelled(), if !stopping => {
+                    stopping = true;
+                    jobs.stop_waiting();
+                }
+                () = jobs.join_next(), if !jobs.is_empty() => {}
+                () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {}
                 pending = requests.recv() => {
                     let Some(pending) = pending else { break };
-                    // Drain admitted work under its original absolute deadline;
-                    // shutdown must not drop a paste before its separate Enter.
-                    match execute(&*client, &registry, pending).await {
-                        #[cfg(test)]
-                        Some(Audit::Barrier(reply)) => { let _ = audits.sender.send(Audit::Barrier(reply)).await; }
-                        Some(audit) => audits.enqueue(audit),
-                        None => {}
+                    match pending {
+                        self::Pending { request: Request::Reserved(command), .. } => {
+                            jobs.dispatch(command, Instant::now(), stopping);
+                        }
+                        pending => {
+                            // Keep U7's drain: never cancel admitted paste before Enter.
+                            match execute(&*client, &registry, pending).await {
+                                #[cfg(test)]
+                                Some(Audit::Barrier(reply)) => { let _ = audits.sender.send(Audit::Barrier(reply)).await; }
+                                Some(audit) => audits.enqueue(audit),
+                                None => {}
+                            }
+                        }
                     }
                 }
             }
@@ -725,9 +776,9 @@ where
 /// real control actor over MockTmuxClient, with a private or disabled OrgHandle.
 ///
 /// **Contract checkpoint:** organisation-aware behavior is not wired yet. This
-/// starts the unchanged legacy actor; the org argument is not used. Every new
-/// reserved operation returns a typed NotImplemented without admitting work.
-/// Production startup continues using spawn_control until implementation lands.
+/// starts the reservation-capable actor; the org argument is not used yet.
+/// Reserved pane effects remain typed NotImplemented; ownership and cleanup run.
+/// Production startup continues using spawn_control until org integration lands.
 pub fn spawn_control_with_org(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
@@ -840,6 +891,7 @@ async fn execute(
     let caller = pending.caller.as_ref();
     if let Some(server) = pending.server {
         let operation = match &pending.request {
+            Request::Reserved(_) => "reserved pane control".into(),
             Request::Send { target, .. } => format!("send to {target}"),
             Request::Prepare { target, caller, .. } => format!(
                 "spawn from {}",
@@ -855,6 +907,7 @@ async fn execute(
         };
         if let Err(error) = outcome(deadline, verify_server(client, server, operation)).await {
             match pending.request {
+                Request::Reserved(command) => command.reject(),
                 Request::Send { reply, .. } | Request::Split { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
@@ -875,6 +928,7 @@ async fn execute(
     let audit = match pending.request {
         #[cfg(test)]
         Request::FlushAudit(reply) => return Some(Audit::Barrier(reply)),
+        Request::Reserved(command) => { command.reject(); return None; },
         Request::Send {
             target,
             text,

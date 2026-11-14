@@ -44,58 +44,81 @@ fn contract_pane_id_accepts_only_exact_ascii_targets() {
 
 #[tokio::test]
 async fn contract_operations_return_typed_not_implemented() {
-    // No public constructor: only the real supervisor will mint capabilities.
-    let reservation = Reservation { agent: agent() };
-    assert_eq!(reservation.agent(), &agent());
-    let pane = PaneId::parse("%7").unwrap();
-    not_implemented(reservation.inspect(&pane).await, "inspect");
-    for expected in [ExpectedTag::Absent, ExpectedTag::Agent(agent())] {
-        not_implemented(reservation.tag(&pane, expected).await, "tag");
-    }
-    not_implemented(reservation.untag(&pane, agent()).await, "untag");
-    for key in [
-        PaneKey::Enter,
-        PaneKey::Escape,
-        PaneKey::Up,
-        PaneKey::Down,
-        PaneKey::CtrlC,
-    ] {
-        not_implemented(reservation.keys(&pane, agent(), key).await, "keys");
-    }
-    not_implemented(
-        reservation
-            .paste(&pane, agent(), "literal;\nEnter".into())
-            .await,
-        "paste",
+    // The real supervisor mints the capability; pane effects remain Task 3.
+    let cancel = CancellationToken::new();
+    let (control, task) = spawn_control(
+        Box::new(MockTmuxClient::new()),
+        crate::registry::spawn_registry(),
+        cancel.clone(),
     );
-    for format in [CaptureFormat::Plain, CaptureFormat::Ansi] {
-        not_implemented(reservation.capture(&pane, format).await, "capture");
-    }
-    not_implemented(
-        reservation
-            .split(
-                SpawnContext::new("%0".into(), None, false),
-                PaneDirection::Below,
-                "50%".into(),
-            )
-            .await,
-        "split",
-    );
-    not_implemented(
-        reservation
-            .kill(
-                &pane,
-                agent(),
-                serde_json::json!({"reason":"down"}),
-                DateTime::from_timestamp(0, 0).unwrap(),
-            )
-            .await,
-        "kill",
-    );
+    control
+        .run_reserved(
+            ReservationRequest {
+                agent: agent(),
+                pane: Some(PaneId::parse("%7").unwrap()),
+                kind: ReservationKind::Adopt,
+                wait: WaitPolicy::Wait,
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+            |reservation| async move {
+                assert_eq!(reservation.agent(), &agent());
+                let pane = PaneId::parse("%7").unwrap();
+                not_implemented(reservation.inspect(&pane).await, "inspect");
+                for expected in [ExpectedTag::Absent, ExpectedTag::Agent(agent())] {
+                    not_implemented(reservation.tag(&pane, expected).await, "tag");
+                }
+                not_implemented(reservation.untag(&pane, agent()).await, "untag");
+                for key in [
+                    PaneKey::Enter,
+                    PaneKey::Escape,
+                    PaneKey::Up,
+                    PaneKey::Down,
+                    PaneKey::CtrlC,
+                ] {
+                    not_implemented(reservation.keys(&pane, agent(), key).await, "keys");
+                }
+                not_implemented(
+                    reservation
+                        .paste(&pane, agent(), "literal;\nEnter".into())
+                        .await,
+                    "paste",
+                );
+                for format in [CaptureFormat::Plain, CaptureFormat::Ansi] {
+                    not_implemented(reservation.capture(&pane, format).await, "capture");
+                }
+                not_implemented(
+                    reservation
+                        .split(
+                            SpawnContext::new("%0".into(), None, false),
+                            PaneDirection::Below,
+                            "50%".into(),
+                        )
+                        .await,
+                    "split",
+                );
+                not_implemented(
+                    reservation
+                        .kill(
+                            &pane,
+                            agent(),
+                            serde_json::json!({"reason":"down"}),
+                            DateTime::from_timestamp(0, 0).unwrap(),
+                        )
+                        .await,
+                    "kill",
+                );
+                Ok::<_, ReservationError>(())
+            },
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+    cancel.cancel();
+    task.await.unwrap();
 }
 
 #[tokio::test]
-async fn contract_job_is_not_admitted_and_never_invokes_callbacks() {
+async fn contract_expired_job_is_not_admitted_and_never_invokes_callbacks() {
     let mock = MockTmuxClient::new();
     let cancel = CancellationToken::new();
     let (control, task) = spawn_control(
@@ -123,7 +146,7 @@ async fn contract_job_is_not_admitted_and_never_invokes_callbacks() {
                         pane: Some(PaneId::parse("%7").unwrap()),
                         kind,
                         wait,
-                        deadline: Instant::now() + Duration::from_secs(30),
+                        deadline: Instant::now(),
                     },
                     move |reservation| async move {
                         work_called.store(true, Ordering::SeqCst);
@@ -141,15 +164,11 @@ async fn contract_job_is_not_admitted_and_never_invokes_callbacks() {
                     },
                 )
                 .await;
-            not_implemented(result, "run_reserved");
+            assert!(matches!(result, Err(ReservationError::Timeout)));
             assert!(!called.load(Ordering::SeqCst));
         }
     }
-    assert_eq!(
-        mock.call_count(),
-        0,
-        "unimplemented jobs must have no effects"
-    );
+    assert_eq!(mock.call_count(), 0, "expired jobs must have no effects");
     cancel.cancel();
     task.await.unwrap();
 }

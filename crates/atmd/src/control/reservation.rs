@@ -1,13 +1,13 @@
 //! Exclusive, fenced control for an agent's lifecycle or one delivery.
 //!
-//! # Contract checkpoint — not implemented yet
+//! # Implementation checkpoint — ownership and supervision
 //!
-//! The signatures below let lifecycle and delivery callers compile against the
-//! real [`ControlHandle`] and [`atm_tmux::MockTmuxClient`], without a second test
-//! trait. Every new async operation currently returns
-//! [`ReservationError::NotImplemented`], with no effects or callback invocation.
-//! The ownership guarantees documented here are the implementation contract,
-//! **not guarantees provided by these stubs**. Existing send/spawn is unchanged.
+//! `run_reserved` now admits bounded daemon-owned jobs, serializes conflicting
+//! ownership, rotates cleanup fences and quarantines failed cleanup. Pane methods
+//! validate the live fence, then return [`ReservationError::NotImplemented`];
+//! tmux effects, org integration and legacy send/spawn isolation are still pending.
+//! The full effect/legacy-path guarantees below remain the implementation contract,
+//! **not guarantees provided by this checkpoint**. Existing send/spawn is unchanged.
 //!
 //! # Ownership and ordering
 //!
@@ -85,6 +85,11 @@ use chrono::{DateTime, Utc};
 use tokio::time::Instant;
 
 use super::{service::ControlHandle, ControlError, SpawnContext};
+
+#[path = "reserved_jobs.rs"]
+pub(super) mod jobs;
+#[path = "reservation_state.rs"]
+pub(super) mod state;
 
 /// Exact tmux pane target: `%` followed by one or more ASCII digits.
 ///
@@ -225,11 +230,14 @@ pub struct PaneCapture {
 ///
 /// Copies have the same lifetime/fence, not independent ownership. No public
 /// constructor/release method: only `run_reserved` can acquire and release.
-/// Implementation will carry actor/operation/phase identity in private fields.
+/// Private actor/operation/phase identity fences every submitted operation.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct Reservation {
     agent: AgentId,
+    control: ControlHandle,
+    fence: state::Fence,
+    deadline: Instant,
 }
 
 impl ControlHandle {
@@ -250,12 +258,12 @@ impl ControlHandle {
     /// after successful work is returned instead. Timeout/worker failure converts
     /// ReservationError through E. None of these failures rolls back effects.
     ///
-    /// **Checkpoint:** returns NotImplemented without invoking either closure.
+    /// Pane effects remain typed stubs at this checkpoint; ownership is live.
     pub async fn run_reserved<T, E, W, WF, C, CF>(
         &self,
-        _request: ReservationRequest,
-        _work: W,
-        _cleanup: C,
+        request: ReservationRequest,
+        work: W,
+        cleanup: C,
     ) -> Result<T, E>
     where
         T: Send + 'static,
@@ -265,14 +273,51 @@ impl ControlHandle {
         C: FnOnce(Reservation, Completion) -> CF + Send + 'static,
         CF: Future<Output = Result<(), E>> + Send + 'static,
     {
-        Err(ReservationError::NotImplemented {
-            operation: "run_reserved",
-        }
-        .into())
+        state::validate(&request, Instant::now())?;
+        let deadline = request.deadline;
+        let (job, response) = jobs::job(work, cleanup);
+        self.enqueue_reserved(
+            jobs::Command::Acquire(jobs::Admission {
+                request,
+                control: self.clone(),
+                job,
+            }),
+            deadline,
+        )
+        .await?;
+        // From enqueue onward the daemon owns the job, not this reply future.
+        response.await.map_err(|_| ReservationError::Unavailable)?
     }
 }
 
 impl Reservation {
+    async fn check(&self, pane: Option<&PaneId>) -> Result<(), ReservationError> {
+        let deadline = Instant::now() + super::service::ACTION_TIMEOUT;
+        self.control
+            .reservation_request(deadline, |reply| jobs::Command::Check {
+                fence: self.fence.clone(),
+                pane: pane.cloned(),
+                reply,
+            })
+            .await
+    }
+
+    async fn begin_cleanup(&self, deadline: Instant) -> Result<Self, ReservationError> {
+        let fence = self
+            .control
+            .reservation_request(deadline, |reply| jobs::Command::Cleanup {
+                fence: self.fence.clone(),
+                deadline,
+                reply,
+            })
+            .await?;
+        Ok(Self {
+            fence,
+            deadline,
+            ..self.clone()
+        })
+    }
+
     #[must_use]
     pub fn agent(&self) -> &AgentId {
         &self.agent
@@ -284,6 +329,7 @@ impl Reservation {
         &self,
         _pane: &PaneId,
     ) -> Result<Option<PaneInspection>, ReservationError> {
+        self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented {
             operation: "inspect",
         })
@@ -297,11 +343,13 @@ impl Reservation {
         _pane: &PaneId,
         _expected: ExpectedTag,
     ) -> Result<(), ReservationError> {
+        self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented { operation: "tag" })
     }
 
     /// Remove only this agent's matching local tag, without touching the process.
     pub async fn untag(&self, _pane: &PaneId, _expected: AgentId) -> Result<(), ReservationError> {
+        self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented { operation: "untag" })
     }
 
@@ -312,6 +360,7 @@ impl Reservation {
         _expected: AgentId,
         _key: PaneKey,
     ) -> Result<(), ReservationError> {
+        self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented { operation: "keys" })
     }
 
@@ -323,6 +372,7 @@ impl Reservation {
         _expected: AgentId,
         _text: String,
     ) -> Result<(), ReservationError> {
+        self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented { operation: "paste" })
     }
 
@@ -333,6 +383,7 @@ impl Reservation {
         _pane: &PaneId,
         _format: CaptureFormat,
     ) -> Result<PaneCapture, ReservationError> {
+        self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented {
             operation: "capture",
         })
@@ -347,6 +398,7 @@ impl Reservation {
         _direction: PaneDirection,
         _size: String,
     ) -> Result<PaneId, ReservationError> {
+        self.check(None).await?;
         Err(ReservationError::NotImplemented { operation: "split" })
     }
 
@@ -362,6 +414,7 @@ impl Reservation {
         _action: serde_json::Value,
         _now: DateTime<Utc>,
     ) -> Result<(), ReservationError> {
+        self.check(Some(_pane)).await?;
         Err(ReservationError::NotImplemented { operation: "kill" })
     }
 }
@@ -401,3 +454,7 @@ pub enum ReservationError {
 #[cfg(test)]
 #[path = "reservation_contract_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reservation_tests.rs"]
+mod ownership_tests;

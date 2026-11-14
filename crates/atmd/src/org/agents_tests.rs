@@ -683,6 +683,23 @@ mod reconciliation {
         .unwrap();
     }
 
+    // Down is admitted for this agent: the admission alone, with work that does
+    // nothing, so the probe does not depend on what `agent.down` does to a pane.
+    async fn down_admitted(agents: &AgentHandle, agent: &str, pane: &str) {
+        agents
+            .lifecycle(
+                request(
+                    agent,
+                    Some(pane),
+                    crate::control::reservation::ReservationKind::Down,
+                ),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+    }
+
     // One registry event handled by the observer, without a failed state read.
     // The hang guard is the outer timeout; a stalled read fails after 5 s first.
     async fn scheduled_without_reading(
@@ -1156,26 +1173,10 @@ mod reconciliation {
             .reason
             .is_some());
         assert_eq!(rig.state("bad").await.status, AgentStatus::Ready);
-        assert!(matches!(
-            agents
-                .down(DownParams {
-                    agent: "p/good".parse().unwrap(),
-                    kill: false,
-                })
-                .await,
-            Err(AgentError::NotImplemented { .. })
-        ));
+        down_admitted(&agents, "p/good", "%1").await;
         // Down inspects the pane itself and is admitted; other work for the failed
         // agent waits for its restart check, and the healthy agent is untouched.
-        assert!(matches!(
-            agents
-                .down(DownParams {
-                    agent: "p/bad".parse().unwrap(),
-                    kill: false,
-                })
-                .await,
-            Err(AgentError::NotImplemented { .. })
-        ));
+        down_admitted(&agents, "p/bad", "%2").await;
         for (agent, pane, admitted) in [("p/bad", "%2", false), ("p/good", "%1", true)] {
             let result = agents
                 .lifecycle(
@@ -1252,15 +1253,7 @@ mod reconciliation {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            agents
-                .down(DownParams {
-                    agent: "p/lead".parse().unwrap(),
-                    kill: false,
-                })
-                .await,
-            Err(AgentError::NotImplemented { .. })
-        ));
+        down_admitted(&agents, "p/lead", "%1").await;
         // The retry needs no registry event.
         rig.inspect_only("%1", "p/lead");
         progress(&mut events, "finished", Some("p/lead")).await;
@@ -1289,15 +1282,7 @@ mod reconciliation {
             .unwrap()
             .contains("observation unavailable"));
         // Down and respawn inspect the pane themselves and are never refused.
-        assert!(matches!(
-            agents
-                .down(DownParams {
-                    agent: "p/lead".parse().unwrap(),
-                    kill: false,
-                })
-                .await,
-            Err(AgentError::NotImplemented { .. })
-        ));
+        down_admitted(&agents, "p/lead", "%1").await;
         agents
             .lifecycle(
                 request("p/lead", Some("%1"), ReservationKind::Respawn),
@@ -1365,15 +1350,7 @@ mod reconciliation {
             Some("clear interrupted by daemon restart; inspect %1")
         );
         assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 1);
-        assert!(matches!(
-            agents
-                .down(DownParams {
-                    agent: "p/lead".parse().unwrap(),
-                    kill: false,
-                })
-                .await,
-            Err(AgentError::NotImplemented { .. })
-        ));
+        down_admitted(&agents, "p/lead", "%1").await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2986,6 +2963,11 @@ mod reconciliation {
                 fenced.then_some("second")
             );
         }
+    }
+
+    // The lifecycle flows' tests use this module's rig; they live in their own file.
+    mod lifecycle {
+        include!("agent_lifecycle_tests.rs");
     }
 
     #[tokio::test]

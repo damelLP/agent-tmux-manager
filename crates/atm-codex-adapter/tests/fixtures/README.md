@@ -3,9 +3,10 @@
 ## Finished-turn clocks (U8g)
 
 Captured: codex-cli 0.167.0, 2026-11-14, U5 and sealed P1 private-tmux
-captures. The P1/P2 corpus contains `<1s` and integer-second finished durations
-(`1s`, `2s`, `7s`, `16s`), with 12-hour `h:mm AM`/`h:mm PM` or 24-hour `HH:mm`
-clocks. P2 has no Worked lines. The sealed long-turn capture below adds `1m 5s`.
+captures. P1 contains `<1s`, `1s`, `7s` and `16s` finished durations with
+24-hour `HH:mm` clocks. U5 supplies `1s • 11:31 AM` and `2s • 11:32 AM`,
+the 12-hour clock evidence; P2 has no Worked lines. The sealed long-turn
+captures below add `1m 5s`.
 Finished durations accept `<1s`, seconds 1–59, minutes 1–59 plus seconds 0–59,
 or positive hours plus minutes/seconds 0–59, all without zero padding.
 Hour-duration shapes follow the codex-cli 0.167.0 binary's formatter and are
@@ -33,13 +34,40 @@ unchanged P1 loopback Responses stub held for 65 seconds, private tmux 3.8
 `capture-pane -p -e -N`, at 100x32 and 120x40. Both
 `screen_styled_u8g_finished-<size>_0.167.0.txt` frames show
 `Worked for 1m 5s • 21:19`. Only the private run root is replaced with an
-equal-width `/tmp/xxx…` token; styles and rows are unchanged. The initial
-prompt was passed through argv, with no pane keys sent or real API access.
-This launch displays compact footer chrome without the supported shortcuts
-row: the full observer still refuses it. A unit test reads the real duration
-line directly; an explicitly Synthetic transplant into the supported P1
-editor tests that duration through both public observers. No compact-footer
-support or style-based completion recognition is added here.
+equal-width `/tmp/xxx…` token; styles and rows are unchanged. Launched as
+`codex --no-daemon --no-alt-screen -C <dir> '<prompt>'`, with no pane keys
+sent or real API access. P3 isolated `--no-alt-screen` as the compact-footer
+trigger, not the positional prompt or `-C`. P3's spawn-today probe
+(`codex '<prompt>'`) and separate agent-policy probe
+(`codex --no-daemon '<prompt>'`) both have the normal footer. Today's atm
+launch applies that agent policy, so prompt-started Codex still has the
+normal footer. The compact empty footer lacks the supported shortcuts row:
+the full observer still refuses it. A unit test reads its real duration line
+directly. No compact-footer support or style-based completion recognition is
+added here.
+
+Captured: codex-cli 0.167.0, 2026-11-14, P3 sealed loopback-only Responses
+stub held 65 seconds, private tmux 3.8 `capture-pane -p -e -N`. Launched as
+`codex --no-daemon`, with a typed prompt. The normal-footer fixtures
+`screen_styled_p3_<stem>_0.167.0.txt` map to `a-matrix/<stem>.styled-N.txt`:
+
+- `A-p1-typed-100x32-idle`: `Worked for 1m 5s • 22:08` at 100x32.
+- `A-p1-typed-100x32-minute-idle-resized-120x40`: the same completed turn
+  after resize to 120x40.
+- `A-p1-typed-100x32-held-over-minute`: Working followed by a trailing tip.
+
+Only the private run root becomes an equal-width `/tmp/xxx…` token; styles,
+rows and spaces are unchanged. Tests strip only the provenance line. The
+minute pair replaces the Synthetic completion-line transplant: both public
+observers read Empty / NotRunning / no dialog / Unknown freshness, and the
+control observer reads conversation true.
+
+**Known limit:** the held-over-minute frame shows `Working (1m 05s • esc to
+interrupt)` followed by `└ Tip: Use /rename to rename your threads for easier
+thread resuming.`. Only the last nonblank history row is checked for Working,
+so both observers read Empty / Unknown turn / no dialog / Unknown freshness,
+with conversation true. This is a trailing-tip limit, not a duration failure;
+the test pins today's fail-closed reading, not support for this running state.
 
 ## Lifecycle control observations (B0)
 
@@ -96,8 +124,11 @@ trimming trailing spaces. Pending width-100 frames clip Interrupt and
 PostModelRequest. The selected row spans the pane; header padding is tmux
 allocation, not a clipping edge. Replays of real Codex bytes in tmux 3.8 show
 half-width header allocation from 142 columns and quarter-width from 284.
-A live Codex at 142 columns or wider and layouts below 100 columns are unverified.
-A combining mark on a full-width line refuses the page (a fail-closed limit).
+A live Codex at 142 columns or wider and layouts below 100 columns are
+unverified. A combining mark on a full-width line widens the inferred edge
+by one character: only pending 100-column pages with clipped descriptions
+refuse in the captured corpus (a fail-closed limit). Trimmed captures and
+pages without clipped descriptions still parse.
 Zero-count rows parse even for missing ATM registrations. Only the known
 uninstalled Interrupt, PreModelRequest and PostModelRequest rows are omitted
 from returned authorization entries: unknown events or installed extras refuse

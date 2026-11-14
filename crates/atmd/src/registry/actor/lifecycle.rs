@@ -8,7 +8,7 @@ use atm_core::{AgentType, LifecycleContext, LifecycleEvent, SessionId};
 use super::create::build_session_from_pid;
 use super::RegistryActor;
 use crate::discovery::read_parent_session_id;
-use crate::registry::commands::RegistryError;
+use crate::registry::commands::{AcceptedStart, RegistryError};
 
 impl RegistryActor {
     /// Handles applying a vendor-neutral lifecycle event to a session.
@@ -141,6 +141,18 @@ impl RegistryActor {
                 read_parent_session_id(p, harness),
             );
             self.insert_new_session(p, session)?;
+        }
+
+        // Recorded before the event is applied and published, so a reader
+        // woken by the row's update already finds the start it came from.
+        if let (true, LifecycleEvent::SessionStart { source }) = (starts_session, &event) {
+            if let Some((session, infra)) = self.sessions_by_pid.get_mut(&p) {
+                if session.id == session_id {
+                    infra.start = Some(AcceptedStart {
+                        source: source.clone(),
+                    });
+                }
+            }
         }
 
         if !self.prepare_child_event(p, &event, harness, &context) {

@@ -1,5 +1,7 @@
 use tracing::debug;
 
+use super::commands::AcceptedStart;
+
 // ============================================================================
 // Infrastructure Entity
 // ============================================================================
@@ -16,6 +18,10 @@ pub(super) struct SessionInfrastructure {
     /// Process start time in clock ticks (from /proc/{pid}/stat field 22).
     /// Used to detect PID reuse - if the start time changes, it's a different process.
     process_start_time: Option<u64>,
+
+    /// The latest untagged `SessionStart` applied to this row. It lives and
+    /// dies with the row, and is not part of the session's view.
+    pub(super) start: Option<AcceptedStart>,
 }
 
 impl SessionInfrastructure {
@@ -24,6 +30,7 @@ impl SessionInfrastructure {
         Self {
             pid: None,
             process_start_time: None,
+            start: None,
         }
     }
 

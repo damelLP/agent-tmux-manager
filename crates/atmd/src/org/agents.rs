@@ -9,10 +9,12 @@
 //! Lifecycle effects remain unavailable until the flow slice is installed.
 
 pub use super::agent_methods::register_agent_methods;
+pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
 pub use super::agent_types::*;
 use super::{agent_project::AgentProjects, OrgHandle, OrgServiceError};
 use crate::control::reservation::{
-    CaptureFormat, PaneId, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
+    CaptureFormat, PaneCapture, PaneId, Reservation, ReservationKind, ReservationRequest,
+    WaitPolicy,
 };
 use crate::server::methods::CallContext;
 use crate::{
@@ -123,8 +125,49 @@ pub(super) struct AgentRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
+    /// Each agent's pane and what was recorded about its processes. In memory
+    /// only; written under the agent's reservation.
+    baselines: Arc<std::sync::Mutex<HashMap<AgentId, (String, PaneBaseline)>>>,
     #[cfg(test)]
     progress: broadcast::Sender<ObservationProgress>,
+}
+
+impl AgentRuntime {
+    /// The baseline recorded for `agent` on `pane`, or one that refuses every
+    /// read: none was recorded, or it belongs to a pane the agent has left.
+    fn baseline(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
+        self.baselines
+            .lock()
+            .ok()
+            .and_then(|baselines| baselines.get(agent).cloned())
+            .filter(|(recorded, _)| recorded == pane)
+            .map_or_else(PaneBaseline::unproven, |(_, baseline)| baseline)
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
+        self.baselines
+            .lock()
+            .unwrap()
+            .insert(agent, (pane.into(), baseline));
+    }
+}
+
+/// What a delivery needs to know about its recipient, read in one call.
+#[derive(Debug, Clone)]
+pub struct Recipient {
+    pub pane: PaneId,
+    pub harness: Harness,
+    /// The harness's screen dispatch, for use with `baseline`.
+    pub screen: &'static AgentScreen,
+    /// What was recorded about the pane's processes. When nothing was, this is
+    /// [`PaneBaseline::unproven`] and every read through `screen` refuses.
+    pub baseline: PaneBaseline,
+    /// The agent's excluded (old) session: a session that appears later must
+    /// not be this one.
+    pub excluded: Option<SessionId>,
+    /// The single eligible parent session on the pane; `None` when there is none.
+    pub session: Option<SessionView>,
 }
 
 #[cfg(test)]
@@ -176,6 +219,22 @@ impl AgentHandle {
     #[cfg(test)]
     pub(super) fn observation_events(&self) -> broadcast::Receiver<ObservationProgress> {
         self.inner.runtime.as_ref().unwrap().progress.subscribe()
+    }
+
+    /// Resolves once no observation failure is stored for `agent`.
+    #[cfg(test)]
+    pub(super) async fn failure_cleared(&self, agent: &AgentId) {
+        let mut errors = self.inner.errors.clone();
+        errors
+            .wait_for(|errors| !errors.contains_key(agent))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
+        let rt = self.inner.runtime.as_ref().unwrap();
+        rt.record_baseline(agent, pane, baseline);
     }
 
     #[must_use]
@@ -441,6 +500,63 @@ impl AgentHandle {
         .await
         .map_err(|_| AgentError::Timeout)?
     }
+    /// The recipient's pane, screen dispatch, baseline and session, for a
+    /// delivery. Call it inside the caller's reservation for `agent`, so no
+    /// lifecycle job changes the answer before it is used.
+    ///
+    /// A registry that cannot answer, and a pane with more than one eligible
+    /// session, are errors: neither is ever reported as "no session".
+    pub async fn recipient(&self, agent: &AgentId) -> Result<Recipient, AgentError> {
+        const OPERATION: &str = "agent recipient";
+        if !matches!(*self.inner.ready.borrow(), Some(Ok(()))) {
+            return Err(self.unavailable(OPERATION));
+        }
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let state = rt.org.snapshot().await?;
+        let found = state
+            .agent(agent)
+            .ok_or_else(|| AgentError::NotFound(format!("agent {agent} was not found")))?;
+        let pane = found
+            .pane
+            .as_ref()
+            .ok_or_else(|| AgentError::Refused(format!("agent {agent} has no pane")))?;
+        let rows: Vec<SessionView> = timeout(LIST_BUDGET, rt.registry.pane_sessions(pane))
+            .await
+            .map_err(|_| AgentError::Timeout)?
+            .map_err(|error| AgentError::Unavailable(format!("session registry: {error}")))?
+            .into_iter()
+            .map(|row| row.view)
+            .collect();
+        let harness = harness(&state, found, &rows);
+        let screen = agent_screen(harness).ok_or_else(|| {
+            AgentError::Refused(format!(
+                "agent {agent}: no screen reader for harness {}",
+                harness.short_tag()
+            ))
+        })?;
+        let mut eligible = rows.into_iter().filter(|row| {
+            matches_agent(found, row) && !row.id.is_pending() && row.harness == harness.short_tag()
+        });
+        let session = eligible.next();
+        if eligible.next().is_some() {
+            return Err(AgentError::Conflict(format!(
+                "agent {agent} has more than one eligible session on {pane}"
+            )));
+        }
+        Ok(Recipient {
+            pane: PaneId::parse(pane)?,
+            harness,
+            screen,
+            baseline: rt.baseline(agent, pane),
+            excluded: found.excluded_session_id.clone(),
+            session,
+        })
+    }
+
     pub async fn reconciled(&self) -> Result<(), AgentError> {
         if let Some(reason) = &self.inner.disabled {
             return Err(AgentError::Unavailable(reason.clone()));
@@ -656,11 +772,17 @@ impl AgentRuntime {
         };
         #[cfg(test)]
         self.progress("capture", Some(agent.id.clone()));
-        let capture = r
-            .capture(&PaneId::parse(pane)?, CaptureFormat::Plain)
-            .await?;
         let harness = harness(state, agent, &rows);
-        let facts = screen(harness, &capture.text);
+        let screen = agent_screen(harness);
+        let capture = r
+            .capture(
+                &PaneId::parse(pane)?,
+                screen.map_or(CaptureFormat::Plain, AgentScreen::capture_format),
+            )
+            .await?;
+        let facts = screen
+            .map(|screen| unchecked_facts(screen, &capture))
+            .unwrap_or_default();
         let rows = self.rows().await?;
         let live: Vec<_> = rows
             .iter()
@@ -744,17 +866,18 @@ fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> Harness {
         })
 }
 
-// One adapter dispatch boundary; future lifecycle flows reuse this rather than
-// adding vendor branches. This base's adapters accept Plain/None; consuming their
-// styled capture policy waits for the adapter contract, not a local guess.
-fn screen(harness: Harness, text: &str) -> ScreenFacts {
-    let text = atm_core::ScreenInput::Plain(text);
-    match harness {
-        Harness::ClaudeCode => atm_claude_adapter::screen::observe_screen(text, None),
-        Harness::Codex => atm_codex_adapter::screen::observe_screen(text, None),
-        Harness::Pi => atm_pi_adapter::screen::observe_screen(text, None),
-        _ => ScreenFacts::default(),
-    }
+// Verdict off: the observer records no pane baseline yet, so it reads the screen
+// against the capture's own process facts (Unknown when tmux reports no root
+// process or command). The flow slice replaces this with the recorded baseline;
+// until then nothing here tells a harness from a shell showing a stale frame.
+fn unchecked_facts(screen: &AgentScreen, capture: &PaneCapture) -> ScreenFacts {
+    let inspection = &capture.inspection;
+    inspection
+        .pane_root_pid()
+        .zip(inspection.foreground_command.clone())
+        .and_then(|(root, command)| PaneBaseline::adopted(root).with_harness(command))
+        .map(|baseline| screen.facts(capture, &baseline))
+        .unwrap_or_default()
 }
 
 fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentListEntry {
@@ -814,6 +937,7 @@ pub fn spawn_agents(
         org,
         registry,
         control,
+        baselines: Arc::default(),
         #[cfg(test)]
         progress: broadcast::channel(4096).0,
     };
@@ -1118,7 +1242,12 @@ async fn observer(
                                 tracing::warn!(agent = %id, %error, retry_in = ?delay, "Agent observation failed");
                             }
                             Ok(()) => {
-                                next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
+                                // An agent that is Down by now keeps no timer entry.
+                                if routes.agents.contains_key(&id) {
+                                    next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
+                                } else {
+                                    next_observation.remove(&id);
+                                }
                                 backoff.remove(&id);
                                 // A binding wake that arrived before or during the restart check was
                                 // dropped, or fenced by the check's own write: look at the rows once more.
@@ -1146,14 +1275,24 @@ async fn observer(
                             Ok(state) => routes.refresh(&state),
                             Err(error) => tracing::warn!(%error, "Agent routing refresh deferred"),
                         }
+                        let id: Option<AgentId> = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok());
                         if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") {
-                            if let Some(id) = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok()) {
+                            if let Some(id) = id {
+                                pull_in(&BTreeSet::from([id.clone()]), &backoff, &mut next_observation);
                                 if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id]), Wake::Observe).await {
                                     tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
                                 }
                             }
                             #[cfg(test)]
                             rt.progress("committed_scheduled", None);
+                        } else if let Some(id) = id.filter(|_| event.kind == "agent.down") {
+                            // The failure was about a pane the agent no longer has: it
+                            // must not outlive the Down and hold the next `up`. A queued
+                            // retry now runs at once and finds the agent Down.
+                            restart.remove(&id);
+                            backoff.remove(&id);
+                            next_observation.remove(&id);
+                            errors.send_modify(|errors| { errors.remove(&id); });
                         }
                     },
                     Ok(_) => {},
@@ -1172,7 +1311,10 @@ async fn observer(
                 #[cfg(test)]
                 rt.progress("scheduling", None);
                 let result = match routes.wake(&rt, event).await {
-                    Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
+                    Ok(ids) => {
+                        pull_in(&ids, &backoff, &mut next_observation);
+                        schedule(&rt, &mut pending, ids, Wake::Bind).await
+                    }
                     Err(error) => Err(error),
                 };
                 #[cfg(test)]
@@ -1186,6 +1328,22 @@ async fn observer(
     // Keep the control/org alive until all admitted Observe jobs finish cleanup.
     while jobs.join_next().await.is_some() {}
     Ok(())
+}
+
+/// A wake for an agent whose observations are failing brings its next retry in
+/// to `RETRY_MIN` from now. Never sooner: a busy agent on an unreadable pane
+/// would otherwise be retried, and logged, on every hook.
+fn pull_in(
+    ids: &BTreeSet<AgentId>,
+    backoff: &BTreeMap<AgentId, Duration>,
+    next_observation: &mut BTreeMap<AgentId, Instant>,
+) {
+    let soonest = Instant::now() + RETRY_MIN;
+    for id in ids.iter().filter(|id| backoff.contains_key(*id)) {
+        if let Some(at) = next_observation.get_mut(id) {
+            *at = (*at).min(soonest);
+        }
+    }
 }
 
 /// What a scheduled observation is for.

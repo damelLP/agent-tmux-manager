@@ -268,7 +268,7 @@ enum ListFormat {
 // ============================================================================
 
 fn create_log_file() -> Option<std::fs::File> {
-    let log_dir = atmd::eventlog::state_dir()?;
+    let log_dir = atmd::eventlog::state_dir();
 
     if let Err(e) = fs::create_dir_all(&log_dir) {
         eprintln!("Warning: Failed to create log directory {log_dir:?}: {e}");

@@ -3,6 +3,212 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// Controlled receiver isolates the handle's admission/cancellation contract;
+// persistence and publication use real files in the other tests.
+fn controlled_log() -> (EventLog, mpsc::Receiver<Append>) {
+    let (requests, receiver) = mpsc::channel(1);
+    let (events, _) = broadcast::channel(1024);
+    (
+        EventLog {
+            requests,
+            slot: Arc::new(Semaphore::new(1)),
+            events,
+        },
+        receiver,
+    )
+}
+
+#[tokio::test]
+async fn expired_deadline_does_not_hand_over() {
+    let (log, mut receiver) = controlled_log();
+    let result = log
+        .append_with_timeout(ts(), "late", serde_json::Value::Null, Duration::ZERO)
+        .await;
+    assert!(matches!(result, Err(EventLogError::TimeoutBeforeHandover)));
+    assert!(receiver.try_recv().is_err(), "expired append was submitted");
+}
+
+#[tokio::test]
+async fn timeout_after_handover_keeps_the_inflight_slot() {
+    let (log, mut receiver) = controlled_log();
+    let short = Duration::from_millis(20);
+    assert!(matches!(
+        log.append_with_timeout(ts(), "first", serde_json::Value::Null, short)
+            .await,
+        Err(EventLogError::TimeoutAfterHandover)
+    ));
+    let first = receiver.recv().await.unwrap();
+    assert!(matches!(
+        log.append_with_timeout(ts(), "second", serde_json::Value::Null, short)
+            .await,
+        Err(EventLogError::TimeoutBeforeHandover)
+    ));
+    assert!(receiver.try_recv().is_err());
+    drop(first);
+    let (result, _) = tokio::join!(
+        log.append_with_timeout(
+            ts(),
+            "third",
+            serde_json::Value::Null,
+            Duration::from_secs(1)
+        ),
+        async {
+            receiver.recv().await.unwrap().reply.send(Ok(1)).unwrap();
+        },
+    );
+    assert_eq!(result.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_and_last_handle_drop_do_not_release_an_active_write() {
+    let (log, mut receiver) = controlled_log();
+    let clone = log.clone();
+    let caller =
+        tokio::spawn(async move { clone.append(ts(), "first", serde_json::Value::Null).await });
+    let active = receiver.recv().await.unwrap();
+    caller.abort();
+    let _ = caller.await;
+    assert!(matches!(
+        log.append_with_timeout(
+            ts(),
+            "second",
+            serde_json::Value::Null,
+            Duration::from_millis(20)
+        )
+        .await,
+        Err(EventLogError::TimeoutBeforeHandover)
+    ));
+    drop(log);
+    assert!(
+        receiver.recv().await.is_none(),
+        "last handle retains sender"
+    );
+    assert!(
+        active.reply.send(Ok(1)).is_err(),
+        "cancelled caller still listening"
+    );
+}
+
+#[tokio::test]
+async fn gone_writer_is_closed_not_a_timeout() {
+    let (log, receiver) = controlled_log();
+    drop(receiver);
+    assert!(matches!(
+        log.append(ts(), "gone", serde_json::Value::Null).await,
+        Err(EventLogError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_clones_publish_in_disk_order_and_lag_can_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = EventLog::open(dir.path(), Stream::Raw).unwrap();
+    let mut live = log.subscribe();
+    let mut tasks = Vec::new();
+    for n in 0..20 {
+        let log = log.clone();
+        tasks.push(tokio::spawn(async move {
+            log.append(ts(), "concurrent", serde_json::json!(n))
+                .await
+                .unwrap()
+        }));
+    }
+    let mut seqs = Vec::new();
+    for task in tasks {
+        seqs.push(task.await.unwrap());
+    }
+    seqs.sort();
+    assert_eq!(seqs, (1..=20).collect::<Vec<_>>());
+    for row in read_from(dir.path(), Stream::Raw, 0) {
+        assert_eq!(*live.recv().await.unwrap(), row.unwrap());
+    }
+    assert!(live.try_recv().is_err());
+    // No per-record raw sync; this crosses the actual public channel capacity.
+    for _ in 0..1025 {
+        log.append(ts(), "lag", serde_json::Value::Null)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        live.recv().await,
+        Err(broadcast::error::RecvError::Lagged(1))
+    ));
+    assert_eq!(live.recv().await.unwrap().seq, 22);
+    let recovered: Vec<_> = read_from(dir.path(), Stream::Raw, 20)
+        .map(|row| row.unwrap().seq)
+        .collect();
+    assert_eq!(recovered, (21..=1045).collect::<Vec<_>>());
+}
+
+#[derive(Clone)]
+struct TraceBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for TraceBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn repair_warns_with_path_line_and_dropped_byte_count() {
+    // Isolate tracing's process-wide callsite-interest cache from concurrent
+    // tests installing/dropping different thread-local subscribers.
+    if std::env::var_os("ATM_TEST_REPAIR_CHILD").is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "eventlog::tests::repair_warns_with_path_line_and_dropped_byte_count",
+            ])
+            .env("ATM_TEST_REPAIR_CHILD", "1")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("repair child timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = segment(
+        dir.path(),
+        Stream::Events,
+        1,
+        &[record(1), b"broken".to_vec()].concat(),
+    );
+    let output = TraceBuffer(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let capture = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || capture.clone())
+        .finish();
+    let log = tracing::subscriber::with_default(subscriber, || {
+        EventLog::open(dir.path(), Stream::Events).unwrap()
+    });
+    let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("WARN") && text.contains("Dropped incomplete event log tail"),
+        "{text}"
+    );
+    assert!(text.contains(&path.display().to_string()), "{text}");
+    assert!(
+        text.contains("line=2") && text.contains("dropped_bytes=6"),
+        "{text}"
+    );
+    drop(log);
+}
+
 fn ts() -> DateTime<Utc> {
     DateTime::from_timestamp(1_700_000_000, 0).unwrap()
 }

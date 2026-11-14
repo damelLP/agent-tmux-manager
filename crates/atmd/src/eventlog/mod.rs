@@ -204,6 +204,9 @@ impl EventLog {
             .await
             .map_err(|_| EventLogError::TimeoutBeforeHandover)?
             .map_err(|_| EventLogError::Closed)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(EventLogError::TimeoutBeforeHandover);
+        }
         let (reply, response) = oneshot::channel();
         self.requests
             .try_send(Append {

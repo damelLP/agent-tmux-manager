@@ -95,3 +95,36 @@ impl Writer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_sync_policy_and_write_errors_are_observable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        for stream in [Stream::Events, Stream::Raw] {
+            let mut writer = Writer::open(&stream.directory(dir.path()), stream).unwrap();
+            // Real Unix devices: /dev/full fails write; /dev/null accepts write
+            // but rejects sync_data. Replace only the low-level I/O boundary.
+            writer.file = OpenOptions::new().write(true).open("/dev/full").unwrap();
+            assert!(writer
+                .append(ts, "full".into(), serde_json::Value::Null)
+                .is_err());
+            assert_eq!(writer.next, Some(1));
+            writer.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
+            let result = writer.append(ts, "sync".into(), serde_json::Value::Null);
+            if stream == Stream::Events {
+                assert!(
+                    result.is_err(),
+                    "events acknowledged without a successful sync"
+                );
+                assert_eq!(writer.next, Some(1));
+            } else {
+                assert_eq!(result.unwrap().seq, 1, "raw attempted per-record sync");
+                assert!(writer.close().is_err(), "raw close skipped sync");
+            }
+        }
+    }
+}

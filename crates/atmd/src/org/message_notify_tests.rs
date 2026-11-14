@@ -370,17 +370,23 @@ async fn failed_append_has_no_notification() {
     let (requests, receive) = mpsc::channel(64);
     let (health, status) = tokio::sync::watch::channel(Ok(0));
     let (committed, _) = tokio::sync::broadcast::channel(16);
+    let mut fail = true;
     let actor = tokio::spawn(actor::run(
         atm_org::OrgState::default(),
         receive,
         health,
         committed.clone(),
         cancel.clone(),
-        |_| async {
-            Err(crate::eventlog::EventLogError::Io {
-                path: "events".into(),
-                source: std::io::Error::other("append failed"),
-            })
+        move |_| {
+            let failed = std::mem::take(&mut fail);
+            async move {
+                if failed {
+                    // Unlike fatal I/O errors, pre-handover timeout allows another command.
+                    Err(crate::eventlog::EventLogError::TimeoutBeforeHandover)
+                } else {
+                    Ok(1)
+                }
+            }
         },
     ));
     let org = OrgHandle {
@@ -394,10 +400,27 @@ async fn failed_append_has_no_notification() {
     let watch = org.watch(vec!["msg.sent".into()], 0).unwrap();
     let (tx, mut rx) = mpsc::channel(32);
     let consumer = tokio::spawn(consume(watch, 0, tx, Duration::ZERO, cancel.clone()));
-    assert!(org
-        .execute(OrgCommand::SendMessage(content()), now())
+    assert!(matches!(
+        org.execute(OrgCommand::SendMessage(content()), now()).await,
+        Err(OrgServiceError::Timeout)
+    ));
+    let mut successful = content();
+    successful.from = Address::System;
+    let committed = org
+        .execute(OrgCommand::SendMessage(successful), now())
         .await
-        .is_err());
+        .unwrap();
+    // This successful commit fences the failed append; cancellation must not mask it.
+    let notice = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(notice.id.seq(), committed[0].seq);
+    assert!(
+        notice.message.contains("from system:"),
+        "{}",
+        notice.message
+    );
     cancel.cancel();
     actor.await.unwrap();
     consumer.await.unwrap();

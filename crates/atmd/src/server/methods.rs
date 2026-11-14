@@ -258,8 +258,10 @@ fn control_error(error: crate::control::service::ServiceError) -> MethodError {
 
 fn require_control(
     control: Option<crate::control::service::ControlHandle>,
+    caller: CallContext,
 ) -> Result<crate::control::service::ControlHandle, MethodError> {
     control
+        .map(|control| control.with_caller(caller))
         .ok_or_else(|| MethodError::new(error_code::UNAVAILABLE, "control service is unavailable"))
 }
 
@@ -268,23 +270,27 @@ fn register_control(
     control: Option<crate::control::service::ControlHandle>,
 ) -> Result<(), MethodError> {
     let send = control.clone();
-    router.register("session.send", Duration::from_secs(35), move |_, params| {
-        let control = send.clone();
-        async move {
-            let p: SendParams = parse_params(params)?;
-            let pane = require_control(control)?
-                .send(p.target, p.text)
-                .await
-                .map_err(control_error)?;
-            Ok(serde_json::json!({"pane": pane}))
-        }
-    })?;
+    router.register(
+        "session.send",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = send.clone();
+            async move {
+                let p: SendParams = parse_params(params)?;
+                let pane = require_control(control, caller)?
+                    .send(p.target, p.text)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"pane": pane}))
+            }
+        },
+    )?;
     let prepare = control.clone();
     router.register("session.spawn_prepare", Duration::from_secs(35), move |caller, params| {
         let control = prepare.clone();
         async move {
             let p: PrepareParams = parse_params(params)?;
-            let context = require_control(control)?.prepare_spawn(p.target_pane, p.cwd, caller.from_pane.map(|p| p.0), p.fallback_cwd).await.map_err(control_error)?;
+            let context = require_control(control, caller.clone())?.prepare_spawn(p.target_pane, p.cwd, caller.from_pane.map(|p| p.0), p.fallback_cwd).await.map_err(control_error)?;
             Ok(serde_json::json!({"target_pane": context.target_pane, "cwd": context.cwd, "caller_pane_missing": context.caller_pane_missing()}))
         }
     })?;
@@ -292,13 +298,13 @@ fn register_control(
     router.register(
         "session.spawn",
         Duration::from_secs(35),
-        move |_, params| {
+        move |caller, params| {
             let control = split.clone();
             async move {
                 let p: SplitParams = parse_params(params)?;
                 let context =
                     crate::control::SpawnContext::new(p.target_pane, None, p.caller_pane_missing);
-                let pane = require_control(control)?
+                let pane = require_control(control, caller)?
                     .split_spawn(context, p.direction, p.size)
                     .await
                     .map_err(control_error)?;
@@ -309,11 +315,11 @@ fn register_control(
     router.register(
         "session.spawn_type",
         Duration::from_secs(35),
-        move |_, params| {
+        move |caller, params| {
             let control = control.clone();
             async move {
                 let p: TypeParams = parse_params(params)?;
-                require_control(control)?
+                require_control(control, caller)?
                     .type_spawn_command(p.pane, p.command)
                     .await
                     .map_err(control_error)?;
@@ -334,6 +340,243 @@ mod tests {
             client_id: CallerId("client".into()),
             from_pane: Some(CallerPane("%12".into())),
         }
+    }
+
+    async fn control_router(
+        org: crate::org::OrgHandle,
+    ) -> (
+        MethodRouter,
+        atm_tmux::MockTmuxClient,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        services
+            .registry
+            .register(atm_core::SessionDomain {
+                id: atm_core::SessionId::new("audit-session"),
+                tmux_pane: Some("%7".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mock = atm_tmux::MockTmuxClient::new();
+        mock.set_next_pane_id("%42");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (control, task) = crate::control::service::spawn_control(
+            Box::new(mock.clone()),
+            services.registry.clone(),
+            org.clone(),
+            cancel.clone(),
+        );
+        services.control = Some(control);
+        services.org = org;
+        (router(services).unwrap(), mock, cancel, task)
+    }
+
+    // An actor request ordered after each mutation is a barrier for its audit.
+    // No timer or polling is used to infer completion.
+    async fn audit_barrier(router: &MethodRouter) {
+        router
+            .call(
+                context(),
+                "session.spawn_prepare",
+                json!({"target_pane":"%7"}),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn successful_control_actions(router: &MethodRouter) {
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.send",
+                    json!({"target":"audit-session","text":"private text"})
+                )
+                .await
+                .unwrap(),
+            json!({"pane":"%7"})
+        );
+        assert_eq!(
+            router.call(context(), "session.spawn", json!({"target_pane":"%7","caller_pane_missing":false,"direction":"below","size":"50%"})).await.unwrap(),
+            json!({"pane":"%42"})
+        );
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.spawn_type",
+                    json!({"pane":"%42","command":"private command"})
+                )
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        audit_barrier(router).await;
+    }
+
+    #[tokio::test]
+    async fn control_actions_append_actual_panes_and_attribution_without_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+        let (router, mock, cancel, task) = control_router(org).await;
+        successful_control_actions(&router).await;
+        let records = router
+            .call(context(), "log.tail", json!({"topics":["control"]}))
+            .await
+            .unwrap();
+        let records = records.as_array().unwrap();
+        assert_eq!(records.len(), 3);
+        for (record, kind, pane, method) in [
+            (&records[0], "control.sent", "%7", "session.send"),
+            (&records[1], "control.spawned", "%42", "session.spawn"),
+            (&records[2], "control.sent", "%42", "session.spawn_type"),
+        ] {
+            assert_eq!(record["kind"], kind);
+            assert_eq!(
+                record["body"],
+                json!({"pane":pane,"action":{
+                    "method":method,"outcome":"ok","error":null,
+                    "client_id":"client","from_pane":"%12"
+                }})
+            );
+        }
+        assert!(!serde_json::to_string(records).unwrap().contains("private"));
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| matches!(call, atm_tmux::mock::MockCall::PasteText { .. }))
+                .count(),
+            1
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn disabled_organisation_does_not_change_or_repeat_control_actions() {
+        let (router, mock, cancel, task) =
+            control_router(crate::org::OrgHandle::disabled("test disabled")).await;
+        successful_control_actions(&router).await;
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| matches!(call, atm_tmux::mock::MockCall::PasteText { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| matches!(call, atm_tmux::mock::MockCall::SplitWindow { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| matches!(call, atm_tmux::mock::MockCall::SendKeys { .. }))
+                .count(),
+            3
+        );
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_errors_are_audited_without_claiming_success_or_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+        let (router, mock, cancel, task) = control_router(org).await;
+        mock.set_next_raw_output("1 0");
+        let error = router
+            .call(
+                context(),
+                "session.send",
+                json!({"target":"%7","text":"no"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "refused");
+        audit_barrier(&router).await;
+        mock.set_next_error(atm_tmux::TmuxError::NotFound);
+        let error = router
+            .call(
+                context(),
+                "session.spawn_type",
+                json!({"pane":"%42","command":"no"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "internal");
+        audit_barrier(&router).await;
+        mock.set_next_error(atm_tmux::TmuxError::NotFound);
+        let error = router
+            .call(
+                context(),
+                "session.send",
+                json!({"target":"audit-session","text":"no"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "internal");
+        audit_barrier(&router).await;
+        mock.set_next_error(atm_tmux::TmuxError::NotFound);
+        let error = router.call(context(), "session.spawn", json!({"target_pane":"%7","caller_pane_missing":false,"direction":"below","size":"50%"})).await.unwrap_err();
+        assert_eq!(error.0.code, "internal");
+        audit_barrier(&router).await;
+        let error = router
+            .call(
+                context(),
+                "session.send",
+                json!({"target":"missing-session","text":"no"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "not_found");
+        audit_barrier(&router).await;
+        let records = router
+            .call(context(), "log.tail", json!({"topics":["control"]}))
+            .await
+            .unwrap();
+        let records = records.as_array().unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0]["body"]["pane"], "%7");
+        assert_eq!(records[1]["body"]["pane"], "%42");
+        assert_eq!(
+            records[2]["body"]["pane"], "%7",
+            "failed alias send still names the resolved pane"
+        );
+        assert_eq!(records[3]["kind"], "control.spawned");
+        assert_eq!(
+            records[3]["body"]["pane"], "%7",
+            "failed split names its attempted target, not a fictitious new pane"
+        );
+        for record in records {
+            assert_eq!(record["body"]["action"]["outcome"], "error");
+            assert!(record["body"]["action"]["error"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()));
+        }
+        assert!(!mock
+            .calls()
+            .iter()
+            .any(|call| matches!(call, atm_tmux::mock::MockCall::PasteText { .. })));
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| matches!(call, atm_tmux::mock::MockCall::SendKeys { .. }))
+                .count(),
+            1
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 //! Serialized, deadline-bounded session control. Dropping a waiting caller does
 //! not cancel an admitted action or retry its possibly partial effects.
+//! Replies acknowledge control, not persistence: audit follows the reply, before
+//! the next queued operation. Failed audits warn once and never change the result.
 
 #[cfg(test)]
 mod tests {
@@ -16,6 +18,7 @@ mod tests {
         let (control, task) = spawn_control(
             Box::new(mock.clone()),
             crate::registry::spawn_registry(),
+            OrgHandle::disabled("test disabled"),
             cancel.clone(),
         );
         assert_eq!(
@@ -67,6 +70,7 @@ mod tests {
         let (control, task) = spawn_control(
             Box::new(mock.clone()),
             crate::registry::spawn_registry(),
+            OrgHandle::disabled("test disabled"),
             CancellationToken::new(),
         );
         let error = control.send("%7".into(), "hi".into()).await.unwrap_err();
@@ -84,16 +88,21 @@ mod tests {
         task.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn expired_queued_actions_never_touch_tmux_even_if_caller_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
         let mock = MockTmuxClient::new();
         let (reply, response) = oneshot::channel();
         drop(response);
         execute(
             &mock,
             &crate::registry::spawn_registry(),
+            &org,
             Pending {
                 deadline: Instant::now(),
+                caller: None,
                 request: Request::Type {
                     pane: "%7".into(),
                     command: "late".into(),
@@ -103,6 +112,66 @@ mod tests {
         )
         .await;
         assert_eq!(mock.call_count(), 0);
+        assert_eq!(
+            org.status().unwrap(),
+            0,
+            "expired queued work is not an action"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn admitted_action_is_audited_even_when_its_receiver_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = CancellationToken::new();
+        let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+        let mock = MockTmuxClient::new();
+        let cancel = CancellationToken::new();
+        let (control, task) = spawn_control(
+            Box::new(mock.clone()),
+            crate::registry::spawn_registry(),
+            org.clone(),
+            cancel.clone(),
+        );
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        control
+            .sender
+            .send(Pending {
+                deadline: Instant::now() + ACTION_TIMEOUT,
+                caller: None,
+                request: Request::Type {
+                    pane: "%42".into(),
+                    command: "once".into(),
+                    reply,
+                },
+            })
+            .await
+            .unwrap();
+        // This next actor operation cannot finish before the earlier audit.
+        control
+            .prepare_spawn(Some("%7".into()), None, None, None)
+            .await
+            .unwrap();
+        let records = org.tail(crate::org::TailParams::default()).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, "control.sent");
+        assert_eq!(records[0].body["pane"], "%42");
+        assert_eq!(records[0].body["action"]["outcome"], "ok");
+        assert_eq!(
+            records[0].body["action"]["client_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| matches!(call, MockCall::SendKeys { .. }))
+                .count(),
+            2
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
     }
 
     #[tokio::test(start_paused = true)]
@@ -113,6 +182,7 @@ mod tests {
             sender
                 .try_send(Pending {
                     deadline: Instant::now() + ACTION_TIMEOUT,
+                    caller: None,
                     request: Request::Type {
                         pane: "%7".into(),
                         command: "queued".into(),
@@ -122,20 +192,16 @@ mod tests {
                 .ok()
                 .unwrap();
         }
-        let handle = ControlHandle { sender };
+        let handle = ControlHandle {
+            sender,
+            caller: None,
+        };
         assert!(matches!(
             handle.send("%7".into(), "blocked".into()).await,
             Err(ServiceError::Timeout)
         ));
-        let (reply, response) = oneshot::channel::<Result<(), ServiceError>>();
-        respond(
-            Instant::now() + ACTION_TIMEOUT,
-            reply,
-            std::future::pending(),
-        )
-        .await;
         assert!(matches!(
-            response.await.unwrap(),
+            outcome::<()>(Instant::now() + ACTION_TIMEOUT, std::future::pending()).await,
             Err(ServiceError::Timeout)
         ));
     }
@@ -143,6 +209,7 @@ mod tests {
 
 use std::time::Duration;
 
+use atm_org::{ControlAudit, OrgCommand};
 use atm_tmux::{PaneDirection, TmuxClient};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -150,7 +217,7 @@ use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{ControlError, SpawnContext};
-use crate::registry::RegistryHandle;
+use crate::{org::OrgHandle, registry::RegistryHandle, server::methods::CallContext};
 
 const CAPACITY: usize = 32;
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -195,6 +262,7 @@ enum Request {
 
 struct Pending {
     deadline: Instant,
+    caller: Option<CallContext>,
     request: Request,
 }
 
@@ -202,9 +270,17 @@ struct Pending {
 #[derive(Debug, Clone)]
 pub struct ControlHandle {
     sender: mpsc::Sender<Pending>,
+    caller: Option<CallContext>,
 }
 
 impl ControlHandle {
+    /// Attribute subsequent calls; this client-supplied identity is not authentication.
+    #[must_use]
+    pub fn with_caller(mut self, caller: CallContext) -> Self {
+        self.caller = Some(caller);
+        self
+    }
+
     async fn request<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, ServiceError> {
         let deadline = Instant::now() + ACTION_TIMEOUT;
         let (reply, response) = oneshot::channel();
@@ -212,6 +288,7 @@ impl ControlHandle {
             self.sender
                 .send(Pending {
                     deadline,
+                    caller: self.caller.clone(),
                     request: make(reply),
                 })
                 .await
@@ -282,6 +359,7 @@ impl ControlHandle {
 pub fn spawn_control(
     client: Box<dyn TmuxClient>,
     registry: RegistryHandle,
+    org: OrgHandle,
     cancel: CancellationToken,
 ) -> (ControlHandle, JoinHandle<()>) {
     let (sender, mut requests) = mpsc::channel::<Pending>(CAPACITY);
@@ -295,41 +373,81 @@ pub fn spawn_control(
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => break,
-                        () = execute(&*client, &registry, pending) => {}
+                        () = execute(&*client, &registry, &org, pending) => {}
                     }
                 }
             }
         }
     });
-    (ControlHandle { sender }, task)
+    (
+        ControlHandle {
+            sender,
+            caller: None,
+        },
+        task,
+    )
 }
 
-async fn respond<T>(
+async fn outcome<T>(
     deadline: Instant,
-    reply: Reply<T>,
     work: impl std::future::Future<Output = Result<T, ServiceError>>,
-) {
+) -> Result<T, ServiceError> {
     // timeout_at may poll an immediately-ready future at an expired deadline;
     // explicitly refuse queued work before its first external effect.
-    let result = if Instant::now() >= deadline {
+    if Instant::now() >= deadline {
         Err(ServiceError::Timeout)
     } else {
         timeout_at(deadline, work)
             .await
             .unwrap_or(Err(ServiceError::Timeout))
-    };
-    let _ = reply.send(result);
+    }
 }
 
-async fn execute(client: &dyn TmuxClient, registry: &RegistryHandle, pending: Pending) {
+fn respond<T>(
+    reply: Reply<T>,
+    result: Result<T, ServiceError>,
+    audit: impl FnOnce(&Result<T, ServiceError>) -> Option<OrgCommand>,
+) -> Option<OrgCommand> {
+    let audit = audit(&result);
+    let _ = reply.send(result);
+    audit
+}
+
+fn control_audit<T>(
+    method: &str,
+    pane: &str,
+    caller: Option<&CallContext>,
+    result: &Result<T, ServiceError>,
+) -> ControlAudit {
+    ControlAudit {
+        pane: pane.into(),
+        action: serde_json::json!({
+            "method": method,
+            "outcome": if result.is_ok() { "ok" } else { "error" },
+            "error": result.as_ref().err().map(ToString::to_string),
+            "client_id": caller.map(|c| c.client_id.0.as_str()),
+            "from_pane": caller.and_then(|c| c.from_pane.as_ref()).map(|p| p.0.as_str()),
+        }),
+    }
+}
+
+async fn execute(
+    client: &dyn TmuxClient,
+    registry: &RegistryHandle,
+    org: &OrgHandle,
+    pending: Pending,
+) {
     let deadline = pending.deadline;
-    match pending.request {
+    let expired = Instant::now() >= deadline;
+    let caller = pending.caller.as_ref();
+    let audit = match pending.request {
         Request::Send {
             target,
             text,
             reply,
         } => {
-            respond(deadline, reply, async {
+            let mut pane = target.starts_with('%').then(|| target.clone());
+            let result = outcome(deadline, async {
                 if !registry.is_connected() {
                     return Err(ServiceError::Unavailable);
                 }
@@ -337,9 +455,15 @@ async fn execute(client: &dyn TmuxClient, registry: &RegistryHandle, pending: Pe
                 if !registry.is_connected() {
                     return Err(ServiceError::Unavailable);
                 }
+                pane = super::resolve_pane_id(&sessions, &target).ok();
                 Ok(super::send(client, &sessions, &target, &text).await?)
             })
-            .await
+            .await;
+            respond(reply, result, |result| {
+                pane.as_deref().map(|pane| {
+                    OrgCommand::ControlSent(control_audit("session.send", pane, caller, result))
+                })
+            })
         }
         Request::Prepare {
             target,
@@ -348,7 +472,7 @@ async fn execute(client: &dyn TmuxClient, registry: &RegistryHandle, pending: Pe
             fallback,
             reply,
         } => {
-            respond(deadline, reply, async {
+            let result = outcome(deadline, async {
                 Ok(super::prepare_spawn(
                     client,
                     cwd.as_deref(),
@@ -358,7 +482,8 @@ async fn execute(client: &dyn TmuxClient, registry: &RegistryHandle, pending: Pe
                 )
                 .await?)
             })
-            .await
+            .await;
+            respond(reply, result, |_| None)
         }
         Request::Split {
             context,
@@ -366,20 +491,42 @@ async fn execute(client: &dyn TmuxClient, registry: &RegistryHandle, pending: Pe
             size,
             reply,
         } => {
-            respond(deadline, reply, async {
+            let result = outcome(deadline, async {
                 Ok(super::split_spawn(client, &context, direction, &size).await?)
             })
-            .await
+            .await;
+            respond(reply, result, |result| {
+                let pane = result.as_deref().unwrap_or(&context.target_pane);
+                Some(OrgCommand::ControlSpawned(control_audit(
+                    "session.spawn",
+                    pane,
+                    caller,
+                    result,
+                )))
+            })
         }
         Request::Type {
             pane,
             command,
             reply,
         } => {
-            respond(deadline, reply, async {
+            let result = outcome(deadline, async {
                 Ok(super::type_spawn_command(client, &pane, &command).await?)
             })
-            .await
+            .await;
+            respond(reply, result, |result| {
+                Some(OrgCommand::ControlSent(control_audit(
+                    "session.spawn_type",
+                    &pane,
+                    caller,
+                    result,
+                )))
+            })
+        }
+    };
+    if let Some(audit) = audit.filter(|_| !expired) {
+        if let Err(error) = org.execute(audit, chrono::Utc::now()).await {
+            tracing::warn!(%error, "control audit failed; action result unchanged, not retrying");
         }
     }
 }

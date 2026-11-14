@@ -88,7 +88,12 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
         .unwrap();
     let mock = MockTmuxClient::new();
     let cancel = CancellationToken::new();
-    let (control, actor) = spawn_control(Box::new(mock.clone()), registry.clone(), cancel.clone());
+    let (control, actor) = spawn_control(
+        Box::new(mock.clone()),
+        registry.clone(),
+        atmd::org::OrgHandle::disabled("test disabled"),
+        cancel.clone(),
+    );
     let mut services = MethodServices::new(registry.clone());
     services.control = Some(control);
     let server =

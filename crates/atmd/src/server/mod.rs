@@ -157,6 +157,7 @@ impl DaemonServer {
             let (control, task) = crate::control::service::spawn_control(
                 Box::new(atm_tmux::RealTmuxClient::new()),
                 self.registry.clone(),
+                services.org.clone(),
                 control_cancel.clone(),
             );
             services.control = Some(control);

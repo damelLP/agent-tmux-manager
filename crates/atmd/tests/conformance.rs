@@ -39,6 +39,7 @@ impl Server {
         let (control, _) = atmd::control::service::spawn_control(
             Box::new(mock),
             services.registry.clone(),
+            services.org.clone(),
             CancellationToken::new(),
         );
         services.control = Some(control);

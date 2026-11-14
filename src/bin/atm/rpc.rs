@@ -4,6 +4,7 @@
 //! never retried: a timeout does not prove that a mutation had no effect.
 
 use std::path::Path;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use atm_protocol::{ClientMessage, DaemonMessage, ProtocolVersion, ResponseError, ResponsePayload};
@@ -14,7 +15,8 @@ use tokio::net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream};
 const MAX_LINE_SIZE: usize = 1_048_576;
 // A timed-out startup may still be blocked on a PID file. Retain its permit
 // in that thread so subsequent calls cannot accumulate more blocked threads.
-static STARTUP_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static STARTUP_SLOT: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -34,6 +36,7 @@ pub async fn call(method: &str, params: Value, budget: Duration) -> Result<Value
     let socket = atm_tui::client::resolve_socket_path();
     let from_pane = super::spawn::non_empty_env("TMUX_PANE");
     call_with_startup(
+        Arc::clone(&STARTUP_SLOT),
         &socket,
         method,
         params,
@@ -45,6 +48,7 @@ pub async fn call(method: &str, params: Value, budget: Duration) -> Result<Value
 }
 
 async fn call_with_startup<F>(
+    startup_slot: Arc<tokio::sync::Semaphore>,
     socket: &Path,
     method: &str,
     params: Value,
@@ -58,7 +62,10 @@ where
     tokio::time::timeout(budget, async {
         // Startup reads a PID file: even a FIFO must not keep the async runtime
         // alive after our deadline. One detached call, never a retry loop.
-        let permit = STARTUP_SLOT.acquire().await.map_err(connection_error)?;
+        let permit = startup_slot
+            .acquire_owned()
+            .await
+            .map_err(connection_error)?;
         let (send, receive) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("atm-rpc-start".into())
@@ -168,6 +175,89 @@ mod tests {
     use serde_json::json;
     use tokio::net::UnixListener;
 
+    fn assert_private_paths(run: &Path, socket: &Path, xdg: Option<&Path>) {
+        let run = run.canonicalize().expect("run directory must exist");
+        assert!(
+            run.parent().is_some(),
+            "filesystem root is not a private run directory"
+        );
+        let socket_dir = socket
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .expect("socket directory must exist");
+        let xdg = xdg
+            .expect("private XDG_STATE_HOME required")
+            .canonicalize()
+            .expect("XDG directory must exist");
+        assert!(
+            socket_dir.starts_with(&run) && socket_dir != run,
+            "ATM_SOCKET must be inside the run directory"
+        );
+        assert!(
+            xdg.parent() == Some(run.as_path()),
+            "XDG_STATE_HOME must be a private child of the run directory"
+        );
+    }
+
+    fn startup_slot() -> std::sync::Arc<tokio::sync::Semaphore> {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+    }
+
+    #[tokio::test]
+    async fn injected_slot_wait_is_bounded_without_running_startup() {
+        let slot = startup_slot();
+        let _held = slot.acquire().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = call_with_startup(
+            slot.clone(),
+            &dir.path().join("unused.sock"),
+            "daemon.info",
+            json!({}),
+            None,
+            Duration::from_millis(30),
+            || panic!("startup ran without its slot"),
+        )
+        .await;
+        assert!(matches!(result, Err(RpcError::Timeout)));
+    }
+
+    #[test]
+    fn autostart_guard_rejects_missing_or_escaped_xdg_and_socket() {
+        let run = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(run.path().join("s")).unwrap();
+        std::fs::create_dir(run.path().join("xdg")).unwrap();
+        let socket = run.path().join("s/atm.sock");
+        let xdg = run.path().join("xdg");
+        assert_private_paths(run.path(), &socket, Some(&xdg));
+        assert!(std::panic::catch_unwind(|| assert_private_paths(
+            Path::new("/"),
+            &socket,
+            Some(&xdg)
+        ))
+        .is_err());
+        for bad in [None, Some(outside.path())] {
+            assert!(
+                std::panic::catch_unwind(|| assert_private_paths(run.path(), &socket, bad))
+                    .is_err()
+            );
+        }
+        assert!(std::panic::catch_unwind(|| assert_private_paths(
+            run.path(),
+            &outside.path().join("atm.sock"),
+            Some(&xdg)
+        ))
+        .is_err());
+        std::os::unix::fs::symlink(outside.path(), run.path().join("escape")).unwrap();
+        assert!(std::panic::catch_unwind(|| assert_private_paths(
+            run.path(),
+            &socket,
+            Some(&run.path().join("escape"))
+        ))
+        .is_err());
+    }
+
     fn connected(methods: Option<Value>) -> Value {
         let mut value =
             json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"cli"});
@@ -224,6 +314,7 @@ mod tests {
             }
         });
         let result = call_with_startup(
+            startup_slot(),
             &socket,
             "daemon.info",
             json!({}),
@@ -301,7 +392,7 @@ mod tests {
             let _ = stream.write_all(&vec![b'x'; 1_048_577]).await;
         });
         assert!(
-            matches!(call_with_startup(&socket, "daemon.info", json!({}), None, Duration::from_secs(5), || Ok(())).await, Err(RpcError::Connection(message)) if message.contains("large"))
+            matches!(call_with_startup(startup_slot(), &socket, "daemon.info", json!({}), None, Duration::from_secs(5), || Ok(())).await, Err(RpcError::Connection(message)) if message.contains("large"))
         );
         peer.await.unwrap();
     }
@@ -312,6 +403,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("slow.sock");
             let listener = UnixListener::bind(&socket).unwrap();
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
             let peer = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
@@ -328,6 +420,7 @@ mod tests {
                     line.clear();
                     read.read_line(&mut line).await.unwrap();
                 }
+                reached_tx.send(()).unwrap();
                 loop {
                     if phase == "noise"
                         && write
@@ -341,6 +434,7 @@ mod tests {
                 }
             });
             let result = call_with_startup(
+                startup_slot(),
                 &socket,
                 "daemon.info",
                 json!({}),
@@ -351,6 +445,9 @@ mod tests {
             .await;
             peer.abort();
             let _ = peer.await;
+            reached_rx
+                .await
+                .expect("timeout must reach the phase being tested");
             assert!(
                 matches!(result, Err(RpcError::Timeout)),
                 "{phase}: {result:?}"
@@ -365,6 +462,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let bind_path = socket.clone();
         let result = call_with_startup(
+            startup_slot(),
             &socket,
             "daemon.info",
             json!({}),
@@ -386,26 +484,38 @@ mod tests {
     #[tokio::test]
     async fn stalled_startup_does_not_hold_the_runtime() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let slot = startup_slot();
         let dir = tempfile::tempdir().unwrap();
-        let result = call_with_startup(
-            &dir.path().join("absent.sock"),
+        let socket = dir.path().join("absent.sock");
+        let first = call_with_startup(
+            slot.clone(),
+            &socket,
             "daemon.info",
             json!({}),
             None,
-            Duration::from_millis(50),
+            Duration::from_secs(5),
             move || {
+                started_tx.send(()).unwrap();
                 let _ = release_rx.recv();
                 Ok(())
             },
-        )
-        .await;
-        assert!(matches!(result, Err(RpcError::Timeout)));
+        );
+        tokio::pin!(first);
+        tokio::select! {
+            started = started_rx => started.unwrap(),
+            result = &mut first => panic!("startup did not reach its blocking phase: {result:?}"),
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(matches!(first.await, Err(RpcError::Timeout)));
         // A timeout must not allow another caller to pile up a detached thread
         // on the same stuck PID-file read.
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let second_called = called.clone();
         let second = call_with_startup(
-            &dir.path().join("absent.sock"),
+            slot,
+            &socket,
             "daemon.info",
             json!({}),
             None,
@@ -423,6 +533,8 @@ mod tests {
 
     /// Run explicitly with a built atmd on a private PATH and all daemon/tmux
     /// state isolated. The outer rig owns and cleans up the spawned daemon.
+    /// U7 replaces this ignored check with a sealed root-level CLI test once a
+    /// command uses rpc.rs; do not enable it in an unsealed test process.
     #[tokio::test]
     #[ignore = "requires a built atmd and a sealed process environment"]
     async fn autostart_stopped_daemon() {
@@ -435,6 +547,11 @@ mod tests {
         let tmux = std::path::PathBuf::from(
             std::env::var_os("TMUX_TMPDIR").expect("private tmux required"),
         );
+        let tmp =
+            std::path::PathBuf::from(std::env::var_os("TMPDIR").expect("private TMPDIR required"));
+        let run = tmp.parent().expect("run directory required");
+        let xdg = std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from);
+        assert_private_paths(run, &socket, xdg.as_deref());
         assert_eq!(socket.parent().and_then(Path::parent), state.parent());
         assert_eq!(tmux.parent(), state.parent());
         assert!(std::env::var_os("TMUX").is_none());
@@ -465,6 +582,7 @@ mod tests {
         .await
         .unwrap();
         let result = call_with_startup(
+            startup_slot(),
             &socket,
             "daemon.info",
             json!({"bad":1}),

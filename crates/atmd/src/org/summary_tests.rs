@@ -204,6 +204,18 @@ async fn full_actor_queue_keeps_dirty_summary_for_retry() {
     actor.await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn stalled_flush_fits_stop_budget_after_connection_drain() {
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(std::future::pending());
+    let observer = SummaryObserver { stop, task };
+    // Stop waits 5 s; connection drain can spend 2 s. The flush must finish
+    // before the remaining 3 s expires. All I/O is in-memory and time is paused.
+    tokio::time::timeout(Duration::from_secs(3), observer.finish())
+        .await
+        .unwrap();
+}
+
 async fn next_summary(watch: &mut crate::org::EventWatch) -> SessionSummary {
     let record = tokio::time::timeout(Duration::from_secs(60), watch.next())
         .await

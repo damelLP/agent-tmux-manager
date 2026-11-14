@@ -187,14 +187,14 @@ mod tests {
                     let gate = gate.clone();
                     let entered = entered.clone();
                     let org = org.clone();
-                    move |audit| {
+                    move |audit, now| {
                         let gate = gate.clone();
                         let entered = entered.clone();
                         let org = org.clone();
                         async move {
                             entered.notify_one();
                             let _permit = gate.acquire().await.unwrap();
-                            org.execute(audit, chrono::Utc::now()).await.unwrap();
+                            org.execute(audit, now).await
                         }
                     }
                 },
@@ -235,6 +235,99 @@ mod tests {
         .expect("control replies must not wait for the held audit barrier");
     }
 
+    #[tokio::test]
+    async fn audit_acknowledgement_follows_persistence_and_keeps_supplied_time() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let org_cancel = CancellationToken::new();
+            let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+            let (control, task) = spawn_control(
+                Box::new(MockTmuxClient::new()),
+                crate::registry::spawn_registry(),
+                org.clone(),
+                CancellationToken::new(),
+            );
+            let now: chrono::DateTime<chrono::Utc> = "2001-02-03T04:05:06Z".parse().unwrap();
+            let (ack, done) = oneshot::channel();
+            control.audit_queue().submit(
+                OrgCommand::ControlKilled(ControlAudit {
+                    pane: "%7".into(),
+                    action: serde_json::json!({}),
+                }),
+                now,
+                Some(ack),
+            );
+            let recorded = done.await.unwrap().unwrap();
+            let events = org.tail(crate::org::TailParams::default()).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(recorded[0].seq, events[0].seq);
+            assert_eq!(events[0].ts, now);
+            drop(control);
+            task.await.unwrap();
+            org_cancel.cancel();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_acknowledgement_waits_behind_a_held_persistence_barrier() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let org_cancel = CancellationToken::new();
+            let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (control, task) = spawn_control_with_audit(
+                Box::new(MockTmuxClient::new()),
+                crate::registry::spawn_registry(),
+                CancellationToken::new(),
+                {
+                    let gate = gate.clone();
+                    let entered = entered.clone();
+                    let org = org.clone();
+                    move |audit, now| {
+                        let gate = gate.clone();
+                        let entered = entered.clone();
+                        let org = org.clone();
+                        async move {
+                            entered.notify_one();
+                            let _held = gate.acquire().await.unwrap();
+                            org.execute(audit, now).await
+                        }
+                    }
+                },
+            );
+            let now: chrono::DateTime<chrono::Utc> = "2001-02-03T04:05:06Z".parse().unwrap();
+            let (ack, mut done) = oneshot::channel();
+            control.audit_queue().submit(
+                OrgCommand::ControlKilled(ControlAudit {
+                    pane: "%2".into(),
+                    action: serde_json::json!({}),
+                }),
+                now,
+                Some(ack),
+            );
+            entered.notified().await;
+            assert!(matches!(
+                done.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(org.status().unwrap(), 0);
+            gate.add_permits(1);
+            let recorded = done.await.unwrap().unwrap();
+            let events = org.tail(crate::org::TailParams::default()).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].ts, now);
+            assert_eq!(recorded[0].seq, events[0].seq);
+            drop(control);
+            task.await.unwrap();
+            org_cancel.cancel();
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn queue_admission_and_stalled_action_share_a_bounded_budget() {
         tokio::time::timeout(Duration::from_secs(90), async {
@@ -256,6 +349,10 @@ mod tests {
             }
             let handle = ControlHandle {
                 sender,
+                audits: AuditQueue {
+                    sender: mpsc::channel(1).0,
+                    dropped: Arc::new(AtomicU64::new(0)),
+                },
                 caller: None,
             };
             let start = Instant::now();
@@ -276,7 +373,13 @@ mod tests {
     }
 }
 
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use atm_org::{ControlAudit, OrgCommand};
 use atm_tmux::{PaneDirection, TmuxClient};
@@ -294,8 +397,17 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const AUDIT_CAPACITY: usize = CAPACITY;
 const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub type AuditAcknowledgement =
+    oneshot::Sender<Result<Vec<crate::eventlog::Envelope>, crate::org::OrgServiceError>>;
+
+#[derive(Debug)]
 enum Audit {
-    Record(OrgCommand),
+    Record {
+        command: OrgCommand,
+        now: chrono::DateTime<chrono::Utc>,
+        acknowledgement: Option<AuditAcknowledgement>,
+    },
+    Finish,
     #[cfg(test)]
     Barrier(Reply<()>),
 }
@@ -346,14 +458,66 @@ struct Pending {
     request: Request,
 }
 
+/// One ordered, non-blocking audit path, also usable by in-process clients.
+#[derive(Debug, Clone)]
+pub struct AuditQueue {
+    sender: mpsc::Sender<Audit>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl AuditQueue {
+    /// Capture time at the effect, not when persistence eventually catches up.
+    /// Optional acknowledgement is awaited by callers outside the control actor.
+    pub fn submit(
+        &self,
+        command: OrgCommand,
+        now: chrono::DateTime<chrono::Utc>,
+        acknowledgement: Option<AuditAcknowledgement>,
+    ) {
+        self.enqueue(Audit::Record {
+            command,
+            now,
+            acknowledgement,
+        });
+    }
+
+    fn enqueue(&self, audit: Audit) {
+        if let Err(error) = self.sender.try_send(audit) {
+            let dropped = self
+                .dropped
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            tracing::warn!(
+                dropped,
+                "control audit queue full or closed; dropping audit"
+            );
+            if let Audit::Record {
+                acknowledgement: Some(reply),
+                ..
+            } = error.into_inner()
+            {
+                let _ = reply.send(Err(crate::org::OrgServiceError::Unavailable(
+                    "control audit queue full or closed".into(),
+                )));
+            }
+        }
+    }
+}
+
 /// A bounded queue shared by RPC and in-process control clients.
 #[derive(Debug, Clone)]
 pub struct ControlHandle {
     sender: mpsc::Sender<Pending>,
+    audits: AuditQueue,
     caller: Option<CallContext>,
 }
 
 impl ControlHandle {
+    #[must_use]
+    pub fn audit_queue(&self) -> AuditQueue {
+        self.audits.clone()
+    }
+
     #[cfg(test)]
     pub(crate) async fn flush_audits(&self) {
         self.request(Request::FlushAudit).await.unwrap();
@@ -447,13 +611,9 @@ pub fn spawn_control(
     org: OrgHandle,
     cancel: CancellationToken,
 ) -> (ControlHandle, JoinHandle<()>) {
-    spawn_control_with_audit(client, registry, cancel, move |audit| {
+    spawn_control_with_audit(client, registry, cancel, move |audit, now| {
         let org = org.clone();
-        async move {
-            if let Err(error) = org.execute(audit, chrono::Utc::now()).await {
-                tracing::warn!(%error, "control audit failed; action result unchanged, not retrying");
-            }
-        }
+        async move { org.execute(audit, now).await }
     })
 }
 
@@ -464,16 +624,36 @@ fn spawn_control_with_audit<F, Fut>(
     mut persist: F,
 ) -> (ControlHandle, JoinHandle<()>)
 where
-    F: FnMut(OrgCommand) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send,
+    F: FnMut(OrgCommand, chrono::DateTime<chrono::Utc>) -> Fut + Send + 'static,
+    Fut: std::future::Future<
+            Output = Result<Vec<crate::eventlog::Envelope>, crate::org::OrgServiceError>,
+        > + Send,
 {
     let (sender, mut requests) = mpsc::channel::<Pending>(CAPACITY);
+    let (audits, mut receive) = mpsc::channel(AUDIT_CAPACITY);
+    let audits = AuditQueue {
+        sender: audits,
+        dropped: Arc::new(AtomicU64::new(0)),
+    };
+    let handle_audits = audits.clone();
     let task = tokio::spawn(async move {
-        let (audits, mut receive) = mpsc::channel(AUDIT_CAPACITY);
         let mut forwarder = tokio::spawn(async move {
             while let Some(audit) = receive.recv().await {
                 match audit {
-                    Audit::Record(audit) => persist(audit).await,
+                    Audit::Record {
+                        command,
+                        now,
+                        acknowledgement,
+                    } => {
+                        let result = persist(command, now).await;
+                        if let Err(error) = &result {
+                            tracing::warn!(%error, "control audit failed; action result unchanged, not retrying");
+                        }
+                        if let Some(reply) = acknowledgement {
+                            let _ = reply.send(result);
+                        }
+                    }
+                    Audit::Finish => receive.close(),
                     #[cfg(test)]
                     Audit::Barrier(reply) => {
                         let _ = reply.send(Ok(()));
@@ -481,7 +661,6 @@ where
                 }
             }
         });
-        let mut dropped = 0_u64;
         loop {
             tokio::select! {
                 biased;
@@ -492,22 +671,19 @@ where
                     // shutdown must not drop a paste before its separate Enter.
                     match execute(&*client, &registry, pending).await {
                         #[cfg(test)]
-                        Some(Audit::Barrier(reply)) => { let _ = audits.send(Audit::Barrier(reply)).await; }
-                        Some(audit) => {
-                            if audits.try_send(audit).is_err() {
-                                dropped = dropped.saturating_add(1);
-                                tracing::warn!(dropped, "control audit queue full or closed; dropping audit");
-                            }
-                        }
+                        Some(Audit::Barrier(reply)) => { let _ = audits.sender.send(Audit::Barrier(reply)).await; }
+                        Some(audit) => audits.enqueue(audit),
                         None => {}
                     }
                 }
             }
         }
-        drop(audits);
-        if tokio::time::timeout(AUDIT_DRAIN_TIMEOUT, &mut forwarder)
-            .await
-            .is_err()
+        if tokio::time::timeout(AUDIT_DRAIN_TIMEOUT, async {
+            let _ = audits.sender.send(Audit::Finish).await;
+            let _ = (&mut forwarder).await;
+        })
+        .await
+        .is_err()
         {
             tracing::warn!("control audit drain timed out; remaining audits dropped, not retried");
             forwarder.abort();
@@ -517,6 +693,7 @@ where
     (
         ControlHandle {
             sender,
+            audits: handle_audits,
             caller: None,
         },
         task,
@@ -660,5 +837,9 @@ async fn execute(
             })
         }
     };
-    audit.filter(|_| !expired).map(Audit::Record)
+    audit.filter(|_| !expired).map(|command| Audit::Record {
+        command,
+        now: chrono::Utc::now(),
+        acknowledgement: None,
+    })
 }

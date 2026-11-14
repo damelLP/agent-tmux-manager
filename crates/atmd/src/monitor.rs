@@ -350,6 +350,7 @@ mod tests {
 
         // CPU might be 0.0 on first call (no baseline yet)
         // Just verify it's a valid number
+        assert!(metrics.cpu_percent.is_finite());
         assert!(metrics.cpu_percent >= 0.0);
     }
 

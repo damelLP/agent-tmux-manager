@@ -39,6 +39,18 @@ const MIN_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
 // U8c has 32 active+parked slots. Observers use at most a quarter, leaving
 // headroom for lifecycle work and deliveries even during restart or event lag.
 const OBSERVER_CONCURRENCY: usize = 8;
+// A failed observation is retried without waiting for a registry event: the
+// harness may be quiet, or its only row excluded. Doubling, capped.
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Why an agent's last observation failed; cleared by its next success.
+#[derive(Debug, Clone)]
+struct ObservationFailure {
+    reason: String,
+    /// The agent's restart check has not completed yet.
+    restart: bool,
+}
 
 // A wake may wait both in the coalescer and in control admission. Retain only
 // its identity context, never a readiness decision or an event-history mirror.
@@ -134,7 +146,7 @@ struct AgentService {
     runtime: Option<AgentRuntime>,
     projects: Option<AgentProjects>,
     ready: watch::Receiver<Option<Result<(), String>>>,
-    errors: watch::Receiver<BTreeMap<AgentId, String>>,
+    errors: watch::Receiver<BTreeMap<AgentId, ObservationFailure>>,
     lifecycle: Option<mpsc::Sender<LifecycleJob>>,
 }
 
@@ -222,11 +234,25 @@ impl AgentHandle {
             .lifecycle
             .as_ref()
             .ok_or_else(|| self.unavailable("lifecycle admission"))?;
-        if let Some(reason) = self.inner.errors.borrow().get(&request.agent) {
-            return Err(AgentError::Unavailable(format!(
-                "{}: {reason}",
-                request.agent
-            )));
+        // Down and Respawn inspect the pane under their own reservation, so a failed
+        // observation never refuses them. Other work waits only for an agent whose
+        // restart check is still open, not for a runtime failure of a checked one.
+        if !matches!(
+            request.kind,
+            ReservationKind::Down | ReservationKind::Respawn
+        ) {
+            if let Some(failure) = self
+                .inner
+                .errors
+                .borrow()
+                .get(&request.agent)
+                .filter(|failure| failure.restart)
+            {
+                return Err(AgentError::Unavailable(format!(
+                    "{}: restart check is being retried: {}",
+                    request.agent, failure.reason
+                )));
+            }
         }
         let control = rt.control.clone();
         let (admitted, admission) = oneshot::channel();
@@ -400,7 +426,9 @@ impl AgentHandle {
                 .filter(|a| filter.as_ref().is_none_or(|id| &a.id.project == id))
                 .map(|a| {
                     let mut entry = list_entry(&state, a, &rows);
-                    if let Some(error) = self.inner.errors.borrow().get(&a.id) {
+                    if let Some(ObservationFailure { reason: error, .. }) =
+                        self.inner.errors.borrow().get(&a.id)
+                    {
                         entry.reason = Some(match entry.reason {
                             Some(reason) => format!("{reason}; observation unavailable: {error}"),
                             None => format!("observation unavailable: {error}"),
@@ -970,7 +998,7 @@ async fn observer(
     mut events: broadcast::Receiver<SessionEvent>,
     mut committed: broadcast::Receiver<Arc<crate::eventlog::Envelope>>,
     ready: &watch::Sender<Option<Result<(), String>>>,
-    errors: &watch::Sender<BTreeMap<AgentId, String>>,
+    errors: &watch::Sender<BTreeMap<AgentId, ObservationFailure>>,
     cancel: &CancellationToken,
 ) -> Result<(), AgentError> {
     let state = loop {
@@ -995,6 +1023,7 @@ async fn observer(
     let mut jobs = JoinSet::new();
     let mut restart = initial.clone();
     let mut next_observation = BTreeMap::new();
+    let mut backoff: BTreeMap<AgentId, Duration> = BTreeMap::new();
     let mut routes = AgentRoutes::default();
     routes.refresh(&state);
     if let Ok(rows) = rt.rows().await {
@@ -1050,16 +1079,22 @@ async fn observer(
                 match result {
                     Some(Ok((id, result))) => {
                         active.remove(&id);
-                        next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
                         #[cfg(test)]
                         rt.progress("finished", Some(id.clone()));
                         initial.remove(&id);
                         match result {
                             Err(error) => {
-                                errors.send_modify(|errors| { errors.insert(id.clone(), error.to_string()); });
-                                tracing::warn!(agent = %id, %error, "Agent observation failed");
+                                let delay = backoff.get(&id).map_or(RETRY_MIN, |last| last.saturating_mul(2).min(RETRY_MAX));
+                                backoff.insert(id.clone(), delay);
+                                next_observation.insert(id.clone(), Instant::now() + delay);
+                                pending.entry(id.clone()).or_insert(None);
+                                let failure = ObservationFailure { reason: error.to_string(), restart: restart.contains(&id) };
+                                errors.send_modify(|errors| { errors.insert(id.clone(), failure); });
+                                tracing::warn!(agent = %id, %error, retry_in = ?delay, "Agent observation failed");
                             }
                             Ok(()) => {
+                                next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
+                                backoff.remove(&id);
                                 restart.remove(&id);
                                 errors.send_modify(|errors| { errors.remove(&id); });
                             }

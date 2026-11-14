@@ -299,7 +299,17 @@ mod reconciliation {
         phase: &str,
         agent: Option<&str>,
     ) {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        progress_within(events, phase, agent, 30).await;
+    }
+
+    // For paused-clock tests whose awaited step is itself a production timeout.
+    async fn progress_within(
+        events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+        phase: &str,
+        agent: Option<&str>,
+        seconds: u64,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
             loop {
                 let event = events.recv().await.unwrap();
                 if event.phase == phase
@@ -436,7 +446,7 @@ mod reconciliation {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn review_stuck_needs_a_safe_screen_to_recover() {
         let dialog = include_str!(
             "../../../atm-pi-adapter/tests/fixtures/screen_pi-dialog-confirm_1.5.0.txt"
@@ -574,7 +584,7 @@ mod reconciliation {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn review_initial_observation_failure_is_agent_local() {
         let rig = Rig::new().await;
         for (name, pane) in [("good", "%1"), ("bad", "%2")] {
@@ -607,6 +617,8 @@ mod reconciliation {
                 .await,
             Err(AgentError::NotImplemented { .. })
         ));
+        // Down inspects the pane itself and is admitted; other work for the failed
+        // agent waits for its restart check, and the healthy agent is untouched.
         assert!(matches!(
             agents
                 .down(DownParams {
@@ -614,11 +626,26 @@ mod reconciliation {
                     kill: false,
                 })
                 .await,
-            Err(AgentError::Unavailable(_))
+            Err(AgentError::NotImplemented { .. })
         ));
+        for (agent, pane, admitted) in [("p/bad", "%2", false), ("p/good", "%1", true)] {
+            let result = agents
+                .lifecycle(
+                    request(
+                        agent,
+                        Some(pane),
+                        crate::control::reservation::ReservationKind::Clear,
+                    ),
+                    |_| async { Ok(()) },
+                    cleanup,
+                )
+                .await;
+            assert_eq!(result.is_ok(), admitted, "{agent}: {result:?}");
+            assert!(admitted || matches!(result, Err(AgentError::Unavailable(_))));
+        }
+        // The failed check is retried by itself (paused clock), with no registry event.
         let mut events = agents.observation_events();
         rig.frame("%2", "p/bad", IDLE);
-        update(&rig, "bad").await;
         progress(&mut events, "finished", Some("p/bad")).await;
         assert!(agents
             .list(ListParams::default())
@@ -626,6 +653,179 @@ mod reconciliation {
             .unwrap()
             .iter()
             .all(|a| a.reason.is_none()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_runtime_observe_timeout_is_retried_and_never_blocks_lifecycle() {
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("recorded", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        // A long lifecycle job holds the agent while another row reports in.
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = rig.control.clone();
+        let held = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Clear),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok::<_, AgentError>(())
+                    },
+                    cleanup,
+                )
+                .await
+        });
+        entry.await.unwrap();
+        rig.row("pending-200", "%1", false).await;
+        progress(&mut events, "started", Some("p/lead")).await;
+        // The Observe gives up after its own 30 s budget, on the paused clock.
+        progress_within(&mut events, "finished", Some("p/lead"), 600).await;
+        release.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert!(agents.list(ListParams::default()).await.unwrap()[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("observation unavailable"));
+        // A runtime failure of a checked agent refuses nothing.
+        agents
+            .lifecycle(
+                request("p/lead", Some("%1"), ReservationKind::Clear),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            agents
+                .down(DownParams {
+                    agent: "p/lead".parse().unwrap(),
+                    kill: false,
+                })
+                .await,
+            Err(AgentError::NotImplemented { .. })
+        ));
+        // The retry needs no registry event.
+        rig.inspect_only("%1", "p/lead");
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            agents.list(ListParams::default()).await.unwrap()[0].reason,
+            None
+        );
+        let calls = rig.client.mock().calls().len();
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(rig.client.mock().calls().len(), calls);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_failed_first_check_is_retried_and_admits_down_and_respawn() {
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("recorded")).await;
+        rig.row("recorded", "%1", false).await;
+        // Nothing scripted: tmux does not answer the first check.
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        assert!(agents.list(ListParams::default()).await.unwrap()[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("observation unavailable"));
+        // Down and respawn inspect the pane themselves and are never refused.
+        assert!(matches!(
+            agents
+                .down(DownParams {
+                    agent: "p/lead".parse().unwrap(),
+                    kill: false,
+                })
+                .await,
+            Err(AgentError::NotImplemented { .. })
+        ));
+        agents
+            .lifecycle(
+                request("p/lead", Some("%1"), ReservationKind::Respawn),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+        // Other lifecycle work waits for the restart check.
+        assert!(matches!(
+            agents
+                .lifecycle(
+                    request("p/lead", Some("%1"), ReservationKind::Clear),
+                    |_| async { Ok(()) },
+                    cleanup,
+                )
+                .await,
+            Err(AgentError::Unavailable(_))
+        ));
+        // Retried by itself, with a backoff that stops growing at one minute:
+        // 1, 2, 4, 8, 16 and 32 s, then every 60 s.
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        let mut retries = 0;
+        while let Ok(event) = events.try_recv() {
+            retries += usize::from(event.phase == "started");
+        }
+        assert!((55..=70).contains(&retries), "{retries} retries in an hour");
+        // tmux answers again: the next retry completes the restart check.
+        rig.frame("%1", "p/lead", IDLE);
+        progress_within(&mut events, "finished", Some("p/lead"), 120).await;
+        assert_eq!(
+            agents.list(ListParams::default()).await.unwrap()[0].reason,
+            None
+        );
+        agents
+            .lifecycle(
+                request("p/lead", Some("%1"), ReservationKind::Clear),
+                |_| async { Ok(()) },
+                cleanup,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_interrupted_clear_recovers_after_a_failed_first_check() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        // The harness still runs the excluded old session: its events wake nobody.
+        rig.row("old", "%1", false).await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Clearing);
+        let mut events = agents.observation_events();
+        rig.inspect_only("%1", "p/lead");
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Stuck);
+        assert_eq!(
+            agent.reason.as_deref(),
+            Some("clear interrupted by daemon restart; inspect %1")
+        );
+        assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 1);
+        assert!(matches!(
+            agents
+                .down(DownParams {
+                    agent: "p/lead".parse().unwrap(),
+                    kill: false,
+                })
+                .await,
+            Err(AgentError::NotImplemented { .. })
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1252,7 +1452,7 @@ mod reconciliation {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn review_failed_restart_note_retries_on_next_wake() {
         let rig = Rig::gated_with_failure(None, Some("msg.sent")).await;
         rig.agent("lead", Some("%1"), Some("old")).await;
@@ -1272,9 +1472,13 @@ mod reconciliation {
             .unwrap()
             .contains("observation unavailable"));
         let mut events = agents.observation_events();
-        for _ in 0..2 {
+        // The first recovery is the observer's own retry (paused clock); the
+        // second pass is an ordinary wake and must not repeat the Note.
+        for wake in [false, true] {
             rig.inspect_only("%1", "p/lead");
-            update(&rig, "pending-100").await;
+            if wake {
+                update(&rig, "pending-100").await;
+            }
             progress(&mut events, "finished", Some("p/lead")).await;
             assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 1);
             assert_eq!(

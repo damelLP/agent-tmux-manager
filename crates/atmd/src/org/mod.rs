@@ -22,9 +22,14 @@ pub mod message_evidence;
 pub mod message_history;
 #[cfg(test)]
 mod message_history_tests;
+mod message_inbox;
 mod message_methods;
 #[cfg(test)]
+mod message_persistence_tests;
+#[cfg(test)]
 mod message_seam_tests;
+#[cfg(test)]
+mod message_service_tests;
 pub mod message_types;
 pub mod messages;
 mod raw;

@@ -85,10 +85,10 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -101,11 +101,176 @@ use tempfile::TempDir;
 #[path = "support/role.rs"]
 mod role_support;
 
-const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANG_GUARD: Duration = Duration::from_secs(60);
+const SOCKET_WAIT_TIMEOUT: Duration = HANG_GUARD;
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SESSION_APPEAR_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const DAEMON_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Wait on SIGCHLD, not elapsed time. Subscribe before checking the child so
+/// an exit between try_wait and recv is retained. Every wake uses the same guard.
+fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let mut exited =
+                            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+                        loop {
+                            if let Some(status) = child.try_wait()? {
+                                return Ok(status);
+                            }
+                            if !matches!(
+                                tokio::time::timeout_at(deadline.into(), exited.recv()).await,
+                                Ok(Some(()))
+                            ) {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "child exit guard expired or signal stream closed (killed and reaped)",
+                                ));
+                            }
+                        }
+                    })
+            })
+            .join()
+            .expect("child waiter thread")
+    })
+}
+
+/// Files avoid a full stdout/stderr pipe preventing the exit we await.
+fn command_output(command: &mut Command) -> Output {
+    let deadline = Instant::now() + HANG_GUARD;
+    let mut stdout = tempfile::tempfile().expect("command stdout");
+    let mut stderr = tempfile::tempfile().expect("command stderr");
+    let mut child = command
+        .stdout(stdout.try_clone().unwrap())
+        .stderr(stderr.try_clone().unwrap())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {command:?}: {e}"));
+    let status = wait_child(&mut child, deadline);
+    stdout.seek(SeekFrom::Start(0)).unwrap();
+    stderr.seek(SeekFrom::Start(0)).unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    stdout.read_to_end(&mut out).unwrap();
+    stderr.read_to_end(&mut err).unwrap();
+    Output {
+        status: status.unwrap_or_else(|e| {
+            panic!(
+                "{command:?}: {e}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            )
+        }),
+        stdout: out,
+        stderr: err,
+    }
+}
+
+/// A trickle of partial frames must not renew the operation's hang guard.
+fn read_frame(reader: &mut BufReader<UnixStream>, deadline: Instant) -> io::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "frame guard expired"))?;
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "peer closed before a frame",
+            ));
+        }
+        let end = available.iter().position(|byte| *byte == b'\n');
+        let count = end.map_or(available.len(), |pos| pos + 1);
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if end.is_some() {
+            return String::from_utf8(line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+    }
+}
+
+fn write_bytes(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "write guard expired"))?;
+        stream.set_write_timeout(Some(remaining))?;
+        let written = stream.write(bytes)?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+/// tmux 3.6 and 3.8 retain a signal sent before its waiter (verified in private
+/// servers). Each operation uses a distinct channel; repeated signals coalesce.
+fn wait_for_signal(label: &str, channel: &str, deadline: Instant) -> io::Result<()> {
+    let mut child = Command::new("tmux")
+        .args(["-L", label, "wait-for", channel])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let status = wait_child(&mut child, deadline)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tmux wait-for {channel}: {status}"
+        )))
+    }
+}
+
+#[test]
+fn protocol_frames_share_the_operation_deadline() {
+    let (mut writer, reader) = UnixStream::pair().unwrap();
+    writer.write_all(b"first\nsecond\n").unwrap();
+    let mut reader = BufReader::new(reader);
+    assert_eq!(
+        read_frame(&mut reader, Instant::now() + HANG_GUARD).unwrap(),
+        "first\n"
+    );
+    // Even an already-buffered next message cannot renew an expired operation.
+    assert_eq!(
+        read_frame(&mut reader, Instant::now()).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn child_exit_is_observed_and_expired_guards_reap() {
+    let mut done = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+    assert_eq!(
+        wait_child(&mut done, Instant::now() + HANG_GUARD)
+            .unwrap()
+            .code(),
+        Some(7)
+    );
+    let mut held = Command::new("sh")
+        .args(["-c", "read answer"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        wait_child(&mut held, Instant::now()).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(
+        held.try_wait().unwrap().is_some(),
+        "timed-out child was reaped"
+    );
+}
 
 /// Returns `Some(path)` if `tmux` is on PATH, `None` otherwise.
 fn tmux_on_path() -> Option<PathBuf> {
@@ -132,9 +297,7 @@ fn atm_binary() -> Option<PathBuf> {
 /// catches "couldn't even spawn tmux" and silently swallows everything
 /// tmux itself prints to stderr.
 fn run_tmux_or_panic(cmd: &mut Command, label: &str) -> Vec<u8> {
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn tmux for {label}: {e}"));
+    let output = command_output(cmd);
     if !output.status.success() {
         panic!(
             "tmux {label} failed (exit {:?})\nstderr: {}\nstdout: {}",
@@ -388,9 +551,11 @@ impl Daemon {
     async fn wait_for_socket(&self) {
         let start = Instant::now();
         while start.elapsed() < SOCKET_WAIT_TIMEOUT {
-            if self.socket_path.exists() {
+            if UnixStream::connect(&self.socket_path).is_ok() {
                 return;
             }
+            // atmd exposes no readiness fd: a successful connect, not a delay
+            // or path existence, establishes that its listener is ready.
             tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
         }
         let log = std::fs::read_to_string(&self.log_path).unwrap_or_default();
@@ -410,21 +575,26 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
+            if std::thread::panicking() {
+                eprintln!(
+                    "--- daemon log ---\n{}",
+                    std::fs::read_to_string(&self.log_path).unwrap_or_default()
+                );
+                for name in ["status", "wchan", "schedstat"] {
+                    eprintln!(
+                        "--- daemon {name} ---\n{}",
+                        std::fs::read_to_string(format!("/proc/{}/{name}", child.id()))
+                            .unwrap_or_default()
+                    );
+                }
+            }
             unsafe {
                 libc::kill(child.id() as i32, libc::SIGTERM);
             }
 
-            let deadline = Instant::now() + DAEMON_SHUTDOWN_GRACE;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if Instant::now() >= deadline => break,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => break,
-                }
+            if let Err(error) = wait_child(&mut child, Instant::now() + HANG_GUARD) {
+                eprintln!("daemon shutdown: {error}");
             }
-            let _ = child.kill();
-            let _ = child.wait();
         }
     }
 }
@@ -435,32 +605,42 @@ impl Drop for Daemon {
 struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    request: String,
+    sent_at: Instant,
+    deadline: Instant,
 }
 
 impl Client {
     fn connect(path: &Path) -> Self {
         let stream = UnixStream::connect(path).expect("connect to atmd socket");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set read timeout");
         let writer = stream.try_clone().expect("clone unix stream");
         Self {
             reader: BufReader::new(stream),
             writer,
+            request: "initial connection".into(),
+            sent_at: Instant::now(),
+            deadline: Instant::now() + HANG_GUARD,
         }
     }
 
     fn send(&mut self, msg: ClientMessage) {
+        self.request = format!("{msg:?}");
+        self.sent_at = Instant::now();
+        self.deadline = self.sent_at + HANG_GUARD;
+        eprintln!("protocol send: {}", self.request);
         let mut json = serde_json::to_vec(&msg).expect("serialize ClientMessage");
         json.push(b'\n');
-        self.writer.write_all(&json).expect("write client message");
-        self.writer.flush().expect("flush client message");
+        write_bytes(&mut self.writer, &json, self.deadline).expect("write client message");
     }
 
     fn recv(&mut self) -> DaemonMessage {
-        let mut line = String::new();
-        let bytes = self.reader.read_line(&mut line).expect("read daemon line");
-        assert!(bytes > 0, "daemon closed connection unexpectedly");
+        let line = read_frame(&mut self.reader, self.deadline).unwrap_or_else(|e| {
+            panic!(
+                "protocol read after {} ({:?} since send): {e}",
+                self.request,
+                self.sent_at.elapsed()
+            )
+        });
         serde_json::from_str(&line).expect("deserialize DaemonMessage")
     }
 }
@@ -640,30 +820,21 @@ async fn scenario_protocol_e2e(env: &E2eEnv) -> String {
     });
     client.send(ClientMessage::hook_event(hook_event));
 
-    let deadline = Instant::now() + SESSION_APPEAR_TIMEOUT;
-    let found = loop {
-        client.send(ClientMessage::list_sessions());
-        let sessions = match client.recv() {
-            DaemonMessage::SessionList { sessions } => sessions,
-            other => panic!("expected SessionList, got {other:?}"),
-        };
-
-        if sessions.iter().any(|s| s.id.as_str() == session_id) {
-            assert!(
-                sessions.len() > baseline_count,
-                "session count should grow by at least one (baseline={baseline_count}, now={})",
-                sessions.len()
-            );
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    // The connection awaits hook application before handling the next request.
+    // Its ListSessions reply is a barrier, not a race with another connection.
+    client.send(ClientMessage::list_sessions());
+    let sessions = match client.recv() {
+        DaemonMessage::SessionList { sessions } => sessions,
+        other => panic!("expected SessionList, got {other:?}"),
     };
     assert!(
-        found,
-        "session {session_id} never appeared in registry within {SESSION_APPEAR_TIMEOUT:?}"
+        sessions.iter().any(|s| s.id.as_str() == session_id),
+        "session {session_id} missing after the hook application barrier"
+    );
+    assert!(
+        sessions.len() > baseline_count,
+        "session count should grow by at least one (baseline={baseline_count}, now={})",
+        sessions.len()
     );
 
     client.send(ClientMessage::disconnect());
@@ -745,7 +916,7 @@ async fn scenario_role_json(env: &E2eEnv, session_id: &str) {
     assert!(matches!(client.recv(), DaemonMessage::SessionList { .. }));
     client.send(ClientMessage::disconnect());
     let run_atm = |args: &[&str]| {
-        role_support::run(
+        command_output(
             Command::new(&env.atm_path)
                 .args(args)
                 .env("ATM_SOCKET", &env.daemon.socket_path)
@@ -1926,14 +2097,8 @@ async fn scenario_workspace_attach_autopick_rejects_unsupported_name(env: &E2eEn
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn control-mode attach");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while ctl.try_wait().expect("poll control-mode attach").is_none() {
-        if Instant::now() >= deadline {
-            let _ = ctl.kill();
-            panic!("control-mode attach to 'my work' didn't exit on stdin EOF");
-        }
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
-    }
+    wait_child(&mut ctl, Instant::now() + HANG_GUARD)
+        .expect("control-mode attach to 'my work' must exit on stdin EOF");
     let ctl = ctl.wait_with_output().expect("collect control-mode attach");
     assert!(
         ctl.status.success(),
@@ -2085,9 +2250,8 @@ async fn create_workspace_with_pi_default(
     if let Some(args) = spawn_pi_args {
         create.env("ATM_SPAWN_PI_ARGS", args);
     }
-    let output = create
-        .output()
-        .expect("run atm workspace create (pi default)");
+    let deadline = Instant::now() + HANG_GUARD;
+    let output = command_output(&mut create);
     assert!(
         output.status.success(),
         "atm workspace create with a pi default failed: stdout={} stderr={}",
@@ -2096,21 +2260,17 @@ async fn create_workspace_with_pi_default(
     );
 
     let agent_pane = top_non_sidebar_pane(tmux.label(), &session_name);
-    // The pane's shell has to start before it reads the keys.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let recorded = loop {
-        if let Ok(recorded) = std::fs::read_to_string(&log) {
-            break recorded;
-        }
-        if Instant::now() >= deadline {
-            let screen = tmux_run_capture(tmux.label(), &["capture-pane", "-p", "-t", &agent_pane])
-                .unwrap_or_default();
-            panic!(
-                "the configured pi didn't run within 10s; agent pane {agent_pane} shows:\n{screen}"
-            );
-        }
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
-    };
+    // Latched even if the stand-in completes before this client starts.
+    if let Err(error) = wait_for_signal(tmux.label(), "pi-recorded", deadline) {
+        let screen = tmux_run_capture(tmux.label(), &["capture-pane", "-p", "-t", &agent_pane])
+            .unwrap_or_default();
+        let stages = std::fs::read_to_string(log.with_extension("stages")).unwrap_or_default();
+        panic!(
+            "pi record completion: {error}; stages:\n{stages}\nagent pane {agent_pane}:\n{screen}"
+        );
+    }
+    let recorded =
+        std::fs::read_to_string(&log).expect("pi signalled after atomically writing its record");
     let mut lines = recorded.lines();
     assert_eq!(
         lines.next(),
@@ -2233,11 +2393,16 @@ fn write_atm_config(config_home: &Path, toml: &str) {
     std::fs::write(dir.join("config.toml"), toml).expect("write atm config");
 }
 
-/// Writes a stand-in `pi` into `dir` that records the pane it runs in and
-/// its arguments to `log`, one line each, then sleeps to keep the pane alive
-/// until the server is killed.
+/// Records argv atomically, then signals completion on its own tmux server.
+/// The stage log distinguishes never-executed, write/rename and signal failures.
+/// Stdin holds the pane alive until explicit teardown, not a timed sleep.
 fn write_pi_standin(dir: &Path, log: &Path) -> PathBuf {
     let path = dir.join("pi");
+    let stages = log.with_extension("stages").display().to_string();
+    let real_tmux = tmux_on_path()
+        .expect("tmux available")
+        .display()
+        .to_string();
     let log = log.display().to_string();
     // Both paths go inside single quotes: in the script and in TOML.
     assert!(
@@ -2245,7 +2410,7 @@ fn write_pi_standin(dir: &Path, log: &Path) -> PathBuf {
         "stand-in paths must not contain a single quote: {log}"
     );
     let body = format!(
-        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$TMUX_PANE\" \"$*\" > '{log}.tmp' && mv '{log}.tmp' '{log}'\nexec sleep 60\n"
+        "#!/bin/sh\nset -e\nprintf 'entered pid=%s pane=%s\\n' \"$$\" \"$TMUX_PANE\" > '{stages}'\nprintf '%s\\n%s\\n' \"$TMUX_PANE\" \"$*\" > '{log}.tmp'\nprintf 'record written\\n' >> '{stages}'\nmv '{log}.tmp' '{log}'\nprintf 'record renamed\\n' >> '{stages}'\n'{real_tmux}' -S \"${{TMUX%%,*}}\" wait-for -S pi-recorded\nprintf 'completion signalled\\n' >> '{stages}'\nexec cat >/dev/null\n"
     );
     std::fs::write(&path, body).expect("write pi stand-in");
     use std::os::unix::fs::PermissionsExt;
@@ -2335,8 +2500,8 @@ fn write_tmux_logging_wrapper(dir: &Path, log: &Path) {
 
 const PREVIEW_MARKERS: [&str; 3] = ["preview-marker-a", "preview-marker-b", "preview-marker-c"];
 
-/// The capture task polls once a second, so this allows several polls.
-const PREVIEW_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Only a hang guard; success is observed in the rendered screen.
+const PREVIEW_STEP_TIMEOUT: Duration = HANG_GUARD;
 
 /// Runs `tmux -L <label> <args>` and returns stdout.
 fn tmux_stdout(socket_label: &str, args: &[&str]) -> String {

@@ -2062,6 +2062,95 @@ fn follower_behind_an_unattempted_head_does_not_time_out_while_it_waits() {
 }
 
 #[test]
+fn replayed_follower_budget_starts_at_promotion_even_without_consumed_waits() {
+    for consume_follower in [false, true] {
+        for status in [SessionStatus::Idle, SessionStatus::Working] {
+            for delivered in [false, true] {
+                // Both messages precede startup. Include an attempted head to
+                // exercise promotion by delivery as well as by final failure.
+                let mut f = Fixture::new(if delivered { 5 } else { 4 });
+                f.apply(OrgEvent::MessageSent(content(agent())), 0);
+                let follower = MessageId::new(f.seq);
+                if delivered {
+                    f.attempt(0);
+                }
+                let mut obs = observation(status);
+                obs.session.as_mut().unwrap().last_event_at = Some(at(-120_000));
+                obs.facts.input = InputState::Draft;
+                for ms in [0, 60_000, 120_000, 300_000] {
+                    f.observe(obs.clone(), ms);
+                    f.consume(ms);
+                    if consume_follower {
+                        wait(consume_of(&mut f, follower, ms), WaitReason::OtherDelivery);
+                    }
+                }
+                let event = if delivered {
+                    OrgEvent::MessageDelivered {
+                        message_id: f.id,
+                        session_id: "s1".into(),
+                        confirmation: "exact".into(),
+                    }
+                } else {
+                    OrgEvent::MessageDeliveryFailed {
+                        message_id: f.id,
+                        reason: "gave up".into(),
+                        final_failure: true,
+                    }
+                };
+                f.apply(event, 300_000);
+                f.observe(obs, 300_000);
+                wait(
+                    consume_of(&mut f, follower, 300_000),
+                    WaitReason::InputNotEmpty,
+                );
+                let live = f.history.snapshot(follower, at(300_000)).unwrap().live;
+                assert_eq!(live.hold_since, Some(at(300_000)));
+                let budget = if status == SessionStatus::Working {
+                    750
+                } else {
+                    120_000
+                };
+                wait(
+                    step_of(&f, follower, 300_000 + budget - 1),
+                    WaitReason::InputNotEmpty,
+                );
+                blocked(
+                    step_of(&f, follower, 300_000 + budget),
+                    FailureReason::DraftPresent,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn replayed_head_keeps_its_recovery_time_budget() {
+    for promoted_in_replay in [false, true] {
+        let mut f = Fixture::new(if promoted_in_replay { 5 } else { 4 });
+        f.apply(OrgEvent::MessageSent(content(agent())), -300_000);
+        if promoted_in_replay {
+            f.apply(
+                OrgEvent::MessageDeliveryFailed {
+                    message_id: f.id,
+                    reason: "gave up before restart".into(),
+                    final_failure: true,
+                },
+                -200_000,
+            );
+            f.id = MessageId::new(4);
+        }
+        let mut obs = observation(SessionStatus::Idle);
+        obs.facts.input = InputState::Draft;
+        f.observe(obs, 60_000);
+        // No consumed step: the current head still starts at recovery, not at
+        // its first live evaluation. Replay must not reset its clock either.
+        assert_eq!(f.snapshot(60_000).live.hold_since, Some(at(0)));
+        wait(f.step(119_999), WaitReason::InputNotEmpty);
+        blocked(f.step(120_000), FailureReason::DraftPresent);
+    }
+}
+
+#[test]
 fn follower_stale_blocker_bound_starts_when_it_becomes_the_head() {
     // A stale Working row with a draft: the short bound is three guard polls
     // (750 ms). It runs for the head only.

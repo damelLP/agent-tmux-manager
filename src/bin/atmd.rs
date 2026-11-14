@@ -365,8 +365,18 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
 
     // Subscribed before discovery, so the notifier sees every session.
     let message_notify_cancel = cancel_token.child_token();
-    let (_notify_handle, message_notify_handle) = notify_config()
-        .await
+    let config = read_startup_config(atm_tui::setup::atm_config_path()).await;
+    // A2 consumes this policy when assembling the active message runtime.
+    // Until then the seam remains unavailable, including for valid policies.
+    if let Err(reason) = &config.delivery {
+        warn!(%reason, "Invalid delivery configuration; message delivery is unavailable");
+    }
+    let (_notify_handle, message_notify_handle) = config
+        .notify
+        .unwrap_or_else(|reason| {
+            warn!(%reason, "Notifications are off");
+            None
+        })
         .map(|config| {
             // Only the program: the arguments may hold a webhook URL or topic.
             let program = config.command.first().cloned().unwrap_or_default();
@@ -453,22 +463,49 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// The `[notify]` section of atm's `config.toml`, read once at start. A
-/// missing file or section turns notifications off, and so, with a
-/// warning, does a config that can't be read or parsed.
-async fn notify_config() -> Option<NotifyConfig> {
-    let path = atm_tui::setup::atm_config_path()?;
-    let text = match read_config(path.clone(), CONFIG_READ_TIMEOUT).await {
-        Ok(text) => text?,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "Cannot read config; notifications are off");
-            return None;
-        }
+/// One file read, with independent section results. Invalid delivery settings
+/// must reach runtime startup as an error, never as a default policy.
+struct StartupConfig {
+    notify: Result<Option<NotifyConfig>, String>,
+    delivery: Result<atm_org::delivery::DeliveryPolicy, String>,
+}
+
+async fn read_startup_config(path: Option<PathBuf>) -> StartupConfig {
+    let text = match path {
+        Some(path) => read_config(path, CONFIG_READ_TIMEOUT).await,
+        None => Ok(None),
     };
-    parse_notify_command(&text).unwrap_or_else(|e| {
-        warn!(path = %path.display(), error = %e, "Invalid config; notifications are off");
-        None
-    })
+    parse_startup_config(text)
+}
+
+fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
+    #[derive(Default, serde::Deserialize)]
+    struct DeliverySection {
+        #[serde(default)]
+        delivery: atm_org::delivery::DeliveryPolicy,
+    }
+
+    match text {
+        Ok(text) => {
+            let text = text.unwrap_or_default();
+            StartupConfig {
+                notify: parse_notify_command(&text).map_err(|error| error.to_string()),
+                delivery: toml::from_str::<DeliverySection>(&text)
+                    .map(|config| config.delivery)
+                    // TOML errors quote arbitrary config values (including secrets).
+                    .map_err(|_| {
+                        "invalid config: malformed TOML or invalid [delivery] settings".into()
+                    }),
+            }
+        }
+        Err(error) => {
+            let reason = format!("cannot read config: {error}");
+            StartupConfig {
+                notify: Err(reason.clone()),
+                delivery: Err(reason),
+            }
+        }
+    }
 }
 
 /// How long atmd waits for `config.toml` before it starts without it.
@@ -526,6 +563,99 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn delivery_config_defaults_when_absent() {
+        for text in [None, Some(""), Some("[notify]\ncommand=['true']\n")] {
+            let config = parse_startup_config(Ok(text.map(str::to_owned)));
+            assert_eq!(
+                config.delivery.unwrap(),
+                atm_org::delivery::DeliveryPolicy::default()
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_config_uses_existing_duration_shape() {
+        let config = parse_startup_config(Ok(Some("[delivery]\nstable_idle={secs=1,nanos=0}\nguard_poll_interval={secs=0,nanos=1000000}\n".into())));
+        let policy = config.delivery.unwrap();
+        assert_eq!(
+            policy.settings().stable_idle,
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            policy.settings().guard_poll_interval,
+            std::time::Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn delivery_config_rejects_unknown_key() {
+        let config = parse_startup_config(Ok(Some("[delivery]\nunknown='SECRET'".into())));
+        let error = config.delivery.unwrap_err();
+        assert!(error.contains("config"));
+        assert!(!error.contains("SECRET"));
+    }
+
+    #[test]
+    fn delivery_config_invalid_values_never_fall_back() {
+        for text in [
+            "[delivery]\nstable_idle={secs=0,nanos=0}",
+            "[delivery]\nstable_idle='SECRET'",
+            "[delivery]\nretry_delays=[{secs=2,nanos=0},{secs=1,nanos=0}]",
+            "[delivery",
+        ] {
+            let error = parse_startup_config(Ok(Some(text.into())))
+                .delivery
+                .unwrap_err();
+            assert!(error.contains("config"));
+            assert!(!error.contains("SECRET"));
+        }
+        let config = parse_startup_config(Ok(Some(
+            "[notify]\ncommand=['true']\n[delivery]\nunknown=1".into(),
+        )));
+        assert!(config.notify.unwrap().is_some());
+        assert!(config.delivery.is_err());
+        let config = parse_startup_config(Ok(Some("[notify]\nunknown=1".into())));
+        assert!(config.notify.is_err());
+        assert!(config.delivery.is_ok());
+    }
+
+    #[test]
+    fn config_read_failure_disables_delivery() {
+        let config = parse_startup_config(Err(anyhow::anyhow!("config read timed out")));
+        assert!(config.notify.is_err());
+        assert!(config.delivery.unwrap_err().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn notify_and_delivery_share_one_file_read() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        // One writer/open only: a second config read would wait forever.
+        let writer = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+                file.write_all(b"[notify]\ncommand=['true']\ndelay_secs=2\n[delivery]\nstable_idle={secs=1,nanos=0}\n").unwrap();
+            }
+        });
+        let config = read_startup_config(Some(path)).await;
+        writer.join().unwrap();
+        let notify = config.notify.unwrap().unwrap();
+        assert_eq!(notify.command, ["true"]);
+        assert_eq!(notify.delay_secs, 2);
+        assert_eq!(
+            config.delivery.unwrap().settings().stable_idle,
+            std::time::Duration::from_secs(1)
+        );
+    }
 
     fn socket_in(dir: &Path) -> PathBuf {
         dir.join("run").join("atmd.sock")

@@ -120,6 +120,7 @@ atmd = { version = "0.3.0", path = "crates/atmd" }
 [dependencies]
 # Required for root package to compile the binaries
 atm-core = { workspace = true }
+atm-org = { workspace = true }
 atm-protocol = { workspace = true }
 atm-tmux = { workspace = true }
 atm-tui = { workspace = true }

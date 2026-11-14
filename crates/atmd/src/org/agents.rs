@@ -1095,7 +1095,13 @@ async fn observer(
                             Ok(()) => {
                                 next_observation.insert(id.clone(), Instant::now() + MIN_OBSERVE_INTERVAL);
                                 backoff.remove(&id);
-                                restart.remove(&id);
+                                // A binding wake that arrived before or during the restart check was
+                                // dropped, or fenced by the check's own write: look at the rows once more.
+                                if restart.remove(&id) {
+                                    if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id.clone()]), Wake::BindOnly).await {
+                                        tracing::warn!(agent = %id, %error, "Agent scheduling failed; waiting for next wake");
+                                    }
+                                }
                                 errors.send_modify(|errors| { errors.remove(&id); });
                             }
                         }
@@ -1110,7 +1116,7 @@ async fn observer(
                 #[cfg(test)]
                 rt.progress("scheduling", None);
                 let result = match routes.wake(&rt, event).await {
-                    Ok(ids) => schedule(&rt, &mut pending, ids, true).await,
+                    Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
                     Err(error) => Err(error),
                 };
                 #[cfg(test)]
@@ -1129,7 +1135,7 @@ async fn observer(
                         }
                         if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") {
                             if let Some(id) = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok()) {
-                                if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id]), false).await {
+                                if let Err(error) = schedule(&rt, &mut pending, BTreeSet::from([id]), Wake::Observe).await {
                                     tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
                                 }
                             }
@@ -1140,7 +1146,7 @@ async fn observer(
                     Ok(_) => {},
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let result = match routes.rebuild(&rt).await {
-                            Ok(ids) => schedule(&rt, &mut pending, ids, true).await,
+                            Ok(ids) => schedule(&rt, &mut pending, ids, Wake::Bind).await,
                             Err(error) => Err(error),
                         };
                         if let Err(error) = result { tracing::warn!(%error, "Agent rescan deferred until next wake"); }
@@ -1155,11 +1161,22 @@ async fn observer(
     Ok(())
 }
 
+/// What a scheduled observation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// Observe without a binding candidate.
+    Observe,
+    /// Observe, with a candidate when the current rows offer one.
+    Bind,
+    /// Queue nothing unless the current rows offer a candidate.
+    BindOnly,
+}
+
 async fn schedule(
     rt: &AgentRuntime,
     pending: &mut BTreeMap<AgentId, Option<BindingCandidate>>,
     ids: BTreeSet<AgentId>,
-    bind: bool,
+    wake: Wake,
 ) -> Result<(), AgentError> {
     for id in ids {
         // Subscribe before the FIFO snapshot. A complete clear can leave the
@@ -1170,7 +1187,7 @@ async fn schedule(
         let Some(agent) = current.agent(&id).filter(|a| a.status != AgentStatus::Down) else {
             continue;
         };
-        let candidate = if bind {
+        let candidate = if wake != Wake::Observe {
             let current_rows = rt.rows().await?;
             let expected = harness(&current, agent, &current_rows);
             let eligible: Vec<_> = current_rows
@@ -1204,7 +1221,7 @@ async fn schedule(
         };
         // One dirty bit/candidate per agent; event floods never create one
         // reservation waiter per event. Acquire re-reads all authoritative state.
-        if candidate.is_some() || !pending.contains_key(&agent.id) {
+        if candidate.is_some() || (wake != Wake::BindOnly && !pending.contains_key(&agent.id)) {
             pending.insert(agent.id.clone(), candidate);
         }
     }

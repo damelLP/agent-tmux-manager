@@ -520,19 +520,108 @@ mod reconciliation {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn review_binding_wake_before_a_failed_restart_check_still_binds() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        // Nothing scripted: the first check fails once.
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        // One read for the retried restart check, one for the binding after it.
+        rig.inspect_only("%1", "p/lead");
+        rig.inspect_only("%1", "p/lead");
+        // The new session's only event arrives before the check has passed.
+        rig.row("fresh", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("fresh"))
+        );
+        assert_eq!(
+            agents.list(ListParams::default()).await.unwrap()[0].reason,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn review_binding_wake_during_a_suspending_restart_check_still_binds() {
+        use crate::control::reservation::ReservationKind;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("old")).await;
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = rig.control.clone();
+        let held = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Delivery),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok::<_, AgentError>(())
+                    },
+                    cleanup,
+                )
+                .await
+        });
+        entry.await.unwrap();
+        let (agents, _) = rig.start();
+        let mut events = agents.observation_events();
+        progress(&mut events, "started", Some("p/lead")).await;
+        // The new session's only event arrives while the restart check waits.
+        rig.row("fresh", "%1", false).await;
+        progress(&mut events, "scheduled", None).await;
+        // The check reads an unknown screen and suspends the agent; that write
+        // fences the waiting candidate, so the binding needs a fresh one.
+        rig.frame("%1", "p/lead", "unknown\n");
+        rig.inspect_only("%1", "p/lead");
+        release.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        progress(&mut events, "finished", Some("p/lead")).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.session_id, Some(SessionId::new("fresh")));
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn review_updated_only_wake_binds_current_row() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), None).await;
-        // Registered before the service subscribes: no Registered wake exists.
-        rig.row("fresh", "%1", false).await;
+        // Known to the registry before the service starts, but on no pane yet:
+        // nothing to bind at the restart check, and no Registered wake later.
+        let mut row = SessionDomain::new(
+            SessionId::new("fresh"),
+            AgentType::GeneralPurpose,
+            Model::default(),
+        );
+        row.harness = Harness::Pi;
+        rig.registry.register(row).await.unwrap();
         rig.inspect_only("%1", "p/lead");
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
         assert_eq!(rig.state("lead").await.session_id, None);
         let mut events = agents.observation_events();
         rig.inspect_only("%1", "p/lead");
-        update(&rig, "fresh").await;
+        // Its first hook carries the pane: one Updated and nothing else.
+        rig.registry
+            .apply_lifecycle_event(
+                SessionId::new("fresh"),
+                atm_core::LifecycleEvent::WorkingStart,
+                Harness::Pi,
+                None,
+                Some("%1".into()),
+            )
+            .await
+            .unwrap();
         progress(&mut events, "finished", Some("p/lead")).await;
         assert_eq!(
             rig.state("lead").await.session_id,
@@ -917,7 +1006,7 @@ mod reconciliation {
         })
         .await;
         rig.row("pending-100", "%1", false).await;
-        rig.frame("%1", "p/lead", IDLE);
+        rig.inspect_only("%1", "p/lead");
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
         let mut events = agents.observation_events();
@@ -950,7 +1039,7 @@ mod reconciliation {
             agent_id: "p/lead".parse().unwrap(),
         })
         .await;
-        rig.frame("%1", "p/lead", IDLE);
+        rig.inspect_only("%1", "p/lead");
         release.send(()).unwrap();
         held.await.unwrap();
         progress(&mut events, "finished", Some("p/lead")).await;
@@ -958,6 +1047,17 @@ mod reconciliation {
         assert_eq!(
             rig.state("lead").await.excluded_session_id,
             Some(SessionId::new("s1"))
+        );
+        // The observation itself succeeded: the fence refused the binding, not a failed read.
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            agents.list(ListParams::default()).await.unwrap()[0].reason,
+            None
         );
     }
 
@@ -1843,19 +1943,29 @@ mod reconciliation {
         assert_eq!(rig.state("other").await.status, AgentStatus::Ready);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn lagged_events_reread_current_registry_instead_of_replaying_old_rows() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
+        // A Stuck agent binds only on a safe screen, so its current row can stay
+        // unbound with no wake pending: the state a lag rescan has to find.
+        rig.command(OrgCommand::Stuck {
+            agent_id: "p/lead".parse().unwrap(),
+            reason: "manual recovery".into(),
+        })
+        .await;
         rig.row("current", "%1", false).await;
-        rig.frame("%1", "p/lead", IDLE);
+        rig.inspect_only("%1", "p/lead");
+        rig.frame("%1", "p/lead", "unknown\n");
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
-        assert_eq!(
-            rig.state("lead").await.session_id,
-            Some(SessionId::new("recorded"))
-        );
-        rig.inspect_only("%1", "p/lead");
+        // The look at the rows after the restart check reads the unsafe screen.
+        let mut observations = agents.observation_events();
+        progress(&mut observations, "finished", Some("p/lead")).await;
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Stuck);
+        assert_eq!(agent.session_id, Some(SessionId::new("recorded")));
+        rig.frame("%1", "p/lead", IDLE);
         let mut committed = rig.org.committed.subscribe();
         // No await: overflow the subscription before it can consume any wake.
         for _ in 0..2050 {

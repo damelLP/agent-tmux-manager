@@ -132,6 +132,11 @@ pub enum HistoryUpdate {
     /// Loss breaks observation continuity but is never positive pane death.
     ObservationLost { recipient: AgentId },
     /// Genuine event receive order; polls/discovery refreshes must not emit this.
+    /// Accepted before the replay is complete, and never an error for an
+    /// ordinary event: a session the history has never seen, one bound to no
+    /// agent, no pane, an older time. Such an event is remembered or ignored.
+    /// Only an event time outside the clock's range fails, because the tap's
+    /// caller treats a failed write as a broken invariant.
     Activity {
         /// Stamped by evidence's clock at receipt, never at a later wake/drain.
         at: DateTime<Utc>,

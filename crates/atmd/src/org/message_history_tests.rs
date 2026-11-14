@@ -1159,6 +1159,24 @@ fn pane_less_activity_never_erases_the_stored_pane() {
         f.snapshot(80_000).live.session.unwrap().last_event_at,
         at(60_000)
     );
+    // The pane it reported is still %1: the same session seen on another pane
+    // is not given that time, as for any reported pane that differs.
+    f.apply(
+        OrgEvent::AgentAdopted {
+            agent_id: agent(),
+            pane: "%2".into(),
+            session_id: Some("s1".into()),
+        },
+        90_000,
+    );
+    let mut obs = observation(SessionStatus::Working);
+    obs.pane = Some(PaneId::parse("%2").unwrap());
+    obs.session.as_mut().unwrap().last_event_at = None;
+    f.observe(obs, 95_000);
+    assert_eq!(
+        f.snapshot(99_000).live.session.unwrap().last_event_at,
+        at(99_000)
+    );
 }
 
 #[test]
@@ -1748,4 +1766,107 @@ fn stale_evidence_copy_before_the_new_arm_does_not_pin_the_old_latch() {
     // A latch copied after the arm is the new attempt's.
     evidence_latch(&mut f, 6_000);
     assert!(f.snapshot(6_000).live.probably_landed);
+}
+
+#[test]
+fn applied_identity_change_drops_the_observation_at_once() {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Idle), 0);
+    assert_eq!(f.step(20_000), DeliveryStep::PasteNow { attempt: 1 });
+    // Another session is bound. What was observed belongs to the old one, and
+    // must not grant a paste before the new one is observed.
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "s2".into(),
+        },
+        20_000,
+    );
+    let live = f.snapshot(20_000).live;
+    assert_eq!(live.session, None);
+    assert_eq!(live.input_line, InputLine::Unknown);
+    assert_eq!(live.pane, PaneLiveness::Unknown);
+    assert!(!matches!(f.step(20_000), DeliveryStep::PasteNow { .. }));
+}
+
+#[test]
+fn ordinary_activity_is_never_an_error() {
+    // One failed Activity write turns evidence off for every message, so only
+    // a broken contract (an event time outside the clock's range) may fail.
+    let try_all = |f: &mut Fixture, ms: i64| {
+        for session in ["s1", "s2", "never-seen", "pending-42"] {
+            for pane in [None, Some(pane()), Some(PaneId::parse("%9").unwrap())] {
+                // In receive order, then with an older event time and an
+                // older `now` than the writer before it.
+                for (event_ms, now_ms) in [(ms, ms), (ms - 500_000, ms), (ms, ms - 500_000)] {
+                    f.history
+                        .record(
+                            HistoryUpdate::Activity {
+                                session_id: session.into(),
+                                pane: pane.clone(),
+                                at: at(event_ms),
+                            },
+                            at(now_ms),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+    };
+    // Before the replay is complete.
+    let mut f = Fixture::new(9);
+    try_all(&mut f, 0);
+
+    let mut f = Fixture::new(0);
+    // No observation yet; then an open, never-attempted message on a stale
+    // Working row with a draft, where every clock is in use.
+    try_all(&mut f, 1_000);
+    let mut obs = observation(SessionStatus::Working);
+    obs.session.as_mut().unwrap().last_event_at = Some(at(-200_000));
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 2_000);
+    f.consume(2_000);
+    try_all(&mut f, 3_000);
+    // Delivering, queued for a retry, and with a second message behind it.
+    let scope = f.attempt(4_000);
+    f.record(HistoryUpdate::Armed { scope }, 4_000);
+    try_all(&mut f, 5_000);
+    fail_for_retry(&mut f, 6_000);
+    f.apply(OrgEvent::MessageSent(content(agent())), 6_000);
+    try_all(&mut f, 7_000);
+    // The observation lost, the agent rebound, and the agent down.
+    f.record(HistoryUpdate::ObservationLost { recipient: agent() }, 8_000);
+    try_all(&mut f, 9_000);
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "s2".into(),
+        },
+        10_000,
+    );
+    obs.session.as_mut().unwrap().id = "s2".into();
+    f.observe(obs, 10_000);
+    try_all(&mut f, 11_000);
+    f.apply(
+        OrgEvent::AgentDown {
+            agent_id: agent(),
+            reason: "down".into(),
+        },
+        12_000,
+    );
+    try_all(&mut f, 13_000);
+    // Long after: old entries are pruned on the way.
+    try_all(&mut f, 1_000_000);
+    // The same through the shared handle, for a session it has never seen.
+    let handle = MessageHistoryHandle::new(5, at(0), DeliveryPolicy::default()).unwrap();
+    handle
+        .record(
+            HistoryUpdate::Activity {
+                session_id: "never-seen".into(),
+                pane: None,
+                at: at(0),
+            },
+            at(0),
+        )
+        .unwrap();
 }

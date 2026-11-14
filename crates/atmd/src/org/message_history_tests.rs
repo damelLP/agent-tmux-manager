@@ -1870,3 +1870,144 @@ fn ordinary_activity_is_never_an_error() {
         )
         .unwrap();
 }
+
+fn step_of(f: &Fixture, id: MessageId, ms: i64) -> DeliveryStep {
+    let s = f.history.snapshot(id, at(ms)).unwrap();
+    next_delivery(&s.message, &s.live, at(ms), &DeliveryPolicy::default()).unwrap()
+}
+fn consume_of(f: &mut Fixture, id: MessageId, ms: i64) -> DeliveryStep {
+    let step = step_of(f, id, ms);
+    f.record(
+        HistoryUpdate::Consumed {
+            id,
+            step: step.clone(),
+        },
+        ms,
+    );
+    step
+}
+
+#[test]
+fn two_unattempted_messages_are_pasted_in_fifo_order() {
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    let follower = MessageId::new(f.seq);
+    f.observe(observation(SessionStatus::Idle), 0);
+    // Both are ready at the same instant; only the head may paste.
+    assert_eq!(f.step(20_000), DeliveryStep::PasteNow { attempt: 1 });
+    let view = f.history.snapshot(follower, at(20_000)).unwrap();
+    assert_eq!(view.blocked_by, Some(f.id));
+    assert!(view.live.other_delivery_in_flight);
+    wait(step_of(&f, follower, 20_000), WaitReason::OtherDelivery);
+    // The history itself refuses the follower's paste: FIFO does not depend
+    // on the caller also reading blocked_by.
+    assert!(matches!(
+        f.history.record(
+            HistoryUpdate::Consumed {
+                id: follower,
+                step: DeliveryStep::PasteNow { attempt: 1 },
+            },
+            at(20_000),
+        ),
+        Err(super::messages::MessageError::Conflict(_))
+    ));
+    // The head is delivered: the follower is the head now.
+    f.attempt(21_000);
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: f.id,
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        },
+        22_000,
+    );
+    let view = f.history.snapshot(follower, at(22_000)).unwrap();
+    assert_eq!(view.blocked_by, None);
+    assert!(!view.live.other_delivery_in_flight);
+}
+
+#[test]
+fn follower_behind_an_unattempted_head_does_not_time_out_while_it_waits() {
+    // A draft sits in the editor. The head holds for it and is blocked after
+    // the readiness timeout (120 s); the follower only waits its turn.
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    let follower = MessageId::new(f.seq);
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    for ms in [0, 60_000, 119_999, 120_000, 500_000] {
+        f.observe(obs.clone(), ms);
+        let head = f.consume(ms);
+        if ms < 120_000 {
+            wait(head, WaitReason::InputNotEmpty);
+        } else {
+            blocked(head, FailureReason::DraftPresent);
+        }
+        wait(consume_of(&mut f, follower, ms), WaitReason::OtherDelivery);
+        let live = f.history.snapshot(follower, at(ms)).unwrap().live;
+        assert_eq!(live.hold_since, None, "{ms}");
+        assert_eq!(live.stale_blocker_since, None, "{ms}");
+    }
+    // The owner gives the head up. The follower becomes the head, and its
+    // readiness budget starts now, not when it was sent.
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "gave up".into(),
+            final_failure: true,
+        },
+        500_000,
+    );
+    f.observe(obs, 500_000);
+    wait(
+        consume_of(&mut f, follower, 500_000),
+        WaitReason::InputNotEmpty,
+    );
+    assert_eq!(
+        f.history
+            .snapshot(follower, at(500_001))
+            .unwrap()
+            .live
+            .hold_since,
+        Some(at(500_000))
+    );
+    wait(step_of(&f, follower, 619_999), WaitReason::InputNotEmpty);
+    blocked(step_of(&f, follower, 620_000), FailureReason::DraftPresent);
+}
+
+#[test]
+fn follower_stale_blocker_bound_starts_when_it_becomes_the_head() {
+    // A stale Working row with a draft: the short bound is three guard polls
+    // (750 ms). It runs for the head only.
+    let mut f = Fixture::new(0);
+    f.apply(OrgEvent::MessageSent(content(agent())), 0);
+    let follower = MessageId::new(f.seq);
+    let mut obs = observation(SessionStatus::Working);
+    obs.session.as_mut().unwrap().last_event_at = Some(at(-120_000));
+    obs.facts.input = InputState::Draft;
+    for ms in [0, 750, 60_000] {
+        f.observe(obs.clone(), ms);
+        let head = f.consume(ms);
+        if ms < 750 {
+            wait(head, WaitReason::InputNotEmpty);
+        } else {
+            blocked(head, FailureReason::DraftPresent);
+        }
+        wait(consume_of(&mut f, follower, ms), WaitReason::OtherDelivery);
+    }
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "gave up".into(),
+            final_failure: true,
+        },
+        100_000,
+    );
+    f.observe(obs, 100_000);
+    wait(
+        consume_of(&mut f, follower, 100_000),
+        WaitReason::InputNotEmpty,
+    );
+    wait(step_of(&f, follower, 100_749), WaitReason::InputNotEmpty);
+    blocked(step_of(&f, follower, 100_750), FailureReason::DraftPresent);
+}

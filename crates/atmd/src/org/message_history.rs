@@ -63,7 +63,9 @@ pub struct DeliverySnapshot {
     pub last_attempt_seq: Option<u64>,
     /// Executor diagnostic; latches probably_landed until new arm or matching retry.
     pub hold: Option<ExecutorHold>,
-    /// Current FIFO predecessor, not a list of followers.
+    /// Current FIFO predecessor, not a list of followers. While it is Some,
+    /// `live.other_delivery_in_flight` is set, whether or not the predecessor
+    /// was attempted yet.
     pub blocked_by: Option<MessageId>,
 }
 
@@ -266,7 +268,7 @@ struct Queue {
 }
 
 impl Queue {
-    /// The policy's reservation veto.
+    /// Another attempted, unconfirmed message: the reservation.
     fn other_in_flight(&self, id: MessageId) -> Option<MessageId> {
         self.in_flight
             .iter()
@@ -275,7 +277,12 @@ impl Queue {
             .find(|other| *other != id)
     }
 
-    /// The veto first, else the FIFO head while it is older than `id`.
+    /// The reservation first, else the FIFO head while it is older than `id`.
+    /// Either one is the policy's veto (`other_delivery_in_flight`), so a
+    /// follower is answered `Wait(OtherDelivery)` and `Consumed` refuses its
+    /// paste: FIFO holds before any first attempt too. That wait is no hold:
+    /// a follower's readiness budget and stale-blocker bound start when it
+    /// becomes the head, not while it waits its turn.
     fn blocked_by(&self, id: MessageId) -> Option<MessageId> {
         self.other_in_flight(id)
             .or(self.head.filter(|head| *head < id))
@@ -472,7 +479,7 @@ impl MessageHistory {
         };
         let queue = self.queue(recipient);
         let mut live = self.shared_live(message, agent, self.recipients.get(recipient), now);
-        live.other_delivery_in_flight = queue.other_in_flight(id).is_some();
+        live.other_delivery_in_flight = queue.blocked_by(id).is_some();
         track.apply(&mut live);
         Ok(DeliverySnapshot {
             message: message.clone(),
@@ -583,7 +590,7 @@ impl MessageHistory {
             let mut live: RecipientLiveView = shared
                 .get_or_insert_with(|| self.shared_live(message, agent, Some(history), now))
                 .clone();
-            live.other_delivery_in_flight = queue.other_in_flight(*id).is_some();
+            live.other_delivery_in_flight = queue.blocked_by(*id).is_some();
             track.apply(&mut live);
             let mut previous = track.stale_blocker;
             if reset {

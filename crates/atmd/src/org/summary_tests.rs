@@ -1,7 +1,6 @@
 use super::*;
 use atm_core::{AgentType, Model, SessionDomain};
 use chrono::TimeZone;
-use std::path::PathBuf;
 
 fn now() -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000, 0).unwrap()
@@ -305,16 +304,15 @@ async fn observer_lag_resync_and_shutdown_flush_exact_cost_without_disabling_org
     let dir = tempfile::tempdir().unwrap();
     let org = OrgHandle::open(dir.path().to_owned(), CancellationToken::new()).await;
     let registry = crate::registry::spawn_registry();
-    registry
-        .register_discovered(
-            SessionId::new("live"),
-            std::process::id(),
-            PathBuf::from("/fixture"),
-            Some("%10".into()),
-            Harness::Pi,
-        )
-        .await
-        .unwrap();
+    let mut domain = SessionDomain::new(
+        SessionId::new("live"),
+        AgentType::GeneralPurpose,
+        Model::Unknown,
+    );
+    domain.harness = Harness::Pi;
+    domain.first_prompt = Some("Read note.txt and reply.".into());
+    registry.register(domain).await.unwrap();
+    let mut watch = org.watch(vec!["session".into()], 0).unwrap();
     let (tx, rx) = broadcast::channel(1);
     // Force lag before the observer starts, then require a real registry snapshot.
     for _ in 0..3 {
@@ -326,36 +324,27 @@ async fn observer_lag_resync_and_shutdown_flush_exact_cost_without_disabling_org
     }
     let stop = CancellationToken::new();
     let task = tokio::spawn(run(registry.clone(), org.clone(), rx, stop.clone()));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if org
-                .snapshot()
-                .await
-                .unwrap()
-                .session_summary(&SessionId::new("live"))
-                .is_some()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let baseline = next_summary(&mut watch).await;
+    assert_eq!(baseline.session_id, SessionId::new("live"));
+    assert_eq!(baseline.cost, Some(Money::from_microdollars(0)));
     assert!(org.status().is_ok());
     // Publish a below-threshold update through the real registry.
-    let mut domain = SessionDomain::new(
-        SessionId::new("precise"),
-        AgentType::GeneralPurpose,
-        Model::Unknown,
-    );
-    domain.cost = Money::from_usd(0.01065);
-    domain.first_prompt = Some("Read note.txt and reply.".into());
-    registry.register(domain).await.unwrap();
+    registry
+        .update_from_status_line(
+            SessionId::new("live"),
+            None,
+            atm_core::StatusLineData {
+                cost_usd: 0.01065,
+                ..Default::default()
+            },
+            Harness::Pi,
+        )
+        .await
+        .unwrap();
     stop.cancel();
     task.await.unwrap();
     let state = org.snapshot().await.unwrap();
-    let summary = state.session_summary(&SessionId::new("precise")).unwrap();
+    let summary = state.session_summary(&SessionId::new("live")).unwrap();
     assert_eq!(summary.cost, Some(Money::from_microdollars(10650)));
     assert_eq!(
         summary.first_prompt.as_deref(),

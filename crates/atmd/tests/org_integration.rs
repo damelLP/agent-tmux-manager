@@ -173,6 +173,7 @@ async fn captured_cost_clean_flush_and_clear_end_snapshots() {
         services.raw = raw.clone();
         let mut server = SocketServer::start(services).await;
         let mut ids = std::collections::HashSet::new();
+        let mut watch = org.watch(vec!["session".into()], 0).unwrap();
         for line in fixture.lines() {
             let mut frame: serde_json::Value = serde_json::from_str(line).unwrap();
             let data = &mut frame["data"];
@@ -183,7 +184,23 @@ async fn captured_cost_clean_flush_and_clear_end_snapshots() {
             if let Some(id) = data["session_id"].as_str() {
                 ids.insert(id.to_owned());
             }
+            let first_prompt = !finish && data["payload"]["text"] == "Read note.txt and reply.";
             server.send(serde_json::from_value(frame).unwrap()).await;
+            if first_prompt {
+                // Commit all non-cost facts before any sub-threshold cost update.
+                // Without a shutdown flush the final cost must remain zero.
+                timeout(Duration::from_secs(60), async {
+                    loop {
+                        let record = watch.next().await.unwrap().unwrap();
+                        if record.body["first_prompt"] == "Read note.txt and reply." {
+                            assert_eq!(record.body["cost"]["microdollars"], 0);
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            }
         }
         server.barrier().await;
         server.stop().await;

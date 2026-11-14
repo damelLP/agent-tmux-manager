@@ -176,27 +176,30 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Option<(&str, &str)> {
 }
 
 fn trust_dialog(lines: &[&str]) -> Option<ControlDialog> {
-    let top = lines.iter().rposition(|s| rule(s, '─'))?;
     let body: Vec<_> = lines
-        .get(top + 1..)?
         .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .enumerate()
+        .map(|(i, s)| (i, s.trim()))
+        .filter(|(_, s)| !s.is_empty())
         .collect();
-    let ["Accessing workspace:", folder, paragraph @ .., "Claude Code'll be able to read, edit, and execute files here.", "Security guide", no, yes, "Enter to confirm · Esc to cancel"] =
-        body.as_slice()
-    else {
+    let [.., (no_index, no), (yes_index, yes), (_, _footer)] = body.as_slice() else {
         return None;
     };
-    if paragraph.join(" ") != "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first."
-        || !folder.starts_with('/') || folder.contains(['…', '⤶']) || folder.contains("...") { return None; }
     let selected = match (*no, *yes) {
         ("❯ No, exit", "Yes, I trust this folder") => false,
         ("No, exit", "❯ Yes, I trust this folder") => true,
         _ => return None,
     };
+    // Validate the full chrome/path through the existing trust grammar. Only
+    // normalize the already-verified pair of selection markers, not any prose.
+    let mut canonical = lines.to_vec();
+    *canonical.get_mut(*no_index)? = "❯ No, exit";
+    *canonical.get_mut(*yes_index)? = "Yes, I trust this folder";
+    let DialogState::FolderTrust { folder } = dialog(&canonical)? else {
+        return None;
+    };
     Some(ControlDialog::FolderTrust {
-        folder: (*folder).into(),
+        folder,
         selected_accept: selected,
         select_accept: (!selected).then_some(ControlKey::Down),
         accept: ControlKey::Enter,

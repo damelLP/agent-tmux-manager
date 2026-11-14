@@ -50,10 +50,9 @@ pub fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
         lines.pop();
     }
     if let Some(dialog) = dialog(&lines) {
-        return ScreenFacts {
-            dialog,
-            ..ScreenFacts::default()
-        };
+        let mut facts = ScreenFacts::default();
+        facts.dialog = dialog;
+        return facts;
     }
     editor(&lines).unwrap_or_default()
 }
@@ -200,12 +199,12 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     } else {
         FreshEditorEvidence::Unknown
     };
-    Some(ScreenFacts {
-        input,
-        turn,
-        dialog: DialogState::None,
-        fresh_editor,
-    })
+    let mut facts = ScreenFacts::default();
+    facts.input = input;
+    facts.turn = turn;
+    facts.dialog = DialogState::None;
+    facts.fresh_editor = fresh_editor;
+    Some(facts)
 }
 
 fn skip_startup_notice(history: &mut Vec<&str>) {
@@ -263,6 +262,14 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    macro_rules! facts {
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut facts = ScreenFacts::default();
+            $(facts.$field = $value;)*
+            facts
+        }};
+    }
+
     macro_rules! capture {
         ($name:literal) => {
             include_str!(concat!(
@@ -292,7 +299,7 @@ mod tests {
                 cases.push((
                     $name,
                     capture!($name),
-                    ScreenFacts {
+                    facts! {
                         input: $input,
                         turn: $turn,
                         dialog: $dialog,
@@ -364,7 +371,7 @@ mod tests {
                 cases.push((
                     $name,
                     u5b_capture!($name),
-                    ScreenFacts {
+                    facts! {
                         input: $input,
                         turn: TurnState::NotRunning,
                         dialog: DialogState::None,
@@ -480,7 +487,7 @@ mod tests {
             let text = IDLE.replace(footer, &format!("{footer}{suffix}"));
             assert_eq!(
                 observe_screen(&text, None),
-                ScreenFacts {
+                facts! {
                     input: InputState::Empty,
                     turn: TurnState::NotRunning,
                     dialog: DialogState::None,
@@ -512,7 +519,7 @@ mod tests {
                 let text = format!("{}{compact}", "\n".repeat(blank_rows));
                 assert_eq!(
                     observe_screen(&text, None),
-                    ScreenFacts {
+                    facts! {
                         input: InputState::Empty,
                         turn: TurnState::NotRunning,
                         dialog: DialogState::None,
@@ -545,7 +552,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             observe_screen(&text, None),
-            ScreenFacts {
+            facts! {
                 input: InputState::Empty,
                 turn: TurnState::NotRunning,
                 dialog: DialogState::None,
@@ -565,7 +572,7 @@ mod tests {
         ] {
             assert_eq!(
                 observe_screen(&damaged, None),
-                ScreenFacts {
+                facts! {
                     input: InputState::Empty,
                     turn: TurnState::Unknown,
                     dialog: DialogState::None,
@@ -594,16 +601,12 @@ mod tests {
                 .replace("done 11:25", "done 09:47")
                 .replace("Haiku 5.5 · Claude Ultra", "Another-model · Another-plan")
                 .replace("/tmp/u8a-fixture/cwd/claude", "/other/project");
-            let expected = if name == "startup" {
-                ScreenFacts {
-                    dialog: DialogState::FolderTrust {
-                        folder: "/other/project".into(),
-                    },
-                    ..expected
-                }
-            } else {
-                expected
-            };
+            let mut expected = expected;
+            if name == "startup" {
+                expected.dialog = DialogState::FolderTrust {
+                    folder: "/other/project".into(),
+                };
+            }
             assert_eq!(observe_screen(&varied, None), expected, "{name}");
             // Synthetic: header cwd value variation; trust still requires its full absolute path.
             if name != "startup" {
@@ -648,7 +651,7 @@ mod tests {
         let text = format!("{bottom}  ⏵⏵ auto mode on (shift+tab to cycle)\n");
         assert_eq!(
             observe_screen(&text, None),
-            ScreenFacts {
+            facts! {
                 input: InputState::Empty,
                 turn: TurnState::Running,
                 dialog: DialogState::None,

@@ -62,10 +62,9 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
         .rposition(|line| line.starts_with("──"))?;
     let body = before_lower.get(top + 1..)?;
     if editor_dialog(body) {
-        return Some(ScreenFacts {
-            dialog: DialogState::Other,
-            ..ScreenFacts::default()
-        });
+        let mut facts = ScreenFacts::default();
+        facts.dialog = DialogState::Other;
+        return Some(facts);
     }
     // A pasted rule can masquerade as the last upper border. Without an editor
     // marker, earlier rules are ambiguous unless they belong to known startup UI.
@@ -102,12 +101,12 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     } else {
         FreshEditorEvidence::Unknown
     };
-    Some(ScreenFacts {
-        input,
-        turn,
-        dialog: DialogState::None,
-        fresh_editor,
-    })
+    let mut facts = ScreenFacts::default();
+    facts.input = input;
+    facts.turn = turn;
+    facts.dialog = DialogState::None;
+    facts.fresh_editor = fresh_editor;
+    Some(facts)
 }
 
 fn editor_dialog(body: &[&str]) -> bool {
@@ -271,6 +270,14 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    macro_rules! facts {
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut facts = ScreenFacts::default();
+            $(facts.$field = $value;)*
+            facts
+        }};
+    }
+
     macro_rules! capture {
         ($name:literal) => {
             include_str!(concat!("../tests/fixtures/screen_pi-", $name, "_1.5.0.txt"))
@@ -293,7 +300,7 @@ mod tests {
                 cases.push((
                     $name,
                     capture!($name),
-                    ScreenFacts {
+                    facts! {
                         input: $input,
                         turn: $turn,
                         dialog: $dialog,
@@ -346,9 +353,9 @@ mod tests {
         ] {
             assert_eq!(
                 observe_screen(text, None),
-                ScreenFacts {
+                facts! {
                     input: InputState::Empty,
-                    turn,
+                    turn: turn,
                     dialog: DialogState::None,
                     fresh_editor: FreshEditorEvidence::Unknown
                 }

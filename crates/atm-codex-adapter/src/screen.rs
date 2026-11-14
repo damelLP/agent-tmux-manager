@@ -72,10 +72,9 @@ pub fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
         lines.pop();
     }
     if known_dialog(&lines) {
-        return ScreenFacts {
-            dialog: DialogState::Other,
-            ..ScreenFacts::default()
-        };
+        let mut facts = ScreenFacts::default();
+        facts.dialog = DialogState::Other;
+        return facts;
     }
     editor(&lines).unwrap_or_default()
 }
@@ -193,16 +192,14 @@ fn editor(lines: &[&str]) -> Option<ScreenFacts> {
     } else {
         TurnState::Unknown
     };
-    Some(ScreenFacts {
-        input,
-        turn,
-        dialog,
-        fresh_editor: if fresh {
-            FreshEditorEvidence::Present
-        } else {
-            FreshEditorEvidence::Unknown
-        },
-    })
+    let mut facts = ScreenFacts::default();
+    facts.input = input;
+    facts.turn = turn;
+    facts.dialog = dialog;
+    if fresh {
+        facts.fresh_editor = FreshEditorEvidence::Present;
+    }
+    Some(facts)
 }
 
 fn positive_integer(value: &str) -> bool {
@@ -275,6 +272,14 @@ fn status_output(body: &[&str]) -> bool {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    macro_rules! facts {
+        ($($field:ident: $value:expr),* $(,)?) => {{
+            let mut facts = ScreenFacts::default();
+            $(facts.$field = $value;)*
+            facts
+        }};
+    }
+
     macro_rules! capture {
         ($name:literal) => {
             include_str!(concat!(
@@ -303,7 +308,7 @@ mod tests {
                 cases.push((
                     $name,
                     capture!($name),
-                    ScreenFacts {
+                    facts! {
                         input: $input,
                         turn: $turn,
                         dialog: $dialog,
@@ -343,7 +348,7 @@ mod tests {
 
     #[test]
     fn u5b_captured_screens() {
-        let fresh = ScreenFacts {
+        let fresh = facts! {
             input: InputState::Unknown,
             turn: TurnState::NotRunning,
             dialog: DialogState::None,

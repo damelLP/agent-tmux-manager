@@ -55,7 +55,20 @@ pub enum FreshEditorEvidence {
 }
 
 /// Independent observations. Default is entirely unknown, never safe.
+///
+/// Build from `Default` and set known fields; future facts must default to unknown.
+/// Exhaustive construction outside this crate is intentionally unavailable:
+/// ```compile_fail
+/// use atm_core::ScreenFacts;
+/// let facts = ScreenFacts {
+///     input: Default::default(),
+///     turn: Default::default(),
+///     dialog: Default::default(),
+///     fresh_editor: Default::default(),
+/// };
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScreenFacts {
     pub input: InputState,
     pub turn: TurnState,

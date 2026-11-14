@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use atm_core::{builtin_harnesses, Harness, HarnessDefinition, SessionId};
-use atm_tmux::{RealTmuxClient, TmuxClient, TmuxError};
+use atm_tmux::{client::TMUX_SOCKET_ENV, RealTmuxClient, TmuxClient, TmuxError};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
@@ -110,19 +110,24 @@ pub struct DiscoveryService {
     transcript_max_age_secs: u64,
     /// Lists tmux panes to map discovered processes to their pane.
     tmux: Box<dyn TmuxClient>,
+    /// A named server admits only processes mapped to one of its panes.
+    require_pane: bool,
 }
 
 impl DiscoveryService {
     /// Creates a new discovery service with default settings.
     ///
     /// Panes are listed with [`RealTmuxClient::new`], which honours
-    /// `ATM_TMUX_SOCKET`.
+    /// `ATM_TMUX_SOCKET`. A nonempty label scopes discovery to that server's
+    /// panes; without one, host-wide discovery (including headless agents)
+    /// is preserved. Moving only `ATM_SOCKET` does not change discovery.
     #[must_use]
     pub fn new(registry: RegistryHandle) -> Self {
         Self {
             registry,
             transcript_max_age_secs: DEFAULT_TRANSCRIPT_MAX_AGE_SECS,
             tmux: Box::new(RealTmuxClient::new()),
+            require_pane: requires_local_pane(std::env::var(TMUX_SOCKET_ENV).ok().as_deref()),
         }
     }
 
@@ -157,22 +162,27 @@ impl DiscoveryService {
         let mut result = DiscoveryResult::default();
 
         // One tmux call per scan; the scan below only looks pids up in it.
-        // A tmux failure means no pane info, not a failed discovery.
+        // A named server fails closed; default discovery tolerates no pane info.
         let pane_pids = list_pane_pids(self.tmux.as_ref())
             .await
             .unwrap_or_else(|e| {
                 match e {
                     // A stopped or wedged server, not just "tmux isn't running".
                     TmuxError::Timeout { .. } | TmuxError::Io(_) => {
-                        warn!(error = %e, "Listing tmux panes failed; discovering without panes");
+                        warn!(error = %e, require_pane = self.require_pane, "Listing tmux panes failed");
                     }
                     _ => debug!(error = %e, "No tmux panes listed"),
                 }
                 HashMap::new()
             });
 
+        if self.require_pane && pane_pids.is_empty() {
+            return result;
+        }
+
         // Scan for agent processes (blocking I/O in spawn_blocking)
-        let scan = move || scan_agent_processes(&pane_pids);
+        let require_pane = self.require_pane;
+        let scan = move || scan_agent_processes(&pane_pids, require_pane);
         let processes = match tokio::task::spawn_blocking(scan).await {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
@@ -287,6 +297,11 @@ impl DiscoveryService {
 // Blocking Filesystem Operations
 // ============================================================================
 
+/// Matches RealTmuxClient's explicit-label selection, not the daemon socket.
+fn requires_local_pane(tmux_socket: Option<&str>) -> bool {
+    tmux_socket.is_some_and(|label| !label.is_empty())
+}
+
 /// Maximum parent-chain depth walked when collecting ancestor PIDs.
 const MAX_ANCESTOR_WALK: usize = 25;
 
@@ -329,6 +344,7 @@ struct ProcessMatch {
 /// `spawn_blocking`.
 fn scan_agent_processes(
     pane_pids: &HashMap<u32, String>,
+    require_pane: bool,
 ) -> Result<Vec<DiscoveredProcess>, DiscoveryError> {
     let mut matches = Vec::new();
 
@@ -349,6 +365,9 @@ fn scan_agent_processes(
         if let Some(mut process_match) = detect_agent_process(pid) {
             process_match.process.tmux_pane =
                 find_pane_for_pid(pid, &process_match.ancestor_pids, pane_pids);
+            if require_pane && process_match.process.tmux_pane.is_none() {
+                continue;
+            }
             matches.push(process_match);
         }
     }
@@ -1524,10 +1543,12 @@ mod tests {
         ]);
         let registry = crate::registry::spawn_registry();
 
-        DiscoveryService::new(registry.clone())
-            .with_tmux(mock.clone())
-            .discover()
-            .await;
+        DiscoveryService {
+            require_pane: true,
+            ..DiscoveryService::new(registry.clone()).with_tmux(mock.clone())
+        }
+        .discover()
+        .await;
 
         assert_eq!(mock.calls(), vec![MockCall::ListPanes]);
         assert_eq!(
@@ -1542,6 +1563,82 @@ mod tests {
                 .as_deref(),
             Some("%8")
         );
+    }
+
+    #[test]
+    fn only_a_nonempty_tmux_label_requires_a_local_pane() {
+        for (label, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("private"), true),
+            (Some(" "), true),
+        ] {
+            assert_eq!(requires_local_pane(label), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn named_discovery_excludes_unmapped_processes_but_default_keeps_them() {
+        let local = StandIn::spawn();
+        let outside = StandIn::spawn();
+        for require_pane in [true, false] {
+            let mock = MockTmuxClient::new();
+            mock.set_panes(vec![test_pane("%7", local.pid())]);
+            let registry = crate::registry::spawn_registry();
+            let discovery = DiscoveryService {
+                require_pane,
+                ..DiscoveryService::new(registry.clone()).with_tmux(mock)
+            };
+            discovery.discover().await;
+            assert_eq!(
+                discovered_pane(&registry, local.pid()).await.as_deref(),
+                Some("%7")
+            );
+            assert_eq!(
+                registry
+                    .get_session(SessionId::pending_from_pid(outside.pid()))
+                    .await
+                    .is_some(),
+                !require_pane,
+            );
+            if require_pane {
+                assert_eq!(registry.get_all_sessions().await.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn named_discovery_fails_closed_on_empty_or_failed_pane_listing() {
+        let agent = StandIn::spawn();
+        for error in [
+            None,
+            Some(TmuxError::CommandFailed {
+                command: "list-panes".into(),
+                stderr: "no server".into(),
+            }),
+            Some(TmuxError::Timeout {
+                command: "list-panes".into(),
+                timeout: Duration::from_secs(5),
+            }),
+            Some(TmuxError::Io(std::io::Error::other("pane listing failed"))),
+            Some(TmuxError::NotFound),
+        ] {
+            let mock = MockTmuxClient::new();
+            if let Some(error) = error {
+                mock.set_panes(vec![test_pane("%7", agent.pid())]);
+                mock.set_next_error(error);
+            }
+            let registry = crate::registry::spawn_registry();
+            let result = DiscoveryService {
+                require_pane: true,
+                ..DiscoveryService::new(registry.clone()).with_tmux(mock.clone())
+            }
+            .discover()
+            .await;
+            assert_eq!(mock.calls(), vec![MockCall::ListPanes]);
+            assert_eq!((result.discovered, result.failed), (0, 0));
+            assert!(registry.get_all_sessions().await.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1565,10 +1662,12 @@ mod tests {
             mock.set_next_error(error);
             let registry = crate::registry::spawn_registry();
 
-            DiscoveryService::new(registry.clone())
-                .with_tmux(mock.clone())
-                .discover()
-                .await;
+            DiscoveryService {
+                require_pane: false,
+                ..DiscoveryService::new(registry.clone()).with_tmux(mock.clone())
+            }
+            .discover()
+            .await;
 
             assert_eq!(mock.calls(), vec![MockCall::ListPanes]);
             assert_eq!(discovered_pane(&registry, agent.pid()).await, None);

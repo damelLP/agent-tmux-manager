@@ -2,11 +2,10 @@
 //! replayed Claude session starts needing input.
 //!
 //! Sealed: `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `HOME`, `TMUX_TMPDIR` and
-//! `ATM_SOCKET` all point into the test's temp dir, and `TMUX`,
-//! `TMUX_PANE` and `ATM_TMUX_SOCKET` are removed, so the daemon reaches
-//! neither the user's daemon nor their tmux server. Startup discovery
-//! still lists the host's real agents, but none of them sends this daemon
-//! a hook, so they never notify.
+//! `ATM_SOCKET` all point into the test's temp dir; `TMUX` and `TMUX_PANE`
+//! are removed. A private `ATM_TMUX_SOCKET` label with no server keeps
+//! discovery empty instead of registering host processes. Replayed hooks
+//! still register sessions, independently of discovery's pane scope.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
@@ -53,7 +52,7 @@ impl Daemon {
             .env("RUST_LOG", "atmd=debug")
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
-            .env_remove("ATM_TMUX_SOCKET")
+            .env("ATM_TMUX_SOCKET", "notify-test")
             .stdin(Stdio::null())
             .stdout(fs::File::create(&log).unwrap())
             .stderr(Stdio::inherit())
@@ -216,6 +215,11 @@ fn atmd_notifies_once_per_permission_dialog() {
 
     let daemon = Daemon::start(dir.path());
     let mut client = Client::connect(&daemon.socket);
+    client.send(&ClientMessage::list_sessions());
+    match client.recv() {
+        DaemonMessage::SessionList { sessions } => assert!(sessions.is_empty()),
+        _ => panic!("expected initial session list"),
+    }
     let hooks = captured_hooks();
     let kind = |i: usize| {
         let hook = &hooks[i];

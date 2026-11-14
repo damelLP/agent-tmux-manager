@@ -77,9 +77,16 @@ rig.close();
   waiters after the cached committed state changes; no list-sessions polling.
   Restart creates a fresh subscription. `pane_rows` and `rows` make explicit
   snapshot queries to the real daemon.
-  SessionView has no PID: use owned panes/IDs, never total host row counts.
-  `discover()` can see unrelated procfs processes. A pending row becoming one
-  real-ID row proves discovery and the hook agree on PID.
+  SessionView has no PID: identify rows by owned panes/IDs. The rig sets a
+  private `ATM_TMUX_SOCKET` label: startup discovery and `discover()` admit only
+  processes mapped to that server's panes, and admit none if pane listing fails.
+  This supersedes the initial M1 allowance for foreign pending rows documented
+  in `scripts/atm-candidate.md` under "Lifecycle and limits": U11b's concurrent
+  runs proved host processes fill the 100-row registry and leak host sessions
+  into failure logs. Default-label daemons remain host-wide; private tests that
+  need discovery isolation must set a label in their own helpers. Direct hooks
+  are not filtered. A pending row becoming one real-ID row proves discovery
+  and the hook agree on PID.
 - `capture(pane)` joins wrapped screen lines; `capture_plain(pane)` preserves
   viewport line structure and trailing newlines (`capture-pane -p`, no `-J`).
   `capture_styled(pane)` uses `capture-pane -e -N -p`, retaining SGR and trailing

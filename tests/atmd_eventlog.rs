@@ -46,7 +46,8 @@ impl Daemon {
         if daemonized {
             command.arg("-d");
         }
-        let log_dir = self.dir.path().join("xdg/atm");
+        // A daemonized atmd writes atm.log beside its PID file in ATM_STATE_DIR.
+        let log_dir = self.state();
         std::fs::create_dir_all(&log_dir).unwrap();
         let changes = directory_changes(&log_dir);
         self.child = Some(

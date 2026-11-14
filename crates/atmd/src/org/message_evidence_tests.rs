@@ -889,3 +889,135 @@ fn first_receipt_is_never_overwritten() {
     observe(&e, "new", "%8", Harness::Pi, REFERENCE);
     assert_eq!(e.receipt(id()).unwrap(), Some(first));
 }
+
+/// A1's live history, with one agent bound to "session" on %7 and one
+/// message for it, as the fold of five committed events would leave it.
+/// `high_water` above 3 leaves the replay incomplete.
+fn live_history(high_water: u64) -> crate::org::message_history::MessageHistoryHandle {
+    use atm_org::{Address, MessageContent, MessageKind, OrgEvent};
+    let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let history = crate::org::message_history::MessageHistoryHandle::new(
+        high_water,
+        start,
+        atm_org::delivery::DeliveryPolicy::default(),
+    )
+    .unwrap();
+    let events = [
+        OrgEvent::ProjectRegistered {
+            project_id: "demo".parse().unwrap(),
+            root: "/project".into(),
+        },
+        OrgEvent::AgentAdopted {
+            agent_id: "demo/worker".parse().unwrap(),
+            pane: "%7".into(),
+            session_id: Some("session".into()),
+        },
+        OrgEvent::MessageSent(MessageContent {
+            from: Address::Owner,
+            to: Address::Agent("demo/worker".parse().unwrap()),
+            kind: MessageKind::Note,
+            body: "brief".into(),
+            attachments: vec![],
+            task: None,
+        }),
+    ];
+    for (seq, event) in (1..).zip(events) {
+        let update = HistoryUpdate::Applied {
+            seq,
+            at: start,
+            event: Some(event),
+        };
+        history.record(update, start).unwrap();
+    }
+    history
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_activity_never_disables_evidence() {
+    // One failed Activity write turns evidence off for everyone, so no
+    // ordinary event may fail it: not before the replay is complete, not for
+    // a session history has never seen, not without a pane, not unproven.
+    for high_water in [3, 9] {
+        let e = armed();
+        let history = live_history(high_water);
+        for session in ["session", "never-seen", "pending-42"] {
+            for pane in [Some("%7"), Some("%9"), None] {
+                for proven in [true, false] {
+                    let event = LifecycleEvent::PromptSubmit {
+                        prompt: Some("an ordinary prompt".into()),
+                    };
+                    for (harness, event) in [(Some(Harness::Pi), Some(&event)), (None, None)] {
+                        e.tap(
+                            &SessionId::new(session),
+                            pane,
+                            harness,
+                            event,
+                            proven,
+                            Some(&history),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+        assert!(e.available(), "{high_water}");
+        exact(&e);
+        assert!(e.receipt(id()).unwrap().is_some());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_tapped_event_reaches_history_with_its_own_receive_time() {
+    use crate::org::message_history::{PanePresence, RecipientObservation, SessionObservation};
+    use atm_core::{DialogState, InputState, ScreenFacts, SessionStatus, TurnState};
+    let e = evidence();
+    let start = e.clock().now().unwrap();
+    let history = live_history(3);
+    let mut facts = ScreenFacts::default();
+    facts.input = InputState::Empty;
+    facts.turn = TurnState::NotRunning;
+    facts.dialog = DialogState::None;
+    let observed = HistoryUpdate::Observed {
+        recipient: "demo/worker".parse().unwrap(),
+        observation: RecipientObservation {
+            pane: Some(PaneId::parse("%7").unwrap()),
+            session: Some(SessionObservation {
+                id: "session".into(),
+                harness: Harness::Pi,
+                status: SessionStatus::Working,
+                last_event_at: None,
+            }),
+            presence: PanePresence::Alive,
+            facts,
+            copy_mode: Some(false),
+            focused: Some(false),
+        },
+    };
+    history.record(observed, start).unwrap();
+    let last_event = |now| {
+        let snapshot = history.snapshot(MessageId::new(3), now).unwrap();
+        snapshot.live.session.unwrap().last_event_at
+    };
+    // Two events, 7 s apart on the evidence clock; nothing reads history in
+    // between. Each must carry the time it was received, not a later one.
+    let session = SessionId::new("session");
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    e.tap(&session, None, None, None, false, Some(&history))
+        .unwrap();
+    let first = e.clock().now().unwrap();
+    assert_eq!(first, start + chrono::TimeDelta::seconds(5));
+    tokio::time::advance(std::time::Duration::from_secs(7)).await;
+    let later = e.clock().now().unwrap();
+    assert_eq!(last_event(later), first);
+    e.tap(
+        &session,
+        Some("%7"),
+        Some(Harness::Pi),
+        Some(&LifecycleEvent::WorkingStart),
+        true,
+        Some(&history),
+    )
+    .unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    assert_eq!(last_event(e.clock().now().unwrap()), later);
+}

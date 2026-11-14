@@ -459,8 +459,8 @@ fn real_hook_pages_are_partial_never_complete() {
 
 #[test]
 fn synthetic_complete_sets_follow_p6_exactly() {
-    // Synthetic: no real complete/lower-page capture exists. These are validator
-    // data, not invented accepted screens. Names come from the installed vocabulary.
+    // Synthetic: validator data exercise mixed active counts, not an invented
+    // accepted screen. Real complete collections are covered by the P2 replay.
     let pending: Vec<_> = CodexEventType::hook_names()
         .enumerate()
         .map(|(i, name)| {

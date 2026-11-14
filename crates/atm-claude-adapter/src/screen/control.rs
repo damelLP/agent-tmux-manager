@@ -5,6 +5,7 @@
 //! above the first complete header are uninterpreted shell output, except that
 //! Claude editor/transcript chrome there vetoes freshness. A second header is
 //! history, not a reason to discard an existing conversation.
+//! A column-0 `❯ ` line above the header, including a shell prompt, vetoes freshness.
 use super::*;
 use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,

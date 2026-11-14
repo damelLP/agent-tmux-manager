@@ -308,6 +308,21 @@ fn synthetic_scrolled_transcript_before_a_complete_header_is_not_fresh() {
 }
 
 #[test]
+fn synthetic_column_zero_shell_prompt_before_header_vetoes_freshness() {
+    // Synthetic: the B0 tail review's shell launch line above A-auto-ready's
+    // real header. A shell prompt indistinguishable from transcript chrome
+    // conservatively vetoes freshness; it does not block the ready editor.
+    let auto = plain(AUTO);
+    let fresh = &auto[auto.find(" ▐▛███▛█   Claude Code v").unwrap()..];
+    let text = format!("❯ cd '/tmp/project' && claude --model example\n{fresh}");
+    for input in [ScreenInput::Plain(&text), ScreenInput::Styled(&text)] {
+        let observed = observe_control_screen(input, None);
+        assert_eq!(observed.dialog, ControlDialog::None);
+        assert_eq!(observed.facts.fresh_editor, FreshEditorEvidence::Unknown);
+    }
+}
+
+#[test]
 fn synthetic_headers_and_footer_damage_do_not_manufacture_freshness() {
     let auto = plain(AUTO);
     for text in [

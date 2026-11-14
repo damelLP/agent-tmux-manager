@@ -26,6 +26,8 @@ pub struct MethodServices {
     pub control: Option<crate::control::service::ControlHandle>,
     /// Named-agent service; None advertises explicitly unavailable operations.
     pub agents: Option<crate::org::agents::AgentHandle>,
+    /// Confirmed-message service; None advertises explicitly unavailable operations.
+    pub messages: Option<crate::org::messages::MessageHandle>,
     /// Production resolves this before daemonization; tests can inject a path.
     /// daemon.info displays non-UTF-8 paths lossily; filesystem use stays exact.
     pub state_dir: PathBuf,
@@ -41,6 +43,7 @@ impl MethodServices {
             registry,
             control: None,
             agents: None,
+            messages: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
             raw: crate::org::RawHandle::default(),
@@ -184,6 +187,15 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         &mut router,
         services.agents.unwrap_or_else(|| {
             crate::org::agents::AgentHandle::disabled("named-agent operations are not configured")
+        }),
+    )?;
+
+    crate::org::messages::register_message_methods(
+        &mut router,
+        services.messages.unwrap_or_else(|| {
+            crate::org::messages::MessageHandle::disabled(
+                "confirmed-message operations are not configured",
+            )
         }),
     )?;
 

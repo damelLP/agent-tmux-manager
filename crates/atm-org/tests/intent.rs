@@ -311,6 +311,53 @@ fn malformed_entries_fail_the_whole_section_with_their_line() {
     }
 }
 
+// Break caught: silently authorizing a weaker prefix of a wrapped measure.
+#[test]
+fn measure_continuations_are_refused_at_any_indent() {
+    for (item, continuation) in [
+        ("mechanical: cargo test --workspace", "  --features strict"),
+        (
+            "mechanical: cargo test --workspace",
+            "    --features strict",
+        ),
+        ("mechanical: cargo test --workspace", "\t--features strict"),
+        ("mechanical: cargo test --workspace", "--features strict"),
+        ("mechanical: scripts/check", "strict"),
+        ("reviewed: .atm/measures/review.md", "  strict"),
+        ("owner", "  only after review"),
+    ] {
+        assert_eq!(
+            parse_intent_measures(&format!(
+                "## How we will know\n- {item}\n{continuation}\n- owner\n"
+            )),
+            Err(IntentError::InvalidMeasure { line: 3 }),
+            "{item:?} followed by {continuation:?}"
+        );
+    }
+    assert_eq!(
+        parse_intent_measures("## How we will know\n- owner\n- owner\n  only after review\n"),
+        Err(IntentError::InvalidMeasure { line: 4 })
+    );
+}
+
+// Break caught: confusing a Markdown boundary with a wrapped measure value.
+#[test]
+fn markdown_boundaries_after_measures_are_not_continuations() {
+    for boundary in [
+        "## Next\n- unknown",
+        "Next\n----\n- unknown",
+        "```\nnot a measure\n```",
+        "---",
+        "<!-- not a measure -->",
+    ] {
+        assert_eq!(
+            parse_intent_measures(&format!("## How we will know\n- owner\n{boundary}\n")).unwrap(),
+            vec![TaskMeasure::Owner],
+            "{boundary}"
+        );
+    }
+}
+
 // Break caught: reviewed rubric references escaping the protected measures directory.
 #[test]
 fn reviewed_paths_must_be_canonical_files_below_the_measures_directory() {

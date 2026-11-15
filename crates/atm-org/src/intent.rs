@@ -30,12 +30,25 @@ pub enum IntentError {
 pub fn parse_intent_measures(text: &str) -> Result<Vec<TaskMeasure>, IntentError> {
     let mut lines = text.lines().enumerate().peekable();
     let (mut found, mut section, mut fence) = (false, None, None);
-    let mut comment = false;
+    let (mut comment, mut after_item) = (false, false);
     let mut measures = Vec::new();
     while let Some((row, raw)) = lines.next() {
         if comment {
             commented_line(raw, &mut comment);
             continue;
+        }
+        let text = raw.trim();
+        if std::mem::take(&mut after_item)
+            && !text.is_empty()
+            && list_item(text).is_none()
+            && heading(text, lines.peek().map(|(_, s)| *s)).is_none()
+            && fence_run(text).is_none()
+            && !thematic_break(text)
+            && !text.contains("<!--")
+        {
+            return Err(IntentError::InvalidMeasure {
+                line: row.saturating_add(1),
+            });
         }
         let Some(line) = markdown_line(raw) else {
             continue;
@@ -88,6 +101,7 @@ pub fn parse_intent_measures(text: &str) -> Result<Vec<TaskMeasure>, IntentError
             if !measures.contains(&measure) {
                 measures.push(measure);
             }
+            after_item = true;
         }
     }
     if !found {

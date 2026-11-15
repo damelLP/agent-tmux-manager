@@ -517,14 +517,97 @@ fn agent_up_reads_main_checkout_role() {}
 /// a safe editor; return that ID on the same process, never rebind the old row.
 /// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "agent.clear is in the base; acceptance not yet written; needs a styled fresh-editor Claude stand-in frame at 200 columns"]
-fn clear_returns_new_ready_session_claude() {}
+fn clear_returns_new_ready_session_claude() {
+    clear_returns_a_new_ready_session(StandInMode::Claude);
+}
 
 /// Held pi clear stays Clearing until changed ID plus safe editor on the same
 /// process/connection; repeated notices alone are not acknowledgment.
 #[test]
-#[ignore = "agent.clear is in the base; pi clear stand-in acceptance not yet written"]
-fn clear_returns_new_ready_session_pi() {}
+fn clear_returns_new_ready_session_pi() {
+    clear_returns_a_new_ready_session(StandInMode::Pi);
+}
+
+/// `agent.clear` of an agent that `agent.up` started and that has had a
+/// turn: the clear command goes into the same process, the agent is Clearing
+/// for as long as the harness has not announced another session, and the
+/// call answers with that session once its editor is safe.
+fn clear_returns_a_new_ready_session(mode: StandInMode) {
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, pane) = (started.id.as_str(), &started.pane);
+    let old = test.complete_fixture_turn(pane);
+    assert_eq!(test.agent(id)["session_id"], old.id.as_str());
+    let identity = process_identity(pane.pid);
+    let cursor = test.cursor();
+    let after = test.rig.event_cursor(pane);
+    let call = test.call_in_background("agent.clear", json!({"agent": id, "timeout_ms": 30000}));
+    // The stand-in took the command and holds the clear on its manual clock:
+    // the call has not answered, and the agent is Clearing, not Ready.
+    test.rig.wait_event(pane, after, |e| {
+        e["kind"] == "rendered" && e["state"] == "clearing"
+    });
+    assert!(!call.is_finished());
+    let held = test.agent(id);
+    assert_eq!(held["state"], "clearing", "{held}");
+    let now = test.rig.control(pane, json!({"command":"barrier"}))["now_ms"]
+        .as_u64()
+        .unwrap();
+    let reply = test.rig.control(
+        pane,
+        json!({"command":"advance_to", "now_ms": now + config.clear_gap_ms}),
+    );
+    assert!(reply["error"].is_null(), "{reply}");
+    let result = call.join().unwrap().unwrap();
+    let row = test.rig.wait_for_row(pane, |r| {
+        !r.id.is_pending() && r.id != old.id && r.status == SessionStatus::Idle
+    });
+    assert_eq!(
+        result,
+        json!({"agent_id": id, "session_id": row.id.as_str()})
+    );
+    // The same process in the same pane, one row, and the agent Ready on it.
+    assert_eq!(process_identity(pane.pid), identity);
+    test.rig.wait_for_absent(&old.id);
+    assert_eq!(test.rig.pane_rows(pane).len(), 1);
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "ready", "{agent}");
+    assert_eq!(agent["pane"], pane.pane_id);
+    assert_eq!(agent["session_id"], row.id.as_str());
+    // The clear command was the only thing typed, and it was not a prompt.
+    test.rig.control(pane, json!({"command": "barrier"}));
+    for event in test
+        .rig
+        .journal(pane)
+        .iter()
+        .filter(|e| e["event_sequence"].as_u64().unwrap() > after)
+    {
+        assert!(
+            !matches!(
+                event["kind"].as_str(),
+                Some("identity" | "accepted" | "rejected" | "queued")
+            ),
+            "{event}"
+        );
+        assert!(
+            !matches!(event["event"].as_str(), Some("UserPromptSubmit" | "input")),
+            "{event}"
+        );
+    }
+    let events = test.tail(cursor);
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .filter(|kind| kind.starts_with("agent.") || kind.starts_with("control."))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["agent.clear_requested", "agent.session_bound"],
+        "{events:?}"
+    );
+    test.rig.close();
+}
 
 /// Codex conversation-to-fresh clear returns Ready/null, excludes the old ID,
 /// then binds the next real prompt's ID once without any slash concatenation.
@@ -547,8 +630,117 @@ fn clear_worktree_default() {}
 /// Respawn replaces pane/process/session under the same agent; stale old events
 /// cannot bind. Use another pre-sized placement window, never split a stand-in.
 #[test]
-#[ignore = "waits for Tasks 6 and 10: respawn acceptance"]
-fn respawn_uses_new_process_and_session() {}
+fn respawn_uses_new_process_and_session() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, old) = (started.id.as_str(), &started.pane);
+    let old_row = test.complete_fixture_turn(old);
+    let old_identity = process_identity(old.pid);
+
+    // Called from another window: the old pane is killed, never split.
+    let log = test.next_stand_in("lead-again", &config);
+    let placement = test.placement(&config);
+    let cursor = test.cursor();
+    let result = test.rpc(
+        "agent.respawn",
+        json!({"agent": id, "caller_server": test.server()}),
+        Some(placement.clone()),
+    );
+    assert_eq!(result["agent_id"], id);
+    let pane_id = result["pane"].as_str().unwrap().to_owned();
+    assert_ne!(pane_id, old.pane_id);
+    let new = test.rig.observe_pane(pane_id, mode, log);
+
+    // The old pane and its process are gone; the new pane is in the
+    // caller's window, tagged, with another process and another session.
+    stand_in::process::wait_exit(old.pid, std::time::Duration::from_secs(30)).unwrap();
+    let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
+    assert!(!panes.lines().any(|p| p == old.pane_id), "{panes}");
+    assert!(panes.lines().any(|p| p == started.placement), "{panes}");
+    let window = |pane_id: &str| {
+        checked(test.rig.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{window_id} #{window_panes} #{session_attached}",
+        ]))
+    };
+    assert_eq!(window(&new.pane_id), window(&placement));
+    assert!(window(&new.pane_id).ends_with(" 2 0"));
+    assert_eq!(test.tag(&new.pane_id), id);
+    assert_ne!(process_identity(new.pid), old_identity);
+    let row = test.rig.wait_for_row(&new, |r| {
+        !r.id.is_pending() && r.status == SessionStatus::Idle
+    });
+    assert_ne!(row.id, old_row.id);
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "ready", "{agent}");
+    assert_eq!(agent["pane"], new.pane_id);
+    assert_eq!(agent["session_id"], row.id.as_str());
+    test.assert_no_prompt(&new);
+
+    // One record: the kill under agent.respawn, the Down, then a start.
+    let events = test.tail(cursor);
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .filter(|kind| kind.starts_with("agent.") || kind.starts_with("control."))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "control.killed",
+            "agent.down",
+            "agent.up_requested",
+            "agent.pane_created",
+            "control.spawned",
+            "agent.session_bound",
+        ],
+        "{events:?}"
+    );
+    let killed = events
+        .iter()
+        .find(|e| e["kind"] == "control.killed")
+        .unwrap();
+    assert_eq!(
+        killed["body"],
+        json!({"pane": old.pane_id, "action": {"method": "agent.respawn", "agent": id}})
+    );
+    let bound = events
+        .iter()
+        .find(|e| e["kind"] == "agent.session_bound")
+        .unwrap();
+    assert_eq!(bound["body"]["session_id"], row.id.as_str());
+
+    // The agent that was started twice is taken down like any other.
+    let cursor = test.cursor();
+    let result = test.rpc("agent.down", json!({"agent": id, "kill": true}), None);
+    assert_eq!(result, json!({"agent_id": id}));
+    stand_in::process::wait_exit(new.pid, std::time::Duration::from_secs(30)).unwrap();
+    let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
+    assert!(!panes.lines().any(|p| p == new.pane_id), "{panes}");
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "down", "{agent}");
+    assert_eq!(agent["pane"], json!(null));
+    assert_eq!(
+        agent["reason"],
+        format!("taken down; {} killed", new.pane_id)
+    );
+    let events = test.tail(cursor);
+    let killed: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "control.killed")
+        .collect();
+    assert_eq!(killed.len(), 1, "{events:?}");
+    assert_eq!(
+        killed[0]["body"],
+        json!({"pane": new.pane_id, "action": {"method": "agent.down", "agent": id}})
+    );
+    test.rig.close();
+}
 
 /// A daemon restart retains durable identity/binding and converges after live
 /// row and foreground-baseline revalidation, without lifecycle input.

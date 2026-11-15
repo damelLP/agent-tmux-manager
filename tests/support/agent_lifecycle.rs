@@ -3,8 +3,9 @@
 //! Ready adoption types the launcher into interactive bash: `rig.launch` uses
 //! a noninteractive child/retained-shell shape and is only for refusal tests.
 //! Each agent has its own detached window, sized before launch (200x50 here).
-//! Future `agent.up` callers need a 200x104 placement window so its vertical
-//! split leaves at least 200x50. Never split/resize a running stand-in or attach.
+//! An `agent.up` or `agent.respawn` is called from a placement window born at
+//! twice the stand-in's height plus the border, so the daemon's vertical split
+//! leaves the stand-in its size. Never split/resize a running stand-in or attach.
 //! Take an event cursor before each action; wait for rendered/row events and
 //! release manual-clock gates explicitly. Only initial shell readiness lacks
 //! an event and uses the shared bounded condition poll. Journal observations
@@ -67,6 +68,32 @@ fn quote(path: &Path) -> String {
     format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
 }
 
+/// One lifecycle request. The bound is above every lifecycle call's own (a
+/// start has 60 s).
+fn request(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    from_pane: Option<String>,
+) -> Result<Value, String> {
+    let response = stand_in::protocol_request(
+        socket,
+        ClientMessage::request("lifecycle".into(), method.into(), params, from_pane),
+        Duration::from_secs(90),
+    )
+    .unwrap();
+    match response {
+        DaemonMessage::Response { id, payload } => {
+            assert_eq!(id, "lifecycle");
+            match payload {
+                ResponsePayload::Result(value) => Ok(value),
+                ResponsePayload::Error(error) => Err(format!("{error:?}")),
+            }
+        }
+        other => Err(format!("{method}: {other:?}")),
+    }
+}
+
 pub struct AgentRig {
     pub rig: StandInRig,
     pub project: PathBuf,
@@ -94,29 +121,24 @@ impl AgentRig {
     }
 
     /// As [`Self::rpc`], with a refusal as a value: its code and message.
-    /// The bound is above every lifecycle call's own (a start has 60 s).
     pub fn call(
         &self,
         method: &str,
         params: Value,
         from_pane: Option<String>,
     ) -> Result<Value, String> {
-        let response = stand_in::protocol_request(
-            &self.rig.socket(),
-            ClientMessage::request("lifecycle".into(), method.into(), params, from_pane),
-            Duration::from_secs(90),
-        )
-        .unwrap();
-        match response {
-            DaemonMessage::Response { id, payload } => {
-                assert_eq!(id, "lifecycle");
-                match payload {
-                    ResponsePayload::Result(value) => Ok(value),
-                    ResponsePayload::Error(error) => Err(format!("{error:?}")),
-                }
-            }
-            other => panic!("{method}: {other:?}\n{}", self.rig.diagnostics()),
-        }
+        request(&self.rig.socket(), method, params, from_pane)
+    }
+
+    /// [`Self::call`] on its own thread, for a call the test must act during
+    /// (a clear waits for the stand-in's clock, which the test moves).
+    pub fn call_in_background(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> std::thread::JoinHandle<Result<Value, String>> {
+        let socket = self.rig.socket();
+        std::thread::spawn(move || request(&socket, method, params, None))
     }
 
     pub fn server(&self) -> String {

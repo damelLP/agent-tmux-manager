@@ -996,3 +996,100 @@ async fn readopt_of_a_starting_agent_on_a_safe_screen_only_reports_the_editor() 
     assert_eq!(agent.status, AgentStatus::Ready);
     assert_eq!(agent.session_id, None);
 }
+
+async fn quarantined(rig: &Rig, agent: &str) -> bool {
+    use crate::control::reservation::ReservationError;
+    matches!(
+        rig.control
+            .run_reserved(
+                request(agent, Some("%1"), ReservationKind::Observe),
+                |_| async { Ok::<_, AgentError>(()) },
+                cleanup,
+            )
+            .await,
+        Err(AgentError::Reservation(ReservationError::Quarantined { .. }))
+    )
+}
+
+#[tokio::test]
+async fn down_kill_of_a_pane_that_just_went_away_records_down() {
+    // Review 19, probe r04. The pane is there at the down's inspection and
+    // gone at the kill's own check: positively absent, which is what a down
+    // wants. Twin (the pane is killed): down_kill_true_kills_once_and_records_down.
+    // The same for a release: there is nothing left to untag.
+    for kill in [true, false] {
+        let (rig, agents) = ready_agent().await;
+        rig.inspect_only("%1", "p/lead");
+        rig.client.script_inspect(&pane("%1"), None).unwrap();
+        down(&agents, kill).await.unwrap();
+        assert!(mutations(&rig).is_empty(), "{kill}");
+        assert_eq!(rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Down, "{kill}");
+        assert_eq!(agent.pane, None);
+        assert_eq!(
+            agent.reason.as_deref(),
+            Some("taken down; %1 was already gone")
+        );
+        assert!(!quarantined(&rig, "p/lead").await);
+    }
+}
+
+#[tokio::test]
+async fn down_refused_before_any_effect_does_not_quarantine() {
+    // Review 19, probe r04b. The tag changes between the down's inspection
+    // and the untag's (or the kill's) own check: refused, nothing changed, so
+    // nothing to account for. Twins (the effect happened and the record did
+    // not): untag_ok_then_down_append_*_quarantines.
+    for kill in [false, true] {
+        let (rig, agents) = ready_agent().await;
+        rig.inspect_only("%1", "p/lead");
+        rig.client
+            .script_tag_check(&tagged("%1", Some("p/other")))
+            .unwrap();
+        let result = down(&agents, kill).await;
+        assert!(
+            matches!(
+                result,
+                Err(AgentError::Reservation(
+                    crate::control::reservation::ReservationError::TagMismatch { .. }
+                ))
+            ),
+            "{kill}: {result:?}"
+        );
+        assert!(mutations(&rig).is_empty(), "{kill}");
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert!(!quarantined(&rig, "p/lead").await, "{kill}");
+    }
+}
+
+#[tokio::test]
+async fn adopt_tag_refused_before_any_effect_does_not_quarantine() {
+    // Review 19, probe r07b. Another tag appears between the adopt's
+    // inspection and its own tag call.
+    let adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    adoption
+        .rig
+        .client
+        .script_inspect(&pane("%1"), Some(&Adoption::inspection(None, "pi", "")))
+        .unwrap();
+    adoption
+        .rig
+        .client
+        .script_tag_check(&Adoption::inspection(Some("p/other"), "pi", ""))
+        .unwrap();
+    let result = adoption.adopt().await;
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::TagMismatch { .. }
+            ))
+        ),
+        "{result:?}"
+    );
+    assert!(mutations(&adoption.rig).is_empty());
+    assert!(adoption.agent().await.is_none());
+    assert!(!quarantined(&adoption.rig, "q/lead").await);
+}

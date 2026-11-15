@@ -69,33 +69,43 @@ impl AgentRuntime {
                         found.local_agent_tag.as_deref().unwrap_or("no tag")
                     )));
                 }
-                Some(_) if kill => {
-                    let action = serde_json::json!({
-                        "method": "agent.down",
-                        "agent": id.to_string(),
-                    });
-                    // An error may still have killed the pane: account for it.
-                    effect.store(true, Ordering::SeqCst);
-                    r.kill(pane, id.clone(), action, chrono::Utc::now()).await?;
-                    if r.inspect(pane).await?.is_some() {
-                        return Err(AgentError::Internal(format!(
-                            "{pane} is still there after it was killed"
-                        )));
-                    }
-                    reason = format!("taken down; {pane} killed");
-                }
                 Some(_) => {
-                    effect.store(true, Ordering::SeqCst);
-                    r.untag(pane, id.clone()).await?;
-                    if r.inspect(pane)
-                        .await?
-                        .is_some_and(|found| found.local_agent_tag.is_some())
-                    {
-                        return Err(AgentError::Internal(format!(
-                            "{pane} still carries a tag after it was released"
-                        )));
+                    let done = if kill {
+                        let action = serde_json::json!({
+                            "method": "agent.down",
+                            "agent": id.to_string(),
+                        });
+                        r.kill(pane, id.clone(), action, chrono::Utc::now()).await
+                    } else {
+                        r.untag(pane, id.clone()).await
+                    };
+                    match changed(effect, done) {
+                        // It went away after the inspection: what a down wants.
+                        Err(ReservationError::PaneGone { .. }) => {
+                            reason = format!("taken down; {pane} was already gone");
+                        }
+                        Err(error) => return Err(error.into()),
+                        Ok(()) if kill => {
+                            if r.inspect(pane).await?.is_some() {
+                                return Err(AgentError::Internal(format!(
+                                    "{pane} is still there after it was killed"
+                                )));
+                            }
+                            reason = format!("taken down; {pane} killed");
+                        }
+                        Ok(()) => {
+                            if r.inspect(pane)
+                                .await?
+                                .is_some_and(|found| found.local_agent_tag.is_some())
+                            {
+                                return Err(AgentError::Internal(format!(
+                                    "{pane} still carries a tag after it was released"
+                                )));
+                            }
+                            reason =
+                                format!("taken down; {pane} released with its program running");
+                        }
                     }
-                    reason = format!("taken down; {pane} released with its program running");
                 }
             }
         }
@@ -134,6 +144,31 @@ impl AgentRuntime {
         }
         Ok(())
     }
+}
+
+/// Record that a pane operation may have changed its pane, unless it failed in
+/// one of the ways [`ReservationError`] documents as "before effect" for a
+/// pane operation: then nothing was changed and nothing needs accounting for.
+/// Every other outcome, success included, may have: an error can follow the
+/// effect. (`InvalidRequest` is left out: for a general operation it is not
+/// documented as before effect.)
+fn changed(effect: &Effect, result: Result<(), ReservationError>) -> Result<(), ReservationError> {
+    let before_effect = matches!(
+        &result,
+        Err(ReservationError::NotImplemented { .. }
+            | ReservationError::Busy { .. }
+            | ReservationError::StaleReservation
+            | ReservationError::ScreenChanged { .. }
+            | ReservationError::TagMismatch { .. }
+            | ReservationError::PaneGone { .. }
+            | ReservationError::InvalidObservation { .. }
+            | ReservationError::Quarantined { .. }
+            | ReservationError::Control(crate::control::ControlError::SendRefused { .. }))
+    );
+    if !before_effect {
+        effect.store(true, Ordering::SeqCst);
+    }
+    result
 }
 
 /// How long a flow waits for the registry to answer one read.
@@ -228,8 +263,7 @@ impl AgentRuntime {
         // Before the tag: an ambiguous pane is refused with nothing changed.
         candidates(&self.pane_sessions(pane).await?)?;
         if !tagged {
-            effect.store(true, Ordering::SeqCst);
-            r.tag(pane, ExpectedTag::Absent).await?;
+            changed(effect, r.tag(pane, ExpectedTag::Absent).await)?;
         }
         // Read everything again now that the pane is ours.
         let rows = self.pane_sessions(pane).await?;

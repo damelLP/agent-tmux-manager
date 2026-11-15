@@ -750,7 +750,10 @@ async fn daemon_lookup_error_keeps_its_text() {
         ).await;
         assert_eq!(out.status.code(), Some(1));
         assert!(out.stdout.is_empty());
-        assert_eq!(out.stderr, b"Error: agent.list is unavailable: test\n");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            "Error: agent.list is unavailable: test\n"
+        );
     }
 }
 

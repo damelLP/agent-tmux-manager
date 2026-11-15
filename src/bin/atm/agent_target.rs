@@ -168,6 +168,7 @@ mod tests {
     async fn stalled_request(
         method: &str,
         params: Value,
+        pane: Option<&str>,
         command: impl Future<Output = Result<()>>,
         expected: &str,
     ) {
@@ -185,7 +186,10 @@ mod tests {
         );
         std::env::set_var("ATM_SOCKET", &socket);
         std::env::set_var("ATM_STATE_DIR", dir.path().join("state"));
-        std::env::remove_var("TMUX_PANE");
+        match pane {
+            Some(pane) => std::env::set_var("TMUX_PANE", pane),
+            None => std::env::remove_var("TMUX_PANE"),
+        }
         let (returned, mut returned_rx) = tokio::sync::oneshot::channel();
         let command = async {
             let result = command.await;
@@ -231,6 +235,7 @@ mod tests {
                 if requests.is_empty() {
                     assert_eq!(request["method"], method);
                     assert_eq!(request["params"], params);
+                    assert_eq!(request.get("from_pane").and_then(Value::as_str), pane);
                 } else {
                     // Let an erroneous follow-up finish without changing its reported error.
                     let reply = json!({"type":"response","id":request["id"],"result":null});
@@ -271,10 +276,12 @@ mod tests {
         );
     }
 
-    async fn stalled_lookup(args: &[&str]) {
+    async fn stalled_lookup(args: &[&str], pane: Option<&str>) {
+        let root = pane.is_none().then(|| std::env::current_dir().unwrap());
         stalled_request(
             "agent.list",
-            json!({"project_root": std::env::current_dir().unwrap()}),
+            json!({"project_root": root}),
+            pane,
             run_command(args, Some(TEST_BUDGET)),
             LOOKUP_TIMEOUT,
         )
@@ -283,23 +290,32 @@ mod tests {
 
     #[tokio::test]
     async fn clear_lookup_timeout_sends_nothing() {
-        stalled_lookup(&["atm", "agent", "clear", "worker"]).await;
+        stalled_lookup(&["atm", "agent", "clear", "worker"], None).await;
     }
     #[tokio::test]
     async fn respawn_lookup_timeout_sends_nothing() {
-        stalled_lookup(&["atm", "agent", "respawn", "worker"]).await;
+        stalled_lookup(&["atm", "agent", "respawn", "worker"], None).await;
     }
     #[tokio::test]
     async fn down_lookup_timeout_sends_nothing() {
-        stalled_lookup(&["atm", "agent", "down", "worker", "--kill"]).await;
+        stalled_lookup(&["atm", "agent", "down", "worker", "--kill"], None).await;
     }
     #[tokio::test]
     async fn inbox_lookup_timeout_sends_nothing() {
-        stalled_lookup(&["atm", "inbox", "--for", "worker"]).await;
+        stalled_lookup(&["atm", "inbox", "--for", "worker"], None).await;
     }
     #[tokio::test]
     async fn send_lookup_timeout_sends_nothing() {
-        stalled_lookup(&["atm", "msg", "send", "--to", "worker", "--body", "hi"]).await;
+        stalled_lookup(
+            &["atm", "msg", "send", "--to", "worker", "--body", "hi"],
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pane_lookup_timeout_sends_nothing() {
+        stalled_lookup(&["atm", "agent", "clear", "worker"], Some("%7")).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -308,39 +324,54 @@ mod tests {
         let _lock = super::super::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let _restore = RestoreEnv(vec![("TMUX_PANE", std::env::var_os("TMUX_PANE"))]);
-        std::env::remove_var("TMUX_PANE");
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = RestoreEnv(
+            ["ATM_SOCKET", "ATM_STATE_DIR", "TMUX_PANE"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("ATM_SOCKET", dir.path().join("rpc.sock"));
+        std::env::set_var("ATM_STATE_DIR", dir.path().join("state"));
         let _permit = super::super::rpc::startup_slot_for_test()
             .acquire_owned()
             .await
             .unwrap();
         // The held semaphore prevents every command from starting a thread or socket I/O.
-        for args in [
-            &["atm", "agent", "clear", "worker"][..],
-            &["atm", "agent", "respawn", "worker"][..],
-            &["atm", "agent", "down", "worker", "--kill"][..],
-            &["atm", "inbox", "--for", "worker"][..],
-            &["atm", "msg", "send", "--to", "worker", "--body", "hi"][..],
+        for (args, pane) in [
+            (&["atm", "agent", "clear", "worker"][..], None),
+            (&["atm", "agent", "respawn", "worker"][..], None),
+            (&["atm", "agent", "down", "worker", "--kill"][..], None),
+            (&["atm", "inbox", "--for", "worker"][..], None),
+            (
+                &["atm", "msg", "send", "--to", "worker", "--body", "hi"][..],
+                None,
+            ),
+            (&["atm", "agent", "clear", "worker"][..], Some("%7")),
         ] {
+            match pane {
+                Some(pane) => std::env::set_var("TMUX_PANE", pane),
+                None => std::env::remove_var("TMUX_PANE"),
+            }
             let command = run_command(args, None);
             tokio::pin!(command);
             assert!(
                 std::future::poll_fn(|cx| Poll::Ready(command.as_mut().poll(cx)))
                     .await
                     .is_pending(),
-                "{args:?}"
+                "{args:?}, pane={pane:?}"
             );
             tokio::time::advance(Duration::from_secs(19)).await;
             assert!(
                 std::future::poll_fn(|cx| Poll::Ready(command.as_mut().poll(cx)))
                     .await
                     .is_pending(),
-                "lookup ended before 20 seconds: {args:?}"
+                "lookup ended before 20 seconds: {args:?}, pane={pane:?}"
             );
             tokio::time::advance(Duration::from_secs(1)).await;
             let result = std::future::poll_fn(|cx| Poll::Ready(command.as_mut().poll(cx))).await;
             let Poll::Ready(result) = result else {
-                panic!("lookup still pending at 20 seconds: {args:?}");
+                panic!("lookup still pending at 20 seconds: {args:?}, pane={pane:?}");
             };
             assert_eq!(result.unwrap_err().to_string(), LOOKUP_TIMEOUT);
         }
@@ -355,7 +386,7 @@ mod tests {
                 super::super::msg::request("msg.send", &params, TEST_BUDGET).await?;
             Ok(())
         };
-        stalled_request("msg.send", params.clone(), command,
+        stalled_request("msg.send", params.clone(), None, command,
             "message request timed out; accepted work may have completed; inspect inbox before retrying").await;
     }
 }

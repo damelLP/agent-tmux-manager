@@ -415,6 +415,9 @@ fn start_messages(
                 services.org.clone(),
                 services.registry.clone(),
                 control,
+                services.agents.clone().unwrap_or_else(|| {
+                    crate::org::agents::AgentHandle::disabled("agent service not configured")
+                }),
                 evidence.clone(),
                 history.clone(),
                 policy,

@@ -252,6 +252,7 @@ async fn message_runtime_shares_eight_admissions_and_deliver_is_unavailable() {
         org,
         registry,
         control,
+        super::agents::AgentHandle::disabled("no agent service in the seam"),
         MessageEvidence::disabled(clock.clone(), "A2 pending"),
         MessageHistoryHandle::disabled("A1/A2 pending"),
         Default::default(),

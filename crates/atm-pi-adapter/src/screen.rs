@@ -6,6 +6,11 @@
 //! than newline, unverified cursor metadata, unknown footers/statuses and partial
 //! frames refuse observation. Trailing blank rows may be omitted.
 //!
+//! Captured: pi 1.5.0, 2026-11-15, sealed private-tmux startup/short-turn captures.
+//! Captured: pi 1.5.2, 2026-11-15, sealed private-tmux offline/resource startups.
+//! Historical update-notice rules require complete chrome and faint labels, not
+//! startup-only history. Unknown notices and unexplained pasted rules still refuse.
+//!
 //! Pi has no native tool approvals, but extension/core dialogs replace the editor.
 //! Recognized select/input/editor hints and the reload box report Other with
 //! unknown input/turn. Ambiguous nested borders refuse observation.
@@ -114,6 +119,58 @@ fn rule(line: &str) -> bool {
     line.chars().count() >= 8 && line.chars().all(|c| c == '─')
 }
 
+fn update_notice(block: &[&str]) -> bool {
+    matches!(block, [upper, "Update Available", message, changelog, lower]
+        if rule(upper)
+            && upper == lower
+            && message.starts_with("New version ")
+            && message.ends_with(" is available. Run pi update")
+            && changelog.starts_with("Changelog: https://"))
+}
+
+fn update_rules(history: &[&str], lower: &str, screen: &StyledScreen) -> bool {
+    let mut offset = 0;
+    let rows: Vec<_> = screen
+        .text()
+        .split_inclusive('\n')
+        .zip(history)
+        .map(|(raw, line)| {
+            let row = (*line, offset);
+            offset += raw.len();
+            row
+        })
+        .collect();
+    rows.split(|(line, _)| line.trim().is_empty())
+        .filter(|block| block.iter().any(|(line, _)| *line == lower))
+        .all(|block| {
+            let [(upper, _), (title, _), message @ .., changelog, (bottom, _)] = block else {
+                return false;
+            };
+            let text = message
+                .iter()
+                .map(|(line, _)| line.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let faint = |(line, offset): &(&str, usize)| {
+                line.find(|c: char| !c.is_whitespace())
+                    .and_then(|i| screen.faint_at(offset + i))
+                    == Some(true)
+            };
+            *upper == lower
+                && *bottom == lower
+                && message.iter().all(|(line, _)| !rule(line))
+                && update_notice(&[
+                    upper.trim(),
+                    title.trim(),
+                    &text,
+                    changelog.0.trim(),
+                    bottom.trim(),
+                ])
+                && message.first().is_some_and(faint)
+                && faint(changelog)
+        })
+}
+
 fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {
     let (footer, before_footer) = lines.split_last()?;
     let zero_usage = usage_footer(footer)?;
@@ -131,10 +188,15 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
         facts.dialog = DialogState::Other;
         return Some((facts, None));
     }
-    // A pasted rule can masquerade as the last upper border. Without an editor
-    // marker, earlier rules are ambiguous unless they belong to known startup UI.
+    // Every earlier matching rule needs its own rendered-notice proof: a pasted
+    // rule can masquerade as the editor top, even after otherwise valid startup.
     let history = lines.get(..top)?;
-    if history.contains(lower) && !startup_only(history) {
+    if history.contains(lower)
+        && !styled.map_or_else(
+            || startup_only(history),
+            |screen| update_rules(history, lower, screen),
+        )
+    {
         return None;
     }
     let upper = *lines.get(top)?;
@@ -342,14 +404,7 @@ fn startup_only(history: &[&str]) -> bool {
                     !entries.is_empty()
                 }
                 [first, ..] if first.starts_with("Warning: ") => true,
-                [upper, "Update Available", message, changelog, lower] => {
-                    rule(upper)
-                        && upper == lower
-                        && message.starts_with("New version ")
-                        && message.ends_with(" is available. Run pi update")
-                        && changelog.starts_with("Changelog: https://")
-                }
-                _ => false,
+                _ => update_notice(&body),
             }
         })
 }

@@ -1387,6 +1387,40 @@ async fn pane_observations_are_throttled_across_frequent_job_wakes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn failed_pane_observations_are_throttled_across_frequent_job_wakes() {
+    let mut rig = ManualJob::new().await;
+    rig.screens.lose(&worker());
+    let id = rig.send().await;
+    for (advance_ms, captures) in [
+        (0, 1),
+        (0, 1),
+        (1, 1),
+        (248, 1),
+        (0, 1),
+        (1, 2),
+        (0, 2),
+        (249, 2),
+        (1, 3),
+    ] {
+        tokio::time::advance(Duration::from_millis(advance_ms)).await;
+        // Failed captures are paced too: keep observed across rounds so an
+        // unrelated wake cannot retry the observer inside the guard poll.
+        let mut queued = rig.job.service.board.queued.subscribe();
+        guarded(rig.job.round(&mut queued)).await.unwrap();
+        assert_eq!(rig.screens.calls(&worker()), captures);
+        let rt = &rig.job.service.rt;
+        let snapshot = rt.history.snapshot(id, rt.clock.now().unwrap()).unwrap();
+        assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+        assert!(snapshot.message.last_attempt.is_none());
+        assert_eq!(
+            rig.job.service.board.progress(id).reason.as_deref(),
+            Some(UNOBSERVED_REASON)
+        );
+    }
+    assert!(rig.notes().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn observation_back_before_the_timeout_tells_nothing_and_delivers() {
     let mut bench = Bench::blind().await;
     bench.script(Act::Deliver);

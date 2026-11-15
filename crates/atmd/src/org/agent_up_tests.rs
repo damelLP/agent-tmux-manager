@@ -764,11 +764,12 @@ async fn focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed() {
     // after his text and run with it. The later frames are scripted and not
     // asserted read or unread: an observation of the stuck agent may read them.
     // Twin: up_order_is_split_tag_pane_created_paste_enter_ready.
-    for first_focused in [false, true] {
+    // (The third: the owner has left again by the second capture.)
+    for (first, second) in [(false, true), (true, true), (true, false)] {
         let mut starting = Starting::new(Harness::Codex).await;
         starting.script_pane();
-        starting.frame(Starting::shell(PROMPT).with_focus(Some(first_focused)));
-        starting.frame(Starting::shell(PROMPT).with_focus(Some(true)));
+        starting.frame(Starting::shell(PROMPT).with_focus(Some(first)));
+        starting.frame(Starting::shell(PROMPT).with_focus(Some(second)));
         let typed = format!("{PROMPT}rm -rf ");
         for _ in 0..3 {
             starting.frame(Starting::shell(&typed));
@@ -835,67 +836,75 @@ async fn launch_line_with_typed_prefix_sends_no_enter() {
     // exit_to_shell_between_paste_and_enter_sends_no_key. After the paste the
     // line must read the prompt followed by the command, in the same shell.
     // Twin: up_order_is_split_tag_pane_created_paste_enter_ready.
-    let mut cases: Vec<(&str, PaneCapture, String)> = Vec::new();
-    {
-        let starting = Starting::new(Harness::Codex).await;
-        let not_staged =
-            format!("{NOT_RUN}: the shell's line is not its prompt followed by the command");
-        cases.push((
+    // Each case builds its frame from the start it runs in: the launch text
+    // names that start's own directory.
+    type Frame = fn(&Starting) -> PaneCapture;
+    let not_staged =
+        format!("{NOT_RUN}: the shell's line is not its prompt followed by the command");
+    let other_program =
+        format!("{NOT_RUN}: the pane's shell is not known to be its foreground program");
+    let cases: [(&str, Frame, &String); 7] = [
+        (
             "typed before the paste",
-            Starting::shell(&format!("{PROMPT}rm -rf ~; {}", starting.text)),
-            not_staged.clone(),
-        ));
-        cases.push((
+            |s| Starting::shell(&format!("{PROMPT}rm -rf ~; {}", s.text)),
+            &not_staged,
+        ),
+        (
             "typed after the paste",
-            Starting::shell(&format!("{PROMPT}{} --yolo", starting.text)),
-            not_staged.clone(),
-        ));
-        cases.push((
+            |s| Starting::shell(&format!("{PROMPT}{} --yolo", s.text)),
+            &not_staged,
+        ),
+        (
             "the prompt was drawn again",
-            Starting::shell(&format!("pb (main)> {}", starting.text)),
-            not_staged.clone(),
-        ));
+            |s| Starting::shell(&format!("pb (main)> {}", s.text)),
+            &not_staged,
+        ),
         // The right length, and only one of the two parts right: the line
         // is compared whole, not by its length and one end.
-        cases.push((
+        (
             "another prompt of the same length",
-            Starting::shell(&format!("pc> {}", starting.text)),
-            not_staged.clone(),
-        ));
-        let mut other_text = starting.text.clone();
-        other_text.replace_range(..1, "x");
-        assert_eq!(other_text.len(), starting.text.len());
-        assert_ne!(other_text, starting.text);
-        cases.push((
+            |s| Starting::shell(&format!("pc> {}", s.text)),
+            &not_staged,
+        ),
+        (
             "another command of the same length",
-            Starting::shell(&format!("{PROMPT}{other_text}")),
-            not_staged,
-        ));
-        let mut other_root = starting.staged();
-        other_root.inspection.pane.pane_pid = 200;
-        let mut other_command = starting.staged();
-        other_command.inspection.foreground_command = Some("vim".into());
-        for (label, capture) in [
-            ("another root process", other_root),
-            ("another program in front", other_command),
-        ] {
-            cases.push((
-                label,
-                capture,
-                format!("{NOT_RUN}: the pane's shell is not known to be its foreground program"),
-            ));
-        }
-    }
-    for (label, capture, reason) in cases {
+            |s| {
+                let mut other = s.text.clone();
+                other.replace_range(..1, "x");
+                assert_ne!(other, s.text);
+                Starting::shell(&format!("{PROMPT}{other}"))
+            },
+            &not_staged,
+        ),
+        (
+            "another root process",
+            |s| {
+                let mut capture = s.staged();
+                capture.inspection.pane.pane_pid = 200;
+                capture
+            },
+            &other_program,
+        ),
+        (
+            "another program in front",
+            |s| {
+                let mut capture = s.staged();
+                capture.inspection.foreground_command = Some("vim".into());
+                capture
+            },
+            &other_program,
+        ),
+    ];
+    for (label, frame, reason) in cases {
         // Seen by the flow's own capture.
         let mut starting = Starting::new(Harness::Codex).await;
         starting.script_pane();
         starting.script_paste();
-        starting.frame(capture.clone());
+        starting.frame(frame(&starting));
         let result = starting.up().await;
         assert!(result.is_err(), "{label}: {result:?}");
         assert_eq!(starting.effects().len(), 3, "{label}: {:?}", starting.effects());
-        starting.assert_stuck(&reason).await;
+        starting.assert_stuck(reason).await;
         assert_eq!(starting.unread(), 0, "{label}");
 
         // Staged for the flow, changed at the Enter's own guard.
@@ -903,7 +912,7 @@ async fn launch_line_with_typed_prefix_sends_no_enter() {
         starting.script_pane();
         starting.script_paste();
         starting.frame(starting.staged());
-        starting.frame(capture);
+        starting.frame(frame(&starting));
         let result = starting.up().await;
         assert!(result.is_err(), "{label}: {result:?}");
         assert_eq!(starting.effects().len(), 3, "{label}: {:?}", starting.effects());

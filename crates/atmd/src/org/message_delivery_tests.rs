@@ -765,6 +765,7 @@ impl Rig {
                 control.clone(),
                 cancel.child_token(),
                 Arc::new(|_| Box::pin(async { None })),
+                Arc::new(|_| None),
             );
             guarded(agents.reconciled()).await.unwrap();
             assert_eq!(tmux.pending_reads(&pane()).unwrap(), 0);

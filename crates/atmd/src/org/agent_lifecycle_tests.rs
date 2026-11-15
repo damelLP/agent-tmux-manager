@@ -1733,3 +1733,42 @@ async fn adopt_refuses_a_role_whose_harness_is_not_the_panes() {
     assert_eq!(agent.session_id, Some(SessionId::new("s1")));
     adoption.followed().await;
 }
+
+#[tokio::test]
+async fn adopt_of_an_agent_stuck_by_an_interrupted_clear_makes_it_ready() {
+    // Decision A, as answered for the reason a daemon restart gives a clear
+    // it interrupted: the agent is Stuck like any other, and the adopt of
+    // its pane, on a safe idle screen, is the answer to "inspect %1".
+    let mut adoption = recorded_with_role(
+        vec![
+            OrgCommand::EditorReady {
+                agent_id: adoptee(),
+            },
+            OrgCommand::Clear {
+                agent_id: adoptee(),
+            },
+        ],
+        &[("pending-100", false, Harness::Pi)],
+    )
+    .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    let recorded = adoption.agent().await.unwrap();
+    assert_eq!(recorded.status, AgentStatus::Stuck);
+    assert_eq!(
+        recorded.reason.as_deref(),
+        Some("clear interrupted by daemon restart; inspect %1")
+    );
+    let mut committed = adoption.rig.org.committed.subscribe();
+    script_readopt(&adoption, PI_PADDED, "pi");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(
+        committed_kinds(&mut committed),
+        ["agent.adopted", "agent.editor_ready"]
+    );
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.reason, None);
+    assert!(mutations(&adoption.rig).is_empty());
+    adoption.followed().await;
+}

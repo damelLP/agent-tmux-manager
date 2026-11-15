@@ -9,8 +9,8 @@ use super::agent_flow::{
     adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, decide_start,
     input_refusal, launch_enter_allowed, launch_line, launch_line_is_staged, launch_paste_allowed,
     placement, prompt_line_allowed, safe_editor, safe_to_paste, shell_baseline, shell_refusal,
-    start_view, started_session, submit_allowed, submit_step, ClearProgress, Ready, StartProgress,
-    StartView, Step,
+    start_view, started_session, submit_allowed, submit_step, ClearProgress, ProcFacts, Ready,
+    StartProgress, StartView, Step,
 };
 use super::agent_launch::{launch_command, LaunchCommand};
 use super::agent_project::PreparedAgent;
@@ -25,7 +25,7 @@ use crate::control::reservation::{
 use crate::control::{service::ServiceError, SpawnContext};
 use crate::registry::PaneSession;
 use crate::server::methods::CallContext;
-use atm_core::harness_control::{ClearProof, ControlDialog, SessionArrival};
+use atm_core::harness_control::{ClearProof, ControlDialog, ControlScreen, SessionArrival};
 use atm_core::{Harness, SessionId, SessionView};
 use atm_org::{AgentId, AgentStatus, OrgCommand};
 use std::sync::{
@@ -301,7 +301,7 @@ impl AgentRuntime {
         };
         // Before the tag: an ambiguous pane is refused with nothing changed.
         let rows = self.pane_sessions(pane).await?;
-        candidates(&rows)?;
+        let session = candidates(&rows)?;
         // So is a pane whose sessions are all of another harness than the
         // role's: none of them could ever be bound to this agent.
         if let Some(wanted) = role.map(|role| role.config.harness.short_tag()) {
@@ -318,13 +318,8 @@ impl AgentRuntime {
                 )));
             }
         }
-        if !tagged {
-            effect.store(true, Ordering::SeqCst);
-            changed(effect, r.tag(pane, ExpectedTag::Absent).await)?;
-        }
-        // Read everything again now that the pane is ours.
-        let rows = self.pane_sessions(pane).await?;
-        let session = candidates(&rows)?;
+        // Every read and capture comes before the tag, so that once the pane
+        // carries it only the organisation's writes can still fail.
         let harness = role.map(|role| role.config.harness).or_else(|| {
             let mut parents = rows
                 .iter()
@@ -345,15 +340,27 @@ impl AgentRuntime {
                     && row.view.harness == harness.short_tag()
             })
         };
-        let safe = match harness.and_then(|harness| agent_screen(harness).zip(Some(harness))) {
+        let seen = match harness.and_then(|harness| agent_screen(harness).zip(Some(harness))) {
             Some((screen, harness)) if live(harness) => {
-                self.adopt_screen(r, id, pane, screen).await?
+                self.adopt_screen(r, pane, screen, found.local_agent_tag.as_deref())
+                    .await?
             }
-            _ => false,
+            _ => None,
         };
+        let (baseline, safe) = match seen {
+            Some((baseline, safe)) => (Some(baseline), safe),
+            None => (None, false),
+        };
+        if !tagged {
+            effect.store(true, Ordering::SeqCst);
+            changed(effect, r.tag(pane, ExpectedTag::Absent).await)?;
+        }
         if let Some(recorded) = existing.filter(|agent| agent.pane.is_some() && !safe) {
             // Already this agent's pane, and nothing new was established: keep
             // what is recorded (a binding included) instead of unbinding it.
+            if let Some(baseline) = baseline {
+                self.record_baseline(id.clone(), pane.as_str(), baseline);
+            }
             return Ok(AdoptResult {
                 agent_id: id.clone(),
                 state: recorded.status,
@@ -381,6 +388,11 @@ impl AgentRuntime {
                 )
                 .await?;
         }
+        // Only now is the agent recorded on this pane: a baseline is never
+        // kept for a pane the organisation does not give the agent.
+        if let Some(baseline) = baseline {
+            self.record_baseline(id.clone(), pane.as_str(), baseline);
+        }
         if safe && !bound && kept != Some(AgentStatus::Ready) {
             // A harness that announces its session with the first prompt.
             self.org
@@ -402,51 +414,37 @@ impl AgentRuntime {
         })
     }
 
-    /// Establish what the adopted pane runs, and whether it shows a safe idle
-    /// editor. The process facts are read between two captures and used only
-    /// when both captures show the same root process and command.
+    /// Establish what a pane to adopt runs, and whether it shows a safe idle
+    /// editor while it still carries `tag`, the tag the adopt's inspection
+    /// found (none before a first adopt). `None` when no harness can be
+    /// pinned. The process facts are read between two captures. Nothing is
+    /// recorded here: the adopt records the baseline once the pane is the
+    /// agent's.
     async fn adopt_screen(
         &self,
         r: &Reservation,
-        id: &AgentId,
         pane: &PaneId,
         screen: &'static AgentScreen,
-    ) -> Result<bool, AgentError> {
+        tag: Option<&str>,
+    ) -> Result<Option<(PaneBaseline, bool)>, AgentError> {
         let format = screen.capture_format();
-        let first = r.capture(pane, format).await?;
-        let seen = |capture: &crate::control::reservation::PaneCapture| {
-            capture
-                .inspection
-                .pane_root_pid()
-                .zip(capture.inspection.foreground_command.clone())
-        };
-        let Some((root, command)) = seen(&first) else {
-            return Ok(false);
+        let first = r.capture(pane, format).await?.inspection;
+        let Some((root, command)) = first.pane_root_pid().zip(first.foreground_command) else {
+            return Ok(None);
         };
         let Some(facts) = (self.proc)(root).await else {
-            return Ok(false);
+            return Ok(None);
         };
         let second = r.capture(pane, format).await?;
-        if seen(&second) != Some((root, command.clone())) {
-            return Ok(false);
-        }
-        let Some(baseline) = adopt_baseline(&facts, root, &command) else {
-            return Ok(false);
-        };
-        let Some((command, control)) = screen.start_candidate(&second, &baseline) else {
-            return Ok(false);
-        };
-        if control.dialog == ControlDialog::Unknown {
-            return Ok(false);
-        }
-        let Some(baseline) = baseline.with_harness(command) else {
-            return Ok(false);
-        };
-        self.record_baseline(id.clone(), pane.as_str(), baseline);
-        Ok(safe_editor(&control)
-            && !second.inspection.dead
-            && !second.inspection.in_mode
-            && second.inspection.local_agent_tag.as_deref() == Some(&id.to_string()))
+        Ok(
+            pin(screen, (root, &command), &facts, &second).map(|(baseline, control)| {
+                let safe = safe_editor(&control)
+                    && !second.inspection.dead
+                    && !second.inspection.in_mode
+                    && second.inspection.local_agent_tag.as_deref() == tag;
+                (baseline, safe)
+            }),
+        )
     }
 
     /// Cleanup of an adopt: if it tagged the pane and the agent is not
@@ -468,6 +466,32 @@ impl AgentRuntime {
         }
         Ok(())
     }
+}
+
+/// The adopt rule: what a pane that already runs something is pinned to, and
+/// the adapter's read of its screen. `seen` is the root process and foreground
+/// command of a look at the pane taken before `facts` were read, and `capture`
+/// was taken after: the reads are not atomic, so the facts count only when
+/// both looks show the same root process and command. `None` pins nothing: the
+/// looks differ, the process shape places no harness, the command is the
+/// shell's own, or the adapter does not recognise the screen.
+fn pin(
+    screen: &AgentScreen,
+    seen: (u32, &str),
+    facts: &ProcFacts,
+    capture: &PaneCapture,
+) -> Option<(PaneBaseline, ControlScreen)> {
+    let (root, command) = seen;
+    let after = &capture.inspection;
+    if after.pane_root_pid() != Some(root) || after.foreground_command.as_deref() != Some(command) {
+        return None;
+    }
+    let baseline = adopt_baseline(facts, root, command)?;
+    let (command, control) = screen.start_candidate(capture, &baseline)?;
+    if control.dialog == ControlDialog::Unknown {
+        return None;
+    }
+    Some((baseline.with_harness(command)?, control))
 }
 
 /// Why a clear has not completed. `None` until the flow commits to clearing;

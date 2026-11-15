@@ -185,6 +185,14 @@ impl OrgHandle {
         command: OrgCommand,
         now: DateTime<Utc>,
     ) -> Result<Vec<Envelope>, OrgServiceError> {
+        self.execute_command(command, now).await
+    }
+
+    async fn execute_command(
+        &self,
+        command: OrgCommand,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Envelope>, OrgServiceError> {
         let (reply, response) = oneshot::channel();
         self.submit(Request::Execute {
             command: Box::new(command),

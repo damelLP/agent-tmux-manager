@@ -1180,6 +1180,69 @@ async fn an_agent_without_a_pane_ends_the_loss() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn paneless_starting_observations_preserve_readiness_and_hold_clocks() {
+    let mut rig = ManualJob::new().await;
+    // Prime the pane-observation throttle with a failed capture. A committed
+    // pane-less Starting state must be seen even within that poll interval.
+    guarded(rig.job.observe()).await.unwrap();
+    rig.command(OrgCommand::Down {
+        agent_id: worker(),
+        reason: "restarting".into(),
+    })
+    .await;
+    rig.command(OrgCommand::Up {
+        agent_id: worker(),
+        role: atm_org::parse_role("worker", "+++\nharness='pi'\n+++\nWork").unwrap(),
+    })
+    .await;
+    let started = rig.job.service.rt.clock.now().unwrap();
+    let id = rig.send().await;
+    for (elapsed, blocked) in [
+        (0, false),
+        (1, false),
+        (249, false),
+        (119_749, false),
+        (1, true),
+        (3_600_000, true),
+    ] {
+        tokio::time::advance(Duration::from_millis(elapsed)).await;
+        // Unlike ManualJob::round, retain the last capture timestamp so the
+        // first calls exercise the actual pane-observation throttle.
+        let mut queued = rig.job.service.board.queued.subscribe();
+        guarded(rig.job.round(&mut queued)).await.unwrap();
+        let rt = &rig.job.service.rt;
+        let now = rt.clock.now().unwrap();
+        let snapshot = rt.history.snapshot(id, now).unwrap();
+        assert_eq!(snapshot.recipient.pane, None);
+        assert_eq!(snapshot.live.agent_status, atm_org::AgentStatus::Starting);
+        assert!(!snapshot.live.owner_focused);
+        assert_eq!(snapshot.live.pane, atm_org::delivery::PaneLiveness::Unknown);
+        assert_eq!(snapshot.live.agent_not_ready_since, Some(started));
+        assert_eq!(snapshot.live.hold_since, None);
+        assert_eq!(snapshot.live.stale_blocker_since, None);
+        assert!(rig.job.lost.is_none());
+        assert_eq!(rig.screens.calls(&worker()), 1);
+        let step = next_delivery(&snapshot.message, &snapshot.live, now, &rt.policy).unwrap();
+        if blocked {
+            assert_eq!(
+                step,
+                DeliveryStep::Blocked {
+                    reason: FailureReason::AgentNotReadyTimeout
+                }
+            );
+        } else {
+            assert!(matches!(
+                step,
+                DeliveryStep::Wait {
+                    reason: WaitReason::AgentNotReady,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn observation_back_before_the_timeout_tells_nothing_and_delivers() {
     let mut bench = Bench::blind().await;
     bench.script(Act::Deliver);

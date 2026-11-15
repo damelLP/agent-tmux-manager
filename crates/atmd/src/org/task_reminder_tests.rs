@@ -997,3 +997,53 @@ async fn long_titles_are_cut_and_many_tasks_wait_for_the_next_turn_end() {
     let lines = sent.body["body"].as_str().unwrap().lines().count();
     assert_eq!(lines, MAX_TASKS + 1);
 }
+
+// ---------------------------------------------------------------- the config
+
+#[test]
+fn the_reminder_section_defaults_to_on_after_a_minute() {
+    let on = |secs| {
+        Ok(Some(ReminderSettings {
+            delay: Duration::from_secs(secs),
+        }))
+    };
+    for text in [
+        "",
+        "[notify]\ncommand=['true']\n",
+        "[reminder]\n",
+        "[reminder]\nenabled=true\n",
+        // Another section's mistake is that section's.
+        "[delivery]\nunknown=1\n[reminder]\ndelay_secs=60\n",
+    ] {
+        assert_eq!(parse_reminder_settings(text), on(60), "{text:?}");
+    }
+    assert_eq!(parse_reminder_settings("[reminder]\ndelay_secs=5"), on(5));
+    assert_eq!(parse_reminder_settings("[reminder]\ndelay_secs=1"), on(1));
+}
+
+#[test]
+fn the_reminder_section_can_turn_reminders_off() {
+    for text in [
+        "[reminder]\nenabled=false",
+        "[reminder]\nenabled=false\ndelay_secs=0",
+    ] {
+        assert_eq!(parse_reminder_settings(text), Ok(None), "{text:?}");
+    }
+}
+
+#[test]
+fn an_invalid_reminder_section_is_an_error_and_never_a_guess() {
+    for text in [
+        "[reminder]\nunknown='SECRET'",
+        "[reminder]\ndelay_secs='SECRET'",
+        "[reminder]\ndelay_secs=-1",
+        "[reminder]\ndelay_secs=0",
+        "[reminder]\nenabled='SECRET'",
+        "[reminder",
+        "reminder='SECRET'",
+    ] {
+        let error = parse_reminder_settings(text).unwrap_err();
+        assert!(error.contains("[reminder]"), "{text:?}: {error}");
+        assert!(!error.contains("SECRET"), "{text:?}: {error}");
+    }
+}

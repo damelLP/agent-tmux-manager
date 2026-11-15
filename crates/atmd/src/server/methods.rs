@@ -37,6 +37,9 @@ pub struct MethodServices {
     /// None leaves library callers unconfigured; the binary supplies its single
     /// config parse result. Invalid settings disable messages with that cause.
     pub delivery_policy: Option<Result<atm_org::delivery::DeliveryPolicy, String>>,
+    /// The reminder on a silent turn end; None leaves it off. Library callers
+    /// start without it, the binary supplies its `[reminder]` settings.
+    pub reminder: Option<atm_org::reminder::ReminderSettings>,
     /// The connection tap's two destinations, as one pair: the shared
     /// receipt/activity store and the history its Activity is forwarded to.
     /// The server builds both with the message runtime, before it accepts a
@@ -63,6 +66,7 @@ impl MethodServices {
             messages: None,
             decisions: None,
             delivery_policy: None,
+            reminder: None,
             message_tap: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),

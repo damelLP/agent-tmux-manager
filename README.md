@@ -224,6 +224,30 @@ pane_gone_grace = { secs = 2, nanos = 0 }
 
 Durations must be positive and fit the policy's checked timestamp arithmetic; retry delays must be nondecreasing. Maximum attempts are the number of retry delays plus one (four by default); an empty retry list permits one attempt. Timing defaults do not prove a harness editor is safe: observations and safety guards still control delivery.
 
+## Task reminders
+
+When a named agent's turn ends and a task assigned to it is still `assigned`, `working` or `changes_requested`, `atmd` waits and then sends the agent one note. The note names the task and the commands that say where it stands: `atm task submit <id>`, or `atm task set-state <id> waiting --reason '...'` (or `blocked`). If the agent's next turn ends the same way, the task's creator gets one note. When the creator is `system` or the agent itself, the note goes to the agent's manager, or to you if it has none.
+
+- A task that is `waiting` or `blocked` is not reminded: the agent has said why it stopped.
+- It happens once per state. A change of state allows one more reminder.
+- Nothing is sent before the agent has been idle for the delay, while its session shows background work, or while a message to it is still on its way.
+- Each note is an ordinary message. It starts a model turn nobody typed, and the delivery guards hold it like any other message: a running turn, a draft, your focused pane.
+- The event log records `task.reminded` and `task.flagged`.
+
+```toml
+[reminder]
+enabled = true    # false turns reminders off
+delay_secs = 60   # idle time after the turn's end before the note
+```
+
+`atmd` reads `[reminder]` when it starts. An unknown key or `delay_secs = 0` turns reminders off and logs the reason.
+
+Limits:
+
+- A pending wait is kept in memory, so a daemon restart drops it. The marks are in the event log, so a restart never sends a second reminder.
+- A turn whose end the harness does not report is not reminded: Esc during a reply in Claude Code or Codex, or a denied dialog.
+- A session that reads idle while the harness still answers (a blocked `Stop` hook, an auto-compact) for longer than the delay gets a reminder it may no longer need, typed after the turn really ends.
+
 ## Decisions
 
 Named agents raise questions through `decision.request`; the owner answers from an **unbound** shell:

@@ -87,6 +87,47 @@ const MAX_TASKS: usize = 20;
 /// The most characters of a task's title a note shows.
 const TITLE_CHARS: usize = 80;
 
+/// `[reminder]` in atm's `config.toml`. An unknown key is an error, so a
+/// misspelt one cannot leave reminders on by accident.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReminderSection {
+    /// False turns the reminder off.
+    enabled: bool,
+    /// Seconds an agent stays idle after a silent turn end before the note.
+    delay_secs: u64,
+}
+
+impl Default for ReminderSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_secs: ReminderSettings::default().delay.as_secs(),
+        }
+    }
+}
+
+/// The reminder's settings in the text of atm's `config.toml`: on with the
+/// default delay when there is no `[reminder]` section, `None` when the
+/// section turns it off. Malformed TOML, an unknown key and a delay of zero
+/// are errors, for the caller to leave reminders off. The error never quotes
+/// the file, which may hold secrets.
+pub fn parse_reminder_settings(text: &str) -> Result<Option<ReminderSettings>, String> {
+    #[derive(Default, serde::Deserialize)]
+    struct ConfigFile {
+        #[serde(default)]
+        reminder: ReminderSection,
+    }
+    let section = toml::from_str::<ConfigFile>(text)
+        .ok()
+        .map(|file| file.reminder)
+        .filter(|section| !section.enabled || section.delay_secs > 0)
+        .ok_or("invalid config: malformed TOML or invalid [reminder] settings")?;
+    Ok(section.enabled.then(|| ReminderSettings {
+        delay: std::time::Duration::from_secs(section.delay_secs),
+    }))
+}
+
 /// A turn end that waits to be judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pending {

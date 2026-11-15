@@ -187,6 +187,15 @@ impl DaemonServer {
                     self.registry.clone(),
                     agents_cancel.clone(),
                 );
+                // The reminder on a silent turn end stops with them too.
+                if let Some(settings) = services.reminder {
+                    crate::org::task_reminder::spawn_task_reminders(
+                        services.org.clone(),
+                        self.registry.subscribe(),
+                        settings,
+                        agents_cancel.clone(),
+                    );
+                }
                 task
             })
         } else {

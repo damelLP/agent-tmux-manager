@@ -1,4 +1,4 @@
-//! P5 capture provenance and source mappings are in fixtures/README.md.
+//! P5/P6 capture provenance and source mappings are in fixtures/README.md.
 #![cfg(test)]
 use atm_codex_adapter::screen::{observe_control_screen, observe_screen, staged_draft_matches};
 use atm_core::harness_control::ControlDialog;
@@ -34,6 +34,36 @@ const CAPTURES: &[Capture] = &[
     capture!("120x40-first-after-down", 6, 36),
 ];
 
+macro_rules! p6_capture {
+    ($name:literal, $row:literal) => {
+        (
+            $name,
+            include_str!(concat!("fixtures/screen_p6_", $name, "_0.167.0.styled.txt")),
+            include_str!(concat!("fixtures/screen_p6_", $name, "_0.167.0.plain.txt")),
+            ScreenCursor {
+                column: 6,
+                row: $row,
+            },
+        )
+    };
+}
+const P6_CAPTURES: &[Capture] = &[
+    p6_capture!("A-80x24-plain-popup", 20),
+    p6_capture!("A-80x24-wrap-popup", 20),
+    p6_capture!("A-80x24-list-popup", 20),
+    p6_capture!("A-80x24-code-popup", 20),
+    p6_capture!("A-100x32-plain-popup", 28),
+    p6_capture!("A-100x32-wrap-popup", 28),
+    p6_capture!("A-100x32-list-popup", 28),
+    p6_capture!("A-100x32-code-popup", 28),
+    p6_capture!("A-120x40-plain-popup", 36),
+    p6_capture!("A-120x40-wrap-popup", 36),
+    p6_capture!("A-120x40-list-popup", 36),
+    p6_capture!("A-120x40-code-popup", 36),
+    p6_capture!("B-80x24-before-enter", 20),
+    p6_capture!("B-120x40-before-enter", 36),
+];
+
 fn body(capture: &str) -> &str {
     let (provenance, text) = capture.split_once('\n').unwrap();
     assert!(provenance.starts_with("Captured: "));
@@ -67,11 +97,23 @@ fn p5_staged_clear_matches_exactly() {
         }
         let input = ScreenInput::Plain(body(plain));
         assert_eq!(staged_draft_matches(input, "/new"), None, "{name}");
-        assert_eq!(
-            observe_screen(input, Some(cursor)).input,
-            InputState::Unknown,
-            "{name}"
-        );
+        for cursor in [None, Some(cursor)] {
+            let facts = observe_screen(input, cursor);
+            assert_eq!(
+                (facts.input, facts.turn, facts.dialog),
+                (
+                    InputState::Unknown,
+                    TurnState::Unknown,
+                    DialogState::Unknown
+                ),
+                "{name}: Plain"
+            );
+            assert_eq!(
+                observe_control_screen(input, cursor).dialog,
+                ControlDialog::Unknown,
+                "{name}: Plain"
+            );
+        }
     }
 }
 
@@ -141,9 +183,7 @@ fn replace_once(text: &str, old: &str, new: &str) -> String {
 }
 
 fn popup_row(text: &str) -> &str {
-    text.lines()
-        .find(|line| line.starts_with("\x1b[1;7m› /new  "))
-        .unwrap()
+    text.lines().find(|line| line.contains("› /new  ")).unwrap()
 }
 
 #[test]
@@ -207,6 +247,20 @@ fn p5_codex_popup_mutations_stay_unknown() {
             (
                 "command not inverse",
                 replace_once(text, row, &row.replace("\x1b[1;7m", "\x1b[1m")),
+                true,
+            ),
+            (
+                "only command text not inverse",
+                replace_once(text, row, &row.replace("› /new", "›\x1b[27m /new\x1b[7m")),
+                true,
+            ),
+            (
+                "only command gap not inverse",
+                replace_once(
+                    text,
+                    row,
+                    &row.replace("/new  \x1b[0;7m", "/new\x1b[27m  \x1b[0;7m"),
+                ),
                 true,
             ),
             (
@@ -344,6 +398,208 @@ fn p5_codex_popup_is_anchor_based() {
                 ControlDialog::Unknown,
                 "{name}: shifted second candidate"
             );
+        }
+    }
+}
+
+#[test]
+fn p6_captured_finished_popup_is_control_none() {
+    for &(name, styled, plain, cursor) in P6_CAPTURES {
+        let text = body(styled);
+        let input = ScreenInput::Styled(text);
+        assert_eq!(staged_draft_matches(input, "/new"), Some(true), "{name}");
+        let decoded = StyledScreen::parse(text).unwrap();
+        let rows: Vec<_> = decoded.text().lines().collect();
+        let status = rows
+            .iter()
+            .position(|row| row.contains("Worked for "))
+            .unwrap();
+        assert!(
+            status > 0 && rows[status - 1].trim_matches(' ').is_empty(),
+            "{name}: blank before status"
+        );
+        for cursor in [None, Some(cursor)] {
+            let facts = observe_screen(input, cursor);
+            let control = observe_control_screen(input, cursor);
+            assert_eq!(control.facts, facts, "{name}");
+            assert_eq!(
+                (facts.input, facts.turn, facts.dialog),
+                (InputState::Draft, TurnState::NotRunning, DialogState::Other),
+                "{name}"
+            );
+            assert_eq!(facts.fresh_editor, FreshEditorEvidence::Unknown, "{name}");
+            assert!(!control.conversation, "{name}");
+            assert_eq!(control.dialog, ControlDialog::None, "{name}");
+            let plain = ScreenInput::Plain(body(plain));
+            let facts = observe_screen(plain, cursor);
+            assert_eq!(
+                (facts.input, facts.turn, facts.dialog),
+                (
+                    InputState::Unknown,
+                    TurnState::Unknown,
+                    DialogState::Unknown
+                ),
+                "{name}: Plain"
+            );
+            assert_eq!(
+                observe_control_screen(plain, cursor).dialog,
+                ControlDialog::Unknown,
+                "{name}: Plain"
+            );
+            assert_eq!(staged_draft_matches(plain, "/new"), None, "{name}: Plain");
+        }
+    }
+}
+
+fn assert_control_unknown(name: &str, label: &str, text: &str, cursor: ScreenCursor) {
+    let input = ScreenInput::Styled(text);
+    for cursor in [None, Some(cursor)] {
+        let control = observe_control_screen(input, cursor);
+        assert_eq!(
+            control.facts,
+            observe_screen(input, cursor),
+            "{name}: {label}"
+        );
+        assert_eq!(control.dialog, ControlDialog::Unknown, "{name}: {label}");
+    }
+}
+
+#[test]
+fn popup_extra_candidates_and_displaced_menu_stay_unknown() {
+    for &(name, styled, _, cursor) in CAPTURES.iter().chain(P6_CAPTURES) {
+        let text = body(styled);
+        let menu = popup_row(text);
+        // Synthetic: M2b, M3 and M7 must not authorize a sole selected command.
+        for (label, replacement) in [
+            (
+                "M2b adjacent candidate",
+                format!("\x1b[0m  /next  another candidate\n{menu}"),
+            ),
+            (
+                "M3 candidate across blank",
+                format!("\x1b[0m  /next  another candidate\n\n{menu}"),
+            ),
+            (
+                "M3 selected candidate across blanks",
+                format!("\x1b[1;7m› /next  another candidate\x1b[0m\n\n\n{menu}"),
+            ),
+            ("M7 extra blank below menu", format!("{menu}\n")),
+        ] {
+            let changed = replace_once(text, menu, &replacement);
+            assert_control_unknown(name, label, &changed, cursor);
+        }
+    }
+}
+
+#[test]
+fn p6_status_impostors_and_missing_separator_stay_unknown() {
+    for &(name, styled, _, cursor) in P6_CAPTURES {
+        let text = body(styled);
+        let status = text
+            .lines()
+            .find(|row| row.contains("Worked for "))
+            .unwrap();
+        // B-120x40 has blank space above the menu, not a touching status boundary.
+        if name == "B-120x40-before-enter" {
+            continue;
+        }
+        // Synthetic: exact chrome, valid values and faint/non-inverse attributes
+        // are all required; a candidate cannot masquerade as a finished status.
+        for (label, replacement) in [
+            ("non-faint status", status.replace("\x1b[2m", "\x1b[0m")),
+            ("inverse status", status.replace("\x1b[2m", "\x1b[2;7m")),
+            (
+                "one non-faint character",
+                status.replace("Worked", "W\x1b[22mo\x1b[2mrked"),
+            ),
+            (
+                "one inverse character",
+                status.replace("Worked", "W\x1b[7mo\x1b[27mrked"),
+            ),
+            (
+                "candidate prefixed status",
+                status.replace("  Worked", "  /next  Worked"),
+            ),
+            (
+                "selection prefixed status",
+                status.replace("  Worked", "› Worked"),
+            ),
+            ("one-space indent", status.replace("  Worked", " Worked")),
+            (
+                "three-space indent",
+                status.replace("  Worked", "   Worked"),
+            ),
+            ("changed chrome", status.replace("Worked for", "Worked on")),
+            ("invalid duration", status.replace("<1s", "0s")),
+            ("out-of-range duration", status.replace("<1s", "60s")),
+            ("padded duration", status.replace("<1s", "1m 05s")),
+            ("invalid clock", status.replace("01:14", "24:00")),
+            ("malformed separator", status.replace(" • ", " · ")),
+            (
+                "extra suffix",
+                format!("{} extra", status.trim_end_matches(' ')),
+            ),
+            (
+                "running turn",
+                "\x1b[2m  Working (1s • esc to interrupt)".into(),
+            ),
+            (
+                "plain answer touching popup",
+                "\x1b[0m  ordinary answer text".into(),
+            ),
+            (
+                "candidate before status",
+                format!("\x1b[0m  /next  another candidate\n{status}"),
+            ),
+            (
+                "candidate before separator",
+                format!("\x1b[0m  /next  another candidate\n\n{status}"),
+            ),
+        ] {
+            let changed = replace_once(text, status, &replacement);
+            assert_control_unknown(name, label, &changed, cursor);
+        }
+        let mut rows: Vec<_> = text.lines().collect();
+        let index = rows.iter().position(|row| *row == status).unwrap();
+        rows.remove(index - 1);
+        assert_control_unknown(name, "missing pre-status blank", &rows.join("\n"), cursor);
+    }
+}
+
+#[test]
+fn p6_status_values_and_relative_anchors_are_not_literal() {
+    for &(name, styled, _, cursor) in P6_CAPTURES {
+        let text = body(styled);
+        let status = text
+            .lines()
+            .find(|row| row.contains("Worked for "))
+            .unwrap();
+        // Synthetic: values use existing finished-duration and clock grammars;
+        // hour-duration shapes are not claimed as real popup observations.
+        for duration in ["<1s", "7s", "1m 5s", "1h 2m 3s"] {
+            for clock in ["00:00", "23:59", "1:00 AM", "12:59 PM"] {
+                let replacement = status.replace("<1s", duration).replace("01:14", clock);
+                let changed = text.replace(status, &replacement);
+                assert_eq!(
+                    observe_control_screen(ScreenInput::Styled(&changed), Some(cursor)).dialog,
+                    ControlDialog::None,
+                    "{name}: {duration}, {clock}"
+                );
+            }
+        }
+        let menu = popup_row(text);
+        for changed in [
+            format!("界 café 🦀 e\u{301}\n\n{text}"),
+            text.lines()
+                .map(|line| format!("{line}     \n"))
+                .collect::<String>(),
+            replace_once(text, menu, &format!("\x1b[0m\n\n{menu}")),
+        ] {
+            let input = ScreenInput::Styled(&changed);
+            let control = observe_control_screen(input, None);
+            assert_eq!(control.facts, observe_screen(input, None), "{name}");
+            assert_eq!(control.dialog, ControlDialog::None, "{name}");
+            assert_eq!(staged_draft_matches(input, "/new"), Some(true), "{name}");
         }
     }
 }

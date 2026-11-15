@@ -596,7 +596,7 @@ impl AgentRuntime {
             )));
         }
         // No session the pane or the agent has now can be the clear's result.
-        let before: Vec<SessionId> = rows
+        let mut before: Vec<SessionId> = rows
             .iter()
             .map(|row| row.id.clone())
             .chain(agent.session_id.clone())
@@ -670,6 +670,15 @@ impl AgentRuntime {
                     let guard = move |capture: &_| {
                         submit_allowed(screen, capture, &baseline, &tag, command)
                     };
+                    // A session that is on the pane before the Enter is not
+                    // its result (somebody cleared by hand meanwhile). Read
+                    // before the key, not after: the real one can beat that.
+                    before.extend(
+                        self.pane_sessions(&pane)
+                            .await?
+                            .into_iter()
+                            .map(|row| row.view.id),
+                    );
                     // Said before the key: a deadline while the key is out
                     // must not report the step before it.
                     waiting_for(

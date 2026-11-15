@@ -1965,3 +1965,74 @@ async fn row_that_arrives_during_an_adopt_is_bound_by_its_next_event() {
     assert_eq!(agent.status, AgentStatus::Ready);
     assert_eq!(agent.session_id, Some(SessionId::new("s1")));
 }
+
+// --- Two checks of an adopt that the mutation run of cp-u8n found unheld ---
+
+#[tokio::test]
+async fn adopt_does_not_count_the_excluded_session_as_the_roles_harness() {
+    // Decision D. The agent's old pi session, which its clear excluded, still
+    // has its row on the pane beside a Codex session. The excluded row is no
+    // evidence that pi lives there (it is not for the screen read either):
+    // the pane runs Codex, and the adopt is refused.
+    let adoption = recorded_with_role(
+        vec![
+            OrgCommand::SessionBound {
+                agent_id: adoptee(),
+                session_id: SessionId::new("old"),
+            },
+            OrgCommand::Clear {
+                agent_id: adoptee(),
+            },
+            OrgCommand::EditorReady {
+                agent_id: adoptee(),
+            },
+        ],
+        &[("old", false, Harness::Pi), ("other", false, Harness::Codex)],
+    )
+    .await;
+    let recorded = adoption.agent().await.unwrap();
+    assert_eq!(recorded.excluded_session_id, Some(SessionId::new("old")));
+    let before = adoption.rig.org.status().unwrap();
+    adoption
+        .rig
+        .client
+        .script_inspect(
+            &pane("%1"),
+            Some(&Adoption::inspection(Some("q/lead"), "codex", "")),
+        )
+        .unwrap();
+    match adoption.adopt().await {
+        Err(AgentError::Refused(reason)) => {
+            assert!(reason.contains("%1 runs codex"), "{reason}");
+            assert!(reason.contains("role names pi"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
+}
+
+#[tokio::test]
+async fn readopt_on_a_busy_screen_keeps_the_record_and_records_the_baseline() {
+    // An agent that is recorded on its pane with nothing known about the
+    // pane's processes, as after a daemon restart. Adopting it again while a
+    // turn runs establishes no readiness, so its record is kept as it is; but
+    // the harness was recognised in the foreground, and that is recorded.
+    let adoption = ready_with_role().await;
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::unproven()
+    );
+    let recorded = adoption.agent().await.unwrap();
+    let mut committed = adoption.rig.org.committed.subscribe();
+    script_readopt(&adoption, PI_RUNNING, "pi");
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::adopted(100).with_harness("pi".into()).unwrap()
+    );
+}

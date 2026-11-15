@@ -52,7 +52,7 @@
 //! | 3 | the idle session shows background work | `Nothing` |
 //! | 4 | this session was already attempted or excluded for starting at its line | `Nothing` |
 //! | 5 | the cache is cold | at the line `Flag`, else `Nothing` |
-//! | 6 | at the line, `"context"` off | `Flag` |
+//! | 6 | at the line, `"context"` off, idle rule not due | `Flag`, with a look-again at the idle limit if still in the future |
 //! | 7 | neither rule is due | `LookAgainAt(idle_since + idle limit)` before that time with `"idle"` on, else `Nothing` |
 //! | 8 | the session has not worked | at the line `Flag`, else `Nothing` |
 //! | 9 | a message to the agent is queued or delivering | `LookAgainAt(now + LOOK_AGAIN)` |

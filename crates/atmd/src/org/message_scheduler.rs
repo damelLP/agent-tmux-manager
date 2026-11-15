@@ -574,13 +574,11 @@ impl Job {
             Err(error) => {
                 // A failed or mismatched observation proves nothing: it is a
                 // loss of continuity, never a dead pane. A recipient history
-                // has never observed has nothing to lose.
+                // has never observed has nothing to lose, and a history that
+                // cannot take the loss fails the step that follows.
                 tracing::debug!(%recipient, %error, "Recipient observation lost");
                 self.focused = None;
-                match (rt.history).record(HistoryUpdate::ObservationLost { recipient }, now) {
-                    Ok(()) | Err(MessageError::NotFound(_)) => {}
-                    Err(error) => return Err(error),
-                }
+                let _ = (rt.history).record(HistoryUpdate::ObservationLost { recipient }, now);
             }
         }
         Ok(())

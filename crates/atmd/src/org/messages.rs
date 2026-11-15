@@ -297,9 +297,9 @@ struct View {
     /// at the fold, so the scheduler never scans the log's messages.
     open: BTreeMap<AgentId, BTreeSet<MessageId>>,
     /// Startup replay only: for each message, where its last attempt went,
-    /// read from the agent's binding as it was at that attempt. Emptied when
-    /// the replay completes.
-    replayed: BTreeMap<MessageId, ReplayedAttempt>,
+    /// read from the agent's binding as it was at that attempt. Taken when
+    /// the replay completes, so a live attempt is never recorded.
+    replayed: Option<BTreeMap<MessageId, ReplayedAttempt>>,
 }
 
 /// The attempted pane and the session the recipient was bound to then.
@@ -342,6 +342,9 @@ impl View {
     /// went. The state is exactly as it was at that attempt, so the binding
     /// read here is the attempt's own, not today's occupant of the pane.
     fn replay_attempt(&mut self, seq: u64, event: &OrgEvent) {
+        let Some(replayed) = &mut self.replayed else {
+            return;
+        };
         match event {
             OrgEvent::MessageDeliveryAttempted {
                 message_id, pane, ..
@@ -360,10 +363,10 @@ impl View {
                     pane: pane.clone(),
                     session,
                 };
-                self.replayed.insert(*message_id, attempt);
+                replayed.insert(*message_id, attempt);
             }
             OrgEvent::MessageDelivered { message_id, .. } => {
-                self.replayed.remove(message_id);
+                replayed.remove(message_id);
             }
             _ => {}
         }
@@ -591,9 +594,7 @@ impl Service {
                 | OrgEvent::MessageDeliveryFailed { message_id, .. } => view.index(*message_id),
                 _ => {}
             }
-            if *self.startup.borrow() == Startup::Replaying {
-                view.replay_attempt(envelope.seq, event);
-            }
+            view.replay_attempt(envelope.seq, event);
         }
         view.cursor = envelope.seq;
         drop(view);
@@ -643,7 +644,7 @@ impl Service {
                 self.expect(message.id, &message.content.to);
             }
         }
-        for (id, attempt) in std::mem::take(&mut view.replayed) {
+        for (id, attempt) in view.replayed.take().unwrap_or_default() {
             let Some(scope) = view.replayed_scope(id, attempt) else {
                 continue;
             };
@@ -728,7 +729,10 @@ fn spawn_service(
 ) -> (MessageHandle, JoinHandle<()>) {
     let service = Arc::new(Service {
         rt: runtime,
-        view: Mutex::new(View::default()),
+        view: Mutex::new(View {
+            replayed: Some(BTreeMap::new()),
+            ..View::default()
+        }),
         startup: watch::Sender::new(Startup::Replaying),
         requests: Semaphore::new(MAX_REQUESTS),
         folded: watch::Sender::new(0),

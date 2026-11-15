@@ -4318,17 +4318,32 @@ mod reconciliation {
         // A down whose kill has an unknown outcome, or whose Down could not
         // be written, leaves the agent Ready on a pane that may be gone, and
         // every later call refused. The list says so at once: it reads the
-        // control service's quarantines, and waits for no observation.
-        let (rig, agents) = pinned_ready().await;
+        // control service's quarantines, and waits for no observation. Only
+        // the quarantined agent's entry says it.
+        const NO_PANE: &str = "recorded pane is absent, dead or no longer owned";
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        // A second agent, never given a pane: Down at the restart check.
+        rig.agent("other", None, None).await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let reasons = || async {
+            let list = agents.list(ListParams::default()).await.unwrap();
+            assert_eq!(list[0].agent_id.to_string(), "p/lead");
+            assert_eq!(list[1].agent_id.to_string(), "p/other");
+            (list[0].reason.clone(), list[1].reason.clone())
+        };
         let mut events = agents.observation_events();
         let before = rig.org.status().unwrap();
         // The twin: an operation that settles leaves nothing to show.
         down_whose_cleanup(&agents, false).await;
-        assert_eq!(listed_reason(&agents).await, None);
+        assert_eq!(reasons().await, (None, Some(NO_PANE.into())));
         down_whose_cleanup(&agents, true).await;
         assert_eq!(
-            listed_reason(&agents).await.as_deref(),
-            Some(QUARANTINED_DOWN)
+            reasons().await,
+            (Some(QUARANTINED_DOWN.into()), Some(NO_PANE.into()))
         );
         assert_eq!(drain_started(&mut events), 0);
         assert_eq!(rig.org.status().unwrap(), before);

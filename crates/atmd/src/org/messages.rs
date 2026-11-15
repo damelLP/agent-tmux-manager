@@ -613,6 +613,16 @@ impl Service {
                 self.expect(MessageId::new(envelope.seq), &content.to);
             }
         }
+        if let Some(OrgEvent::MessageDeliveryFailed {
+            message_id,
+            final_failure: true,
+            ..
+        }) = &event
+        {
+            // After history has the failure: a job that finds the reference
+            // gone also finds the message failed.
+            self.rt.evidence.forget_unscoped(*message_id);
+        }
         self.folded.send_replace(envelope.seq);
         Ok(())
     }
@@ -628,28 +638,35 @@ impl Service {
         }
     }
 
-    /// The startup replay reached its fence: undelivered agent messages
-    /// become known to evidence, and requests are admitted. An attempt of the
+    /// The startup replay reached its fence: open agent messages become
+    /// known to evidence, and requests are admitted. An attempt of the
     /// previous process stays held for the owner (history's restart rule),
     /// but where its scope is unambiguous evidence expects it again, so a
     /// receipt that arrives late still confirms it instead of a retry
-    /// pasting it twice.
+    /// pasting it twice. A message that failed for good is expected only
+    /// for such a scope: without one nothing could confirm it, and its
+    /// reference would be held for ever.
     fn replayed(&self) -> Result<(), MessageError> {
         if *self.startup.borrow() != Startup::Replaying {
             return Ok(());
         }
         let mut view = self.view()?;
+        let mut replayed = view.replayed.take().unwrap_or_default();
         for message in view.state.messages() {
-            if message.status != DeliveryStatus::Delivered {
-                self.expect(message.id, &message.content.to);
-            }
-        }
-        for (id, attempt) in view.replayed.take().unwrap_or_default() {
-            let Some(scope) = view.replayed_scope(id, attempt) else {
-                continue;
+            let id = message.id;
+            let scope = (replayed.remove(&id)).and_then(|attempt| view.replayed_scope(id, attempt));
+            let failed = match message.status {
+                DeliveryStatus::Queued | DeliveryStatus::Delivering => false,
+                DeliveryStatus::Failed if scope.is_some() => true,
+                _ => continue,
             };
-            if let Err(error) = self.rt.evidence.arm(scope) {
+            self.expect(id, &message.content.to);
+            if let Some(Err(error)) = scope.map(|scope| self.rt.evidence.arm(scope)) {
                 tracing::warn!(%id, %error, "Replayed attempt stays unconfirmable: evidence refused its scope");
+            }
+            if failed {
+                // Its scope was refused: nothing is left to wait for.
+                self.rt.evidence.forget_unscoped(id);
             }
         }
         drop(view);

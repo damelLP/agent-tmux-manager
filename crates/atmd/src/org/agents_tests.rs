@@ -381,6 +381,31 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn restart_ready_unbound_shell_with_child_attempts_no_capture() {
+        // A shell holding a child cannot pin a harness. A Ready, unbound
+        // agent needs no capture, including one that would fail unscripted.
+        let rig = Rig::new().await;
+        *rig.proc.lock().unwrap() = Some(shell_with_child("sh"));
+        rig.agent("lead", Some("%1"), None).await;
+        rig.row("pending-100", "%1", false).await;
+        inspect_with(&rig, "sh");
+        let before = rig.org.status().unwrap();
+        let (agents, _) = rig.start();
+        // This current-thread test subscribes before yielding to the observer.
+        let mut events = agents.observation_events();
+        agents.reconciled().await.unwrap();
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.phase, "capture", "unnecessary capture was attempted");
+        }
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(
+            told(&agents).await,
+            (AgentStatus::Ready, None, PaneBaseline::unproven(), None)
+        );
+    }
+
+    #[tokio::test]
     async fn review_safe_restart_ready_has_zero_writes() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;

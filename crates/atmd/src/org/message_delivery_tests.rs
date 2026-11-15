@@ -3906,6 +3906,36 @@ async fn activity_after_zero_effect_failure_stays_retryable() {
     }
 }
 
+/// Cancellation before the paste leaves cleanup as the only producer of
+/// NotStarted. Later session activity must still allow a no-effect retry.
+#[tokio::test(start_paused = true)]
+async fn activity_after_pre_paste_cancellation_stays_retryable() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE)]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    rig.rt.cancel.cancel();
+    rig.release();
+    rig.fold_rest();
+    let delivered = guarded(attempt).await.unwrap();
+    assert!(
+        matches!(delivered, Err(MessageError::Unavailable(_))),
+        "{delivered:?}"
+    );
+    assert_eq!((rig.pastes(), rig.keys()), (0, 0));
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+    assert_eq!(rig.snapshot(id).hold, None);
+
+    rig.prompt("s1", "another task, not the message reference".into());
+    assert!(rig.rt.evidence.snapshot(id).unwrap().probably_landed);
+    rig.copy_evidence(id);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 2 });
+}
+
 /// The same activity when an earlier attempt of the message was applied, or
 /// has an unknown outcome: that paste may be what the session is working
 /// on, so the latch stays in force and the message is blocked, although the
@@ -3915,15 +3945,15 @@ async fn prior_applied_or_unknown_attempt_keeps_activity_latch() {
     for prior in [APPLIED, UNKNOWN] {
         let mut rig = Rig::attempt().await;
         let id = rig.ready_message().await;
-        // Attempt 1: the paste lands and tmux fails the first look
-        // (applied), or tmux reports a failure for the paste itself.
+        // Attempt 1 leaves a potentially applied paste and a hold. Whether
+        // a failed look returns an error is not the latch's contract.
         rig.script(&[pi(IDLE), pi(IDLE)]);
         if prior == UNKNOWN {
             rig.tmux_gate
                 .fail_next_after_effect(Effect::PasteText)
                 .unwrap();
         }
-        rig.deliver(id).await.unwrap_err();
+        let _ = rig.deliver(id).await;
         let first = rig.snapshot(id);
         assert_eq!(first.hold, Some(ExecutorHold::InputOutcomeUnknown));
         assert_eq!(rig.pastes(), 1, "{prior:?}");

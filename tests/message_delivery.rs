@@ -204,10 +204,11 @@ fn safe_retry_after_known_zero_effect() {
     );
 }
 
-/// The prompt hook is lost after Enter and the session shows activity: the
-/// message is held for the owner, never failed and never typed again.
+/// The prompt hook is lost after Enter: the message is held for the owner,
+/// never failed and never typed again. Ending the turn below is incidental;
+/// this does not distinguish a hold with activity from one without it.
 #[test]
-fn lost_hook_with_activity_blocks() {
+fn lost_hook_blocks() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let lead = rig.ready_agent("lead", StandInMode::Claude);
     rig.stand_in_control(&lead.pane, "/atm/drop-next UserPromptSubmit", "drop armed");
@@ -395,7 +396,7 @@ fn give_up_releases_queue() {
 /// after the retry. The stand-in can drop a hook but cannot hold one and
 /// release it later; that part stays with atmd's scripted tests.
 #[test]
-fn owner_retry_same_id_preserves_late_receipt_and_fifo() {
+fn owner_retry_same_id_keeps_fifo() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let mut watch = rig.watch();
     let (lead, ids) = queue_behind_lost_hook(&rig, &["head", "follower"]);

@@ -183,6 +183,7 @@ pub mod delivery;
 mod event;
 pub mod idle;
 mod ids;
+pub mod reminder;
 mod replay;
 mod state;
 mod task;

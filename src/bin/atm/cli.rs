@@ -357,6 +357,14 @@ pub(super) async fn cmd_status() -> Result<()> {
             eprintln!("unread count unavailable: {error}");
         }
     }
+    match super::decide::pending_count().await {
+        Ok(0) => {}
+        Ok(count) => parts.push(format!("{count} decisions")),
+        Err(error) => {
+            parts.push("? decisions".into());
+            eprintln!("decision count unavailable: {error}");
+        }
+    }
     use std::io::Write;
     writeln!(std::io::stdout().lock(), "{}", parts.join(" "))?;
 

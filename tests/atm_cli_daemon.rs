@@ -715,10 +715,12 @@ fn test_commands_read_the_daemons_session_list() {
     assert!(status.status.success(), "atm status: {status:?}");
     assert_eq!(
         String::from_utf8_lossy(&status.stdout),
-        "1\u{2191} $0.00 ? unread\n"
+        "1\u{2191} $0.00 ? unread ? decisions\n"
     );
     assert!(String::from_utf8_lossy(&status.stderr)
         .contains("unread count unavailable: the daemon is too old; restart atmd"));
+    assert!(String::from_utf8_lossy(&status.stderr)
+        .contains("decision count unavailable: the daemon is too old; restart atmd"));
 }
 
 /// A daemon that does not list the method is too old. All pane commands say

@@ -41,12 +41,14 @@ pub(super) async fn run<F, Fut>(
             Request::Execute {
                 command,
                 now,
+                caller_pane,
                 reply,
             } => {
                 let result = execute(
                     &mut state,
                     &command,
                     now,
+                    caller_pane.as_deref(),
                     &health,
                     &publication,
                     &mut append,
@@ -69,6 +71,7 @@ async fn execute<F, Fut>(
     state: &mut OrgState,
     command: &OrgCommand,
     now: DateTime<Utc>,
+    caller_pane: Option<&str>,
     health: &watch::Sender<Health>,
     publication: &broadcast::Sender<Arc<Envelope>>,
     append: &mut F,
@@ -94,7 +97,12 @@ where
     };
     let events = state.decide(command, now)?;
     let mut committed = Vec::with_capacity(events.len());
-    for event in events {
+    for mut event in events {
+        if let atm_org::OrgEvent::DecisionResolved(answer)
+        | atm_org::OrgEvent::DecisionOverruled(answer) = &mut event
+        {
+            answer.caller_pane = caller_pane.map(str::to_owned);
+        }
         let mut envelope = Envelope {
             seq: 0, // Assigned by the log, never predicted by a command caller.
             ts: now,

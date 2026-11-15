@@ -155,7 +155,8 @@
 //! log: a new message kind or address form, or a known event referring to an entity
 //! created by a skipped unknown kind. On such replay errors the daemon must disable
 //! organisation methods, not fail to start. Unknown decision kinds fold as
-//! [`DecisionKind::Unknown`] (the original word is lost); new requests refuse it.
+//! [`DecisionKind::Unknown`] (the original word is lost in the fold only; the log
+//! keeps it); new requests refuse it.
 //!
 //! # Data and limits
 //!

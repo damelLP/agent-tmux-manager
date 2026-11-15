@@ -112,7 +112,6 @@ pub fn foreground(
 pub struct AgentScreen {
     harness: Harness,
     policy: &'static ControlPolicy,
-    observe: fn(ScreenInput<'_>, Option<ScreenCursor>) -> ScreenFacts,
     staged: fn(ScreenInput<'_>, &str) -> Option<bool>,
     control: fn(ScreenInput<'_>, Option<ScreenCursor>) -> ControlScreen,
     hooks_valid: fn(&[HookListEntry]) -> bool,
@@ -132,7 +131,6 @@ static SCREENS: [AgentScreen; 3] = [
     AgentScreen {
         harness: Harness::ClaudeCode,
         policy: &atm_claude_adapter::screen::CONTROL_POLICY,
-        observe: atm_claude_adapter::screen::observe_screen,
         staged: atm_claude_adapter::screen::staged_draft_matches,
         control: atm_claude_adapter::screen::observe_control_screen,
         hooks_valid: no_hook_list,
@@ -140,7 +138,6 @@ static SCREENS: [AgentScreen; 3] = [
     AgentScreen {
         harness: Harness::Pi,
         policy: &atm_pi_adapter::screen::CONTROL_POLICY,
-        observe: atm_pi_adapter::screen::observe_screen,
         staged: atm_pi_adapter::screen::staged_draft_matches,
         control: atm_pi_adapter::screen::observe_control_screen,
         hooks_valid: no_hook_list,
@@ -148,7 +145,6 @@ static SCREENS: [AgentScreen; 3] = [
     AgentScreen {
         harness: Harness::Codex,
         policy: &atm_codex_adapter::screen::CONTROL_POLICY,
-        observe: atm_codex_adapter::screen::observe_screen,
         staged: atm_codex_adapter::screen::staged_draft_matches,
         control: atm_codex_adapter::screen::observe_control_screen,
         hooks_valid: atm_codex_adapter::screen::validate_hook_list,
@@ -185,13 +181,11 @@ impl AgentScreen {
         )
     }
 
-    /// All Unknown unless the capture has this harness's format and the
-    /// harness is in the foreground.
+    /// The facts of [`Self::control`]'s read: all Unknown unless the capture
+    /// has this harness's format and the harness is in the foreground.
     #[must_use]
     pub fn facts(&self, capture: &PaneCapture, baseline: &PaneBaseline) -> ScreenFacts {
-        self.harness_input(capture, baseline)
-            .map(|input| (self.observe)(input, None))
-            .unwrap_or_default()
+        self.control(capture, baseline).facts
     }
 
     /// `None` unless the harness is in the foreground; otherwise the adapter's

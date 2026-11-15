@@ -2088,24 +2088,20 @@ fn submit_requires_staged_true_and_dialog_none() {
     ] {
         assert_eq!(submit(harness, fixture, command), NOT_STAGED, "{harness:?}");
     }
-    // A screen the adapter does not recognise is looked at again, even with
-    // the command staged: Codex's `/new` popup is not recognised as "no
-    // dialog" by its adapter yet, so today no Enter follows a Codex paste.
+    // Codex draws a one-row completion popup for a pasted `/new`. Its adapter
+    // reads exactly that popup, with `/new` selected and staged, as no dialog,
+    // so the Enter follows.
     let codex = agent_screen(Harness::Codex).unwrap();
     let popup = unfocused(Harness::Codex, CODEX_POPUP);
     assert_eq!(codex.staged(&popup, &pinned("codex"), "/new"), Some(true));
-    assert_eq!(submit(Harness::Codex, CODEX_POPUP, "/new"), NOT_RECOGNISED);
+    assert_eq!(submit(Harness::Codex, CODEX_POPUP, "/new"), enter());
+    assert!(submit_allowed(codex, &popup, &pinned("codex"), TAG, "/new"));
+    assert_eq!(submit(Harness::Codex, CODEX_POPUP, "/ne"), NOT_STAGED);
+    // A screen the adapter does not recognise is looked at again.
     assert_eq!(
         submit(Harness::ClaudeCode, CLAUDE_MODAL, "/clear"),
         NOT_RECOGNISED
     );
-    assert!(!submit_allowed(
-        codex,
-        &popup,
-        &pinned("codex"),
-        TAG,
-        "/new"
-    ));
     // A recognised dialog stops the flow.
     for (harness, fixture, command) in [
         (Harness::ClaudeCode, CLAUDE_TRUST, "/clear"),
@@ -2415,11 +2411,17 @@ fn clear_table_fresh() {
         step(CODEX_FRESH, &none, Some(&row)),
         Step::Ready(Ready::Editor)
     );
-    // The command still staged, a draft, an unread screen: look again.
-    assert_eq!(step(CODEX_POPUP, &none, None), NOT_RECOGNISED);
+    // The command still staged under its popup, or a draft: look again. So is
+    // a screen the adapter does not read.
+    for fixture in [CODEX_POPUP, CODEX_DRAFT] {
+        assert_eq!(
+            step(fixture, &none, None),
+            Step::Wait("no fresh editor is shown")
+        );
+    }
     assert_eq!(
-        step(CODEX_DRAFT, &none, None),
-        Step::Wait("no fresh editor is shown")
+        decide_clear(codex, &ControlScreen::default(), &none, None),
+        NOT_RECOGNISED
     );
 
     // exact_worktree_default_only: the worktree choice is answered once, on

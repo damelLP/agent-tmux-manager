@@ -138,10 +138,87 @@ verified separately.
   best-effort check. The lock coordinates these tools only; it cannot prevent
   cargo install or a TUI from racing. Owner quiescence is mandatory.
 
+## Rollout in one command
+
+`atm-rollout` is the owner procedure above as one command. It calls `atm-promote`
+and `atm-rollback` unchanged and adds what was done by hand around them. Nothing
+runs unattended: you start it, and the protected-file report is still yours to accept.
+
+```sh
+scripts/atm-rollout /absolute/candidate/install --bin-dir /absolute/installed/bin \
+  --socket /absolute/daemon.sock [--installed-commit REV] [--report-sha256 HEX] \
+  [--wait[=SECONDS]] [--real HARNESS] [--dry-run]
+scripts/atm-rollout --rollback --bin-dir /absolute/installed/bin --socket /absolute/daemon.sock
+```
+
+The candidate is a candidate-kit install directory: `install.json` (its `sha` and
+`hashes`) beside `bin/`. Run it from the root of the checkout at the candidate's
+commit, in a shell like the one the daemon was started from: the report uses Git
+in the current directory, and the daemon is restarted with this shell's
+environment. `--bin-dir` and `--socket` are mandatory, as above. Every `atm` and
+`atmd` call gets `ATM_SOCKET` set to `--socket` and no `TMUX_PANE`, so its calls
+count as the owner's.
+
+| Step | What runs | Refuses with (exit 1, nothing changed) |
+|---|---|---|
+| 0 | Path and pair checks, `install.json` hashes, a connect to the socket, `atmd status`, the daemon's executable and start environment | `candidate binaries do not match install.json` · `candidate pair already installed` · `interrupted promotion` · `no daemon answers` · `atmd status names no running daemon` · `the daemon (pid N) does not run <bin>/atmd` · `the daemon was started with KEY=...` (state, config or tmux variables differ from this shell) |
+| 1 | `atm-protected-files.py <installed commit> <candidate commit>`, printed with its sha256. Accept it by typing `yes` on a terminal, or with `--report-sha256` of the report you already read. The installed commit is the one the last rollout recorded in `<bin>/.atm-promotion/rollout.json`, else `--installed-commit` | `installed build's commit is unknown` · `--installed-commit disagrees with the recorded` · `protected-file report failed` · `protected-file report not accepted` · `the report needs your yes` |
+| 2 | Smoke of the candidate pair on a private socket, state directory and tmux server in a temp directory: `agent up`, `msg send` until delivered, `agent clear`, `agent down --kill`, on the repository's pi stand-in (`tests/support/stand_in`), or on a real harness with `--real` | `smoke failed at <start, up, message, clear, down>: ...; run kept in <dir>` |
+| 3 | The state before: `atm list`, `atm agent list`, each agent's unread inbox, Claude's `statusLine`, every process on the installed pair. Sessions mid-turn are listed, not refused | `agent X is starting` · `agent X is clearing` · `message M to X is being delivered` · `pid N runs "atm ...", not a sidebar` · `sidebar pid N is not in a tmux pane` · `sidebar pid N was not started from the shell of pane %P` |
+| 4 | Each sidebar gets `C-c` in its pane and is waited for. The rollout waits for the daemon's lock (`<socket>.lock`), runs `atmd stop`, and holds the lock | `sidebar pid N in %P did not quit` · `the daemon did not stop` · `another daemon took the socket` (each after starting again what it stopped) |
+| 5 | `atm-promote` | Its own refusal, when the previous pair is still in place: the daemon and the sidebars are started again |
+| 6 | The lock is released; `atmd start -d`; wait for the socket to answer | |
+| 7 | Checks: `identity` (the installed bytes and modes are the candidate's, and the answering daemon runs the installed file), `list`, `status`, `agent-list`, `agents` (every named agent of step 3, on the same pane), `send` (one `atm send` into a detached scratch tmux session, closed again) | |
+| 8 | On a failed start or check: stop, `atm-rollback`, start, the same checks against the previous pair. **Exit 3** names the failed check | |
+| 9 | Each sidebar's command line is typed back into its pane. What differs from step 3 is printed: sessions gone or new, agents whose state changed, a `statusLine` that `atm setup` replaced (with the command that puts yours back; nothing is restored for you). The installed commit is recorded | |
+
+Exit codes: 0 the new build runs and passed the checks; 1 refused, nothing changed;
+2 usage; 3 rolled back, the previous build runs and passed the checks; 4 `NEEDS YOU`,
+with which pair is installed, whether a daemon answers and which sidebars are not back.
+
+`--dry-run` runs steps 0, 1 (no question asked) and 3, which only read, and prints
+the commands of the rest. `--wait` polls step 3 until nothing is in flight (300
+seconds unless given) instead of refusing. `--rollback` is steps 0, 3, 4,
+`atm-rollback`, 6, 7 and 9 for the day the previous pair should come back; a failed
+check then exits 4, it does not swap again.
+
+### Why the daemon's lock
+
+`atm list`, `atm send`, every RPC command and an open TUI start the daemon when none
+answers. Between a stop and a swap that brought the old daemon back. `atmd` takes
+`flock` on `<socket>.lock` before it binds and holds it until it exits; the rollout
+waits on that lock before the stop, so it owns it the moment the daemon lets go,
+and keeps it until the swap is done. A caller in between gets `Daemon failed to
+start within 3 seconds` instead of an old daemon. Verified on a private socket with
+a stage 0 release pair; 0.3.0 has the same lock.
+
+### Limits
+
+- A restart leaves an agent that was starting or clearing `stuck`, and a message
+  that was being delivered held until `atm msg retry`. Step 3 refuses those; work
+  that begins between step 3 and the stop is not seen.
+- Agent states are compared in words only (step 9): a state the new daemon recorded
+  is in the log, and a rollback would not undo it. Idle sessions of a harness that
+  only reports on its next event show as "no row until its next event".
+- **Rollback onto newer state.** An older daemon skips event kinds it does not know.
+  A log it cannot replay makes it start with the organisation methods disabled: the
+  rollout then exits 4 and says that the previous build runs but named agents and
+  messages are unavailable until the newer build is back. The state directory is
+  never moved, edited or deleted.
+- The sidebar restart types into the pane's shell, as `atm workspace` does. It does
+  not look at what was typed there since the quit. A sidebar that the tmux
+  new-window hook starts while the daemon is down fails and is not looked for.
+- The scratch session is created on the tmux server `atm` itself uses and killed by
+  its id. What a user's own tmux hooks do with a new detached session is not known.
+- `--real <harness>` starts model turns on the owner's account and has only run
+  against the stand-in placed under the harness's name: not verified with a real CLI.
+- The lock stops daemons on this socket. It does not stop `cargo install` or a
+  daemon on another socket; `atm-promote`'s own checks still apply.
+
 ## Verification
 
-`cargo test --test candidate_kit` and `cargo test --workspace` run both the
-candidate kit suite and `promotion_kit_test.py` through the Cargo bridge. For
+`cargo test --test candidate_kit` and `cargo test --workspace` run the candidate
+kit suite, `promotion_kit_test.py` and `rollout_kit_test.py` through the Cargo bridge. For
 local combined Python discovery after building both binaries:
 
 ```sh
@@ -154,5 +231,7 @@ Use the repository's sealed test environment for these commands: private HOME,
 XDG, ATM_STATE_DIR, ATM_SOCKET, TMPDIR and TMUX_TMPDIR; no inherited TMUX or
 TMUX_PANE, no user-installed binaries on PATH. Tests use fake home/bin directories,
 not the owner's assets. They exercise a real private daemon refusal and real
-setup against Cargo-built pairs, never a model harness. Same-version pairs prove
+setup against Cargo-built pairs, never a model harness. The rollout tests run whole
+rollouts on a private daemon and a private tmux server with a real sidebar, and
+use the stand-in pi where an agent is needed. Same-version pairs prove
 promotion/rollback mechanics, not a real historical downgrade or state recovery.

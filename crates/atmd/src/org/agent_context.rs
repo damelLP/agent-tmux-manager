@@ -193,23 +193,38 @@ fn read_files(
 /// multiply stalled filesystem threads, and Tokio never joins a hung read.
 async fn detached_read<T: Send + 'static>(
     slot: Arc<Semaphore>,
+    role_file: &Path,
     read: impl FnOnce() -> Result<T, AgentError> + Send + 'static,
-) -> Result<T, AgentError> {
-    let permit = slot
-        .try_acquire_owned()
-        .map_err(|_| AgentError::Unavailable("context file read is busy; try again".into()))?;
-    let (send, receive) = oneshot::channel();
-    std::thread::Builder::new()
-        .name("atm-agent-context".into())
-        .spawn(move || {
-            let _permit = permit;
-            let _ = send.send(read());
-        })
-        .map_err(|e| AgentError::Internal(format!("context reader: {e}")))?;
-    tokio::time::timeout(FILE_BUDGET, receive)
-        .await
-        .map_err(|_| AgentError::Timeout)?
-        .map_err(|_| AgentError::Unavailable("context reader stopped".into()))?
+) -> Result<T, MethodError> {
+    tokio::time::timeout(FILE_BUDGET, async move {
+        let permit = slot
+            .acquire_owned()
+            .await
+            .map_err(|_| AgentError::Unavailable("context reader stopped".into()))?;
+        let (send, receive) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("atm-agent-context".into())
+            .spawn(move || {
+                let result = read();
+                drop(permit);
+                let _ = send.send(result);
+            })
+            .map_err(|e| AgentError::Internal(format!("context reader: {e}")))?;
+        receive
+            .await
+            .map_err(|_| AgentError::Unavailable("context reader stopped".into()))?
+    })
+    .await
+    .map_err(|_| {
+        MethodError::new(
+            error_code::TIMEOUT,
+            format!(
+                "reading agent context files for {} took longer than 5 s",
+                role_file.display()
+            ),
+        )
+    })?
+    .map_err(MethodError::from)
 }
 
 /// Advertised even if persistence is unavailable; no lifecycle/message runtime
@@ -228,7 +243,8 @@ pub fn register_agent_context_method(
             let agent = context_agent(&state, &caller)?;
             let (role_file, memory_file) = paths(&state, agent)?;
             let name = agent.id.name.clone();
-            let (role, exists) = detached_read(slot, move || read_files(&role_file, &memory_file, &name)).await?;
+            let reading = role_file.clone();
+            let (role, exists) = detached_read(slot, &reading, move || read_files(&role_file, &memory_file, &name)).await?;
             let context = assemble_context(&state, agent, role, exists)?;
             let value = serde_json::to_value(context).map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))?;
             let bytes = serde_json::to_vec(&value).map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))?.len();
@@ -325,34 +341,50 @@ mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let first_slot = slot.clone();
         let first = tokio::spawn(async move {
-            detached_read(first_slot, move || {
-                entered.send(()).unwrap();
-                gate.recv().unwrap();
-                Ok(())
-            })
+            detached_read(
+                first_slot,
+                Path::new("/project/.atm/roles/worker.md"),
+                move || {
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                    Ok(())
+                },
+            )
             .await
         });
         entry.await.unwrap();
         tokio::time::pause();
-        assert!(matches!(first.await.unwrap(), Err(AgentError::Timeout)));
+        let error = first.await.unwrap().unwrap_err();
+        assert_eq!(error.0.code, "timeout");
+        assert!(error.to_string().contains("reading agent context"));
+        assert!(error.to_string().contains("/project/.atm/roles/worker.md"));
+        assert!(!error.to_string().contains("admitted effects"));
         let calls = Arc::new(AtomicUsize::new(0));
         for _ in 0..20 {
             let count = calls.clone();
-            assert!(matches!(
-                detached_read(slot.clone(), move || {
+            let error = detached_read(
+                slot.clone(),
+                Path::new("/project/.atm/roles/worker.md"),
+                move || {
                     count.fetch_add(1, Ordering::SeqCst);
                     Ok(())
-                })
-                .await,
-                Err(AgentError::Unavailable(_))
-            ));
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0.code, "timeout");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         tokio::time::resume();
         release.send(()).unwrap();
         // Permit release, not a delay, proves the original worker completed.
         drop(slot.clone().acquire_owned().await.unwrap());
-        assert_eq!(detached_read(slot, || Ok(7)).await.unwrap(), 7);
+        assert_eq!(
+            detached_read(slot, Path::new("/project/.atm/roles/worker.md"), || Ok(7))
+                .await
+                .unwrap(),
+            7
+        );
     }
 
     // Break caught: dropping/cancelling the request releases the slot early.
@@ -363,22 +395,115 @@ mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let copy = slot.clone();
         let first = tokio::spawn(async move {
-            detached_read(copy, move || {
-                entered.send(()).unwrap();
-                gate.recv().unwrap();
-                Ok(())
-            })
+            detached_read(
+                copy,
+                Path::new("/project/.atm/roles/worker.md"),
+                move || {
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                    Ok(())
+                },
+            )
             .await
         });
         entry.await.unwrap();
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
-        assert!(matches!(
-            detached_read(slot.clone(), || Ok(())).await,
-            Err(AgentError::Unavailable(_))
-        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        tokio::time::pause();
+        let error = detached_read(
+            slot.clone(),
+            Path::new("/project/.atm/roles/worker.md"),
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0.code, "timeout");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        tokio::time::resume();
         release.send(()).unwrap();
         drop(slot.clone().acquire_owned().await.unwrap());
-        detached_read(slot, || Ok(())).await.unwrap();
+        detached_read(slot, Path::new("/project/.atm/roles/worker.md"), || Ok(()))
+            .await
+            .unwrap();
+    }
+
+    // Break caught: simultaneous fast reads refuse instead of waiting for the
+    // same bounded resource; the reply arrives before capacity is released.
+    #[tokio::test]
+    async fn context_overlapping_reads_both_succeed() {
+        let slot = Arc::new(Semaphore::new(1));
+        let (entered, entry) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let copy = slot.clone();
+        let first = tokio::spawn(async move {
+            detached_read(
+                copy,
+                Path::new("/project/.atm/roles/worker.md"),
+                move || {
+                    entered.send(()).unwrap();
+                    let _ = gate.recv();
+                    Ok(11)
+                },
+            )
+            .await
+        });
+        entry.await.unwrap();
+        let mut second = Box::pin(detached_read(
+            slot.clone(),
+            Path::new("/project/.atm/roles/worker.md"),
+            || Ok(22),
+        ));
+        std::future::poll_fn(|cx| {
+            use std::{future::Future, task::Poll};
+            assert!(
+                second.as_mut().poll(cx).is_pending(),
+                "overlapping reader must wait"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        release.send(()).unwrap();
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().unwrap(), 11);
+        assert_eq!(second.unwrap(), 22);
+        assert_eq!(
+            slot.available_permits(),
+            1,
+            "reply must follow slot release"
+        );
+    }
+
+    // Break caught: a cancelled waiter later spawns a detached reader anyway.
+    #[tokio::test]
+    async fn context_cancelled_waiter_never_starts_a_reader() {
+        let slot = Arc::new(Semaphore::new(1));
+        let permit = slot.clone().acquire_owned().await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut waiting = Box::pin(detached_read(
+            slot.clone(),
+            Path::new("/project/.atm/roles/worker.md"),
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            use std::{future::Future, task::Poll};
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(waiting);
+        drop(permit);
+        detached_read(slot, Path::new("/project/.atm/roles/worker.md"), || Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

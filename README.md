@@ -139,7 +139,7 @@ atm msg send --to project/lead --kind report --body 'DONE: <result>'
 
 A missing role file is shown explicitly with `instructions: null` in JSON; the other context remains available and reports go to `owner`. A role with no manager also reports to `owner`. A bare manager name resolves in your project; a full `project/name` reaches another project. An invalid role or manager is refused, never replaced by cached instructions. Unexpected file errors are reported, not treated as missing. Memory is checked but never read or created by this command.
 
-Role files are limited to 256 KiB and the context result to 512 KiB, without silently truncating instructions or summaries. An oversized context is refused; use `atm inbox --unread` for paged messages. A file read has a five-second deadline and at most one detached read is in flight; a stalled read cannot block the daemon or accumulate workers. The CLI allows 17 seconds including startup and transport. JSON preserves original content and additive daemon fields; text escapes terminal controls.
+Role files are limited to 256 KiB and the context result to 512 KiB, without silently truncating instructions or summaries. An oversized context is refused; use `atm inbox --unread` for paged messages. Each caller has five seconds total to wait for the file-read slot and its result. Overlapping calls wait without starting extra threads; at most one detached read is in flight. A stalled read times out its callers without blocking daemon shutdown or accumulating workers. The CLI allows 17 seconds including startup and transport. JSON preserves original content and additive daemon fields; text escapes terminal controls.
 
 ### Sending text
 

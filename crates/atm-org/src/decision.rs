@@ -160,8 +160,8 @@ pub struct DecisionWithdrawal {
     pub reason: Option<String>,
 }
 
-/// One decision as folded from the log. `closed_at` is the time of the fact
-/// that ended it: resolved, overruled, expired or withdrawn.
+/// One decision as folded from the log. `status` decides; the other fields keep
+/// the last fact of their kind, also from a log today's policy would not write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     pub id: DecisionId,
@@ -172,6 +172,8 @@ pub struct Decision {
     pub taken_at: Option<DateTime<Utc>>,
     pub resolution: Option<DecisionResolution>,
     pub withdrawal: Option<DecisionWithdrawal>,
+    /// Time of the last resolved, overruled, expired or withdrawn fact, even if
+    /// a later fact changed `status` back to taken provisionally.
     pub closed_at: Option<DateTime<Utc>>,
 }
 impl Decision {

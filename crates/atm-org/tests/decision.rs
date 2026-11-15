@@ -643,6 +643,71 @@ fn emitted_events_carry_the_command_and_apply_stamps_the_time() {
 }
 
 #[test]
+fn a_repeated_take_by_another_party_keeps_the_first_choice_and_time() {
+    let (mut rig, id) = Rig::with(DecisionStatus::TakenProvisionally);
+    let before = rig.state.clone();
+    assert_eq!(
+        rig.run(
+            DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                decision_id: id,
+                option: "a".into(),
+                by: other(),
+            }),
+            at(40),
+        ),
+        Ok(vec![])
+    );
+    let decision = rig.state.decision(&id).unwrap();
+    assert_eq!(decision.provisional.as_ref().unwrap().by, Address::System);
+    assert_eq!(decision.taken_at, Some(at(5)));
+    assert_eq!(rig.state, before);
+}
+
+#[test]
+fn the_owner_can_repeat_the_requesters_withdrawal() {
+    let (mut rig, id) = Rig::with(DecisionStatus::Withdrawn);
+    let before = rig.state.clone();
+    assert_eq!(rig.run(withdraw(id, Address::Owner), at(40)), Ok(vec![]));
+    assert_eq!(rig.state, before);
+}
+
+#[test]
+fn an_unlisted_answer_to_a_final_decision_is_an_invalid_state() {
+    for state in [DecisionStatus::Resolved, DecisionStatus::Expired] {
+        let (mut rig, id) = Rig::with(state);
+        let before = rig.state.clone();
+        assert_eq!(
+            rig.run(resolve(id, "unlisted"), at(40)),
+            Err(Refusal::Decision(DecisionRefusal::InvalidState {
+                decision_id: id,
+                state,
+                operation: "resolve",
+            }))
+        );
+        assert_eq!(rig.state, before);
+    }
+}
+
+#[test]
+fn an_irreversible_decision_waits_even_on_a_nonrecommended_option() {
+    for changes_intent in [false, true] {
+        let mut rig = Rig::new();
+        let mut request = request();
+        request.may_be_undone = false;
+        request.changes_intent = changes_intent;
+        let id = rig.request(request);
+        let before = rig.state.clone();
+        assert_eq!(
+            rig.run(take(id, "b"), at(40)),
+            Err(Refusal::Decision(DecisionRefusal::MustWait {
+                decision_id: id,
+            }))
+        );
+        assert_eq!(rig.state, before);
+    }
+}
+
+#[test]
 fn another_option_on_a_provisional_decision_is_an_overrule() {
     let (mut rig, id) = Rig::with(DecisionStatus::TakenProvisionally);
     let events = rig.run(resolve(id, "b"), at(40)).unwrap();

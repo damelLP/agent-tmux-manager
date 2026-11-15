@@ -112,9 +112,10 @@
 //! | expired | refuses | refuses | no event | refuses |
 //! | withdrawn | refuses | refuses | refuses | no event |
 //!
-//! Before the state is looked at: Resolve refuses anyone but the owner, and an
-//! option that is not listed; Withdraw refuses anyone but the requester and the
-//! owner. Request refuses an empty title, fewer than two options, an empty or
+//! Before the state is looked at, Resolve refuses anyone but the owner, and
+//! Withdraw refuses anyone but the requester and the owner. On a pending or
+//! provisional decision, Resolve refuses an option that is not listed.
+//! Request refuses an empty title, fewer than two options, an empty or
 //! repeated option, a recommendation that is not an option, and a deadline not
 //! after `now`. Whether the owner is away is not known here: the caller decides
 //! when to take a decision provisionally, this policy whether it may.

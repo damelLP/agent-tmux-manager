@@ -10,20 +10,21 @@
 //! adopt and clear act on panes; up and respawn are not built yet and answer
 //! "not implemented" after admission.
 
+use super::agent_flow::{adopt_baseline, classify_pane, PaneShape};
+use super::agent_lifecycle::pin;
 pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
 pub use super::agent_types::*;
 use super::{agent_project::AgentProjects, OrgHandle, OrgServiceError};
 use crate::control::reservation::{
-    CaptureFormat, PaneCapture, PaneId, Reservation, ReservationKind, ReservationRequest,
-    WaitPolicy,
+    CaptureFormat, PaneId, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
 };
 use crate::server::methods::CallContext;
 use crate::{
     control::service::ControlHandle,
     registry::{RegistryHandle, SessionEvent},
 };
-use atm_core::{DialogState, Harness, InputState, ScreenFacts, SessionId, SessionView, TurnState};
+use atm_core::{DialogState, Harness, InputState, SessionId, SessionView, TurnState};
 use atm_org::{Agent, OrgCommand, OrgState};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -771,12 +772,15 @@ impl AgentRuntime {
         // Registry failure is never evidence that every agent is gone.
         self.rows().await?;
         let mut in_mode = false;
+        // The root process and foreground command the inspection shows.
+        let mut look = None;
         let gone = match &agent.pane {
             None => true,
             Some(pane) => match r.inspect(&PaneId::parse(pane)?).await? {
                 None => true,
                 Some(p) => {
                     in_mode = p.in_mode;
+                    look = p.pane_root_pid().zip(p.foreground_command.clone());
                     p.dead || p.local_agent_tag.as_deref() != Some(&agent.id.to_string())
                 }
             },
@@ -794,7 +798,46 @@ impl AgentRuntime {
                     chrono::Utc::now(),
                 )
                 .await?;
+            self.forget_baseline(&agent.id);
             return Ok(());
+        }
+        // What is recorded about the pane's processes: nothing after a daemon
+        // restart, until a pass (or an adopt) pins the harness.
+        let stored = agent
+            .pane
+            .as_deref()
+            .map_or_else(PaneBaseline::unproven, |pane| {
+                self.baseline(&agent.id, pane)
+            });
+        // The harness is not known to be in front: read the pane's processes,
+        // once. An idle shell under an agent that was Ready or bound is the
+        // positive evidence that its harness exited, with or without an end
+        // event. Any other shape records nothing here.
+        let mut processes = None;
+        let (root, command) = look
+            .as_ref()
+            .map(|(root, command)| (*root, command.as_str()))
+            .unzip();
+        if foreground(&stored, root, command) != Some(Foreground::Harness) {
+            if let Some(root) = root {
+                processes = (self.proc)(root).await;
+            }
+            if let Some(pane) = agent.pane.as_ref().filter(|_| {
+                (agent.status == AgentStatus::Ready || agent.session_id.is_some())
+                    && processes.as_ref().and_then(classify_pane) == Some(PaneShape::IdleShell)
+            }) {
+                self.org
+                    .execute(
+                        OrgCommand::Down {
+                            agent_id: agent.id.clone(),
+                            reason: format!("the harness exited to the shell in {pane}"),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                self.forget_baseline(&agent.id);
+                return Ok(());
+            }
         }
         if let Some(pane) = &agent.pane {
             let reason = format!("clear interrupted by daemon restart; inspect {pane}");
@@ -873,10 +916,26 @@ impl AgentRuntime {
             }
             binding = None;
         }
+        let harness = harness(state, agent, &rows);
+        let screen = agent_screen(harness);
+        // Whether this pass can pin the harness by the adopt rule: nothing is
+        // recorded yet, the agent is Starting or Ready, and the inspection and
+        // the process read that followed it allow a baseline. The capture
+        // below is the rule's second look.
+        let pinnable = screen.zip(look.as_ref()).zip(processes.as_ref()).filter(
+            |((_, (root, command)), processes)| {
+                stored == PaneBaseline::unproven()
+                    && matches!(agent.status, AgentStatus::Ready | AgentStatus::Starting)
+                    && adopt_baseline(processes, *root, command).is_some()
+            },
+        );
         // A capture can change nothing for a Ready agent on an ordinary wake, or
-        // for a session-less one at the restart check: don't read, or fail on, it.
+        // for a session-less one at the restart check, unless it can pin: don't
+        // read, or fail on, it.
         if (stuck && binding.is_none())
-            || (agent.status == AgentStatus::Ready && (!initial || agent.session_id.is_none()))
+            || (agent.status == AgentStatus::Ready
+                && (!initial || agent.session_id.is_none())
+                && pinnable.is_none())
         {
             return Ok(());
         }
@@ -885,22 +944,39 @@ impl AgentRuntime {
         };
         #[cfg(test)]
         self.progress("capture", Some(agent.id.clone()));
-        let harness = harness(state, agent, &rows);
-        let screen = agent_screen(harness);
         let capture = r
             .capture(
                 &PaneId::parse(pane)?,
                 screen.map_or(CaptureFormat::Plain, AgentScreen::capture_format),
             )
             .await?;
-        let facts = screen
-            .map(|screen| unchecked_facts(screen, &capture))
-            .unwrap_or_default();
         let rows = self.rows().await?;
         let live: Vec<_> = rows
             .iter()
             .filter(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
             .collect();
+        // The adopt rule also needs a live row of the agent's harness, and the
+        // pane must still be the agent's on the capture.
+        let pinned = pinnable
+            .filter(|_| {
+                !live.is_empty()
+                    && !capture.inspection.dead
+                    && capture.inspection.local_agent_tag.as_deref() == Some(&agent.id.to_string())
+            })
+            .and_then(|((screen, (root, command)), processes)| {
+                pin(screen, (*root, command), processes, &capture)
+            });
+        let baseline = match pinned {
+            Some((baseline, _)) => {
+                self.record_baseline(agent.id.clone(), pane, baseline.clone());
+                baseline
+            }
+            None => stored,
+        };
+        // Unknown unless the recorded harness is the pane's foreground program.
+        let facts = screen
+            .map(|screen| screen.facts(&capture, &baseline))
+            .unwrap_or_default();
         let parents = live.iter().filter(|row| !row.id.is_pending()).count();
         let safe = !capture.inspection.dead
             && !capture.inspection.in_mode
@@ -977,22 +1053,6 @@ pub(super) fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> 
                 Harness::Unknown
             }
         })
-}
-
-// Verdict off: the observer records no pane baseline yet, so it reads the screen
-// against the capture's own process facts (Unknown when tmux reports no root
-// process or command). The flow slice replaces this with the recorded baseline;
-// until then nothing here tells a harness from a shell showing a stale frame.
-fn unchecked_facts(screen: &AgentScreen, capture: &PaneCapture) -> ScreenFacts {
-    let inspection = &capture.inspection;
-    inspection
-        .pane_root_pid()
-        .zip(inspection.foreground_command.clone())
-        .and_then(|(root, command)| PaneBaseline::adopted(root).with_harness(command))
-        // The control observer's facts: it is the adapters' complete read of an
-        // editor (Claude's legacy observer knows fewer real idle footers).
-        .map(|baseline| screen.control(capture, &baseline).facts)
-        .unwrap_or_default()
 }
 
 fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentListEntry {

@@ -50,8 +50,10 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
     let remaining = Arc::new(AtomicUsize::new(steps.len()));
     let peer_remaining = Arc::clone(&remaining);
     let peer_listener = Arc::clone(&listener);
+    let (exited, exit_received) = tokio::sync::oneshot::channel();
     let mut peer = tokio::spawn(async move {
         let listener = peer_listener;
+        let mut exit_received = Some(exit_received);
         for step in steps {
             let (mut read, mut write) = loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -67,6 +69,10 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
                 );
                 break (read, write);
             };
+            // A capability refusal expects only this handshake, never a request.
+            if step.method.is_empty() {
+                peer_remaining.fetch_sub(1, Ordering::SeqCst);
+            }
             write.write_all(format!("{}\n",json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"test","methods":[step.method]})).as_bytes()).await.unwrap();
             let mut line = String::new();
             if step.method.is_empty() {
@@ -75,7 +81,10 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
                     0,
                     "old daemon must receive no request"
                 );
-                peer_remaining.fetch_sub(1, Ordering::SeqCst);
+                // EOF and process exit may be observed in either order.
+                if let Some(exited) = exit_received.take() {
+                    exited.await.unwrap();
+                }
                 continue;
             }
             read.read_line(&mut line).await.unwrap();
@@ -118,7 +127,11 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
         command.env("TMUX_PANE", pane);
     }
     let output = tokio::time::timeout(Duration::from_secs(30), async {
-        let child = command.output();
+        let child = async {
+            let output = command.output().await;
+            let _ = exited.send(());
+            output
+        };
         tokio::pin!(child);
         tokio::select! {
             result = &mut peer => {

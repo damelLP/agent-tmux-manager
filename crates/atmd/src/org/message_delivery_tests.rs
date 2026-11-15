@@ -3811,3 +3811,39 @@ fn trust_default_no_never_gets_a_key() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The confirmation window and the inputs
+// ---------------------------------------------------------------------------
+
+/// The attempt's append takes longer than the confirmation window (and less
+/// than the writer's reply deadline, so the commit succeeds). The window
+/// started at the attempt's event and has ended before anything was typed:
+/// no paste. An attempt that typed nothing is failed for its retry, where a
+/// paste now could only be left staged in the editor.
+#[tokio::test(start_paused = true)]
+async fn no_paste_once_the_confirmation_window_has_ended() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    // The first capture; a paste guard and a look nobody may ask for.
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id)]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    let window = rig.rt.policy.settings().confirmation_timeout;
+    tokio::time::advance(window).await;
+    rig.release();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 2 * 3);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.last_attempt_seq, Some(before + 1));
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    assert_eq!(snapshot.hold, None);
+    // The attempt and its failure for the retry.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 2);
+}

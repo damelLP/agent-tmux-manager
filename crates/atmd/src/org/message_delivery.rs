@@ -660,6 +660,12 @@ impl Attempt {
         if rt.cancel.is_cancelled() {
             return Err(shutting_down());
         }
+        if Instant::now() >= confirm_by {
+            // The window ended before anything was typed (a slow commit or
+            // fold). No paste: cleanup records that, and the attempt is
+            // failed for its retry instead of leaving a draft staged.
+            return Ok(());
+        }
         self.set(|progress| progress.paste = EffectCertainty::Unknown)?;
         // Every decision about an input is this one function of one capture:
         // the actor's own for each input, a fresh one for each look between.

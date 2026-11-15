@@ -198,9 +198,14 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
     let ordinary = editor(&lines, Some(screen));
     let (menu, above_editor) = if !above.is_empty() {
         (above, true)
-    } else if ordinary.is_some() {
-        // A valid ordinary footer owns its opaque status slot, even when that
-        // slot prints something resembling a menu. Only the above block can be UI.
+    } else if ordinary.is_some()
+        || below.last().is_some_and(|footer| {
+            let footer = footer.trim();
+            MODE_FOOTERS.contains(&footer.split_once("  ").map_or(footer, |(left, _)| left))
+        })
+    {
+        // A recognized mode footer owns its opaque status slot, including in
+        // manual mode. The ordinary/control readers still validate the frame.
         return Ok(None);
     } else if has_menu(&below) {
         (below.as_slice(), false)

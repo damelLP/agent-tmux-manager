@@ -120,6 +120,50 @@ fn custom_status_control_preserves_editor() {
 }
 
 #[test]
+fn synthetic_menu_like_status_preserves_manual_and_auto_editors() {
+    for (fixture, conversation, fresh) in [
+        (
+            capture!("B-baseline-conversation-120x40"),
+            true,
+            FreshEditorEvidence::Unknown,
+        ),
+        (
+            capture!("B-clear-007-120x40"),
+            false,
+            FreshEditorEvidence::Present,
+        ),
+        (AUTO, false, FreshEditorEvidence::Present),
+    ] {
+        let text = body(fixture);
+        let footer = text
+            .lines()
+            .find(|row| row.contains('⏸') || row.contains("⏵⏵"))
+            .unwrap();
+        // Synthetic: opaque status values inserted into real manual/auto frames.
+        for status in [
+            "  ❯ main",
+            "  /srv/proj  main",
+            "  Opus 5.5 /srv/proj  main",
+            "  [plain] ctx 7%",
+        ] {
+            let changed = text.replace(footer, &format!("{status}\n{footer}"));
+            assert_ne!(changed, text);
+            let control = observe(&changed);
+            assert_eq!(control.dialog, ControlDialog::None, "{status}");
+            assert_eq!(control.facts.input, InputState::Empty, "{status}");
+            assert_eq!(control.facts.turn, TurnState::NotRunning, "{status}");
+            assert_eq!(control.facts.dialog, atm_core::DialogState::None);
+            assert_eq!(control.facts.fresh_editor, fresh, "{status}");
+            assert_eq!(control.conversation, conversation, "{status}");
+            assert_eq!(
+                screen::staged_draft_matches(ScreenInput::Styled(&changed), "/clear"),
+                None
+            );
+        }
+    }
+}
+
+#[test]
 fn custom_status_clear_menu_above_editor() {
     for fixture in [
         include_str!("fixtures/screen_styled_s1_status-clear-80_2.1.325.txt"),

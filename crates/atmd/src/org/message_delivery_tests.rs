@@ -3166,6 +3166,34 @@ fn foreground_unknown_masks_editor_facts() {
     }
 }
 
+/// Exercise the guard's redundant flag wiring directly: the actor normally
+/// refuses these frames before invoking the delivery predicate.
+#[test]
+fn guard_capture_flags_refuse_enter_before_actor_checks() {
+    let id = MessageId::new(123);
+    let reference = inbox_reference(id);
+    let screen = agent_screen(Harness::Pi).unwrap();
+    let good = guard_facts(
+        GuardedInput::Enter,
+        &staged(id),
+        screen,
+        &baseline(),
+        &reference,
+    );
+    assert!(guard_allows_input(&good));
+    for (in_mode, synchronized) in [(true, false), (false, true)] {
+        // Synthetic: change only the mode/synchronization flags of the staged frame.
+        let frame = with(staged(id), |capture| {
+            capture.inspection.in_mode = in_mode;
+            capture.inspection.synchronized = synchronized;
+        });
+        let facts = guard_facts(GuardedInput::Enter, &frame, screen, &baseline(), &reference);
+        assert_eq!(facts.in_mode, in_mode);
+        assert_eq!(facts.synchronized, synchronized);
+        assert!(!guard_allows_input(&facts), "{facts:?}");
+    }
+}
+
 /// Real command-completion frames (Codex 0.167.0 with `/new` typed, Claude
 /// 2.1.325 with `/clear` typed; each adapter's fixture README has the
 /// `Captured:` line): the adapter matches the draft exactly, a popup is

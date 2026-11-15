@@ -188,7 +188,24 @@ impl DaemonServer {
         // After control exists and before the first connection is accepted.
         let messages_cancel = CancellationToken::new();
         let messages_task = start_messages(&mut services, &messages_cancel);
+        let decisions_cancel = CancellationToken::new();
+        let decisions_task = if services.decisions.is_none() {
+            let clock = crate::org::messages::MessageClock::new(
+                tokio::time::Instant::now(),
+                chrono::Utc::now(),
+            );
+            let (decisions, task) = crate::org::decisions::spawn_decisions(
+                services.org.clone(),
+                clock,
+                decisions_cancel.clone(),
+            );
+            services.decisions = Some(decisions);
+            Some(task)
+        } else {
+            None
+        };
         let result = self.run_with_services(services).await;
+        decisions_cancel.cancel();
         // Reserved work stops at once and its cleanups run while control and
         // the organisation writer still exist; then each stage, in order and
         // by its bound (see `stop`), which logs a stage that overruns.
@@ -213,7 +230,17 @@ impl DaemonServer {
                 control.stop_reserved_work();
             }
         };
-        stop::stop_stages(stop_work, stages).await;
+        // Drain the non-input bridge alongside the existing stages, not in
+        // addition to their global shutdown budget. Accepted org work survives.
+        let drain_decisions = async {
+            if let Some(mut task) = decisions_task {
+                if timeout(stop::MESSAGES, &mut task).await.is_err() {
+                    warn!("Decision bridge did not stop by its bound; aborting it");
+                    task.abort();
+                }
+            }
+        };
+        tokio::join!(drain_decisions, stop::stop_stages(stop_work, stages));
         result
     }
 

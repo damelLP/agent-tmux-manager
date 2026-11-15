@@ -190,7 +190,7 @@ pub struct DecisionWithdrawal {
 
 /// One decision as folded from the log. `status` decides; the other fields keep
 /// the last fact of their kind, also from a log today's policy would not write.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
     pub id: DecisionId,
     pub request: DecisionRequest,

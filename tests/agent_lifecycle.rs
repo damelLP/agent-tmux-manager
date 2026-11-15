@@ -757,9 +757,87 @@ fn tmux_restart_does_not_claim_reused_pane() {}
 
 /// Pending discovery is liveness, not a replacement session ID. A safe idle
 /// restarted agent preserves its recorded binding and revalidates Ready.
+///
+/// The agent is a pi that sends nothing across the restart, as an idle pi
+/// does: pi-atm connects again only on its next send. Its row can come from
+/// discovery alone, and discovery has only a real pi's process shape to go
+/// by (the cmdline `pi` and NUL padding).
 #[test]
-#[ignore = "covered by unit first_list_waits_for_initial_inspection_and_preserves_pending_binding; pending-row restart acceptance not yet written"]
-fn idle_pending_restart_ready_preserves_binding() {}
+fn idle_pending_restart_ready_preserves_binding() {
+    let mut test = AgentRig::start(StandInMode::Pi);
+    let pane = test.shell_agent("lead", &support::config(StandInMode::Pi));
+    let row = test.complete_fixture_turn(&pane);
+    let result = test.adopt("lead", &pane);
+    assert_eq!(result["state"], "ready", "{result}");
+    let id = result["agent_id"].as_str().unwrap();
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", pane.pid)).unwrap();
+    assert!(
+        cmdline.len() > 3
+            && cmdline
+                .strip_prefix(b"pi")
+                .is_some_and(|padding| padding.iter().all(|byte| *byte == 0)),
+        "the stand-in must have a real pi's cmdline: {:?}",
+        String::from_utf8_lossy(&cmdline)
+    );
+    let connections = |test: &AgentRig| {
+        test.rig
+            .journal(&pane)
+            .iter()
+            .filter(|e| e["kind"] == "connected")
+            .count()
+    };
+    assert_eq!(connections(&test), 1);
+    let after = test.rig.event_cursor(&pane);
+    test.rig.stop_daemon();
+    test.rig
+        .wait_event(&pane, after, |e| e["kind"] == "disconnected");
+    // The transport's own event, not a delay: after it the next send is
+    // accepted, as pi-atm's is once its close back-off has run out.
+    test.rig
+        .wait_event(&pane, after, |e| e["kind"] == "transport_retry_ready");
+    test.rig.start_daemon();
+    // agent.list answers after the restart's first pass over the agents.
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "ready", "{agent}");
+    assert_eq!(agent["session_id"], row.id.as_str(), "{agent}");
+    assert!(agent["reason"].is_null(), "{agent}");
+    let pending = atm_core::SessionId::pending_from_pid(pane.pid);
+    let rows = test.rig.pane_rows(&pane);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].id, pending, "{rows:?}");
+    assert_eq!(rows[0].harness, "pi", "{rows:?}");
+    // A refresh finds the same process and adds no row.
+    test.rig.discover();
+    let rows = test.rig.pane_rows(&pane);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].id, pending, "{rows:?}");
+    // Nothing came from the stand-in: no connection and no input.
+    assert_eq!(
+        connections(&test),
+        1,
+        "the row must come from discovery alone"
+    );
+    test.assert_no_input_since(&pane, after);
+    // Its next event gives that row the session id it had before.
+    test.rig.paste(&pane, "next prompt after the restart");
+    test.rig.wait_for_row(&pane, |r| {
+        r.id == row.id && r.status == SessionStatus::Working
+    });
+    let now = test.rig.control(&pane, json!({"command":"barrier"}))["now_ms"]
+        .as_u64()
+        .unwrap();
+    let reply = test
+        .rig
+        .control(&pane, json!({"command":"advance_to", "now_ms":now + 500}));
+    assert!(reply["error"].is_null(), "{reply}");
+    test.rig
+        .wait_for_row(&pane, |r| r.id == row.id && r.status == SessionStatus::Idle);
+    let rows = test.rig.pane_rows(&pane);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(connections(&test), 2);
+    assert_eq!(test.agent(id)["session_id"], row.id.as_str());
+    test.rig.close();
+}
 
 /// A busy/unknown restart remains Starting until a later real event and safe
 /// editor jointly permit Ready; stale idle history cannot satisfy it.

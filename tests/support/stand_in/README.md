@@ -186,7 +186,10 @@ does not change daemon command construction.
 
 `rig.launcher(mode)` is an absolute executable symlink named `claude`, `codex` or
 `pi`, suitable for `ATM_SPAWN_BIN` (or a per-harness override). It is not shipped
-as a binary. Arguments are validated **before** identity/session announcement.
+as a binary. The pi stand-in overwrites its own `/proc` cmdline with the bare
+name `pi` and NUL padding once it has started, as a real pi's
+`process.title = "pi"` does (pi 1.5.0); the Claude and Codex stand-ins keep the
+launcher path there. Arguments are validated **before** identity/session announcement.
 One positional initial prompt is supported; `--` makes a leading dash literal.
 It remains pending through startup dialogs and is submitted once after they
 finish, never interpreted as a trust/update selection. This is a synthetic safe

@@ -5,9 +5,36 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-/// Readiness predicate for synchronous startup loops: bind alone is not ready.
+/// A successful, nonblocking connect: neither bind nor a full backlog is ready.
 pub fn socket_is_ready(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let address = socket_address(socket);
+    unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            std::ptr::from_ref(&address).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        ) == 0
+    }
+}
+
+fn socket_address(socket: &Path) -> libc::sockaddr_un {
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path = std::ffi::CString::new(socket.as_os_str().as_bytes()).unwrap();
+    assert!(path.as_bytes_with_nul().len() <= address.sun_path.len());
+    for (dst, src) in address.sun_path.iter_mut().zip(path.as_bytes_with_nul()) {
+        *dst = *src as libc::c_char;
+    }
+    address
 }
 
 /// Register before probing so binding between probe and wait cannot be missed.
@@ -268,13 +295,7 @@ mod socket_readiness_tests {
         };
         assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let path = std::ffi::CString::new(socket.as_os_str().as_bytes()).unwrap();
-        assert!(path.as_bytes_with_nul().len() <= address.sun_path.len());
-        for (dst, src) in address.sun_path.iter_mut().zip(path.as_bytes_with_nul()) {
-            *dst = *src as libc::c_char;
-        }
+        let address = socket_address(&socket);
         assert_eq!(
             unsafe {
                 libc::bind(
@@ -312,6 +333,21 @@ mod socket_readiness_tests {
         listener
             .accept()
             .expect("readiness required a real connect");
+    }
+
+    #[test]
+    fn synchronous_readiness_does_not_block_on_a_full_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("atmd.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&socket).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // A detached probe lets the outer hang guard report a blocking connect.
+        std::thread::spawn(move || {
+            let _ = tx.send(socket_is_ready(&socket));
+        });
+        assert!(!rx.recv_timeout(Duration::from_secs(30)).unwrap());
     }
 
     #[tokio::test]

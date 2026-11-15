@@ -919,12 +919,18 @@ async fn session_that_starts_before_the_enter_is_not_the_clears_proof() {
         clearing.frame(cleared);
         let call = clearing.start();
         // The Clear is committed after the precheck's capture, and the
-        // paste's guard is paced after that capture.
-        loop {
-            if committed.recv().await.unwrap().kind == "agent.clear_requested" {
-                break;
+        // paste's guard is paced after that capture. Bounded: the rig keeps
+        // the sender alive, so a Clear that is never recorded would
+        // otherwise be waited for without end.
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                if committed.recv().await.unwrap().kind == "agent.clear_requested" {
+                    break;
+                }
             }
-        }
+        })
+        .await
+        .expect("the clear was never recorded");
         clearing.session_start("early", Some("clear")).await;
         clearing.awaiting_session().await;
         assert_eq!(
@@ -1379,8 +1385,9 @@ async fn codex_popup_other_selection_sends_no_enter() {
     // Also codex_popup_candidate_above_selected_sends_no_enter and
     // codex_popup_selected_row_without_inverse_sends_no_enter. Synthetic: the
     // real popup frame with its one row changed. Codex's adapter reads none
-    // of them as "no dialog", so the staged command gets no Enter. Twin (the
-    // unchanged frame): codex_clear_goes_from_conversation_to_fresh_editor.
+    // of them as "no dialog", so the staged command gets no Enter. Twins
+    // (the unchanged frame gets its Enter): worktree_default_is_answered_only_once,
+    // codex_second_clear_ignores_the_excluded_old_row.
     let popup = body(CODEX_POPUP);
     let row = popup
         .lines()

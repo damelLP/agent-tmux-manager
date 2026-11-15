@@ -15,7 +15,7 @@ use super::{
 use crate::server::methods::{CallContext, MethodError};
 use atm_org::{
     Address, AgentId, MessageContent, MessageId, MessageKind, OrgCommand, OrgEvent, OrgState, Task,
-    TaskActor, TaskCommand, TaskFileKind, TaskId, TaskKind, TaskState, TaskSubmission,
+    TaskActor, TaskCommand, TaskCost, TaskFileKind, TaskId, TaskKind, TaskState, TaskSubmission,
 };
 use atm_protocol::ResponseError;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,8 @@ pub struct ListResult {
 #[derive(Debug, Serialize)]
 pub struct GetResult {
     pub task: Task,
+    /// Running observed totals, or the frozen accepted record.
+    pub usage: TaskCost,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_status: Option<atm_org::budget::BudgetStatus>,
 }
@@ -397,10 +399,13 @@ impl TaskHandle {
             caller_address(&state, &caller)?;
             let task = task(&state, &params.task_id)?;
             let now = chrono::Utc::now();
-            let usage = state.task_cost(&task.id, now).unwrap_or_default();
+            let usage = state
+                .task_cost(&task.id, now)
+                .ok_or_else(|| TaskError::Internal("known task has no usage projection".into()))?;
             let result = GetResult {
                 task: task.clone(),
                 budget_status: atm_org::budget::budget_status(&state, task, &usage, now),
+                usage,
             };
             bounded(&result)?;
             Ok(result)

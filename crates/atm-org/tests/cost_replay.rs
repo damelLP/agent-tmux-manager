@@ -1,6 +1,7 @@
 //! Synthetic golden history: exact integer cost and deterministic supplied time.
 //! Breaks caught: dropping observations on restart, recomputing accepted time at
 //! restart, loss of exact money, and prefix-dependent accumulation.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test fixture helpers only
 use atm_core::Money;
 use atm_org::*;
 use chrono::{DateTime, Utc};

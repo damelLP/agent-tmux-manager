@@ -1,4 +1,4 @@
-//! Budget deadlines on a sealed real daemon; no model or harness turns.
+//! Budget checks on a sealed real daemon; scripted stand-ins, no real models.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #[allow(dead_code)]
@@ -83,12 +83,82 @@ fn reminders_off_still_notifies_due_budget_once_across_restart() {
         .count();
     assert_eq!(notes, 1);
     let got_after = rig.call("task.get", json!({"task_id":task}), None).unwrap();
-    assert_eq!(got_after, got);
+    // T4a's running usage includes elapsed wall time, which may advance.
+    assert_eq!(got_after["task"], got["task"]);
+    assert_eq!(got_after["budget_status"], got["budget_status"]);
     assert!(!rig
         .test
         .tail(0)
         .iter()
         .any(|event| event["kind"] == "task.reminded"));
+    rig.test.rig.close();
+}
+
+// Break caught: the real prompt-ingestion boundary never advances the task
+// ledger, or the normal runtime cannot deliver its budget note to the creator.
+#[test]
+fn committed_stand_in_prompt_notifies_the_creator_without_stopping_work() {
+    let mut rig = start_without_reminders();
+    let lead = rig.ready_agent("lead", stand_in::StandInMode::Pi);
+    let worker = rig.ready_agent("worker", stand_in::StandInMode::Pi);
+    let cursor = rig.test.rig.event_cursor(&lead.pane);
+    let mut watch = rig.watch();
+    let task = rig
+        .call(
+            "task.create",
+            json!({
+                "title":"One observed turn", "measure":{"kind":"owner"}, "budget":{"turns":0}
+            }),
+            Some(&lead.pane),
+        )
+        .unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let assigned = rig
+        .call(
+            "task.assign",
+            json!({"task_id":task,"agent_id":worker.id}),
+            Some(&lead.pane),
+        )
+        .unwrap();
+    let brief = assigned["notification"]["message_id"].as_str().unwrap();
+    let sent = watch.wait("budget note to the task creator", |event| {
+        event["kind"] == "msg.sent"
+            && event["body"]["task"] == task
+            && event["body"]["from"] == "system"
+            && event["body"]["to"] == lead.id
+            && event["body"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("crossed a budget limit"))
+    });
+    let message = format!("m{}", sent["seq"].as_u64().unwrap());
+    watch.wait(
+        "budget note accepted by the creator",
+        support::about("msg.delivered", &message),
+    );
+    // The prompt's usage event can queue the budget note before the message
+    // runtime records delivery of that very prompt. Accept either ordering.
+    if watch.all(support::about("msg.delivered", brief)).is_empty() {
+        watch.wait(
+            "assigned brief accepted by stand-in",
+            support::about("msg.delivered", brief),
+        );
+    }
+    assert_eq!(
+        rig.accepted_since(&lead.pane, cursor),
+        [support::reference(&message)]
+    );
+    let got = rig.call("task.get", json!({"task_id":task}), None).unwrap();
+    assert_eq!(got["task"]["creator"], lead.id);
+    assert_eq!(got["task"]["agent_id"], worker.id);
+    assert_eq!(got["task"]["state"], "assigned");
+    assert_eq!(got["task"]["cost"], Value::Null);
+    assert_eq!(got["usage"]["turns"], 1);
+    assert_eq!(got["budget_status"]["crossed"], json!(["turns"]));
+    assert_eq!(got["budget_status"]["notification"], message);
+    rig.finish_turn(&worker.pane);
+    rig.finish_turn(&lead.pane);
     rig.test.rig.close();
 }
 

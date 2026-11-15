@@ -85,6 +85,8 @@ async fn task_get_budget_status_reads_the_running_task_ledger() {
         serde_json::Value::Null
     );
     assert_eq!(first["task"]["cost"], serde_json::Value::Null);
+    assert_eq!(first["usage"]["turns"], 1);
+    assert_eq!(first["usage"]["cost"], json!({"microdollars":0}));
 
     org.execute(
         OrgCommand::ObserveTaskUsage(TaskUsageObservation {
@@ -114,5 +116,7 @@ async fn task_get_budget_status_reads_the_running_task_ledger() {
         format!("m{}", sent.first().unwrap().seq)
     );
     assert_eq!(second["task"]["state"], "assigned");
+    assert_eq!(second["usage"]["turns"], 1);
+    assert_eq!(second["usage"]["cost"], json!({"microdollars":1}));
     cancel.cancel();
 }

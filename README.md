@@ -254,6 +254,14 @@ Limits:
 - A turn whose end the harness does not report is not reminded: Esc during a reply in Claude Code or Codex, or a denied dialog.
 - A session that reads idle while the harness still answers (a blocked `Stop` hook, an auto-compact) for longer than the delay gets a reminder it may no longer need, typed after the turn really ends.
 
+## Task usage
+
+`atm task get <id>` (or the `task.get` RPC) includes `usage`: observed prompt turns, wall-clock seconds in each task state, review rounds, changes-requested verdicts, cumulative-cost deltas, and peak reported context percentage. The same totals are readable while work runs. Final result acceptance persists a frozen copy in `task.cost`; approving a plan instead resumes work. Records and running baselines survive daemon restart, and a missing cost append after an accepted verdict is repaired on startup.
+
+Only a proven parent session bound to a named agent can contribute. Exactly one open task must be assigned to that agent; otherwise measurements are unattributed. A first cumulative price establishes a baseline, not a charge for historical work; later positive high-water increases count once. Attribution follows observation order, so delayed reports can cross task boundaries. Counts reflect observations, not a complete billing history: lost/overflowed measurements and time spent on an older daemon cannot be recovered. Working/idle edges, tool calls and provider replies are not additional user turns.
+
+Missing cost/context is `null`, not reported zero. Codex reports no USD price; context requires explicit active tokens and window capacity, never a guessed model window or lifetime tokens. Peak percentages round up to whole percent and survive compaction. State time includes waiting and daemon downtime, stops at acceptance/cancellation, and sums subsecond visits before reporting whole seconds. Review starts (or direct verdicts naming a review) count rounds; automatic closure of a review does not create another round. Files/lines changed and files read are not measured here. No agent is stopped by accounting.
+
 ## Decisions
 
 Named agents raise questions through `decision.request`; the owner answers from an **unbound** shell:

@@ -12,7 +12,7 @@ use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 use atm_core::SessionStatus;
 use serde_json::json;
 use stand_in::StandInMode;
-use support::{checked, process_identity, AgentRig};
+use support::{checked, process_identity, AgentRig, Started};
 
 /// Adoption must bind the existing process/session, not launch or type into it.
 #[test]
@@ -331,20 +331,181 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
 /// start, real session plus safe editor, no implicit prompt, all in its own window.
 /// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance and a styled fresh-editor Claude stand-in frame at 200 columns"]
-fn agent_up_ready_tagged_env_claude() {}
+fn agent_up_ready_tagged_env_claude() {
+    up_is_ready_tagged_and_announced(StandInMode::Claude, true);
+}
 
 /// Codex up: daemon override, role/required args and ATM_AGENT, pre-start tag,
 /// fresh safe Ready/null without submitting a prompt to manufacture a session.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance"]
-fn agent_up_ready_tagged_env_codex() {}
+fn agent_up_ready_tagged_env_codex() {
+    up_is_ready_tagged_and_announced(StandInMode::Codex, false);
+}
 
 /// Pi up: daemon override, role args/model and ATM_AGENT, pre-start tag,
 /// session_start plus safe editor before Ready, no implicit initial prompt.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance"]
-fn agent_up_ready_tagged_env_pi() {}
+fn agent_up_ready_tagged_env_pi() {
+    up_is_ready_tagged_and_announced(StandInMode::Pi, true);
+}
+
+/// `agent.up` from a pane of the private server: the daemon splits it, tags
+/// the new pane, types the launch command into its shell and waits for the
+/// harness. `bound`: the harness announces a session at its start, and Ready
+/// is that session with a safe editor; otherwise Ready has no session yet.
+fn up_is_ready_tagged_and_announced(mode: StandInMode, bound: bool) {
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, pane) = (started.id.as_str(), &started.pane);
+    assert_eq!(started.result["state"], "ready", "{}", started.result);
+    assert_eq!(id, "project/lead");
+
+    // The pane is the lower half of the caller's window: never attached,
+    // the size the stand-in draws at, tagged for the agent.
+    assert_ne!(pane.pane_id, started.placement);
+    let window = |pane_id: &str| {
+        checked(test.rig.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{window_id} #{window_panes} #{session_attached}",
+        ]))
+    };
+    assert_eq!(window(&pane.pane_id), window(&started.placement));
+    assert!(
+        window(&pane.pane_id).ends_with(" 2 0"),
+        "{}",
+        window(&pane.pane_id)
+    );
+    let size = checked(test.rig.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &pane.pane_id,
+        "#{pane_width} #{pane_height}",
+    ]));
+    assert_eq!(size, format!("{} {}", config.columns, config.rows));
+    assert_eq!(test.tag(&pane.pane_id), id);
+
+    // The harness is a job of the pane's interactive shell, started through
+    // the daemon's ATM_SPAWN_BIN in the role's directory, with ATM_AGENT set.
+    let shell: u32 =
+        checked(
+            test.rig
+                .tmux(&["display-message", "-p", "-t", &pane.pane_id, "#{pane_pid}"]),
+        )
+        .parse()
+        .unwrap();
+    assert_ne!(shell, pane.pid);
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pane.pid)).unwrap();
+    let parent: u32 = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(parent, shell);
+    let environ = std::fs::read(format!("/proc/{}/environ", pane.pid)).unwrap();
+    assert!(
+        environ
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == format!("ATM_AGENT={id}").as_bytes()),
+        "ATM_AGENT is not in the harness's environment"
+    );
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{}/cwd", pane.pid)).unwrap(),
+        test.project.canonicalize().unwrap()
+    );
+    let journal = test.rig.journal(pane);
+    let identity = journal.iter().find(|e| e["kind"] == "identity").unwrap();
+    assert_eq!(
+        identity["argv"][0],
+        test.rig.launcher(mode).to_str().unwrap(),
+        "{identity}"
+    );
+
+    // Ready is the harness's own row and nothing typed into its editor.
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "ready", "{agent}");
+    assert_eq!(agent["pane"], pane.pane_id);
+    if bound {
+        let row = test.rig.wait_for_row(pane, |r| {
+            !r.id.is_pending() && r.status == SessionStatus::Idle
+        });
+        assert_eq!(test.rig.pane_rows(pane).len(), 1);
+        assert_eq!(agent["session_id"], row.id.as_str(), "{agent}");
+    } else {
+        // No session is announced before a first prompt: the only row a
+        // discovery pass can give the pane is its own placeholder.
+        test.rig.discover();
+        let rows = test.rig.pane_rows(pane);
+        assert!(rows.iter().all(|row| row.id.is_pending()), "{rows:?}");
+        assert_eq!(agent["session_id"], json!(null), "{agent}");
+        assert_eq!(test.agent(id)["state"], "ready");
+    }
+    test.assert_no_prompt(pane);
+    // Nothing was typed into the caller's pane. (The split resized it, and
+    // the rig's shell redraws its prompt as an empty line then.)
+    let caller = checked(
+        test.rig
+            .tmux(&["capture-pane", "-p", "-t", &started.placement]),
+    );
+    assert!(
+        caller.is_empty() || caller == started.placement_screen,
+        "{caller}"
+    );
+    assert_eq!(test.tag(&started.placement), "");
+
+    // The record: requested, the pane, the launch's audit, then readiness;
+    // the launch is the only control action.
+    let events = test.tail(started.cursor);
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .filter(|kind| kind.starts_with("agent.") || kind.starts_with("control."))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "agent.up_requested",
+            "agent.pane_created",
+            "control.spawned",
+            if bound {
+                "agent.session_bound"
+            } else {
+                "agent.editor_ready"
+            },
+        ],
+        "{events:?}"
+    );
+    let spawned = events
+        .iter()
+        .find(|e| e["kind"] == "control.spawned")
+        .unwrap();
+    assert_eq!(
+        spawned["body"],
+        json!({
+            "pane": pane.pane_id,
+            "action": {
+                "method": "agent.up",
+                "agent": id,
+                "binary": test.rig.launcher(mode),
+            },
+        })
+    );
+    // A second up of an agent that is up is refused, with nothing done.
+    let cursor = test.cursor();
+    let again = test.up_from("lead", &started.placement);
+    assert!(again.is_err(), "{again:?}");
+    assert!(test.tail(cursor).is_empty());
+    assert!(window(&pane.pane_id).ends_with(" 2 0"));
+    test.rig.close();
+}
 
 /// A linked checkout uses the main role, not a conflicting linked role. Scrub
 /// all GIT_* for fixture git commands; prove the temp gitdir before any write.

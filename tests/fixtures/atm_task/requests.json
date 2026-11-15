@@ -6,7 +6,7 @@
   {"name":"create-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"create","method":"task.create","params":{"title":"","measure":{"kind":"owner"}}}},
   {"name":"create-success","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"create","method":"task.create","params":{"title":"New","measure":{"kind":"owner"}}}},
   {"name":"get-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"get","method":"task.get","params":{"task_id":"t999"}}},
-  {"name":"get-success","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"get","method":"task.get","params":{"task_id":"t6"}}},
+  {"name":"get-success","setup":"accepted","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"get","method":"task.get","params":{"task_id":"t6"}}},
   {"name":"list-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"list","method":"task.list","params":{"limit":0}}},
   {"name":"list-success","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"list","method":"task.list","params":{}}},
   {"name":"review-refusal","setup":"submitted","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"review","method":"task.review","params":{"task_id":"t6","review_task":"t6"}}},

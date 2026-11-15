@@ -783,7 +783,7 @@ where
                 "status line is not a JSON object".to_string(),
             ));
         }
-        let (pid, pane, status) = parse_status_line_with_pane(data)?;
+        let (pid, pane, status, usage) = parse_status_line_with_pane(data)?;
         let session_id = SessionId::new(status.session_id.clone());
 
         // Send to registry for processing
@@ -796,6 +796,17 @@ where
                 atm_core::Harness::ClaudeCode,
             )
             .await;
+        if applied.is_ok() {
+            if let Some(usage) = usage {
+                self.observe_task_usage(
+                    &session_id,
+                    pane.as_deref(),
+                    atm_core::Harness::ClaudeCode,
+                    &usage,
+                )
+                .await;
+            }
+        }
         // Activity only: it can neither bind nor confirm, so it needs no parent
         // proof. The pane is the one the hook script reported (inside tmux),
         // never one repaired from the current row. An unparsable pane is an
@@ -828,13 +839,13 @@ where
         pane: Option<String>,
         context: atm_core::LifecycleContext,
     ) -> Result<(), ConnectionError> {
-        let tapped = context.child.is_none()
+        let parent = context.child.is_none()
             && !matches!(
                 event,
                 atm_core::LifecycleEvent::ChildSessionStart { .. }
                     | atm_core::LifecycleEvent::ChildSessionEnd { .. }
-            )
-            && self.message_tapped();
+            );
+        let tapped = parent && self.message_tapped();
         // A SessionEnd removes its row, so no snapshot can prove it afterwards.
         // It needs none: it is activity of a session that can bind no more.
         let ends = matches!(event, atm_core::LifecycleEvent::SessionEnd { .. });
@@ -849,6 +860,13 @@ where
                 context,
             )
             .await;
+        if parent
+            && applied.is_ok()
+            && matches!(event, atm_core::LifecycleEvent::PromptSubmit { .. })
+        {
+            self.observe_task_usage(&session, pane.as_deref(), harness, &event)
+                .await;
+        }
         if tapped {
             // An unparsable pane is an unknown pane. Without a pane no event
             // can bind or confirm, so there is nothing to prove.
@@ -861,6 +879,34 @@ where
             self.record_message_event(&session, pane, Some(harness), Some(&event), proven);
         }
         applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
+    }
+
+    /// Accounting takes only explicit, applied measurements with the event's
+    /// original proven parent identity. Submission never waits for the log.
+    async fn observe_task_usage(
+        &self,
+        session: &SessionId,
+        pane: Option<&str>,
+        harness: atm_core::Harness,
+        event: &atm_core::LifecycleEvent,
+    ) {
+        if self.org.status().is_err() {
+            return;
+        }
+        let pane = pane.filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
+        let Some(input) = atm_org::TaskUsageObservation::from_lifecycle(
+            session.clone(),
+            pane.map(str::to_owned),
+            event,
+        ) else {
+            return;
+        };
+        if !self.message_parent_proven(session, pane, harness).await {
+            return;
+        }
+        if let Err(error) = self.org.observe_task_usage(input, chrono::Utc::now()) {
+            warn!(%error, session_id = %session, "Task usage observation lost");
+        }
     }
 
     /// The proof a receipt or a lazy binding needs: one healthy snapshot shows
@@ -997,6 +1043,7 @@ where
             "Processing pi event"
         );
 
+        let accounting = raw_event.accounting_usage();
         // The first event is genuine activity; any following events are
         // derived metadata. Suppressed primary events yield no batch.
         let mut events = raw_event.to_lifecycle_events().into_iter();
@@ -1050,6 +1097,15 @@ where
                 .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
         }
 
+        if let Some(usage) = accounting {
+            self.observe_task_usage(
+                &session_id,
+                raw_event.tmux_pane.as_deref(),
+                atm_core::Harness::Pi,
+                &usage,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1156,16 +1212,24 @@ where
             };
 
             if let Some(usage) = usage {
+                let event = usage.to_lifecycle_event();
                 self.registry
                     .apply_lifecycle_event(
-                        session_id,
-                        usage.to_lifecycle_event(),
+                        session_id.clone(),
+                        event.clone(),
                         atm_core::Harness::Codex,
                         pid,
-                        tmux_pane,
+                        tmux_pane.clone(),
                     )
                     .await
                     .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+                self.observe_task_usage(
+                    &session_id,
+                    tmux_pane.as_deref(),
+                    atm_core::Harness::Codex,
+                    &event,
+                )
+                .await;
             }
         }
 
@@ -1281,20 +1345,28 @@ where
 pub fn parse_status_line(
     data: serde_json::Value,
 ) -> Result<(Option<u32>, StatusLineData), ConnectionError> {
-    parse_status_line_with_pane(data).map(|(pid, _, status)| (pid, status))
+    parse_status_line_with_pane(data).map(|(pid, _, status, _)| (pid, status))
 }
+
+type ParsedStatusLine = (
+    Option<u32>,
+    Option<String>,
+    StatusLineData,
+    Option<atm_core::LifecycleEvent>,
+);
 
 /// [`parse_status_line`], with the tmux pane `atm-hook` adds inside tmux.
 fn parse_status_line_with_pane(
     data: serde_json::Value,
-) -> Result<(Option<u32>, Option<String>, StatusLineData), ConnectionError> {
+) -> Result<ParsedStatusLine, ConnectionError> {
     let raw: RawStatusLine =
         serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
     // Always Some today; the Option predates the empty-model rules
     let status = raw
         .to_status_line_data()
         .ok_or_else(|| ConnectionError::ParseError("status line has no data".to_string()))?;
-    Ok((raw.pid, raw.tmux_pane, status))
+    let usage = raw.accounting_usage();
+    Ok((raw.pid, raw.tmux_pane, status, usage))
 }
 
 /// Errors that can occur during connection handling.

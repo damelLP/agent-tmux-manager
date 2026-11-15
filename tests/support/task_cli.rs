@@ -164,7 +164,7 @@ pub fn contracts() -> Vec<Value> {
 pub async fn method_answer(fixture: &Value, cli_args: Option<&[&str]>) -> Value {
     let setup = fixture["setup"].as_str().unwrap_or("");
     assert!(
-        matches!(setup, "" | "assigned" | "submitted" | "review"),
+        matches!(setup, "" | "assigned" | "submitted" | "review" | "accepted"),
         "unknown task CLI fixture setup: {setup:?}"
     );
     use atm_org::{OrgCommand, TaskActor, TaskCommand, TaskCreated, TaskKind, TaskSubmission};
@@ -225,13 +225,27 @@ pub async fn method_answer(fixture: &Value, cli_args: Option<&[&str]>) -> Value 
         .await
         .unwrap();
     }
-    if setup == "submitted" || setup == "review" {
+    if matches!(setup, "submitted" | "review" | "accepted") {
         org.execute(
             OrgCommand::Task(TaskCommand::Submit {
                 task_id: "t6".parse().unwrap(),
                 what: TaskSubmission::Result,
                 files: vec![],
                 by: actor("project/worker"),
+            }),
+            now,
+        )
+        .await
+        .unwrap();
+    }
+    if setup == "accepted" {
+        org.execute(
+            OrgCommand::Task(TaskCommand::Verdict {
+                task_id: "t6".parse().unwrap(),
+                verdict: atm_org::TaskVerdict::Accepted,
+                review_task: None,
+                note: None,
+                by: actor("owner"),
             }),
             now,
         )

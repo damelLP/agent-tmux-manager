@@ -128,6 +128,7 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::AgentSaved { .. } => 37,
         OrgEvent::OwnerAway(_) => 38,
         OrgEvent::OwnerBack(_) => 39,
+        OrgEvent::TaskUsageObserved(_) => 40,
     }
 }
 
@@ -230,6 +231,13 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
                 .into_iter()
                 .filter(|_| !n.is_multiple_of(7))
                 .collect(),
+        }),
+        40 => OrgEvent::TaskUsageObserved(TaskUsageObserved {
+            session_id: text.into(),
+            task_id: flag.then(|| format!("t{n}").parse().unwrap()),
+            turn: flag,
+            cumulative_cost: Some(Money::from_microdollars(cost)),
+            context_percent: Some((n % 101) as u8),
         }),
         _ => OrgEvent::OwnerBack(OwnerBack {
             by: owner_or(flag, agent_id),
@@ -395,6 +403,7 @@ fn command_slot(command: &OrgCommand) -> usize {
         OrgCommand::SaveRequested { .. } => 23,
         OrgCommand::Saved { .. } => 24,
         OrgCommand::Owner(_) => 25,
+        OrgCommand::ObserveTaskUsage(_) => 26,
     }
 }
 
@@ -496,6 +505,13 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
             agent_id,
             message_id,
         },
+        26 => OrgCommand::ObserveTaskUsage(TaskUsageObservation {
+            session_id,
+            pane: Some(pane),
+            turn: flag,
+            cumulative_cost: Some(Money::from_microdollars((n % 1000000) as i64)),
+            context_percent: Some((n % 101) as u8),
+        }),
         // Slot 25: the switch by the owner or an agent, caps from zero up, and
         // the away table applied to the decision ids a history reaches.
         _ => OrgCommand::Owner(match n % 3 {
@@ -591,14 +607,14 @@ fn task_command_case(n: u64, flag: bool) -> TaskCommand {
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..40)
+    let events: Vec<_> = (0..41)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..40).collect::<Vec<_>>());
-    let commands: Vec<_> = (0..26)
+    assert_eq!(events, (0..41).collect::<Vec<_>>());
+    let commands: Vec<_> = (0..27)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
-    assert_eq!(commands, (0..26).collect::<Vec<_>>());
+    assert_eq!(commands, (0..27).collect::<Vec<_>>());
     let picks: Vec<_> = (0..5)
         .map(|pick| match command_case(21, pick, true) {
             OrgCommand::Decision(command) => decision_support::decision_command_pick(&command),
@@ -776,7 +792,7 @@ impl ExcludedReach {
 
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..40, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..41, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
@@ -794,7 +810,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
         ..Config::default()
     });
     let inputs = (
-        prop::collection::vec((0usize..26, 0u64..50, any::<bool>()), 0..80),
+        prop::collection::vec((0usize..27, 0u64..50, any::<bool>()), 0..80),
         any::<usize>(),
     );
     runner
@@ -824,7 +840,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
                 }
                 // Every command is tried at every generated reachable state, not
                 // only the randomly selected command that advanced the history.
-                for candidate in 0..26 {
+                for candidate in 0..27 {
                     let mut probe = reachable.clone();
                     let command = command_case(candidate, n, flag);
                     let result = probe.decide(&command, time());

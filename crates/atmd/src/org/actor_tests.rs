@@ -456,6 +456,129 @@ async fn failed_second_event_preserves_committed_prefix() {
     assert!(status.borrow().is_err());
 }
 
+// Break caught: acceptance is acknowledged before its cost append, or an
+// uncertain cost append is silently retried/hidden instead of preserving prefix.
+#[tokio::test]
+async fn failed_accepted_cost_append_preserves_verdict_prefix() {
+    let mut state = OrgState::default();
+    for line in include_str!("../../../atm-org/tests/fixtures/task_cost_log.jsonl")
+        .lines()
+        .take(7)
+    {
+        let envelope: Envelope = serde_json::from_str(line).unwrap();
+        let event = OrgEvent::from_parts(&envelope.kind, &envelope.body)
+            .unwrap()
+            .unwrap();
+        state.apply(envelope.seq, envelope.ts, &event).unwrap();
+    }
+    let command = OrgCommand::Task(atm_org::TaskCommand::Verdict {
+        task_id: "t3".parse().unwrap(),
+        verdict: atm_org::TaskVerdict::Accepted,
+        review_task: None,
+        note: None,
+        by: atm_org::TaskActor {
+            who: atm_org::Address::Owner,
+            lead: false,
+        },
+    });
+    let (health, status) = watch::channel(Ok(7));
+    let mut kinds = Vec::new();
+    let result = execute(
+        &mut state,
+        &command,
+        now(),
+        None,
+        &health,
+        &broadcast::channel(8).0,
+        &mut |e: Envelope| {
+            kinds.push(e.kind);
+            std::future::ready(if kinds.len() == 1 {
+                Ok(8)
+            } else {
+                Err(EventLogError::TimeoutAfterHandover)
+            })
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(kinds, ["task.verdict", "task.cost_recorded"]);
+    let task = state.task(&"t3".parse().unwrap()).unwrap();
+    assert_eq!(task.state, atm_org::TaskState::Accepted);
+    assert!(task.cost.is_none());
+    assert!(status.borrow().is_err());
+}
+
+// Break caught: publication or command acknowledgement crosses a still-pending
+// cost append. Only the disk boundary is stalled; decide/apply/publication run.
+#[tokio::test]
+async fn accepted_cost_waits_for_its_append_before_publication_and_reply() {
+    let mut state = OrgState::default();
+    for line in include_str!("../../../atm-org/tests/fixtures/task_cost_log.jsonl")
+        .lines()
+        .take(7)
+    {
+        let envelope: Envelope = serde_json::from_str(line).unwrap();
+        state
+            .apply(
+                envelope.seq,
+                envelope.ts,
+                &OrgEvent::from_parts(&envelope.kind, &envelope.body)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    let command = OrgCommand::Task(atm_org::TaskCommand::Verdict {
+        task_id: "t3".parse().unwrap(),
+        verdict: atm_org::TaskVerdict::Accepted,
+        review_task: None,
+        note: None,
+        by: atm_org::TaskActor {
+            who: atm_org::Address::Owner,
+            lead: false,
+        },
+    });
+    let (health, status) = watch::channel(Ok(7));
+    let (publication, mut published) = broadcast::channel(8);
+    let (entered, mut entry) = mpsc::channel(1);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut seq = 7;
+    let mut append = |e: Envelope| {
+        seq += 1;
+        let seq = seq;
+        let entered = entered.clone();
+        let gate = gate.clone();
+        async move {
+            if e.kind == "task.cost_recorded" {
+                entered.send(()).await.unwrap();
+                let _permit = gate.acquire().await.unwrap();
+            }
+            Ok(seq)
+        }
+    };
+    let work = execute(
+        &mut state,
+        &command,
+        now(),
+        None,
+        &health,
+        &publication,
+        &mut append,
+    );
+    tokio::pin!(work);
+    tokio::select! { result = &mut work => panic!("accepted command returned before cost append: {result:?}"), _ = entry.recv() => {} }
+    assert_eq!(*status.borrow(), Ok(8));
+    assert_eq!(published.try_recv().unwrap().kind, "task.verdict");
+    assert!(matches!(
+        published.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    gate.add_permits(1);
+    assert_eq!(work.await.unwrap().len(), 2);
+    assert_eq!(*status.borrow(), Ok(9));
+    assert_eq!(published.try_recv().unwrap().kind, "task.cost_recorded");
+}
+
 #[tokio::test(start_paused = true)]
 async fn caller_timeout_does_not_cancel_a_later_commit() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));

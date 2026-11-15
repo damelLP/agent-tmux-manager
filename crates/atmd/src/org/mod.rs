@@ -16,6 +16,7 @@ pub mod agent_context;
 pub mod agent_handover;
 #[cfg(test)]
 mod agent_handover_tests;
+mod cost;
 // Pure decisions first; the flows that call them follow in their own commits.
 #[cfg_attr(not(test), allow(dead_code))]
 mod agent_flow;

@@ -117,6 +117,7 @@ pub struct OrgState {
     agents: BTreeMap<AgentId, Agent>,
     messages: BTreeMap<MessageId, Message>,
     pub(crate) tasks: BTreeMap<u64, Task>,
+    pub(crate) costs: crate::cost::CostLedger,
     summaries: HashMap<SessionId, SessionSummary>,
     decisions: BTreeMap<DecisionId, Decision>,
     pub(crate) owner: OwnerState,
@@ -316,6 +317,7 @@ impl OrgState {
             OrgEvent::TaskReminded(fact) => fact.check(self)?,
             OrgEvent::TaskFlagged(fact) => fact.check(self)?,
             OrgEvent::TaskCostRecorded(fact) => fact.check(self)?,
+            OrgEvent::TaskUsageObserved(fact) => fact.check(self)?,
             OrgEvent::SessionSummary(summary) => {
                 valid_external_id("session id", summary.session_id.as_str())?;
                 if let Some(pane) = &summary.pane {
@@ -391,6 +393,7 @@ impl OrgState {
         {
             return Err(ApplyError::DuplicateDecision(DecisionId::new(seq)));
         }
+        self.track_cost_transition(event, ts);
         match event {
             OrgEvent::ProjectRegistered { project_id, root } => {
                 self.projects.insert(
@@ -570,6 +573,7 @@ impl OrgState {
             OrgEvent::TaskReminded(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
             OrgEvent::TaskFlagged(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
             OrgEvent::TaskCostRecorded(fact) => fact.fold(self.task_mut(&fact.task_id)?),
+            OrgEvent::TaskUsageObserved(fact) => self.apply_usage(fact),
             OrgEvent::SessionSummary(summary) => {
                 self.summaries
                     .insert(summary.session_id.clone(), summary.clone());

@@ -106,6 +106,18 @@ fn extract_context_usage(messages: Option<&Value>) -> (Option<u64>, Option<f64>)
 }
 
 impl RawPiEvent {
+    /// Cumulative accounting only; the legacy context-message fallback is one
+    /// request's cost, not a session total. Leave cockpit compatibility intact.
+    /// Captured: pi 0.73.1, 2026-10-24, pi_session_cost fixture/socket tap.
+    #[must_use]
+    pub fn accounting_usage(&self) -> Option<LifecycleEvent> {
+        self.usage?;
+        match self.to_lifecycle_event()? {
+            event @ LifecycleEvent::ContextUpdate { .. } => Some(event),
+            _ => None,
+        }
+    }
+
     /// Complete translation: the original event, then any derived metadata.
     /// Only the first event is genuine activity; later events update registry
     /// metadata without entering message-delivery evidence. Never resurrect a
@@ -302,6 +314,14 @@ impl RawPiEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_per_request_usage_is_not_a_cumulative_accounting_sample() {
+        // Synthetic: old extension frame, deliberately without the usage snapshot.
+        let raw: crate::RawPiEvent = serde_json::from_value(serde_json::json!({"event":"context", "payload":{"messages":[{"role":"assistant","usage":{"totalTokens":10,"cost":{"total":0.5}}}]}})).unwrap();
+        assert!(raw.to_lifecycle_event().is_some());
+        assert!(raw.accounting_usage().is_none());
+    }
+
     use super::*;
     use crate::wire::{PiModel, PiPayload};
 

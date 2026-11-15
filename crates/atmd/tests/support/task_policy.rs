@@ -59,12 +59,32 @@ async fn linked_verdict_requires_a_fresh_review_result_and_closes_both_tasks() {
         } else {
             result.unwrap();
             let state = rig.snapshot().await;
-            assert_eq!(rig.org.status().unwrap(), cursor + 2);
+            // Two verdicts and their two acceptance cost records.
+            assert_eq!(rig.org.status().unwrap(), cursor + 4);
+            let records = rig
+                .org
+                .tail(atmd::org::TailParams {
+                    after_seq: cursor,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let costs: Vec<_> = records
+                .iter()
+                .filter(|e| e.kind == "task.cost_recorded")
+                .map(|e| json!({"kind":e.kind, "task_id":e.body["task_id"]}))
+                .collect();
+            assert_eq!(
+                costs,
+                [
+                    json!({"kind":"task.cost_recorded", "task_id":"t6"}),
+                    json!({"kind":"task.cost_recorded", "task_id":id}),
+                ]
+            );
             for id in ["t6", id] {
-                assert_eq!(
-                    state.task(&id.parse().unwrap()).unwrap().state,
-                    TaskState::Accepted
-                );
+                let task = state.task(&id.parse().unwrap()).unwrap();
+                assert_eq!(task.state, TaskState::Accepted);
+                assert!(task.cost.is_some());
             }
         }
     }

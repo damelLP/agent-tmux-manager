@@ -15,7 +15,7 @@ use super::{
 use crate::server::methods::{CallContext, MethodError};
 use atm_org::{
     Address, AgentId, MessageContent, MessageId, MessageKind, OrgCommand, OrgEvent, OrgState, Task,
-    TaskActor, TaskCommand, TaskFileKind, TaskId, TaskKind, TaskState, TaskSubmission,
+    TaskActor, TaskCommand, TaskCost, TaskFileKind, TaskId, TaskKind, TaskState, TaskSubmission,
 };
 use atm_protocol::ResponseError;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,8 @@ pub struct ListResult {
 #[derive(Debug, Serialize)]
 pub struct GetResult {
     pub task: Task,
+    /// Running observed totals, or the frozen accepted record.
+    pub usage: TaskCost,
 }
 
 /// Canonical task sequence; legacy free-text message references are not task IDs.
@@ -395,6 +397,11 @@ impl TaskHandle {
             caller_address(&state, &caller)?;
             let result = GetResult {
                 task: task(&state, &params.task_id)?.clone(),
+                usage: state
+                    .task_cost(&params.task_id, chrono::Utc::now())
+                    .ok_or_else(|| {
+                        TaskError::Internal("known task has no usage projection".into())
+                    })?,
             };
             bounded(&result)?;
             Ok(result)

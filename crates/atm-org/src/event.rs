@@ -197,6 +197,8 @@ pub enum OrgEvent {
     TaskFlagged(crate::TaskFlagged),
     #[serde(rename = "task.cost_recorded")]
     TaskCostRecorded(crate::TaskCostRecorded),
+    #[serde(rename = "task.usage_observed")]
+    TaskUsageObserved(crate::TaskUsageObserved),
     #[serde(rename = "session.summary")]
     SessionSummary(SessionSummary),
     #[serde(rename = "control.sent")]
@@ -255,6 +257,7 @@ impl OrgEvent {
             Self::TaskReminded(_) => "task.reminded",
             Self::TaskFlagged(_) => "task.flagged",
             Self::TaskCostRecorded(_) => "task.cost_recorded",
+            Self::TaskUsageObserved(_) => "task.usage_observed",
             Self::SessionSummary(_) => "session.summary",
             Self::ControlSent(_) => "control.sent",
             Self::ControlSpawned(_) => "control.spawned",
@@ -314,6 +317,7 @@ impl OrgEvent {
                 | "task.reminded"
                 | "task.flagged"
                 | "task.cost_recorded"
+                | "task.usage_observed"
                 | "session.summary"
                 | "control.sent"
                 | "control.spawned"

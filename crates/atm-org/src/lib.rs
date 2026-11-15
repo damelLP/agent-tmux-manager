@@ -191,6 +191,7 @@
 mod away;
 mod command;
 mod config;
+mod cost;
 mod decision;
 pub mod delivery;
 mod event;
@@ -204,6 +205,7 @@ mod task;
 pub use away::*;
 pub use command::*;
 pub use config::*;
+pub use cost::{TaskUsageObservation, TaskUsageObserved};
 pub use decision::*;
 pub use event::*;
 pub use ids::*;

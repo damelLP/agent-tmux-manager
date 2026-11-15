@@ -1048,6 +1048,18 @@ impl AgentRuntime {
                             chrono::Utc::now(),
                         )
                         .await?;
+                    // The agent is Ready now. The reason above was decided
+                    // for what it was before (Starting without a session
+                    // has none): when its harness is not known to be in
+                    // front, say so, and with that let its own session
+                    // start the pass that pins it.
+                    if foreground(&stored, root, command) != Some(Foreground::Harness) {
+                        if let Some(pane) = agent.pane.as_deref() {
+                            let shape = processes.as_ref().and_then(classify_pane);
+                            let text = refusal_text(pane, &stored, command, shape);
+                            self.set_refusal(&agent.id, pane, Some(text));
+                        }
+                    }
                     return Ok(());
                 }
             }

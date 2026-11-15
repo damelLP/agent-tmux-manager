@@ -11,7 +11,7 @@ const CAPACITY: usize = 32;
 #[derive(Default)]
 pub(super) struct Pacing {
     after: HashMap<PaneId, Instant>,
-    waiting: Vec<(Instant, Command)>,
+    waiting: Vec<(Instant, PaneId, Command)>,
 }
 
 impl Pacing {
@@ -36,16 +36,24 @@ impl Pacing {
             return None;
         }
         self.after.retain(|_, due| *due > now);
-        if let Some(due) = self.after.get(pane) {
-            if self.waiting.len() >= CAPACITY {
-                command.reject();
+        let pane = pane.clone();
+        if let Some(due) = self.after.get(&pane) {
+            if self
+                .waiting
+                .iter()
+                .filter(|(_, queued, _)| queued == &pane)
+                .count()
+                >= CAPACITY
+            {
+                command.reject_with(ReservationError::PacingRefused { pane: pane.clone() });
             } else {
-                self.waiting.push(((*due).min(deadline), command));
+                self.waiting
+                    .push(((*due).min(deadline), pane.clone(), command));
             }
             return None;
         }
         if self.after.len() >= CAPACITY {
-            command.reject();
+            command.reject_with(ReservationError::PacingRefused { pane: pane.clone() });
             return None;
         }
         self.after.insert(pane.clone(), now + INTERVAL);
@@ -54,18 +62,18 @@ impl Pacing {
 
     pub(super) fn take_ready(&mut self, now: Instant) -> Vec<Command> {
         let mut ready = Vec::new();
-        for (due, command) in std::mem::take(&mut self.waiting) {
+        for (due, pane, command) in std::mem::take(&mut self.waiting) {
             if due <= now {
                 ready.push(command);
             } else {
-                self.waiting.push((due, command));
+                self.waiting.push((due, pane, command));
             }
         }
         ready
     }
 
     pub(super) fn next_deadline(&self) -> Option<Instant> {
-        self.waiting.iter().map(|(due, _)| *due).min()
+        self.waiting.iter().map(|(due, _, _)| *due).min()
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -73,13 +81,13 @@ impl Pacing {
     }
 
     pub(super) fn stop(&mut self) {
-        for (due, command) in std::mem::take(&mut self.waiting) {
+        for (due, pane, command) in std::mem::take(&mut self.waiting) {
             if matches!(command, Command::Observe { .. }) {
                 command.reject();
             } else {
                 // Admitted pane actions still fence at execution. In particular,
                 // cleanup keeps its independent budget during daemon shutdown.
-                self.waiting.push((due, command));
+                self.waiting.push((due, pane, command));
             }
         }
     }

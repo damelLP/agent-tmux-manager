@@ -1,8 +1,9 @@
 //! Legacy input joins the same actor ordering as reserved pane effects.
 //! Parked input yields to reservation waiters on its pane, including later
 //! arrivals. A steady stream of reservations can starve it until its deadline.
-//! Dropping a caller does not cancel admitted parked input: it can still start
-//! within that deadline. Once input starts, finish Enter under tmux's timeout.
+//! A send whose caller is gone before the first effect is discarded, including
+//! after pre-effect reads. Once input starts, finish Enter under tmux's timeout.
+//! Spawn typing retains daemon-owned admission even if its caller disappears.
 use super::org_mirror::{Mirror, View};
 use super::*;
 use crate::control::reservation::{pane_ops, state::InputGate, PaneId};
@@ -29,6 +30,9 @@ pub(super) async fn dispatch(
     audits: &AuditQueue,
     may_park: bool,
 ) -> Option<Pending> {
+    if matches!(&pending.request, Request::Send { reply, .. } if reply.is_closed()) {
+        return None;
+    }
     // Preserve U7's identity boundary: a foreign server is rejected before it
     // becomes an attributable control action, including before any ownership I/O.
     if let Some(server) = pending.server.take() {
@@ -92,6 +96,9 @@ pub(super) async fn dispatch(
                 .await?;
                 if Instant::now() >= pending.deadline {
                     return Err(ServiceError::Timeout);
+                }
+                if reply.is_closed() {
+                    return Err(ServiceError::Unavailable);
                 }
                 // Admission expires before the first effect, never between paste
                 // and Enter. Each tmux call retains its own bounded timeout.

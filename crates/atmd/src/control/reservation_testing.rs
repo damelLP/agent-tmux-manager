@@ -17,7 +17,7 @@
 //! | inspect, missing pane | successful empty filtered metadata only (1) | script_inspect(None) |
 //! | tag / untag / unguarded keys / paste / kill | filtered metadata; pane-local tag (2), then effect | script_tag_check |
 //! | capture / observe | filtered metadata; single metadata/capture/clients/end command list; pane-local tag (3) | script_capture / script_observe |
-//! | keys_guarded / paste_guarded | same 3 reads as capture, pure check, then effect if approved | script_capture |
+//! | keys_guarded / literal_key_guarded / paste_guarded | same 3 reads as capture, pure check, then effect if approved | script_capture |
 //! | split | no observation reads; SplitWindow, then claim before replying | mock().set_next_pane_id |
 //! | legacy send / spawn_type, unavailable org | ownership: filtered metadata; pane-local tag (2), before input | script_tag_check |
 //!
@@ -31,18 +31,19 @@
 //! Script each operation separately. Scripts are FIFO **within a pane**; other
 //! panes can interleave freely. A missing script, wrong read order/format, or
 //! unsupported raw command returns TmuxError, never a plausible empty answer.
-//! Non-raw effects delegate to mock(); use its calls/errors/unique split IDs,
+//! Non-raw effects and the fixed literal send-keys argv delegate to mock();
+//! literal input is recorded as RawCommand, not SendKeys. Use calls/errors/unique split IDs,
 //! not set_next_raw_output, which cannot script these reserved reads.
 //!
 //! Legacy ownership is the only legacy read this client serves. It cannot serve
-//! U7 send's `#{pane_in_mode} #{bracket_paste_flag}` state read or a noncanonical
+//! send's mode/bracket/synchronize-panes/input-off state read or a noncanonical
 //! target's `#{pane_id}` resolution read: both are rejected, not answered by the
 //! mock's raw-output FIFO. Of legacy input, only canonical-target spawn_type is
 //! supported end-to-end (script an
 //! untagged ownership check when the org is unavailable); use MockTmuxClient for
 //! legacy sends or alias resolution.
 use super::{
-    pane_ops::{CLIENTS, CLIENTS_MARKER, FORMAT},
+    pane_ops::{CLIENTS, CLIENTS_MARKER, COMMAND, FORMAT},
     CaptureFormat, PaneCapture, PaneId, PaneInspection,
 };
 use atm_tmux::{MockTmuxClient, PaneDirection, PaneInfo, TmuxClient, TmuxError};
@@ -52,6 +53,66 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scripted_default_matches_real_v2_frames_including_absent_process_facts() {
+        for (fixture, bracketed) in [
+            (include_str!("fixtures/tmux_3.6_reserved_v2.json"), None),
+            (
+                include_str!("fixtures/tmux_3.8_reserved_v2.json"),
+                Some(false),
+            ),
+        ] {
+            let data: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            for sample in data["samples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| s["label"] != "paused")
+            {
+                let inspection = PaneInspection::new(
+                    PaneInfo {
+                        pane_id: "%0".into(),
+                        session_name: "probe".into(),
+                        window_index: 0,
+                        pane_pid: 123,
+                        width: 40,
+                        height: 6,
+                        is_active: true,
+                    },
+                    None,
+                    false,
+                    false,
+                    bracketed,
+                    0,
+                    0,
+                )
+                .with_foreground_process(
+                    None,
+                    (sample["argv0"] == "neutral-program").then(|| "neutral-program".into()),
+                );
+                assert_eq!(
+                    metadata(&inspection).output,
+                    sample["metadata"].as_str().unwrap()
+                );
+                let capture =
+                    PaneCapture::new("\n\n\n\n\n\n".into(), inspection, CaptureFormat::Plain)
+                        .with_focus(Some(sample["label"] == "attached"));
+                let client = ScriptedTmuxClient::new();
+                client.script_capture(&capture).unwrap();
+                let scripts = client.scripts.lock().unwrap();
+                let reads = scripts.get(&PaneId::parse("%0").unwrap()).unwrap();
+                assert_eq!(
+                    reads.get(1).unwrap().output,
+                    sample["frame"].as_str().unwrap()
+                );
+            }
+        }
+    }
+}
 
 const LEGACY_FORMAT: &str = "ATM-PANE-v1\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}";
 const END: &str = "ATM-END\t#{pane_id}";
@@ -143,14 +204,12 @@ impl ScriptedTmuxClient {
         }
         let first = metadata(&capture.inspection);
         let clients = match capture.focused {
-            Some(true) => format!("{CLIENTS_MARKER}\nfocused\t{pane}\n"),
-            Some(false) => format!("{CLIENTS_MARKER}\n"),
-            // Unknown current output is explicitly malformed, not empty clients
-            // (which means observed absence). Preserve historical v1 fixtures.
-            None if first.output.starts_with("ATM-PANE-v2\t") => {
-                format!("{CLIENTS_MARKER}\n\t{pane}\n")
+            Some(true) => {
+                format!("{CLIENTS_MARKER}\nattached,focused,control-mode,UTF-8\t{pane}\n")
             }
-            None => String::new(),
+            Some(false) => format!("{CLIENTS_MARKER}\n"),
+            // Unknown output is explicitly malformed, never observed absence.
+            None => format!("{CLIENTS_MARKER}\n\t{pane}\n"),
         };
         let output = format!(
             "{}{}{clients}ATM-END\t{}\n",
@@ -211,8 +270,8 @@ impl ScriptedTmuxClient {
 
 fn metadata(inspection: &PaneInspection) -> Read {
     let pane = &inspection.pane;
-    let mut output = format!(
-        "ATM-PANE-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+    let output = format!(
+        "ATM-PANE-v2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         pane.pane_id,
         pane.session_name,
         pane.window_index,
@@ -228,20 +287,14 @@ fn metadata(inspection: &PaneInspection) -> Read {
             .unwrap_or_default(),
         inspection.cursor_column,
         inspection.cursor_row,
+        inspection
+            .foreground_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_default(),
+        inspection.foreground_command.as_deref().unwrap_or_default(),
+        u8::from(inspection.synchronized),
+        u8::from(inspection.input_off),
     );
-    if inspection.foreground_pid.is_some() || inspection.foreground_command.is_some() {
-        output = format!(
-            "{}\t{}\t{}\n",
-            output
-                .trim_end_matches('\n')
-                .replacen("ATM-PANE-v1", "ATM-PANE-v2", 1),
-            inspection
-                .foreground_pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_default(),
-            inspection.foreground_command.as_deref().unwrap_or_default()
-        );
-    }
     Read {
         kind: ReadKind::Metadata,
         output,
@@ -262,7 +315,8 @@ fn local_tag(inspection: &PaneInspection) -> Read {
 fn requested_read(subcommand: &str, args: &[&str]) -> Result<(PaneId, ReadKind), TmuxError> {
     match (subcommand, args) {
         ("list-panes", ["-a", "-f", filter, "-F", format])
-            if matches!(*format, FORMAT | LEGACY_FORMAT) =>
+            if matches!(*format, FORMAT | LEGACY_FORMAT)
+                || *format == FORMAT.replace(COMMAND, "") =>
         {
             let pane = filter
                 .strip_prefix("#{==:#{pane_id},")
@@ -344,10 +398,20 @@ impl TmuxClient for ScriptedTmuxClient {
             ) {
                 return Ok(output);
             }
+            if let ("send-keys", ["-l", "-t", pane, "--", key]) = (subcommand, args) {
+                pane_id(pane)?;
+                if *key == "\\;"
+                    || (*key != ";"
+                        && key.len() == 1
+                        && key.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+                {
+                    return Ok(output);
+                }
+            }
             self.read(subcommand, args)
         })
     }
-    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>) -> String);
+    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
     forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
     forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
     forward!(kill_pane<'a>(pane: &'a str) -> ());

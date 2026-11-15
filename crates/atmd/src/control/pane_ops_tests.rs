@@ -90,6 +90,52 @@ fn reservation_decodes_real_tmux_frames_and_preserves_whitespace_style() {
     }
 }
 #[test]
+fn reservation_real_v2_frames_preserve_focus_and_suppress_control_names() {
+    for fixture in [
+        include_str!("fixtures/tmux_3.6_reserved_v2.json"),
+        include_str!("fixtures/tmux_3.8_reserved_v2.json"),
+    ] {
+        let data: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        for sample in data["samples"].as_array().unwrap() {
+            let capture = decode_capture(
+                &PaneId::parse("%0").unwrap(),
+                sample["frame"].as_str().unwrap(),
+                CaptureFormat::Plain,
+            )
+            .unwrap();
+            assert_eq!(capture.text, "\n\n\n\n\n\n");
+            assert_eq!(capture.inspection.pane_root_pid(), Some(123));
+            assert_eq!(
+                capture.inspection.foreground_command.as_deref(),
+                (sample["argv0"] == "neutral-program").then_some("neutral-program")
+            );
+            assert_eq!(capture.focused, Some(sample["label"] != "unattached"));
+        }
+    }
+}
+
+#[test]
+fn reservation_focus_accepts_real_key_value_client_flags() {
+    for fixture in [
+        include_str!("fixtures/tmux_3.6_clients.json"),
+        include_str!("fixtures/tmux_3.8_clients.json"),
+    ] {
+        let data: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        for key in ["attached", "paused"] {
+            let line = data[key].as_str().unwrap();
+            assert_eq!(
+                decode_focus(&PaneId::parse("%0").unwrap(), line),
+                Some(true)
+            );
+            assert_eq!(
+                decode_focus(&PaneId::parse("%7").unwrap(), line),
+                Some(false)
+            );
+        }
+    }
+}
+
+#[test]
 fn reservation_focus_is_exact_and_malformed_clients_are_unknown() {
     let pane = PaneId::parse("%0").unwrap();
     let data = fixture();

@@ -1,9 +1,9 @@
 //! Fixed reserved tmux operations. The owner actor supplies the checked fence.
 //! Framing/focus/process formats verified on private tmux 3.6 and 3.8. The v1
-//! captures remain in fixtures/tmux_3.8_reserved_observations.json.
+//! captures remain in fixtures/tmux_3.8_reserved_observations.json; current v2
+//! frames and real clients are in fixtures/tmux_{3.6,3.8}_reserved_v2.json.
 //! Captured: tmux 3.6 and 3.8, 2026-11-14, private PTY focus/shell probes.
-//! Neither
-//! version exposes a foreground PID: the v2 PID slot is deliberately empty,
+//! Neither version exposes a foreground PID: the v2 PID slot is deliberately empty,
 //! never substituted with pane_pid (the root may be a shell wrapper).
 use super::{
     state::{Fence, State},
@@ -15,13 +15,18 @@ use atm_org::AgentId;
 use atm_tmux::{PaneDirection, PaneInfo, TmuxClient, TmuxError};
 use tokio::time::Instant;
 
-pub(super) const FORMAT: &str = "ATM-PANE-v2\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}\t\t#{pane_current_command}";
+pub(super) const FORMAT: &str = "ATM-PANE-v2\t#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_dead}\t#{pane_in_mode}\t#{bracket_paste_flag}\t#{cursor_x}\t#{cursor_y}\t\t#{?#{m/r:[[:cntrl:]],#{pane_current_command}},,#{pane_current_command}}\t#{pane_synchronized}\t#{pane_input_off}";
+// tmux 3.6 prints argv[0] raw. Suppress control-bearing names inside tmux,
+// before they can escape the tab/newline record. Mutations omit this field.
+pub(super) const COMMAND: &str =
+    "#{?#{m/r:[[:cntrl:]],#{pane_current_command}},,#{pane_current_command}}";
 pub(super) const CLIENTS: &str = "#{client_flags}\t#{pane_id}";
 pub(super) const CLIENTS_MARKER: &str = "ATM-CLIENTS-v1";
 const END: &str = "ATM-END\t#{pane_id}";
 pub(in crate::control) type Guard = Box<dyn FnOnce(&PaneCapture) -> bool + Send>;
 pub(in crate::control) enum Input {
     Key(PaneKey),
+    LiteralKey(char),
     Paste(String),
 }
 pub(in crate::control) enum Action {
@@ -226,6 +231,19 @@ pub(super) async fn execute(
                         )
                         .await
                 }
+                Input::LiteralKey(key) => {
+                    // tmux parses a bare semicolon as a command separator even
+                    // after --. Verified with a raw receiver on private tmux 3.8.
+                    let encoded = if key == ';' {
+                        "\\;".into()
+                    } else {
+                        key.to_string()
+                    };
+                    client
+                        .raw_command("send-keys", &["-l", "-t", pane.as_str(), "--", &encoded])
+                        .await
+                        .map(|_| ())
+                }
                 Input::Paste(text) => client.paste_text(pane.as_str(), &text).await,
             }
             .map_err(|source| tmux(&pane, "send reserved input", source))?;
@@ -240,27 +258,24 @@ fn check_input(
 ) -> Result<(), ReservationError> {
     let text = match input {
         Input::Paste(text) => Some(text.as_str()),
-        Input::Key(_) => None,
+        Input::Key(_) | Input::LiteralKey(_) => None,
     };
+    if text.is_some_and(crate::control::send::unsafe_paste) {
+        return Err(ReservationError::UnsafePaste { pane: pane.clone() });
+    }
     let reason = crate::control::send::input_refusal(
         inspection.in_mode,
         inspection.dead,
         inspection.bracketed_paste,
         text,
-    )
-    .or_else(|| {
-        text.filter(|text| {
-            text.chars()
-                .any(|c| c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\r'))
-        })
-        .map(|_| "paste text contains unsafe control bytes")
-    });
+        inspection.synchronized,
+        inspection.input_off,
+    );
     match reason {
-        Some(reason) => Err(ControlError::SendRefused {
-            pane: pane.to_string(),
+        Some(reason) => Err(ReservationError::PaneInputRefused {
+            pane: pane.clone(),
             reason,
-        }
-        .into()),
+        }),
         None => Ok(()),
     }
 }
@@ -287,10 +302,16 @@ fn check_tag(
 async fn metadata(
     client: &dyn TmuxClient,
     pane: &PaneId,
+    process: bool,
 ) -> Result<Option<PaneInspection>, ReservationError> {
     let filter = format!("#{{==:#{{pane_id}},{pane}}}");
+    let format = if process {
+        FORMAT.to_owned()
+    } else {
+        FORMAT.replace(COMMAND, "")
+    };
     let output = client
-        .raw_command("list-panes", &["-a", "-f", &filter, "-F", FORMAT])
+        .raw_command("list-panes", &["-a", "-f", &filter, "-F", &format])
         .await
         .map_err(|source| tmux(pane, "read pane metadata", source))?;
     if output.is_empty() {
@@ -319,7 +340,14 @@ pub(in crate::control) async fn inspect(
     client: &dyn TmuxClient,
     pane: &PaneId,
 ) -> Result<Option<PaneInspection>, ReservationError> {
-    let Some(mut inspection) = metadata(client, pane).await? else {
+    inspect_with_process(client, pane, true).await
+}
+async fn inspect_with_process(
+    client: &dyn TmuxClient,
+    pane: &PaneId,
+    process: bool,
+) -> Result<Option<PaneInspection>, ReservationError> {
+    let Some(mut inspection) = metadata(client, pane, process).await? else {
         return Ok(None);
     };
     inspection.local_agent_tag = tag(client, pane).await?;
@@ -329,7 +357,7 @@ async fn present(
     client: &dyn TmuxClient,
     pane: &PaneId,
 ) -> Result<PaneInspection, ReservationError> {
-    inspect(client, pane)
+    inspect_with_process(client, pane, false)
         .await?
         .ok_or_else(|| ReservationError::PaneGone { pane: pane.clone() })
 }
@@ -338,7 +366,7 @@ pub(super) async fn capture(
     pane: &PaneId,
     format: CaptureFormat,
 ) -> Result<PaneCapture, ReservationError> {
-    metadata(client, pane)
+    metadata(client, pane, false)
         .await?
         .ok_or_else(|| ReservationError::PaneGone { pane: pane.clone() })?;
     let mut args = vec![
@@ -476,6 +504,11 @@ fn decode_metadata_line(pane: &PaneId, line: &str) -> Result<PaneInspection, Res
     } else {
         (None, None)
     };
+    let (synchronized, input_off) = if let Some(flag) = fields.next() {
+        (boolean(Some(flag))?, boolean(fields.next())?)
+    } else {
+        (false, false) // Historical fixtures predate these formats.
+    };
     if fields.next().is_some()
         || width == 0
         || height == 0
@@ -484,7 +517,7 @@ fn decode_metadata_line(pane: &PaneId, line: &str) -> Result<PaneInspection, Res
     {
         return Err(fail());
     }
-    Ok(PaneInspection::new(
+    let mut inspection = PaneInspection::new(
         PaneInfo {
             pane_id: pane.to_string(),
             session_name,
@@ -501,7 +534,10 @@ fn decode_metadata_line(pane: &PaneId, line: &str) -> Result<PaneInspection, Res
         cursor_column,
         cursor_row,
     )
-    .with_foreground_process(foreground_pid, foreground_command))
+    .with_foreground_process(foreground_pid, foreground_command);
+    inspection.synchronized = synchronized;
+    inspection.input_off = input_off;
+    Ok(inspection)
 }
 fn decode_capture(
     pane: &PaneId,
@@ -557,10 +593,16 @@ fn decode_focus(pane: &PaneId, output: &str) -> Option<bool> {
         let target = PaneId::parse(target).ok()?;
         let mut client_focused = false;
         for flag in flags.split(',') {
-            if flag.is_empty()
-                || !flag
+            let (name, value) = flag
+                .split_once('=')
+                .map_or((flag, None), |(name, value)| (name, Some(value)));
+            if name.is_empty()
+                || !name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || value.is_some_and(|value| {
+                    value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic())
+                })
             {
                 return None;
             }

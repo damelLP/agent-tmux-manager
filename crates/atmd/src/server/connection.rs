@@ -14,11 +14,13 @@
 //! - Connection errors are logged and result in graceful disconnect
 
 use std::collections::HashMap;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+    unix::AsyncFd, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    BufWriter, Interest,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -33,7 +35,7 @@ use atm_core::{SessionId, StatusLineData};
 use atm_pi_adapter::RawPiEvent;
 use atm_protocol::{error_code, ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 
-use super::methods::{CallContext, CallerId, CallerPane, MethodRouter};
+use super::methods::{CallContext, CallerId, CallerPane, MethodError, MethodRouter};
 use super::MAX_TUI_CLIENTS;
 use crate::discovery::{DiscoveryResult, DiscoveryService};
 use crate::registry::{RegistryHandle, SessionEvent};
@@ -141,6 +143,10 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     /// A broken peer stops input/replies, but accepted handlers still finish.
     peer_failed: CancellationToken,
 
+    /// Full socket closure drops only the waiting session.send method future.
+    caller_gone: CancellationToken,
+    disconnect_monitor: Option<AsyncFd<OwnedFd>>,
+
     /// Forwards registry events while subscribed
     forwarder: Option<Forwarder>,
 
@@ -150,6 +156,37 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     message_evidence: Option<crate::org::message_evidence::MessageEvidence>,
     message_history: Option<crate::org::message_history::MessageHistoryHandle>,
     watcher: Option<Forwarder>,
+}
+
+impl ConnectionHandler {
+    /// Observe closure independently of the buffered writer, including during
+    /// request draining. A duplicate registration must not clear the writer's
+    /// readiness. EOF alone is only a write-half-close and must preserve replies.
+    pub(crate) fn with_disconnect_monitor(mut self) -> std::io::Result<Self> {
+        self.disconnect_monitor = Some(AsyncFd::with_interest(
+            self.reader
+                .get_ref()
+                .as_ref()
+                .as_fd()
+                .try_clone_to_owned()?,
+            Interest::WRITABLE,
+        )?);
+        Ok(self)
+    }
+}
+
+async fn peer_disconnected(monitor: Option<AsyncFd<OwnedFd>>) -> std::io::Result<()> {
+    let Some(monitor) = monitor else {
+        return std::future::pending().await;
+    };
+    loop {
+        let mut ready = monitor.writable().await?;
+        if ready.ready().is_write_closed() {
+            return Ok(());
+        }
+        // Ordinary writable edges are not disconnects (including after SHUT_WR).
+        ready.clear_ready();
+    }
 }
 
 impl<R, W> ConnectionHandler<R, W>
@@ -189,6 +226,8 @@ where
             connection_number,
             cancel,
             peer_failed: CancellationToken::new(),
+            caller_gone: CancellationToken::new(),
+            disconnect_monitor: None,
             forwarder: None,
             methods,
             raw: crate::org::RawHandle::default(),
@@ -254,8 +293,25 @@ where
 
         let client_id = self.client_id.clone();
 
-        // Enter message processing loop
-        if let Err(e) = self.process_messages().await {
+        // Watch through EOF and protocol Disconnect while accepted work drains.
+        let monitor = self.disconnect_monitor.take();
+        let caller_gone = self.caller_gone.clone();
+        let result = {
+            let processing = self.process_messages();
+            tokio::pin!(processing);
+            tokio::select! {
+                biased;
+                result = peer_disconnected(monitor) => {
+                    match result {
+                        Ok(()) => caller_gone.cancel(),
+                        Err(error) => warn!(%error, "Disconnect monitor failed; preserving accepted work"),
+                    }
+                    processing.await
+                }
+                result = &mut processing => result,
+            }
+        };
+        if let Err(e) = result {
             debug!(
                 client_id = ?self.client_id,
                 error = %e,
@@ -356,9 +412,10 @@ where
         self.stop_forwarder().await;
         self.stop_watcher().await;
         let mut writable = result.is_ok() && !self.peer_failed.is_cancelled();
-        // EOF/disconnect closes only input. Finish accepted work up to its own
-        // deadline, even if the peer can no longer receive replies. Only daemon
-        // shutdown aborts the remaining jobs by dropping this JoinSet.
+        // EOF/protocol Disconnect closes only input. Finish accepted work up to
+        // its deadline. Full socket closure separately drops session.send's wait;
+        // the control actor decides whether its first effect has already begun.
+        // Only daemon shutdown aborts every remaining job via this JoinSet.
         while !requests.is_empty() {
             tokio::select! {
                 biased;
@@ -525,8 +582,16 @@ where
                     from_pane: from_pane.map(CallerPane),
                 };
                 let methods = Arc::clone(&self.methods);
+                let caller_gone = self.caller_gone.clone();
                 requests.spawn(async move {
-                    let response = match methods.call(context, &method, params).await {
+                    let result = tokio::select! {
+                        biased;
+                        _ = caller_gone.cancelled(), if method == "session.send" => {
+                            Err(MethodError::new(error_code::UNAVAILABLE, "caller disconnected"))
+                        }
+                        result = methods.call(context, &method, params) => result,
+                    };
+                    let response = match result {
                         Ok(value) => DaemonMessage::response_ok(id, value),
                         Err(error) => {
                             DaemonMessage::response_err(id, &error.0.code, &error.0.message)
@@ -3343,6 +3408,51 @@ mod tests {
             result = handler.process_messages() => result.unwrap(),
             _ = std::future::ready(()) => panic!("shutdown waited for a blocked forwarder"),
         }
+    }
+
+    #[tokio::test]
+    async fn full_disconnect_still_drains_other_accepted_methods() {
+        timeout(Duration::from_secs(60), async {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+            let mut router = MethodRouter::default();
+            router
+                .register("wait", Duration::from_secs(60), move |_, _| {
+                    let (entry, gate, finished) = (entry.clone(), gate.clone(), finished.clone());
+                    async move {
+                        entry.notify_one();
+                        gate.notified().await;
+                        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::Value::Null)
+                    }
+                })
+                .unwrap();
+            let (mut handler, peer) = handshake_pair();
+            handler.methods = Arc::new(router);
+            let handler = handler.with_disconnect_monitor().unwrap();
+            // Observe the actual full-close signal before releasing the other
+            // method; this catches accidentally applying send-only cancellation
+            // to all accepted work, without depending on scheduler order.
+            let gone = handler.caller_gone.clone();
+            let run = tokio::spawn(handler.run());
+            let mut peer = BufReader::new(peer);
+            send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::Connected { .. }
+            ));
+            send_client(peer.get_mut(), request("other", 0)).await;
+            entered.notified().await;
+            drop(peer);
+            gone.cancelled().await;
+            release.notify_one();
+            run.await.unwrap();
+            assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

@@ -496,7 +496,7 @@ fn apply_slot<'a>(
                 SplitDirection::Horizontal => crate::PaneDirection::Right,
             };
             let new_pane = client
-                .split_window(pane_id, &child.size, direction, None, None)
+                .split_window(pane_id, &child.size, direction, None, None, false)
                 .await?;
             apply_slot(client, child, &new_pane, result).await?;
         }
@@ -827,6 +827,7 @@ name = "nope"
                 direction: crate::PaneDirection::Below,
                 command: None,
                 cwd: None,
+                detached: false,
             } if target == "%1" && size == "50%"
         ));
 
@@ -839,6 +840,7 @@ name = "nope"
                 direction: crate::PaneDirection::Right,
                 command: None,
                 cwd: None,
+                detached: false,
             } if target == "%1" && size == "25%"
         ));
 

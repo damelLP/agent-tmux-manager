@@ -181,6 +181,40 @@ async fn respawn_kills_then_ups_in_one_reservation() {
 }
 
 #[tokio::test]
+async fn respawn_failed_new_start_is_stuck_on_new_pane_with_owner_note() {
+    // The old pane was killed, but somebody selected the new pane before
+    // its prompt was read: nothing is typed and cleanup accounts for the
+    // unfinished start on that new pane, with one note to the owner.
+    let mut starting = Starting::ready(CODEX).await;
+    starting.script_replace();
+    starting.frame(Starting::moved(
+        Starting::shell(PROMPT).with_focus(Some(true)),
+        "%2",
+    ));
+    let result = starting.respawn().await;
+    assert!(matches!(result, Err(AgentError::Refused(_))), "{result:?}");
+    let agent = starting.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Stuck);
+    assert_eq!(agent.pane.as_deref(), Some("%2"));
+    assert_eq!(agent.session_id, None);
+    let reason = agent.reason.as_deref().unwrap();
+    assert!(reason.starts_with("start did not complete: the new pane was selected"));
+    assert!(reason.ends_with("; inspect %2"));
+    let state = starting.rig.org.snapshot().await.unwrap();
+    let notes: Vec<_> = state.messages()
+        .filter(|message| message.content.to == atm_org::Address::Owner)
+        .collect();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].content.body, format!("agent q/lead: {reason}"));
+    assert_eq!(starting.effects(), [
+        "kill %1",
+        "split %0 Below detached=true command=None",
+        "set-option -p -t %2 @atm-agent q/lead",
+    ]);
+    assert_eq!(starting.unread_all(), 0);
+}
+
+#[tokio::test]
 async fn respawn_only_old_pane_refuses_before_kill() {
     // Run from the agent's own pane, the pane to split is the pane the
     // respawn kills: refused with nothing changed. Twin: the same call from

@@ -6,6 +6,9 @@
 //! Delivery must independently check the screen before input.
 //! A Stuck agent recovers only when one observation finds its session row and
 //! captures a safe editor; a binding alone never clears Stuck.
+//! A flow never outlives its daemon: at the restart check an agent found
+//! Clearing, or Starting with no session bound, is recorded Stuck and its
+//! owner gets one note.
 //! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: up, down,
 //! adopt, clear and respawn act on panes.
 
@@ -934,12 +937,26 @@ impl AgentRuntime {
         if let Some(pane) = &agent.pane {
             self.set_refusal(&agent.id, pane, refused);
         }
+        // A flow never outlives its daemon. At the restart check a clear, and
+        // a start that has bound no session, have nobody driving them: the
+        // agent is Stuck and its owner is told, once.
+        let starting = agent.status == AgentStatus::Starting && agent.session_id.is_none();
+        let interrupted = initial && (agent.status == AgentStatus::Clearing || starting);
         if let Some(pane) = &agent.pane {
-            let reason = format!("clear interrupted by daemon restart; inspect {pane}");
-            if (initial && agent.status == AgentStatus::Clearing)
-                || (agent.status == AgentStatus::Stuck && agent.reason.as_ref() == Some(&reason))
-            {
-                if agent.status == AgentStatus::Clearing {
+            let cleared = format!("clear interrupted by daemon restart; inspect {pane}");
+            let started = format!("was still starting when the daemon restarted; inspect {pane}");
+            // This pass's reason follows the status. An agent already Stuck
+            // with either reason may still lack its note.
+            let reason = if interrupted {
+                Some(if starting { started } else { cleared })
+            } else {
+                agent.reason.clone().filter(|recorded| {
+                    agent.status == AgentStatus::Stuck
+                        && (*recorded == cleared || *recorded == started)
+                })
+            };
+            if let Some(reason) = reason {
+                if interrupted {
                     self.org
                         .execute(
                             OrgCommand::Stuck {
@@ -970,7 +987,9 @@ impl AgentRuntime {
                 }
             }
         }
-        if agent.status == AgentStatus::Clearing {
+        // The snapshot still shows an interrupted start as Starting: nothing
+        // below may pin, bind or capture for an agent just recorded Stuck.
+        if agent.status == AgentStatus::Clearing || interrupted {
             return Ok(());
         }
         let rows = self.rows().await?;

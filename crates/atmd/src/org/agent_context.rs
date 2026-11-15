@@ -61,7 +61,7 @@ fn context_agent<'s>(state: &'s OrgState, caller: &CallContext) -> Result<&'s Ag
         .ok_or_else(|| MessageError::NotFound(format!("agent {id} was not found")))
 }
 
-fn paths(state: &OrgState, agent: &Agent) -> Result<(PathBuf, PathBuf), AgentError> {
+pub(super) fn paths(state: &OrgState, agent: &Agent) -> Result<(PathBuf, PathBuf), AgentError> {
     let project = state.project(&agent.id.project).ok_or_else(|| {
         AgentError::NotFound(format!("project {} was not found", agent.id.project))
     })?;
@@ -201,7 +201,7 @@ fn read_files(
 
 /// A worker owns the slot, not its waiting future. Timeouts/cancellation cannot
 /// multiply stalled filesystem threads, and Tokio never joins a hung read.
-async fn detached_read<T: Send + 'static>(
+pub(super) async fn detached_read<T: Send + 'static>(
     slot: Arc<Semaphore>,
     role_file: &Path,
     read: impl FnOnce() -> Result<T, AgentError> + Send + 'static,

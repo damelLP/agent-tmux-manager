@@ -121,6 +121,9 @@ pub struct RecipientObservation {
 
 /// Pure inputs in receive/apply order. IDs live on updates, not `record`, because
 /// one applied envelope can affect an agent or several messages at once.
+// Applied embeds the event directly. Boxing it touches every test that builds
+// one; the role keys of the automatic handover took it over clippy's limit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum HistoryUpdate {
     /// Committed fact only; None advances the cursor for a skipped unknown kind.

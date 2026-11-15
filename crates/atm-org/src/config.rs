@@ -74,6 +74,18 @@ pub struct RoleConfig {
     pub clear: Option<String>,
     #[serde(default)]
     pub trust_dirs: Vec<String>,
+    /// The reasons the daemon may hand this seat over without a command;
+    /// empty is off. Read through [`crate::auto_handover::handover_settings`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_handover: Vec<String>,
+    /// The seat's context line in percent, when it is not the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_line: Option<u8>,
+    /// The prompt cache life the role's author assumes. No built-in value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<u32>,
 }
 fn default_cwd() -> String {
     ".".into()
@@ -122,6 +134,10 @@ fn parse_front_matter(name: &str, text: &str) -> Result<RoleConfig, ConfigError>
         "pane",
         "clear",
         "trust_dirs",
+        "auto_handover",
+        "context_line",
+        "cache_minutes",
+        "idle_minutes",
     ];
     for key in table.keys() {
         if !KEYS.contains(&key.as_str()) {
@@ -144,5 +160,9 @@ fn parse_front_matter(name: &str, text: &str) -> Result<RoleConfig, ConfigError>
     })?;
     let mut config: RoleConfig = table.try_into().map_err(toml_error)?;
     config.harness = definition.harness;
+    crate::auto_handover::handover_settings(&config).map_err(|problem| ConfigError::Role {
+        name: name.into(),
+        problem: problem.to_string(),
+    })?;
     Ok(config)
 }

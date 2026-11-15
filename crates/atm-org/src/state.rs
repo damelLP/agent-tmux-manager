@@ -345,6 +345,17 @@ impl OrgState {
             OrgEvent::DecisionExpired { decision_id } => {
                 self.require_decision(decision_id)?;
             }
+            OrgEvent::AgentSaveRequested {
+                agent_id,
+                message_id,
+            }
+            | OrgEvent::AgentSaved {
+                agent_id,
+                message_id,
+            } => {
+                self.require_agent(agent_id)?;
+                self.require_message(message_id)?;
+            }
         }
         Ok(())
     }
@@ -551,8 +562,11 @@ impl OrgState {
                 self.summaries
                     .insert(summary.session_id.clone(), summary.clone());
             }
-            OrgEvent::ControlSent(_) | OrgEvent::ControlSpawned(_) | OrgEvent::ControlKilled(_) => {
-            }
+            OrgEvent::ControlSent(_)
+            | OrgEvent::ControlSpawned(_)
+            | OrgEvent::ControlKilled(_)
+            | OrgEvent::AgentSaveRequested { .. }
+            | OrgEvent::AgentSaved { .. } => {}
             OrgEvent::DecisionRequested(request) => {
                 let id = DecisionId::new(seq);
                 self.decisions

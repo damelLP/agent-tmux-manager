@@ -227,6 +227,42 @@ fn inbox_entry(body: &str) -> Value {
 }
 
 #[tokio::test]
+async fn inbox_delivery_text_is_readable_and_omits_absent_fields() {
+    for (phase, status, pane, attempt, reason, line) in [
+        ("delivered", "delivered", Some("%7"), 1, None, "delivery: delivered pane=%7 attempt=1"),
+        ("blocked", "delivering", Some("%7"), 2, Some("inspect pane"), "delivery: blocked pane=%7 attempt=2 reason=inspect pane"),
+        ("failed", "failed", None, 0, Some("agent unavailable"), "delivery: failed reason=agent unavailable"),
+        ("queued", "queued", None, 0, None, "delivery: queued"),
+        ("waiting", "queued", None, 0, Some("agent busy"), "delivery: waiting reason=agent busy"),
+        ("delivering", "delivering", None, 3, None, "delivery: delivering attempt=3"),
+        ("waiting", "queued", Some("%7\nforged"), 1, Some("inspect C:\\logs\nnext\t\u{1b}"), "delivery: waiting pane=%7\\nforged attempt=1 reason=inspect C:\\\\logs\\nnext\\t\\u{1b}"),
+        ("queued", "queued", Some("%0"), 0, Some(""), "delivery: queued pane=%0 reason="),
+    ] {
+        let mut entry = inbox_entry("original body");
+        entry["status"] = json!(status);
+        entry["delivery"] = json!({
+            "phase":phase,"pane":pane,"attempt":attempt,"reason":reason,
+            "session_id":null,"confirmation":null,"retry_at":null,"blocked_by":null,
+            "extra_delivery":{"future":null}
+        });
+        entry["extra_entry"] = json!([1, "future"]);
+        let result = json!({"messages":[entry],"unread_count":1,"next_after":null,"extra_result":true});
+        for format in ["text", "json"] {
+            let out = run(&["inbox", "--format", format], None, vec![ok("msg.inbox", inbox(), result.clone())], true).await;
+            if format == "json" {
+                assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), result);
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert_eq!(text.lines().find(|line| line.starts_with("delivery:")), Some(line));
+                assert!(text.contains(&format!(" status={status} ")), "{text}");
+                assert!(text.contains("\n  original body\n"));
+                assert!(!text.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn inbox_text_preserves_code_backslashes_newlines_and_tabs() {
     let body = "printf 'a\\nb'\nregex \\d+\nC:\\path\n\tindented\n";
     let out = run(

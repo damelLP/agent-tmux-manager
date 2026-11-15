@@ -135,7 +135,7 @@ fn output<R: Serialize>(
     }
     Ok(())
 }
-fn status_text(status: DeliveryStatus) -> Result<String> {
+fn status_text(status: impl Serialize) -> Result<String> {
     Ok(serde_json::to_value(status)?
         .as_str()
         .unwrap_or("unknown")
@@ -249,12 +249,18 @@ fn render_inbox(
                 .map(|t| t.to_rfc3339())
                 .unwrap_or_else(|| "-".into())
         )?;
-        // JSON quotes presentation metadata safely, including optional hold/retry fields.
-        writeln!(
-            out,
-            "delivery: {}",
-            escaped(&serde_json::to_string(&entry.delivery)?, false)
-        )?;
+        let delivery = &entry.delivery;
+        write!(out, "delivery: {}", status_text(delivery.phase)?)?;
+        if let Some(pane) = &delivery.pane {
+            write!(out, " pane={}", escaped(pane, false))?;
+        }
+        if delivery.attempt > 0 {
+            write!(out, " attempt={}", delivery.attempt)?;
+        }
+        if let Some(reason) = &delivery.reason {
+            write!(out, " reason={}", escaped(reason, false))?;
+        }
+        writeln!(out)?;
         if let Some(task) = &c.task {
             writeln!(out, "task: {}", escaped(&task.to_string(), false))?;
         }

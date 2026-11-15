@@ -59,8 +59,9 @@
 //! # Reviews and measures
 //!
 //! A review is a task of kind `review` that names the task it judges when it
-//! is created. `StartReview` names it and moves the judged task to
-//! `in review`. A verdict may name a review task: it must judge this task, be
+//! is created. `StartReview` names it and moves the judged task to `in review`,
+//! but refuses a review held by that task's own agent. A verdict may name a
+//! review task: it must judge this task, be
 //! `submitted` as a result, and not be handed in by this task's own agent. The
 //! verdict then writes two events, its own and the review task's `accepted`;
 //! every event changes exactly one task.
@@ -672,13 +673,22 @@ impl OrgState {
             } => {
                 let task = self.require_task(task_id)?;
                 task.authority(by, "start a review of")?;
-                if task.state == S::InReview && task.review_task.as_ref() == Some(review_task) {
-                    return Ok(vec![]);
-                }
-                if task.state != S::Submitted {
+                let again =
+                    task.state == S::InReview && task.review_task.as_ref() == Some(review_task);
+                if task.state != S::Submitted && !again {
                     return Err(task.refuse("start a review of").into());
                 }
                 let review = self.review_of(task, review_task)?;
+                if review.agent_id.is_some() && review.agent_id == task.agent_id {
+                    return Err(TaskRefusal::OwnReview {
+                        task_id: task_id.clone(),
+                        review_task: review_task.clone(),
+                    }
+                    .into());
+                }
+                if again {
+                    return Ok(vec![]);
+                }
                 if matches!(review.state, S::Accepted | S::Cancelled) {
                     return Err(review.refuse("start a review with").into());
                 }

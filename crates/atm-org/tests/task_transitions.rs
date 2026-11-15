@@ -968,6 +968,46 @@ fn rule_8_a_review_handed_in_by_the_judged_tasks_own_agent_does_not_count() {
 }
 
 #[test]
+fn probe_own_review_rule() {
+    for already_in_review in [false, true] {
+        let (mut rig, task) = handed_in(reviewed(), TaskSubmission::Result);
+        let review = rig.review_task(&task);
+        if already_in_review {
+            rig.ok(assign(&review, REVIEWER, by(LEAD)));
+            rig.ok(start_review(&task, &review, by(LEAD)));
+        }
+        rig.ok(assign(&review, BUILD, by(LEAD)));
+        rig.ok(submit(
+            &review,
+            TaskSubmission::Result,
+            "self-review.md",
+            by(BUILD),
+        ));
+        let before = rig.state.clone();
+        let log = rig.log.clone();
+        let seq = rig.seq;
+        for who in [by(LEAD), as_lead(BOSS), by("owner")] {
+            assert_eq!(
+                rig.run(start_review(&task, &review, who)),
+                Err(Refusal::Task(TaskRefusal::OwnReview {
+                    task_id: task.clone(),
+                    review_task: review.clone(),
+                }))
+            );
+            assert_eq!(rig.state, before);
+            assert_eq!(rig.log, log);
+            assert_eq!(rig.seq, seq);
+        }
+        // An independent reviewer makes the start (or repeat) valid again.
+        rig.ok(set(&review, S::Working, None, by(BUILD)));
+        rig.ok(assign(&review, REVIEWER, by(LEAD)));
+        let events = rig.ok(start_review(&task, &review, by(LEAD)));
+        assert_eq!(events.len(), usize::from(!already_in_review));
+        assert_eq!(rig.task(&task).state, S::InReview);
+    }
+}
+
+#[test]
 fn starting_a_review_needs_a_live_review_task_of_this_task() {
     let mut case = situation(Sit::SubmittedResult);
     let task = case.task.clone();

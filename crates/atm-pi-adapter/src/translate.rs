@@ -106,8 +106,30 @@ fn extract_context_usage(messages: Option<&Value>) -> (Option<u64>, Option<f64>)
 }
 
 impl RawPiEvent {
-    /// Translates this pi raw event into a vendor-neutral
-    /// `LifecycleEvent`.
+    /// Complete translation: the original event, then any derived metadata.
+    /// Only the first event is genuine activity; later events update registry
+    /// metadata without entering message-delivery evidence. Never resurrect a
+    /// shutdown or turn a suppressed primary event into a metadata-only row.
+    #[must_use]
+    pub fn to_lifecycle_events(&self) -> Vec<LifecycleEvent> {
+        let Some(event) = self.to_lifecycle_event() else {
+            return Vec::new();
+        };
+        let model = match event {
+            LifecycleEvent::SessionEnd { .. } | LifecycleEvent::ProviderModelChange { .. } => None,
+            _ => self
+                .current_model
+                .as_ref()
+                .map(|model| LifecycleEvent::ProviderModelChange {
+                    provider: model.provider.clone(),
+                    model: Some(model.id.clone()),
+                }),
+        };
+        std::iter::once(event).chain(model).collect()
+    }
+
+    /// Translates the primary event only. Use [`Self::to_lifecycle_events`]
+    /// for the complete translation, including the envelope's model snapshot.
     ///
     /// Returns `None` for events that should be suppressed (e.g.
     /// duplicate-of-`tool_call`) or that this adapter does not yet
@@ -1032,6 +1054,107 @@ mod tests {
             Some(LifecycleEvent::SessionEnd {
                 reason: Some("quit".into())
             })
+        );
+    }
+
+    #[test]
+    fn captured_startup_model_is_not_lost() {
+        // Captured: pi 0.73.1, 2026-10-24, private tmux TUI, pi-atm
+        // socket tap and local fake provider (see the crate docs).
+        let mut session = atm_core::SessionDomain::new(
+            atm_core::SessionId::new("captured"),
+            atm_core::AgentType::GeneralPurpose,
+            atm_core::Model::Unknown,
+        );
+        let mut prompt_costs = Vec::new();
+        for line in include_str!("../tests/fixtures/pi_session_cost_0.73.1.jsonl").lines() {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            let raw = frame(envelope["data"].clone());
+            assert_ne!(raw.event, PiEventType::ModelSelect);
+            for event in raw.to_lifecycle_events() {
+                session.apply_lifecycle_event(&event);
+            }
+            assert_eq!(atm_core::SessionView::from_domain(&session).model, "fake-b");
+            match raw.event {
+                PiEventType::SessionStart
+                | PiEventType::AgentEnd
+                | PiEventType::SessionShutdown => {
+                    assert_eq!(session.status, atm_core::SessionStatus::Idle);
+                }
+                _ => assert_eq!(session.status, atm_core::SessionStatus::Working),
+            }
+            if raw.event == PiEventType::AgentEnd {
+                prompt_costs.push(session.cost.as_microdollars());
+            }
+        }
+        assert_eq!(prompt_costs, [6_975, 10_650]);
+    }
+
+    #[test]
+    fn complete_mapping_preserves_primary_without_usable_model() {
+        // Synthetic: absent/malformed snapshot mutations of startup.
+        for model in [
+            Value::Null,
+            serde_json::json!({"provider": "atmfake"}),
+            serde_json::json!([]),
+        ] {
+            let event = frame(serde_json::json!({
+                "event": "session_start", "payload": {"reason": "startup"}, "model": model,
+            }));
+            assert_eq!(
+                event.to_lifecycle_events(),
+                [LifecycleEvent::SessionStart {
+                    source: Some("startup".into()),
+                }]
+            );
+        }
+        assert_eq!(
+            raw(PiEventType::AgentEnd, PiPayload::default()).to_lifecycle_events(),
+            [LifecycleEvent::WorkingEnd]
+        );
+    }
+
+    #[test]
+    fn complete_mapping_never_revives_shutdown_or_suppressed_events() {
+        // Synthetic: snapshots on suppressed and malformed primary events
+        // must not create registry rows or evidence by themselves.
+        for name in [
+            "tool_execution_start",
+            "tool_result",
+            "message_update",
+            "future_event",
+            "tool_call",
+        ] {
+            let event = frame(serde_json::json!({
+                "event": name, "model": model_snapshot("fake-b", 32_000),
+            }));
+            assert!(event.to_lifecycle_events().is_empty(), "{name}");
+        }
+        let event = frame(serde_json::json!({
+            "event": "session_shutdown", "payload": {"reason": "quit"},
+            "model": model_snapshot("fake-b", 32_000),
+        }));
+        assert_eq!(
+            event.to_lifecycle_events(),
+            [LifecycleEvent::SessionEnd {
+                reason: Some("quit".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn complete_mapping_model_select_payload_wins_over_snapshot() {
+        // Synthetic: a conflicting envelope must not undo explicit selection.
+        let event = frame(serde_json::json!({
+            "event": "model_select", "payload": {"model": model_snapshot("fake-b", 32_000)},
+            "model": model_snapshot("fake-a", 128_000),
+        }));
+        assert_eq!(
+            event.to_lifecycle_events(),
+            [LifecycleEvent::ProviderModelChange {
+                provider: Some("atmfake".into()),
+                model: Some("fake-b".into()),
+            }]
         );
     }
 

@@ -992,10 +992,10 @@ where
             "Processing pi event"
         );
 
-        // Pi adapter intentionally returns None for events it suppresses
-        // (e.g. tool_execution_start/tool_result paired duplicates) and
-        // for high-frequency internal events. Skip those silently.
-        let lifecycle = match raw_event.to_lifecycle_event() {
+        // The first event is genuine activity; any following events are
+        // derived metadata. Suppressed primary events yield no batch.
+        let mut events = raw_event.to_lifecycle_events().into_iter();
+        let lifecycle = match events.next() {
             Some(le) => le,
             None => {
                 debug!(event = %raw_event.event, "pi event suppressed by adapter");
@@ -1022,14 +1022,28 @@ where
         };
 
         self.apply_message_lifecycle(
-            session_id,
+            session_id.clone(),
             lifecycle,
             atm_core::Harness::Pi,
             raw_event.pid,
-            raw_event.tmux_pane,
+            raw_event.tmux_pane.clone(),
             Default::default(),
         )
         .await?;
+        // Like Codex's derived metadata: no second activity tap or parent
+        // snapshot for a model learned from the same incoming frame.
+        for metadata in events {
+            self.registry
+                .apply_lifecycle_event(
+                    session_id.clone(),
+                    metadata,
+                    atm_core::Harness::Pi,
+                    raw_event.pid,
+                    raw_event.tmux_pane.clone(),
+                )
+                .await
+                .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -2234,6 +2248,128 @@ mod tests {
         assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
         drop(handler);
         actor.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn message_evidence_pi_derived_model_is_not_activity() {
+        use crate::org::message_history::{
+            HistoryUpdate, MessageHistoryHandle, PanePresence, RecipientObservation,
+            SessionObservation,
+        };
+        use atm_core::{Harness, LifecycleEvent, SessionStatus};
+        use atm_org::OrgEvent;
+        let (handler, evidence) = evidence_handler(Harness::Pi).await;
+        let base = evidence.clock().now().unwrap();
+        let worker = "demo/worker".parse().unwrap();
+        let history =
+            MessageHistoryHandle::new(3, base, atm_org::delivery::DeliveryPolicy::default())
+                .unwrap();
+        let events = [
+            OrgEvent::ProjectRegistered {
+                project_id: "demo".parse().unwrap(),
+                root: "/demo".into(),
+            },
+            OrgEvent::AgentAdopted {
+                agent_id: worker,
+                pane: "%7".into(),
+                session_id: Some("evidence-session".into()),
+            },
+            OrgEvent::MessageSent(atm_org::MessageContent {
+                from: atm_org::Address::Owner,
+                to: atm_org::Address::Agent("demo/worker".parse().unwrap()),
+                kind: atm_org::MessageKind::Note,
+                body: "brief".into(),
+                attachments: vec![],
+                task: None,
+            }),
+        ];
+        for (seq, event) in (1..).zip(events) {
+            history
+                .record(
+                    HistoryUpdate::Applied {
+                        seq,
+                        at: base,
+                        event: Some(event),
+                    },
+                    base,
+                )
+                .unwrap();
+        }
+        history
+            .record(
+                HistoryUpdate::Observed {
+                    recipient: "demo/worker".parse().unwrap(),
+                    observation: RecipientObservation {
+                        pane: Some(crate::control::reservation::PaneId::parse("%7").unwrap()),
+                        session: Some(SessionObservation {
+                            id: "evidence-session".into(),
+                            harness: Harness::Pi,
+                            status: SessionStatus::Working,
+                            last_event_at: Some(base - chrono::TimeDelta::seconds(100)),
+                        }),
+                        presence: PanePresence::Alive,
+                        facts: atm_core::ScreenFacts::default(),
+                        copy_mode: Some(false),
+                        focused: Some(false),
+                    },
+                },
+                base,
+            )
+            .unwrap();
+        let mut handler =
+            handler.with_message_evidence(Some(evidence.clone()), Some(history.clone()));
+        let row = handler
+            .registry
+            .get_session("evidence-session".into())
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        handler.registry = RegistryHandle::new(sender, events);
+        let actor = tokio::spawn(async move {
+            let mut applied = Vec::new();
+            let mut snapshots = 0;
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    crate::registry::RegistryCommand::ApplyLifecycleEvent {
+                        event,
+                        respond_to,
+                        ..
+                    } => {
+                        if matches!(event, LifecycleEvent::ProviderModelChange { .. }) {
+                            // Metadata is later than the actual receive. If tapped,
+                            // it would replace the genuine activity timestamp.
+                            tokio::time::advance(Duration::from_secs(1)).await;
+                        }
+                        applied.push(event);
+                        respond_to.send(Ok(())).unwrap();
+                    }
+                    crate::registry::RegistryCommand::GetAllSessions { respond_to } => {
+                        snapshots += 1;
+                        respond_to.send(vec![row.clone()]).unwrap();
+                    }
+                    _ => panic!("unexpected registry operation"),
+                }
+            }
+            (applied, snapshots)
+        });
+        // Captured pi 0.73.1 prompt with synthetic test attribution; helper
+        // provenance above. Its envelope already includes fake-b.
+        handler
+            .handle_pi_event(captured_prompt(Harness::Pi))
+            .await
+            .unwrap();
+        let snapshot = history
+            .snapshot("m3".parse().unwrap(), evidence.clock().now().unwrap())
+            .unwrap();
+        assert_eq!(snapshot.live.session.unwrap().last_event_at, base);
+        assert!(evidence.receipt("m123".parse().unwrap()).unwrap().is_some());
+        drop(handler);
+        let (applied, snapshots) = actor.await.unwrap();
+        assert!(
+            matches!(applied.as_slice(), [LifecycleEvent::PromptSubmit { .. }, LifecycleEvent::ProviderModelChange { model: Some(id), .. }] if id == "fake-b")
+        );
+        assert_eq!(snapshots, 1, "only the genuine event needs a parent proof");
     }
 
     #[tokio::test]

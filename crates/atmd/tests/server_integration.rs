@@ -2258,21 +2258,48 @@ async fn test_e2e_pi_captured_session_cost_is_cumulative() {
     assert_eq!(last["event"], "session_shutdown");
 
     let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut updates = registry.subscribe();
     let mut client = server.connect().await;
     client.handshake(None).await;
-    for event in rest {
-        client.send(ClientMessage::pi_event(event.clone())).await;
-    }
+    timeout(Duration::from_secs(60), async {
+        for event in rest {
+            client.send(ClientMessage::pi_event(event.clone())).await;
+        }
+        // The same connection handles frames in order: Pong is a barrier
+        // after every lifecycle and derived metadata apply, not a delay.
+        client.send(ClientMessage::ping(1)).await;
+        assert!(matches!(
+            client.recv().await,
+            DaemonMessage::Pong { seq: 1, .. }
+        ));
+    })
+    .await
+    .expect("captured pi frames applied");
 
-    let done = |s: &[SessionView]| matches!(s, [one] if one.cost_usd == 0.01065);
-    let sessions = sessions_when(&registry, done).await;
-    let shown: Vec<(f64, &str)> = sessions
+    let sessions = registry.get_all_sessions().await;
+    let shown: Vec<(&str, f64, &str)> = sessions
         .iter()
-        .map(|s| (s.cost_usd, s.context_display.as_str()))
+        .map(|s| (s.model.as_str(), s.cost_usd, s.context_display.as_str()))
         .collect();
-    assert_eq!(shown, [(0.01065, "3.8% (1.2K/32K)")]);
+    assert_eq!(shown, [("fake-b", 0.01065, "3.8% (1.2K/32K)")]);
+    let mut idle_costs = Vec::new();
+    while let Ok(event) = updates.try_recv() {
+        if let atmd::registry::SessionEvent::Updated { session } = event {
+            if session.status == atm_core::SessionStatus::Idle && session.cost_usd > 0.0 {
+                assert_eq!(session.model, "fake-b");
+                if idle_costs.last() != Some(&session.cost_usd) {
+                    idle_costs.push(session.cost_usd);
+                }
+            }
+        }
+    }
+    assert_eq!(idle_costs, [0.006975, 0.01065]);
 
-    server.shutdown().await;
+    server.cancel_token.cancel();
+    timeout(Duration::from_secs(60), server.run_task)
+        .await
+        .expect("server stops")
+        .unwrap();
 }
 
 // ============================================================================

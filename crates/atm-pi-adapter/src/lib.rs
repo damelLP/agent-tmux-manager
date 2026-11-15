@@ -39,6 +39,9 @@
 //! - **model** = `claude-sonnet-4-6` / `gpt-5.5` / etc.
 //!
 //! Provider+model changes ride [`atm_core::LifecycleEvent::ProviderModelChange`].
+//! The complete translation (`RawPiEvent::to_lifecycle_events`) also forwards
+//! the envelope's current model after the original event, so startup/resume
+//! needs no `model_select`. Derived metadata is not message activity.
 //! atm-core keeps only the model: `SessionDomain` has no provider.
 //!
 //! ## NeedsInput is extension-mediated
@@ -135,10 +138,8 @@
 //!
 //! - `model_select` fires only when the user changes model: pi's source
 //!   emits it for `set` and `cycle`, never for the declared `restore`.
-//!   A fresh or resumed session sends none, so its model shows as
-//!   unknown until the user switches. pi-atm's envelope snapshot of
-//!   `ctx.model` holds the startup model, but the adapter reads only its
-//!   context window.
+//!   The complete translation uses pi-atm's envelope snapshot instead;
+//!   older pi-atm without that snapshot still needs a model switch.
 //! - The context window comes from that snapshot, on `context` events.
 //!   pi-atm before the snapshot sends none, so context percentages use
 //!   the unknown model's 200K default until the user re-runs `atm setup`.
@@ -156,9 +157,9 @@
 //!   $0.003675, where the footer showed `$0.007` and `$0.011`.
 //! - After `/resume`, `/fork` or `/reload`, the new row shows $0 until the
 //!   next prompt's first `context` frame, while pi's footer shows the
-//!   session file's total at once. It shares a cause with the
-//!   `model_select` gap above: one pi event maps to one `LifecycleEvent`,
-//!   so `session_start` can't also carry the usage or the model.
+//!   session file's total at once. Unlike the model, usage is not
+//!   snapshotted on `session_start`, so even the complete translation
+//!   cannot restore the cost from that frame.
 //!   Unverified: read, not run.
 //! - Compaction and branch-summary calls aren't counted. pi's footer
 //!   doesn't count them either, since they aren't assistant messages.
@@ -194,9 +195,10 @@
 //!   `session_shutdown` comes from the old instance and `session_start`
 //!   from the new one on a new connection. atmd ends the old row and
 //!   starts a new one. That includes `/reload`, which keeps the id, so
-//!   the row's model and cost reset (fake-b at $0.0033 became Unknown at
-//!   $0). The old instance's connection stays open until atmd closes it
-//!   after 300 s idle. Over rpc, `new_session` and `clone` fired
+//!   the row's cost resets (the original check went from fake-b at
+//!   $0.0033 to Unknown at $0; complete translation now restores the
+//!   model from the snapshot). The old instance's connection stays open
+//!   until atmd closes it after 300 s idle. Over rpc, `new_session` and `clone` fired
 //!   `session_start` twice; the TUI's `/new` fired it once.
 //! - atmd renames a row from `pending-<pid>` to a real id on any event.
 //!   A `session_start` with another real id ends the session the pid's row

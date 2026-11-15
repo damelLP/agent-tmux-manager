@@ -31,7 +31,7 @@ impl Rig {
         for command in [
             OrgCommand::RegisterProject {
                 project_id: "project".parse().unwrap(),
-                root: "/project".into(),
+                root: dir.path().to_str().unwrap().into(),
                 move_root: false,
             },
             OrgCommand::Adopt {

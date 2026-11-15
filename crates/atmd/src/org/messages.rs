@@ -57,6 +57,7 @@ pub use super::message_methods::register_message_methods;
 use super::message_scheduler::{self, Board, Effects, Resolution, Resolve};
 pub use super::message_types::*;
 use super::{
+    agents::AgentHandle,
     message_delivery::{inbox_reference, MESSAGE_RESOLUTION_BUDGET},
     message_evidence::{AttemptScope, MessageEvidence},
     message_history::MessageHistoryHandle,
@@ -169,6 +170,9 @@ pub struct MessageRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
+    /// What is recorded about a recipient's pane lives in the agent service's
+    /// memory: the executor and the observer read a recipient through it.
+    pub agents: AgentHandle,
     pub evidence: MessageEvidence,
     pub history: MessageHistoryHandle,
     pub policy: DeliveryPolicy,
@@ -181,11 +185,14 @@ pub struct MessageRuntime {
 
 impl MessageRuntime {
     /// Pure dependency assembly; no tasks, observations, writes or input effects.
+    // One argument per shared daemon service: they have no common owner to bundle.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         org: OrgHandle,
         registry: RegistryHandle,
         control: ControlHandle,
+        agents: AgentHandle,
         evidence: MessageEvidence,
         history: MessageHistoryHandle,
         policy: DeliveryPolicy,
@@ -196,6 +203,7 @@ impl MessageRuntime {
             org,
             registry,
             control,
+            agents,
             evidence,
             history,
             policy,
@@ -723,12 +731,13 @@ pub fn spawn_messages(
     runtime: MessageRuntime,
     startup_high_water: u64,
 ) -> (MessageHandle, JoinHandle<()>) {
+    let effects = Effects::production(&runtime);
     match runtime.org.watch(Vec::new(), 0) {
         Ok(events) => spawn_service(
             runtime,
             Events::Watch(Box::new(events)),
             startup_high_water,
-            Some(Effects::production()),
+            Some(effects),
         ),
         Err(error) => (
             MessageHandle::disabled(error.to_string()),

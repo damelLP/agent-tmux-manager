@@ -116,6 +116,7 @@ pub(super) fn runtime(
         org,
         registry,
         control,
+        super::agents::AgentHandle::disabled("no agent service in this rig"),
         MessageEvidence::new(clock),
         history,
         policy,

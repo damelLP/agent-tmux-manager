@@ -444,11 +444,10 @@ fn owner_retry_same_id_keeps_fifo() {
 /// The head's Enter lands and its hook is lost, so the old daemon's attempt
 /// has ended in a hold before that daemon is stopped.
 ///
-/// At this head a restarted daemon records no baseline for the adopted agent
-/// and cannot paste. The post-restart no-input, no-attempt and queued-follower
-/// checks therefore cannot detect a removed restart hold; the restart-notice
-/// assertion is the one that catches it. Recheck those input checks when the
-/// observer pins a baseline after restart, without re-adopting in this test.
+/// The restart-notice assertion catches a removed restart hold. The checks
+/// after restart are no longer vacuous: removing the hold produced a
+/// `msg.delivery_failed` event. However, the test stops at the notice wait
+/// before reaching those checks under that mutation.
 #[test]
 fn restart_queued_and_delivering_hold() {
     let mut rig = MessageRig::start(Confirmation::Default);

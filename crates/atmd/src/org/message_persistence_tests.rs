@@ -333,3 +333,172 @@ async fn unavailable_organisation_gives_a_disabled_service_with_its_cause() {
     }
     cancel.cancel();
 }
+
+fn summary(session: &str, agent: &AgentId) -> OrgCommand {
+    OrgCommand::RecordSummary(atm_org::SessionSummary {
+        session_id: session.into(),
+        pane: Some("%1".into()),
+        agent_id: Some(agent.clone()),
+        harness: atm_core::Harness::Pi,
+        model: None,
+        cost: None,
+        first_prompt: None,
+        started: utc(),
+        ended: None,
+    })
+}
+
+impl Process {
+    /// The message's exact reference, submitted in this session on %1, as
+    /// the connection tap hands a proven parent event to evidence.
+    fn reference(&self, id: MessageId, session: &str) {
+        let event = atm_core::LifecycleEvent::PromptSubmit {
+            prompt: Some(super::message_delivery::inbox_reference(id)),
+        };
+        (self.rt.evidence)
+            .tap(
+                &session.into(),
+                Some("%1"),
+                Some(atm_core::Harness::Pi),
+                Some(&event),
+                true,
+                Some(&self.rt.history),
+            )
+            .unwrap();
+    }
+
+    /// Wait on the log's own watch until the message is committed delivered.
+    async fn delivered(&self, id: MessageId) {
+        let mut events = self.org.watch(Vec::new(), 0).unwrap();
+        loop {
+            let envelope = guarded(events.next()).await.unwrap().unwrap();
+            let event = atm_org::OrgEvent::from_parts(&envelope.kind, &envelope.body).unwrap();
+            if matches!(event, Some(atm_org::OrgEvent::MessageDelivered { message_id, .. }) if message_id == id)
+            {
+                guarded(self.rt.history.folded(envelope.seq)).await.unwrap();
+                return;
+            }
+        }
+    }
+
+    async fn project(&self) -> AgentId {
+        self.run(OrgCommand::RegisterProject {
+            project_id: "demo".parse().unwrap(),
+            root: "/demo".into(),
+            move_root: false,
+        })
+        .await;
+        "demo/worker".parse().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn startup_reconstructs_bound_attempt_not_current_occupant() {
+    let before = tempfile::tempdir().unwrap();
+    let first = Process::start(before.path()).await;
+    let worker = first.project().await;
+    let adopt = |session: &str| OrgCommand::Adopt {
+        agent_id: worker.clone(),
+        pane: "%1".into(),
+        session_id: Some(session.into()),
+    };
+    first.run(adopt("s1")).await;
+    first.run(summary("s1", &worker)).await;
+    let id = first
+        .send(None, Address::Agent(worker.clone()), "brief")
+        .await;
+    first
+        .run(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: "%1".into(),
+        })
+        .await;
+    // After the attempt the agent comes back on the same pane in another
+    // session: today's occupant is not the session that was pasted into.
+    first
+        .run(OrgCommand::Down {
+            agent_id: worker.clone(),
+            reason: "restarted".into(),
+        })
+        .await;
+    first.run(adopt("s2")).await;
+    first.run(summary("s2", &worker)).await;
+
+    let after = tempfile::tempdir().unwrap();
+    copy_log(before.path(), after.path());
+    let second = Process::start(after.path()).await;
+    // Held for the owner, as every attempt of a previous process is.
+    second.notice().await;
+    assert_eq!(
+        second.step(id),
+        DeliveryStep::Blocked {
+            reason: FailureReason::Restarted
+        }
+    );
+    // The occupant submits the reference: not the attempted session, so it
+    // confirms nothing.
+    second.reference(id, "s2");
+    assert!(second.rt.evidence.receipt(id).unwrap().is_none());
+    // The attempted session's own receipt arrives late: it confirms, and the
+    // scheduler persists it without any retry.
+    second.reference(id, "s1");
+    second.delivered(id).await;
+    let entry = second.inbox(Some("%1")).await.messages.remove(0);
+    assert_eq!(entry.status, DeliveryStatus::Delivered);
+    assert_eq!(entry.delivery.attempt, 1);
+    assert_eq!(entry.delivery.session_id, Some("s1".into()));
+}
+
+#[tokio::test]
+async fn ambiguous_lazy_replay_stays_restarted() {
+    let before = tempfile::tempdir().unwrap();
+    let first = Process::start(before.path()).await;
+    let worker = first.project().await;
+    // Attempted while the agent had a pane and no session yet: a lazy first
+    // prompt. The session it then bound says nothing certain about the paste.
+    first
+        .run(OrgCommand::Adopt {
+            agent_id: worker.clone(),
+            pane: "%1".into(),
+            session_id: None,
+        })
+        .await;
+    let id = first
+        .send(None, Address::Agent(worker.clone()), "brief")
+        .await;
+    first
+        .run(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: "%1".into(),
+        })
+        .await;
+    first
+        .run(OrgCommand::SessionBound {
+            agent_id: worker.clone(),
+            session_id: "s1".into(),
+        })
+        .await;
+    first.run(summary("s1", &worker)).await;
+
+    let after = tempfile::tempdir().unwrap();
+    copy_log(before.path(), after.path());
+    let second = Process::start(after.path()).await;
+    second.notice().await;
+    // No scope was rebuilt, so no row can confirm it, whatever it submits.
+    second.reference(id, "s1");
+    let facts = second.rt.evidence.snapshot(id).unwrap();
+    assert!(facts.receipt.is_none());
+    assert!(!facts.probably_landed);
+    assert_eq!(
+        second.step(id),
+        DeliveryStep::Blocked {
+            reason: FailureReason::Restarted
+        }
+    );
+    assert_eq!(
+        second.inbox(Some("%1")).await.messages[0].status,
+        DeliveryStatus::Delivering
+    );
+}

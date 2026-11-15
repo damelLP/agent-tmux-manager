@@ -58,7 +58,7 @@ use super::message_scheduler::{self, Board, Effects, Resolution, Resolve};
 pub use super::message_types::*;
 use super::{
     message_delivery::{inbox_reference, MESSAGE_RESOLUTION_BUDGET},
-    message_evidence::MessageEvidence,
+    message_evidence::{AttemptScope, MessageEvidence},
     message_history::MessageHistoryHandle,
     EventWatch, OrgHandle, OrgServiceError,
 };
@@ -296,6 +296,22 @@ struct View {
     /// Per recipient, in FIFO order: its queued and delivering messages. Kept
     /// at the fold, so the scheduler never scans the log's messages.
     open: BTreeMap<AgentId, BTreeSet<MessageId>>,
+    /// Startup replay only: for each message, where its last attempt went,
+    /// read from the agent's binding as it was at that attempt. Emptied when
+    /// the replay completes.
+    replayed: BTreeMap<MessageId, ReplayedAttempt>,
+}
+
+/// The attempted pane and the session the recipient was bound to then.
+#[derive(Debug)]
+struct ReplayedAttempt {
+    attempt_seq: u64,
+    recipient: AgentId,
+    pane: String,
+    /// None: the agent held another pane or no session at that attempt (a
+    /// lazy first prompt). Such an attempt cannot be told from a later
+    /// occupant's activity, so nothing may confirm it.
+    session: Option<atm_core::SessionId>,
 }
 
 impl View {
@@ -318,6 +334,56 @@ impl View {
                 self.open.remove(recipient);
             }
         }
+    }
+}
+
+impl View {
+    /// During the startup replay, remember where a message's last attempt
+    /// went. The state is exactly as it was at that attempt, so the binding
+    /// read here is the attempt's own, not today's occupant of the pane.
+    fn replay_attempt(&mut self, seq: u64, event: &OrgEvent) {
+        match event {
+            OrgEvent::MessageDeliveryAttempted {
+                message_id, pane, ..
+            } => {
+                let Some(Address::Agent(recipient)) =
+                    (self.state.message(message_id)).map(|message| &message.content.to)
+                else {
+                    return;
+                };
+                let session = (self.state.agent(recipient))
+                    .filter(|agent| agent.pane.as_ref() == Some(pane))
+                    .and_then(|agent| agent.session_id.clone());
+                let attempt = ReplayedAttempt {
+                    attempt_seq: seq,
+                    recipient: recipient.clone(),
+                    pane: pane.clone(),
+                    session,
+                };
+                self.replayed.insert(*message_id, attempt);
+            }
+            OrgEvent::MessageDelivered { message_id, .. } => {
+                self.replayed.remove(message_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// The scope of a replayed attempt, if it is unambiguous: the recipient
+    /// was bound to a session on the attempted pane, and that session's
+    /// harness is on record. Anything less stays without a scope, so only the
+    /// owner can resolve it.
+    fn replayed_scope(&self, id: MessageId, attempt: ReplayedAttempt) -> Option<AttemptScope> {
+        let session = attempt.session?;
+        Some(AttemptScope {
+            message_id: id,
+            attempt_seq: attempt.attempt_seq,
+            recipient: attempt.recipient,
+            pane: PaneId::parse(&attempt.pane).ok()?,
+            harness: self.state.session_summary(&session)?.harness,
+            session_id: Some(session),
+            excluded_sessions: Default::default(),
+        })
     }
 }
 
@@ -525,6 +591,9 @@ impl Service {
                 | OrgEvent::MessageDeliveryFailed { message_id, .. } => view.index(*message_id),
                 _ => {}
             }
+            if *self.startup.borrow() == Startup::Replaying {
+                view.replay_attempt(envelope.seq, event);
+            }
         }
         view.cursor = envelope.seq;
         drop(view);
@@ -559,15 +628,27 @@ impl Service {
     }
 
     /// The startup replay reached its fence: undelivered agent messages
-    /// become known to evidence, and requests are admitted.
+    /// become known to evidence, and requests are admitted. An attempt of the
+    /// previous process stays held for the owner (history's restart rule),
+    /// but where its scope is unambiguous evidence expects it again, so a
+    /// receipt that arrives late still confirms it instead of a retry
+    /// pasting it twice.
     fn replayed(&self) -> Result<(), MessageError> {
         if *self.startup.borrow() != Startup::Replaying {
             return Ok(());
         }
-        let view = self.view()?;
+        let mut view = self.view()?;
         for message in view.state.messages() {
             if message.status != DeliveryStatus::Delivered {
                 self.expect(message.id, &message.content.to);
+            }
+        }
+        for (id, attempt) in std::mem::take(&mut view.replayed) {
+            let Some(scope) = view.replayed_scope(id, attempt) else {
+                continue;
+            };
+            if let Err(error) = self.rt.evidence.arm(scope) {
+                tracing::warn!(%id, %error, "Replayed attempt stays unconfirmable: evidence refused its scope");
             }
         }
         drop(view);

@@ -4430,6 +4430,61 @@ async fn a_start_line_is_typed_and_confirmed_as_its_own_text() {
     );
 }
 
+/// Synthetic: narrow editor frames using the adapters' recognized chrome,
+/// with ASCII start text wrapped at the pane edge. These are matcher/guard
+/// boundary checks, not captures of the harnesses' own wrapping algorithms.
+/// Break caught: a wrapped draft authorizes Enter without an exact staged match.
+#[test]
+fn wrapped_start_lines_do_not_authorize_enter() {
+    use crate::org::agent_screen_tests::capture as shot_of;
+    let reference = crate::org::start_line::start_reference(MessageId::new(123));
+    assert_eq!(reference.len(), 48);
+    for (harness, command, columns, wrapped) in [
+        (Harness::ClaudeCode, "claude", 50_u16, false),
+        (Harness::ClaudeCode, "claude", 49, true),
+        (Harness::ClaudeCode, "claude", 40, true),
+        (Harness::Pi, "pi", 48, false),
+        (Harness::Pi, "pi", 47, true),
+        (Harness::Pi, "pi", 40, true),
+    ] {
+        let prefix = if harness == Harness::ClaudeCode {
+            "❯\u{a0}"
+        } else {
+            ""
+        };
+        let first_row = usize::from(columns) - prefix.chars().count();
+        let (first, rest) = reference.split_at(reference.len().min(first_row));
+        let continuation = if rest.is_empty() {
+            String::new()
+        } else {
+            format!("\n{rest}")
+        };
+        let rule = "─".repeat(usize::from(columns));
+        let editor = format!("{rule}\n{prefix}{first}{continuation}\n{rule}\n");
+        let text = match harness {
+            Harness::ClaudeCode => format!(
+                "✻ Worked for 1s · done 1 tool\n{editor}  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+            ),
+            _ => format!("{editor}/project\n0.0%/272k\n"),
+        };
+        let mut capture =
+            shot_of(&text, CaptureFormat::Ansi, Some(100), Some(command)).with_focus(Some(false));
+        capture.inspection.pane.width = columns;
+        let screen = agent_screen(harness).unwrap();
+        let baseline = PaneBaseline::adopted(100)
+            .with_harness(command.into())
+            .unwrap();
+        let facts = guard_facts(GuardedInput::Enter, &capture, screen, &baseline, &reference);
+        let case = format!("{command}, {columns} columns, wrapped: {wrapped}");
+        assert_eq!(facts.screen.input, InputState::Draft, "{case}");
+        assert_eq!(facts.screen.turn, TurnState::NotRunning, "{case}");
+        assert_eq!(facts.control_dialog, ControlDialog::None, "{case}");
+        assert_eq!(facts.staged, (!wrapped).then_some(true), "{case}");
+        assert_eq!(guard_allows_input(&facts), !wrapped, "{case}");
+        eprintln!("{case}; staged: {:?}; Enter: {}", facts.staged, !wrapped);
+    }
+}
+
 /// The draft must match the start line's own text: the inbox reference in
 /// its place gets no Enter, and the attempt is held for the owner.
 #[tokio::test(start_paused = true)]

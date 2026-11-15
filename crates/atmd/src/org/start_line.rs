@@ -22,6 +22,11 @@
 //!   one until he retries or gives up, and giving up queues no replacement.
 //! - Nobody acknowledges a start line: it stays unread in `atm inbox`. `atm me`
 //!   does not list it.
+//! - The Claude and pi matchers refuse wrapped staged drafts: no Enter or automatic
+//!   confirmation; a pasted line stays in the editor for inspection. For `m123`
+//!   the start text is 48 columns: synthetic edge-wrap checks fail below 50 pane
+//!   columns for Claude's two-column prompt and 48 for pi. Each extra ID digit
+//!   needs another column. Real-harness wrapping boundaries are unverified.
 //! - An agent that goes down or stuck before its line is delivered (a respawn
 //!   records it down for a moment, so it can too) leaves the line blocked: the
 //!   owner gets a "blocked: recipient agent is stuck or down" notice, and his

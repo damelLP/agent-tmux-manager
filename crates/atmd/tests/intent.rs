@@ -217,6 +217,38 @@ async fn no_registered_project_preserves_legacy_creation_but_bad_roots_are_refus
     cancel.cancel();
 }
 
+// Break caught: treating a missing/stale registered checkout as absent policy.
+#[tokio::test]
+async fn missing_project_roots_refuse_instead_of_skipping_policy() {
+    for had_policy in [false, true] {
+        let rig = Rig::new().await;
+        let root = rig.dir.path().join("first");
+        if had_policy {
+            rig.intent("first", "## How we will know\n- owner\n");
+            fs::rename(&root, rig.dir.path().join("moved")).unwrap();
+        } else {
+            fs::remove_dir(&root).unwrap();
+        }
+        let before = rig.org.snapshot().await.unwrap();
+        let cursor = rig.org.status().unwrap();
+        let error = rig
+            .create(
+                Some("%7"),
+                params(json!({"kind":"mechanical","command":"unlisted-check"})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "refused", "{error:?}");
+        assert!(
+            error.0.message.contains("project root missing"),
+            "{error:?}"
+        );
+        assert_eq!(rig.org.snapshot().await.unwrap(), before);
+        assert_eq!(rig.org.status().unwrap(), cursor);
+        assert!(!root.exists());
+    }
+}
+
 // Break caught: unbounded reads or policy bytes silently decoded/replaced on invalid UTF-8.
 #[tokio::test]
 async fn invalid_utf8_oversized_and_nonregular_policy_files_are_refused() {

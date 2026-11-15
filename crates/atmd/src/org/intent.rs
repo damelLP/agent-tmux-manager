@@ -114,7 +114,7 @@ pub(super) fn file_error(path: &Path, error: io::Error) -> AgentError {
     AgentError::Internal(format!("{}: {error}", path.display()))
 }
 
-/// Only a genuinely missing file/directory means absent policy. Do not follow
+/// Only missing policy under an existing project means absent policy. Do not follow
 /// static symlinks; nonblocking/no-follow open also rejects a final-file swap to
 /// a FIFO or link. These same-user checks are not a filesystem sandbox.
 pub(super) fn read_policy(
@@ -125,7 +125,12 @@ pub(super) fn read_policy(
     let dir = root.join(".atm");
     for (path, directory) in [(&dir, true), (&dir.join(name), false)] {
         match fs::symlink_metadata(path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if directory && !fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+                    return Err(refused(root, "project root missing"));
+                }
+                return Ok(None);
+            }
             Err(e) => return Err(file_error(path, e)),
             Ok(metadata)
                 if if directory {

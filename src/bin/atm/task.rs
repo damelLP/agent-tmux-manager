@@ -34,6 +34,7 @@ pub enum TaskAction {
     /// Create an open task; structured flags take the existing method JSON objects
     Create {
         title: String,
+        /// Task kind: work, review, plan, errand, drift_check
         #[arg(long, default_value = "work", value_parser = parse_word::<TaskKind>)]
         kind: TaskKind,
         #[arg(long, value_parser = parse_task)]
@@ -44,10 +45,10 @@ pub enum TaskAction {
         #[arg(long, value_parser = parse_json::<TaskMeasure>)]
         measure: TaskMeasure,
         /// JSON with optional cost {"microdollars":N}, turns and RFC3339 deadline
-        #[arg(long, value_parser = parse_json::<TaskBudget>)]
+        #[arg(long, value_parser = parse_strict_json::<TaskBudget>)]
         budget: Option<TaskBudget>,
         /// Repeatable JSON: {"path":"file","kind":"brief","note":null}
-        #[arg(long = "file", value_parser = parse_json::<TaskFile>)]
+        #[arg(long = "file", value_parser = parse_strict_json::<TaskFile>)]
         files: Vec<TaskFile>,
         #[arg(long)]
         rests_on: Option<DecisionId>,
@@ -62,6 +63,7 @@ pub enum TaskAction {
     SetState {
         #[arg(value_parser = parse_task)]
         task_id: TaskId,
+        /// State: open, working, waiting, blocked, cancelled
         #[arg(value_parser = parse_word::<TaskState>)]
         state: TaskState,
         #[arg(long)]
@@ -71,10 +73,11 @@ pub enum TaskAction {
     Submit {
         #[arg(value_parser = parse_task)]
         task_id: TaskId,
+        /// Submission kind: plan, result
         #[arg(long, default_value = "result", value_parser = parse_word::<TaskSubmission>)]
         what: TaskSubmission,
         /// Repeatable JSON: {"path":"file","kind":"report","note":null}
-        #[arg(long = "file", value_parser = parse_json::<TaskFile>)]
+        #[arg(long = "file", value_parser = parse_strict_json::<TaskFile>)]
         files: Vec<TaskFile>,
     },
     /// Attach a literal path; does not read the file
@@ -82,6 +85,7 @@ pub enum TaskAction {
         #[arg(value_parser = parse_task)]
         task_id: TaskId,
         path: String,
+        /// File kind: brief, report, evidence, plan, contract
         #[arg(long, value_parser = parse_word::<TaskFileKind>)]
         kind: TaskFileKind,
         #[arg(long)]
@@ -111,8 +115,10 @@ pub enum TaskAction {
         agent_id: Option<AgentId>,
         #[arg(long)]
         creator: Option<Address>,
+        /// State: open, assigned, working, waiting, blocked, submitted, in_review, accepted, changes_requested, cancelled
         #[arg(long, value_parser = parse_word::<TaskState>)]
         state: Option<TaskState>,
+        /// Task kind: work, review, plan, errand, drift_check
         #[arg(long, value_parser = parse_word::<TaskKind>)]
         kind: Option<TaskKind>,
         #[arg(long, value_parser = parse_task)]
@@ -138,6 +144,28 @@ fn parse_task(text: &str) -> std::result::Result<TaskId, String> {
 }
 fn parse_json<T: DeserializeOwned>(text: &str) -> std::result::Result<T, String> {
     serde_json::from_str(text).map_err(|e| e.to_string())
+}
+fn parse_strict_json<T: DeserializeOwned + Serialize>(
+    text: &str,
+) -> std::result::Result<T, String> {
+    let raw: Value = parse_json(text)?;
+    let value: T = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+    check_json_keys(
+        &raw,
+        &serde_json::to_value(&value).map_err(|e| e.to_string())?,
+    )?;
+    Ok(value)
+}
+fn check_json_keys(raw: &Value, encoded: &Value) -> std::result::Result<(), String> {
+    if let Some(fields) = raw.as_object() {
+        for (key, value) in fields {
+            let known = encoded
+                .get(key)
+                .ok_or_else(|| format!("unknown JSON field {key:?}"))?;
+            check_json_keys(value, known)?;
+        }
+    }
+    Ok(())
 }
 fn parse_word<T: DeserializeOwned>(text: &str) -> std::result::Result<T, String> {
     serde_json::from_value(Value::String(text.into())).map_err(|e| e.to_string())

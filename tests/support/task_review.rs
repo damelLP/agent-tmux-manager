@@ -108,3 +108,96 @@ async fn get_details_are_single_escaped_valid_json() {
     );
     assert!(!text.contains('\u{9b}'));
 }
+
+// Break caught: serde silently discards misspelled file/budget keys before the daemon sees them.
+#[tokio::test]
+async fn file_and_budget_flags_reject_unknown_keys_before_daemon_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let create = ["task", "create", "New", "--measure", r#"{"kind":"owner"}"#];
+    for (flag, value, field) in [
+        (
+            "--file",
+            r#"{"path":"brief.md","kind":"brief","notes":"read first"}"#,
+            "notes",
+        ),
+        (
+            "--file",
+            r#"{"path":"brief.md","kind":"brief","future":1}"#,
+            "future",
+        ),
+        ("--budget", r#"{"turn":10}"#, "turn"),
+        (
+            "--budget",
+            r#"{"cost":{"microdollars":100,"currency":"usd"}}"#,
+            "currency",
+        ),
+    ] {
+        let mut args = create.to_vec();
+        args.extend([flag, value]);
+        let output = super::support::command(dir.path(), &args, None)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(field),
+            "{output:?}"
+        );
+    }
+    let output = super::support::command(
+        dir.path(),
+        &[
+            "task",
+            "submit",
+            "t6",
+            "--file",
+            r#"{"path":"report.md","kind":"report","notes":"read first"}"#,
+        ],
+        None,
+    )
+    .output()
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        !dir.path().join("fallback").exists(),
+        "no daemon startup for invalid keys"
+    );
+    assert!(!dir.path().join("rpc.sock").exists());
+    assert!(!dir.path().join("state/atmd.pid").exists());
+}
+
+// Break caught: custom enum parsers hide accepted words from users reading --help.
+#[tokio::test]
+async fn enum_help_names_the_supported_words() {
+    let dir = tempfile::tempdir().unwrap();
+    for (action, phrase) in [
+        (
+            "create",
+            "Task kind: work, review, plan, errand, drift_check",
+        ),
+        ("list", "Task kind: work, review, plan, errand, drift_check"),
+        (
+            "attach",
+            "File kind: brief, report, evidence, plan, contract",
+        ),
+        ("submit", "Submission kind: plan, result"),
+        (
+            "set-state",
+            "State: open, working, waiting, blocked, cancelled",
+        ),
+    ] {
+        let output = super::support::command(dir.path(), &["task", action, "--help"], None)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(help.contains(phrase), "{action}: {help}");
+    }
+    assert!(!dir.path().join("fallback").exists());
+}

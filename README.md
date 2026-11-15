@@ -84,7 +84,7 @@ atm send <id> "fix the tests"     # send text to agent
 atm reply <id> --yes               # accept a permission prompt
 atm peek <id> --prompt             # extract the active prompt
 atm list -f json --status working  # list working agents as JSON
-atm task list --open                # unfinished tasks; get t41 shows every field
+atm task list --open               # unfinished tasks; get t41 shows every field
 atm decisions                      # pending/provisional decisions for you
 atm decide d41 yes 'Approved'      # owner answer; --rule records a rule mark
 atm status                         # one-line summary for tmux status bar
@@ -299,7 +299,7 @@ Structured flags use the method's JSON objects, not filenames containing JSON:
 --budget '{"cost":{"microdollars":1000000},"turns":10,"deadline":"2026-12-01T00:00:00Z"}'
 ```
 
-File kinds are `brief`, `report`, `evidence`, `plan`, `contract`. Budget fields are optional; cost is an integer **microdollar object**, not floating USD, and deadlines use RFC3339. Budget data does not make this CLI stop work. File paths are literal: neither client nor daemon reads/uploads attached files or checks they exist; prefer absolute paths across worktrees. Optional notes default to null. Quote multiline arguments to retain exact text; no stdin is read automatically.
+File kinds are `brief`, `report`, `evidence`, `plan`, `contract`. Budget fields are optional; cost is an integer **microdollar object**, not floating USD, and deadlines use RFC3339. Unknown keys in `--file` and `--budget` objects (including nested cost keys) are syntax errors, refused before contacting the daemon rather than silently discarded. Budget data does not make this CLI stop work. File paths are literal: neither client nor daemon reads/uploads attached files or checks they exist; prefer absolute paths across worktrees. Optional notes default to null. Quote multiline arguments to retain exact text; no stdin is read automatically.
 
 ### Task identity and notification outcomes
 

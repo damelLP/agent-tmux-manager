@@ -30,7 +30,8 @@ use crate::{
 };
 use atm_core::{DialogState, InputState, TurnState};
 use atm_org::{
-    delivery::DeliveryPolicy, Address, AgentId, MessageContent, MessageKind, OrgCommand, OrgState,
+    delivery::DeliveryPolicy, Address, AgentId, AgentStatus, MessageContent, MessageKind,
+    OrgCommand, OrgState,
 };
 use atm_tmux::{mock::MockCall, PaneInfo, TmuxError};
 use std::sync::{
@@ -502,6 +503,92 @@ fn inbox_reference_is_one_printable_ascii_line_for_any_id() {
             reference.bytes().all(|b| (b' '..=b'~').contains(&b)),
             "{reference:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The token on the screen, and the session an attempt is confirmed against
+// ---------------------------------------------------------------------------
+
+fn shot(format: CaptureFormat, text: &str) -> PaneCapture {
+    let mut capture = frame("demo/worker");
+    capture.format = format;
+    capture.text = text.into();
+    capture
+}
+
+#[test]
+fn token_split_by_style_or_wrap_still_visible() {
+    let id = MessageId::new(123);
+    let visible = |format, text: &str| token_visible(&shot(format, text), id);
+    for format in [CaptureFormat::Ansi, CaptureFormat::Plain] {
+        // One row, as the editor or the transcript shows the reference.
+        assert_eq!(
+            visible(format, "> [m123] Read: atm inbox --id m123   \n"),
+            Some(true)
+        );
+        // A row break inside the token (a pane narrower than the token).
+        assert_eq!(visible(format, "> [m1\n23] Read: atm\n"), Some(true));
+        // Another message's token, and a longer id that starts the same.
+        assert_eq!(visible(format, "> [m124] Read: atm\n"), Some(false));
+        assert_eq!(visible(format, "> [m1234] Read: atm\n"), Some(false));
+        // The id without its brackets (the command's own argument) is no token.
+        assert_eq!(visible(format, "atm inbox --id m123\n"), Some(false));
+        assert_eq!(visible(format, "\n\n"), Some(false));
+    }
+    // A style change inside the token: the raw bytes do not hold it, the
+    // decoded cells do.
+    let styled = "\x1b[1m> [m1\x1b[0m23] Read\x1b[7m \x1b[0m\n";
+    assert!(!styled.contains("[m123]"));
+    assert_eq!(visible(CaptureFormat::Ansi, styled), Some(true));
+    // A style change and a row break together.
+    assert_eq!(
+        visible(CaptureFormat::Ansi, "\x1b[1m[m\x1b[0m1\n23]\n"),
+        Some(true)
+    );
+    // A styled capture the decoder refuses is unknown, never "absent".
+    assert_eq!(visible(CaptureFormat::Ansi, "\x1b[2J[m123] Read\n"), None);
+}
+
+#[test]
+fn attempt_session_table() {
+    use AgentStatus::{Clearing, Down, Ready, Starting, Stuck};
+    let (s1, s2) = (SessionId::new("s1"), SessionId::new("s2"));
+    let session = |status, recorded, eligible| attempt_session(status, recorded, eligible);
+    // Ready and bound to the pane's one eligible row: confirm against it.
+    assert_eq!(
+        session(Ready, Some(&s1), Some(&s1)).unwrap(),
+        Some(s1.clone())
+    );
+    // Ready, nothing bound and no eligible row: a lazy first prompt.
+    assert_eq!(session(Ready, None, None).unwrap(), None);
+    let refused = [
+        // The binding's row is gone, or another session holds the pane.
+        (Ready, Some(&s1), None),
+        (Ready, Some(&s1), Some(&s2)),
+        // A row the agent is not bound to is nothing to confirm against.
+        (Ready, None, Some(&s1)),
+    ];
+    for (status, recorded, eligible) in refused {
+        assert!(
+            matches!(
+                session(status, recorded, eligible),
+                Err(MessageError::Refused(_))
+            ),
+            "{status:?} {recorded:?} {eligible:?}"
+        );
+    }
+    // No other status takes a delivery, whatever is bound.
+    for status in [Starting, Clearing, Stuck, Down] {
+        for (recorded, eligible) in [(Some(&s1), Some(&s1)), (None, None)] {
+            assert!(
+                matches!(
+                    session(status, recorded, eligible),
+                    Err(MessageError::Refused(_))
+                ),
+                "{status:?} {recorded:?}"
+            );
+        }
     }
 }
 

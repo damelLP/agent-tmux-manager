@@ -78,6 +78,19 @@ pub(super) fn paths(state: &OrgState, agent: &Agent) -> Result<(PathBuf, PathBuf
     ))
 }
 
+/// The address a role names as its manager: the owner when it names none or
+/// `owner`, an agent of the same project for a bare name, the address as
+/// written for a full id. `None` when the name is not a valid address.
+pub(super) fn manager_address(agent: &AgentId, role: Option<&RoleSpec>) -> Option<Address> {
+    match role.and_then(|r| r.config.manager.as_deref()) {
+        None | Some("owner") => Some(Address::Owner),
+        Some(name) if name.contains('/') => name.parse::<Address>().ok(),
+        Some(name) => AgentId::new(agent.project.clone(), name)
+            .map(Address::Agent)
+            .ok(),
+    }
+}
+
 fn assemble_context(
     state: &OrgState,
     agent: &Agent,
@@ -85,19 +98,9 @@ fn assemble_context(
     memory_exists: bool,
 ) -> Result<AgentContext, AgentError> {
     let (role_file, memory_path) = paths(state, agent)?;
-    let manager = match role.as_ref().and_then(|r| r.config.manager.as_deref()) {
-        None | Some("owner") => Address::Owner,
-        Some(name) => {
-            let address = if name.contains('/') {
-                name.parse::<Address>()
-            } else {
-                AgentId::new(agent.id.project.clone(), name).map(Address::Agent)
-            };
-            address.map_err(|_| {
-                AgentError::Refused(format!("{}: invalid role manager", role_file.display()))
-            })?
-        }
-    };
+    let manager = manager_address(&agent.id, role.as_ref()).ok_or_else(|| {
+        AgentError::Refused(format!("{}: invalid role manager", role_file.display()))
+    })?;
     let unread_messages = state
         .inbox(&Address::Agent(agent.id.clone()))
         .into_iter()

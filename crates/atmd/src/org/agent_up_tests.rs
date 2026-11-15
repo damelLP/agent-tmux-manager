@@ -967,6 +967,53 @@ async fn launch_line_with_typed_prefix_sends_no_enter() {
 }
 
 #[tokio::test]
+async fn line_changed_after_the_paste_waits_and_only_the_exact_line_is_run() {
+    // After the paste the launch text is on the line and can't be taken
+    // back. A line that then reads anything but the prompt followed by the
+    // command gets no Enter, and the start waits: when the line reads
+    // exactly that again (what was typed after it was removed), the Enter
+    // goes out. What runs is the prompt's line and the command, nothing else.
+    let mut starting = Starting::new(Harness::Codex).await;
+    starting.script_pane();
+    starting.script_paste();
+    starting.frame(Starting::shell(&format!("{PROMPT}{} --yolo", starting.text)));
+    starting.frame(starting.staged());
+    starting.frame(starting.staged());
+    starting.frame(Starting::screen(CODEX_FRESH, "codex"));
+    let result = starting.up().await.unwrap();
+    assert_eq!(result.state, AgentStatus::Ready);
+    assert_eq!(starting.effects(), starting.launched());
+    assert_eq!(starting.unread(), 0);
+
+    // The line never reads that again: no Enter, and the start's deadline
+    // ends it with the command left typed at the prompt (the changed line
+    // for the rest of the sixty seconds, a paced capture each quarter second
+    // on the paused clock).
+    let mut starting = Starting::new(Harness::Codex).await;
+    starting.script_pane();
+    starting.script_paste();
+    for _ in 0..260 {
+        starting.frame(Starting::shell(&format!("{PROMPT}{} --yolo", starting.text)));
+    }
+    let result = starting.up().await;
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(starting.effects().len(), 3, "{:?}", starting.effects());
+    starting
+        .assert_stuck(&format!(
+            "{NOT_RUN}: the shell's line is not its prompt followed by the command"
+        ))
+        .await;
+}
+
+#[tokio::test]
 async fn prompt_that_reads_differently_after_it_was_read_ends_the_start() {
     // The prompt is read once. Drawn again between that reading and the
     // paste's guard, the line is not read as a new prompt: nothing was sent,

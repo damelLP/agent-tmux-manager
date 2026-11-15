@@ -1047,6 +1047,70 @@ async fn unobservable_recipient_says_so_tells_the_owner_once_and_never_pastes() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn unobservable_stuck_recipient_keeps_its_reason_and_resumes_when_ready() {
+    let mut rig = ManualJob::new().await;
+    rig.command(OrgCommand::Stuck {
+        agent_id: worker(),
+        reason: "needs recovery".into(),
+    })
+    .await;
+    let id = rig.send().await;
+    rig.round(0).await;
+    assert!(rig.job.lost.is_some());
+    let now = rig.job.service.rt.clock.now().unwrap();
+    let live = rig.job.service.rt.history.snapshot(id, now).unwrap().live;
+    assert_eq!(live.agent_status, atm_org::AgentStatus::Stuck);
+    assert!(live.owner_focused);
+    let notice = blocked_notice(id, "recipient agent is stuck or down", &[], false);
+    // Completed rounds before, at and beyond the 120 s loss deadline must
+    // keep the blocked reason and never add an unobserved notice or paste.
+    for elapsed in [0, 119_999, 1, 3_600_000] {
+        rig.round(elapsed).await;
+        let inbox = rig
+            .messages
+            .inbox(
+                InboxParams {
+                    recipient: Some(Address::Agent(worker())),
+                    id: Some(id),
+                    ..page()
+                },
+                owner(),
+            )
+            .await
+            .unwrap();
+        let entry = inbox.messages.first().unwrap();
+        assert_eq!(entry.status, DeliveryStatus::Queued);
+        assert_eq!(entry.delivery.phase, DeliveryPhase::Blocked);
+        assert_eq!(
+            entry.delivery.reason.as_deref(),
+            Some("recipient agent is stuck or down")
+        );
+        assert_eq!(entry.delivery.attempt, 0);
+        assert_eq!(rig.notes().await, std::slice::from_ref(&notice));
+    }
+    // The fake executor panics on any earlier dispatch. Now allow a real
+    // scheduled attempt through the rig, including its receipt and fold.
+    rig.job.effects.deliver = Arc::new(|rt, id, _| Box::pin(perform(rt, id, Act::Deliver)));
+    rig.screens.set(worker(), ready("%1", "s1"));
+    rig.command(OrgCommand::Adopt {
+        agent_id: worker(),
+        pane: "%1".into(),
+        session_id: Some("s1".into()),
+    })
+    .await;
+    rig.round(0).await;
+    assert!(rig.job.lost.is_none());
+    rig.round(10_000).await;
+    rig.round(0).await;
+    let now = rig.job.service.rt.clock.now().unwrap();
+    let snapshot = rig.job.service.rt.history.snapshot(id, now).unwrap();
+    assert_eq!(snapshot.live.agent_status, atm_org::AgentStatus::Ready);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+    assert_eq!(snapshot.message.last_attempt.unwrap().attempt, 1);
+    assert_eq!(rig.notes().await, [notice]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn one_unobserved_notice_for_the_oldest_open_message() {
     let bench = Bench::blind().await;
     let first = bench.send(worker(), "first").await;
@@ -1113,6 +1177,69 @@ async fn an_agent_without_a_pane_ends_the_loss() {
     assert_eq!(bench.notes().await.len(), 1);
     bench.pass(2).await;
     assert_eq!(bench.notes().await, [down, unobserved(id)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn paneless_starting_observations_preserve_readiness_and_hold_clocks() {
+    let mut rig = ManualJob::new().await;
+    // Prime the pane-observation throttle with a failed capture. A committed
+    // pane-less Starting state must be seen even within that poll interval.
+    guarded(rig.job.observe()).await.unwrap();
+    rig.command(OrgCommand::Down {
+        agent_id: worker(),
+        reason: "restarting".into(),
+    })
+    .await;
+    rig.command(OrgCommand::Up {
+        agent_id: worker(),
+        role: atm_org::parse_role("worker", "+++\nharness='pi'\n+++\nWork").unwrap(),
+    })
+    .await;
+    let started = rig.job.service.rt.clock.now().unwrap();
+    let id = rig.send().await;
+    for (elapsed, blocked) in [
+        (0, false),
+        (1, false),
+        (249, false),
+        (119_749, false),
+        (1, true),
+        (3_600_000, true),
+    ] {
+        tokio::time::advance(Duration::from_millis(elapsed)).await;
+        // Unlike ManualJob::round, retain the last capture timestamp so the
+        // first calls exercise the actual pane-observation throttle.
+        let mut queued = rig.job.service.board.queued.subscribe();
+        guarded(rig.job.round(&mut queued)).await.unwrap();
+        let rt = &rig.job.service.rt;
+        let now = rt.clock.now().unwrap();
+        let snapshot = rt.history.snapshot(id, now).unwrap();
+        assert_eq!(snapshot.recipient.pane, None);
+        assert_eq!(snapshot.live.agent_status, atm_org::AgentStatus::Starting);
+        assert!(!snapshot.live.owner_focused);
+        assert_eq!(snapshot.live.pane, atm_org::delivery::PaneLiveness::Unknown);
+        assert_eq!(snapshot.live.agent_not_ready_since, Some(started));
+        assert_eq!(snapshot.live.hold_since, None);
+        assert_eq!(snapshot.live.stale_blocker_since, None);
+        assert!(rig.job.lost.is_none());
+        assert_eq!(rig.screens.calls(&worker()), 1);
+        let step = next_delivery(&snapshot.message, &snapshot.live, now, &rt.policy).unwrap();
+        if blocked {
+            assert_eq!(
+                step,
+                DeliveryStep::Blocked {
+                    reason: FailureReason::AgentNotReadyTimeout
+                }
+            );
+        } else {
+            assert!(matches!(
+                step,
+                DeliveryStep::Wait {
+                    reason: WaitReason::AgentNotReady,
+                    ..
+                }
+            ));
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]

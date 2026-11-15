@@ -33,9 +33,11 @@
 //! the inbox shows "recipient cannot be observed" where the policy answers
 //! its unbounded focus wait, and once it has lasted the policy's readiness
 //! timeout the owner gets one notice per loss, for the oldest open message.
-//! Nothing is held: the message stays queued and is delivered when an
-//! observation returns. An observation that succeeded with an unknown focus
-//! is no loss; it waits as the next paragraph says.
+//! A Stuck or Down recipient keeps its own blocked reason and notice instead,
+//! whatever the focus, and gets no unobserved notice. Nothing is held: the
+//! message stays queued until observations return and delivery guards clear.
+//! An observation that succeeded with an unknown focus is no loss; it waits
+//! as the next paragraph says.
 //!
 //! Notices go to the owner's inbox once per message and reason while the
 //! message is open, after the state that caused them is applied. A focus
@@ -592,14 +594,10 @@ impl Job {
         );
     }
 
-    /// One observation per guard poll at most; history keeps the last one.
+    /// One pane observation per guard poll at most; history keeps the last one.
     async fn observe(&mut self) -> Result<(), MessageError> {
         let service = self.service.clone();
         let rt = &service.rt;
-        let poll = rt.policy.settings().guard_poll_interval;
-        if self.observed.is_some_and(|at| at.elapsed() < poll) {
-            return Ok(());
-        }
         let now = rt.clock.now()?;
         let recipient = self.recipient.clone();
         let agent = service.agent(&self.recipient)?;
@@ -627,6 +625,11 @@ impl Job {
                 Err(error) => Err(error),
             };
         };
+        // Committed pane-less state needs no capture or pacing.
+        let poll = rt.policy.settings().guard_poll_interval;
+        if self.observed.is_some_and(|at| at.elapsed() < poll) {
+            return Ok(());
+        }
         let observed = tokio::time::timeout(OBSERVE_BUDGET, (self.effects.observe)(agent))
             .await
             .unwrap_or(Err(MessageError::Timeout));

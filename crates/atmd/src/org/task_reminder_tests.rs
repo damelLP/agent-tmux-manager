@@ -374,13 +374,17 @@ impl Rig {
 
     /// A work task `creator` made, assigned to `to`.
     async fn task(&self, creator: Address, to: &str) -> TaskId {
+        self.titled("Do the work", creator, to).await
+    }
+
+    async fn titled(&self, title: &str, creator: Address, to: &str) -> TaskId {
         let by = TaskActor {
             who: creator.clone(),
             lead: true,
         };
         let made = self
             .run(OrgCommand::Task(TaskCommand::Create(TaskCreated {
-                title: "Do the work".into(),
+                title: title.into(),
                 kind: TaskKind::Work,
                 creator,
                 parent: None,
@@ -1012,6 +1016,28 @@ async fn missed_registry_events_cost_the_pending_waits_only() {
 }
 
 // ----------------------------------------------------------------- the texts
+
+#[tokio::test]
+async fn control_characters_in_a_title_cannot_break_a_note_into_lines() {
+    let rig = Rig::new().await;
+    // An escape sequence and a line break, as a careless title could hold.
+    let task = rig
+        .titled("a\u{1b}[31mb\nc\td", Address::Owner, "build")
+        .await;
+    let state = rig.state().await;
+    let builder = state.agent(&agent("build")).unwrap();
+    let held = [state.task(&task).unwrap()];
+    let reminder = reminder_note(&state, builder, &held).unwrap().body;
+    let first = format!("Your turn ended and task {task} (\"a [31mb c d\") is still assigned.");
+    assert_eq!(reminder.lines().next(), Some(first.as_str()));
+    assert_eq!(reminder.lines().count(), 2);
+    let flag = flag_note(builder, Address::Owner, &held).body;
+    assert!(
+        flag.starts_with(&format!("Task {task} (\"a [31mb c d\"): ")),
+        "{flag}"
+    );
+    assert_eq!(flag.lines().count(), 1);
+}
 
 #[tokio::test]
 async fn long_titles_are_cut_and_many_tasks_wait_for_the_next_turn_end() {

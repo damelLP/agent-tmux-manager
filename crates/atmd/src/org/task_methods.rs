@@ -200,7 +200,7 @@ pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Resul
     let intent = super::intent::IntentFiles::default();
     router.register(
         "task.create",
-        Duration::from_secs(30),
+        Duration::from_secs(35),
         move |caller, params| {
             let tasks = creating.clone();
             let org = org.clone();
@@ -338,4 +338,85 @@ pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Resul
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::methods::{CallContext, CallerId};
+    use crate::{eventlog::Envelope, org::Request};
+    use atm_org::{OrgCommand, OrgState};
+    use serde_json::json;
+    use tokio::sync::{broadcast, mpsc, watch};
+
+    // Break caught: the router discards an admitted mutation result at 30s,
+    // even though create's policy admission and mutation have separate budgets.
+    #[tokio::test(start_paused = true)]
+    async fn create_returns_admitted_mutation_past_the_old_router_deadline() {
+        let (requests, mut receive) = mpsc::channel(8);
+        let (_health, health) = watch::channel(Ok(0));
+        let (committed, _) = broadcast::channel(8);
+        let org = OrgHandle {
+            requests,
+            health,
+            committed,
+            reads: None,
+        };
+        let mut router = MethodRouter::default();
+        register_task_methods(&mut router, org).unwrap();
+        assert_eq!(
+            router
+                .names()
+                .iter()
+                .filter(|n| *n == "task.create")
+                .count(),
+            1
+        );
+        let call = tokio::spawn(async move {
+            router
+                .call(
+                    CallContext {
+                        client_id: CallerId("create-deadline".into()),
+                        from_pane: None,
+                    },
+                    "task.create",
+                    json!({"title":"Work","measure":{"kind":"owner"}}),
+                )
+                .await
+        });
+        let Request::Snapshot(reply) = receive.recv().await.unwrap() else {
+            panic!("expected policy snapshot");
+        };
+        reply.send(OrgState::default()).unwrap();
+        // The snapshot is ready before the scheduling delay. All I/O here is
+        // in-memory; only the paused clock advances, never a real-time wait.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let Request::Snapshot(reply) = receive.recv().await.unwrap() else {
+            panic!("expected mutation snapshot");
+        };
+        reply.send(OrgState::default()).unwrap();
+        let Request::Execute {
+            command,
+            now,
+            reply,
+            ..
+        } = receive.recv().await.unwrap()
+        else {
+            panic!("expected admitted create");
+        };
+        let OrgCommand::Task(TaskCommand::Create(created)) = *command else {
+            panic!("expected task creation");
+        };
+        reply
+            .send(Ok(vec![Envelope {
+                seq: 1,
+                ts: now,
+                kind: "task.created".into(),
+                body: serde_json::to_value(created).unwrap(),
+            }]))
+            .unwrap();
+        let result = call.await.unwrap().unwrap();
+        assert_eq!(result["task_id"], "t1");
+        assert_eq!(result["changed"], true);
+    }
 }

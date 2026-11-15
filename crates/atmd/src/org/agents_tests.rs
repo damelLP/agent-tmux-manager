@@ -3117,8 +3117,8 @@ mod reconciliation {
     }
 
     // The lifecycle flows' tests use this module's rig; they live in their own file.
-    // --- Task 10, the observer half: the recorded baseline, re-derived by the
-    // adopt rule, and the process read when the harness is not in front ---
+    // --- Observer baseline recovery by the adopt rule, and process evidence
+    // when the harness is no longer in the foreground ---
 
     use super::super::agent_flow::ProcFacts;
 

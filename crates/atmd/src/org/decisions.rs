@@ -124,6 +124,10 @@ pub struct ListResult {
     pub pending_count: usize,
     pub provisional_count: usize,
     pub next_after: Option<DecisionId>,
+    /// The owner has said he is away. Present only while true, so a result
+    /// from before the away switch, or while he is present, is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub away: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetResult {
@@ -176,6 +180,7 @@ fn list(
             .filter(|d| d.status == DecisionStatus::TakenProvisionally)
             .count(),
         next_after: None,
+        away: state.owner().away_since.is_some(),
     };
     if params.count_only {
         return Ok(result);

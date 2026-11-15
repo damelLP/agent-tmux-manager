@@ -308,7 +308,7 @@ stacking_cap = 1
 
 No file means 1. The daemon reads the file of every registered project when you run `atm away`, records the caps with the switch, and prints them; a change takes effect at the next `atm away`. A value below 1, an unknown key or a file that is not TOML refuses `atm away` with the file's path, and you stay present. A decision's project is that of the agent that asked.
 
-Only the owner sets the switch: as for `atm decide`, a pane bound to an agent is refused and an unbound pane counts as you. This is attribution, not authentication. The switch is in the org event log (`owner.away`, `owner.back`), so it survives a daemon restart; after one, the daemon handles whatever was left pending. Repeating either command changes nothing and says so. `--format json` prints the daemon's result.
+Only the owner sets the switch: as for `atm decide`, a pane bound to an agent is refused and an unbound pane counts as you. This is attribution, not authentication. The switch is in the org event log (`owner.away`, `owner.back`), so it survives a daemon restart; after one, the daemon handles whatever was left pending. Repeating either command changes nothing and says so. `--format json` prints the daemon's result. While you are away `atm status` ends with `away`, so a forgotten `atm back` shows in your status line; the mark comes with the decision count (`decision.list` adds `"away": true` to its result, and only then), so it is absent when that count cannot be read.
 
 | Method | Params | Result |
 |---|---|---|

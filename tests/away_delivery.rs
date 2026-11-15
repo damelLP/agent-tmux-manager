@@ -34,6 +34,10 @@ fn told(rig: &MessageRig, watch: &mut Watch, seat: &Recipient, kind: &str, body:
     id
 }
 
+fn status(rig: &MessageRig) -> String {
+    String::from_utf8(rig.atm(None, &["status"]).stdout).unwrap()
+}
+
 fn assign(rig: &MessageRig, task: &Value, seat: &Recipient) -> Result<Value, (String, String)> {
     rig.call(
         "task.assign",
@@ -78,6 +82,7 @@ fn a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart() {
     assert_eq!(away["pending_count"], 0);
     let since = away["away_since"].clone();
     assert!(since.is_string());
+    assert!(status(&rig).ends_with(" away\n"), "{:?}", status(&rig));
 
     // The agent asks; the daemon takes it for the owner and tells the agent.
     let decision = rig
@@ -167,6 +172,7 @@ fn a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart() {
         String::from_utf8(rig.atm(None, &["back"]).stdout).unwrap(),
         "Not away.\n"
     );
+    assert!(!status(&rig).contains("away"), "{:?}", status(&rig));
 
     // The owner's answer lifts the hold.
     let mut watch = rig.watch();

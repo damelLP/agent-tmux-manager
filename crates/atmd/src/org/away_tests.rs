@@ -681,6 +681,10 @@ async fn methods_are_the_owners_take_no_parameters_and_report_the_switch() {
         assert_eq!(error.code, "invalid_params", "{method}");
     }
     assert_eq!(rig.state().await.owner().away_since, None);
+    // The list result says nothing of the switch while the owner is present.
+    let counts = json!({"decisions":[],"pending_count":0,"provisional_count":0,"next_after":null});
+    let list = |context: CallContext| call(context, "decision.list", json!({"count_only":true}));
+    assert_eq!(list(owner()).await.unwrap(), counts);
     assert_eq!(
         call(owner(), "owner.back", Value::Null).await.unwrap(),
         json!({"changed":false,"away_since":null,"provisional_count":0,"pending_count":0})
@@ -695,10 +699,19 @@ async fn methods_are_the_owners_take_no_parameters_and_report_the_switch() {
     let again = call(owner(), "owner.away", Value::Null).await.unwrap();
     assert_eq!(again["changed"], false);
     assert_eq!(again["away_since"], away["away_since"]);
+    // While away every caller's list says so: `atm status` reads it there.
+    let mut marked = counts.clone();
+    marked["away"] = json!(true);
+    assert_eq!(list(pane("%7")).await.unwrap(), marked);
+    assert_eq!(
+        call(owner(), "decision.list", json!({})).await.unwrap(),
+        marked
+    );
     assert_eq!(
         call(owner(), "owner.back", json!({})).await.unwrap(),
         json!({"changed":true,"away_since":since,"provisional_count":0,"pending_count":0})
     );
+    assert_eq!(list(owner()).await.unwrap(), counts);
     // A daemon without the decision service advertises both and sets nothing.
     let disabled = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
     for method in ["owner.away", "owner.back"] {

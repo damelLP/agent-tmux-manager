@@ -101,17 +101,21 @@ pub async fn exchange(
                 expected["from_pane"] = json!(pane);
             }
             assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), expected);
-            let mut response = json!({"type":"response","id":"r1"});
-            response
-                .as_object_mut()
-                .unwrap()
-                .extend(reply.as_object().unwrap().clone());
-            write
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .unwrap();
+            // A null reply deliberately drops the connection after admitting the request.
+            if !reply.is_null() {
+                let mut response = json!({"type":"response","id":"r1"});
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(reply.as_object().unwrap().clone());
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
             line.clear();
         }
+        drop(write);
         assert_eq!(read.read_line(&mut line).await.unwrap(), 0, "only one RPC");
         listener
     });

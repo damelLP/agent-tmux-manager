@@ -201,3 +201,39 @@ async fn enum_help_names_the_supported_words() {
     }
     assert!(!dir.path().join("fallback").exists());
 }
+
+// Break caught: a connection lost after a mutation request is mistaken for a safe retry.
+#[tokio::test]
+async fn mid_mutation_disconnect_warns_to_inspect_before_retrying() {
+    for name in ["create", "assign", "verdict"] {
+        for format in ["text", "json"] {
+            let output = invoke(&case(name), &["--format", format], Value::Null).await;
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(output.stdout.is_empty());
+            let text = String::from_utf8(output.stderr).unwrap();
+            assert!(text.contains("task may have committed"), "{text}");
+            assert!(
+                text.contains("atm task get") && text.contains("atm task list"),
+                "{text}"
+            );
+            assert!(text.contains("daemon closed the connection"), "{text}");
+        }
+    }
+}
+
+// Break caught: read timeouts claim accepted work may commit, even though reads change nothing.
+#[tokio::test]
+async fn daemon_read_timeout_does_not_claim_accepted_work() {
+    for name in ["get", "list"] {
+        let reply = json!({"error":{"code":"timeout","message":"task request timed out; accepted work may complete; inspect tasks and inbox before retrying"}});
+        let output = invoke(&case(name), &[], reply).await;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(text.contains("task read request timed out"), "{text}");
+        assert!(
+            !text.contains("accepted work") && !text.contains("committed"),
+            "{text}"
+        );
+    }
+}

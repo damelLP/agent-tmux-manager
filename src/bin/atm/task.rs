@@ -393,17 +393,37 @@ fn render(method: &str, raw: &Value, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+fn read_method(method: &str) -> bool {
+    matches!(method, "task.list" | "task.get")
+}
 fn request_budget(method: &str) -> Duration {
-    if matches!(method, "task.list" | "task.get") {
+    if read_method(method) {
         READ_BUDGET
     } else {
         MUTATION_BUDGET
     }
 }
-fn request_error(error: super::rpc::RpcError) -> anyhow::Error {
+fn request_error(method: &str, error: super::rpc::RpcError) -> anyhow::Error {
+    use super::rpc::RpcError;
+    let read = read_method(method);
+    if read
+        && (matches!(&error, RpcError::Timeout)
+            || matches!(&error, RpcError::Daemon(reply) if reply.code == atm_protocol::error_code::TIMEOUT))
+    {
+        return anyhow::anyhow!(
+            "task read request timed out; retry atm task get <id> or atm task list"
+        );
+    }
     match error {
-        super::rpc::RpcError::Timeout => anyhow::Error::new(TaskError::Timeout),
-        other => anyhow::anyhow!("{}", escaped(&other.to_string(), false)),
+        RpcError::Timeout => anyhow::Error::new(TaskError::Timeout),
+        other => {
+            let diagnostic = escaped(&other.to_string(), false);
+            if !read && matches!(other, RpcError::Connection(_)) {
+                anyhow::anyhow!("{diagnostic}; task may have committed; inspect atm task list and atm task get <id> before retrying")
+            } else {
+                anyhow::anyhow!("{diagnostic}")
+            }
+        }
     }
 }
 
@@ -411,7 +431,7 @@ pub async fn cmd_task(args: TaskArgs) -> Result<()> {
     let (method, params) = command(args.action)?;
     let raw = super::rpc::call(method, params, request_budget(method))
         .await
-        .map_err(request_error)?;
+        .map_err(|error| request_error(method, error))?;
     let mut out = io::stdout().lock();
     match args.format {
         // JSON is the raw daemon answer, independent of this build's text schema.
@@ -420,7 +440,7 @@ pub async fn cmd_task(args: TaskArgs) -> Result<()> {
             let mut text = Vec::new();
             render(method, &raw, &mut text).map_err(|error| {
                 let diagnostic = escaped(&format!("{error:#}"), false);
-                if matches!(method, "task.list" | "task.get") {
+                if read_method(method) {
                     anyhow::anyhow!("{diagnostic}")
                 } else {
                     anyhow::anyhow!("{diagnostic}; task may have committed; inspect atm task list and atm task get <id> before retrying")
@@ -460,7 +480,20 @@ mod tests {
     // Break caught: removing the Timeout arm loses the task outcome-unknown warning.
     #[test]
     fn task_timeout_keeps_outcome_unknown_advice() {
-        assert_eq!(request_error(super::super::rpc::RpcError::Timeout).to_string(),
+        assert_eq!(request_error("task.create", super::super::rpc::RpcError::Timeout).to_string(),
             "task request timed out; accepted work may complete; inspect tasks and inbox before retrying");
+    }
+
+    // Break caught: the client-side read deadline is described as an uncertain mutation.
+    #[test]
+    fn read_timeout_has_read_only_advice() {
+        for method in ["task.get", "task.list"] {
+            let text = request_error(method, super::super::rpc::RpcError::Timeout).to_string();
+            assert!(text.contains("task read request timed out"), "{text}");
+            assert!(
+                !text.contains("accepted work") && !text.contains("committed"),
+                "{text}"
+            );
+        }
     }
 }

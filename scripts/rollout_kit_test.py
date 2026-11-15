@@ -235,6 +235,21 @@ class Rig(unittest.TestCase):
     def agents(self):
         return json.loads(self.checked([self.bin / 'atm', 'agent', 'list', '--format', 'json']))
 
+    def events(self):
+        return b''.join(path.read_bytes() for path in sorted((self.root / 'state/log/events').glob('*.jsonl')))
+
+    def append_events(self, *events):
+        """Events in the organisation log's own line format; only while no daemon runs."""
+        self.assertFalse(atm_rollout.listening(self.socket))
+        segment = sorted((self.root / 'state/log/events').glob('*.jsonl'))[-1]
+        lines = segment.read_text().splitlines()
+        seq = json.loads(lines[-1])['seq'] + 1 if lines else int(segment.stem)
+        with segment.open('a') as log:
+            for kind, body in events:
+                log.write(json.dumps(dict(seq=seq, ts=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                                          kind=kind, body=body), separators=(',', ':')) + '\n')
+                seq += 1
+
     def stop_everything(self):
         """Only what this test owns, each by an identity read first; the tmux server goes
         even when the daemon's part fails."""
@@ -704,26 +719,74 @@ class FailedChecks(Rig):
         out = self.rolled_back('identity', old, [started])
         self.assertIn('does not run the installed atmd', out)
 
+    def test_an_agent_that_is_not_down_and_lost_its_pane_still_rolls_back(self):
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        seat = self.agent()
+        self.wrap({'agent list --format json': [dict(self.agents()[0], pane=None)]})
+        self.assertIn('project/seat was on pane %s and is now on -' % seat['pane'], self.rolled_back('agents', old))
+
+
+class DownAcrossTheRestart(Rig):
+    """A daemon's start records an agent whose pane is gone as down. That is a change to
+    print, not a reason to roll a good build back (and the old build would record the same)."""
+
+    def test_a_stuck_agent_whose_pane_was_closed_goes_down_and_the_rollout_goes_on(self):
+        self.start_tmux()
+        new = self.pair(self.candidate / 'bin')
+        self.start_daemon()
+        self.checked([self.bin / 'atmd', 'stop'])  # the log exists now
+        # A start that never bound a session, as the log has it; the next daemon finds it
+        # still starting and records it stuck, on its tagged pane.
+        (self.root / 'project').mkdir()
+        pane, _ = self.pane()
+        self.tmux('set-option', '-p', '-t', pane, '@atm-agent', 'project/seat')
+        role = dict(name='seat', harness='pi', cwd='.', instructions='', command_prefix=[], spawn_args=[],
+                    skills=[], trust_dirs=[], clear=None, manager=None, model=None, pane=None, profile=None)
+        self.append_events(('project.registered', dict(project_id='project', root=str(self.root / 'project'))),
+                           ('agent.up_requested', dict(agent_id='project/seat', role=role)),
+                           ('agent.pane_created', dict(agent_id='project/seat', pane=pane)))
+        self.start_daemon()
+        self.assertEqual([(a['state'], a['pane']) for a in self.agents()], [('stuck', pane)])
+        self.tmux('kill-pane', '-t', pane)
+        # The running daemon looks at an agent again only on a session event: none comes.
+        self.assertEqual([(a['state'], a['pane']) for a in self.agents()], [('stuck', pane)])
+        warning = f"Warning: agent project/seat's pane {pane} is gone; the restart will record it down"
+        code, out, err = self.in_process(*self.args(report=False), '--dry-run')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(warning, out)
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(warning, out)
+        self.assertIn('  agent project/seat: stuck -> down', out)
+        self.assert_running(new)
+        self.assertEqual([(a['state'], a['pane']) for a in self.agents()], [('down', None)])
+
+    def test_an_agent_downed_between_the_snapshot_and_the_stop_is_a_printed_change(self):
+        self.start_tmux()
+        new = self.pair(self.candidate / 'bin')
+        self.start_daemon()
+        seat = self.agent()
+
+        def downed(rollout):
+            self.checked([self.bin / 'atm', 'agent', 'down', seat['agent_id'], '--kill'])
+        code, out, err = self.in_process(*self.args(), patches=[self.before_step('stop_daemon', downed)])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"Agent project/seat: ready, pane {seat['pane']}", out)
+        self.assertIn('  agent project/seat: ready -> down', out)
+        self.assert_running(new)
+
 
 class NewerState(Rig):
     """Plan risk 7: the rollback lands on a state directory the newer build has written to."""
-
-    def events(self):
-        return b''.join(path.read_bytes() for path in sorted((self.root / 'state/log/events').glob('*.jsonl')))
 
     def newer_build_writes(self, *events):
         """Between the new daemon's start and its checks: events appended in the log's own
         line format, as a newer daemon would have written them, then the daemon again."""
         def write(rollout):
             self.checked([self.bin / 'atmd', 'stop'])
-            segment = sorted((self.root / 'state/log/events').glob('*.jsonl'))[-1]
-            lines = segment.read_text().splitlines()
-            seq = json.loads(lines[-1])['seq'] + 1 if lines else int(segment.stem)
-            with segment.open('a') as log:
-                for kind, body in events:
-                    log.write(json.dumps(dict(seq=seq, ts=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                                              kind=kind, body=body), separators=(',', ':')) + '\n')
-                    seq += 1
+            self.append_events(*events)
             self.written = self.events()
             self.checked([self.bin / 'atmd', 'start', '-d'])
             wait_for(lambda: atm_rollout.listening(self.socket), 'the newer daemon again')

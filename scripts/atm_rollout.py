@@ -413,6 +413,12 @@ class Rollout:
             raise OSError(f'atm agent list exit {listed.returncode}: {listed.stderr.strip()}')
         return json.loads(listed.stdout)
 
+    def panes(self, server=None):
+        """The pane ids on a tmux server (the one atm picks, unless given); None if it is silent."""
+        listed = self.call([*(['tmux', '-S', server] if server else self.tmux), 'list-panes', '-a', '-F',
+                            '#{pane_id}'])
+        return set(listed.stdout.split()) if listed.returncode == 0 else None
+
     def snapshot(self):
         sessions = self.atm_json('list', '--format', 'json')
         agents = self.named_agents()
@@ -459,8 +465,12 @@ class Rollout:
         say(f"Sessions: {len(snapshot['sessions'])}, {len(working)} mid-turn"
             + (' (a restart does not stop them): ' + ', '.join(
                 f"{row.get('id_short')} {row.get('tmux_pane') or '-'}" for row in working) if working else ''))
+        panes = self.panes()
         for agent in snapshot['agents'] or []:
             say(f"Agent {agent['agent_id']}: {agent['state']}, pane {agent.get('pane') or '-'}")
+            if panes is not None and agent.get('pane') and agent['pane'] not in panes:
+                say(f"Warning: agent {agent['agent_id']}'s pane {agent['pane']} is gone; the restart will "
+                    'record it down')
         if snapshot['agents'] is None:
             say('The installed build has no named agents.')
         for sidebar in snapshot['sidebars']:
@@ -580,12 +590,14 @@ class Rollout:
                 say(f"This build has no named agents; the {len(before['agents'] or [])} of before are in "
                     'the state directory, untouched, and not visible to it.')
             else:
-                after = {agent['agent_id']: agent.get('pane') for agent in listed}
+                after = {agent['agent_id']: agent for agent in listed}
                 for agent in before['agents'] or []:
-                    name, pane = agent['agent_id'], agent.get('pane')
-                    if name not in after or after[name] != pane:
+                    name, pane, now = agent['agent_id'], agent.get('pane'), after.get(agent['agent_id'])
+                    # Down is a state the difference prints, not this build's fault: a daemon's
+                    # start records an agent whose pane is gone as down, and so would the old one.
+                    if now is None or (now['state'] != 'down' and now.get('pane') != pane):
                         raise CheckFailed('agents', f"{name} was on pane {pane or '-'} and is now "
-                                          + (f"on {after[name] or '-'}" if name in after else 'missing'))
+                                          + (f"on {now.get('pane') or '-'}" if now else 'missing'))
             self.check_send()
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             raise CheckFailed('checks', str(error)) from error
@@ -602,9 +614,7 @@ class Rollout:
             return
         panes = set()
         for server in {row['server'] for row in self.stopped} | {None}:
-            listed = self.call([*(['tmux', '-S', server] if server else self.tmux),
-                                'list-panes', '-a', '-F', '#{pane_id}'])
-            panes |= set(listed.stdout.split())
+            panes |= self.panes(server) or set()
         def by_pane(rows):  # a row found by discovery has a placeholder id, new with every daemon
             return {row.get('tmux_pane') or row['id']: row for row in rows
                     if row.get('tmux_pane') or not row['id'].startswith('pending-')}

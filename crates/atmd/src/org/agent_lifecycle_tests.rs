@@ -1520,7 +1520,7 @@ async fn adopt_of_an_agent_with_a_role_reads_the_screen_only_of_its_live_harness
     }
 }
 
-// --- cp-u8-21: a second adopt of a Clearing or Stuck agent ---
+// --- A second adopt of a Clearing or Stuck agent ---
 
 /// `q/lead` with a pi role, Ready without a session on %1, its harness's
 /// discovery row on the pane, and the service started.
@@ -1691,7 +1691,7 @@ async fn second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready() {
     }
 }
 
-// --- cp-u8-21 D: a role whose harness is not the pane's ---
+// --- A role whose harness is not the pane's ---
 
 /// `q/lead` was started with a pi role and taken down: it has a role and no
 /// pane. `rows` are the top-level session rows on %1.
@@ -1912,14 +1912,13 @@ async fn adopt_of_an_agent_stuck_by_an_interrupted_clear_makes_it_ready() {
     adoption.followed().await;
 }
 
-// --- cp-u8-21 B: every read and capture of an adopt comes before its tag ---
+// --- Every read and capture of an adopt comes before its tag ---
 
 #[tokio::test]
 async fn adopt_that_fails_before_its_tag_leaves_no_tag_and_no_quarantine() {
-    // Review 19, probe r07: a capture of the adopt fails. It used to come
-    // after the tag and left a tagged pane with no adoption recorded, and a
-    // quarantine. Now the pane is not tagged yet: nothing is changed, nothing
-    // is recorded, and the same adopt succeeds when the pane can be read.
+    // A capture fails before the tag: nothing is changed or recorded, and
+    // no reservation is quarantined. The same adopt succeeds when the pane
+    // can be read again.
     let mut adoption = Adoption::new().await;
     adoption.rig.row("s1", "%1", false).await;
     *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
@@ -1954,8 +1953,8 @@ async fn adopt_that_fails_before_its_tag_leaves_no_tag_and_no_quarantine() {
 
 #[tokio::test]
 async fn adopt_tag_ok_then_adopt_append_fails_quarantines() {
-    // Review 19, mutation m07. What can still fail after the tag is the
-    // organisation's write. The pane then carries a tag with no adoption
+    // The organisation's write can still fail after the tag. The pane
+    // then carries a tag with no adoption
     // behind it, and the cleanup must not release the reservation. No
     // baseline is kept for a pane the organisation does not give the agent.
     // Twin: adopt_that_fails_before_its_tag_leaves_no_tag_and_no_quarantine.
@@ -2079,7 +2078,7 @@ async fn row_that_arrives_during_an_adopt_is_bound_by_its_next_event() {
     assert_eq!(agent.session_id, Some(SessionId::new("s1")));
 }
 
-// --- Two checks of an adopt that the mutation run of cp-u8n found unheld ---
+// --- An adopt refuses stale row and foreground evidence ---
 
 #[tokio::test]
 async fn adopt_does_not_count_the_excluded_session_as_the_roles_harness() {

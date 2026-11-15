@@ -4,4 +4,6 @@ Captured: atmd b3f75b26, 2026-11-15, the private `DaemonServer` method-fixture t
 
 `cases.json` holds successful method results, hand-written CLI arguments/complete parameter objects, and intended text goldens. `refusals.json` records one error for each method. Scripted CLI tests replay these errors to verify passthrough independently of which otherwise-valid CLI arguments elicited the call: notably the CLI rejects `list --limit 0` itself, while the daemon's captured limit refusal is still a valid error response to display.
 
-Forward-compatibility, malformed-response, control-character, pagination, unconfirmed-notification, and optional-argument variants in the tests are synthetic and labeled at their assertions; they are not claimed to be harness captures.
+Captured: atmd 4645cb04, 2026-11-15, the same private-server method check after merging the newer-enum and input-validation contracts. Original success/refusal answers were unchanged. `unknown-inputs.json` records the additional exact `invalid_params` answers. Its later enum words are synthetic probes; the refusal responses were observed, not invented. The CLI's shared serde enums normalize these inputs to `unknown` before the daemon refuses them.
+
+Forward-compatibility results, malformed responses, control characters, pagination, unconfirmed notifications, and optional-argument variants in the tests are synthetic and labeled at their assertions; they are not claimed to be harness captures. Every success command is also exercised against the private real daemon, not only a scripted RPC peer.

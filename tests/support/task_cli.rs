@@ -170,7 +170,7 @@ pub fn contracts() -> Vec<Value> {
         .collect()
 }
 
-pub async fn method_answer(fixture: &Value) -> Value {
+pub async fn method_answer(fixture: &Value, cli_args: Option<&[&str]>) -> Value {
     use atm_org::{OrgCommand, TaskActor, TaskCommand, TaskCreated, TaskKind, TaskSubmission};
     use atmd::{
         org::{agents::AgentHandle, messages::MessageHandle, OrgHandle},
@@ -274,6 +274,15 @@ pub async fn method_answer(fixture: &Value) -> Value {
     .await;
     let server_task = tokio::spawn(run);
     let answer = tokio::time::timeout(Duration::from_secs(60), async {
+        if let Some(args) = cli_args {
+            let output = command(dir.path(), args, fixture["request"]["from_pane"].as_str())
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty());
+            return json!({"result":serde_json::from_slice::<Value>(&output.stdout).unwrap()});
+        }
         let stream = UnixStream::connect(socket).await.unwrap();
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);

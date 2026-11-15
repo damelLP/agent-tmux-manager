@@ -42,7 +42,7 @@ async fn method_answers_match_the_recorded_contract() {
     let fixtures = support::contracts();
     assert_eq!(fixtures.len(), 18);
     for fixture in fixtures {
-        let answer = support::method_answer(&fixture).await;
+        let answer = support::method_answer(&fixture, None).await;
         let name = fixture["name"].as_str().unwrap();
         let expected = if let Some(name) = name.strip_suffix("-refusal") {
             refusals()[name].clone()
@@ -435,4 +435,115 @@ async fn bad_arguments_exit_two_without_contacting_a_daemon() {
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
     }
     assert!(!dir.path().join("fallback").exists());
+}
+
+// Break caught: scripted peers mask client/server schema or caller-attribution drift.
+#[tokio::test]
+async fn every_task_command_works_against_the_real_private_daemon() {
+    let contracts = support::contracts();
+    for case in cases() {
+        let name = format!("{}-success", case["name"].as_str().unwrap());
+        let fixture = contracts
+            .iter()
+            .find(|fixture| fixture["name"] == name)
+            .unwrap();
+        let mut args = args(&case);
+        args.extend(["--format", "json"]);
+        assert_eq!(
+            support::method_answer(fixture, Some(&args)).await,
+            case["reply"],
+            "{name}"
+        );
+    }
+}
+
+// Break caught: newer enum words cause a failed read, disappear in JSON, or hide cost details.
+#[tokio::test]
+async fn newer_task_enum_words_remain_readable_in_both_formats() {
+    for name in ["list", "get"] {
+        let case = case(name);
+        // Synthetic: later task vocabularies, not malformed known values.
+        let mut reply = case["reply"].clone();
+        let task = if name == "list" {
+            &mut reply["result"]["tasks"][0]
+        } else {
+            &mut reply["result"]["task"]
+        };
+        task["kind"] = json!("future_kind");
+        task["state"] = json!("future_state");
+        if name == "get" {
+            task["files"][0]["kind"] = json!("future_file");
+            task["measure"] = json!({"kind":"future_measure","data":42});
+            task["submission"] = json!("future_submission");
+            task["cost"] = json!({"seconds_in_state":{"future_state":9},"future_metric":17});
+            task["last_verdict"] = json!("future_verdict");
+        }
+        let output = invoke(&case, &[], reply.clone()).await;
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("t6 unknown kind=unknown"), "{text}");
+        if name == "get" {
+            for word in [
+                "future_file",
+                "future_measure",
+                "future_submission",
+                "future_state",
+                "future_metric",
+                "future_verdict",
+            ] {
+                assert!(text.contains(word), "{word}: {text}");
+            }
+        }
+        let output = invoke(&case, &["--format", "json"], reply.clone()).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            reply["result"]
+        );
+    }
+}
+
+// Break caught: CLI mistakes replay compatibility for permission to create newer task values.
+#[tokio::test]
+async fn newer_enum_inputs_reach_daemon_field_refusals() {
+    let tests: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/atm_task/unknown-inputs.json")).unwrap();
+    let contracts = support::contracts();
+    for test in tests {
+        let name = test["name"].as_str().unwrap();
+        let key = test["key"].as_str().unwrap();
+        let case = case(name);
+        let fixture_name = format!("{name}-success");
+        let mut fixture = contracts
+            .iter()
+            .find(|fixture| fixture["name"] == fixture_name)
+            .unwrap()
+            .clone();
+        fixture["request"]["params"] = case["params"].clone();
+        fixture["request"]["params"][key] = test["value"].clone();
+        assert_eq!(
+            support::method_answer(&fixture, None).await,
+            test["reply"],
+            "{name} {key}"
+        );
+        let output = support::exchange(
+            &args(&test),
+            case["method"].as_str().unwrap(),
+            fixture["request"]["params"].clone(),
+            test["reply"].clone(),
+            fixture["request"]["from_pane"].as_str(),
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1), "{name} {key}: {output:?}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!(
+                "Error: {}\n",
+                test["reply"]["error"]["message"].as_str().unwrap()
+            )
+        );
+    }
 }

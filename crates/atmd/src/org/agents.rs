@@ -1217,12 +1217,18 @@ pub(super) fn refusal_text(
 /// What `agent.list` says of an agent whose operation could not be settled.
 /// The reservation keeps the operation and its pane, not why its cleanup
 /// failed. The operation is named as its `agent.<kind>` method is; the
-/// observer's own reservation is an observation.
+/// observer's own reservation is an observation. Each word is written out:
+/// a renamed variant must not change what users read.
 #[must_use]
 pub(super) fn quarantine_text(quarantine: &Quarantine) -> String {
     let kind = match quarantine.kind {
-        ReservationKind::Observe => "observation".into(),
-        kind => format!("{kind:?}").to_lowercase(),
+        ReservationKind::Up => "up",
+        ReservationKind::Adopt => "adopt",
+        ReservationKind::Clear => "clear",
+        ReservationKind::Respawn => "respawn",
+        ReservationKind::Down => "down",
+        ReservationKind::Delivery => "delivery",
+        ReservationKind::Observe => "observation",
     };
     let on = quarantine
         .pane

@@ -4362,10 +4362,39 @@ mod reconciliation {
             pane: pane.map(|pane| PaneId::parse(pane).unwrap()),
             kind,
         };
-        assert_eq!(
-            quarantine_text(&quarantine(Some("%1"), ReservationKind::Down)),
-            QUARANTINED_DOWN
-        );
+        // Every kind, character for character. The words are those of the
+        // `agent.<kind>` methods; a delivery and the observer's own
+        // reservation have none and are a delivery and an observation.
+        for (kind, text) in [
+            (
+                ReservationKind::Up,
+                "quarantined: the agent's up on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Adopt,
+                "quarantined: the agent's adopt on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Clear,
+                "quarantined: the agent's clear on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Respawn,
+                "quarantined: the agent's respawn on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (ReservationKind::Down, QUARANTINED_DOWN),
+            (
+                ReservationKind::Delivery,
+                "quarantined: the agent's delivery on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Observe,
+                "quarantined: the agent's observation on %1 could not be settled; restart atmd and reconcile",
+            ),
+        ] {
+            assert_eq!(quarantine_text(&quarantine(Some("%1"), kind)), text);
+        }
+        // The pane is the one the quarantine names; without one, none.
         assert_eq!(
             quarantine_text(&quarantine(Some("%12"), ReservationKind::Respawn)),
             "quarantined: the agent's respawn on %12 could not be settled; restart atmd and reconcile"
@@ -4374,21 +4403,6 @@ mod reconciliation {
             quarantine_text(&quarantine(None, ReservationKind::Up)),
             "quarantined: the agent's up could not be settled; restart atmd and reconcile"
         );
-        // The other kinds are named as their `agent.<kind>` methods are; the
-        // observer's own reservation is an observation.
-        for (kind, name) in [
-            (ReservationKind::Adopt, "adopt"),
-            (ReservationKind::Clear, "clear"),
-            (ReservationKind::Observe, "observation"),
-        ] {
-            assert_eq!(
-                quarantine_text(&quarantine(Some("%1"), kind)),
-                format!(
-                    "quarantined: the agent's {name} on %1 could not be settled; \
-                     restart atmd and reconcile"
-                )
-            );
-        }
     }
 
     #[tokio::test]

@@ -291,6 +291,18 @@ fn fold_records_facts_without_enforcing_the_table() {
     assert_eq!(decision.status, DecisionStatus::Expired);
     assert_eq!(decision.closed_at, Some(at(23)));
     assert!(decision.resolution.is_some());
+
+    // Reading old facts still accepts an owner requester, unlike new commands.
+    let mut request = request();
+    request.requester = Address::Owner;
+    state
+        .apply(24, at(24), &OrgEvent::DecisionRequested(request.clone()))
+        .unwrap();
+    assert_eq!(state.decision(&d(24)).unwrap().request, request);
+    assert_eq!(
+        state.decision(&d(24)).unwrap().status,
+        DecisionStatus::Pending
+    );
 }
 
 #[test]
@@ -943,7 +955,12 @@ fn a_request_is_checked_before_it_is_logged() {
         })
     };
     type Change = fn(&mut DecisionRequest);
-    let cases: [(Change, &'static str, &str); 9] = [
+    let cases: [(Change, &'static str, &str); 10] = [
+        (
+            |r| r.requester = Address::Owner,
+            "requester",
+            "must be an agent or system",
+        ),
         (|r| r.title.clear(), "title", "must not be empty"),
         (|r| r.options.clear(), "options", "need at least two"),
         (|r| r.options.truncate(1), "options", "need at least two"),
@@ -1003,11 +1020,10 @@ fn a_request_is_checked_before_it_is_logged() {
         )))
     );
 
-    // Accepted: any known requester, no recommendation, no deadline, a
-    // deadline one second ahead, empty context and files, many options.
-    let changes: [Change; 7] = [
+    // Accepted: a known agent or system requester, no recommendation, no deadline,
+    // a deadline one second ahead, empty context and files, many options.
+    let changes: [Change; 6] = [
         |r| r.requester = Address::System,
-        |r| r.requester = Address::Owner,
         |r| r.recommended = None,
         |r| r.deadline = None,
         |r| r.deadline = Some(at(11)),
@@ -1030,7 +1046,7 @@ fn a_request_is_checked_before_it_is_logged() {
         assert_eq!(decision.status, DecisionStatus::Pending);
         assert_eq!(decision.requested_at, at(rig.seq as u32));
     }
-    assert_eq!(rig.state.decisions().count(), 7);
+    assert_eq!(rig.state.decisions().count(), 6);
 }
 
 #[test]

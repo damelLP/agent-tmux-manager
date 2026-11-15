@@ -383,6 +383,9 @@ fn check_request(request: &DecisionRequest, now: DateTime<Utc>) -> Result<(), Re
             reason: reason.into(),
         })
     };
+    if request.requester == Address::Owner {
+        return invalid("requester", "must be an agent or system");
+    }
     let options = &request.options;
     if request.title.is_empty() {
         return invalid("title", "must not be empty");

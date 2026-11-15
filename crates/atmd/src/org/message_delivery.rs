@@ -8,8 +8,10 @@
 //! its screen and the policy are read again; only `PasteNow` goes on. The
 //! attempt's event is committed and folded, evidence and then history are
 //! armed with its scope, and the reference is pasted once, behind a guard on
-//! a fresh capture. For now the attempt ends there: staging, Enter and the
-//! wait for the receipt are not built yet, so an applied paste is held.
+//! a fresh capture. The editor is then watched, with no key sent, until the
+//! adapter reads the reference as the staged draft; one Enter follows, behind
+//! the same guard, and the attempt waits for the session's own prompt event
+//! until the confirmation window that began at the attempt's event ends.
 //! Cleanup settles by [`disposition`] over what work left behind, whatever
 //! stopped it.
 
@@ -22,21 +24,23 @@ use super::message_history::{
 use super::messages::{recipient_observation, MessageError, MessageRuntime};
 use super::OrgServiceError;
 use crate::control::reservation::{
-    CaptureFormat, PaneCapture, PaneId, Reservation, ReservationError, ReservationKind,
+    CaptureFormat, PaneCapture, PaneId, PaneKey, Reservation, ReservationError, ReservationKind,
     ReservationRequest, WaitPolicy,
 };
 use atm_core::{
-    styled_screen::StyledScreen, DialogState, InputState, ScreenFacts, SessionId, TurnState,
+    harness_control::ControlDialog, styled_screen::StyledScreen, DialogState, InputState,
+    ScreenFacts, SessionId, TurnState,
 };
 use atm_org::{
     delivery::{next_delivery, DeliveryStep},
-    AgentStatus, DeliveryReceipt, MessageId, OrgCommand, OrgEvent,
+    AgentStatus, ControlAudit, DeliveryReceipt, MessageId, OrgCommand, OrgEvent,
 };
+use chrono::TimeDelta;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{sleep_until, timeout_at, Instant};
 
 pub const ATTEMPT_WORK_BUDGET: Duration = Duration::from_secs(30);
 pub const ATTEMPT_CLEANUP_BUDGET: Duration = Duration::from_secs(10);
@@ -110,13 +114,19 @@ pub enum GuardedInput {
     Enter,
 }
 
-/// What one fresh capture shows, as plain facts. `screen` and `staged` come
-/// from the one screen dispatch, which already answers Unknown and `None`
-/// unless the harness is positively the pane's foreground program.
+/// What one fresh capture shows, as plain facts. `screen`, `control_dialog`
+/// and `staged` come from the one screen dispatch, which already answers
+/// Unknown and `None` unless the harness is positively the pane's foreground
+/// program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryGuardFacts {
     pub input: GuardedInput,
+    /// The facts of the dispatch's control read of the capture.
     pub screen: ScreenFacts,
+    /// That same read's dialog. It knows popups `screen.dialog` does not
+    /// model (a slash completion, the clear and new-session popups), where
+    /// Enter picks a row and a paste filters the list. It only ever refuses.
+    pub control_dialog: ControlDialog,
     /// The adapter's exact match of the staged draft with the reference.
     pub staged: Option<bool>,
     /// Some(false) is the only observed absence of the owner's focus.
@@ -134,20 +144,25 @@ pub struct DeliveryGuardFacts {
 /// to submit it. Every fact must be positively known: Unknown, `None` and a
 /// value this build does not know all refuse.
 ///
-/// Paste needs an empty editor; Enter needs the adapter's exact match of the
-/// staged draft instead. A dialog of any kind refuses, also when the draft
-/// matches: a match never chooses a menu entry or answers a prompt. An
-/// unreported bracketed-paste flag is allowed, because the reference is one
-/// printable ASCII line; a reported "off" refuses.
+/// Paste needs an empty editor. Enter needs an editor that holds a draft and
+/// the adapter's exact match of that draft with the reference: a match in an
+/// editor read as empty or unknown means the screen is not understood. A
+/// dialog of any kind, in either read, refuses, also when the draft matches:
+/// a match never chooses a menu entry or answers a prompt. An unreported
+/// bracketed-paste flag is allowed, because the reference is one printable
+/// ASCII line; a reported "off" refuses.
 #[must_use]
 pub fn guard_allows_input(facts: &DeliveryGuardFacts) -> bool {
     let editor = match facts.input {
         GuardedInput::Paste => facts.screen.input == InputState::Empty,
-        GuardedInput::Enter => facts.staged == Some(true),
+        GuardedInput::Enter => {
+            facts.screen.input == InputState::Draft && facts.staged == Some(true)
+        }
     };
     editor
         && facts.screen.turn == TurnState::NotRunning
         && facts.screen.dialog == DialogState::None
+        && facts.control_dialog == ControlDialog::None
         && facts.focused == Some(false)
         && facts.bracketed_paste != Some(false)
         && !facts.in_mode
@@ -385,7 +400,18 @@ pub(super) fn observation(
     recipient_observation(capture, session, facts)
 }
 
-/// One capture as the plain facts a delivery guard decides on.
+/// [`attempt_session`] on one recipient read.
+fn session_gate(recipient: &Recipient) -> Result<Option<SessionId>, MessageError> {
+    attempt_session(
+        recipient.status,
+        recipient.session_id.as_ref(),
+        recipient.session.as_ref().map(|row| &row.id),
+    )
+}
+
+/// One capture as the plain facts a delivery guard decides on: one control
+/// read of it for the screen facts and the dialog, and the staged match and
+/// the pane's flags from that same capture.
 fn guard_facts(
     input: GuardedInput,
     capture: &PaneCapture,
@@ -393,9 +419,11 @@ fn guard_facts(
     baseline: &PaneBaseline,
     reference: &str,
 ) -> DeliveryGuardFacts {
+    let control = screen.control(capture, baseline);
     DeliveryGuardFacts {
         input,
-        screen: screen.facts(capture, baseline),
+        screen: control.facts,
+        control_dialog: control.dialog,
         staged: screen.staged(capture, baseline, reference),
         focused: capture.focused,
         bracketed_paste: capture.inspection.bracketed_paste,
@@ -420,9 +448,56 @@ impl Attempt {
         .map_err(|_| MessageError::Internal("delivery attempt progress lock poisoned".into()))
     }
 
-    /// Inside the reservation, up to the one guarded paste. Ok also when the
-    /// policy asked for no paste, a receipt made it unnecessary, or the pane
-    /// refused it with nothing sent: cleanup settles each of those.
+    /// Before each input: the recipient, read again, must still be the one
+    /// the attempt was armed for. [`attempt_session`] cannot know the armed
+    /// scope, so its answer is compared here, with the pane and the harness;
+    /// the scope's baseline must still hold the agent's excluded session.
+    async fn still_armed(&self, scope: &AttemptScope) -> Result<(), MessageError> {
+        let agents = &self.rt.agents;
+        let recipient = (agents.recipient(&scope.recipient).await).map_err(agent_error)?;
+        let session = session_gate(&recipient)?;
+        let excluded = (recipient.excluded.iter()).all(|old| scope.excluded_sessions.contains(old));
+        if recipient.pane == scope.pane
+            && recipient.harness == scope.harness
+            && session == scope.session_id
+            && excluded
+        {
+            Ok(())
+        } else {
+            Err(MessageError::Conflict(format!(
+                "agent {} changed after its attempt was armed",
+                scope.recipient
+            )))
+        }
+    }
+
+    /// One audit record for the attempt's Enter, with the time the call
+    /// returned. The queue never waits: when it is full or stalled the record
+    /// is dropped with a warning, and nothing is typed again for it.
+    fn audit(&self, attempt: u32, entered: &Result<(), ReservationError>) {
+        let Ok(now) = self.rt.clock.now() else {
+            return;
+        };
+        let action = serde_json::json!({
+            "method": "msg.deliver",
+            "message": self.id.to_string(),
+            "attempt": attempt,
+            "op": "enter",
+            "outcome": if entered.is_ok() { "ok" } else { "error" },
+            "error": entered.as_ref().err().map(ToString::to_string),
+        });
+        let sent = OrgCommand::ControlSent(ControlAudit {
+            pane: self.pane.to_string(),
+            action,
+        });
+        self.rt.control.audit_queue().submit(sent, now, None);
+    }
+
+    /// Inside the reservation: at most one guarded paste, then at most one
+    /// guarded Enter that was sent or may have been, then the wait for the
+    /// receipt. Ok also when the policy asked for no paste, a receipt made an
+    /// input unnecessary, the pane refused the paste with nothing sent, or
+    /// the confirmation window ended: cleanup settles each of those.
     async fn work(&self, r: &Reservation) -> Result<(), MessageError> {
         let (rt, id, pane) = (&self.rt, self.id, &self.pane);
         let agent = r.agent().clone();
@@ -447,12 +522,7 @@ impl Attempt {
         let seen = match r.capture(pane, format).await {
             Ok(capture) => tagged(capture).and_then(|capture| {
                 let observation = observation(&recipient, &capture)?;
-                let session_id = attempt_session(
-                    recipient.status,
-                    recipient.session_id.as_ref(),
-                    recipient.session.as_ref().map(|row| &row.id),
-                )?;
-                Ok((capture, session_id, observation))
+                Ok((capture, session_gate(&recipient)?, observation))
             }),
             Err(error) => Err(error.into()),
         };
@@ -542,10 +612,10 @@ impl Attempt {
             matches!(event, Ok(Some(OrgEvent::MessageDeliveryAttempted { message_id, attempt: number, pane: on }))
                 if message_id == id && number == attempt && on == pane.as_str())
         };
-        let seq = (committed.iter())
+        let event = (committed.iter())
             .find(|envelope| ours(OrgEvent::from_parts(&envelope.kind, &envelope.body)))
-            .map(|envelope| envelope.seq);
-        let Some(seq) = seq else {
+            .map(|envelope| (envelope.seq, envelope.ts));
+        let Some((seq, attempted_at)) = event else {
             // An attempt the log already held gives no permission.
             self.set(|progress| progress.attempt = AttemptCommit::Absent)?;
             return Err(MessageError::Conflict(format!(
@@ -557,6 +627,12 @@ impl Attempt {
             progress.seq = Some(seq);
         })?;
         rt.history.folded(seq).await?;
+        // The confirmation window starts at the attempt's event, not at Enter.
+        let settings = rt.policy.settings();
+        let confirm_by = (TimeDelta::from_std(settings.confirmation_timeout).ok())
+            .and_then(|window| attempted_at.checked_add_signed(window))
+            .ok_or_else(|| MessageError::Internal("confirmation deadline overflows".into()))
+            .and_then(|at| rt.clock.deadline(at))?;
 
         // Evidence first, then history, with one scope; then input. History
         // refuses a scope whose sequence is not the message's last attempt.
@@ -570,21 +646,29 @@ impl Attempt {
             excluded_sessions: recipient.excluded.iter().cloned().collect(),
         };
         rt.evidence.arm(scope.clone())?;
-        rt.history
-            .record(HistoryUpdate::Armed { scope }, rt.clock.now()?)?;
+        let armed = HistoryUpdate::Armed {
+            scope: scope.clone(),
+        };
+        rt.history.record(armed, rt.clock.now()?)?;
         if rt.evidence.snapshot(id)?.receipt.is_some() {
             // An earlier attempt's prompt arrived meanwhile: no paste.
             return Ok(());
         }
+        self.still_armed(&scope).await?;
         if rt.cancel.is_cancelled() {
             return Err(shutting_down());
         }
         self.set(|progress| progress.paste = EffectCertainty::Unknown)?;
-        let (baseline, expected) = (recipient.baseline.clone(), reference.clone());
-        let guard = move |capture: &PaneCapture| {
-            guard_allows_input(&guard_facts(paste, capture, screen, &baseline, &expected))
+        // Every decision about an input is this one function of one capture:
+        // the actor's own for each input, a fresh one for each look between.
+        let guard = |input| {
+            let (baseline, expected) = (recipient.baseline.clone(), reference.clone());
+            move |capture: &PaneCapture| {
+                guard_allows_input(&guard_facts(input, capture, screen, &baseline, &expected))
+            }
         };
-        let pasted = r.paste_guarded(pane, agent, reference, format, guard).await;
+        let text = reference.clone();
+        let pasted = (r.paste_guarded(pane, agent.clone(), text, format, guard(paste))).await;
         // No await from the call's return to the record: work can be aborted
         // at any await, and the paste's outcome must not be lost with it.
         let landed = paste_certainty(&pasted);
@@ -596,11 +680,64 @@ impl Attempt {
         };
         rt.history.record(recorded, rt.clock.now()?)?;
         match pasted {
+            Ok(()) => {}
             Err(error) if landed == EffectCertainty::NotStarted => {
                 tracing::debug!(%id, %error, "Message paste was refused; nothing was sent");
-                Ok(())
+                return Ok(());
             }
-            pasted => Ok(pasted?),
+            Err(error) => return Err(error.into()),
+        }
+
+        // The harness draws the paste after tmux has returned: look at the
+        // editor, sending nothing, until the reference is read as the staged
+        // draft and every guard fact allows. A frame here only says when to
+        // try: the Enter's own guard decides again on the actor's capture.
+        let enter = GuardedInput::Enter;
+        loop {
+            if Instant::now() >= confirm_by {
+                // No key at the bound: cleanup looks for the token and holds.
+                return Ok(());
+            }
+            let look_again = Instant::now() + settings.guard_poll_interval;
+            if guard(enter)(&r.capture(pane, format).await?) {
+                if rt.evidence.snapshot(id)?.receipt.is_some() {
+                    // An earlier attempt's prompt arrived: no second one.
+                    return Ok(());
+                }
+                self.still_armed(&scope).await?;
+                if rt.cancel.is_cancelled() {
+                    return Err(shutting_down());
+                }
+                let key = PaneKey::Enter;
+                let entered =
+                    (r.keys_guarded(pane, agent.clone(), key, format, guard(enter))).await;
+                // A refused screen check alone may be looked at again. Any
+                // other return ends the keys, also one that names no effect:
+                // an Enter that was or may have been sent is never repeated.
+                if !matches!(entered, Err(ReservationError::ScreenChanged { .. })) {
+                    self.audit(attempt, &entered);
+                    entered?;
+                    break;
+                }
+            }
+            sleep_until(look_again.min(confirm_by)).await;
+        }
+
+        // Subscribed before the first look, so no receipt is missed between
+        // a look and the wait. A wake is a hint; evidence retains the fact.
+        let mut wake = rt.evidence.subscribe();
+        loop {
+            if rt.evidence.snapshot(id)?.receipt.is_some() {
+                return Ok(());
+            }
+            tokio::select! {
+                changed = wake.changed() => changed.map_err(|_| {
+                    MessageError::Unavailable("message evidence stopped".into())
+                })?,
+                () = rt.cancel.cancelled() => return Err(shutting_down()),
+                // Nothing is failed here: cleanup holds what Enter left.
+                () = sleep_until(confirm_by) => return Ok(()),
+            }
         }
     }
 
@@ -739,7 +876,18 @@ impl Attempt {
         let settled = match (decided, &receipt) {
             (AttemptDisposition::Deliver, Some(receipt)) => self.delivered(receipt, limit).await,
             (AttemptDisposition::Fail, _) => self.fail(progress, limit).await,
-            (AttemptDisposition::Hold(hold), _) => self.hold(progress.seq, hold),
+            (AttemptDisposition::Hold(hold), _) => {
+                // Work may have been stopped inside the paste call, before it
+                // could record the paste. Recording one paste a second time
+                // only resets the same pane clocks again.
+                let pasted = HistoryUpdate::Paste {
+                    id,
+                    pane: self.pane.clone(),
+                    certainty: progress.paste,
+                };
+                let _ = (rt.clock.now()).and_then(|now| rt.history.record(pasted, now));
+                self.hold(progress.seq, hold)
+            }
             _ => Settled::Neither,
         };
         if cleanup_succeeds(decided, settled) {

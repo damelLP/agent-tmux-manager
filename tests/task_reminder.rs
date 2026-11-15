@@ -165,10 +165,8 @@ fn a_silent_turn_end_is_reminded_and_the_next_is_told_to_the_creator() {
 //
 // The stand-in holds the hook that would tell the daemon a turn has started
 // (`hold_next_hook`, `release_hook`): the row reads idle while the screen
-// shows the turn. Written against the controls' contract; never run before
-// they exist.
+// shows the turn.
 #[test]
-#[ignore = "needs cp/s1-standin"]
 fn a_reminder_decided_while_the_row_wrongly_reads_idle_is_typed_after_the_turn() {
     let mut rig = start();
     let lead = rig.ready_agent("lead", StandInMode::Pi);

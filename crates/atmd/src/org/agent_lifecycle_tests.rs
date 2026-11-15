@@ -1268,6 +1268,10 @@ async fn adopt_tag_whose_call_outlives_the_deadline_quarantines() {
             .await
     });
     while mutations(&adoption.rig).is_empty() {
+        // An adopt that ends before its tag never writes one: fail, don't spin.
+        if call.is_finished() {
+            panic!("the adopt ended before its tag: {:?}", call.await);
+        }
         tokio::task::yield_now().await;
     }
     tokio::time::pause();

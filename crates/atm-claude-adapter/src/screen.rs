@@ -54,8 +54,12 @@
 //! captures.
 //!
 //! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
-//! Legacy facts stay Unknown; the staged matcher accepts only the complete
-//! captured completion layout with both editor and selected command exact.
+//! Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
+//! Fullscreen also places the menu above the editor, with other matching skills
+//! and aligned wrapped descriptions. It is recognized without a startup header;
+//! its transcript tail still proves neither idle nor freshness. Both completion
+//! layouts require the editor and selected command exact before Enter. A present
+//! but invalid menu refuses staging and control, never an ordinary-editor fallback.
 //! The control observer additionally recognizes captured launch/footer modes.
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
@@ -136,8 +140,8 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 ///
 /// Requires Styled and a nonempty expected string without controls or trailing
 /// whitespace. Compares after removing trailing ASCII spaces from the draft only;
-/// leading whitespace stays exact. The known single-command completion menu also
-/// matches when both the editor draft and selected command equal expected exactly;
+/// leading whitespace stays exact. A captured completion menu matches only
+/// when both the editor draft and selected command equal expected exactly;
 /// its description is not command identity. Other differences return Some(false);
 /// unknown layouts, faint text and multiline/wrapped drafts return None. A match proves
 /// visible text only, not that Enter submits it: consumers must handle popups
@@ -153,8 +157,12 @@ pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bo
     }
     if let ScreenInput::Styled(text) = input {
         let screen = StyledScreen::parse(text).ok()?;
-        if let Some((draft, selected)) = control::completion_draft(&screen) {
-            return Some(draft == expected && selected == expected);
+        match control::completion_draft(&screen) {
+            control::CompletionDraft::Recognised { draft, selected } => {
+                return Some(draft == expected && selected == expected);
+            }
+            control::CompletionDraft::Invalid => return None,
+            control::CompletionDraft::Absent => {}
         }
     }
     let (_, draft) = inspect(input, None);

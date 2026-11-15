@@ -688,8 +688,10 @@ impl Reservation {
     /// foreground process, focus and screen on that capture; this effect does
     /// not infer dialog permission. There is deliberately no unguarded form.
     ///
-    /// Uses one `send-keys -l -t <pane> -- <character>` command (tmux's command
-    /// parser requires escaping a semicolon). Success acknowledges tmux, not
+    /// Uses one `send-keys -l -t <pane> -- <character>` command. A private raw-byte
+    /// probe on tmux 3.8 verified that a bare `;` returns success but delivers
+    /// nothing, even after `--`; `\;` delivers `;`. Keep the escape to avoid
+    /// reporting a key sent when none arrived. Success acknowledges tmux, not
     /// the application. Errors may leave the outcome unknown; never retry
     /// blindly. No automatic retry or additional key is sent.
     pub async fn literal_key_guarded<P>(

@@ -4181,7 +4181,7 @@ mod reconciliation {
                 *rig.proc.lock().unwrap() = processes.clone();
                 // A bound agent's restart check reads its screen; one without
                 // a session only inspects when nothing can be pinned.
-                match (&script, bound) {
+                let script_pane = || match (&script, bound) {
                     (Script::Frame(command), true) => rig.frame_of("%1", "p/lead", IDLE, command),
                     (Script::Frame(command), false) => inspect_with(&rig, command),
                     (Script::NoCommand, true) => {
@@ -4195,7 +4195,8 @@ mod reconciliation {
                             .unwrap();
                     }
                     (Script::NoCommand, false) => rig.inspect_only("%1", "p/lead"),
-                }
+                };
+                script_pane();
                 let (agents, _) = rig.start();
                 agents.reconciled().await.unwrap();
                 assert_eq!(unread(&rig), 0, "{case} {bound}");
@@ -4212,9 +4213,25 @@ mod reconciliation {
                 };
                 assert_eq!((lead.status, lead.reason), (status, None), "{case} {bound}");
                 assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+                let mut events = agents.observation_events();
+
+                // The suspended agent is Starting with its session now. A
+                // later pass over the same pane (its session reports again)
+                // pins nothing either, and the reason stays.
+                if bound && row {
+                    script_pane();
+                    update(&rig, id).await;
+                    progress(&mut events, "finished", Some("p/lead")).await;
+                    assert_eq!(unread(&rig), 0, "{case}");
+                    assert_eq!(
+                        listed_reason(&agents).await.as_deref(),
+                        Some(text),
+                        "{case}"
+                    );
+                    assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+                }
 
                 // The harness is in front with its row: the pass pins it.
-                let mut events = agents.observation_events();
                 *rig.proc.lock().unwrap() = Some(job());
                 rig.frame("%1", "p/lead", IDLE);
                 if row {
@@ -4260,6 +4277,46 @@ mod reconciliation {
         assert_eq!(unread(&rig), 0);
         assert_eq!(listed_reason(&agents).await, None);
         assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn ready_agent_bound_by_a_late_row_keeps_its_reason_and_is_then_pinned() {
+        // A Ready agent without a session, nothing pinned (no row of its
+        // harness at the restart check): the list says why. Its session's
+        // row arrives and is bound, with no screen read; the reason stays.
+        // The session's next event, its own now, starts the pass that pins.
+        // Twin, Starting before the binding (after an adopt):
+        // adopted_agent_bound_by_its_first_event_says_why_and_is_then_pinned.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        inspect_with(&rig, "pi");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(listed_reason(&agents).await.as_deref(), Some(NOT_CONFIRMED));
+        let mut events = agents.observation_events();
+
+        inspect_with(&rig, "pi");
+        rig.row("s1", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(
+            told(&agents).await,
+            (
+                AgentStatus::Ready,
+                Some(SessionId::new("s1")),
+                PaneBaseline::unproven(),
+                Some(SessionId::new("s1"))
+            )
+        );
+        assert_eq!(listed_reason(&agents).await.as_deref(), Some(NOT_CONFIRMED));
+
+        rig.frame("%1", "p/lead", IDLE);
+        update(&rig, "s1").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(told(&agents).await.2, pinned_to("pi"));
+        assert_eq!(listed_reason(&agents).await, None);
         assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
     }
 
@@ -4339,6 +4396,27 @@ mod reconciliation {
             Some(SHELL_HOLDS_CHILD)
         );
         assert_eq!(agents.refusal_of(&lead, "%2"), None);
+
+        // The write, too: what is stored for the agent is a record of
+        // another pane, and the pass refuses on %1. The reason is stored for
+        // %1 (where the read finds it), not put into the other pane's record.
+        let (rig, agents) = pinned_ready().await;
+        agents.record_baseline(lead.clone(), "%2", pinned_to("pi"));
+        let mut events = agents.observation_events();
+        *rig.proc.lock().unwrap() = Some(shell_with_child("zsh"));
+        inspect_with(&rig, "zsh");
+        rig.row("pending-300", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(
+            agents.refusal_of(&lead, "%1").as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
+        assert_eq!(agents.refusal_of(&lead, "%2"), None);
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
     }
 
     #[tokio::test]
@@ -4425,10 +4503,39 @@ mod reconciliation {
             pane: pane.map(|pane| PaneId::parse(pane).unwrap()),
             kind,
         };
-        assert_eq!(
-            quarantine_text(&quarantine(Some("%1"), ReservationKind::Down)),
-            QUARANTINED_DOWN
-        );
+        // Every kind, character for character. The words are those of the
+        // `agent.<kind>` methods; a delivery and the observer's own
+        // reservation have none and are a delivery and an observation.
+        for (kind, text) in [
+            (
+                ReservationKind::Up,
+                "quarantined: the agent's up on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Adopt,
+                "quarantined: the agent's adopt on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Clear,
+                "quarantined: the agent's clear on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Respawn,
+                "quarantined: the agent's respawn on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (ReservationKind::Down, QUARANTINED_DOWN),
+            (
+                ReservationKind::Delivery,
+                "quarantined: the agent's delivery on %1 could not be settled; restart atmd and reconcile",
+            ),
+            (
+                ReservationKind::Observe,
+                "quarantined: the agent's observation on %1 could not be settled; restart atmd and reconcile",
+            ),
+        ] {
+            assert_eq!(quarantine_text(&quarantine(Some("%1"), kind)), text);
+        }
+        // The pane is the one the quarantine names; without one, none.
         assert_eq!(
             quarantine_text(&quarantine(Some("%12"), ReservationKind::Respawn)),
             "quarantined: the agent's respawn on %12 could not be settled; restart atmd and reconcile"
@@ -4437,21 +4544,6 @@ mod reconciliation {
             quarantine_text(&quarantine(None, ReservationKind::Up)),
             "quarantined: the agent's up could not be settled; restart atmd and reconcile"
         );
-        // The other kinds are named as their `agent.<kind>` methods are; the
-        // observer's own reservation is an observation.
-        for (kind, name) in [
-            (ReservationKind::Adopt, "adopt"),
-            (ReservationKind::Clear, "clear"),
-            (ReservationKind::Observe, "observation"),
-        ] {
-            assert_eq!(
-                quarantine_text(&quarantine(Some("%1"), kind)),
-                format!(
-                    "quarantined: the agent's {name} on %1 could not be settled; \
-                     restart atmd and reconcile"
-                )
-            );
-        }
     }
 
     #[tokio::test]
@@ -4669,6 +4761,74 @@ mod reconciliation {
         include!("agent_start_dialog_tests.rs");
         include!("agent_respawn_tests.rs");
         include!("stop_tests.rs");
+
+        // Here for the adopt rig of the files above.
+        #[tokio::test]
+        async fn adopted_agent_bound_by_its_first_event_says_why_and_is_then_pinned() {
+            // An adopt that cannot place the harness (here: a screen the
+            // adapter does not know) leaves the agent Starting, with no
+            // session and nothing recorded about its pane. The harness's next
+            // event binds it, and a binding reads no screen: the agent is
+            // Ready with nothing pinned, so every input to it is refused. The
+            // binding pass says so, and with that reason stored the agent's
+            // own session starts the pass that pins it.
+            // Twin, Ready before the binding:
+            // ready_agent_bound_by_a_late_row_keeps_its_reason_and_is_then_pinned.
+            let mut adoption = Adoption::new().await;
+            adoption.rig.row("s1", "%1", false).await;
+            *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+            adoption.script_untagged();
+            adoption.script_untagged_capture("unknown\n", "pi");
+            adoption.script_untagged_capture("unknown\n", "pi");
+            adoption.script_tag();
+            adoption.script_follow_up(Some(("unknown\n", "pi")));
+            assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+            // Starting, waiting for its session: the list shows no reason.
+            adoption.followed().await;
+            let agent = adoption.agent().await.unwrap();
+            assert_eq!(
+                (agent.status, agent.session_id),
+                (AgentStatus::Starting, None)
+            );
+            assert_eq!(
+                adoption.agents.baseline_of(&adoptee(), "%1"),
+                PaneBaseline::unproven()
+            );
+
+            adoption.script_follow_up(None);
+            update(&adoption.rig, "s1").await;
+            progress(&mut adoption.events, "finished", Some("q/lead")).await;
+            assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+            let agent = adoption.agent().await.unwrap();
+            assert_eq!(
+                (agent.status, agent.session_id),
+                (AgentStatus::Ready, Some(SessionId::new("s1")))
+            );
+            assert_eq!(
+                adoption.agents.baseline_of(&adoptee(), "%1"),
+                PaneBaseline::unproven()
+            );
+            assert_eq!(
+                adoption.agents.refusal_of(&adoptee(), "%1").as_deref(),
+                Some(NOT_CONFIRMED)
+            );
+            assert_eq!(
+                listed_reason(&adoption.agents).await.as_deref(),
+                Some(NOT_CONFIRMED)
+            );
+
+            // The harness shows its editor; its own session reports again.
+            adoption.script_follow_up(Some((PI_PADDED, "pi")));
+            update(&adoption.rig, "s1").await;
+            adoption.followed().await;
+            assert_eq!(
+                adoption.agents.baseline_of(&adoptee(), "%1"),
+                PaneBaseline::adopted(100)
+                    .with_harness("pi".into())
+                    .unwrap()
+            );
+            assert_eq!(adoption.agent().await.unwrap().status, AgentStatus::Ready);
+        }
     }
 
     #[tokio::test]

@@ -193,7 +193,11 @@ pub enum ReservationKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quarantine {
     pub agent: AgentId,
-    /// The pane the operation reserved, or else the one it created.
+    /// The pane the operation created, when it created one; else the pane it
+    /// reserved. A respawn reserves the agent's old pane and creates the new
+    /// one: quarantined after its split it names the new pane (the old one
+    /// is gone by then), before it the old one. An up reserves no pane: it
+    /// names the pane it created, or none.
     pub pane: Option<PaneId>,
     pub kind: ReservationKind,
 }

@@ -41,19 +41,28 @@ pub enum AgentAction {
         format: AgentFormat,
     },
     Clear {
-        agent: AgentId,
+        #[arg(value_parser = super::agent_target::parse_agent)]
+        agent: String,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
         #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=120_000))]
         timeout_ms: u64,
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
     Respawn {
-        agent: AgentId,
+        #[arg(value_parser = super::agent_target::parse_agent)]
+        agent: String,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
     Down {
-        agent: AgentId,
+        #[arg(value_parser = super::agent_target::parse_agent)]
+        agent: String,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
         #[arg(long)]
         kill: bool,
         #[arg(long, value_enum, default_value = "text")]
@@ -179,12 +188,16 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
         ),
         AgentAction::Clear {
             agent,
+            project_root,
             timeout_ms,
             format,
         } => (
             request::<_, ClearResult>(
                 "agent.clear",
-                ClearParams { agent, timeout_ms },
+                ClearParams {
+                    agent: super::agent_target::agent(&agent, project_root).await?,
+                    timeout_ms,
+                },
                 timeout_ms.div_ceil(1000) + 25,
             )
             .await?,
@@ -192,11 +205,15 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
             &["agent_id", "session_id"][..],
             false,
         ),
-        AgentAction::Respawn { agent, format } => (
+        AgentAction::Respawn {
+            agent,
+            project_root,
+            format,
+        } => (
             request::<_, RespawnResult>(
                 "agent.respawn",
                 RespawnParams {
-                    agent,
+                    agent: super::agent_target::agent(&agent, project_root).await?,
                     caller_server: None,
                 },
                 85,
@@ -208,10 +225,19 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
         ),
         AgentAction::Down {
             agent,
+            project_root,
             kill,
             format,
         } => (
-            request::<_, DownResult>("agent.down", DownParams { agent, kill }, 55).await?,
+            request::<_, DownResult>(
+                "agent.down",
+                DownParams {
+                    agent: super::agent_target::agent(&agent, project_root).await?,
+                    kill,
+                },
+                55,
+            )
+            .await?,
             matches!(format, AgentFormat::Json),
             &["agent_id"][..],
             false,

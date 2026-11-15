@@ -62,8 +62,10 @@ pub enum MsgAction {
 }
 #[derive(Debug, Args)]
 pub struct InboxArgs {
-    #[arg(long = "for")]
-    recipient: Option<Address>,
+    #[arg(long = "for", value_parser = super::agent_target::parse_address)]
+    recipient: Option<String>,
+    #[arg(long)]
+    project_root: Option<PathBuf>,
     #[arg(long)]
     unread: bool,
     #[arg(long, conflicts_with = "after")]
@@ -277,10 +279,14 @@ fn render_inbox(
     Ok(())
 }
 pub async fn cmd_inbox(args: InboxArgs) -> Result<()> {
+    let recipient = match args.recipient {
+        Some(to) => Some(super::agent_target::address(&to, args.project_root).await?),
+        None => None,
+    };
     let (result, raw): (InboxResult, _) = request(
         "msg.inbox",
         InboxParams {
-            recipient: args.recipient.clone(),
+            recipient: recipient.clone(),
             unread_only: args.unread,
             count_only: false,
             id: args.id,
@@ -293,9 +299,7 @@ pub async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     let mut out = io::stdout().lock();
     match args.format {
         MessageFormat::Json => output(&raw, args.format, "", &mut out),
-        MessageFormat::Text => {
-            render_inbox(&result, args.recipient.as_ref(), args.unread, &mut out)
-        }
+        MessageFormat::Text => render_inbox(&result, recipient.as_ref(), args.unread, &mut out),
     }
 }
 

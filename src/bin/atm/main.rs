@@ -164,7 +164,6 @@ mod agent_contract_tests {
     #[test]
     fn clear_rejects_bad_ids_and_timeout_bounds() {
         for args in [
-            vec!["atm", "agent", "clear", "lead"],
             vec!["atm", "agent", "clear", "project/lead", "--timeout-ms", "0"],
             vec![
                 "atm",

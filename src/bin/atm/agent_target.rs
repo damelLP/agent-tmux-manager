@@ -23,11 +23,31 @@ async fn list(root: Option<PathBuf>) -> Result<ListResult> {
     .map(|(result, _)| result)
 }
 
+pub(super) fn parse_agent(text: &str) -> Result<String, String> {
+    let validated = if text.contains('/') {
+        text.parse::<AgentId>()
+    } else {
+        "validation"
+            .parse()
+            .and_then(|project| AgentId::new(project, text))
+    };
+    validated
+        .map(|_| text.to_owned())
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn parse_address(text: &str) -> Result<String, String> {
+    if text == "owner" || text == "system" {
+        return Ok(text.to_owned());
+    }
+    parse_agent(text)
+}
+
 fn unique_name(rows: &[AgentListEntry], name: &str) -> Result<AgentId> {
     let mut matches = rows.iter().filter(|row| row.agent_id.name == name);
     let first = matches
         .next()
-        .with_context(|| format!("agent {name} was not found in the selected project"))?;
+        .with_context(|| format!("agent {name} was not found in the selected project; use project/name or --project-root <path>"))?;
     if matches.next().is_some() {
         bail!("agent name {name} is ambiguous; use project/name");
     }

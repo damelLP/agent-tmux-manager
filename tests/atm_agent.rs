@@ -274,7 +274,13 @@ async fn agent_cli_parse_failures_exit_two_without_connecting() {
     }
     for action in ["clear", "respawn", "down"] {
         for id in [
-            "lead",
+            "",
+            "Lead",
+            "léad",
+            " lead",
+            "owner",
+            "system",
+            "012345678901234567890123456789012",
             "/lead",
             "project/",
             "project/owner",

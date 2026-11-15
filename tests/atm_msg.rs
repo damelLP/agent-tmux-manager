@@ -1,7 +1,14 @@
 //! CLI contracts against a private scripted peer, NOT delivery acceptance.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use serde_json::{json, Value};
-use std::{process::Output, time::Duration};
+use std::{
+    process::Output,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
@@ -23,8 +30,15 @@ fn ok(method: &'static str, params: Value, result: Value) -> Step {
 async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: bool) -> Output {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("rpc.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = Arc::new(UnixListener::bind(&socket).unwrap());
     for step in &mut steps {
+        if step.method == "agent.respawn" {
+            step.params["caller_server"] = json!(dir
+                .path()
+                .join(format!("tmux/tmux-{}/message-cli-test", unsafe {
+                    libc::getuid()
+                })));
+        }
         if step.params["project_root"] == "$cwd" {
             step.params["project_root"] = json!(dir.path());
         }
@@ -33,7 +47,11 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
         }
     }
     let expected_pane = pane.map(str::to_owned);
-    let peer = tokio::spawn(async move {
+    let remaining = Arc::new(AtomicUsize::new(steps.len()));
+    let peer_remaining = Arc::clone(&remaining);
+    let peer_listener = Arc::clone(&listener);
+    let mut peer = tokio::spawn(async move {
+        let listener = peer_listener;
         for step in steps {
             let (mut read, mut write) = loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -57,6 +75,7 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
                     0,
                     "old daemon must receive no request"
                 );
+                peer_remaining.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
             read.read_line(&mut line).await.unwrap();
@@ -67,6 +86,7 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
                 req.get("from_pane").and_then(Value::as_str),
                 expected_pane.as_deref()
             );
+            peer_remaining.fetch_sub(1, Ordering::SeqCst);
             let mut reply = step.payload;
             reply["type"] = json!("response");
             reply["id"] = req["id"].clone();
@@ -89,24 +109,47 @@ async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: b
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env("ATM_SOCKET", socket)
+        .env("ATM_TMUX_SOCKET", "message-cli-test")
+        .env("TMUX_TMPDIR", dir.path().join("tmux"))
         .env("ATM_STATE_DIR", dir.path().join("state"))
         .env("XDG_STATE_HOME", dir.path().join("xdg"))
         .kill_on_drop(true);
     if let Some(pane) = pane {
         command.env("TMUX_PANE", pane);
     }
-    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
-        .await
-        .unwrap()
-        .unwrap();
-    if output.status.success() != success {
-        peer.abort();
-        panic!("unexpected CLI result: {output:?}");
-    }
-    tokio::time::timeout(Duration::from_secs(30), peer)
-        .await
-        .unwrap()
-        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(30), async {
+        let child = command.output();
+        tokio::pin!(child);
+        tokio::select! {
+            result = &mut peer => {
+                result.unwrap();
+                tokio::select! {
+                    output = &mut child => output.unwrap(),
+                    extra = listener.accept() => panic!("unexpected connection after script: {extra:?}"),
+                }
+            }
+            output = &mut child => {
+                let output = output.unwrap();
+                if output.status.success() != success || remaining.load(Ordering::SeqCst) != 0 {
+                    peer.abort();
+                    panic!("unexpected CLI result or missing scripted request: {output:?}");
+                }
+                peer.await.unwrap();
+                output
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.success(), success, "{output:?}");
+    std::future::poll_fn(|cx| {
+        assert!(
+            listener.poll_accept(cx).is_pending(),
+            "unexpected extra connection"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
     output
 }
 fn send(to: &str, body: &str) -> Value {
@@ -514,6 +557,310 @@ async fn old_daemon_is_rejected_before_sending_a_request() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("the daemon is too old; restart atmd"));
 }
 
+const TARGET_ACTIONS: [&str; 5] = ["clear", "respawn", "down", "down-kill", "inbox"];
+
+fn target_args<'a>(action: &str, target: &'a str) -> Vec<&'a str> {
+    match action {
+        "clear" => vec!["agent", "clear", target],
+        "respawn" => vec!["agent", "respawn", target],
+        "down" => vec!["agent", "down", target],
+        "down-kill" => vec!["agent", "down", target, "--kill"],
+        "inbox" => vec!["inbox", "--for", target],
+        _ => panic!("unknown test action"),
+    }
+}
+
+fn target_step(action: &str, target: &str) -> Step {
+    match action {
+        "clear" => ok(
+            "agent.clear",
+            json!({"agent":target,"timeout_ms":30000}),
+            json!({"agent_id":target,"session_id":null}),
+        ),
+        "respawn" => ok(
+            "agent.respawn",
+            json!({"agent":target}),
+            json!({"agent_id":target,"pane":"%9"}),
+        ),
+        "down" | "down-kill" => ok(
+            "agent.down",
+            json!({"agent":target,"kill":action == "down-kill"}),
+            json!({"agent_id":target}),
+        ),
+        "inbox" => {
+            let mut params = inbox();
+            params["for"] = json!(target);
+            ok(
+                "msg.inbox",
+                params,
+                json!({"messages":[],"unread_count":0,"next_after":null}),
+            )
+        }
+        _ => panic!("unknown test action"),
+    }
+}
+
+#[tokio::test]
+async fn all_agent_targets_accept_bare_and_full_ids() {
+    for action in TARGET_ACTIONS {
+        for target in ["worker", "p/worker"] {
+            let mut steps = vec![];
+            if target == "worker" {
+                steps.push(ok(
+                    "agent.list",
+                    json!({"project_root":"$cwd"}),
+                    json!([
+                        agent("p/worker-extra", None, "ready"),
+                        agent("p/worker", None, "starting")
+                    ]),
+                ));
+            }
+            steps.push(target_step(action, "p/worker"));
+            let out = run(&target_args(action, target), None, steps, true).await;
+            assert!(out.stderr.is_empty(), "{action}: {out:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn all_agent_targets_refuse_missing_or_ambiguous_names() {
+    for action in TARGET_ACTIONS {
+        for (rows, diagnostic) in [
+            (json!([]), "was not found"),
+            (json!([agent("p/other", None, "ready")]), "was not found"),
+            (
+                json!([
+                    agent("p/worker", None, "ready"),
+                    agent("q/worker", None, "ready")
+                ]),
+                "ambiguous",
+            ),
+        ] {
+            let out = run(
+                &target_args(action, "worker"),
+                None,
+                vec![ok("agent.list", json!({"project_root":"$cwd"}), rows)],
+                false,
+            )
+            .await;
+            assert_eq!(out.status.code(), Some(1), "{action}: {out:?}");
+            assert!(out.stdout.is_empty());
+            let error = String::from_utf8(out.stderr).unwrap();
+            assert!(
+                error.contains(diagnostic) && error.contains("project/name"),
+                "{action}: {error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn all_agent_targets_use_bound_project_or_absolute_root() {
+    for action in TARGET_ACTIONS {
+        run(
+            &target_args(action, "worker"),
+            Some("%7"),
+            vec![
+                ok(
+                    "agent.list",
+                    json!({"project_root":null}),
+                    json!([
+                        agent("p/caller", Some("%7"), "ready"),
+                        agent("p/worker", Some("%8"), "ready"),
+                        agent("q/worker", Some("%9"), "ready")
+                    ]),
+                ),
+                target_step(action, "p/worker"),
+            ],
+            true,
+        )
+        .await;
+        for (root, expected) in [("/q", "/q"), ("sub", "$cwd/sub")] {
+            let mut args = target_args(action, "worker");
+            args.extend(["--project-root", root]);
+            run(
+                &args,
+                Some("%7"),
+                vec![
+                    ok(
+                        "agent.list",
+                        json!({"project_root":expected}),
+                        json!([agent("q/worker", None, "ready")]),
+                    ),
+                    target_step(action, "q/worker"),
+                ],
+                true,
+            )
+            .await;
+        }
+        for rows in [
+            json!([]),
+            json!([agent("p/caller", Some("%8"), "ready")]),
+            json!([agent("p/caller", Some("%7"), "down")]),
+        ] {
+            run(
+                &target_args(action, "worker"),
+                Some("%7"),
+                vec![
+                    ok("agent.list", json!({"project_root":null}), rows),
+                    ok(
+                        "agent.list",
+                        json!({"project_root":"$cwd"}),
+                        json!([agent("q/worker", None, "ready")]),
+                    ),
+                    target_step(action, "q/worker"),
+                ],
+                true,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn all_agent_targets_refuse_ambiguous_bindings_or_cross_project_fallback() {
+    for action in TARGET_ACTIONS {
+        for (rows, diagnostic) in [
+            (
+                json!([
+                    agent("p/a", Some("%7"), "ready"),
+                    agent("q/b", Some("%7"), "starting"),
+                    agent("p/worker", None, "ready")
+                ]),
+                "caller pane has ambiguous agent bindings",
+            ),
+            (
+                json!([
+                    agent("p/caller", Some("%7"), "ready"),
+                    agent("q/worker", None, "ready")
+                ]),
+                "was not found",
+            ),
+        ] {
+            let out = run(
+                &target_args(action, "worker"),
+                Some("%7"),
+                vec![ok("agent.list", json!({"project_root":null}), rows)],
+                false,
+            )
+            .await;
+            assert_eq!(out.status.code(), Some(1), "{action}: {out:?}");
+            assert!(out.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(diagnostic),
+                "{out:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_addresses_preserve_bypass_and_system_policy() {
+    for action in TARGET_ACTIONS {
+        let mut args = target_args(action, "p/worker");
+        args.extend(["--project-root", "/not-a-project"]);
+        run(
+            &args,
+            Some("not-a-pane"),
+            vec![target_step(action, "p/worker")],
+            true,
+        )
+        .await;
+        for root in [None, Some("/q")] {
+            let mut args = target_args(action, "worker");
+            if let Some(root) = root {
+                args.extend(["--project-root", root]);
+            }
+            let out = run(&args, Some("not-a-pane"), vec![], false).await;
+            assert_eq!(out.status.code(), Some(1), "{action}: {out:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("pane"));
+        }
+    }
+    run(
+        &[
+            "inbox",
+            "--for",
+            "owner",
+            "--project-root",
+            "/not-a-project",
+        ],
+        Some("not-a-pane"),
+        vec![target_step("inbox", "owner")],
+        true,
+    )
+    .await;
+    run(
+        &["inbox", "--project-root", "/not-a-project"],
+        None,
+        vec![ok(
+            "msg.inbox",
+            inbox(),
+            json!({"messages":[],"unread_count":0,"next_after":null}),
+        )],
+        true,
+    )
+    .await;
+    let mut params = inbox();
+    params["for"] = json!("system");
+    let out = run(&["inbox", "--for", "system"], None, vec![Step {
+        method: "msg.inbox", params,
+        payload: json!({"error":{"code":"refused","message":"system is not a message recipient or inbox"}}),
+    }], false).await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("system is not a message recipient or inbox")
+    );
+    run(
+        &[
+            "msg",
+            "send",
+            "--to",
+            "owner",
+            "--body",
+            "hi",
+            "--project-root",
+            "/not-a-project",
+        ],
+        Some("not-a-pane"),
+        vec![ok(
+            "msg.send",
+            send("owner", "hi"),
+            json!({"message_id":"m1"}),
+        )],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bare_inbox_pagination_keeps_resolved_recipient() {
+    let mut params = inbox();
+    params["for"] = json!("p/worker");
+    params["unread_only"] = json!(true);
+    let out = run(
+        &["inbox", "--for", "worker", "--unread"],
+        None,
+        vec![
+            ok(
+                "agent.list",
+                json!({"project_root":"$cwd"}),
+                json!([agent("p/worker", None, "ready")]),
+            ),
+            ok(
+                "msg.inbox",
+                params,
+                json!({"messages":[],"unread_count":0,"next_after":"m3"}),
+            ),
+        ],
+        true,
+    )
+    .await;
+    assert_eq!(
+        out.stdout,
+        b"0 unread\nnext: --for p/worker --unread --after m3\n"
+    );
+}
+
 #[tokio::test]
 async fn local_validation_and_retry_warning_need_no_connection() {
     for (args,code,needle) in [
@@ -523,6 +870,11 @@ async fn local_validation_and_retry_warning_need_no_connection() {
         (vec!["msg","send","--to","bad/name/extra","--body","x"],1,"agent"),
         (vec!["msg","ack","m01"],2,"invalid"),
         (vec!["inbox","--id","m1","--after","m2"],2,"cannot be used"),
+        (vec!["inbox","--for",""],2,"invalid"),
+        (vec!["inbox","--for","Bad"],2,"invalid"),
+        (vec!["inbox","--for","p/"],2,"invalid"),
+        (vec!["inbox","--for","p/a/b"],2,"invalid"),
+        (vec!["inbox","--for","p/owner"],2,"invalid"),
         (vec!["msg","send","--to","owner","--body","x","--from","p/a"],2,"unexpected"),
         (vec!["msg","ack"],2,"required"),
     ] {

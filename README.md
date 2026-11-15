@@ -98,7 +98,12 @@ atm layout pair                    # two agents + ATM sidebar
 ```bash
 atm agent up worker                          # start the agent of role "worker" in this project
 atm agent up worker --project-root ../other  # ... in another project
+atm agent clear worker                      # clear the agent's current context
+atm agent respawn worker                    # replace its pane and start it again
+atm agent down worker --kill                # stop the agent and kill its pane
 ```
+
+For `clear`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
 
 `atm agent up <name>` asks `atmd` to start the agent that `.atm/roles/<name>.md` under the project root describes. The project root is the current directory unless `--project-root` is given. `atmd` splits a new pane at 50% without moving your focus, waits there for an idle shell, types one launch line and Enter, and waits for the harness. The line is `cd <the role's cwd> && ATM_AGENT=<project>/<name>`, then the role's `command_prefix`, then the harness command with the role's `spawn_args` and `model`.
 
@@ -126,9 +131,10 @@ apply.
 The message CLI is distinct from the immediate `atm send` command. It calls the daemon's `msg.*` service, with no direct-tmux fallback. `atmd` starts the runtime at startup using the configured delivery policy or its defaults.
 
 ```sh
-atm msg send --to project/worker --kind brief --body 'Read the attached brief' --attach /absolute/path/brief.md --task task-1
+atm msg send --to worker --kind brief --body 'Read the attached brief' --attach /absolute/path/brief.md --task task-1
 atm msg send --to owner --kind report --body 'Tests passed'
 atm inbox                             # your inbox; does not mark anything read
+atm inbox --for worker --unread --limit 100
 atm inbox --for owner --unread --limit 100
 atm inbox --id m123 --format json      # full original body, including newlines
 atm inbox --after m123 --limit 100      # explicit pagination; follow next_after
@@ -137,7 +143,7 @@ atm msg retry m123 --accept-duplicate-risk
 atm msg give-up m123
 ```
 
-All commands accept `--format text|json` (default `text`). Send requires `--to` and `--body`; optional flags are `--kind`, repeatable `--attach`, `--task`, and `--project-root`. Kinds are `note` (default), `brief`, `report`, `question`, `answer`, and `review`. Inbox accepts `--for`, `--unread`, `--id`, `--after`, and `--limit`; `--id` and `--after` are mutually exclusive. IDs use canonical `mN` form.
+All commands accept `--format text|json` (default `text`). Send requires `--to` and `--body`; optional flags are `--kind`, repeatable `--attach`, `--task`, and `--project-root`. Kinds are `note` (default), `brief`, `report`, `question`, `answer`, and `review`. Inbox accepts `--for`, `--project-root`, `--unread`, `--id`, `--after`, and `--limit`; `--id` and `--after` are mutually exclusive. IDs use canonical `mN` form.
 
 - Targets are `owner`, a full `project/name` address, or an exact bare agent name. Full addresses bypass name lookup. Bare names use `--project-root` if supplied (relative paths become absolute); otherwise they use the uniquely bound, non-Down caller pane's project, or the absolute current directory if unbound. Unknown/ambiguous names or caller bindings fail rather than guessing across projects. `system` is not a recipient or inbox.
 - Sender attribution comes from the caller's pane binding; an unbound caller is Owner. There is no `--from` or send-now bypass. Owner can inspect agent inboxes; agents can inspect only their own. System notices and Owner-only resolution rely on local socket/client-supplied pane attribution, **not authentication against hostile local clients**.

@@ -1,4 +1,5 @@
 //! P5 capture provenance and source mappings are in fixtures/README.md.
+#![cfg(test)]
 use atm_core::harness_control::ControlDialog;
 use atm_core::{
     DialogState, FreshEditorEvidence, InputState, ScreenCursor, ScreenInput, TurnState,

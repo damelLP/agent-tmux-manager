@@ -1,4 +1,5 @@
 //! P5 capture provenance and source mappings are in fixtures/README.md.
+#![cfg(test)]
 use atm_claude_adapter::screen::{observe_control_screen, observe_screen, staged_draft_matches};
 use atm_core::harness_control::ControlDialog;
 use atm_core::{

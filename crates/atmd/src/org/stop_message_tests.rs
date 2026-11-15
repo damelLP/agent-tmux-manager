@@ -91,6 +91,51 @@ async fn stop_with_a_held_delivery_attempt_ends_inside_the_budget() {
     assert_eq!(rig.org.status().unwrap(), before + 1);
 }
 
+/// The stop arrives while tmux has taken the paste but not answered its call.
+/// When the call answers, cleanup can inspect the staged reference and hold
+/// the attempt without sending Enter or writing another event.
+#[tokio::test(start_paused = true)]
+async fn stop_while_the_paste_has_not_answered_settles_inside_the_message_budget() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id)]);
+    let before = rig.org.status().unwrap();
+    rig.fold_rest();
+    rig.tmux_gate.hold_next(Effect::PasteText).unwrap();
+    let attempt = rig.spawn_deliver(id);
+    guarded(rig.tmux_gate.entered()).await;
+
+    let answer_paste = async {
+        // The message token is cancelled after reserved work is stopped.
+        rig.rt.cancel.cancelled().await;
+        // atm-tmux/src/client.rs's private COMMAND_TIMEOUT, per command.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        rig.tmux_gate.release();
+    };
+    let (stopped, ()) = guarded(async {
+        tokio::join!(stop_during(&rig, attempt, true), answer_paste)
+    })
+    .await;
+
+    assert_eq!(stopped.overruns, []);
+    assert!(
+        matches!(
+            stopped.delivered,
+            Some(Err(MessageError::Reservation(
+                ReservationError::Unavailable
+            )))
+        ),
+        "{:?}",
+        stopped.delivered
+    );
+    assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 0));
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+}
+
 /// The attempt has not started: it waits for its reservation behind another
 /// job on the recipient's pane. The stop refuses what waits, so the executor
 /// returns at once, having committed and typed nothing; the message stays

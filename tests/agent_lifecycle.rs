@@ -849,8 +849,104 @@ fn durable_clearing_after_restart_refuses_raw_send() {}
 /// ready/delivered and the stand-in gates; exactly one new-generation prompt
 /// contains the token, never concatenated /clear or /new. No substitute executor.
 #[test]
-#[ignore = "waits for Task 12: Task 8 plus U9b slice B integration"]
-fn msg_send_during_clear_delivers_once_to_new_generation() {}
+fn msg_send_during_clear_delivers_once_to_new_generation() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start_with_config(mode, DELIVERY);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, pane) = (started.id.as_str(), &started.pane);
+    let old = test.complete_fixture_turn(pane);
+    let cursor = test.cursor();
+    let after = test.rig.event_cursor(pane);
+    let call = test.call_in_background("agent.clear", json!({"agent": id, "timeout_ms": 30000}));
+    test.rig.wait_event(pane, after, |e| {
+        e["kind"] == "rendered" && e["state"] == "clearing"
+    });
+    // Sent while the stand-in holds the clear: recorded, and not typed.
+    let sent = test.rpc(
+        "msg.send",
+        json!({"to": id, "body": "after the clear"}),
+        None,
+    );
+    let message = sent["message_id"].as_str().unwrap().to_owned();
+    let reference = format!("[{message}] Read: atm inbox --id {message}");
+    assert!(!call.is_finished());
+    assert_eq!(test.agent(id)["state"], "clearing");
+    let held = test.rig.event_cursor(pane);
+    let now = test.rig.control(pane, json!({"command":"barrier"}))["now_ms"]
+        .as_u64()
+        .unwrap();
+    let reply = test.rig.control(
+        pane,
+        json!({"command":"advance_to", "now_ms": now + config.clear_gap_ms}),
+    );
+    assert!(reply["error"].is_null(), "{reply}");
+    let cleared = call.join().unwrap().unwrap();
+    let new = cleared["session_id"].as_str().unwrap().to_owned();
+    assert_ne!(new, old.id.as_str());
+
+    // The new session takes the reference as a prompt, exactly as sent.
+    let accepted = test.rig.wait_event(pane, held, |e| e["kind"] == "accepted");
+    assert_eq!(accepted["text"], reference.as_str(), "{accepted}");
+    test.rig.wait("the delivery's record", || {
+        test.tail(cursor)
+            .iter()
+            .any(|e| e["kind"] == "msg.delivered")
+    });
+    // One prompt since the clear began, in the new session: the clear
+    // command was not a prompt, and the reference was not joined to it.
+    let journal = test.rig.journal(pane);
+    let since: Vec<_> = journal
+        .iter()
+        .filter(|e| e["event_sequence"].as_u64().unwrap() > after)
+        .collect();
+    let prompts: Vec<_> = since
+        .iter()
+        .filter(|e| matches!(e["kind"].as_str(), Some("accepted" | "rejected" | "queued")))
+        .collect();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let inputs: Vec<_> = since.iter().filter(|e| e["event"] == "input").collect();
+    assert_eq!(inputs.len(), 1, "{inputs:?}");
+    assert_eq!(inputs[0]["data"]["session_id"], new.as_str());
+    assert_eq!(inputs[0]["data"]["payload"]["text"], reference.as_str());
+
+    // The record: the message was sent during the clear and attempted only
+    // after the agent was bound to its new session; one attempt, delivered.
+    let events = test.tail(cursor);
+    let seq = |kind: &str| {
+        let found: Vec<_> = events.iter().filter(|e| e["kind"] == kind).collect();
+        assert_eq!(found.len(), 1, "{kind}: {events:?}");
+        found[0]["seq"].as_u64().unwrap()
+    };
+    let order = [
+        seq("agent.clear_requested"),
+        seq("msg.sent"),
+        seq("agent.session_bound"),
+        seq("msg.delivery_attempted"),
+        seq("msg.delivered"),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{events:?}");
+    let delivered = events
+        .iter()
+        .find(|e| e["kind"] == "msg.delivered")
+        .unwrap();
+    assert_eq!(
+        delivered["body"],
+        json!({
+            "message_id": message,
+            "session_id": new,
+            "confirmation": "prompt_submit_exact_reference",
+        })
+    );
+    let agent = test.agent(id);
+    assert_eq!(agent["session_id"], new.as_str(), "{agent}");
+    test.rig.close();
+}
+
+/// A delivery policy whose waits are as short as the policy allows: the
+/// tests wait on events, and the defaults (ten seconds of idle) would only
+/// make them long.
+const DELIVERY: &str = "[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\nstable_empty_input = { secs = 0, nanos = 1000000 }\n";
 
 /// An already-admitted real delivery finishes before clear starts; later
 /// delivery waits for readiness. The in-process coalesced-reservation callback

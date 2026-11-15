@@ -101,7 +101,15 @@ pub struct AgentRig {
 
 impl AgentRig {
     pub fn start(mode: StandInMode) -> Self {
+        Self::start_with_config(mode, "")
+    }
+
+    /// As [`Self::start`], with `config` as the daemon's `config.toml`.
+    pub fn start_with_config(mode: StandInMode, config: &str) -> Self {
         let mut rig = StandInRig::start();
+        let dir = rig.root().join("config/atm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), config).unwrap();
         rig.set_daemon_env("ATM_SPAWN_BIN", rig.launcher(mode));
         rig.restart_daemon();
         let project = rig.root().join("project");

@@ -710,7 +710,8 @@ fn lazy_codex_id_binds_only_after_prompt() {
 /// pasted: the attempt is committed before any input, or there is no input.
 ///
 /// The fault is real and outside the daemon: its log's segment is full and
-/// its directory read-only, so the next append is refused before it is
+/// its directory is moved aside and replaced with a regular file. Creating
+/// the next segment fails with ENOTDIR even for root, before anything is
 /// written. The owner's focus holds the message until the fault is in place,
 /// because looking away appends nothing: the attempt's own event is then the
 /// first record the log refuses.

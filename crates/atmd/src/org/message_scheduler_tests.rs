@@ -845,6 +845,10 @@ fn blocked_notice_text_is_pinned() {
         "staged draft does not exactly match; Enter was not sent"
     );
     assert_eq!(
+        reason(Some(ExecutorHold::EnterNotSent)),
+        "reference is staged in the editor; Enter was not sent"
+    );
+    assert_eq!(
         blocked_reason(FailureReason::Restarted, Some(ExecutorHold::StagedMismatch)),
         FailureReason::Restarted.to_string()
     );

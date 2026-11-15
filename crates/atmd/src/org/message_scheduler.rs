@@ -442,6 +442,9 @@ fn blocked_reason(reason: FailureReason, hold: Option<ExecutorHold>) -> String {
         (FailureReason::ProbablyDelivered, Some(ExecutorHold::InputOutcomeUnknown)) => {
             "input outcome is unknown".into()
         }
+        (FailureReason::ProbablyDelivered, Some(ExecutorHold::EnterNotSent)) => {
+            "reference is staged in the editor; Enter was not sent".into()
+        }
         _ => reason.to_string(),
     }
 }

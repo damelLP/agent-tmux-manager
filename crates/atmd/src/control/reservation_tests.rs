@@ -970,3 +970,76 @@ async fn reservation_work_failure_preserved_and_panics_get_cleanup() {
         task.await.unwrap();
     }
 }
+
+// The daemon's stop: work ends at once, cleanup runs, and the actor stays
+// for the cleanups, legacy input and audits of the stages that stop later.
+#[tokio::test(start_paused = true)]
+async fn stopping_reserved_work_aborts_work_and_runs_cleanup_as_worker_stopped() {
+    let (control, cancel, task, _) = actor();
+    let (entered, entry) = oneshot::channel();
+    let (cleaning, clean) = oneshot::channel();
+    let (finish, finished) = oneshot::channel();
+    let job = queued(
+        &control,
+        request("p/a", Some("%1"), ReservationKind::Clear),
+        move |_| async move {
+            entered.send(()).unwrap();
+            std::future::pending::<Result<(), ReservationError>>().await
+        },
+        move |r, completion| async move {
+            assert_eq!(completion, Completion::WorkerStopped);
+            cleaning.send(r).unwrap();
+            finished.await.unwrap();
+            Ok(())
+        },
+    )
+    .await;
+    entry.await.unwrap();
+    let waiter = queued(
+        &control,
+        request("p/a", Some("%1"), ReservationKind::Delivery),
+        |_| async { panic!("a waiting reservation ran after the stop") },
+        noop,
+    )
+    .await;
+    barrier(&control).await;
+    control.stop_reserved_work();
+    // The cleanup's own fenced pane operation is served.
+    let cleanup = clean.await.unwrap();
+    assert!(cleanup
+        .inspect(&PaneId::parse("%1").unwrap())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        waiter.await.unwrap(),
+        Err(ReservationError::Unavailable)
+    ));
+    assert!(matches!(
+        control
+            .run_reserved(
+                request("p/b", Some("%2"), ReservationKind::Observe),
+                |_| async { Ok::<_, ReservationError>(()) },
+                noop
+            )
+            .await,
+        Err(ReservationError::Unavailable)
+    ));
+    assert!(matches!(
+        control
+            .observe(&PaneId::parse("%1").unwrap(), CaptureFormat::Plain)
+            .await,
+        Err(ReservationError::Unavailable)
+    ));
+    finish.send(()).unwrap();
+    assert!(matches!(
+        job.await.unwrap(),
+        Err(ReservationError::Unavailable)
+    ));
+    // The service itself was not stopped: legacy requests are still answered.
+    barrier(&control).await;
+    assert!(!task.is_finished());
+    assert!(!cancel.is_cancelled());
+    cancel.cancel();
+    task.await.unwrap();
+}

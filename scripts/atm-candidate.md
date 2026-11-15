@@ -101,7 +101,7 @@ Like `atmd stop`, each pinned process gets up to 75 seconds from signaling to ex
 with one progress line on stderr after 5 seconds. This also applies when waiting
 without signaling after an ownership change, and to the private tmux server's
 exit. The bound is per process, not a total kit-stop deadline; processes are stopped
-in sequence. Nominal daemon drains can take 64 seconds, but blocked filesystem or
+in sequence. A nominal daemon shutdown can take 66 seconds, but blocked filesystem or
 Tokio blocking-pool work can last indefinitely. A timeout names the PID that may
 still be shutting down and retains the runtime/manifest; it does not force exit
 or claim that every pending write was persisted.

@@ -935,6 +935,24 @@ async fn failed_stuck_write_at_the_deadline_keeps_the_timeout() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn failed_note_at_the_deadline_still_answers_with_the_recorded_reason() {
+    // The cleanup's Stuck write succeeds and the owner's note cannot be
+    // written. The choice: the record is written, so the caller is told its
+    // reason, whatever follows. The agent is Stuck with that reason, there is
+    // no note, and the reservation is quarantined. Twin:
+    // failed_stuck_write_at_the_deadline_keeps_the_timeout (no record).
+    const REASON: &str = "clear did not complete: the clear command was being submitted \
+        and may have reached the harness; inspect %1";
+    let (clearing, result) = clear_ended_at_its_deadline_with_one_failed_write("msg.sent").await;
+    let agent = clearing.agent().await;
+    assert_eq!(agent.reason.as_deref(), Some(REASON));
+    assert_told_stuck(&result, &agent);
+    let state = clearing.rig.org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 0, "the note was not written");
+    assert!(quarantined(&clearing.rig, "p/lead").await);
+}
+
+#[tokio::test(start_paused = true)]
 async fn timeout_waiting_for_the_reservation_is_not_answered_with_an_earlier_stuck_reason() {
     // The agent is Stuck since an earlier call, and another job holds its
     // reservation. A clear waits to be admitted and runs out of its time

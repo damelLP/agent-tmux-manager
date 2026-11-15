@@ -81,12 +81,20 @@ fn down_kill_removes_pane_and_records_audit() {
     let result = test.rpc("agent.down", json!({"agent": id, "kill": true}), None);
     assert_eq!(result, json!({"agent_id": id}));
     stand_in::process::wait_exit(pane.pid, std::time::Duration::from_secs(30)).unwrap();
-    // A killed process needs no ending hook or editor input to complete Down.
-    assert!(test
+    // Down needs no ending hook or editor input. EOF before SIGHUP can still
+    // make the dying stand-in record its own SessionEnd attempt, and only that.
+    for event in test
         .rig
         .journal(&pane)
         .iter()
-        .all(|e| e["event_sequence"].as_u64().unwrap() <= before_kill));
+        .filter(|e| e["event_sequence"].as_u64().unwrap() > before_kill)
+    {
+        assert_eq!(
+            (event["kind"].as_str(), event["event"].as_str()),
+            (Some("event"), Some("SessionEnd")),
+            "unexpected record after kill: {event}"
+        );
+    }
     let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
     assert!(!panes.lines().any(|p| p == pane.pane_id));
     assert!(panes.lines().any(|p| p == other.pane_id));
@@ -124,6 +132,12 @@ fn down_kill_removes_pane_and_records_audit() {
     assert_eq!(test.rig.capture_styled(&other), other_screen);
     assert_eq!(test.rig.pane_rows(&other)[0].id, other_row.id);
     test.assert_no_input_since(&other, other_cursor);
+    // Re-read after exit and the intervening checks, without waiting for an
+    // optional End hook: a recorded send attempt does not prove its delivery.
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "down", "{agent}");
+    assert_eq!(agent["pane"], json!(null), "{agent}");
+    assert_eq!(agent["session_id"], json!(null), "{agent}");
     test.rig.close();
 }
 

@@ -1093,3 +1093,205 @@ async fn adopt_tag_refused_before_any_effect_does_not_quarantine() {
     assert!(adoption.agent().await.is_none());
     assert!(!quarantined(&adoption.rig, "q/lead").await);
 }
+
+/// `q/lead` with a pi role, recorded on %1 before the service starts: Up and
+/// PaneCreated, then `more`. Its project is registered at the directory an
+/// adopt names, so the adopt finds this agent.
+async fn recorded_with_role(more: Vec<OrgCommand>, rows: &[(&str, bool, Harness)]) -> Adoption {
+    let rig = Rig::new().await;
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("q")).unwrap();
+    let root = project.path().join("q").canonicalize().unwrap();
+    rig.command(OrgCommand::RegisterProject {
+        project_id: "q".parse().unwrap(),
+        root: root.to_str().unwrap().into(),
+        move_root: false,
+    })
+    .await;
+    rig.command(OrgCommand::Up {
+        agent_id: adoptee(),
+        role: atm_org::parse_role("lead", "+++\nharness='pi'\n+++\n").unwrap(),
+    })
+    .await;
+    rig.command(OrgCommand::PaneCreated {
+        agent_id: adoptee(),
+        pane: "%1".into(),
+    })
+    .await;
+    for command in more {
+        rig.command(command).await;
+    }
+    for (id, child, harness) in rows {
+        rig.row_of(id, "%1", *child, *harness).await;
+    }
+    let recorded = rig.org.snapshot().await.unwrap();
+    let recorded = recorded.agent(&adoptee()).unwrap();
+    // The restart check: a Starting agent's reads its screen, and uses none
+    // of it without a session; a session-less Ready agent's only inspects.
+    let tagged = Adoption::inspection(Some("q/lead"), "pi", "unknown\n");
+    rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
+    if recorded.status == AgentStatus::Starting {
+        rig.client
+            .script_capture(&PaneCapture::new("unknown\n".into(), tagged, CaptureFormat::Ansi))
+            .unwrap();
+    }
+    let (agents, _) = rig.start();
+    agents.reconciled().await.unwrap();
+    assert_eq!(rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    let events = agents.observation_events();
+    Adoption {
+        rig,
+        agents,
+        project,
+        events,
+    }
+}
+
+#[tokio::test]
+async fn adopt_of_an_agent_with_a_role_binds_only_its_own_session() {
+    // Review 19, finding 5. A Ready agent with a role and no session is
+    // adopted again on its idle pane. A discovery row shows that its harness
+    // lives there; the other row on the pane is not the agent's to bind: the
+    // session its clear excluded, a subagent's row, a row of another harness.
+    // Nothing is bound and nothing is written.
+    let cleared = || {
+        vec![
+            OrgCommand::SessionBound {
+                agent_id: adoptee(),
+                session_id: SessionId::new("old"),
+            },
+            OrgCommand::Clear {
+                agent_id: adoptee(),
+            },
+            OrgCommand::EditorReady {
+                agent_id: adoptee(),
+            },
+        ]
+    };
+    let ready = || {
+        vec![OrgCommand::EditorReady {
+            agent_id: adoptee(),
+        }]
+    };
+    type Case = (&'static str, Vec<OrgCommand>, (&'static str, bool, Harness));
+    let cases: [Case; 3] = [
+        ("the excluded session", cleared(), ("old", false, Harness::Pi)),
+        ("a child row", ready(), ("child", true, Harness::Pi)),
+        ("a row of another harness", ready(), ("other", false, Harness::Codex)),
+    ];
+    for (case, commands, row) in cases {
+        let adoption =
+            recorded_with_role(commands, &[row, ("pending-100", false, Harness::Pi)]).await;
+        *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+        let recorded = adoption.agent().await.unwrap();
+        assert_eq!(recorded.status, AgentStatus::Ready, "{case}");
+        let before = adoption.rig.org.status().unwrap();
+        script_readopt(&adoption, PI_PADDED, "pi");
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(adoption.rig.org.status().unwrap(), before, "{case}");
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{case}");
+    }
+    // The twin: a session that is the agent's. The pane is in copy mode when
+    // the row arrives, so the observer leaves the binding alone, and the
+    // adopt, with the pane out of copy mode again, makes it.
+    let adoption = recorded_with_role(Vec::new(), &[]).await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    let mut in_mode = Adoption::inspection(Some("q/lead"), "pi", "unknown\n");
+    in_mode.in_mode = true;
+    adoption.rig.client.script_inspect(&pane("%1"), Some(&in_mode)).unwrap();
+    adoption
+        .rig
+        .client
+        .script_capture(&PaneCapture::new("unknown\n".into(), in_mode, CaptureFormat::Ansi))
+        .unwrap();
+    adoption.rig.row("s1", "%1", false).await;
+    settle(&adoption).await;
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(adoption.agent().await.unwrap().session_id, None);
+    script_readopt(&adoption, PI_PADDED, "pi");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(
+        adoption.agent().await.unwrap().session_id,
+        Some(SessionId::new("s1"))
+    );
+    settle(&adoption).await;
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+}
+
+/// Every observation the events so far started has ended, successfully: the
+/// observer has nothing running and nothing queued.
+async fn settle(adoption: &Adoption) {
+    let mut events = adoption.agents.observation_events();
+    update_unrelated(&adoption.rig, &mut events).await;
+    progress(&mut events, "idle", None).await;
+}
+
+#[tokio::test]
+async fn adopt_of_an_agent_with_a_role_reads_the_screen_only_of_its_live_harness() {
+    // A Starting agent with a pi role. With no row of pi on the pane its
+    // screen is not read at all (a row of another harness is no evidence that
+    // pi runs there): nothing is pinned and it stays Starting.
+    let adoption = recorded_with_role(Vec::new(), &[("other", false, Harness::Codex)]).await;
+    let before = adoption.rig.org.status().unwrap();
+    script_readopt(&adoption, PI_PADDED, "pi");
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    assert_eq!(
+        adoption.rig.client.pending_reads(&pane("%1")).unwrap(),
+        6,
+        "neither capture was read"
+    );
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::unproven()
+    );
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+
+    // With pi's discovery row, the idle screen counts unless the capture
+    // itself says the pane is dead, in a mode, or not tagged for the agent.
+    type Change = fn(&mut PaneInspection);
+    let cases: [(&str, Change, bool); 4] = [
+        ("the twin: a live tagged pane", |_| {}, true),
+        ("a dead pane", |i| i.dead = true, false),
+        ("copy mode", |i| i.in_mode = true, false),
+        ("no tag", |i| i.local_agent_tag = None, false),
+    ];
+    for (case, change, safe) in cases {
+        let adoption =
+            recorded_with_role(Vec::new(), &[("pending-100", false, Harness::Pi)]).await;
+        *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+        let mut committed = adoption.rig.org.committed.subscribe();
+        let tagged = Adoption::inspection(Some("q/lead"), "pi", "");
+        adoption.rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
+        adoption.script_capture(PI_PADDED, "pi");
+        let text = body(PI_PADDED);
+        let mut second = Adoption::inspection(Some("q/lead"), "pi", text);
+        change(&mut second);
+        adoption
+            .rig
+            .client
+            .script_capture(&PaneCapture::new(text.into(), second, CaptureFormat::Ansi))
+            .unwrap();
+        let result = adoption.adopt().await;
+        let kinds = committed_kinds(&mut committed);
+        if safe {
+            assert_eq!(result.unwrap().state, AgentStatus::Ready, "{case}");
+            assert_eq!(kinds, ["agent.editor_ready"], "{case}");
+        } else {
+            // Either the control service refuses the capture or the flow
+            // does not count it: the agent is not made Ready.
+            assert!(
+                !matches!(&result, Ok(adopted) if adopted.state == AgentStatus::Ready),
+                "{case}: {result:?}"
+            );
+            assert_eq!(kinds, Vec::<String>::new(), "{case}");
+            assert_eq!(
+                adoption.agent().await.unwrap().status,
+                AgentStatus::Starting,
+                "{case}"
+            );
+        }
+    }
+}

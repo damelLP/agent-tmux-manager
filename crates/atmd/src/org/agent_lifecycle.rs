@@ -7,7 +7,7 @@
 
 use super::agent_flow::{
     adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, input_refusal,
-    safe_to_paste, submit_allowed, submit_step, ClearProgress, Ready, Step,
+    safe_editor, safe_to_paste, submit_allowed, submit_step, ClearProgress, Ready, Step,
 };
 use super::agent_screen::{agent_screen, AgentScreen};
 use super::agents::{
@@ -16,7 +16,7 @@ use super::agents::{
 use crate::control::reservation::{ExpectedTag, PaneId, Reservation, ReservationError};
 use crate::registry::PaneSession;
 use atm_core::harness_control::{ClearProof, ControlDialog};
-use atm_core::{DialogState, Harness, InputState, SessionId, SessionView, TurnState};
+use atm_core::{Harness, SessionId, SessionView};
 use atm_org::{AgentId, AgentStatus, OrgCommand};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -386,10 +386,7 @@ impl AgentRuntime {
             return Ok(false);
         };
         self.record_baseline(id.clone(), pane.as_str(), baseline);
-        Ok(control.dialog == ControlDialog::None
-            && control.facts.input == InputState::Empty
-            && control.facts.turn == TurnState::NotRunning
-            && control.facts.dialog == DialogState::None
+        Ok(safe_editor(&control)
             && !second.inspection.dead
             && !second.inspection.in_mode
             && second.inspection.local_agent_tag.as_deref() == Some(&id.to_string()))

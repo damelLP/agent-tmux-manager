@@ -514,7 +514,8 @@ pub(super) fn input_refusal(
 }
 
 /// An editor a command may be typed into: no dialog, empty, no turn running.
-fn safe_editor(control: &ControlScreen) -> bool {
+#[must_use]
+pub(super) fn safe_editor(control: &ControlScreen) -> bool {
     control.dialog == ControlDialog::None
         && control.facts.input == InputState::Empty
         && control.facts.turn == TurnState::NotRunning

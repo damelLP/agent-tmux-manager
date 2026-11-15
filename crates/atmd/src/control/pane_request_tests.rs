@@ -579,3 +579,134 @@ async fn an_admitted_kill_finishes_and_is_logged_when_the_daemon_stops() {
     assert_eq!(recorded[0].1["action"]["outcome"], "ok");
     org_cancel.cancel();
 }
+
+/// tmux takes `%01` for `%1`. The gate must be asked about the pane tmux
+/// will act on, or a non-canonical id slips an interrupt past its clear.
+#[tokio::test(start_paused = true)]
+async fn a_noncanonical_pane_id_meets_the_gate_of_its_canonical_pane() {
+    let mock = MockTmuxClient::new();
+    let (control, actor, cancel) = start(Box::new(mock.clone()));
+    let (job, release) = hold(&control, ReservationKind::Clear, |_| async { Ok(()) }).await;
+    mock.set_next_raw_output("%1\n");
+    let error = control.interrupt("%01".into()).await.unwrap_err();
+    assert_eq!(error.to_string(), CLEARING);
+    assert!(effects(&mock).is_empty(), "{:?}", mock.calls());
+    mock.set_next_raw_output("%1\n");
+    assert_eq!(control.kill("%01".into()).await.unwrap(), "%1");
+    let calls = effects(&mock);
+    assert!(
+        matches!(calls.as_slice(), [kill] if is_kill(kill, "%1")),
+        "{calls:?}"
+    );
+    release.send(()).unwrap();
+    job.await.unwrap().unwrap();
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+/// A caller can leave after its request was taken up: while the daemon checks
+/// the tmux server or reads the registry. Its kill must not happen then.
+mod caller_gone_during_the_reads {
+    use super::*;
+    use atm_tmux::{PaneDirection, PaneInfo};
+    type Call<'a, T> = std::pin::Pin<Box<dyn Future<Output = Result<T, TmuxError>> + Send + 'a>>;
+    macro_rules! forward {
+        ($method:ident <$($lt:lifetime),*> ($($arg:ident : $ty:ty),*) -> $result:ty) => {
+            fn $method<'s, $($lt,)* 'async_trait>(&'s self, $($arg: $ty),*) -> Call<'async_trait, $result>
+            where 's: 'async_trait, $($lt: 'async_trait,)* Self: 'async_trait {
+                Box::pin(self.mock.$method($($arg),*))
+            }
+        };
+    }
+    /// Every tmux read reports that it began, then waits for the test.
+    struct Stalled {
+        mock: MockTmuxClient,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+    impl TmuxClient for Stalled {
+        fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
+            &'s self,
+            command: &'c str,
+            args: &'a [&'v str],
+        ) -> Call<'async_trait, String>
+        where
+            's: 'async_trait,
+            'c: 'async_trait,
+            'a: 'async_trait,
+            'v: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+                self.mock.raw_command(command, args).await
+            })
+        }
+        forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());
+        forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
+        forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
+        forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
+        forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
+        forward!(kill_pane<'a>(pane: &'a str) -> ());
+        forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
+        forward!(list_panes<>() -> Vec<PaneInfo>);
+        forward!(display_popup<'a, 'b, 'c>(width: &'a str, height: &'b str, command: &'c str) -> ());
+        forward!(select_pane<'a>(pane: &'a str) -> ());
+        forward!(capture_pane<'a>(pane: &'a str) -> Vec<String>);
+        forward!(new_session<'a>(name: &'a str) -> String);
+    }
+
+    #[tokio::test]
+    async fn a_caller_gone_during_the_server_check_gets_no_kill_and_no_log_entry() {
+        let (_dir, org, org_cancel) = logged().await;
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("own");
+        std::fs::write(&own, "").unwrap();
+        let mock = MockTmuxClient::new();
+        mock.set_next_raw_output(own.to_str().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let cancel = CancellationToken::new();
+        let (control, actor) = spawn_control(
+            Box::new(Stalled {
+                mock: mock.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            crate::registry::spawn_registry(),
+            org.clone(),
+            cancel.clone(),
+        );
+        let (reply, response) = oneshot::channel();
+        control
+            .sender
+            .send(Pending {
+                server: Some(own.to_str().unwrap().into()),
+                deadline: Instant::now() + ACTION_TIMEOUT,
+                caller: None,
+                request: Request::Kill {
+                    target: "%1".into(),
+                    reply,
+                },
+            })
+            .await
+            .ok()
+            .unwrap();
+        // The request is past its first caller check and inside the server check.
+        entered.notified().await;
+        drop(response);
+        release.add_permits(1);
+        // Queued behind the kill's turn: answered once that turn is over.
+        control.flush_audits().await;
+        let calls = effects(&mock);
+        assert!(
+            calls.is_empty(),
+            "a gone caller's kill reached tmux: {calls:?}"
+        );
+        assert!(events(&org).await.is_empty());
+        cancel.cancel();
+        actor.await.unwrap();
+        org_cancel.cancel();
+    }
+}

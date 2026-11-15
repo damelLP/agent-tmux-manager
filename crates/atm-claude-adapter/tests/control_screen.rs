@@ -120,6 +120,50 @@ fn custom_status_control_preserves_editor() {
 }
 
 #[test]
+fn synthetic_menu_like_status_preserves_manual_and_auto_editors() {
+    for (fixture, conversation, fresh) in [
+        (
+            capture!("B-baseline-conversation-120x40"),
+            true,
+            FreshEditorEvidence::Unknown,
+        ),
+        (
+            capture!("B-clear-007-120x40"),
+            false,
+            FreshEditorEvidence::Present,
+        ),
+        (AUTO, false, FreshEditorEvidence::Present),
+    ] {
+        let text = body(fixture);
+        let footer = text
+            .lines()
+            .find(|row| row.contains('⏸') || row.contains("⏵⏵"))
+            .unwrap();
+        // Synthetic: opaque status values inserted into real manual/auto frames.
+        for status in [
+            "  ❯ main",
+            "  /srv/proj  main",
+            "  Opus 5.5 /srv/proj  main",
+            "  [plain] ctx 7%",
+        ] {
+            let changed = text.replace(footer, &format!("{status}\n{footer}"));
+            assert_ne!(changed, text);
+            let control = observe(&changed);
+            assert_eq!(control.dialog, ControlDialog::None, "{status}");
+            assert_eq!(control.facts.input, InputState::Empty, "{status}");
+            assert_eq!(control.facts.turn, TurnState::NotRunning, "{status}");
+            assert_eq!(control.facts.dialog, atm_core::DialogState::None);
+            assert_eq!(control.facts.fresh_editor, fresh, "{status}");
+            assert_eq!(control.conversation, conversation, "{status}");
+            assert_eq!(
+                screen::staged_draft_matches(ScreenInput::Styled(&changed), "/clear"),
+                None
+            );
+        }
+    }
+}
+
+#[test]
 fn custom_status_clear_menu_above_editor() {
     for fixture in [
         include_str!("fixtures/screen_styled_s1_status-clear-80_2.1.325.txt"),
@@ -431,6 +475,278 @@ fn synthetic_headers_and_footer_damage_do_not_manufacture_freshness() {
     assert_eq!(
         observe(capture!("C3-dialog-120x40")).dialog,
         ControlDialog::Unknown
+    );
+}
+
+// Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
+// README maps the actual -p -e -N sources and equal-width private-cwd sanitization.
+const ABOVE_COMPLETIONS: [&str; 6] = [
+    include_str!("fixtures/screen_styled_s1_clear-multi-wrapped_2.1.325.txt"),
+    include_str!("fixtures/screen_styled_s1_clear-single_2.1.325.txt"),
+    include_str!("fixtures/screen_styled_s1_clear-multi-80_2.1.325.txt"),
+    include_str!("fixtures/screen_styled_s1_clear-multi-160_2.1.325.txt"),
+    include_str!("fixtures/screen_styled_s1_clear-multi-header_2.1.325.txt"),
+    include_str!("fixtures/screen_styled_s1_clear-multi-drawn_2.1.325.txt"),
+];
+const NEUTRAL_HEADER: &str = " ▐▛███▛█   Claude Code v2.1.325\n▝▜██████▀  Demo Model · API Usage Billing\n ▝▝   ▝▝   /tmp/fixture\n\n";
+
+#[test]
+fn captured_above_completion_with_and_without_header() {
+    // Removing above-menu recognition must fail on the real no-header frames.
+    for (case, fixture) in ABOVE_COMPLETIONS.into_iter().enumerate() {
+        let input = ScreenInput::Styled(body(fixture));
+        for cursor in [None, Some(atm_core::ScreenCursor { column: 0, row: 0 })] {
+            let control = observe_control_screen(input, cursor);
+            assert_eq!(control.dialog, ControlDialog::None, "case {case}");
+            assert_eq!(
+                (
+                    control.facts.input,
+                    control.facts.turn,
+                    control.facts.dialog,
+                    control.facts.fresh_editor
+                ),
+                (
+                    InputState::Draft,
+                    TurnState::Unknown,
+                    atm_core::DialogState::None,
+                    FreshEditorEvidence::Unknown
+                ),
+                "case {case}"
+            );
+        }
+        assert_eq!(
+            screen::staged_draft_matches(input, "/clear"),
+            Some(true),
+            "case {case}"
+        );
+        for wrong in ["/clear-other", " /clear", "/clea"] {
+            assert_eq!(
+                screen::staged_draft_matches(input, wrong),
+                Some(false),
+                "case {case}: {wrong}"
+            );
+        }
+        assert_eq!(
+            screen::staged_draft_matches(ScreenInput::Plain(&plain(fixture)), "/clear"),
+            None
+        );
+    }
+}
+
+#[test]
+fn synthetic_top_cut_completion_continuations_refuse_staging() {
+    let text = plain(ABOVE_COMPLETIONS.first().unwrap());
+    let rule = text.lines().find(|row| row.starts_with('─')).unwrap();
+    let (_, editor) = text.split_once(rule).unwrap();
+    // Synthetic: the pane top cuts off every command, leaving only a real
+    // description continuation above the editor, with optional blank padding.
+    let continuations: Vec<_> = text
+        .lines()
+        .filter(|row| row.contains("on disk") || row.contains("consistent wording"))
+        .collect();
+    assert_eq!(continuations.len(), 2);
+    for continuation in continuations {
+        for padding in ["", "\n\n"] {
+            let cut = format!("{padding}{continuation}\n{rule}{editor}");
+            assert_eq!(
+                screen::staged_draft_matches(ScreenInput::Styled(&cut), "/clear"),
+                None,
+                "{cut}"
+            );
+            assert_eq!(observe(&cut).dialog, ControlDialog::Unknown);
+        }
+    }
+}
+
+#[test]
+fn above_completion_checks_selection_before_fallback() {
+    // Ignoring the selected name, or falling back after a bad menu, must fail.
+    let text = plain(ABOVE_COMPLETIONS.first().unwrap());
+    // Synthetic: one name differs, retaining the real frame and description columns.
+    for changed in [
+        text.replace("  ❯ /clear", "  ❯ /other"),
+        text.replace("❯\u{a0}/clear", "❯\u{a0}/other"),
+    ] {
+        for text in [changed.clone(), format!("{NEUTRAL_HEADER}{changed}")] {
+            assert_eq!(
+                screen::staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+                Some(false)
+            );
+        }
+    }
+    // Synthetic: no selected row, two selected rows, a clipped selection, or faint draft.
+    for changed in [
+        text.replace("  ❯ /clear", "    /clear"),
+        text.replace(
+            "  ❯ /clear",
+            &format!("  ❯ /other{}Other command\n  ❯ /clear", " ".repeat(40)),
+        ),
+        text.replace("  ❯ /clear", "  ❯ …clear"),
+        text.replace("❯\u{a0}/clear", "❯\u{a0}\x1b[2m/clear\x1b[22m"),
+        text.replace("❯\u{a0}/clear", "❯\u{a0}/cl\x1b[2mear\x1b[22m"),
+    ] {
+        assert_ne!(changed, text);
+        for text in [changed.clone(), format!("{NEUTRAL_HEADER}{changed}")] {
+            assert_eq!(
+                screen::staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+                None
+            );
+            assert_eq!(observe(&text).dialog, ControlDialog::Unknown);
+        }
+    }
+}
+
+#[test]
+fn synthetic_duplicate_selected_command_names_refuse_staging() {
+    let text = plain(ABOVE_COMPLETIONS.first().unwrap());
+    let selected = text
+        .lines()
+        .find(|row| row.starts_with("  ❯ /clear"))
+        .unwrap();
+    let skill = text.lines().find(|row| row.starts_with("    …")).unwrap();
+    // Synthetic: a user skill shares the selected command's name. Keep the
+    // real frame/description columns; neither wording nor order proves identity.
+    let custom = selected.replace(
+        "Start a new session with empty context; previous session stays",
+        "My own clear skill (user)",
+    );
+    assert_ne!(custom, selected);
+    let duplicate = selected.replace("  ❯ /clear", "    /clear");
+    assert_eq!(
+        screen::staged_draft_matches(
+            ScreenInput::Styled(&text.replace(selected, &custom)),
+            "/clear"
+        ),
+        Some(true)
+    );
+    for changed in [
+        text.replace(selected, &custom).replace(skill, &duplicate),
+        text.replace(selected, &duplicate).replace(skill, &custom),
+    ] {
+        for changed in [changed.clone(), changed.replace("/clear", "/other")] {
+            for changed in [changed.clone(), format!("{NEUTRAL_HEADER}{changed}")] {
+                assert_eq!(
+                    screen::staged_draft_matches(ScreenInput::Styled(&changed), "/clear"),
+                    None
+                );
+                assert_eq!(observe(&changed).dialog, ControlDialog::Unknown);
+            }
+        }
+    }
+}
+
+#[test]
+fn above_completion_requires_exact_frame() {
+    // Accepting arbitrary popup rows or weakening the shared frame check must fail.
+    let text = plain(ABOVE_COMPLETIONS.first().unwrap());
+    let rule = "─".repeat(116);
+    let status = text.lines().find(|s| s.starts_with("  [fixture]")).unwrap();
+    // Synthetic: each mutation damages one captured boundary, not command identity.
+    for (why, changed) in [
+        ("missing rule", text.replacen(&rule, "", 1)),
+        ("unequal rules", text.replacen(&rule, &"─".repeat(115), 1)),
+        (
+            "second editor row",
+            text.replace("❯\u{a0}/clear", "❯\u{a0}/clear\n  second row"),
+        ),
+        ("missing editor", text.replace("❯\u{a0}/clear", "")),
+        ("changed footer", text.replace("cycle)", "changed)")),
+        (
+            "missing footer",
+            text.replace("  ⏵⏵ auto mode on (shift+tab to cycle)", ""),
+        ),
+        (
+            "second status row",
+            text.replace(status, &format!("{status}\n  extra status")),
+        ),
+        (
+            "displaced status",
+            text.replace(status, &format!("\n{status}")),
+        ),
+        (
+            "unindented status",
+            text.replace(status, status.trim_start()),
+        ),
+        ("extra suffix", format!("{text}\nUnknown popup")),
+        (
+            "unknown popup row",
+            text.replacen(&rule, &format!("  Unexpected popup row\n{rule}"), 1),
+        ),
+        (
+            "gap before editor",
+            text.replacen(&rule, &format!("\n{rule}"), 1),
+        ),
+        (
+            "gap before continuation",
+            text.replace(
+                "                                                  consistent wording",
+                "\n                                                  consistent wording",
+            ),
+        ),
+        (
+            "damaged skill margin",
+            text.replace("    …ents", "     …ents"),
+        ),
+        (
+            "damaged description margin",
+            text.replace(
+                "                                                  on disk",
+                "                                                 on disk",
+            ),
+        ),
+        ("conceal", format!("{text}\x1b[8m")),
+        (
+            "unsupported status style",
+            text.replace(status, "  \x1b[4munderlined\x1b[24m"),
+        ),
+    ] {
+        assert_ne!(changed, text, "{why}");
+        for text in [changed.clone(), format!("{NEUTRAL_HEADER}{changed}")] {
+            assert_eq!(
+                screen::staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+                None,
+                "{why}"
+            );
+            assert_eq!(observe(&text).dialog, ControlDialog::Unknown, "{why}");
+        }
+    }
+}
+
+#[test]
+fn above_completion_values_are_not_input() {
+    let text = plain(ABOVE_COMPLETIONS.first().unwrap());
+    let status = text.lines().find(|s| s.starts_with("  [fixture]")).unwrap();
+    // Synthetic: description/status/history values and Insight rules are not command identity.
+    for changed in [
+        text.replace(
+            "Start a new session with empty context; previous session stays",
+            "A different description with /clear in it",
+        ),
+        text.replace(status, "  /clear"),
+        text.replace(&format!("{status}\n"), ""),
+        format!("  ★ Insight ─────────────────────────────\n{text}"),
+        text.replace("v2.1.325", "v9.8.7"),
+    ] {
+        for text in [changed.clone(), format!("{NEUTRAL_HEADER}{changed}")] {
+            let input = ScreenInput::Styled(&text);
+            assert_eq!(screen::staged_draft_matches(input, "/clear"), Some(true));
+            let control = observe(&text);
+            assert_eq!(control.dialog, ControlDialog::None);
+            assert_eq!(control.facts.turn, TurnState::Unknown);
+            assert_eq!(control.facts.fresh_editor, FreshEditorEvidence::Unknown);
+        }
+    }
+    let wrong = text.replace("❯\u{a0}/clear", "❯\u{a0}/other");
+    let wrong = wrong.replace(status, "  /clear");
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(&format!("/clear\n{wrong}")), "/clear"),
+        Some(false)
+    );
+    // Synthetic: the grammar is not a /clear spelling exception.
+    let other = text.replace("/clear", "/other");
+    assert_eq!(
+        screen::staged_draft_matches(ScreenInput::Styled(&other), "/other"),
+        Some(true)
     );
 }
 

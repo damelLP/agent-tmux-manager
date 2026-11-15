@@ -46,6 +46,201 @@ def journal(r):
 
 
 class ControlTests(unittest.TestCase):
+    # Synthetic: acknowledging but ignoring the control would forward the paste.
+    def test_refuse_next_paste_never_reaches_model_and_next_paste_works(self):
+        for mode in ["claude", "codex", "pi"]:
+            with self.subTest(mode=mode):
+                r = runtime()
+                r.mode, r.model = mode, make(mode)
+                sent = []
+                r.forward = sent.append
+                text = "/atm/dialog\nλ not submitted;"
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.render())
+                    r.control({"id": 1, "command": "refuse_next_paste"})
+                    for byte in ("\x1b[200~" + text + "\x1b[201~\r").encode():
+                        r.input(bytes([byte]))
+                    self.assertEqual(sent, [], "a refused paste must forward nothing")
+                    self.assertFalse(any(e["kind"] in ("accepted", "queued", "selection")
+                                         for e in journal(r)))
+                    rejected = [e for e in journal(r) if e["kind"] == "rejected"]
+                    self.assertEqual([(e["reason"], e["text"]) for e in rejected],
+                                     [("refuse_next_paste", text)])
+                    self.assertEqual(r.model.state, "idle")
+                    self.assertEqual(r.parser.draft, b"")
+                    r.input(b"\x1b[200~next paste\x1b[201~\r")
+                self.assertEqual(r.model.active_prompt, "next paste")
+                self.assertEqual(r.model.state, "working")
+                self.assertTrue(sent)
+
+    def test_refusal_preserves_draft_and_does_not_answer_dialog(self):
+        r = runtime()
+        r.forward = lambda data: self.fail("refused paste reached forwarding")
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.render())
+            r.input(b"keep me")
+            r.control({"id": 1, "command": "refuse_next_paste"})
+            r.input(b"\x1b[200~/clear\x1b[201~\r")
+        self.assertEqual(r.parser.draft, b"keep me")
+        self.assertEqual(r.generation, 1)
+        r = runtime()
+        r.model = make(folder_trust=True)
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.start())
+            r.control({"id": 2, "command": "refuse_next_paste"})
+            r.input(b"\x1b[200~yes\x1b[201~\r")
+        self.assertEqual(r.model.dialog, "folder-trust")
+        self.assertTrue(r.running)
+        self.assertFalse(any(e["kind"] == "selection" for e in journal(r)))
+
+    def test_invalid_refusal_control_leaves_draft_and_arm_intact(self):
+        r = runtime()
+        r.parser.draft.extend(b"keep me")
+        r.control({"id": 1, "command": "refuse_next_paste"})
+        self.assertNotIn("error", journal(r)[-1])
+        r.control({"id": 2, "command": "refuse_next_paste"})
+        self.assertIn("error", journal(r)[-1])
+        with redirect_stdout(io.StringIO()):
+            r.input(b"\x1b[200~rejected once\x1b[201~\r")
+        self.assertEqual(r.parser.draft, b"keep me")
+        self.assertEqual([e["text"] for e in journal(r) if e["kind"] == "rejected"],
+                         ["rejected once"])
+        for prefix in [b"\x1b", b"\x1b[200~partial"]:
+            r = runtime()
+            r.parser.feed(prefix)
+            r.control({"id": 3, "command": "refuse_next_paste"})
+            self.assertIn("error", journal(r)[-1])
+
+    # Break caught: an acknowledgment-only hold arm forwards completion early.
+    def test_held_completion_is_not_forwarded_until_release(self):
+        for mode, expected in [("claude", ["Stop"]), ("codex", ["Stop"]),
+                               ("pi", ["turn_end", "agent_end"])]:
+            with self.subTest(mode=mode):
+                r = runtime()
+                r.mode, r.model = mode, make(mode)
+                sent = []
+                r.forward = sent.append
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.start())
+                    r.action(("submit", "turn"))
+                    sent.clear()
+                    r.control({"id": 1, "command": "hold_next_hook"})
+                    r.control({"id": 2, "command": "advance_to", "now_ms": 500})
+                    lifecycle = lambda: [d for d in sent if "event" in d or "hook_event_name" in d]
+                    self.assertEqual(lifecycle(), [], "held completion must not be forwarded")
+                    self.assertEqual(r.model.state, "idle")
+                    held = [e for e in journal(r) if e["kind"] == "held"]
+                    self.assertEqual([e["event"] for e in held], expected)
+                    r.control({"id": 3, "command": "barrier"})
+                    self.assertEqual(lifecycle(), [])
+                    r.control({"id": 4, "command": "release_hook"})
+                self.assertEqual(lifecycle(), [e["data"] for e in held])
+                self.assertEqual(journal(r)[-1]["id"], 4, "release acknowledges after forwarding")
+                released = [e for e in journal(r) if e["kind"] == "event"
+                            and e["event"] in expected]
+                self.assertEqual([e["event"] for e in released], expected)
+                r.control({"id": 5, "command": "release_hook"})
+                self.assertIn("error", journal(r)[-1])
+                self.assertEqual(len(lifecycle()), len(expected))
+
+    def test_invalid_hook_controls_do_not_erase_named_hold_or_draft(self):
+        r = runtime()
+        sent = []
+        r.forward = sent.append
+        r.parser.draft.extend(b"keep me")
+        for name in ["stop", "input", "", [], {}, True, 1]:
+            r.control({"id": 1, "command": "hold_next_hook", "event": name})
+            self.assertIn("error", journal(r)[-1])
+        r.control({"id": 2, "command": "hold_next_hook", "event": "Stop"})
+        self.assertNotIn("error", journal(r)[-1])
+        for command in ["hold_next_hook", "release_hook"]:
+            r.control({"id": 3, "command": command})
+            self.assertIn("error", journal(r)[-1])
+        self.assertEqual(r.parser.draft, b"keep me")
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.start())
+            r.action(("submit", "turn"))
+            r.control({"id": 4, "command": "advance_to", "now_ms": 500})
+            self.assertFalse(any(d.get("hook_event_name") == "Stop" for d in sent))
+            r.control({"id": 5, "command": "release_hook"})
+        self.assertEqual(sum(d.get("hook_event_name") == "Stop" for d in sent), 1)
+
+    def test_held_shutdown_can_be_released_before_process_exit(self):
+        r = runtime()
+        sent = []
+        r.forward = sent.append
+        with redirect_stdout(io.StringIO()):
+            r.control({"id": 1, "command": "hold_next_hook"})
+            r.action(("exit", ""))
+            self.assertTrue(r.running)
+            self.assertEqual(sent, [])
+            r.control({"id": 2, "command": "release_hook"})
+        self.assertFalse(r.running)
+        self.assertEqual([d["hook_event_name"] for d in sent], ["SessionEnd"])
+        self.assertEqual(journal(r)[-2]["kind"], "exit")
+        self.assertEqual(journal(r)[-1]["id"], 2)
+
+    # Synthetic: ignoring the control must leave baseline usage, not 40%.
+    def test_context_share_control_changes_next_real_status_or_usage(self):
+        import json
+        import tempfile
+        for mode, wanted in [("claude", 400000), ("pi", 108800), ("codex", 103360)]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                r = runtime()
+                r.mode, r.model, r.root = mode, make(mode), harness.Path(directory)
+                reported = []
+                def forward(data):
+                    if mode == "claude" and "context_window" in data:
+                        usage = data["context_window"]["current_usage"]
+                        reported.append(usage["input_tokens"] if usage else 0)
+                    elif mode == "pi" and "usage" in data:
+                        reported.append(data["usage"]["contextTokens"])
+                    elif mode == "codex":
+                        path = harness.Path(harness.patch_paths(data["transcript_path"], r.root))
+                        if path.is_file():
+                            record = json.loads(path.read_text())
+                            reported.append(record["payload"]["info"]["last_token_usage"]["total_tokens"])
+                r.forward = forward
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.start())
+                    r.action(("submit", "turn"))
+                    reported.clear()
+                    sequence = r.render_sequence
+                    r.control({"id": 1, "command": "set_context_share", "percent": 40})
+                    self.assertEqual(reported, [], "setting usage must not send it immediately")
+                    self.assertEqual(r.render_sequence, sequence, "control must not redraw")
+                    r.control({"id": 2, "command": "advance_to", "now_ms": 500})
+                self.assertEqual(reported, [wanted], "next payload must carry the requested context share")
+                self.assertEqual(journal(r)[-1]["id"], 2)
+
+    def test_invalid_context_control_keeps_pending_share_and_draft(self):
+        r = runtime()
+        r.parser.draft.extend(b"keep me")
+        r.control({"id": 1, "command": "set_context_share", "percent": 40})
+        self.assertNotIn("error", journal(r)[-1])
+        for value in [None, True, "40", -1, 101, float("nan")]:
+            r.control({"id": 2, "command": "set_context_share", "percent": value})
+            self.assertIn("error", journal(r)[-1])
+        r.control({"id": 3, "command": "set_context_share"})
+        self.assertIn("error", journal(r)[-1])
+        sent = []
+        r.forward = sent.append
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.status())
+        self.assertEqual(sent[0]["context_window"]["used_percentage"], 40)
+        self.assertEqual(r.parser.draft, b"keep me")
+
+    def test_codex_usage_write_refuses_a_path_outside_its_private_root(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            r = runtime()
+            r.root = harness.Path(directory) / "private"
+            r.root.mkdir()
+            outside = harness.Path(directory) / "outside.jsonl"
+            with self.assertRaises(ValueError):
+                r.effects([{"kind": "usage", "path": str(outside), "data": {}}])
+            self.assertFalse(outside.exists())
+
     def test_status_record_follows_forwarding_not_the_draft_redraw(self):
         r = runtime()
         sent = []

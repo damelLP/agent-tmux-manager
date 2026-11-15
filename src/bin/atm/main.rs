@@ -48,6 +48,7 @@ mod me;
 mod msg;
 pub mod rpc;
 mod spawn;
+mod task;
 mod tui;
 mod workspace;
 use cli::{cmd_interrupt, cmd_kill, cmd_list, cmd_peek, cmd_reply, cmd_role, cmd_send, cmd_status};
@@ -206,6 +207,8 @@ mod agent_contract_tests {
 enum Command {
     /// Show your identity, instructions, handover, unread work and reporting command
     Me(me::MeArgs),
+    /// Create, assign, inspect and review durable tasks
+    Task(task::TaskArgs),
     /// Record the owner's answer to a decision
     Decide(decide::DecideArgs),
     /// List pending and provisional decisions
@@ -439,6 +442,7 @@ async fn main() -> Result<()> {
     // Handle subcommands first (before TUI initialization)
     match args.command {
         Some(Command::Me(args)) => return me::cmd_me(args).await,
+        Some(Command::Task(args)) => return task::cmd_task(args).await,
         Some(Command::Decide(args)) => return decide::cmd_decide(args).await,
         Some(Command::Decisions(args)) => return decide::cmd_decisions(args).await,
         Some(Command::Msg { action }) => return msg::cmd_msg(action).await,

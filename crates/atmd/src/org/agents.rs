@@ -1204,10 +1204,14 @@ pub(super) fn refusal_text(
 
 /// What `agent.list` says of an agent whose operation could not be settled.
 /// The reservation keeps the operation and its pane, not why its cleanup
-/// failed.
+/// failed. The operation is named as its `agent.<kind>` method is; the
+/// observer's own reservation is an observation.
 #[must_use]
 pub(super) fn quarantine_text(quarantine: &Quarantine) -> String {
-    let kind = format!("{:?}", quarantine.kind).to_lowercase();
+    let kind = match quarantine.kind {
+        ReservationKind::Observe => "observation".into(),
+        kind => format!("{kind:?}").to_lowercase(),
+    };
     let on = quarantine
         .pane
         .as_ref()

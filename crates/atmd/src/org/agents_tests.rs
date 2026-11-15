@@ -2347,7 +2347,7 @@ mod reconciliation {
         assert_eq!(
             rows[0].reason.as_deref(),
             Some(
-                "quarantined: the agent's observe on %1 could not be settled; \
+                "quarantined: the agent's observation on %1 could not be settled; \
                  restart atmd and reconcile"
             )
         );
@@ -4296,6 +4296,21 @@ mod reconciliation {
             quarantine_text(&quarantine(None, ReservationKind::Up)),
             "quarantined: the agent's up could not be settled; restart atmd and reconcile"
         );
+        // The other kinds are named as their `agent.<kind>` methods are; the
+        // observer's own reservation is an observation.
+        for (kind, name) in [
+            (ReservationKind::Adopt, "adopt"),
+            (ReservationKind::Clear, "clear"),
+            (ReservationKind::Observe, "observation"),
+        ] {
+            assert_eq!(
+                quarantine_text(&quarantine(Some("%1"), kind)),
+                format!(
+                    "quarantined: the agent's {name} on %1 could not be settled; \
+                     restart atmd and reconcile"
+                )
+            );
+        }
     }
 
     #[tokio::test]

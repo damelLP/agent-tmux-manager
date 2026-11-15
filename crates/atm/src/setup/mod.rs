@@ -8,7 +8,8 @@
 //!   `hooks` block and adds a `statusLine` only when absent. A user's own
 //!   statusLine is preserved without a backup; its command should forward
 //!   stdin to `atm-hook` for context, model and cost updates. `atm uninstall`
-//!   still restores `claude-statusline-backup.json` from older setups.
+//!   removes/restores only an exact generated statusLine, including legacy
+//!   entries; custom commands stay. Backups from older setups still restore.
 //! - **pi** (<https://pi.dev/>): writes the `pi-atm` TypeScript
 //!   extension to `~/.pi/agent/packages/pi-atm/`, then adds
 //!   `"packages/pi-atm"` to `~/.pi/agent/settings.json`'s `packages`
@@ -43,8 +44,9 @@ mod pi;
 mod skills;
 
 use claude::{
-    claude_skills_dir, detect_claude_code, hook_script_path, read_settings, setup_claude_code,
-    status_line_backup_path, uninstall_status_line, write_settings,
+    claude_skills_dir, create_status_line_entry, detect_claude_code, hook_script_path,
+    read_settings, setup_claude_code, status_line_backup_path, uninstall_status_line,
+    write_settings,
 };
 use codex::{
     codex_hook_script_path, codex_skills_dir, detect_codex, read_codex_hooks, setup_codex,
@@ -201,7 +203,7 @@ pub fn uninstall() -> Result<()> {
         println!("  No hooks found");
     }
 
-    // Step 2: Remove statusLine if it uses atm-hook, restoring the user's
+    // Step 2: Remove only an exact ATM-generated statusLine, restoring the user's
     // own from an older setup's backup. ATM's backup never stops uninstall: one it
     // can't read or delete is left for the user, with a warning.
     let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
@@ -215,13 +217,16 @@ pub fn uninstall() -> Result<()> {
         }
     };
     let has_backup = backup.is_some();
-    let changed = uninstall_status_line(&mut settings, backup);
+    let changed = uninstall_status_line(&mut settings, backup, &create_status_line_entry());
     if changed {
         write_settings(&settings)?;
     }
     match (changed, has_backup) {
         (true, true) => println!("\nstatusLine restored from {}", backup_path.display()),
         (true, false) => println!("\nstatusLine configuration removed"),
+        (false, _) if settings.contains_key("statusLine") => {
+            println!("\nstatusLine - kept yours; not an atm-generated entry")
+        }
         (false, _) => println!("\nstatusLine - not configured by atm"),
     }
     // The backup is done with once restored, or once a statusLine of the

@@ -19,7 +19,7 @@ pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground,
 pub use super::agent_types::*;
 use super::{agent_project::AgentProjects, OrgHandle, OrgServiceError};
 use crate::control::reservation::{
-    CaptureFormat, PaneId, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
+    CaptureFormat, PaneId, Quarantine, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
 };
 use crate::server::methods::CallContext;
 use crate::{
@@ -41,6 +41,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const LIST_BUDGET: Duration = Duration::from_secs(5);
+// The list's read of the quarantined operations, inside `LIST_BUDGET`.
+const QUARANTINE_BUDGET: Duration = Duration::from_secs(1);
 const OBSERVE_BUDGET: Duration = Duration::from_secs(30);
 const MIN_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
 // U8c has 32 active+parked slots. Observers use at most a quarter, leaving
@@ -666,11 +668,32 @@ impl AgentHandle {
             };
             let state = rt.org.snapshot().await?;
             let rows = rt.rows().await?;
+            // The operations whose cleanup failed. A control service that does
+            // not answer in time leaves the list without them, never without
+            // its agents.
+            let quarantines = rt
+                .control
+                .quarantines(Instant::now() + QUARANTINE_BUDGET)
+                .await
+                .unwrap_or_default();
             Ok(state
                 .agents()
                 .filter(|a| filter.as_ref().is_none_or(|id| &a.id.project == id))
                 .map(|a| {
                     let mut entry = list_entry(&state, a, &rows);
+                    // A quarantined agent takes no call at all, its owner's
+                    // included, on a pane that may be gone: that is shown in
+                    // place of a refusal read on that pane and of the failed
+                    // observation, which fails on the quarantine itself. A
+                    // recorded reason stays in front of it.
+                    if let Some(quarantine) = quarantines.iter().find(|q| q.agent == a.id) {
+                        let quarantined = quarantine_text(quarantine);
+                        entry.reason = Some(match entry.reason {
+                            Some(reason) => format!("{reason}; {quarantined}"),
+                            None => quarantined,
+                        });
+                        return entry;
+                    }
                     // A Ready or Starting agent has no recorded reason: what
                     // the last observation found refused is its reason.
                     if matches!(a.status, AgentStatus::Ready | AgentStatus::Starting) {
@@ -1177,6 +1200,19 @@ pub(super) fn refusal_text(
         }
     };
     format!("input refused: {why}")
+}
+
+/// What `agent.list` says of an agent whose operation could not be settled.
+/// The reservation keeps the operation and its pane, not why its cleanup
+/// failed.
+#[must_use]
+pub(super) fn quarantine_text(quarantine: &Quarantine) -> String {
+    let kind = format!("{:?}", quarantine.kind).to_lowercase();
+    let on = quarantine
+        .pane
+        .as_ref()
+        .map_or_else(String::new, |pane| format!(" on {pane}"));
+    format!("quarantined: the agent's {kind}{on} could not be settled; restart atmd and reconcile")
 }
 
 pub(super) fn matches_agent(agent: &Agent, row: &SessionView) -> bool {

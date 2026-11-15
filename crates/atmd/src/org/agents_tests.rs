@@ -2341,12 +2341,16 @@ mod reconciliation {
         agents.reconciled().await.unwrap();
         release.send(()).unwrap();
         rig.org.snapshot().await.unwrap();
+        // The quarantined operation is the observation itself. The list
+        // names it, in place of the failed observation it used to show.
         let rows = agents.list(ListParams::default()).await.unwrap();
-        assert!(rows[0]
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("observation unavailable"));
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some(
+                "quarantined: the agent's observe on %1 could not be settled; \
+                 restart atmd and reconcile"
+            )
+        );
         agents
             .lifecycle(
                 request("p/healthy", None, ReservationKind::Down),
@@ -4241,6 +4245,112 @@ mod reconciliation {
         assert!(
             reason.starts_with(&format!("{SHELL_HOLDS_CHILD}; observation unavailable: ")),
             "{reason}"
+        );
+    }
+
+    // --- A quarantined agent says so in `agent.list` ---
+
+    const QUARANTINED_DOWN: &str =
+        "quarantined: the agent's down on %1 could not be settled; restart atmd and reconcile";
+
+    /// A down of `p/lead` on %1 that does nothing, and whose cleanup fails
+    /// (the control service then quarantines the agent and the pane) or not.
+    async fn down_whose_cleanup(agents: &AgentHandle, fails: bool) {
+        let result = agents
+            .lifecycle(
+                request(
+                    "p/lead",
+                    Some("%1"),
+                    crate::control::reservation::ReservationKind::Down,
+                ),
+                |_| async { Ok(()) },
+                move |_, _| async move {
+                    if fails {
+                        Err(AgentError::Internal("the down is not recorded".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        assert_eq!(result.is_err(), fails);
+    }
+
+    #[test]
+    fn quarantine_text_names_the_operation_and_its_pane() {
+        use crate::control::reservation::{Quarantine, ReservationKind};
+        let quarantine = |pane: Option<&str>, kind| Quarantine {
+            agent: "p/lead".parse().unwrap(),
+            pane: pane.map(|pane| PaneId::parse(pane).unwrap()),
+            kind,
+        };
+        assert_eq!(
+            quarantine_text(&quarantine(Some("%1"), ReservationKind::Down)),
+            QUARANTINED_DOWN
+        );
+        assert_eq!(
+            quarantine_text(&quarantine(Some("%12"), ReservationKind::Respawn)),
+            "quarantined: the agent's respawn on %12 could not be settled; restart atmd and reconcile"
+        );
+        assert_eq!(
+            quarantine_text(&quarantine(None, ReservationKind::Up)),
+            "quarantined: the agent's up could not be settled; restart atmd and reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantined_agent_shows_it_in_the_list_without_a_pass() {
+        // A down whose kill has an unknown outcome, or whose Down could not
+        // be written, leaves the agent Ready on a pane that may be gone, and
+        // every later call refused. The list says so at once: it reads the
+        // control service's quarantines, and waits for no observation.
+        let (rig, agents) = pinned_ready().await;
+        let mut events = agents.observation_events();
+        let before = rig.org.status().unwrap();
+        // The twin: an operation that settles leaves nothing to show.
+        down_whose_cleanup(&agents, false).await;
+        assert_eq!(listed_reason(&agents).await, None);
+        down_whose_cleanup(&agents, true).await;
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(QUARANTINED_DOWN)
+        );
+        assert_eq!(drain_started(&mut events), 0);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn quarantine_wins_over_a_refusal_and_a_failed_observation() {
+        // The refusal was read on a pane that may no longer exist, and a pass
+        // over a quarantined agent fails on the quarantine itself: the list
+        // shows the quarantine alone, once.
+        let (rig, agents, mut events) = refused_ready().await;
+        down_whose_cleanup(&agents, true).await;
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(QUARANTINED_DOWN)
+        );
+        update(&rig, "pending-300").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(QUARANTINED_DOWN)
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_follows_a_recorded_reason() {
+        let (rig, agents) = pinned_ready().await;
+        rig.command(OrgCommand::Stuck {
+            agent_id: "p/lead".parse().unwrap(),
+            reason: "manual recovery".into(),
+        })
+        .await;
+        down_whose_cleanup(&agents, true).await;
+        assert_eq!(
+            listed_reason(&agents).await,
+            Some(format!("manual recovery; {QUARANTINED_DOWN}"))
         );
     }
 

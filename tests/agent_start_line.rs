@@ -19,7 +19,7 @@ mod support;
 use lifecycle::Started;
 use serde_json::{json, Value};
 use stand_in::{StandInMode, StandInPane};
-use support::{about, reference, Confirmation, MessageRig, Watch};
+use support::{about, notice, reference, Confirmation, MessageRig, Watch};
 
 /// The text typed for start line `id`.
 fn line(id: &str) -> String {
@@ -57,7 +57,14 @@ fn accepted(text: &str) -> impl Fn(&Value) -> bool {
 /// A message rig whose daemon starts agents with the `mode` stand-in and has
 /// start lines on (the stand-in rig turns them off by default).
 fn start_line_rig(mode: StandInMode) -> MessageRig {
+    start_line_rig_with(mode, |_| {})
+}
+
+/// As [`start_line_rig`], with `prepare` run before the daemon's restart,
+/// which reads the config.
+fn start_line_rig_with(mode: StandInMode, prepare: impl FnOnce(&MessageRig)) -> MessageRig {
     let mut rig = MessageRig::start(Confirmation::Generous);
+    prepare(&rig);
     let launcher = rig.test.rig.launcher(mode);
     rig.test.rig.set_daemon_env("ATM_SPAWN_BIN", launcher);
     rig.test.rig.set_daemon_env("ATM_SPAWN_START_LINE", "on");
@@ -65,6 +72,26 @@ fn start_line_rig(mode: StandInMode) -> MessageRig {
     assert_eq!(rig.test.rpc("agent.list", json!({}), None), json!([]));
     rig.assert_delivery_config_in_force();
     rig
+}
+
+/// Set the daemon config's stable-idle window to `window`, read at the
+/// daemon's next start; returns the window it replaced.
+fn set_stable_idle(rig: &MessageRig, window: &str) -> String {
+    let path = rig.test.rig.root().join("config/atm/config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    let mut replaced = None;
+    let mut lines = Vec::new();
+    for line in config.lines() {
+        match line.strip_prefix("stable_idle = ") {
+            Some(old) => {
+                assert!(replaced.replace(old.to_owned()).is_none(), "{config}");
+                lines.push(format!("stable_idle = {window}"));
+            }
+            None => lines.push(line.to_owned()),
+        }
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    replaced.unwrap_or_else(|| panic!("no stable_idle in {config}"))
 }
 
 /// `agent.up` of `lead`; its start line is typed, confirmed and its turn
@@ -211,5 +238,90 @@ fn a_message_sent_during_a_clear_is_typed_before_the_start_line() {
         [reference(&message), line(&line_id)]
     );
     never_joined(&rig, &pane);
+    rig.test.rig.close();
+}
+
+/// A start line still queued when the daemon restarts is typed once by the
+/// new daemon, as its own text, and confirmed by the session's prompt event:
+/// the startup replay expects the line's text, not an inbox reference. No
+/// hold, and nothing about it reaches the owner.
+///
+/// The first daemon's stable-idle window is one no test outlasts, so the line
+/// is still unattempted when the test starts a turn of its own; from then on
+/// the busy session keeps it queued, across the restart, until that turn ends
+/// under the new daemon's short window. The window is never awaited. Claude
+/// only: the pi stand-in loses its transport across a restart (a known
+/// limit), so its delivery never starts.
+#[test]
+fn a_start_line_queued_across_a_restart_is_typed_once_and_confirmed() {
+    let mode = StandInMode::Claude;
+    let mut short = String::new();
+    let mut rig = start_line_rig_with(mode, |rig| {
+        short = set_stable_idle(rig, "{ secs = 600, nanos = 0 }");
+    });
+    let mut watch = rig.watch();
+    let started = Started::up(&rig.test, "lead", &lifecycle::started_config(mode));
+    assert_eq!(started.result["state"], "ready", "{}", started.result);
+    let agent = started.id.clone();
+    let pane = started.pane;
+    let session = rig.test.agent(&agent)["session_id"]
+        .as_str()
+        .expect("a session bound at the start")
+        .to_owned();
+    let id = id_of(&watch.wait("the start line", start_line_for(&agent)));
+    rig.hold_turn(&pane);
+    watch.catch_up(&rig);
+    assert!(
+        watch.all(about("msg.delivery_attempted", &id)).is_empty(),
+        "attempted before the restart: {:?}",
+        watch.seen
+    );
+    let end = rig.test.cursor();
+    drop(watch);
+
+    set_stable_idle(&rig, &short);
+    let cursor = rig.test.rig.event_cursor(&pane);
+    rig.test.rig.restart_daemon();
+    rig.assert_delivery_config_in_force();
+    let mut watch = Watch::open(&rig, end);
+    rig.finish_turn(&pane);
+
+    // The fence: the line's receipt, or the hold the owner is told of instead.
+    let delivered = about("msg.delivered", &id);
+    let held = notice(&format!("{id} blocked: "));
+    let outcome = watch.wait("the line's receipt or its hold", |e| {
+        delivered(e) || held(e)
+    });
+    assert_eq!(outcome["kind"], "msg.delivered", "held instead: {outcome}");
+    assert_eq!(outcome["body"]["session_id"], session.as_str());
+    assert_eq!(
+        outcome["body"]["confirmation"],
+        "prompt_submit_exact_reference"
+    );
+    rig.finish_turn(&pane);
+
+    // Typed once, as its own text, by the new daemon.
+    assert_eq!(rig.accepted_since(&pane, cursor), [line(&id)]);
+    let log = rig.test.tail(0);
+    let attempts: Vec<_> = log
+        .iter()
+        .filter(|e| about("msg.delivery_attempted", &id)(e))
+        .collect();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert!(seq(attempts[0]) > end, "{attempts:?}");
+    // No hold and no duplicate risk for the owner to settle.
+    let told: Vec<_> = log
+        .iter()
+        .filter(|e| {
+            e["kind"] == "msg.sent"
+                && e["body"]["to"] == "owner"
+                && e["body"]["body"].as_str().is_some_and(|body| {
+                    body.starts_with(&format!("{id} ")) || body.contains("accept-duplicate-risk")
+                })
+        })
+        .collect();
+    assert!(told.is_empty(), "the owner was told: {told:?}");
+    let entry = rig.inbox_entry(None, Some(&agent), &id);
+    assert_eq!(entry["status"], "delivered", "{entry}");
     rig.test.rig.close();
 }

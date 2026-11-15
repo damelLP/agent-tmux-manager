@@ -36,7 +36,10 @@
 //! can be delivered, so that call answers `started` at once and the handover
 //! carries on. If it then fails, the agent's manager gets one note. A caller
 //! that waits gets the refusal as its answer and no note. A caller that goes
-//! away does not stop the handover.
+//! away does not stop the handover; if its call has ended by the time the
+//! handover fails, the manager gets that same note. The daemon ends a call
+//! at the method's deadline. A client that closes its socket is not such an
+//! end: the connection keeps the call and discards its answer.
 //!
 //! The handover policy in `atm_org::idle` is not asked: a command may hand
 //! over at any context share.
@@ -80,7 +83,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::{
-    sync::{broadcast, Semaphore},
+    sync::{broadcast, oneshot, Semaphore},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
@@ -348,11 +351,16 @@ impl Handovers {
         let Admitted { job, own, manager } = self.admit(p, caller, deadline).await?;
         let (agent_id, message_id) = (job.agent.clone(), job.message_id);
         let org = self.org.clone();
-        let task = tokio::spawn(async move {
+        let (answer, waiting) = oneshot::channel();
+        // The agent itself does not wait: with no receiver from the start,
+        // its handover's failure cannot be taken for a delivered answer.
+        let waiting = (!own).then_some(waiting);
+        tokio::spawn(async move {
             let agent = job.agent.clone();
-            let result = job.run().await;
-            if let (true, Err(error)) = (own, &result) {
-                // Nobody waits for this answer: tell the agent's manager.
+            // An answer nobody takes comes back. That is the agent's own
+            // handover, or a caller whose call has ended: a failure is then
+            // told to the agent's manager instead.
+            if let Err(Err(error)) = answer.send(job.run().await) {
                 let note = MessageContent {
                     from: Address::System,
                     to: manager,
@@ -365,18 +373,18 @@ impl Handovers {
                     tracing::warn!(%agent, %error, "Handover failure note was not recorded");
                 }
             }
-            result
         });
-        if own {
+        let Some(waiting) = waiting else {
             return Ok(HandoverResult {
                 agent_id,
                 message_id,
                 state: HandoverState::Started,
                 session_id: None,
             });
-        }
-        task.await
-            .map_err(|error| AgentError::Internal(format!("handover task: {error}")))?
+        };
+        waiting
+            .await
+            .map_err(|_| AgentError::Internal("handover task stopped".into()))?
     }
 
     /// The checks, the save request and its audit: everything before the

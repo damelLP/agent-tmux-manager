@@ -706,6 +706,52 @@ async fn a_caller_that_waits_gets_the_refusal_and_no_note() {
 }
 
 #[tokio::test]
+async fn a_failure_after_the_callers_call_has_ended_is_told_to_the_manager() {
+    let mut rig = Rig::new().await;
+    // The lead asks for the worker's handover and waits for the answer.
+    let (_deadline, call) = rig.start("worker", from_pane("%0"));
+    let request = rig.requested().await;
+    // The call ends before the handover does (the daemon drops a call at
+    // its deadline). Awaited, so the waiting side is gone before the end.
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    rig.deliver(request, "s1", "%1").await;
+    rig.report("s1", LifecycleEvent::Idle).await;
+
+    let note = rig.next("msg.sent").await;
+    assert_eq!(note.body["from"], "system");
+    assert_eq!(note.body["to"], "p/lead", "the worker's manager");
+    assert_eq!(
+        note.body["body"],
+        format!(
+            "handover of p/worker did not complete: p/worker ended its save turn and {} \
+             did not change; nothing was cleared",
+            rig.memory("worker").display()
+        )
+    );
+    assert!(rig.cleared.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_handover_that_works_after_its_caller_left_sends_no_note() {
+    let mut rig = Rig::new().await;
+    let (_deadline, call) = rig.start("worker", from_pane("%0"));
+    let request = rig.requested().await;
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    rig.deliver(request, "s1", "%1").await;
+    std::fs::write(rig.memory("worker"), "state").unwrap();
+    rig.report("s1", LifecycleEvent::Idle).await;
+    // The handover carries on to the clear, and nobody is sent anything.
+    let cleared = tokio::time::timeout(GUARD, rig.cleared.recv()).await;
+    assert_eq!(cleared.unwrap(), Some(id("worker")));
+    assert_eq!(
+        rig.kinds(),
+        ["msg.delivery_attempted", "msg.delivered", "agent.saved"]
+    );
+}
+
+#[tokio::test]
 async fn a_handover_is_refused_before_anything_is_sent() {
     let mut rig = Rig::new().await;
     rig.agent("fresh", "+++\nharness='pi'\n+++\n", "%2", None)

@@ -791,6 +791,79 @@ async fn clear_enter_outcome_unknown_never_repeats_enter() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_guard_refusal_that_sent_nothing_is_not_an_unknown_outcome() {
+    // Review 23, probes r2 and r2b. The flow's own capture was clean, and the
+    // control actor refuses on the capture of the paste's guard (`at_paste`)
+    // or of the Enter's. Twins with an uncertain error: the two
+    // *_outcome_unknown_* tests.
+    type Change = fn(&mut PaneCapture);
+    let passing: [(&str, Change); 2] = [
+        ("copy mode", |capture| capture.inspection.in_mode = true),
+        ("a dead pane", |capture| capture.inspection.dead = true),
+    ];
+    for at_paste in [true, false] {
+        // The pane refuses input for now: nothing was sent, and the flow
+        // looks again. The pane allows it later, and the clear completes.
+        for (label, change) in passing {
+            let mut clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+            clearing.frame(CLAUDE_CONVERSATION);
+            if at_paste {
+                clearing.frame_with(CLAUDE_CONVERSATION, change);
+            }
+            clearing.frame(CLAUDE_CONVERSATION);
+            clearing.frame(CLAUDE_STAGED);
+            if !at_paste {
+                clearing.frame_with(CLAUDE_STAGED, change);
+                clearing.frame(CLAUDE_STAGED);
+            }
+            clearing.frame(CLAUDE_STAGED);
+            clearing.frame(CLAUDE_CLEARED);
+            clearing.follow_up();
+            clearing.follow_up();
+            let call = clearing.start();
+            clearing.awaiting_session().await;
+            clearing.session_start("new", Some("clear")).await;
+            let result = call.await.unwrap();
+            assert!(result.is_ok(), "{label}, at the paste {at_paste}: {result:?}");
+            assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+            clearing.settled().await;
+            assert_eq!(clearing.unread(), 0, "{label}, at the paste {at_paste}");
+        }
+        // The pane is not the agent's any more, or is gone: nothing was sent,
+        // and the clear stops saying so.
+        for gone in [false, true] {
+            let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+            clearing.frame(CLAUDE_CONVERSATION);
+            if !at_paste {
+                clearing.frame(CLAUDE_CONVERSATION);
+                clearing.frame(CLAUDE_STAGED);
+            }
+            if gone {
+                clearing.rig.client.script_inspect(&pane("%1"), None).unwrap();
+            } else {
+                clearing.frame_with(CLAUDE_STAGED, |capture| {
+                    capture.inspection.local_agent_tag = Some("p/other".into());
+                });
+            }
+            let result = clearing.clear().await;
+            assert!(
+                matches!(result, Err(AgentError::Reservation(_))),
+                "{result:?}"
+            );
+            let sent: &[&str] = if at_paste { &[] } else { &["paste %1 /clear"] };
+            assert_eq!(clearing.sent(), sent, "gone {gone}");
+            let what = if at_paste { "typing" } else { "submitting" };
+            clearing
+                .assert_stuck_with(&format!(
+                    "{what} the clear command was refused, and nothing was sent by it (pane %1"
+                ))
+                .await;
+            assert_eq!(clearing.unread(), 0, "gone {gone}, at the paste {at_paste}");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn clear_paste_outcome_unknown_never_repeats_paste() {
     let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
     let mut committed = clearing.rig.org.committed.subscribe();

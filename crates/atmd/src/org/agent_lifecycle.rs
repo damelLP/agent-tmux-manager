@@ -174,9 +174,18 @@ pub(super) fn changed(
     effect: &Effect,
     result: Result<(), ReservationError>,
 ) -> Result<(), ReservationError> {
-    let before_effect = matches!(
-        &result,
-        Err(ReservationError::NotImplemented { .. }
+    if result.as_ref().is_err_and(before_effect) {
+        effect.store(false, Ordering::SeqCst);
+    }
+    result
+}
+
+/// The errors [`ReservationError`] documents as "before effect" for a pane
+/// operation: the call that answered with one sent nothing and changed nothing.
+fn before_effect(error: &ReservationError) -> bool {
+    matches!(
+        error,
+        ReservationError::NotImplemented { .. }
             | ReservationError::Busy { .. }
             | ReservationError::StaleReservation
             | ReservationError::ScreenChanged { .. }
@@ -187,12 +196,8 @@ pub(super) fn changed(
             | ReservationError::PaneGone { .. }
             | ReservationError::InvalidObservation { .. }
             | ReservationError::Quarantined { .. }
-            | ReservationError::Control(crate::control::ControlError::SendRefused { .. }))
-    );
-    if before_effect {
-        effect.store(false, Ordering::SeqCst);
-    }
-    result
+            | ReservationError::Control(crate::control::ControlError::SendRefused { .. })
+    )
 }
 
 /// How long a flow waits for the registry to answer one read.
@@ -458,14 +463,38 @@ fn stopped(waiting: &Waiting, id: &AgentId, what: &str, reason: String) -> Agent
     error
 }
 
-/// An input whose reply was an error other than a refused guard: whether it
-/// reached the pane is unknown, so it is never sent again.
-fn unknown_outcome(waiting: &Waiting, what: &str, error: ReservationError) -> AgentError {
-    waiting_for(
-        waiting,
-        format!("{what} failed, and whether it reached the pane is unknown ({error})"),
-    );
-    error.into()
+/// A guarded paste or key (`what`) that answered with an error. `Ok` when the
+/// flow may look at the pane again: its own guard refused the capture
+/// (`changed` says so), or the pane refuses input for now (copy mode). Both
+/// sent nothing. Any other error ends the flow: one documented as before
+/// effect says that nothing was sent by this call; for the rest, whether the
+/// input reached the pane is unknown, so it is never sent again.
+fn input_error(
+    waiting: &Waiting,
+    what: &str,
+    changed: &str,
+    error: ReservationError,
+) -> Result<(), AgentError> {
+    let sent_nothing = format!("{what} was refused, and nothing was sent by it ({error})");
+    match error {
+        ReservationError::ScreenChanged { .. } => waiting_for(waiting, changed),
+        ReservationError::PaneInputRefused { .. }
+        | ReservationError::Control(crate::control::ControlError::SendRefused { .. }) => {
+            waiting_for(waiting, sent_nothing);
+        }
+        error if before_effect(&error) => {
+            waiting_for(waiting, sent_nothing);
+            return Err(error.into());
+        }
+        error => {
+            waiting_for(
+                waiting,
+                format!("{what} failed, and whether it reached the pane is unknown ({error})"),
+            );
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 impl AgentRuntime {
@@ -597,14 +626,12 @@ impl AgentRuntime {
                 .await
             {
                 Ok(()) => break,
-                // Nothing was sent: look again.
-                Err(ReservationError::ScreenChanged { .. }) => waiting_for(
+                Err(error) => input_error(
                     waiting,
+                    "typing the clear command",
                     "the editor stopped being safe before the clear command was typed",
-                ),
-                Err(error) => {
-                    return Err(unknown_outcome(waiting, "typing the clear command", error))
-                }
+                    error,
+                )?,
             }
         }
         waiting_for(waiting, "the clear command did not appear in the editor");
@@ -620,17 +647,12 @@ impl AgentRuntime {
                     self.progress("clear_submitting", Some(id.clone()));
                     match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
                         Ok(()) => break,
-                        Err(ReservationError::ScreenChanged { .. }) => waiting_for(
+                        Err(error) => input_error(
                             waiting,
+                            "submitting the clear command",
                             "the screen changed before the clear command was submitted",
-                        ),
-                        Err(error) => {
-                            return Err(unknown_outcome(
-                                waiting,
-                                "submitting the clear command",
-                                error,
-                            ))
-                        }
+                            error,
+                        )?,
                     }
                 }
                 Step::Wait(reason) => waiting_for(
@@ -697,17 +719,12 @@ impl AgentRuntime {
                     };
                     match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
                         Ok(()) => progress.worktree_kept = true,
-                        Err(ReservationError::ScreenChanged { .. }) => waiting_for(
+                        Err(error) => input_error(
                             waiting,
+                            "answering the worktree choice",
                             "the worktree choice changed before it was answered",
-                        ),
-                        Err(error) => {
-                            return Err(unknown_outcome(
-                                waiting,
-                                "answering the worktree choice",
-                                error,
-                            ))
-                        }
+                            error,
+                        )?,
                     }
                 }
                 Step::Wait(reason) => waiting_for(waiting, reason),
@@ -965,15 +982,14 @@ impl AgentRuntime {
             {
                 Ok(()) => break (baseline, before),
                 // Nothing was sent: read the shell's line again.
-                Err(ReservationError::ScreenChanged { .. }) => {
-                    waiting_for(
-                        waiting,
-                        "the shell's line changed before the launch command was typed",
-                    );
-                    refused_line = Some(before);
-                }
                 Err(error) => {
-                    return Err(unknown_outcome(waiting, "typing the launch command", error))
+                    input_error(
+                        waiting,
+                        "typing the launch command",
+                        "the shell's line changed before the launch command was typed",
+                        error,
+                    )?;
+                    refused_line = Some(before);
                 }
             }
         };
@@ -1003,15 +1019,14 @@ impl AgentRuntime {
                         .await
                     {
                         Ok(()) => break,
-                        Err(ReservationError::ScreenChanged { .. }) => {
-                            "the shell's line changed before the command was run"
-                        }
                         Err(error) => {
-                            return Err(unknown_outcome(
+                            input_error(
                                 waiting,
                                 "running the launch command",
+                                "the launch command was typed and not run: the shell's line changed before the command was run",
                                 error,
-                            ))
+                            )?;
+                            continue;
                         }
                     }
                 }

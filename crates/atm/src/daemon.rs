@@ -282,12 +282,18 @@ mod tests {
         let socket = dir.path().join("atmd.sock");
         assert!(!is_socket_listening(&socket), "no socket file");
 
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-        assert!(is_socket_listening(&socket), "live listener");
-
-        // A crashed daemon leaves the socket file behind.
-        drop(listener);
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+        listener
+            .bind(&SockAddr::unix(&socket).unwrap())
+            .expect("bind");
+        // A bound, never-listened socket models a stale path without relying on
+        // drop closing the last descriptor while sibling tests may fork.
+        let _inherited_listener = listener.try_clone().unwrap();
+        assert!(socket.exists());
         assert!(!is_socket_listening(&socket), "stale socket file");
+
+        listener.listen(1).unwrap();
+        assert!(is_socket_listening(&socket), "live listener");
     }
 
     /// A stalled daemon whose backlog is full still counts, and the probe

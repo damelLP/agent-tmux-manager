@@ -123,7 +123,7 @@ apply.
 
 ## Confirmed messages and inbox
 
-The message CLI is distinct from the immediate `atm send` command. It calls the daemon's `msg.*` service, with no direct-tmux fallback. **The runtime on this branch is not enabled yet:** valid calls return `unavailable`; the commands and contracts below are ready for runtime integration, not evidence of working delivery.
+The message CLI is distinct from the immediate `atm send` command. It calls the daemon's `msg.*` service, with no direct-tmux fallback. `atmd` starts the runtime at startup using the configured delivery policy or its defaults.
 
 ```sh
 atm msg send --to project/worker --kind brief --body 'Read the attached brief' --attach /absolute/path/brief.md --task task-1
@@ -152,7 +152,7 @@ All commands accept `--format text|json` (default `text`). Send requires `--to` 
 
 ### Delivery configuration
 
-`atmd` reads `[delivery]` and `[notify]` from the same bounded startup file read. Missing file/section uses the delivery defaults; unknown delivery keys, invalid values, malformed TOML or a failed/timed-out read return an explicit policy error, never a valid-looking default. A bad delivery section does not disable a valid notification section (nor vice versa). Restart to pick up changes. **On this branch the parsed policy is a handoff for runtime integration; validation is wired, but delivery remains unavailable regardless of policy.**
+`atmd` reads `[delivery]` and `[notify]` from the same bounded startup file read. Missing file/section uses the delivery defaults; unknown delivery keys, invalid values, malformed TOML or a failed/timed-out read return an explicit policy error, never a valid-looking default. A bad delivery section does not disable a valid notification section (nor vice versa). Restart to pick up changes. If the delivery policy is invalid or the runtime cannot start, message commands (including `atm inbox`) return `message service unavailable` with the cause, which is also logged by the daemon.
 
 Durations use `{ secs, nanos }`, not strings or bare numbers. Omitted fields take these defaults:
 

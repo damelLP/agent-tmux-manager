@@ -180,6 +180,13 @@ impl DaemonServer {
                     agents_cancel.clone(),
                 );
                 services.agents = Some(agents);
+                // The note at the context line, for the agents this server runs.
+                // It stops with their token.
+                crate::org::agent_handover::spawn_context_notes(
+                    services.org.clone(),
+                    self.registry.clone(),
+                    agents_cancel.clone(),
+                );
                 task
             })
         } else {

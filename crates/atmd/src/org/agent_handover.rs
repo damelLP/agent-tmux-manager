@@ -704,11 +704,7 @@ struct Seen {
 /// one that carries the status change, because a harness may report its
 /// share after it reports the turn's end. Runs until `cancel` or until the
 /// registry stops.
-pub fn spawn_context_notes(
-    org: OrgHandle,
-    registry: RegistryHandle,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn_context_notes(org: OrgHandle, registry: RegistryHandle, cancel: CancellationToken) {
     let mut rows = registry.subscribe();
     tokio::spawn(async move {
         let limits = HandoverLimits::default();
@@ -774,5 +770,5 @@ pub fn spawn_context_notes(
                 Err(error) => tracing::warn!(%agent, %error, "Context note was not recorded"),
             }
         }
-    })
+    });
 }

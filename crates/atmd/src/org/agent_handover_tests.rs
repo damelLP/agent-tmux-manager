@@ -825,7 +825,7 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
 #[tokio::test]
 async fn one_note_per_session_when_a_turn_ends_at_the_line() {
     let mut rig = Rig::new().await;
-    let _watcher = spawn_context_notes(rig.org.clone(), rig.registry.clone(), rig.cancel.clone());
+    spawn_context_notes(rig.org.clone(), rig.registry.clone(), rig.cancel.clone());
     // Below the line: no note.
     rig.share("s1", 399).await;
     rig.turn("s1").await;

@@ -1998,6 +1998,69 @@ async fn unbound_codex_attempt_keeps_the_excluded_session_in_both_scopes() {
     assert_eq!(rig.snapshot(id).hold, None);
 }
 
+/// Pin the defensive scope comparisons directly, without inventing a
+/// concurrent lifecycle change through an already-held reservation.
+#[tokio::test(start_paused = true)]
+async fn armed_lazy_scope_rejects_wrong_exclusion_pane_or_harness() {
+    let (rig, id) = ready_unbound_codex().await;
+    let scope = AttemptScope {
+        message_id: id,
+        attempt_seq: 0,
+        recipient: worker(),
+        pane: pane(),
+        harness: Harness::Codex,
+        session_id: None,
+        excluded_sessions: HashSet::from([SessionId::new("old")]),
+    };
+    let attempt = Attempt {
+        rt: rig.rt.clone(),
+        id,
+        pane: pane(),
+        progress: Arc::new(Mutex::new(Progress {
+            attempt: AttemptCommit::Absent,
+            number: 0,
+            before: 0,
+            seq: None,
+            paste: NOT_STARTED,
+            enter: NOT_STARTED,
+            format: None,
+            settled: None,
+        })),
+    };
+    attempt.still_armed(&scope).await.unwrap();
+    for (case, changed) in [
+        (
+            "exclusion",
+            AttemptScope {
+                excluded_sessions: HashSet::new(),
+                ..scope.clone()
+            },
+        ),
+        (
+            "pane",
+            AttemptScope {
+                pane: PaneId::parse("%2").unwrap(),
+                ..scope.clone()
+            },
+        ),
+        (
+            "harness",
+            AttemptScope {
+                harness: Harness::Pi,
+                ..scope.clone()
+            },
+        ),
+    ] {
+        let error = attempt.still_armed(&changed).await.unwrap_err();
+        assert!(
+            matches!(error, MessageError::Conflict(_)),
+            "{case}: {error:?}"
+        );
+    }
+    assert!(rig.effects().is_empty());
+    assert!(rig.snapshot(id).message.last_attempt.is_none());
+}
+
 /// Lifecycle moves the agent to another pane while the attempt waits for
 /// its reservation: no attempt is made against the pane it asked for.
 #[tokio::test(start_paused = true)]

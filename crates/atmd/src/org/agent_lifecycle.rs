@@ -1181,7 +1181,7 @@ impl AgentRuntime {
     /// before the cursor, which the paste and its Enter are checked against.
     ///
     /// The process facts are read between two captures and used only when both
-    /// show the same root process, shell and line. A line that is
+    /// show the same root process, shell and line, and that line is not blank. A line that is
     /// `refused_line` with more typed after it is never taken.
     async fn idle_shell(
         &self,
@@ -1217,8 +1217,11 @@ impl AgentRuntime {
                 continue;
             }
             match launch_line(&second) {
+                // A blank line is a shell that has drawn no prompt yet (an idle
+                // shell can still be reading its startup files).
                 Some(line)
-                    if launch_line(&first).as_ref() == Some(&line)
+                    if !line.trim().is_empty()
+                        && launch_line(&first).as_ref() == Some(&line)
                         && prompt_line_allowed(refused_line, &line) =>
                 {
                     self.record_baseline(id.clone(), pane.as_str(), baseline.clone());

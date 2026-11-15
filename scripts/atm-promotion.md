@@ -170,7 +170,7 @@ count as the owner's.
 | 6 | The lock is released; `atmd start -d`; wait for the socket to answer | |
 | 7 | Checks: `identity` (the installed bytes and modes are the candidate's, and the answering daemon runs the installed file), `list`, `status`, `agent-list` (asked again for up to a minute while the daemon says it is still starting), `agents` (every named agent of step 3 is there, and is on the same pane unless it is now `down`; both are skipped, in words, for a build whose `atm` has no `agent` command), `send` (one `atm send` into a detached scratch tmux session, closed again) | |
 | 8 | On a failed start or check, or a Ctrl-C during `atm-promote` (check `interrupted`): stop, `atm-rollback`, start, the same checks against the previous pair. **Exit 3** names the failed check | |
-| 9 | Each sidebar's command line is typed back into its pane. What differs from step 3 is printed: sessions gone or new, agents whose state changed (`-> down` and `-> stuck` first), a `statusLine` that `atm setup` replaced (with the command that puts yours back; nothing is restored for you). The installed commit is recorded | |
+| 9 | Each sidebar's command line is typed back into its pane. What differs from step 3 is printed: sessions gone or new, agents whose state changed (`-> down` and `-> stuck` first), a `statusLine` that `atm setup` replaced (with the command that puts yours back; nothing is restored for you). An agent of step 3 that is now `down` while its pane still exists gets a `rollout: WARNING: agent X is now down but its pane %P is still there` line just before the last line, here, after a rollback (exit 3) and after a refusal that follows a restart; after a rollout it ends with the `--rollback` command. The installed commit is recorded | |
 
 **A refusal says how far the run got.** Before anything is stopped (steps 0 to 3) the
 text is `rollout: refused, nothing changed: <reason>`. From step 4 on, the rollout
@@ -229,7 +229,10 @@ a stage 0 release pair; 0.3.0 has the same lock.
   that was being delivered held until `atm msg retry`. Step 3 refuses those; work
   that begins between step 3 and the stop is not seen.
 - Agent states are compared in words only (step 9): a state the new daemon recorded
-  is in the log, and a rollback would not undo it. Sessions are compared by pane: an
+  is in the log, and a rollback would not undo it. A `down` agent passes the `agents`
+  check whether its pane is gone or alive, because a harness that exited and a build
+  that misreads live panes at its start leave the same listing: such a build ends in
+  exit 0, and the `WARNING` line is the only sign of it. Sessions are compared by pane: an
   idle session of a harness that only reports on its next event shows as "only a
   placeholder row until its next event".
 - **Rollback onto newer state.** An older daemon skips event kinds it does not know.

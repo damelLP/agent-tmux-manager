@@ -243,6 +243,14 @@ class Rig(unittest.TestCase):
     def agents(self):
         return json.loads(self.checked([self.bin / 'atm', 'agent', 'list', '--format', 'json']))
 
+    def listed_down(self):
+        """The agent list of a build that takes the one live agent for down, as a wrapper serves it."""
+        return [dict(self.agents()[0], state='down', pane=None)]
+
+    def warning(self, seat, advice='a daemon misread the pane: look at it'):
+        return (f"rollout: WARNING: agent {seat['agent_id']} is now down but its pane {seat['pane']} is still "
+                f'there. If you did not stop it, {advice}')
+
     def events(self):
         return b''.join(path.read_bytes() for path in sorted((self.root / 'state/log/events').glob('*.jsonl')))
 
@@ -683,6 +691,20 @@ class Gap(Rig):
             self.assertEqual(process.wait(timeout=30), 0)
         return code, out, err, holders[0].pid
 
+    def test_a_restart_after_a_refused_swap_warns_of_an_agent_down_on_a_live_pane(self):
+        self.start_tmux()
+        self.start_daemon()
+        seat = self.agent()
+        # The installed build answers the snapshot; started again, it lists the seat down.
+        self.wrap({'agent list': {'each': [None, self.listed_down()]}}, installed=True)
+        old = self.pair()
+        code, out, err, _ = self.refused_swap()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('  agent project/seat: ready -> down', out)
+        self.assertEqual(out.splitlines()[-1], self.warning(seat))
+        self.assertIn('rollout: refused before the swap; the installed build is unchanged and was started', err)
+        self.assert_running(old)
+
     def test_a_restart_after_a_refused_swap_that_fails_a_check_needs_the_owner(self):
         self.wrap({'status': 1}, installed=True)  # the installed build, started again, does not answer it
         self.start_tmux()
@@ -841,6 +863,17 @@ class FailedChecks(Rig):
         self.assertEqual([(agent['agent_id'], agent['pane']) for agent in self.agents()],
                          [('project/seat', seat['pane'])])
 
+    def test_a_rollback_that_finds_an_agent_down_on_a_live_pane_warns_before_its_last_line(self):
+        self.start_tmux()
+        self.start_daemon()
+        seat = self.agent()
+        self.wrap({'send': 1})  # the new build fails a check
+        # The previous build answers the snapshot; back after the rollback, it lists the seat down.
+        self.wrap({'agent list': {'each': [None, self.listed_down()]}}, installed=True)
+        lines = self.rolled_back('send', self.pair()).splitlines()
+        self.assertEqual(lines[-2], self.warning(seat))  # no rollback command: this is the rollback
+        self.assertTrue(lines[-1].startswith('rollout: ROLLED BACK: check send failed'), lines[-1])
+
     def test_a_daemon_that_is_not_the_installed_file_fails_identity(self):
         self.start_tmux()
         old = self.pair()
@@ -927,6 +960,7 @@ class DownAcrossTheRestart(Rig):
         self.assertEqual(code, 0, out + err)
         self.assertIn(warning, out)
         self.assertIn('  agent project/seat: stuck -> down', out)
+        self.assertNotIn('WARNING', out)  # its pane is gone: the down is the expected one
         self.assert_running(new)
         self.assertEqual([(a['state'], a['pane']) for a in self.agents()], [('down', None)])
 
@@ -942,7 +976,27 @@ class DownAcrossTheRestart(Rig):
         self.assertEqual(code, 0, out + err)
         self.assertIn(f"Agent project/seat: ready, pane {seat['pane']}", out)
         self.assertIn('  agent project/seat: ready -> down', out)
+        self.assertNotIn('WARNING', out)
         self.assert_running(new)
+
+    def test_an_agent_listed_down_on_a_pane_that_is_still_there_is_a_loud_warning(self):
+        # What a build that misreads live panes at its start answers (it would also have
+        # written the down to the log). The check cannot tell it from a harness that exited
+        # and left its shell, so the run passes; the line before the last one says it.
+        self.start_tmux()
+        self.start_daemon()
+        seat = self.agent()
+        self.wrap({'agent list --format json': self.listed_down()})
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('Checks passed: identity, list, status, agent-list, agents, send.', out)
+        lines = out.splitlines()
+        self.assertEqual(lines[-2], self.warning(
+            seat, 'this build misread the pane: look at it, then roll back with: scripts/atm-rollout '
+            f'--rollback --bin-dir {self.bin} --socket {self.socket}'))
+        self.assertTrue(lines[-1].startswith('rollout: DONE: the new build is running'), lines[-1])
+        self.assertEqual(self.tmux('display-message', '-p', '-t', seat['pane'], '#{pane_dead}'), '0')
+        self.assert_running(self.pair(self.candidate / 'bin'))
 
 
 class NewerState(Rig):
@@ -1128,6 +1182,22 @@ class AfterTheSwap(Rig):
         code, out, err = self.in_process('--rollback', *target)
         self.assertEqual(code, 1, out + err)
         self.assertIn('refused, nothing changed: the previous pair is already installed', err)
+        self.assert_running(old)
+
+    def test_rollback_warns_of_an_agent_down_on_a_live_pane_and_names_no_second_rollback(self):
+        self.start_tmux()
+        self.start_daemon()
+        seat = self.agent()
+        # The previous build answers the first snapshot; back in place, it lists the seat down.
+        self.wrap({'agent list': {'each': [None, self.listed_down()]}}, installed=True)
+        old = self.pair()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn('WARNING', out)  # the new build lists the seat ready on its pane
+        code, out, err = self.in_process('--rollback', '--bin-dir', self.bin, '--socket', self.socket)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.splitlines()[-2:], [
+            self.warning(seat), 'rollout: DONE: the previous build is running and passed the checks.'])
         self.assert_running(old)
 
     def test_a_previous_build_without_named_agents_is_rolled_back_to_and_says_so(self):

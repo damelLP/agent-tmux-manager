@@ -612,13 +612,15 @@ class Rollout:
             self.call([*self.tmux, 'kill-session', '-t', session])
 
     def checks(self, before, expected, send=True):
-        """Raises CheckFailed with the first check that fails. Without `send` they only read."""
+        """Raises CheckFailed with the first check that fails. Without `send` they only read.
+        Returns the agents of `before` that are now down, each with its pane of then."""
         def answers(name, *args):
             result = self.call([self.atm, *args])
             if result.returncode != 0:
                 raise CheckFailed(name, f"atm {' '.join(args)} exit {result.returncode}: {result.stderr.strip()}")
             return result.stdout
 
+        down = []
         try:
             if fingerprint(self.bin) != expected:
                 raise CheckFailed('identity', 'the installed pair is not the expected one')
@@ -644,12 +646,25 @@ class Rollout:
                     if now is None or (now['state'] != 'down' and now.get('pane') != pane):
                         raise CheckFailed('agents', f"{name} was on pane {pane or '-'} and is now "
                                           + (f"on {now.get('pane') or '-'}" if now else 'missing'))
+                    if now['state'] == 'down':
+                        down.append((name, pane))
             if send:
                 self.check_send()
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             raise CheckFailed('checks', str(error)) from error
         say('Checks passed: identity, list, status'
             + ('' if listed is None else ', agent-list, agents') + (', send.' if send else '.'))
+        return down
+
+    def warn_down(self, down, advice='a daemon misread the pane: look at it'):
+        """Down on a pane that is still there is what a harness that exited leaves, and also what
+        a build that misreads live panes records at its start. The checks pass both; this says it.
+        A pane that step 3 warned was gone is not among them: tmux does not use a pane id twice."""
+        panes = self.panes() or ()
+        for name, pane in down:
+            if pane in panes:
+                say(f'rollout: WARNING: agent {name} is now down but its pane {pane} is still there. '
+                    f'If you did not stop it, {advice}')
 
     # ---- step 9: what differs -----------------------------------------------
 
@@ -791,7 +806,7 @@ class Rollout:
             return self.roll_back(CheckFailed('interrupted', 'Ctrl-C during the swap'), before)
         try:
             self.start_daemon()
-            self.checks(before, self.new)
+            down = self.checks(before, self.new)
         except CheckFailed as failure:
             if self.args.rollback:
                 raise NeedsYou(f'the previous pair is installed, but {failure}') from failure
@@ -801,10 +816,11 @@ class Rollout:
         self.status_line_note(before)
         say(YOURS)
         self.record()
+        back = f'scripts/atm-rollout --rollback --bin-dir {self.bin} --socket {self.socket}'
+        self.warn_down(down, *([] if self.args.rollback else [
+            f'this build misread the pane: look at it, then roll back with: {back}']))
         say('rollout: DONE: the ' + ('previous' if self.args.rollback else 'new') + ' build is running and '
-            'passed the checks.' + ('' if self.args.rollback else
-                                    f' To go back: scripts/atm-rollout --rollback --bin-dir {self.bin} '
-                                    f'--socket {self.socket}'))
+            'passed the checks.' + ('' if self.args.rollback else f' To go back: {back}'))
         return 0
 
     def restore(self, before, lock, reason):
@@ -820,7 +836,7 @@ class Rollout:
         if now == self.pid and not quit_any:
             raise Refused(reason)
         try:
-            self.checks(before, self.old, send=False)
+            down = self.checks(before, self.old, send=False)
         except CheckFailed as failure:
             raise NeedsYou(f'refused before the swap ({reason}); the installed build was started again, '
                            f'and then {failure}') from failure
@@ -829,6 +845,7 @@ class Rollout:
                            'is not back')
         self.difference(before)
         self.status_line_note(before)
+        self.warn_down(down)
         daemon = f'was started again (daemon pid {self.pid} -> {now})' if now != self.pid else \
             f'kept running (daemon pid {now})'
         raise Stopped(f'the installed build is unchanged and {daemon}: {reason}')
@@ -845,7 +862,7 @@ class Rollout:
             raise NeedsYou(f'{failure}, and atm-rollback failed; the daemon is stopped')
         try:
             self.start_daemon()
-            self.checks(before, self.old)
+            down = self.checks(before, self.old)
         except CheckFailed as second:
             if second.name == 'agent-list' and UNREADABLE_LOG in second.detail:
                 raise NeedsYou(f'{failure}; the previous build runs but cannot read the organisation log the '
@@ -854,6 +871,7 @@ class Rollout:
             raise NeedsYou(f'{failure}; rolled back, and then {second}') from second
         self.restart_sidebars()
         self.status_line_note(before)
+        self.warn_down(down)
         say(f'rollout: ROLLED BACK: {failure}; the previous build is running and passed the checks.')
         return 3
 

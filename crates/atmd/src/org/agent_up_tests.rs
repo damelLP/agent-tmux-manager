@@ -168,6 +168,25 @@ impl Starting {
         }
     }
 
+    /// The frames a start would need to read the shell's line a second time
+    /// as its prompt and launch after it: `line` five times (a refused paste
+    /// guard, the start's own look, two captures of a new proof, a paste
+    /// guard), then `line` with the launch text after it, twice (the staged
+    /// capture and the Enter's guard), and the harness.
+    fn script_second_reading(&self, line: &str) {
+        for _ in 0..5 {
+            self.frame(Self::shell(line));
+        }
+        let staged = Self::shell(&format!("{line}{}", self.text));
+        self.frame(staged.clone());
+        self.frame(staged);
+        self.frame(Self::screen(CODEX_FRESH, "codex"));
+    }
+
+    /// What is left of [`Self::script_second_reading`] when the start ends
+    /// at its own look: six frames, three reads each.
+    const SECOND_READING_UNREAD: usize = 6 * 3;
+
     /// Everything a start reads up to and including its Enter.
     fn script_launch(&self) {
         self.script_pane();
@@ -941,17 +960,26 @@ async fn prompt_that_reads_differently_after_it_was_read_ends_the_start() {
     // paste's guard, the line is not read as a new prompt: nothing was sent,
     // and the start ends. (Before the Task 6 review the new line was taken;
     // a line with typed text was taken the same way.)
+    //
+    // The frames go on as a second reading of the prompt would need them:
+    // the new line five times in all, then that line with the launch after
+    // it. The start reads two of them (the refused guard, and its own look)
+    // and none of the rest.
     let mut starting = Starting::new(Harness::Codex).await;
     starting.script_pane();
     starting.frame(Starting::shell(PROMPT));
     starting.frame(Starting::shell(PROMPT));
-    starting.frame(Starting::shell("pb (main)> "));
-    starting.frame(Starting::shell("pb (main)> "));
+    starting.script_second_reading("pb (main)> ");
     let result = starting.up().await;
     assert!(result.is_err(), "{result:?}");
+    // (An observation of the stuck agent may have inspected the pane once.)
+    assert!(
+        starting.unread() + 1 >= Starting::SECOND_READING_UNREAD,
+        "{}",
+        starting.unread()
+    );
     assert_eq!(starting.effects().len(), 2, "{:?}", starting.effects());
     starting.assert_stuck(CHANGED).await;
-    assert_eq!(starting.unread(), 0);
 }
 
 #[tokio::test]
@@ -962,18 +990,24 @@ async fn draft_at_the_prompt_before_the_launch_paste_sends_nothing() {
     // guard refuses, the flow's next capture reads another line than the
     // prompt, and the start ends with no paste and no Enter.
     // Twin: up_order_is_split_tag_pane_created_paste_enter_ready.
+    // The frames go on as a second reading of the prompt would need them
+    // (prompt_that_reads_differently_after_it_was_read_ends_the_start).
     let draft = format!("{PROMPT}rm -rf ~; ");
     let mut starting = Starting::new(Harness::Codex).await;
     starting.script_pane();
     starting.frame(Starting::shell(PROMPT));
     starting.frame(Starting::shell(PROMPT));
-    starting.frame(Starting::shell(&draft));
-    starting.frame(Starting::shell(&draft));
+    starting.script_second_reading(&draft);
     let result = starting.up().await;
     assert!(result.is_err(), "{result:?}");
+    // (An observation of the stuck agent may have inspected the pane once.)
+    assert!(
+        starting.unread() + 1 >= Starting::SECOND_READING_UNREAD,
+        "{}",
+        starting.unread()
+    );
     assert_eq!(starting.effects().len(), 2, "{:?}", starting.effects());
     starting.assert_stuck(CHANGED).await;
-    assert_eq!(starting.unread(), 0);
 
     // Typed while somebody is focused on the pane: that only waits. When
     // the focus has gone the line is not the prompt, and the start ends.

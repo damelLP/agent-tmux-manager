@@ -18,6 +18,11 @@ const MAX_LINE_SIZE: usize = 1_048_576;
 static STARTUP_SLOT: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
+#[cfg(test)]
+pub(super) fn startup_slot_for_test() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(&STARTUP_SLOT)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     #[error("the daemon is too old; restart atmd")]

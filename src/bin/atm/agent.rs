@@ -145,6 +145,13 @@ fn row(value: &Value, columns: &[&str]) -> String {
 }
 
 pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
+    cmd_agent_with_lookup_budget(action, super::agent_target::AGENT_LIST_TIMEOUT).await
+}
+
+pub(super) async fn cmd_agent_with_lookup_budget(
+    action: AgentAction,
+    lookup_budget: Duration,
+) -> anyhow::Result<()> {
     let (value, json, columns, list) = match action {
         AgentAction::Up {
             name,
@@ -195,7 +202,7 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
             request::<_, ClearResult>(
                 "agent.clear",
                 ClearParams {
-                    agent: super::agent_target::agent(&agent, project_root).await?,
+                    agent: super::agent_target::agent(&agent, project_root, lookup_budget).await?,
                     timeout_ms,
                 },
                 timeout_ms.div_ceil(1000) + 25,
@@ -213,7 +220,7 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
             request::<_, RespawnResult>(
                 "agent.respawn",
                 RespawnParams {
-                    agent: super::agent_target::agent(&agent, project_root).await?,
+                    agent: super::agent_target::agent(&agent, project_root, lookup_budget).await?,
                     caller_server: None,
                 },
                 85,
@@ -232,7 +239,7 @@ pub async fn cmd_agent(action: AgentAction) -> anyhow::Result<()> {
             request::<_, DownResult>(
                 "agent.down",
                 DownParams {
-                    agent: super::agent_target::agent(&agent, project_root).await?,
+                    agent: super::agent_target::agent(&agent, project_root, lookup_budget).await?,
                     kill,
                 },
                 55,

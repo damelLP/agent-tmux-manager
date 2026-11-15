@@ -13,11 +13,11 @@ use std::{path::PathBuf, time::Duration};
 // 10 s agent.list router + 10 s startup/transport margin = 20 s.
 pub(super) const AGENT_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
-async fn list(root: Option<PathBuf>) -> Result<ListResult> {
+async fn list(root: Option<PathBuf>, budget: Duration) -> Result<ListResult> {
     let value = super::rpc::call(
         "agent.list",
         serde_json::to_value(ListParams { project_root: root })?,
-        AGENT_LIST_TIMEOUT,
+        budget,
     )
     .await
     .map_err(|error| match error {
@@ -63,14 +63,14 @@ fn unique_name(rows: &[AgentListEntry], name: &str, searched: &str) -> Result<Ag
     Ok(first.agent_id.clone())
 }
 
-pub(super) async fn address(to: &str, root: Option<PathBuf>) -> Result<Address> {
+pub(super) async fn address(to: &str, root: Option<PathBuf>, budget: Duration) -> Result<Address> {
     if to == "owner" || to == "system" {
         return Ok(to.parse()?);
     }
-    Ok(Address::Agent(agent(to, root).await?))
+    Ok(Address::Agent(agent(to, root, budget).await?))
 }
 
-pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
+pub(super) async fn agent(to: &str, root: Option<PathBuf>, budget: Duration) -> Result<AgentId> {
     if to.contains('/') {
         return Ok(to.parse()?);
     }
@@ -81,7 +81,7 @@ pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
         .transpose()?;
     if root.is_none() {
         if let Some(pane) = pane {
-            let rows = list(None).await?;
+            let rows = list(None, budget).await?;
             let mut bindings = rows.iter().filter(|row| {
                 row.state != AgentStatus::Down && row.pane.as_deref() == Some(pane.as_str())
             });
@@ -108,7 +108,7 @@ pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
         Some(root) => std::env::current_dir()?.join(root),
         None => std::env::current_dir()?,
     };
-    let rows = list(Some(root.clone())).await?;
+    let rows = list(Some(root.clone()), budget).await?;
     let searched = match rows.first() {
         Some(row) => format!("project {} ({source})", row.agent_id.project),
         None => format!(
@@ -124,6 +124,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::{json, Value};
+    use std::{future::Future, task::Poll};
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
@@ -141,8 +142,36 @@ mod tests {
         }
     }
 
+    const TEST_BUDGET: Duration = Duration::from_secs(1);
+    const LOOKUP_TIMEOUT: &str = "agent lookup failed: timed out; nothing was sent";
+
+    async fn run_command(args: &[&str], budget: Option<Duration>) -> Result<()> {
+        use super::super::{agent, msg, Args, Command};
+        match (Args::try_parse_from(args).unwrap().command.unwrap(), budget) {
+            (Command::Agent { action }, Some(budget)) => {
+                agent::cmd_agent_with_lookup_budget(action, budget).await
+            }
+            (Command::Inbox(args), Some(budget)) => {
+                msg::cmd_inbox_with_lookup_budget(args, budget).await
+            }
+            (Command::Msg { action }, Some(budget)) => {
+                msg::cmd_msg_with_lookup_budget(action, budget).await
+            }
+            (Command::Agent { action }, None) => agent::cmd_agent(action).await,
+            (Command::Inbox(args), None) => msg::cmd_inbox(args).await,
+            (Command::Msg { action }, None) => msg::cmd_msg(action).await,
+            _ => panic!("unexpected test command"),
+        }
+    }
+
     #[allow(clippy::await_holding_lock)]
-    async fn stalled_command(args: &[&str], method: &str, budget: Duration, expected: &str) {
+    async fn stalled_request(
+        method: &str,
+        params: Value,
+        pane: Option<&str>,
+        command: impl Future<Output = Result<()>>,
+        expected: &str,
+    ) {
         let _lock = super::super::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -157,109 +186,207 @@ mod tests {
         );
         std::env::set_var("ATM_SOCKET", &socket);
         std::env::set_var("ATM_STATE_DIR", dir.path().join("state"));
-        std::env::remove_var("TMUX_PANE");
-        tokio::time::timeout(Duration::from_secs(90), async {
-            let command = async {
-                match super::super::Args::try_parse_from(args).unwrap().command.unwrap() {
-                    super::super::Command::Agent { action } => super::super::agent::cmd_agent(action).await,
-                    super::super::Command::Inbox(args) => super::super::msg::cmd_inbox(args).await,
-                    super::super::Command::Msg { action } => super::super::msg::cmd_msg(action).await,
-                    _ => panic!("unexpected test command"),
-                }
-            };
-            tokio::pin!(command);
-            let peer = async {
-                let (mut read, mut write) = loop {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let (read, write) = stream.into_split();
-                    let mut read = BufReader::new(read);
-                    let mut line = String::new();
-                    if read.read_line(&mut line).await.unwrap() == 0 { continue; }
-                    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["type"], "connect");
-                    break (read, write);
+        match pane {
+            Some(pane) => std::env::set_var("TMUX_PANE", pane),
+            None => std::env::remove_var("TMUX_PANE"),
+        }
+        let (returned, mut returned_rx) = tokio::sync::oneshot::channel();
+        let command = async {
+            let result = command.await;
+            eprintln!("command returned: {result:?}");
+            returned.send(()).unwrap();
+            result
+        };
+        let peer = async {
+            let mut requests = Vec::new();
+            let mut connections_after_request = 0;
+            loop {
+                let (stream, _) = tokio::select! {
+                    stream = listener.accept() => stream.unwrap(),
+                    returned = &mut returned_rx => {
+                        returned.unwrap();
+                        break;
+                    }
                 };
-                write.write_all(format!("{}\n", json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"test","methods":[method]})).as_bytes()).await.unwrap();
+                if !requests.is_empty() {
+                    connections_after_request += 1;
+                }
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
                 let mut line = String::new();
+                if read.read_line(&mut line).await.unwrap() == 0 {
+                    eprintln!("empty startup probe");
+                    continue;
+                }
+                assert_eq!(
+                    serde_json::from_str::<Value>(&line).unwrap()["type"],
+                    "connect"
+                );
+                let hello = json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"test",
+                    "methods":["agent.list","agent.clear","agent.respawn","agent.down","msg.inbox","msg.send"]});
+                write
+                    .write_all(format!("{hello}\n").as_bytes())
+                    .await
+                    .unwrap();
+                line.clear();
                 assert_ne!(read.read_line(&mut line).await.unwrap(), 0);
                 let request: Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(request["method"], method);
-                if method == "agent.list" {
-                    assert_eq!(request["params"], json!({"project_root":std::env::current_dir().unwrap()}));
+                eprintln!("request: {request}");
+                if requests.is_empty() {
+                    assert_eq!(request["method"], method);
+                    assert_eq!(request["params"], params);
+                    assert_eq!(request.get("from_pane").and_then(Value::as_str), pane);
+                } else {
+                    // Let an erroneous follow-up finish without changing its reported error.
+                    let reply = json!({"type":"response","id":request["id"],"result":null});
+                    write
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
                 }
-                (read, write)
-            };
-            // Do not pause while startup/handshake I/O is pending: first observe the request.
-            let (mut read, _write) = tokio::select! {
-                peer = peer => peer,
-                result = &mut command => panic!("command ended before its request: {result:?}"),
-            };
-            tokio::time::pause();
-            tokio::time::advance(budget).await;
-            let error = command.await.unwrap_err();
-            tokio::time::resume();
-            assert_eq!(error.to_string(), expected);
-            let mut extra = String::new();
-            assert_eq!(read.read_line(&mut extra).await.unwrap(), 0, "nothing follows the failed lookup");
-            std::future::poll_fn(|cx| {
-                assert!(listener.poll_accept(cx).is_pending(), "unexpected operation after timeout");
-                std::task::Poll::Ready(())
-            }).await;
-        }).await.unwrap();
+                requests.push(request["method"].as_str().unwrap().to_owned());
+                line.clear();
+                assert_eq!(
+                    read.read_line(&mut line).await.unwrap(),
+                    0,
+                    "second request on one connection: {line}"
+                );
+                eprintln!("request connection closed");
+            }
+            (requests, connections_after_request)
+        };
+        // Real time: both command return and connection EOF must happen before inspection.
+        let (result, (requests, connections_after_request)) =
+            tokio::time::timeout(Duration::from_secs(60), async {
+                tokio::join!(command, peer)
+            })
+            .await
+            .expect("command and peer must finish");
+        assert_eq!(result.unwrap_err().to_string(), expected);
+        assert_eq!(requests, [method], "unexpected operation after timeout");
+        assert_eq!(
+            connections_after_request, 0,
+            "unexpected connection after request"
+        );
+        // Inspect the kernel queue directly, not the reactor's readiness from one poll.
+        let extra = listener.into_std().unwrap().accept();
+        assert!(
+            matches!(&extra, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "unexpected connection after command and EOF: {extra:?}"
+        );
+    }
+
+    async fn stalled_lookup(args: &[&str], pane: Option<&str>) {
+        let root = pane.is_none().then(|| std::env::current_dir().unwrap());
+        stalled_request(
+            "agent.list",
+            json!({"project_root": root}),
+            pane,
+            run_command(args, Some(TEST_BUDGET)),
+            LOOKUP_TIMEOUT,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn clear_lookup_timeout_sends_nothing() {
-        stalled_command(
-            &["atm", "agent", "clear", "worker"],
-            "agent.list",
-            AGENT_LIST_TIMEOUT,
-            "agent lookup failed: timed out; nothing was sent",
-        )
-        .await;
+        stalled_lookup(&["atm", "agent", "clear", "worker"], None).await;
     }
     #[tokio::test]
     async fn respawn_lookup_timeout_sends_nothing() {
-        stalled_command(
-            &["atm", "agent", "respawn", "worker"],
-            "agent.list",
-            AGENT_LIST_TIMEOUT,
-            "agent lookup failed: timed out; nothing was sent",
-        )
-        .await;
+        stalled_lookup(&["atm", "agent", "respawn", "worker"], None).await;
     }
     #[tokio::test]
     async fn down_lookup_timeout_sends_nothing() {
-        stalled_command(
-            &["atm", "agent", "down", "worker", "--kill"],
-            "agent.list",
-            AGENT_LIST_TIMEOUT,
-            "agent lookup failed: timed out; nothing was sent",
-        )
-        .await;
+        stalled_lookup(&["atm", "agent", "down", "worker", "--kill"], None).await;
     }
     #[tokio::test]
     async fn inbox_lookup_timeout_sends_nothing() {
-        stalled_command(
-            &["atm", "inbox", "--for", "worker"],
-            "agent.list",
-            AGENT_LIST_TIMEOUT,
-            "agent lookup failed: timed out; nothing was sent",
-        )
-        .await;
+        stalled_lookup(&["atm", "inbox", "--for", "worker"], None).await;
     }
     #[tokio::test]
     async fn send_lookup_timeout_sends_nothing() {
-        stalled_command(
+        stalled_lookup(
             &["atm", "msg", "send", "--to", "worker", "--body", "hi"],
-            "agent.list",
-            AGENT_LIST_TIMEOUT,
-            "agent lookup failed: timed out; nothing was sent",
+            None,
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn pane_lookup_timeout_sends_nothing() {
+        stalled_lookup(&["atm", "agent", "clear", "worker"], Some("%7")).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)]
+    async fn lookup_commands_use_twenty_second_budget() {
+        let _lock = super::super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = RestoreEnv(
+            ["ATM_SOCKET", "ATM_STATE_DIR", "TMUX_PANE"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("ATM_SOCKET", dir.path().join("rpc.sock"));
+        std::env::set_var("ATM_STATE_DIR", dir.path().join("state"));
+        let _permit = super::super::rpc::startup_slot_for_test()
+            .acquire_owned()
+            .await
+            .unwrap();
+        // The held semaphore prevents every command from starting a thread or socket I/O.
+        for (args, pane) in [
+            (&["atm", "agent", "clear", "worker"][..], None),
+            (&["atm", "agent", "respawn", "worker"][..], None),
+            (&["atm", "agent", "down", "worker", "--kill"][..], None),
+            (&["atm", "inbox", "--for", "worker"][..], None),
+            (
+                &["atm", "msg", "send", "--to", "worker", "--body", "hi"][..],
+                None,
+            ),
+            (&["atm", "agent", "clear", "worker"][..], Some("%7")),
+        ] {
+            match pane {
+                Some(pane) => std::env::set_var("TMUX_PANE", pane),
+                None => std::env::remove_var("TMUX_PANE"),
+            }
+            let command = run_command(args, None);
+            tokio::pin!(command);
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(command.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "{args:?}, pane={pane:?}"
+            );
+            tokio::time::advance(Duration::from_secs(19)).await;
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(command.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "lookup ended before 20 seconds: {args:?}, pane={pane:?}"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let result = std::future::poll_fn(|cx| Poll::Ready(command.as_mut().poll(cx))).await;
+            let Poll::Ready(result) = result else {
+                panic!("lookup still pending at 20 seconds: {args:?}, pane={pane:?}");
+            };
+            assert_eq!(result.unwrap_err().to_string(), LOOKUP_TIMEOUT);
+        }
+    }
+
     #[tokio::test]
     async fn send_operation_timeout_keeps_outcome_unknown_warning() {
-        stalled_command(&["atm", "msg", "send", "--to", "p/worker", "--body", "hi"], "msg.send", Duration::from_secs(15),
+        let params =
+            json!({"to":"p/worker","kind":"note","body":"hi","attachments":[],"task":null});
+        let command = async {
+            let _: (atmd::org::messages::SendResult, _) =
+                super::super::msg::request("msg.send", &params, TEST_BUDGET).await?;
+            Ok(())
+        };
+        stalled_request("msg.send", params.clone(), None, command,
             "message request timed out; accepted work may have completed; inspect inbox before retrying").await;
     }
 }

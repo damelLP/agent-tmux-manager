@@ -143,6 +143,13 @@ fn status_text(status: impl Serialize) -> Result<String> {
 }
 
 pub async fn cmd_msg(action: MsgAction) -> Result<()> {
+    cmd_msg_with_lookup_budget(action, super::agent_target::AGENT_LIST_TIMEOUT).await
+}
+
+pub(super) async fn cmd_msg_with_lookup_budget(
+    action: MsgAction,
+    lookup_budget: Duration,
+) -> Result<()> {
     match action {
         MsgAction::Send {
             to,
@@ -155,7 +162,7 @@ pub async fn cmd_msg(action: MsgAction) -> Result<()> {
         } => {
             let kind = serde_json::from_value(serde_json::Value::String(kind))
                 .context("invalid message kind")?;
-            let to = super::agent_target::address(&to, project_root).await?;
+            let to = super::agent_target::address(&to, project_root, lookup_budget).await?;
             if to == Address::System {
                 bail!("system is not a message recipient");
             }
@@ -295,8 +302,17 @@ fn render_inbox(
     Ok(())
 }
 pub async fn cmd_inbox(args: InboxArgs) -> Result<()> {
+    cmd_inbox_with_lookup_budget(args, super::agent_target::AGENT_LIST_TIMEOUT).await
+}
+
+pub(super) async fn cmd_inbox_with_lookup_budget(
+    args: InboxArgs,
+    lookup_budget: Duration,
+) -> Result<()> {
     let recipient = match args.recipient {
-        Some(to) => Some(super::agent_target::address(&to, args.project_root).await?),
+        Some(to) => {
+            Some(super::agent_target::address(&to, args.project_root, lookup_budget).await?)
+        }
         None => None,
     };
     let (result, raw): (InboxResult, _) = request(

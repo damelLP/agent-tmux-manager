@@ -215,7 +215,10 @@ impl AgentRuntime {
 
     /// Take a pane that already runs a harness under this agent's name: tag
     /// it, and record the agent on it. No key is sent and nothing in the pane
-    /// is changed but the tag.
+    /// is changed but the tag. An agent already Clearing on this pane answers
+    /// Clearing unchanged, after checking the pane's tag. A role is refused
+    /// before tagging when the pane's non-excluded top-level rows name other
+    /// harnesses and none names its own. Discovery rows count as evidence too.
     ///
     /// The agent is Ready only when this call's own capture shows a safe idle
     /// editor of a harness that is positively in the pane's foreground, with a

@@ -112,6 +112,12 @@
 //! give-up. `Wait(OtherDelivery)` is deliberately unbounded: the blocked message's
 //! owner notice must list the messages queued behind it, not silently hide them.
 //!
+//! # Handover policy
+//!
+//! [`idle::handover_step`] is pure: from an agent's context share, idle time
+//! and what it waits for, and the limits passed in for its harness and model,
+//! it answers nothing, flag, save or clear. It never refuses a handover.
+//!
 //! # Compatibility direction
 //!
 //! A newer daemon must read every older log. An older daemon may fail on a newer
@@ -139,6 +145,7 @@ mod command;
 mod config;
 pub mod delivery;
 mod event;
+pub mod idle;
 mod ids;
 mod replay;
 mod state;

@@ -672,6 +672,46 @@ async fn all_agent_targets_accept_bare_and_full_ids() {
 }
 
 #[tokio::test]
+async fn malformed_lookup_answers_say_nothing_was_sent() {
+    for action in TARGET_ACTIONS {
+        let out = run(
+            &target_args(action, "worker"),
+            None,
+            vec![ok(
+                "agent.list",
+                json!({"project_root":"$cwd"}),
+                json!({"not":"agent rows"}),
+            )],
+            false,
+        )
+        .await;
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        let text = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            text.starts_with(
+                "Error: agent lookup failed: malformed answer from daemon; nothing was sent\n"
+            ),
+            "{text}"
+        );
+    }
+    let out = run(
+        &["msg", "send", "--to", "worker", "--body", "hi"],
+        None,
+        vec![ok(
+            "agent.list",
+            json!({"project_root":"$cwd"}),
+            json!({"not":"agent rows"}),
+        )],
+        false,
+    )
+    .await;
+    assert!(String::from_utf8(out.stderr).unwrap().starts_with(
+        "Error: agent lookup failed: malformed answer from daemon; nothing was sent\n"
+    ));
+}
+
+#[tokio::test]
 async fn all_agent_targets_refuse_missing_or_ambiguous_names() {
     for action in TARGET_ACTIONS {
         for (rows, diagnostic) in [

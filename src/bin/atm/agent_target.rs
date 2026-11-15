@@ -14,13 +14,20 @@ use std::{path::PathBuf, time::Duration};
 pub(super) const AGENT_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 async fn list(root: Option<PathBuf>) -> Result<ListResult> {
-    super::msg::request(
+    let value = super::rpc::call(
         "agent.list",
-        ListParams { project_root: root },
+        serde_json::to_value(ListParams { project_root: root })?,
         AGENT_LIST_TIMEOUT,
     )
     .await
-    .map(|(result, _)| result)
+    .map_err(|error| match error {
+        super::rpc::RpcError::Timeout => {
+            anyhow::anyhow!("agent lookup failed: timed out; nothing was sent")
+        }
+        other => anyhow::Error::new(other),
+    })?;
+    serde_json::from_value(value)
+        .context("agent lookup failed: malformed answer from daemon; nothing was sent")
 }
 
 pub(super) fn parse_agent(text: &str) -> Result<String, String> {
@@ -95,4 +102,149 @@ pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
         None => std::env::current_dir()?,
     };
     unique_name(&list(Some(root)).await?, to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use serde_json::{json, Value};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn stalled_command(args: &[&str], method: &str, budget: Duration, expected: &str) {
+        let _lock = super::super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("rpc.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let _restore = RestoreEnv(
+            ["ATM_SOCKET", "ATM_STATE_DIR", "TMUX_PANE"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("ATM_SOCKET", &socket);
+        std::env::set_var("ATM_STATE_DIR", dir.path().join("state"));
+        std::env::remove_var("TMUX_PANE");
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let command = async {
+                match super::super::Args::try_parse_from(args).unwrap().command.unwrap() {
+                    super::super::Command::Agent { action } => super::super::agent::cmd_agent(action).await,
+                    super::super::Command::Inbox(args) => super::super::msg::cmd_inbox(args).await,
+                    super::super::Command::Msg { action } => super::super::msg::cmd_msg(action).await,
+                    _ => panic!("unexpected test command"),
+                }
+            };
+            tokio::pin!(command);
+            let peer = async {
+                let (mut read, mut write) = loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read, write) = stream.into_split();
+                    let mut read = BufReader::new(read);
+                    let mut line = String::new();
+                    if read.read_line(&mut line).await.unwrap() == 0 { continue; }
+                    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["type"], "connect");
+                    break (read, write);
+                };
+                write.write_all(format!("{}\n", json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"test","methods":[method]})).as_bytes()).await.unwrap();
+                let mut line = String::new();
+                assert_ne!(read.read_line(&mut line).await.unwrap(), 0);
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                if method == "agent.list" {
+                    assert_eq!(request["params"], json!({"project_root":std::env::current_dir().unwrap()}));
+                }
+                (read, write)
+            };
+            // Do not pause while startup/handshake I/O is pending: first observe the request.
+            let (mut read, _write) = tokio::select! {
+                peer = peer => peer,
+                result = &mut command => panic!("command ended before its request: {result:?}"),
+            };
+            tokio::time::pause();
+            tokio::time::advance(budget).await;
+            let error = command.await.unwrap_err();
+            tokio::time::resume();
+            assert_eq!(error.to_string(), expected);
+            let mut extra = String::new();
+            assert_eq!(read.read_line(&mut extra).await.unwrap(), 0, "nothing follows the failed lookup");
+            std::future::poll_fn(|cx| {
+                assert!(listener.poll_accept(cx).is_pending(), "unexpected operation after timeout");
+                std::task::Poll::Ready(())
+            }).await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_lookup_timeout_sends_nothing() {
+        stalled_command(
+            &["atm", "agent", "clear", "worker"],
+            "agent.list",
+            AGENT_LIST_TIMEOUT,
+            "agent lookup failed: timed out; nothing was sent",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn respawn_lookup_timeout_sends_nothing() {
+        stalled_command(
+            &["atm", "agent", "respawn", "worker"],
+            "agent.list",
+            AGENT_LIST_TIMEOUT,
+            "agent lookup failed: timed out; nothing was sent",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn down_lookup_timeout_sends_nothing() {
+        stalled_command(
+            &["atm", "agent", "down", "worker", "--kill"],
+            "agent.list",
+            AGENT_LIST_TIMEOUT,
+            "agent lookup failed: timed out; nothing was sent",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn inbox_lookup_timeout_sends_nothing() {
+        stalled_command(
+            &["atm", "inbox", "--for", "worker"],
+            "agent.list",
+            AGENT_LIST_TIMEOUT,
+            "agent lookup failed: timed out; nothing was sent",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn send_lookup_timeout_sends_nothing() {
+        stalled_command(
+            &["atm", "msg", "send", "--to", "worker", "--body", "hi"],
+            "agent.list",
+            AGENT_LIST_TIMEOUT,
+            "agent lookup failed: timed out; nothing was sent",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn send_operation_timeout_keeps_outcome_unknown_warning() {
+        stalled_command(&["atm", "msg", "send", "--to", "p/worker", "--body", "hi"], "msg.send", Duration::from_secs(15),
+            "message request timed out; accepted work may have completed; inspect inbox before retrying").await;
+    }
 }

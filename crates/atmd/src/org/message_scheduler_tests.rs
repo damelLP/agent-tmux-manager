@@ -1315,6 +1315,36 @@ async fn paneless_starting_observations_preserve_readiness_and_hold_clocks() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn pane_observations_are_throttled_across_frequent_job_wakes() {
+    let mut rig = ManualJob::new().await;
+    rig.screens
+        .set(worker(), with(ready("%1", "s1"), |o| o.focused = None));
+    let id = rig.send().await;
+    for (advance_ms, captures) in [
+        (0, 1),
+        (0, 1),
+        (1, 1),
+        (248, 1),
+        (0, 1),
+        (1, 2),
+        (0, 2),
+        (249, 2),
+        (1, 3),
+    ] {
+        tokio::time::advance(Duration::from_millis(advance_ms)).await;
+        // Retain observed across completed rounds: wakes within 250 ms may
+        // reevaluate delivery, but must not capture the same pane again.
+        let mut queued = rig.job.service.board.queued.subscribe();
+        guarded(rig.job.round(&mut queued)).await.unwrap();
+        assert_eq!(rig.screens.calls(&worker()), captures);
+        let rt = &rig.job.service.rt;
+        let snapshot = rt.history.snapshot(id, rt.clock.now().unwrap()).unwrap();
+        assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+        assert!(snapshot.message.last_attempt.is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn observation_back_before_the_timeout_tells_nothing_and_delivers() {
     let mut bench = Bench::blind().await;
     bench.script(Act::Deliver);

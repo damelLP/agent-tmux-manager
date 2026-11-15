@@ -305,14 +305,7 @@ impl AgentRuntime {
         // So is a pane whose sessions are all of another harness than the
         // role's: none of them could ever be bound to this agent.
         if let Some(wanted) = role.map(|role| role.config.harness.short_tag()) {
-            let found: Vec<&str> = rows
-                .iter()
-                .filter(|row| {
-                    row.view.parent_session_id.is_none() && excluded.as_ref() != Some(&row.view.id)
-                })
-                .map(|row| row.view.harness.as_str())
-                .collect();
-            if let Some(other) = found.first().filter(|_| !found.contains(&wanted)) {
+            if let Some(other) = other_harness(&rows, excluded.as_ref(), wanted) {
                 return Err(AgentError::Refused(format!(
                     "{pane} runs {other}, but agent {id}'s role names {wanted}; nothing was changed"
                 )));
@@ -466,6 +459,24 @@ impl AgentRuntime {
         }
         Ok(())
     }
+}
+
+/// A role refuses a pane only when its non-excluded top-level rows name
+/// other harnesses and none names the wanted one. Discovery rows count too.
+pub(super) fn other_harness<'a>(
+    rows: &'a [PaneSession],
+    excluded: Option<&SessionId>,
+    wanted: &str,
+) -> Option<&'a str> {
+    let harnesses: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.view.parent_session_id.is_none() && excluded != Some(&row.view.id))
+        .map(|row| row.view.harness.as_str())
+        .collect();
+    harnesses
+        .first()
+        .copied()
+        .filter(|_| !harnesses.contains(&wanted))
 }
 
 /// The adopt rule: what a pane that already runs something is pinned to, and

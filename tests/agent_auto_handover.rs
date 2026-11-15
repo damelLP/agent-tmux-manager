@@ -8,7 +8,9 @@
 //! or a committed event.
 //!
 //! Synthetic: the context share is the stand-in's `set_context_share`
-//! control, not a captured usage.
+//! control, not a captured usage. The daemon's share is an f64 quotient (63
+//! can arrive as 62.99999999999999), so no test compares it for equality:
+//! the share is read from the note, which rounds it.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -220,13 +222,11 @@ fn handed_over_at_the_line(mode: StandInMode) {
 }
 
 #[test]
-#[ignore = "needs cp/s1-standin"]
 fn a_seat_at_its_line_is_handed_over_with_no_command_pi() {
     handed_over_at_the_line(StandInMode::Pi);
 }
 
 #[test]
-#[ignore = "needs cp/s1-standin"]
 fn a_seat_at_its_line_is_handed_over_with_no_command_claude() {
     handed_over_at_the_line(StandInMode::Claude);
 }
@@ -234,7 +234,6 @@ fn a_seat_at_its_line_is_handed_over_with_no_command_claude() {
 /// The editor looks idle but the harness has not reported the turn's end:
 /// the daemon asks for nothing until it has.
 #[test]
-#[ignore = "needs cp/s1-standin"]
 fn nothing_is_asked_before_the_turn_end_is_reported_pi() {
     let mut seat = Seat::start(StandInMode::Pi);
     seat.work_starts(63);
@@ -264,7 +263,6 @@ fn nothing_is_asked_before_the_turn_end_is_reported_pi() {
 /// The harness does not take the pasted request: nothing is saved and
 /// nothing is cleared.
 #[test]
-#[ignore = "needs cp/s1-standin"]
 fn a_request_the_harness_does_not_take_clears_nothing_pi() {
     let mut seat = Seat::start(StandInMode::Pi);
     seat.work_starts(63);

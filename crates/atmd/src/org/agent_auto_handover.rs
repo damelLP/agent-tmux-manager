@@ -49,6 +49,13 @@
 //!   on record, so nothing is done until a turn ends; a handover the restart
 //!   cut off is lost with its note, and its session can be asked to save once
 //!   more.
+//! - A save request that was not delivered when its handover gave up stays
+//!   queued, as for the handover on command: the daemon withdraws nothing.
+//!   When what held it is gone it is typed, the agent saves, and nothing
+//!   clears the session; for an idle seat that turn is paid for on a cold
+//!   cache, which is what the idle rule is there to avoid. The owner's
+//!   give-up cancels the request. This needs `cache_minutes` in a role file
+//!   to happen to an idle seat.
 //! - The organisation's state is copied once per look, and the role file is
 //!   read on the watcher's own task with a five-second budget. A filesystem
 //!   that hangs delays every look by that long; registry events missed

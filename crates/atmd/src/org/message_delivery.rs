@@ -71,7 +71,8 @@ pub enum AttemptPhase {
 /// What the one guarded paste call left behind, read from its own result: Ok
 /// is Applied. Only for that call's result, taken where it returns: an error
 /// from `run_reserved`, from a later call or one a caller built says nothing
-/// about the paste.
+/// about the paste. The Enter call's own result is read the same way, for
+/// the words of a hold only: it never decides another key.
 #[must_use]
 pub fn paste_certainty(result: &Result<(), ReservationError>) -> EffectCertainty {
     match result {
@@ -196,6 +197,10 @@ pub struct AttemptExitFacts {
     /// The `[mN]` token in the final capture's decoded cells. None: that
     /// capture was not taken, failed or could not be decoded.
     pub token_visible: Option<bool>,
+    /// The attempt's Enter. NotStarted: no Enter call was made, or its own
+    /// result proved that it sent nothing. Applied: a call returned Ok.
+    /// Unknown: a call was made and failed otherwise, or never returned.
+    pub enter: EffectCertainty,
 }
 
 /// What cleanup owes an attempt before the recipient is released.
@@ -210,7 +215,8 @@ pub enum AttemptDisposition {
     /// left to the policy; for any other `DeliveryFailed` is written. If it
     /// cannot be persisted and folded, hold `InputOutcomeUnknown` instead.
     Fail,
-    /// Something may have been typed: never `DeliveryFailed`; retain this hold.
+    /// Something may have been typed: never `DeliveryFailed`; retain this
+    /// hold, whose reason says what is known of the Enter.
     Hold(ExecutorHold),
     /// Nothing can be retained for this attempt, because its log sequence is
     /// not known: cleanup fails.
@@ -219,7 +225,11 @@ pub enum AttemptDisposition {
 
 /// The exit rule: an exact receipt wins over everything; otherwise only a
 /// paste that is known to have sent nothing may be failed, and a paste that
-/// was or may have been applied is held, with the token as its reason.
+/// was or may have been applied is held. The hold's reason: an Enter whose
+/// outcome is unknown is "input outcome unknown" whatever the screen shows;
+/// with the token on screen, "Enter was not sent" when none was, and the
+/// token when an Enter returned Ok and nothing confirmed it; without the
+/// token, unknown.
 #[must_use]
 pub fn disposition(facts: &AttemptExitFacts) -> AttemptDisposition {
     if facts.receipt {
@@ -229,10 +239,10 @@ pub fn disposition(facts: &AttemptExitFacts) -> AttemptDisposition {
         (EffectCertainty::NotStarted, AttemptCommit::Absent) => AttemptDisposition::NoAttempt,
         (EffectCertainty::NotStarted, AttemptCommit::Committed) => AttemptDisposition::Fail,
         (EffectCertainty::Applied | EffectCertainty::Unknown, AttemptCommit::Committed) => {
-            AttemptDisposition::Hold(if facts.token_visible == Some(true) {
-                ExecutorHold::TokenVisible
-            } else {
-                ExecutorHold::InputOutcomeUnknown
+            AttemptDisposition::Hold(match (facts.enter, facts.token_visible) {
+                (EffectCertainty::NotStarted, Some(true)) => ExecutorHold::EnterNotSent,
+                (EffectCertainty::Applied, Some(true)) => ExecutorHold::TokenVisible,
+                _ => ExecutorHold::InputOutcomeUnknown,
             })
         }
         // No sequence to hold under. Possible input with no known attempt
@@ -325,6 +335,7 @@ struct Progress {
     /// The log sequence of the attempt's event, once known.
     seq: Option<u64>,
     paste: EffectCertainty,
+    enter: EffectCertainty,
     /// The recipient's capture format, once known.
     format: Option<CaptureFormat>,
     /// How far cleanup got, once it ran.
@@ -721,8 +732,12 @@ impl Attempt {
                 // that comes late is honoured, and a key refused here would
                 // leave the reference staged for the owner to clear.
                 let key = PaneKey::Enter;
+                self.set(|progress| progress.enter = EffectCertainty::Unknown)?;
                 let entered =
                     (r.keys_guarded(pane, agent.clone(), key, format, guard(enter))).await;
+                // As for the paste: no await before the outcome is noted.
+                let sent = paste_certainty(&entered);
+                self.set(|progress| progress.enter = sent)?;
                 // A refused screen check alone may be looked at again. Any
                 // other return ends the keys, also one that names no effect:
                 // an Enter that was or may have been sent is never repeated.
@@ -884,6 +899,7 @@ impl Attempt {
             receipt: receipt.is_some(),
             paste: progress.paste,
             token_visible: token,
+            enter: progress.enter,
         });
         let settled = match (decided, &receipt) {
             (AttemptDisposition::Deliver, Some(receipt)) => self.delivered(receipt, limit).await,
@@ -969,6 +985,7 @@ pub async fn deliver(
         before: 0,
         seq: None,
         paste: EffectCertainty::NotStarted,
+        enter: EffectCertainty::NotStarted,
         format: None,
         settled: None,
     };

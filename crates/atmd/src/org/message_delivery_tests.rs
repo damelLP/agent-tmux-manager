@@ -880,11 +880,10 @@ impl Rig {
             };
             tmux.script_inspect(&pane(), Some(&idle.inspection))
                 .unwrap();
-            // Ready unbound agents are inspected but need no restart
-            // capture; only a recorded binding is revalidated by a read.
-            if !codex {
-                tmux.script_capture(&idle).unwrap();
-            }
+            // Even a Ready unbound pane is captured while the restart pass
+            // tries to pin its baseline. Give it its own frame so a failed
+            // read cannot queue a retry ahead of the delivery reservation.
+            tmux.script_capture(&idle).unwrap();
             let (agents, _task) = spawn_agents_with(
                 org.clone(),
                 registry.clone(),
@@ -1397,9 +1396,9 @@ fn staged(id: MessageId) -> PaneCapture {
     capture
 }
 
-/// Real Codex 0.167.0 fresh editor supplying the startup inspection's
-/// metadata; a Ready unbound agent needs no restart capture. Provenance is
-/// recorded with the adapter's fixture. No harness process is started.
+/// Real Codex 0.167.0 fresh editor for the startup inspection and capture.
+/// Provenance is recorded with the adapter's fixture. No harness process is
+/// started.
 const CODEX_IDLE: &str = include_str!(
     "../../../atm-codex-adapter/tests/fixtures/screen_styled_u5b_rich-fresh_0.167.0.txt"
 );

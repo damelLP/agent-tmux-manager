@@ -1605,6 +1605,31 @@ async fn second_adopt_of_a_clearing_agent_changes_nothing() {
         assert!(mutations(&adoption.rig).is_empty());
         assert_eq!(adoption.agent().await.unwrap(), recorded);
     }
+
+    // A foreign tag refuses even when the agent is Clearing: that answer
+    // must not hide the fact that this is no longer the agent's pane.
+    let adoption = ready_with_role().await;
+    adoption.rig.command(OrgCommand::Clear { agent_id: adoptee() }).await;
+    let recorded = adoption.agent().await.unwrap();
+    assert_eq!(recorded.status, AgentStatus::Clearing);
+    let before = adoption.rig.org.status().unwrap();
+    let mut committed = adoption.rig.org.committed.subscribe();
+    adoption.rig.client.script_inspect(
+        &pane("%1"),
+        Some(&Adoption::inspection(Some("q/other"), "pi", "")),
+    ).unwrap();
+    match adoption.adopt().await {
+        Err(AgentError::Refused(reason)) => {
+            assert!(reason.contains("%1 is tagged for q/other"), "{reason}");
+            assert!(reason.contains("nothing was changed"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert!(mutations(&adoption.rig).is_empty());
+    assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
 }
 
 #[tokio::test]
@@ -1759,6 +1784,85 @@ async fn adopt_refuses_a_role_whose_harness_is_not_the_panes() {
     assert_eq!(agent.pane.as_deref(), Some("%1"));
     assert_eq!(agent.session_id, Some(SessionId::new("s1")));
     adoption.followed().await;
+}
+
+fn harness_row(id: &str, child: bool, harness: Harness) -> crate::registry::PaneSession {
+    let mut row = SessionDomain::new(
+        SessionId::new(id),
+        AgentType::GeneralPurpose,
+        Model::default(),
+    );
+    row.harness = harness;
+    row.tmux_pane = Some("%1".into());
+    row.parent_session_id = child.then(|| SessionId::new("parent"));
+    crate::registry::PaneSession {
+        view: atm_core::SessionView::from_domain(&row),
+        pid: None,
+        start: None,
+    }
+}
+
+#[test]
+fn role_harness_refusal_is_independent_of_row_order() {
+    use super::super::super::agent_lifecycle::other_harness;
+
+    // Looking only at the first row would refuse the pi role in one order.
+    for others in [1, 8] {
+        let mut rows: Vec<_> = (0..others)
+            .map(|i| harness_row(&format!("other-{i}"), false, Harness::Codex))
+            .collect();
+        rows.push(harness_row("own", false, Harness::Pi));
+        assert_eq!(other_harness(&rows, None, "pi"), None);
+        rows.reverse();
+        assert_eq!(other_harness(&rows, None, "pi"), None);
+    }
+}
+
+#[test]
+fn role_harness_refusal_uses_only_non_excluded_parent_rows() {
+    use super::super::super::agent_lifecycle::other_harness;
+
+    let excluded = SessionId::new("old");
+    for (rows, want) in [
+        (vec![harness_row("child", true, Harness::Codex)], None),
+        (vec![harness_row("old", false, Harness::Codex)], None),
+        (
+            vec![
+                harness_row("old", false, Harness::Pi),
+                harness_row("other", false, Harness::Codex),
+            ],
+            Some("codex"),
+        ),
+        (
+            vec![
+                harness_row("child", true, Harness::Pi),
+                harness_row("other", false, Harness::Codex),
+            ],
+            Some("codex"),
+        ),
+    ] {
+        assert_eq!(other_harness(&rows, Some(&excluded), "pi"), want, "{rows:?}");
+    }
+}
+
+#[test]
+fn role_harness_refusal_counts_discovery_rows_but_allows_no_rows() {
+    use super::super::super::agent_lifecycle::other_harness;
+
+    for (rows, want) in [
+        (vec![], None),
+        (vec![harness_row("pending-100", false, Harness::Codex)], Some("codex")),
+        (vec![harness_row("pending-100", false, Harness::Pi)], None),
+        (
+            vec![
+                harness_row("other", false, Harness::Codex),
+                harness_row("pending-100", false, Harness::Pi),
+            ],
+            None,
+        ),
+    ] {
+        assert_eq!(other_harness(&rows, None, "pi"), want, "{rows:?}");
+    }
 }
 
 #[tokio::test]

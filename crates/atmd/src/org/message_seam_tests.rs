@@ -276,7 +276,8 @@ async fn message_runtime_shares_eight_admissions_and_deliver_is_unavailable() {
             Instant::now() + Duration::from_secs(30),
         ))
         .await,
-        "message delivery executor is not configured",
+        // The executor reads history first, and history is disabled.
+        "A1/A2 pending",
     );
     assert!(mock.calls().is_empty());
     cancel.cancel();

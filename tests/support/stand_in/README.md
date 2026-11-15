@@ -284,7 +284,7 @@ proves the entire next bracketed paste was consumed without entering the editor,
 model, queue, slash commands or dialog selection. Fragmented/multiline input is
 one paste. Its immediately following Enter is swallowed so an older draft is not
 submitted; the draft is preserved. New ordinary typing or another paste resumes
-normal input. Cursor reports and control messages do not consume that Enter.
+normal input. Cursor reports, control messages, arrow keys and lone Escape do not consume that Enter.
 Ordinary typing/CLI prompts do not consume the arm. A duplicate arm, an unfinished
 paste/escape sequence, or a refusal still awaiting its Enter rejects arming without
 changing the existing input/arm. The next paste after the rejected submission is
@@ -308,13 +308,18 @@ control processing. Arm only one gate per process:
   the hook was withheld, **not** sent. It keeps its original session ID. Every
   later lifecycle hook is also held in emission order, including across clear.
   Thus pi's `agent_end` cannot overtake a held `turn_end`. Status payloads are
-  independent: neither held nor a consumer of the arm.
+  independent: neither held nor a consumer of the arm. Claude statuses can therefore
+  precede a held Stop or a new session's held SessionStart.
 - `{"command":"release_hook"}` forwards the buffered hooks exactly once, in
   order, through the normal hook/replay path, then acknowledges the control.
   It disarms the gate; later hooks flow normally. An acknowledgment is still only
   completed forwarding attempts, not daemon receipt: await the daemon row/event
   when receipt matters. A held shutdown also defers process exit until release,
-  keeping this control stream usable; exit otherwise behaves as before.
+  keeping this control stream usable; exit otherwise behaves as before. An unfired
+  literal-next arm also holds `/atm/exit`'s SessionEnd/session_shutdown: use a named
+  completion arm instead, or await that shutdown's `held` event and `release_hook`
+  before `wait_for_shell`. Closing the pane (stdin EOF) or terminating the process
+  with a signal drops held hooks and any queued shutdown hook; none are replayed.
 - A duplicate arm (armed or holding), unknown/malformed name, or release with no
   captured hook returns a control error without overwriting the gate/draft.
   Release while only armed does not cancel that arm. Existing `/atm/drop-next`
@@ -365,6 +370,10 @@ the rig root. Later settings never overwrite that file, including for held hooks
 A subsequent unconfigured Codex hook reports no new usage, so the daemon keeps
 its last known share; use another setting (including zero) and a non-ending hook
 to reset it. Claude/pi return to their captured payload values after consumption.
+Real Codex reuses one rollout per session; this synthetic control switches paths,
+and unconfigured hooks reference an absent fixture transcript instead of rereading it.
+Synthetic pi `contextTokens` can exceed the unchanged session-token total; this
+control injects a context line, not internally consistent usage accounting.
 
 Consumption is at **generation**, not receipt: a dropped report consumes the
 setting; a held report keeps its generated value even if a new setting is armed
@@ -377,10 +386,12 @@ reported share; its control acknowledgment alone is not proof of receipt:
 rig.control(&pane, serde_json::json!({"command":"set_context_share", "percent":40}));
 rig.control(&pane, serde_json::json!({"command":"advance_to", "now_ms":500}));
 rig.wait_for_row(&pane, |r| r.status == atm_core::SessionStatus::Idle
-    && r.context_percentage == 40.0);
+    && (r.context_percentage - 40.0).abs() < 1e-6);
 ```
 
 As above, use the actual work deadline rather than 500 if time already advanced.
+Use a tolerance: the daemon computes an f64 quotient, so even an integer share
+such as 58 can be reported as 57.99999999999999 rather than exactly 58.0.
 **Synthetic:** context counts/percentages and the Codex rollout composition are
 fault-injection values, not captured usage measurements. Codex's record shape and
 258400 capacity reuse the captured `codex_rollout_tokens_0.163.0.jsonl` documented

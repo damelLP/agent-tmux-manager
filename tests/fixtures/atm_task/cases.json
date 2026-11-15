@@ -1,0 +1,65 @@
+[
+  {
+    "name":"create", "method":"task.create",
+    "args":["task","create","New","--measure","{\"kind\":\"owner\"}"],
+    "params":{"title":"New","kind":"work","parent":null,"judges":null,"measure":{"kind":"owner"},"budget":null,"files":[],"rests_on":null},
+    "reply":{"result":{"task_id":"t7","changed":true,"notification":null}},
+    "text":"t7 changed\n"
+  },
+  {
+    "name":"assign", "method":"task.assign",
+    "args":["task","assign","t6","project/worker"],
+    "params":{"task_id":"t6","agent_id":"project/worker"},
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m8"}}},
+    "text":"t6 changed\nnotification: queued m8 (not delivery confirmation)\n"
+  },
+  {
+    "name":"set_state", "method":"task.set_state",
+    "args":["task","set-state","t6","working"],
+    "params":{"task_id":"t6","state":"working","reason":null},
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":null}},
+    "text":"t6 changed\n"
+  },
+  {
+    "name":"submit", "method":"task.submit",
+    "args":["task","submit","t6"],
+    "params":{"task_id":"t6","what":"result","files":[]},
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m9"}}},
+    "text":"t6 changed\nnotification: queued m9 (not delivery confirmation)\n"
+  },
+  {
+    "name":"attach", "method":"task.attach",
+    "args":["task","attach","t6","evidence.log","--kind","evidence"],
+    "params":{"task_id":"t6","file":{"path":"evidence.log","kind":"evidence","note":null}},
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":null}},
+    "text":"t6 changed\n"
+  },
+  {
+    "name":"review", "method":"task.review",
+    "args":["task","review","t6","t9"],
+    "params":{"task_id":"t6","review_task":"t9"},
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":null}},
+    "text":"t6 changed\n"
+  },
+  {
+    "name":"verdict", "method":"task.verdict",
+    "args":["task","verdict","t6","accepted"],
+    "params":{"task_id":"t6","verdict":"accepted","review_task":null,"note":null},
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":null}},
+    "text":"t6 changed\n"
+  },
+  {
+    "name":"list", "method":"task.list",
+    "args":["task","list"],
+    "params":{"agent_id":null,"creator":null,"state":null,"kind":null,"parent":null,"after":null,"open_only":false,"limit":100},
+    "reply":{"result":{"tasks":[{"task_id":"t6","title":"Task","kind":"work","state":"open","agent_id":null,"reason":null}],"next_after":null}},
+    "text":"t6 open kind=work agent=-\n  title: Task\n"
+  },
+  {
+    "name":"get", "method":"task.get",
+    "args":["task","get","t6"],
+    "params":{"task_id":"t6"},
+    "reply":{"result":{"task":{"task_id":"t6","title":"Task","kind":"work","creator":"owner","agent_id":null,"parent":null,"judges":null,"state":"open","reason":null,"submission":null,"review_task":null,"files":[{"path":"briefs/task.md","kind":"brief","note":null}],"measure":{"kind":"mechanical","command":"check"},"budget":null,"rests_on":null,"reminded_at":null,"flagged_at":null,"cost":null,"created_at":"2026-01-15T12:00:00Z","changed_at":"2026-01-15T12:00:00Z"}}},
+    "text":"t6 open kind=work agent=-\n  title: Task\n  budget: null\n  changed_at: \"2026-01-15T12:00:00Z\"\n  cost: null\n  created_at: \"2026-01-15T12:00:00Z\"\n  creator: \"owner\"\n  files: [{\"kind\":\"brief\",\"note\":null,\"path\":\"briefs/task.md\"}]\n  flagged_at: null\n  judges: null\n  measure: {\"command\":\"check\",\"kind\":\"mechanical\"}\n  parent: null\n  reminded_at: null\n  rests_on: null\n  review_task: null\n  submission: null\n"
+  }
+]

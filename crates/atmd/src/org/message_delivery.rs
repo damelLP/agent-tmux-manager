@@ -327,6 +327,8 @@ struct Progress {
     paste: EffectCertainty,
     /// The recipient's capture format, once known.
     format: Option<CaptureFormat>,
+    /// How far cleanup got, once it ran.
+    settled: Option<Settled>,
 }
 
 /// One attempt's dependencies, cloned into its work and its cleanup.
@@ -890,6 +892,7 @@ impl Attempt {
             }
             _ => Settled::Neither,
         };
+        let _ = self.set(|progress| progress.settled = Some(settled));
         if cleanup_succeeds(decided, settled) {
             Ok(())
         } else {
@@ -913,6 +916,9 @@ impl Attempt {
 ///   InputOutcomeUnknown and keep it held; failed history/persistence disables
 ///   rescheduling rather than losing this veto. Staged mismatch/token holds use
 ///   their specific Held reason. A receipt always remains eligible to win later.
+/// - One exception: a final attempt that cleanup recorded as having typed
+///   nothing is reported as Ok, whatever stopped its work. No retry can follow
+///   it, so nothing needs a veto, and the policy fails the message.
 ///
 /// Ok does not mean delivered: the policy asked for no paste, the attempt was
 /// settled (delivered, failed for a retry, or held), or a final attempt typed
@@ -954,21 +960,27 @@ pub async fn deliver(
         seq: None,
         paste: EffectCertainty::NotStarted,
         format: None,
+        settled: None,
     };
-    let work = Attempt {
+    let attempt = Attempt {
         rt,
         id,
         pane,
         progress: Arc::new(Mutex::new(progress)),
     };
-    let cleanup = work.clone();
-    control
+    let (work, cleanup) = (attempt.clone(), attempt.clone());
+    let ran = control
         .run_reserved(
             request,
             move |r| async move { work.work(&r).await },
             move |r, _| async move { cleanup.settle(&r).await },
         )
-        .await
+        .await;
+    match attempt.progress() {
+        // An error of work says nothing against what cleanup then proved.
+        Ok(progress) if progress.settled == Some(Settled::LeftToPolicy) => Ok(()),
+        _ => ran,
+    }
 }
 
 #[cfg(test)]

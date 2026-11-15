@@ -7,6 +7,8 @@ mod stand_in;
 #[path = "support/agent_lifecycle.rs"]
 mod support;
 
+use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
 use atm_core::SessionStatus;
 use serde_json::json;
 use stand_in::StandInMode;
@@ -199,6 +201,7 @@ fn adopt_noninteractive_launcher_stays_starting() {
     let pane = test.rig.launch(&support::config(StandInMode::Claude));
     test.complete_fixture_turn(&pane);
     let identity = process_identity(pane.pid);
+    let screen = test.rig.capture_styled(&pane);
     let after = test.rig.event_cursor(&pane);
     let cursor = test.cursor();
     let result = test.adopt("lead", &pane);
@@ -213,10 +216,12 @@ fn adopt_noninteractive_launcher_stays_starting() {
     assert_eq!(adopted["body"]["session_id"], json!(null));
     assert_eq!(process_identity(pane.pid), identity);
     test.assert_no_input_since(&pane, after);
+    assert_eq!(test.rig.capture_styled(&pane), screen);
     test.rig.close();
 }
 
-/// Private selectors/env must not reach the live server or installed harnesses.
+/// Verify private selectors/env and reject harness executables on daemon PATH.
+/// The outer seal already removes TMUX/TMUX_PANE; this is not a leak injection.
 #[test]
 fn lifecycle_rig_is_private_and_daemon_override_is_set() {
     let mut first = AgentRig::start(StandInMode::Claude);
@@ -245,6 +250,30 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
         assert!(!entries
             .iter()
             .any(|e| e.starts_with(b"TMUX=") || e.starts_with(b"TMUX_PANE=")));
+        let path = entries
+            .iter()
+            .find_map(|entry| entry.strip_prefix(b"PATH="))
+            .expect("daemon PATH must be explicit");
+        for directory in std::env::split_paths(std::ffi::OsStr::from_bytes(path)) {
+            assert!(
+                directory.is_absolute(),
+                "nonabsolute PATH entry: {directory:?}"
+            );
+            for harness in ["claude", "codex", "pi"] {
+                let executable = directory.join(harness);
+                match std::fs::metadata(&executable) {
+                    Ok(metadata) => assert!(
+                        !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0,
+                        "harness executable on daemon PATH: {executable:?}"
+                    ),
+                    Err(error) => assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound,
+                        "cannot inspect daemon PATH candidate {executable:?}: {error}"
+                    ),
+                }
+            }
+        }
         assert_eq!(
             checked(
                 test.rig

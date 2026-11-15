@@ -89,6 +89,7 @@ pub enum OrgCommand {
     ControlSent(ControlAudit),
     ControlSpawned(ControlAudit),
     ControlKilled(ControlAudit),
+    Decision(DecisionCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -126,6 +127,8 @@ pub enum Refusal {
     InvalidRecipient(Address),
     #[error("invalid {field}: {reason}")]
     InvalidValue { field: &'static str, reason: String },
+    #[error(transparent)]
+    Decision(#[from] DecisionRefusal),
 }
 
 impl OrgCommand {
@@ -194,18 +197,19 @@ impl OrgCommand {
             Self::ControlSent(audit) => OrgEvent::ControlSent(audit),
             Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
             Self::ControlKilled(audit) => OrgEvent::ControlKilled(audit),
+            Self::Decision(command) => command.event(),
         }
     }
 }
 
 impl OrgState {
     /// Validate intent without changing state or assigning event sequences.
-    /// `now` is explicit for future timed policy; event timestamps come from the
-    /// log writer, and today's decisions need no clock or time comparison.
+    /// Event timestamps come from the log writer. `now` is compared only with a
+    /// decision's deadline; no other policy needs a clock.
     pub fn decide(
         &self,
         command: &OrgCommand,
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<Vec<OrgEvent>, Refusal> {
         let event = command.event();
         self.validate_event(&event)?;
@@ -428,6 +432,7 @@ impl OrgState {
                 nonempty("pane", &audit.pane)?;
                 true
             }
+            OrgCommand::Decision(command) => return self.decide_decision(command, event, now),
         };
         Ok(if changed { vec![event] } else { vec![] })
     }

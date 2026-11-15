@@ -1,4 +1,5 @@
 //! Synthetic multi-project histories: no harness, clock, daemon or tmux.
+use super::decision_support;
 use super::support::{
     assert_agent_invariants, assert_decided_bindings, assert_editor_ready_preserves, content,
     editor_ready_cycle, role, summary, time,
@@ -41,7 +42,7 @@ pub struct Seed {
 }
 pub fn arb_seed() -> impl Strategy<Value = Seed> {
     (
-        0usize..21,
+        0usize..22,
         0usize..3,
         0usize..4,
         0usize..6,
@@ -177,7 +178,24 @@ impl Seed {
             17 => OrgCommand::ControlSpawned(audit),
             18 => OrgCommand::ControlKilled(audit),
             19 => OrgCommand::EditorReady { agent_id },
-            _ => OrgCommand::Revalidate { agent_id },
+            20 => OrgCommand::Revalidate { agent_id },
+            _ => {
+                let decisions: Vec<_> = state.decisions().collect();
+                let target = decisions
+                    .get(self.value as usize % decisions.len().max(1))
+                    .map(|decision| decision.id)
+                    .unwrap_or(DecisionId::new(999_999));
+                // Some deadlines fall behind the history's clock (refused at the
+                // request), some are reached later (expiry), some never.
+                let deadline = time() + Duration::milliseconds(600 + i64::from(self.value) * 10);
+                OrgCommand::Decision(decision_support::decision_command(
+                    self.to as u64,
+                    target,
+                    address(self.from),
+                    self.flag.then_some(deadline),
+                    self.pane.is_multiple_of(2),
+                ))
+            }
         }
     }
 }
@@ -529,7 +547,57 @@ impl History {
                 history.step(command).unwrap();
             }
         }
-        assert_eq!(history.kinds.len(), 20);
+        // Every decision kind: overruled after a provisional choice, confirmed,
+        // withdrawn, and expired at its deadline (the clock is the sequence).
+        let mut request = decision_support::request();
+        request.requester = Address::Agent(agent(0));
+        request.deadline = None;
+        let resolution = |decision_id, option: &str| {
+            DecisionCommand::Resolve(DecisionResolution {
+                decision_id,
+                option: option.into(),
+                by: Address::Owner,
+                note: None,
+                standing_rule: false,
+            })
+        };
+        let run = |history: &mut Self, command| {
+            let events = history.step(OrgCommand::Decision(command)).unwrap();
+            assert_eq!(events.len(), 1);
+            DecisionId::new(history.seq)
+        };
+        let overruled = run(&mut history, DecisionCommand::Request(request.clone()));
+        let taken = DecisionCommand::TakeProvisionally(ProvisionalChoice {
+            decision_id: overruled,
+            option: "a".into(),
+            by: Address::System,
+        });
+        run(&mut history, taken);
+        run(&mut history, resolution(overruled, "b"));
+        let confirmed = run(&mut history, DecisionCommand::Request(request.clone()));
+        run(&mut history, resolution(confirmed, "a"));
+        let withdrawn = run(&mut history, DecisionCommand::Request(request.clone()));
+        let withdrawal = DecisionCommand::Withdraw(DecisionWithdrawal {
+            decision_id: withdrawn,
+            by: Address::Agent(agent(0)),
+            reason: None,
+        });
+        run(&mut history, withdrawal);
+        request.deadline = Some(time() + Duration::milliseconds(history.seq as i64 + 1));
+        let expired = run(&mut history, DecisionCommand::Request(request));
+        let expiry = DecisionCommand::Expire {
+            decision_id: expired,
+        };
+        run(&mut history, expiry);
+        for (id, status) in [
+            (overruled, DecisionStatus::Overruled),
+            (confirmed, DecisionStatus::Resolved),
+            (withdrawn, DecisionStatus::Withdrawn),
+            (expired, DecisionStatus::Expired),
+        ] {
+            assert_eq!(history.state.decision(&id).unwrap().status, status);
+        }
+        assert_eq!(history.kinds.len(), 26);
         assert_eq!(history.state.agents().count(), 3);
         assert_eq!(history.state.projects().count(), 2);
         history

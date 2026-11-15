@@ -110,3 +110,53 @@ pub fn decision_event_case(slot: usize, text: String, n: u64, flag: bool) -> Org
         }),
     }
 }
+
+/// One command per decision command variant (`pick % 5`), aimed at `target`.
+pub fn decision_command(
+    pick: u64,
+    target: DecisionId,
+    requester: Address,
+    deadline: Option<DateTime<Utc>>,
+    flag: bool,
+) -> DecisionCommand {
+    match pick % 5 {
+        0 => {
+            let mut request = request();
+            request.requester = requester;
+            request.deadline = deadline;
+            request.may_be_undone = flag;
+            DecisionCommand::Request(request)
+        }
+        1 => DecisionCommand::TakeProvisionally(ProvisionalChoice {
+            decision_id: target,
+            option: "a".into(),
+            by: Address::System,
+        }),
+        2 => DecisionCommand::Resolve(DecisionResolution {
+            decision_id: target,
+            option: if flag { "a" } else { "b" }.into(),
+            by: Address::Owner,
+            note: None,
+            standing_rule: flag,
+        }),
+        3 => DecisionCommand::Expire {
+            decision_id: target,
+        },
+        _ => DecisionCommand::Withdraw(DecisionWithdrawal {
+            decision_id: target,
+            by: requester,
+            reason: None,
+        }),
+    }
+}
+
+/// Exhaustive on purpose: a new decision command must get a pick above.
+pub fn decision_command_pick(command: &DecisionCommand) -> u64 {
+    match command {
+        DecisionCommand::Request(_) => 0,
+        DecisionCommand::TakeProvisionally(_) => 1,
+        DecisionCommand::Resolve(_) => 2,
+        DecisionCommand::Expire { .. } => 3,
+        DecisionCommand::Withdraw(_) => 4,
+    }
+}

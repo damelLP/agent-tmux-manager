@@ -388,3 +388,641 @@ fn unknown_references_and_duplicate_ids_leave_the_state_unchanged() {
 fn request_body() -> serde_json::Value {
     OrgEvent::DecisionRequested(request()).to_body()
 }
+
+// ---- Policy: the state table, cell by cell -------------------------------
+
+fn other() -> Address {
+    "p/other".parse().unwrap()
+}
+fn requester() -> Address {
+    Address::Agent(builder())
+}
+/// The golden request's deadline, moved next to the rig's clock.
+fn deadline() -> DateTime<Utc> {
+    at(30)
+}
+
+/// Decide, check that deciding changed nothing, then apply what was decided.
+struct Rig {
+    state: OrgState,
+    seq: u64,
+}
+impl Rig {
+    /// Project `p` with the agents `p/builder` and `p/other`.
+    fn new() -> Self {
+        let mut rig = Self {
+            state: OrgState::default(),
+            seq: 0,
+        };
+        rig.apply(OrgEvent::ProjectRegistered {
+            project_id: "p".parse().unwrap(),
+            root: "/project".into(),
+        });
+        for (name, pane) in [("p/builder", "%1"), ("p/other", "%2")] {
+            rig.apply(OrgEvent::AgentAdopted {
+                agent_id: name.parse().unwrap(),
+                pane: pane.into(),
+                session_id: None,
+            });
+        }
+        rig
+    }
+    fn apply(&mut self, event: OrgEvent) {
+        self.seq += 1;
+        self.state
+            .apply(self.seq, at(self.seq as u32), &event)
+            .unwrap();
+    }
+    fn run(
+        &mut self,
+        command: DecisionCommand,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<OrgEvent>, Refusal> {
+        let before = self.state.clone();
+        let result = self.state.decide(&OrgCommand::Decision(command), now);
+        assert_eq!(self.state, before, "decide changed the state");
+        let events = result?;
+        for event in &events {
+            self.apply(event.clone());
+        }
+        Ok(events)
+    }
+    /// One emitted event, as (kind, the decision's status afterwards).
+    fn emits(
+        &mut self,
+        id: DecisionId,
+        command: DecisionCommand,
+        now: DateTime<Utc>,
+    ) -> (&'static str, DecisionStatus) {
+        let events = self.run(command, now).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        (events[0].kind(), self.status(id))
+    }
+    fn status(&self, id: DecisionId) -> DecisionStatus {
+        self.state.decision(&id).unwrap().status
+    }
+    fn request(&mut self, request: DecisionRequest) -> DecisionId {
+        let events = self.run(DecisionCommand::Request(request), at(0)).unwrap();
+        assert_eq!(events.len(), 1);
+        d(self.seq)
+    }
+    /// A decision on the golden request (changes the intent, recommends `a`,
+    /// options `a` and `b`), walked to `status` by legal commands only.
+    fn with(status: DecisionStatus) -> (Self, DecisionId) {
+        let mut rig = Self::new();
+        let mut request = request();
+        request.deadline = Some(deadline());
+        let id = rig.request(request);
+        let steps = match status {
+            DecisionStatus::Pending => vec![],
+            DecisionStatus::TakenProvisionally => vec![take(id, "a")],
+            DecisionStatus::Resolved => vec![resolve(id, "a")],
+            DecisionStatus::Overruled => vec![take(id, "a"), resolve(id, "b")],
+            DecisionStatus::Expired => vec![DecisionCommand::Expire { decision_id: id }],
+            DecisionStatus::Withdrawn => vec![withdraw(id, requester())],
+        };
+        for step in steps {
+            assert_eq!(rig.run(step, deadline()).unwrap().len(), 1);
+        }
+        assert_eq!(rig.status(id), status);
+        (rig, id)
+    }
+}
+
+fn take(decision_id: DecisionId, option: &str) -> DecisionCommand {
+    DecisionCommand::TakeProvisionally(ProvisionalChoice {
+        decision_id,
+        option: option.into(),
+        by: Address::System,
+    })
+}
+fn answer(decision_id: DecisionId, option: &str) -> DecisionResolution {
+    DecisionResolution {
+        decision_id,
+        option: option.into(),
+        by: Address::Owner,
+        note: Some("because".into()),
+        standing_rule: false,
+    }
+}
+fn resolve(decision_id: DecisionId, option: &str) -> DecisionCommand {
+    DecisionCommand::Resolve(answer(decision_id, option))
+}
+fn withdraw(decision_id: DecisionId, by: Address) -> DecisionCommand {
+    DecisionCommand::Withdraw(DecisionWithdrawal {
+        decision_id,
+        by,
+        reason: Some("no longer needed".into()),
+    })
+}
+
+const STATES: [DecisionStatus; 6] = [
+    DecisionStatus::Pending,
+    DecisionStatus::TakenProvisionally,
+    DecisionStatus::Resolved,
+    DecisionStatus::Overruled,
+    DecisionStatus::Expired,
+    DecisionStatus::Withdrawn,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cell {
+    /// One event of this kind, leaving the decision in this state.
+    Emits(&'static str, DecisionStatus),
+    /// Accepted, no event: a repeat of what already happened.
+    Nothing,
+    /// Refused because of the state the decision is in.
+    Refused,
+}
+
+/// The plan's table: columns are take provisionally (on the recommended
+/// option), the owner's answer (the recorded one, else the recommended
+/// option), expire (deadline reached) and withdraw (by the requester).
+fn expected(state: DecisionStatus) -> [Cell; 4] {
+    use Cell::{Emits, Nothing, Refused};
+    use DecisionStatus::*;
+    match state {
+        Pending => [
+            Emits("decision.taken_provisionally", TakenProvisionally),
+            Emits("decision.resolved", Resolved),
+            Emits("decision.expired", Expired),
+            Emits("decision.withdrawn", Withdrawn),
+        ],
+        TakenProvisionally => [
+            Nothing,
+            Emits("decision.resolved", Resolved),
+            Refused,
+            Refused,
+        ],
+        Resolved | Overruled => [Refused, Nothing, Refused, Refused],
+        Expired => [Refused, Refused, Nothing, Refused],
+        Withdrawn => [Refused, Refused, Refused, Nothing],
+    }
+}
+
+#[test]
+fn every_cell_of_the_state_table() {
+    for state in STATES {
+        for (column, cell) in expected(state).into_iter().enumerate() {
+            let (mut rig, id) = Rig::with(state);
+            let recorded = rig.state.decision(&id).unwrap().resolution.clone();
+            let (command, operation) = match column {
+                0 => (take(id, "a"), "take provisionally"),
+                1 => (
+                    DecisionCommand::Resolve(recorded.unwrap_or_else(|| answer(id, "a"))),
+                    "resolve",
+                ),
+                2 => (DecisionCommand::Expire { decision_id: id }, "expire"),
+                _ => (withdraw(id, requester()), "withdraw"),
+            };
+            let before = rig.state.clone();
+            let result = rig.run(command, deadline());
+            let label = format!("{state:?}, {operation}");
+            match cell {
+                Cell::Emits(kind, after) => {
+                    let events = result.expect(&label);
+                    assert_eq!(events.len(), 1, "{label}");
+                    assert_eq!(events[0].kind(), kind, "{label}");
+                    assert_eq!(rig.status(id), after, "{label}");
+                }
+                Cell::Nothing => {
+                    assert_eq!(result, Ok(vec![]), "{label}");
+                    assert_eq!(rig.state, before, "{label}");
+                }
+                Cell::Refused => {
+                    assert_eq!(
+                        result,
+                        Err(Refusal::Decision(DecisionRefusal::InvalidState {
+                            decision_id: id,
+                            state,
+                            operation,
+                        })),
+                        "{label}"
+                    );
+                    assert_eq!(rig.state, before, "{label}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn emitted_events_carry_the_command_and_apply_stamps_the_time() {
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    let events = rig.run(take(id, "a"), at(40)).unwrap();
+    let choice = ProvisionalChoice {
+        decision_id: id,
+        option: "a".into(),
+        by: Address::System,
+    };
+    assert_eq!(
+        events,
+        [OrgEvent::DecisionTakenProvisionally(choice.clone())]
+    );
+    let taken_at = at(rig.seq as u32);
+    let events = rig.run(resolve(id, "a"), at(41)).unwrap();
+    assert_eq!(events, [OrgEvent::DecisionResolved(answer(id, "a"))]);
+    let decision = rig.state.decision(&id).unwrap();
+    assert_eq!(decision.provisional, Some(choice));
+    assert_eq!(decision.taken_at, Some(taken_at));
+    assert_eq!(decision.resolution, Some(answer(id, "a")));
+    assert_eq!(decision.closed_at, Some(at(rig.seq as u32)));
+
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    let events = rig.run(withdraw(id, Address::Owner), at(40)).unwrap();
+    let withdrawal = DecisionWithdrawal {
+        decision_id: id,
+        by: Address::Owner,
+        reason: Some("no longer needed".into()),
+    };
+    assert_eq!(events, [OrgEvent::DecisionWithdrawn(withdrawal.clone())]);
+    assert_eq!(
+        rig.state.decision(&id).unwrap().withdrawal,
+        Some(withdrawal)
+    );
+}
+
+#[test]
+fn another_option_on_a_provisional_decision_is_an_overrule() {
+    let (mut rig, id) = Rig::with(DecisionStatus::TakenProvisionally);
+    let events = rig.run(resolve(id, "b"), at(40)).unwrap();
+    assert_eq!(events, [OrgEvent::DecisionOverruled(answer(id, "b"))]);
+    let decision = rig.state.decision(&id).unwrap();
+    assert_eq!(decision.status, DecisionStatus::Overruled);
+    assert_eq!(decision.provisional.as_ref().unwrap().option, "a");
+    assert_eq!(decision.resolution, Some(answer(id, "b")));
+    // The same option confirms: resolved, never overruled.
+    let (mut rig, id) = Rig::with(DecisionStatus::TakenProvisionally);
+    assert_eq!(
+        rig.emits(id, resolve(id, "a"), at(40)),
+        ("decision.resolved", DecisionStatus::Resolved)
+    );
+    // From pending there is nothing to overrule, whatever the option.
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    assert_eq!(
+        rig.emits(id, resolve(id, "b"), at(40)),
+        ("decision.resolved", DecisionStatus::Resolved)
+    );
+}
+
+#[test]
+fn a_final_answer_is_only_repeated_never_changed() {
+    for state in [DecisionStatus::Resolved, DecisionStatus::Overruled] {
+        let recorded = |rig: &Rig, id| rig.state.decision(&id).unwrap().resolution.clone().unwrap();
+        let (rig, id) = Rig::with(state);
+        let same = recorded(&rig, id);
+        let mut other_option = same.clone();
+        other_option.option = if same.option == "a" { "b" } else { "a" }.into();
+        let mut other_note = same.clone();
+        other_note.note = None;
+        let mut now_a_rule = same.clone();
+        now_a_rule.standing_rule = true;
+        for changed in [other_option, other_note, now_a_rule] {
+            let (mut rig, id) = Rig::with(state);
+            assert_eq!(
+                rig.run(DecisionCommand::Resolve(changed), at(40)),
+                Err(Refusal::Decision(DecisionRefusal::InvalidState {
+                    decision_id: id,
+                    state,
+                    operation: "resolve",
+                }))
+            );
+        }
+    }
+}
+
+#[test]
+fn only_the_first_two_classes_are_taken_and_only_on_the_recommendation() {
+    for (may_be_undone, changes_intent, taken) in [
+        (true, false, true),
+        (true, true, true),
+        (false, false, false),
+        (false, true, false),
+    ] {
+        let mut rig = Rig::new();
+        let mut request = request();
+        request.may_be_undone = may_be_undone;
+        request.changes_intent = changes_intent;
+        let id = rig.request(request);
+        let result = rig.run(take(id, "a"), at(40));
+        if taken {
+            assert_eq!(result.unwrap().len(), 1);
+            assert_eq!(rig.status(id), DecisionStatus::TakenProvisionally);
+        } else {
+            assert_eq!(
+                result,
+                Err(Refusal::Decision(DecisionRefusal::MustWait {
+                    decision_id: id
+                }))
+            );
+            assert_eq!(rig.status(id), DecisionStatus::Pending);
+            // It waits for the owner, who may still answer it.
+            assert_eq!(
+                rig.emits(id, resolve(id, "a"), at(41)),
+                ("decision.resolved", DecisionStatus::Resolved)
+            );
+        }
+    }
+
+    let not_recommended = |id, option: &str| {
+        Err(Refusal::Decision(DecisionRefusal::NotRecommended {
+            decision_id: id,
+            option: option.into(),
+        }))
+    };
+    // Another listed option, an unlisted one, and no recommendation at all.
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    assert_eq!(rig.run(take(id, "b"), at(40)), not_recommended(id, "b"));
+    assert_eq!(rig.run(take(id, "c"), at(40)), not_recommended(id, "c"));
+    let mut request = request();
+    request.recommended = None;
+    let id = rig.request(request);
+    assert_eq!(rig.run(take(id, "a"), at(40)), not_recommended(id, "a"));
+    assert_eq!(rig.status(id), DecisionStatus::Pending);
+
+    // A repeat is accepted only for the option already taken.
+    let (mut rig, id) = Rig::with(DecisionStatus::TakenProvisionally);
+    assert_eq!(
+        rig.run(take(id, "b"), at(40)),
+        Err(Refusal::Decision(DecisionRefusal::InvalidState {
+            decision_id: id,
+            state: DecisionStatus::TakenProvisionally,
+            operation: "take provisionally",
+        }))
+    );
+}
+
+#[test]
+fn only_the_owner_decides_in_every_state() {
+    for state in STATES {
+        for who in [requester(), other(), Address::System] {
+            let (mut rig, id) = Rig::with(state);
+            let mut resolution = answer(id, "a");
+            resolution.by = who.clone();
+            assert_eq!(
+                rig.run(DecisionCommand::Resolve(resolution), at(40)),
+                Err(Refusal::Decision(DecisionRefusal::NotAllowed {
+                    decision_id: id,
+                    who,
+                    operation: "resolve",
+                })),
+                "{state:?}"
+            );
+            assert_eq!(rig.status(id), state);
+        }
+    }
+}
+
+#[test]
+fn the_answer_must_be_a_listed_option() {
+    for state in [DecisionStatus::Pending, DecisionStatus::TakenProvisionally] {
+        let (mut rig, id) = Rig::with(state);
+        for option in ["c", "", "A"] {
+            assert_eq!(
+                rig.run(resolve(id, option), at(40)),
+                Err(Refusal::Decision(DecisionRefusal::UnknownOption {
+                    decision_id: id,
+                    option: option.into(),
+                }))
+            );
+        }
+        assert_eq!(rig.status(id), state);
+    }
+}
+
+#[test]
+fn only_the_requester_and_the_owner_withdraw() {
+    for state in STATES {
+        for who in [other(), Address::System] {
+            let (mut rig, id) = Rig::with(state);
+            assert_eq!(
+                rig.run(withdraw(id, who.clone()), at(40)),
+                Err(Refusal::Decision(DecisionRefusal::NotAllowed {
+                    decision_id: id,
+                    who,
+                    operation: "withdraw",
+                })),
+                "{state:?}"
+            );
+            assert_eq!(rig.status(id), state);
+        }
+    }
+    for who in [requester(), Address::Owner] {
+        let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+        assert_eq!(
+            rig.emits(id, withdraw(id, who), at(40)),
+            ("decision.withdrawn", DecisionStatus::Withdrawn)
+        );
+    }
+    // The daemon withdraws what it asked itself.
+    let mut rig = Rig::new();
+    let mut request = request();
+    request.requester = Address::System;
+    let id = rig.request(request);
+    assert_eq!(
+        rig.emits(id, withdraw(id, Address::System), at(40)),
+        ("decision.withdrawn", DecisionStatus::Withdrawn)
+    );
+}
+
+#[test]
+fn a_decision_expires_at_its_deadline_and_not_before() {
+    let expire = |id| DecisionCommand::Expire { decision_id: id };
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    for early in [at(0), at(29)] {
+        assert_eq!(
+            rig.run(expire(id), early),
+            Err(Refusal::Decision(DecisionRefusal::DeadlineNotReached {
+                decision_id: id,
+                deadline: deadline(),
+            }))
+        );
+    }
+    assert_eq!(rig.status(id), DecisionStatus::Pending);
+    assert_eq!(
+        rig.emits(id, expire(id), deadline()),
+        ("decision.expired", DecisionStatus::Expired)
+    );
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    assert_eq!(
+        rig.emits(id, expire(id), at(31)),
+        ("decision.expired", DecisionStatus::Expired)
+    );
+
+    // Without a deadline nothing expires, however late it is.
+    let mut rig = Rig::new();
+    let mut request = request();
+    request.deadline = None;
+    let id = rig.request(request);
+    assert_eq!(
+        rig.run(expire(id), at(59)),
+        Err(Refusal::Decision(DecisionRefusal::NoDeadline {
+            decision_id: id
+        }))
+    );
+
+    // Until the daemon records the expiry, the owner's late answer still counts.
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    assert_eq!(
+        rig.emits(id, resolve(id, "b"), at(45)),
+        ("decision.resolved", DecisionStatus::Resolved)
+    );
+}
+
+#[test]
+fn a_request_is_checked_before_it_is_logged() {
+    let invalid = |field: &'static str, reason: &str| {
+        Err(Refusal::InvalidValue {
+            field,
+            reason: reason.into(),
+        })
+    };
+    type Change = fn(&mut DecisionRequest);
+    let cases: [(Change, &'static str, &str); 9] = [
+        (|r| r.title.clear(), "title", "must not be empty"),
+        (|r| r.options.clear(), "options", "need at least two"),
+        (|r| r.options.truncate(1), "options", "need at least two"),
+        (
+            |r| r.options.push(String::new()),
+            "options",
+            "must not be empty",
+        ),
+        (
+            |r| r.options.push("a".into()),
+            "options",
+            "must be distinct",
+        ),
+        (
+            |r| r.recommended = Some("c".into()),
+            "recommended",
+            "must be one of the options",
+        ),
+        (
+            |r| r.recommended = Some(String::new()),
+            "recommended",
+            "must be one of the options",
+        ),
+        (
+            |r| r.deadline = Some(at(10)),
+            "deadline",
+            "must be in the future",
+        ),
+        (
+            |r| r.deadline = Some(at(9)),
+            "deadline",
+            "must be in the future",
+        ),
+    ];
+    for (change, field, reason) in cases {
+        let mut rig = Rig::new();
+        let before = rig.state.clone();
+        let mut request = request();
+        change(&mut request);
+        assert_eq!(
+            rig.run(DecisionCommand::Request(request), at(10)),
+            invalid(field, reason),
+            "{field}: {reason}"
+        );
+        assert_eq!(rig.state, before);
+    }
+
+    // References are checked first, as for every command.
+    let mut rig = Rig::new();
+    let mut unknown = request();
+    unknown.requester = "p/stranger".parse().unwrap();
+    unknown.title.clear();
+    assert_eq!(
+        rig.run(DecisionCommand::Request(unknown), at(10)),
+        Err(Refusal::Invariant(ApplyError::UnknownAgent(
+            "p/stranger".parse().unwrap()
+        )))
+    );
+
+    // Accepted: any known requester, no recommendation, no deadline, a
+    // deadline one second ahead, empty context and files, many options.
+    let changes: [Change; 7] = [
+        |r| r.requester = Address::System,
+        |r| r.requester = Address::Owner,
+        |r| r.recommended = None,
+        |r| r.deadline = None,
+        |r| r.deadline = Some(at(11)),
+        |r| {
+            r.context.clear();
+            r.files.clear();
+        },
+        |r| r.options.extend(["c".to_owned(), "d".to_owned()]),
+    ];
+    let mut rig = Rig::new();
+    for change in changes {
+        let mut request = request();
+        change(&mut request);
+        let events = rig
+            .run(DecisionCommand::Request(request.clone()), at(10))
+            .unwrap();
+        assert_eq!(events, [OrgEvent::DecisionRequested(request.clone())]);
+        let decision = rig.state.decision(&d(rig.seq)).unwrap();
+        assert_eq!(decision.request, request);
+        assert_eq!(decision.status, DecisionStatus::Pending);
+        assert_eq!(decision.requested_at, at(rig.seq as u32));
+    }
+    assert_eq!(rig.state.decisions().count(), 7);
+}
+
+#[test]
+fn commands_on_an_unknown_decision_are_refused() {
+    let (mut rig, _) = Rig::with(DecisionStatus::Pending);
+    let missing = d(999);
+    for command in [
+        take(missing, "a"),
+        resolve(missing, "a"),
+        DecisionCommand::Expire {
+            decision_id: missing,
+        },
+        withdraw(missing, Address::Owner),
+    ] {
+        assert_eq!(
+            rig.run(command, at(40)),
+            Err(Refusal::Invariant(ApplyError::UnknownDecision(missing)))
+        );
+    }
+    // An unknown `by` is a reference error too, before any policy.
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    let stranger: Address = "p/stranger".parse().unwrap();
+    assert_eq!(
+        rig.run(withdraw(id, stranger), at(40)),
+        Err(Refusal::Invariant(ApplyError::UnknownAgent(
+            "p/stranger".parse().unwrap()
+        )))
+    );
+}
+
+#[test]
+fn refusals_read_as_sentences() {
+    let (mut rig, id) = Rig::with(DecisionStatus::Expired);
+    let text = |result: Result<Vec<OrgEvent>, Refusal>| result.unwrap_err().to_string();
+    assert_eq!(
+        text(rig.run(take(id, "a"), at(40))),
+        format!("cannot take provisionally decision {id} while Expired")
+    );
+    let mut resolution = answer(id, "a");
+    resolution.by = other();
+    assert_eq!(
+        text(rig.run(DecisionCommand::Resolve(resolution), at(40))),
+        format!("p/other may not resolve decision {id}")
+    );
+    let (mut rig, id) = Rig::with(DecisionStatus::Pending);
+    assert_eq!(
+        text(rig.run(resolve(id, "c"), at(40))),
+        format!("\"c\" is not an option of decision {id}")
+    );
+    assert_eq!(
+        text(rig.run(take(id, "b"), at(40))),
+        format!(
+            "decision {id} can only be taken provisionally on its recommended option, not \"b\""
+        )
+    );
+    assert_eq!(
+        text(rig.run(DecisionCommand::Expire { decision_id: id }, at(0))),
+        format!("decision {id} is open until 2026-01-15 12:00:30 UTC")
+    );
+}

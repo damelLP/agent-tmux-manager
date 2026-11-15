@@ -22,10 +22,11 @@
 //! and `by` are known, the ID is new) and never today's policy, so a late or
 //! older fact still folds. Older readers skip all six kinds.
 
-use crate::Address;
+use crate::{Address, OrgEvent, OrgState, Refusal};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeSet, fmt, str::FromStr};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -195,4 +196,229 @@ impl Decision {
         self.status = status;
         self.closed_at = Some(ts);
     }
+}
+
+/// Requests about decisions, carried by [`crate::OrgCommand::Decision`]. Each holds
+/// the body of the event it asks for; [`OrgState::decide`] applies the policy
+/// table in the crate documentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionCommand {
+    Request(DecisionRequest),
+    /// Only on the recommended option; the caller reads it from the request.
+    TakeProvisionally(ProvisionalChoice),
+    /// The owner's answer. It becomes `decision.overruled` when it differs
+    /// from a provisional choice; the caller never picks between the two.
+    Resolve(DecisionResolution),
+    /// The deadline has passed, judged against `decide`'s `now`.
+    Expire {
+        decision_id: DecisionId,
+    },
+    Withdraw(DecisionWithdrawal),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DecisionRefusal {
+    #[error("cannot {operation} decision {decision_id} while {state:?}")]
+    InvalidState {
+        decision_id: DecisionId,
+        state: DecisionStatus,
+        operation: &'static str,
+    },
+    #[error("decision {decision_id} cannot be undone or reaches outside: it waits for the owner")]
+    MustWait { decision_id: DecisionId },
+    #[error("decision {decision_id} can only be taken provisionally on its recommended option, not {option:?}")]
+    NotRecommended {
+        decision_id: DecisionId,
+        option: String,
+    },
+    #[error("{option:?} is not an option of decision {decision_id}")]
+    UnknownOption {
+        decision_id: DecisionId,
+        option: String,
+    },
+    #[error("{who} may not {operation} decision {decision_id}")]
+    NotAllowed {
+        decision_id: DecisionId,
+        who: Address,
+        operation: &'static str,
+    },
+    #[error("decision {decision_id} has no deadline")]
+    NoDeadline { decision_id: DecisionId },
+    #[error("decision {decision_id} is open until {deadline}")]
+    DeadlineNotReached {
+        decision_id: DecisionId,
+        deadline: DateTime<Utc>,
+    },
+}
+
+impl DecisionCommand {
+    /// The candidate event, built from the command alone like every other
+    /// command's, so decide validates its references before policy.
+    pub(crate) fn event(&self) -> OrgEvent {
+        match self.clone() {
+            Self::Request(request) => OrgEvent::DecisionRequested(request),
+            Self::TakeProvisionally(choice) => OrgEvent::DecisionTakenProvisionally(choice),
+            Self::Resolve(resolution) => OrgEvent::DecisionResolved(resolution),
+            Self::Expire { decision_id } => OrgEvent::DecisionExpired { decision_id },
+            Self::Withdraw(withdrawal) => OrgEvent::DecisionWithdrawn(withdrawal),
+        }
+    }
+}
+
+impl OrgState {
+    /// Decision policy. `event` is the command's candidate, whose references
+    /// decide has already validated.
+    pub(crate) fn decide_decision(
+        &self,
+        command: &DecisionCommand,
+        event: OrgEvent,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<OrgEvent>, Refusal> {
+        let changed = match command {
+            DecisionCommand::Request(request) => {
+                check_request(request, now)?;
+                true
+            }
+            DecisionCommand::TakeProvisionally(choice) => {
+                let decision = self.require_decision(&choice.decision_id)?;
+                let decision_id = decision.id;
+                match decision.status {
+                    DecisionStatus::Pending => {
+                        if decision.class() == DecisionClass::Irreversible {
+                            return Err(DecisionRefusal::MustWait { decision_id }.into());
+                        }
+                        if decision.request.recommended.as_ref() != Some(&choice.option) {
+                            return Err(DecisionRefusal::NotRecommended {
+                                decision_id,
+                                option: choice.option.clone(),
+                            }
+                            .into());
+                        }
+                        true
+                    }
+                    DecisionStatus::TakenProvisionally
+                        if decision
+                            .provisional
+                            .as_ref()
+                            .is_some_and(|taken| taken.option == choice.option) =>
+                    {
+                        false
+                    }
+                    _ => return Err(wrong_state(decision, "take provisionally")),
+                }
+            }
+            DecisionCommand::Resolve(resolution) => {
+                let decision = self.require_decision(&resolution.decision_id)?;
+                if resolution.by != Address::Owner {
+                    return Err(not_allowed(decision, &resolution.by, "resolve"));
+                }
+                match decision.status {
+                    DecisionStatus::Pending | DecisionStatus::TakenProvisionally => {
+                        if !decision.request.options.contains(&resolution.option) {
+                            return Err(DecisionRefusal::UnknownOption {
+                                decision_id: decision.id,
+                                option: resolution.option.clone(),
+                            }
+                            .into());
+                        }
+                        let overrules = decision.status == DecisionStatus::TakenProvisionally
+                            && decision
+                                .provisional
+                                .as_ref()
+                                .is_some_and(|taken| taken.option != resolution.option);
+                        if overrules {
+                            return Ok(vec![OrgEvent::DecisionOverruled(resolution.clone())]);
+                        }
+                        true
+                    }
+                    DecisionStatus::Resolved | DecisionStatus::Overruled
+                        if decision.resolution.as_ref() == Some(resolution) =>
+                    {
+                        false
+                    }
+                    _ => return Err(wrong_state(decision, "resolve")),
+                }
+            }
+            DecisionCommand::Expire { decision_id } => {
+                let decision = self.require_decision(decision_id)?;
+                let decision_id = decision.id;
+                match (decision.status, decision.request.deadline) {
+                    (DecisionStatus::Expired, _) => false,
+                    (DecisionStatus::Pending, None) => {
+                        return Err(DecisionRefusal::NoDeadline { decision_id }.into())
+                    }
+                    (DecisionStatus::Pending, Some(deadline)) if now < deadline => {
+                        return Err(DecisionRefusal::DeadlineNotReached {
+                            decision_id,
+                            deadline,
+                        }
+                        .into())
+                    }
+                    (DecisionStatus::Pending, Some(_)) => true,
+                    _ => return Err(wrong_state(decision, "expire")),
+                }
+            }
+            DecisionCommand::Withdraw(withdrawal) => {
+                let decision = self.require_decision(&withdrawal.decision_id)?;
+                if withdrawal.by != Address::Owner && withdrawal.by != decision.request.requester {
+                    return Err(not_allowed(decision, &withdrawal.by, "withdraw"));
+                }
+                match decision.status {
+                    DecisionStatus::Withdrawn => false,
+                    DecisionStatus::Pending => true,
+                    _ => return Err(wrong_state(decision, "withdraw")),
+                }
+            }
+        };
+        Ok(if changed { vec![event] } else { vec![] })
+    }
+}
+
+fn check_request(request: &DecisionRequest, now: DateTime<Utc>) -> Result<(), Refusal> {
+    let invalid = |field, reason: &str| {
+        Err(Refusal::InvalidValue {
+            field,
+            reason: reason.into(),
+        })
+    };
+    let options = &request.options;
+    if request.title.is_empty() {
+        return invalid("title", "must not be empty");
+    }
+    if options.len() < 2 {
+        return invalid("options", "need at least two");
+    }
+    if options.iter().any(String::is_empty) {
+        return invalid("options", "must not be empty");
+    }
+    if options.iter().collect::<BTreeSet<_>>().len() != options.len() {
+        return invalid("options", "must be distinct");
+    }
+    if request
+        .recommended
+        .as_ref()
+        .is_some_and(|option| !options.contains(option))
+    {
+        return invalid("recommended", "must be one of the options");
+    }
+    if request.deadline.is_some_and(|deadline| deadline <= now) {
+        return invalid("deadline", "must be in the future");
+    }
+    Ok(())
+}
+fn wrong_state(decision: &Decision, operation: &'static str) -> Refusal {
+    DecisionRefusal::InvalidState {
+        decision_id: decision.id,
+        state: decision.status,
+        operation,
+    }
+    .into()
+}
+fn not_allowed(decision: &Decision, who: &Address, operation: &'static str) -> Refusal {
+    DecisionRefusal::NotAllowed {
+        decision_id: decision.id,
+        who: who.clone(),
+        operation,
+    }
+    .into()
 }

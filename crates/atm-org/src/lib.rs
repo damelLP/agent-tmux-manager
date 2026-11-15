@@ -97,6 +97,28 @@
 //! Control audits refuse an empty pane; otherwise they always emit and do not
 //! change organisation state.
 //!
+//! # Decision policy
+//!
+//! A decision is a question with listed options put to the owner; see the
+//! decision module's types for its fields and derived class. Its commands
+//! arrive as [`OrgCommand::Decision`]. Rows are the six states; "no event" is
+//! a repeat of what already happened.
+//!
+//! | State | TakeProvisionally | Resolve | Expire | Withdraw |
+//! |---|---|---|---|---|
+//! | pending | taken provisionally; refuses a decision that may not be undone, and any option but the recommended one | resolved | expired once `now` reaches the deadline; refuses without a deadline or before it | withdrawn |
+//! | taken provisionally | no event for the same option | resolved for the provisional option, overruled for another | refuses | refuses |
+//! | resolved, overruled | refuses | no event for the identical answer, else refuses | refuses | refuses |
+//! | expired | refuses | refuses | no event | refuses |
+//! | withdrawn | refuses | refuses | refuses | no event |
+//!
+//! Before the state is looked at: Resolve refuses anyone but the owner, and an
+//! option that is not listed; Withdraw refuses anyone but the requester and the
+//! owner. Request refuses an empty title, fewer than two options, an empty or
+//! repeated option, a recommendation that is not an option, and a deadline not
+//! after `now`. Whether the owner is away is not known here: the caller decides
+//! when to take a decision provisionally, this policy whether it may.
+//!
 //! # Delivery policy
 //!
 //! [`delivery::next_delivery`] is pure: the executor supplies observations and

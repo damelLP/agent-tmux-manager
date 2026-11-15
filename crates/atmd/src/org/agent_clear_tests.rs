@@ -891,6 +891,45 @@ async fn deadline_during_the_enter_says_the_command_may_have_been_submitted() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn timeout_waiting_for_the_reservation_is_not_answered_with_an_earlier_stuck_reason() {
+    // The agent is Stuck since an earlier call, and another job holds its
+    // reservation. A clear waits to be admitted and runs out of its time
+    // there: its flow never ran, and its cleanup recorded nothing. The
+    // caller keeps the timeout. The earlier reason is not this call's
+    // outcome, and the record keeps it. Twin:
+    // deadline_during_the_enter_says_the_command_may_have_been_submitted
+    // (a timeout this call's own cleanup recorded Stuck for).
+    const EARLIER: &str = "start did not complete: an earlier call; inspect %1";
+    let (rig, agents) = ready_agent().await;
+    rig.command(OrgCommand::Stuck {
+        agent_id: lead(),
+        reason: EARLIER.into(),
+    })
+    .await;
+    let (release, held) = hold_agent_reservation(&rig, "p/lead", "%1").await;
+    let result = agents
+        .clear(ClearParams {
+            agent: lead(),
+            timeout_ms: 5_000,
+        })
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    let agent = rig.state("lead").await;
+    assert_eq!(agent.status, AgentStatus::Stuck);
+    assert_eq!(agent.reason.as_deref(), Some(EARLIER));
+    release.send(()).unwrap();
+    held.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn session_that_starts_before_the_enter_is_not_the_clears_proof() {
     // Review 23, probe r3. Somebody clears by hand in the agent's pane after
     // the flow's first read and before its Enter: that session is not what

@@ -20,6 +20,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 include!("task_budget_tests.rs");
+include!("task_budget_usage_tests.rs");
 
 const DELAY: i64 = 60;
 /// Virtual time: longer than any wait a test arms, so it only ends a hang.

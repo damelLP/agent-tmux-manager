@@ -396,14 +396,11 @@ impl TaskHandle {
             let state = self.org.snapshot().await?;
             caller_address(&state, &caller)?;
             let task = task(&state, &params.task_id)?;
+            let now = chrono::Utc::now();
+            let usage = state.task_cost(&task.id, now).unwrap_or_default();
             let result = GetResult {
                 task: task.clone(),
-                budget_status: atm_org::budget::budget_status(
-                    &state,
-                    task,
-                    &atm_org::TaskCost::default(),
-                    chrono::Utc::now(),
-                ),
+                budget_status: atm_org::budget::budget_status(&state, task, &usage, now),
             };
             bounded(&result)?;
             Ok(result)

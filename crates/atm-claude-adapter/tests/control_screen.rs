@@ -597,6 +597,45 @@ fn above_completion_checks_selection_before_fallback() {
 }
 
 #[test]
+fn synthetic_duplicate_selected_command_names_refuse_staging() {
+    let text = plain(ABOVE_COMPLETIONS.first().unwrap());
+    let selected = text
+        .lines()
+        .find(|row| row.starts_with("  ❯ /clear"))
+        .unwrap();
+    let skill = text.lines().find(|row| row.starts_with("    …")).unwrap();
+    // Synthetic: a user skill shares the selected command's name. Keep the
+    // real frame/description columns; neither wording nor order proves identity.
+    let custom = selected.replace(
+        "Start a new session with empty context; previous session stays",
+        "My own clear skill (user)",
+    );
+    assert_ne!(custom, selected);
+    let duplicate = selected.replace("  ❯ /clear", "    /clear");
+    assert_eq!(
+        screen::staged_draft_matches(
+            ScreenInput::Styled(&text.replace(selected, &custom)),
+            "/clear"
+        ),
+        Some(true)
+    );
+    for changed in [
+        text.replace(selected, &custom).replace(skill, &duplicate),
+        text.replace(selected, &duplicate).replace(skill, &custom),
+    ] {
+        for changed in [changed.clone(), changed.replace("/clear", "/other")] {
+            for changed in [changed.clone(), format!("{NEUTRAL_HEADER}{changed}")] {
+                assert_eq!(
+                    screen::staged_draft_matches(ScreenInput::Styled(&changed), "/clear"),
+                    None
+                );
+                assert_eq!(observe(&changed).dialog, ControlDialog::Unknown);
+            }
+        }
+    }
+}
+
+#[test]
 fn above_completion_requires_exact_frame() {
     // Accepting arbitrary popup rows or weakening the shared frame check must fail.
     let text = plain(ABOVE_COMPLETIONS.first().unwrap());

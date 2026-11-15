@@ -248,6 +248,7 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
         return Err(());
     }
     let mut selected = None;
+    let mut commands = Vec::new();
     let mut description_start = None;
     for row in menu {
         let entry = row.strip_prefix("  ❯ ").map(|s| (s, true)).or_else(|| {
@@ -267,6 +268,10 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
                 return Err(());
             }
             description_start = Some(column);
+            if selected == Some(command) || (is_selected && commands.contains(&command)) {
+                return Err(());
+            }
+            commands.push(command);
             if is_selected
                 && (!command.strip_prefix('/').is_some_and(|name| {
                     !name.is_empty()

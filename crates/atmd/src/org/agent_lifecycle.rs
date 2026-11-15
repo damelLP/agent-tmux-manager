@@ -453,9 +453,12 @@ pub(super) type Waiting = Arc<std::sync::Mutex<Unfinished>>;
 #[derive(Debug, Default)]
 pub(super) struct Unfinished {
     reason: Option<String>,
-    /// Keys the flow sent that nothing has shown the harness to have taken.
-    /// The cleanup adds it to the reason, whatever the flow waited for last.
+    /// The keys the flow has sent to its harness's dialogs. The cleanup adds
+    /// it to the reason, whatever the flow waited for last.
     unanswered: Option<String>,
+    /// The audit of an accept whose dialog has not been seen to go. The
+    /// cleanup writes it when the flow ends before that was seen.
+    unaudited: Option<atm_org::ControlAudit>,
 }
 
 fn waiting_for(waiting: &Waiting, reason: impl Into<String>) {
@@ -467,6 +470,21 @@ fn waiting_for(waiting: &Waiting, reason: impl Into<String>) {
 fn unanswered(waiting: &Waiting, sent: Option<String>) {
     if let Ok(mut waiting) = waiting.lock() {
         waiting.unanswered = sent;
+    }
+}
+
+fn unaudited(waiting: &Waiting, audit: Option<atm_org::ControlAudit>) {
+    if let Ok(mut waiting) = waiting.lock() {
+        waiting.unaudited = audit;
+    }
+}
+
+/// How a reason names the dialog a start's key went to.
+fn dialog_name(dialog: &ControlDialog) -> String {
+    match dialog {
+        ControlDialog::FolderTrust { folder, .. } => format!("the trust dialog for {folder}"),
+        ControlDialog::LaunchSkip { .. } => "the update prompt".into(),
+        _ => "the harness's start dialog".into(),
     }
 }
 
@@ -822,15 +840,26 @@ impl AgentRuntime {
         what: &str,
     ) -> Result<(), AgentError> {
         let state = self.org.snapshot().await?;
-        let committed = waiting.lock().map_or_else(
-            |_| Some("its progress was lost".into()),
-            |w| {
+        let (committed, unaudited) = waiting.lock().map_or_else(
+            |_| (Some("its progress was lost".into()), None),
+            |mut w| {
                 let sent = w.unanswered.iter().map(|sent| format!("; {sent}"));
-                w.reason
+                let reason = w
+                    .reason
                     .clone()
-                    .map(|reason| reason + &sent.collect::<String>())
+                    .map(|reason| reason + &sent.collect::<String>());
+                (reason, w.unaudited.take())
             },
         );
+        if let Some(audit) = unaudited {
+            // An accept went out and the flow ended before its dialog was
+            // seen to go. A failure to write this must not cost the Stuck
+            // record below, which names the key too.
+            let _ = self
+                .org
+                .execute(OrgCommand::ControlSent(audit), chrono::Utc::now())
+                .await;
+        }
         let (Some(waiting), Some(agent)) = (
             committed,
             state.agent(id).filter(|agent| agent.status == unfinished),
@@ -1199,26 +1228,34 @@ impl AgentRuntime {
         let announces = policy.session_arrival == SessionArrival::AtStart;
         let mut progress = StartProgress::default();
         // The key that last accepted a trust dialog, for its audit, and every
-        // key sent to that dialog since it was last seen accepted.
+        // key this start has sent to a dialog, as (the dialog, its keys).
         let mut accepted_with = None;
-        let mut trust_keys: Vec<String> = Vec::new();
-        let audit = |dialog: &str, key: PaneKey, folder: Option<String>| {
+        let mut sent_keys: Vec<(String, Vec<String>)> = Vec::new();
+        // `gone` is said only by the audit of an accept whose dialog was not
+        // seen to go; the audit of one that was has no such field.
+        let audit_of = |dialog: &str, key: PaneKey, folder: Option<&str>, gone: Option<bool>| {
             let mut action = serde_json::json!({
                 "method": "agent.up",
                 "agent": tag,
                 "dialog": dialog,
                 "key": format!("{key:?}"),
             });
-            if let Some((action, folder)) = action.as_object_mut().zip(folder) {
-                action.insert("folder".into(), folder.into());
+            if let Some(action) = action.as_object_mut() {
+                if let Some(folder) = folder {
+                    action.insert("folder".into(), folder.into());
+                }
+                if let Some(gone) = gone {
+                    action.insert("dialog_gone".into(), gone.into());
+                }
             }
-            self.org.execute(
-                OrgCommand::ControlSent(atm_org::ControlAudit {
-                    pane: pane.to_string(),
-                    action,
-                }),
-                chrono::Utc::now(),
-            )
+            atm_org::ControlAudit {
+                pane: pane.to_string(),
+                action,
+            }
+        };
+        let audit = |audit: atm_org::ControlAudit| {
+            self.org
+                .execute(OrgCommand::ControlSent(audit), chrono::Utc::now())
         };
         loop {
             let mut session = None;
@@ -1247,9 +1284,10 @@ impl AgentRuntime {
             // The first screen after an accept that is not the trust dialog:
             // the harness took the answer.
             if let Some((folder, key)) = progress.trust_accepted(&control).zip(accepted_with) {
-                audit("folder_trust", key, Some(folder)).await?;
-                trust_keys.clear();
-                unanswered(waiting, None);
+                // Never two audits for one accept: this one replaces the one
+                // the cleanup would write.
+                unaudited(waiting, None);
+                audit(audit_of("folder_trust", key, Some(&folder), None)).await?;
             }
             match decide_start(
                 policy,
@@ -1308,38 +1346,58 @@ impl AgentRuntime {
                         }
                     };
                     // Said before the key, as for the launch's Enter.
+                    let dialog = dialog_name(&expect);
                     waiting_for(
                         waiting,
-                        "the harness's start dialog was being answered and the key may have reached it",
+                        format!(
+                            "{key:?} was being sent to {dialog} and may have reached the harness"
+                        ),
                     );
                     #[cfg(test)]
                     self.progress("up_answering", Some(id.clone()));
                     match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
                         Ok(()) => {
                             progress.sent(action, &expect);
-                            if let ControlDialog::FolderTrust { folder, .. } = &expect {
-                                trust_keys.push(format!("{key:?}"));
-                                // A round that is never accepted is not
-                                // audited: its Stuck reason says what was sent.
-                                unanswered(
-                                    waiting,
-                                    Some(format!(
-                                        "atm sent {} to the trust dialog for {folder} and has not seen it accepted",
-                                        trust_keys.join(", ")
-                                    )),
-                                );
+                            // Every reason from here on names the keys sent.
+                            match sent_keys.last_mut() {
+                                Some((to, keys)) if *to == dialog => keys.push(format!("{key:?}")),
+                                _ => sent_keys.push((dialog, vec![format!("{key:?}")])),
                             }
-                            match action {
-                                KeyAction::TrustAccept => accepted_with = Some(key),
-                                KeyAction::SkipLaunchPrompt => {
-                                    audit("launch_skip", key, None).await?;
+                            let sent: Vec<String> = sent_keys
+                                .iter()
+                                .map(|(to, keys)| format!("{} to {to}", keys.join(", ")))
+                                .collect();
+                            unanswered(
+                                waiting,
+                                Some(format!("atm had sent {}", sent.join(" and "))),
+                            );
+                            match (action, &expect) {
+                                (
+                                    KeyAction::TrustAccept,
+                                    ControlDialog::FolderTrust { folder, .. },
+                                ) => {
+                                    accepted_with = Some(key);
+                                    // Written by the cleanup if the start
+                                    // ends before the dialog is seen to go.
+                                    unaudited(
+                                        waiting,
+                                        Some(audit_of(
+                                            "folder_trust",
+                                            key,
+                                            Some(folder),
+                                            Some(false),
+                                        )),
+                                    );
+                                }
+                                (KeyAction::SkipLaunchPrompt, _) => {
+                                    audit(audit_of("launch_skip", key, None, None)).await?;
                                 }
                                 _ => {}
                             }
                         }
                         Err(error) => input_error(
                             waiting,
-                            "answering the harness's start dialog",
+                            &format!("sending {key:?} to {dialog}"),
                             "the harness's start dialog changed before it was answered",
                             error,
                         )?,

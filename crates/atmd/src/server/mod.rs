@@ -182,7 +182,16 @@ impl DaemonServer {
         } else {
             None
         };
+        // After control exists and before the first connection is accepted.
+        let messages_cancel = CancellationToken::new();
+        let messages_task = start_messages(&mut services, &messages_cancel);
         let result = self.run_with_services(services).await;
+        // Messages stop first: an attempt in flight settles while agents,
+        // control and the organisation writer are still there for it.
+        messages_cancel.cancel();
+        if let Some(task) = messages_task {
+            let _ = task.await;
+        }
         // Drain agent reservations while the shared control and org still exist.
         agents_cancel.cancel();
         if let Some(task) = agents_task {
@@ -288,8 +297,7 @@ impl DaemonServer {
         let cancel = self.cancel_token.child_token();
         let raw = services.raw.clone();
         let org = services.org.clone();
-        let evidence = services.message_evidence.clone();
-        let history = services.message_history.clone();
+        let (evidence, history) = services.message_tap.clone().unzip();
 
         connections.spawn(async move {
             let handler = ConnectionHandler::new(
@@ -380,6 +388,64 @@ impl DaemonServer {
     }
 }
 
+/// Start the confirmed-message service and install its tap, unless a handle
+/// was injected (that one stays authoritative) or no delivery policy was
+/// configured (the methods then stay explicitly unavailable). An invalid
+/// policy, or a runtime that cannot be built, disables messages with the
+/// cause. One clock origin is taken here, at the I/O boundary; the committed
+/// cursor is read once and is both history's replay gate and the service's
+/// startup fence. Replay runs in the service's task: the socket does not wait
+/// for it.
+fn start_messages(
+    services: &mut methods::MethodServices,
+    cancel: &CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use crate::org::{
+        message_evidence::MessageEvidence,
+        message_history::MessageHistoryHandle,
+        messages::{spawn_messages, MessageClock, MessageError, MessageHandle, MessageRuntime},
+    };
+    if services.messages.is_some() {
+        return None;
+    }
+    let started = match services.delivery_policy.clone()? {
+        Err(cause) => Err(cause),
+        Ok(policy) => (|| {
+            let control = services.control.clone().ok_or_else(|| {
+                MessageError::Unavailable("control service not configured".into())
+            })?;
+            let high_water = services.org.status()?;
+            let clock = MessageClock::new(tokio::time::Instant::now(), chrono::Utc::now());
+            let history = MessageHistoryHandle::new(high_water, clock.now()?, policy.clone())?;
+            let evidence = MessageEvidence::new(clock);
+            let runtime = MessageRuntime::new(
+                services.org.clone(),
+                services.registry.clone(),
+                control,
+                evidence.clone(),
+                history.clone(),
+                policy,
+                cancel.clone(),
+            );
+            let (messages, task) = spawn_messages(runtime, high_water);
+            Ok::<_, MessageError>((messages, task, (evidence, history)))
+        })()
+        .map_err(|error| error.to_string()),
+    };
+    match started {
+        Ok((messages, task, tap)) => {
+            services.messages = Some(messages);
+            services.message_tap = Some(tap);
+            Some(task)
+        }
+        Err(cause) => {
+            warn!(%cause, "Message delivery is unavailable");
+            services.messages = Some(MessageHandle::disabled(cause));
+            None
+        }
+    }
+}
+
 /// Waits up to [`CONNECTION_DRAIN_TIMEOUT`] for cancelled connection
 /// handlers to finish, then aborts the rest.
 async fn drain_connections(mut connections: JoinSet<()>) {
@@ -421,6 +487,7 @@ mod tests {
     async fn message_evidence_connections_use_enriched_services() {
         use crate::org::{
             message_evidence::{AttemptScope, MessageEvidence},
+            message_history::MessageHistoryHandle,
             messages::MessageClock,
         };
         use atm_core::{AgentType, Harness, Model, SessionDomain};
@@ -461,7 +528,13 @@ mod tests {
             })
             .unwrap();
         // Runtime enriches its clone after DaemonServer construction.
-        services.message_evidence = Some(evidence.clone());
+        let history = MessageHistoryHandle::new(
+            0,
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            atm_org::delivery::DeliveryPolicy::default(),
+        )
+        .unwrap();
+        services.message_tap = Some((evidence.clone(), history));
         let (ours, peer) = tokio::net::UnixStream::pair().unwrap();
         let mut tasks = JoinSet::new();
         server.handle_connection(
@@ -505,6 +578,285 @@ mod tests {
         );
         cancel.cancel();
         while tasks.join_next().await.is_some() {}
+    }
+
+    /// Why the installed message handle refuses, if it does.
+    async fn message_cause(services: &methods::MethodServices) -> Option<String> {
+        use crate::org::messages::MessageError;
+        match services.messages.as_ref()?.initialized().await {
+            Err(MessageError::Unavailable(cause)) => Some(cause),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_start_only_on_a_valid_policy_and_keep_an_injected_handle() {
+        use crate::org::messages::MessageHandle;
+        let cancel = CancellationToken::new();
+        let policy = || Some(Ok(atm_org::delivery::DeliveryPolicy::default()));
+        let fresh = || methods::MethodServices::new(crate::registry::spawn_registry());
+
+        // Unconfigured: the router's own "not configured" handle stays.
+        let mut services = fresh();
+        assert!(start_messages(&mut services, &cancel).is_none());
+        assert!(services.messages.is_none() && services.message_tap.is_none());
+
+        // An invalid policy disables the methods with its cause.
+        services.delivery_policy = Some(Err("invalid [delivery] settings".into()));
+        assert!(start_messages(&mut services, &cancel).is_none());
+        assert_eq!(
+            message_cause(&services).await.as_deref(),
+            Some("invalid [delivery] settings")
+        );
+        assert!(services.message_tap.is_none());
+
+        // An injected handle is authoritative, whatever the policy says.
+        let mut services = fresh();
+        services.delivery_policy = policy();
+        services.messages = Some(MessageHandle::disabled("injected"));
+        assert!(start_messages(&mut services, &cancel).is_none());
+        assert_eq!(message_cause(&services).await.as_deref(), Some("injected"));
+        assert!(services.message_tap.is_none());
+
+        // A valid policy with nothing to run on is disabled with that cause,
+        // never half started: no control, then no organisation writer.
+        let mut services = fresh();
+        services.delivery_policy = policy();
+        assert!(start_messages(&mut services, &cancel).is_none());
+        let cause = message_cause(&services).await.unwrap();
+        assert!(cause.contains("control service not configured"), "{cause}");
+        let mut services = fresh();
+        services.delivery_policy = policy();
+        let (control, _task) = crate::control::service::spawn_control(
+            Box::new(atm_tmux::MockTmuxClient::new()),
+            services.registry.clone(),
+            services.org.clone(),
+            cancel.clone(),
+        );
+        services.control = Some(control);
+        assert!(start_messages(&mut services, &cancel).is_none());
+        let cause = message_cause(&services).await.unwrap();
+        assert!(
+            cause.contains("organisation service not configured"),
+            "{cause}"
+        );
+        assert!(services.message_tap.is_none());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn started_messages_serve_the_router_install_the_tap_and_stop_on_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let mut services = methods::MethodServices::new(crate::registry::spawn_registry());
+        services.org = crate::org::OrgHandle::open(dir.path().into(), cancel.clone()).await;
+        let (control, _task) = crate::control::service::spawn_control(
+            Box::new(atm_tmux::MockTmuxClient::new()),
+            services.registry.clone(),
+            services.org.clone(),
+            cancel.clone(),
+        );
+        services.control = Some(control);
+        services.delivery_policy = Some(Ok(atm_org::delivery::DeliveryPolicy::default()));
+        let stop = CancellationToken::new();
+        // Synchronous: the listener never waits for the replay.
+        let task = start_messages(&mut services, &stop).unwrap();
+        let (evidence, _history) = services.message_tap.clone().unwrap();
+        assert!(evidence.available());
+        // The router a connection is given serves the started service.
+        let router = methods::router(services.clone()).unwrap();
+        let caller = || methods::CallContext {
+            client_id: methods::CallerId("test".into()),
+            from_pane: None,
+        };
+        let call = |name: &'static str, params: serde_json::Value| {
+            let router = &router;
+            async move {
+                timeout(Duration::from_secs(60), router.call(caller(), name, params))
+                    .await
+                    .unwrap()
+            }
+        };
+        let sent = call(
+            "msg.send",
+            serde_json::json!({"to": "owner", "body": "hello"}),
+        )
+        .await
+        .unwrap();
+        let inbox = call("msg.inbox", serde_json::json!({})).await.unwrap();
+        assert_eq!(inbox["messages"][0]["message_id"], sent["message_id"]);
+        assert_eq!(inbox["messages"][0]["content"]["body"], "hello");
+        assert_eq!(inbox["unread_count"], 1);
+        // Messages stop on their own token, while control and the writer
+        // (still running here) outlive them.
+        stop.cancel();
+        timeout(Duration::from_secs(60), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let stopped = call("msg.inbox", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(stopped.0.code, "unavailable");
+        assert!(services.org.status().is_ok());
+        cancel.cancel();
+    }
+
+    /// A restart reads the log the previous process left. Copying it gives
+    /// the next writer its own stream lock.
+    fn copy_log(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_log(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn started_messages_hold_and_expect_an_attempt_of_the_previous_process() {
+        use crate::org::messages::{Address, InboxParams, MessageContent, MessageId, MessageKind};
+        use atm_org::delivery::{next_delivery, DeliveryPolicy, DeliveryStep, FailureReason};
+        use atm_org::{DeliveryStatus, OrgCommand};
+        let hang = Duration::from_secs(60);
+        let worker: atm_org::AgentId = "demo/worker".parse().unwrap();
+
+        // The previous process: a message to a bound agent, attempted on its
+        // pane and never confirmed.
+        let before = tempfile::tempdir().unwrap();
+        let previous = CancellationToken::new();
+        let org = crate::org::OrgHandle::open(before.path().into(), previous.clone()).await;
+        let run = |command| {
+            let org = org.clone();
+            async move {
+                let committed = timeout(hang, org.execute(command, chrono::Utc::now())).await;
+                committed.unwrap().unwrap().last().unwrap().seq
+            }
+        };
+        run(OrgCommand::RegisterProject {
+            project_id: "demo".parse().unwrap(),
+            root: "/demo".into(),
+            move_root: false,
+        })
+        .await;
+        run(OrgCommand::Adopt {
+            agent_id: worker.clone(),
+            pane: "%1".into(),
+            session_id: Some("s1".into()),
+        })
+        .await;
+        run(OrgCommand::RecordSummary(atm_org::SessionSummary {
+            session_id: "s1".into(),
+            pane: Some("%1".into()),
+            agent_id: Some(worker.clone()),
+            harness: atm_core::Harness::Pi,
+            model: None,
+            cost: None,
+            first_prompt: None,
+            started: chrono::Utc::now(),
+            ended: None,
+        }))
+        .await;
+        let sent = run(OrgCommand::SendMessage(MessageContent {
+            from: Address::Owner,
+            to: Address::Agent(worker.clone()),
+            kind: MessageKind::Note,
+            body: "brief".into(),
+            attachments: vec![],
+            task: None,
+        }))
+        .await;
+        let id = MessageId::new(sent);
+        run(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: "%1".into(),
+        })
+        .await;
+        previous.cancel();
+
+        // This process, started as the daemon starts it.
+        let after = tempfile::tempdir().unwrap();
+        copy_log(before.path(), after.path());
+        let cancel = CancellationToken::new();
+        let mut services = methods::MethodServices::new(crate::registry::spawn_registry());
+        services.org = crate::org::OrgHandle::open(after.path().into(), cancel.clone()).await;
+        let (control, _task) = crate::control::service::spawn_control(
+            Box::new(atm_tmux::MockTmuxClient::new()),
+            services.registry.clone(),
+            services.org.clone(),
+            cancel.clone(),
+        );
+        services.control = Some(control);
+        let policy = DeliveryPolicy::default();
+        services.delivery_policy = Some(Ok(policy.clone()));
+        let stop = CancellationToken::new();
+        let task = start_messages(&mut services, &stop).unwrap();
+        let messages = services.messages.clone().unwrap();
+        let (evidence, history) = services.message_tap.clone().unwrap();
+        timeout(hang, messages.initialized())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Initialized means replayed: the inbox has the message as the
+        // previous process left it.
+        let params = InboxParams {
+            recipient: Some(Address::Agent(worker.clone())),
+            unread_only: false,
+            count_only: false,
+            id: Some(id),
+            after: None,
+            limit: 1,
+        };
+        let caller = methods::CallContext {
+            client_id: methods::CallerId("test".into()),
+            from_pane: None,
+        };
+        let inbox = timeout(hang, messages.inbox(params, caller)).await.unwrap();
+        let entry = inbox.unwrap().messages.remove(0);
+        assert_eq!(entry.content.body, "brief");
+        assert_eq!(entry.status, DeliveryStatus::Delivering);
+        assert_eq!(entry.delivery.attempt, 1);
+        // Its attempt is held for the owner: this process cannot know what
+        // the paste did, so the policy must not paste it again.
+        let held = || {
+            let now = evidence.clock().now().unwrap();
+            let snapshot = history.snapshot(id, now).unwrap();
+            next_delivery(&snapshot.message, &snapshot.live, now, &policy).unwrap()
+        };
+        let restarted = DeliveryStep::Blocked {
+            reason: FailureReason::Restarted,
+        };
+        assert_eq!(held(), restarted);
+        // And the replay came before the service was ready: evidence expects
+        // the attempted session again, on the clock history recovered with,
+        // so its late receipt confirms.
+        let recovered = evidence.clock().now().unwrap() - chrono::Utc::now();
+        assert!(recovered.abs() < chrono::TimeDelta::hours(1), "{recovered}");
+        let prompt = atm_core::LifecycleEvent::PromptSubmit {
+            prompt: Some(format!("[{id}] Read: atm inbox --id {id}")),
+        };
+        evidence
+            .tap(
+                &SessionId::new("s1"),
+                Some("%1"),
+                Some(atm_core::Harness::Pi),
+                Some(&prompt),
+                true,
+                Some(&history),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence.receipt(id).unwrap().unwrap().session_id.as_str(),
+            "s1"
+        );
+        // Messages stop while the writer they commit to is still there.
+        stop.cancel();
+        timeout(hang, task).await.unwrap().unwrap();
+        cancel.cancel();
     }
 
     #[test]

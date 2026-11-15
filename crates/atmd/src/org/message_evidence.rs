@@ -16,6 +16,12 @@
 //! lost proof holds the messages that event could affect, until a new arm or
 //! the owner's retry, and leaves every other message alone.
 //!
+//! Two facts hold a message whatever else fails to match, and neither can
+//! confirm. An event of the attempted (bound) session holds its latest scope
+//! on whatever pane its hook reports. And an event whose prompt is a
+//! message's exact reference, when it confirms nothing, holds that message
+//! from any session, pane or harness: only the paste produces that text.
+//!
 //! Register/arm/observe share one short synchronous lock. Coalesced wakeups do
 //! not discard retained facts. No await or callback into the service on
 //! ingestion. Keep earlier attempt scopes for late receipts, including after
@@ -26,16 +32,21 @@
 //! (a poisoned lock, a clock outside its range, an Activity that history could
 //! not retain) disables evidence for everyone, which blocks input and retries.
 //!
-//! Known limit: nothing evicts the scopes of a finally failed message, since a
-//! late receipt may still confirm it. A daemon that retains 16384 scopes
-//! refuses new arms until it restarts; retained receipts keep working.
+//! Known limit: nothing evicts a finally failed message that was attempted,
+//! since a late receipt may still confirm it. Such a message keeps its
+//! reference and its scopes; one that failed without a scope keeps nothing.
+//! After 4096 attempted-and-failed messages in one log, new messages to agents
+//! are refused ("message evidence reference capacity exhausted") until the log
+//! is replaced. A restart does not clear it: each start expects the last
+//! attempt of every such message again, where its scope can be rebuilt.
+//! Retained receipts keep working.
 //!
 //! Lock order: evidence, then history. The tap stamps an event's receive time
 //! and forwards its Activity to history under one evidence lock acquisition, so
 //! each event keeps its own time and nothing is retained per session. History
 //! never calls evidence.
 //!
-//! Wakes are a `watch` counter: every consumer (A2's scheduler, B's confirmation
+//! Wakes are a `watch` counter, moved when a fact changes: every consumer (A2's scheduler, B's confirmation
 //! wait) holds its own receiver from `subscribe`, so none misses a change.
 
 use super::message_history::{HistoryUpdate, MessageHistoryHandle};
@@ -73,7 +84,12 @@ pub struct AttemptEvidence {
     pub probably_landed: bool,
 }
 
-const MAX_MESSAGES: usize = 4096;
+/// References: one for each open message, and one for each finally failed
+/// message that still has a scope. The second kind is never evicted, so it
+/// bounds the attempted-and-failed messages of one log (see the module docs).
+pub(super) const MAX_MESSAGES: usize = 4096;
+/// Scopes over all references. A full store refuses the next arm, and with it
+/// the attempt; it empties only as receipts are acknowledged.
 const MAX_SCOPES: usize = 16384;
 /// Bounds one scope's excluded baseline, not the sessions the daemon sees.
 const MAX_SESSIONS: usize = 4096;
@@ -90,6 +106,9 @@ struct Entry {
     scopes: Vec<Scope>,
     receipt: Option<DeliveryReceipt>,
     probably_landed: bool,
+    /// The owner released the latest attempt's latch: until a new arm, that
+    /// attempt's session activity no longer sets it.
+    released: bool,
 }
 
 #[derive(Debug, Default)]
@@ -145,9 +164,10 @@ impl MessageEvidence {
         Ok(state)
     }
 
-    /// One wake per consumer for every change; see the module docs.
+    /// One wake per consumer for every changed fact (a latch, a receipt, an
+    /// arm, a disable), not for every event; see the module docs.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.wake.subscribe()
     }
 
@@ -196,6 +216,7 @@ impl MessageEvidence {
                 scopes: Vec::new(),
                 receipt: None,
                 probably_landed: false,
+                released: false,
             },
         );
         Ok(())
@@ -242,10 +263,47 @@ impl MessageEvidence {
                 lazy_session: None,
             });
             entry.probably_landed = false;
+            entry.released = false;
             state.scopes += 1;
         }
         self.wake();
         Ok(())
+    }
+
+    /// The owner's retry of the latest attempt, accepting the duplicate risk.
+    /// Clears the latch, and that attempt's session activity no longer sets
+    /// it: otherwise the next evidence copy would undo the retry. Scopes and
+    /// a receipt stay, so a late receipt still confirms, and the message's
+    /// exact reference still holds it. A newer armed attempt refuses the
+    /// release as stale; an attempt that was never armed here (it predates
+    /// this process, or its arm failed) has no scope to compare with.
+    pub(crate) fn release(&self, id: MessageId, attempt_seq: u64) -> Result<(), MessageError> {
+        let mut state = self.state()?;
+        let entry = state
+            .messages
+            .get_mut(&id)
+            .ok_or_else(|| MessageError::Unavailable("message reference not registered".into()))?;
+        if (entry.scopes.last()).is_some_and(|scope| scope.identity.attempt_seq > attempt_seq) {
+            return Err(MessageError::Conflict(
+                "message attempt sequence does not match".into(),
+            ));
+        }
+        let changed = entry.probably_landed;
+        entry.probably_landed = false;
+        entry.released = true;
+        if changed {
+            self.wake();
+        }
+        Ok(())
+    }
+
+    /// Every retained receipt nobody has acknowledged yet: what the scheduler
+    /// still has to persist as Delivered, for a finally failed message too.
+    pub(crate) fn confirmed(&self) -> Result<Vec<(MessageId, DeliveryReceipt)>, MessageError> {
+        let state = self.state()?;
+        Ok((state.messages.iter())
+            .filter_map(|(id, entry)| Some((*id, entry.receipt.clone()?)))
+            .collect())
     }
 
     /// An unknown or acknowledged ID is unavailable, as in `snapshot`: Ok(None)
@@ -284,6 +342,17 @@ impl MessageEvidence {
             state.messages.remove(&id);
         }
         Ok(())
+    }
+
+    /// A message that failed for good and has no scope can never be confirmed,
+    /// so its reference buys nothing: forget it. With a scope it stays, for a
+    /// late receipt.
+    pub(crate) fn forget_unscoped(&self, id: MessageId) {
+        if let Ok(mut state) = self.state() {
+            if (state.messages.get(&id)).is_some_and(|entry| entry.scopes.is_empty()) {
+                state.messages.remove(&id);
+            }
+        }
     }
 
     /// Only the tap's accepted original parent identity may enter here.
@@ -341,34 +410,41 @@ impl MessageEvidence {
         history: Option<&MessageHistoryHandle>,
     ) -> Result<(), MessageError> {
         let mut state = self.state()?;
-        if session.is_pending() {
-            return Ok(());
-        }
         let pane = pane.map(PaneId::parse).transpose()?;
         let at = self
             .clock
             .now()
             .map_err(|_| self.disable(&mut state, "message evidence clock unavailable"))?;
+        // A pending ID is no session: it is never bound and is no activity.
+        let pending = session.is_pending();
+        let mut changed = false;
         for entry in state.messages.values_mut() {
+            let before = (entry.probably_landed, entry.receipt.is_some());
+            let named = prompt == Some(entry.expected.as_str());
             let last_seq = entry.scopes.last().map(|s| s.identity.attempt_seq);
-            for scope in &mut entry.scopes {
+            for scope in entry.scopes.iter_mut().filter(|_| !pending) {
                 let identity = &scope.identity;
-                if harness.is_some_and(|h| h != identity.harness)
-                    || pane.as_ref().is_some_and(|p| p != &identity.pane)
-                    || identity.excluded_sessions.contains(session)
-                {
+                if harness.is_some_and(|h| h != identity.harness) {
                     continue;
                 }
+                let on_pane = pane.as_ref().is_none_or(|p| p == &identity.pane);
                 let latest = Some(identity.attempt_seq) == last_seq;
                 let bound = identity.session_id.as_ref().or(scope.lazy_session.as_ref());
-                // Whether this scope may bind or confirm from the event.
-                let mut trusted = proven;
+                // Whether this scope may bind or confirm from the event. A
+                // proof is about the pane the event names, never another one.
+                let mut trusted = proven && on_pane;
                 if let Some(bound) = bound {
+                    // The attempted session's own event counts whatever pane
+                    // its hook reports: a hook can name its forwarder's pane.
                     if bound != session {
                         continue;
                     }
                 } else {
-                    if pane.is_none() || harness.is_none() {
+                    if !on_pane
+                        || pane.is_none()
+                        || harness.is_none()
+                        || identity.excluded_sessions.contains(session)
+                    {
                         continue;
                     }
                     // Only the latest scope binds lazily. Once a newer attempt
@@ -379,22 +455,32 @@ impl MessageEvidence {
                         scope.lazy_session = Some(session.clone());
                     }
                 }
-                let exact = pane.is_some() && prompt == Some(entry.expected.as_str());
-                // An exact reference this scope cannot trust may be a lost late
-                // receipt, or the paste submitted by someone else: hold the
-                // message rather than lose the fact or confirm from it.
-                if latest || (exact && !trusted) {
+                if latest && !entry.released {
                     entry.probably_landed = true;
                 }
-                if trusted && exact && entry.receipt.is_none() {
+                if trusted && named && pane.is_some() && entry.receipt.is_none() {
                     entry.receipt = Some(DeliveryReceipt {
                         session_id: session.clone(),
                         confirmation: "prompt_submit_exact_reference".into(),
                     });
                 }
             }
+            // The text names the message, and nothing but its paste produces
+            // it. When no scope could confirm from it, it may be a lost late
+            // receipt or the paste submitted elsewhere: hold the message, from
+            // whatever session, pane or harness, rather than lose the fact.
+            // A message that was never attempted has no paste to have landed.
+            if named && entry.receipt.is_none() && !entry.scopes.is_empty() {
+                entry.probably_landed = true;
+            }
+            changed |= before != (entry.probably_landed, entry.receipt.is_some());
         }
-        self.wake();
+        if changed {
+            self.wake();
+        }
+        if pending {
+            return Ok(());
+        }
         if let Some(history) = history {
             let update = HistoryUpdate::Activity {
                 at,

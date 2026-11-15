@@ -70,15 +70,7 @@ pub fn observe_control_screen(
         });
         let blocks = history
             .split(|s| s.trim().is_empty())
-            .filter(|block| {
-                !block.is_empty()
-                    && block.iter().all(|s| {
-                        s.starts_with(' ')
-                            && !s.starts_with("  ")
-                            && !s.trim().starts_with(['✓', '↳'])
-                            && !s.trim().starts_with("Warning:")
-                    })
-            })
+            .filter(|block| transcript_block(block))
             .count();
         !startup_visible
             && blocks >= 2
@@ -90,4 +82,14 @@ pub fn observe_control_screen(
                 == Some(false)
     };
     result
+}
+
+fn transcript_block(block: &[&str]) -> bool {
+    !block.is_empty()
+        && block.iter().all(|s| {
+            s.starts_with(' ')
+                && !s.starts_with("  ")
+                && !s.trim().starts_with(['✓', '↳'])
+                && !s.trim().starts_with("Warning:")
+        })
 }

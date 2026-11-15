@@ -4040,7 +4040,7 @@ mod reconciliation {
                 *rig.proc.lock().unwrap() = processes.clone();
                 // A bound agent's restart check reads its screen; one without
                 // a session only inspects when nothing can be pinned.
-                match (&script, bound) {
+                let script_pane = || match (&script, bound) {
                     (Script::Frame(command), true) => rig.frame_of("%1", "p/lead", IDLE, command),
                     (Script::Frame(command), false) => inspect_with(&rig, command),
                     (Script::NoCommand, true) => {
@@ -4054,7 +4054,8 @@ mod reconciliation {
                             .unwrap();
                     }
                     (Script::NoCommand, false) => rig.inspect_only("%1", "p/lead"),
-                }
+                };
+                script_pane();
                 let (agents, _) = rig.start();
                 agents.reconciled().await.unwrap();
                 assert_eq!(unread(&rig), 0, "{case} {bound}");
@@ -4071,9 +4072,25 @@ mod reconciliation {
                 };
                 assert_eq!((lead.status, lead.reason), (status, None), "{case} {bound}");
                 assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+                let mut events = agents.observation_events();
+
+                // The suspended agent is Starting with its session now. A
+                // later pass over the same pane (its session reports again)
+                // pins nothing either, and the reason stays.
+                if bound && row {
+                    script_pane();
+                    update(&rig, id).await;
+                    progress(&mut events, "finished", Some("p/lead")).await;
+                    assert_eq!(unread(&rig), 0, "{case}");
+                    assert_eq!(
+                        listed_reason(&agents).await.as_deref(),
+                        Some(text),
+                        "{case}"
+                    );
+                    assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+                }
 
                 // The harness is in front with its row: the pass pins it.
-                let mut events = agents.observation_events();
                 *rig.proc.lock().unwrap() = Some(job());
                 rig.frame("%1", "p/lead", IDLE);
                 if row {
@@ -4238,6 +4255,27 @@ mod reconciliation {
             Some(SHELL_HOLDS_CHILD)
         );
         assert_eq!(agents.refusal_of(&lead, "%2"), None);
+
+        // The write, too: what is stored for the agent is a record of
+        // another pane, and the pass refuses on %1. The reason is stored for
+        // %1 (where the read finds it), not put into the other pane's record.
+        let (rig, agents) = pinned_ready().await;
+        agents.record_baseline(lead.clone(), "%2", pinned_to("pi"));
+        let mut events = agents.observation_events();
+        *rig.proc.lock().unwrap() = Some(shell_with_child("zsh"));
+        inspect_with(&rig, "zsh");
+        rig.row("pending-300", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(
+            agents.refusal_of(&lead, "%1").as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
+        assert_eq!(agents.refusal_of(&lead, "%2"), None);
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
     }
 
     #[tokio::test]

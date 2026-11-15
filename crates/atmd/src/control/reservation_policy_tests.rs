@@ -141,6 +141,9 @@ fn reservation_quarantines_lists_failed_cleanups_only() {
     let (ok, _) = run(&mut state, "p/ok", Some("%2"), ReservationKind::Observe);
     state.finish(ok, true);
     run(&mut state, "p/live", Some("%3"), ReservationKind::Delivery);
+    // An operation still in its cleanup may yet settle: not quarantined.
+    let (_, fence) = run(&mut state, "p/cleaning", Some("%4"), ReservationKind::Clear);
+    state.begin_cleanup(&fence, now + CLEANUP_TIMEOUT).unwrap();
     let quarantine = |agent: &str, pane: Option<&str>, kind| Quarantine {
         agent: agent.parse().unwrap(),
         pane: pane.map(|pane| PaneId::parse(pane).unwrap()),

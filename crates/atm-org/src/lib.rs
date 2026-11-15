@@ -175,6 +175,7 @@
 //! once per session (None if no cost was reported), using Money's saturation.
 //! Delivery timestamps and first read time come from apply's supplied timestamp.
 
+mod away;
 mod command;
 mod config;
 mod decision;
@@ -185,6 +186,7 @@ mod ids;
 mod replay;
 mod state;
 mod task;
+pub use away::*;
 pub use command::*;
 pub use config::*;
 pub use decision::*;

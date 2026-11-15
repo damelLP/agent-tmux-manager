@@ -390,6 +390,30 @@ async fn respawn_of_a_pane_that_is_not_the_agents_any_more_refuses() {
 }
 
 #[tokio::test]
+async fn respawn_refuses_when_recorded_pane_changed_before_acquisition() {
+    // The respawn prepared against %1 while a preceding job held the agent;
+    // that job leaves it Ready on %2. The stale respawn must not take down
+    // or replace the newly recorded pane.
+    let mut starting = Starting::ready(CODEX).await;
+    let (release, held) = hold_agent_reservation(&starting.rig, "q/lead", "%1").await;
+    starting.inspect("%0", None);
+    let call = starting.respawning(None).await;
+    move_recorded_pane(&starting.rig, started(), "codex").await;
+    let before = starting.rig.org.status().unwrap();
+    release.send(()).unwrap();
+    held.await.unwrap();
+    let result = call.await.unwrap();
+    assert!(matches!(&result, Err(AgentError::Conflict(reason))
+        if reason.contains("changed its pane")), "{result:?}");
+    assert!(starting.effects().is_empty());
+    assert_eq!(starting.rig.org.status().unwrap(), before);
+    let agent = starting.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.pane.as_deref(), Some("%2"));
+    assert_eq!(starting.unread_all(), 0);
+}
+
+#[tokio::test]
 async fn bad_respawn_role_refuses_before_any_read() {
     // The role is read again before anything is reserved: a role file that
     // no longer parses refuses the respawn with no pane read and no record.

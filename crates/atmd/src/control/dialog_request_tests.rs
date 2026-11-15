@@ -234,6 +234,44 @@ async fn a_paced_reply_rechecks_a_new_clear_before_capturing_or_typing() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_paced_reply_that_becomes_held_parks_until_delivery_releases() {
+    let client = ScriptedTmuxClient::new();
+    let mock = client.mock();
+    // Initial admission, release from the hold, then the fresh pacing grant.
+    script_admission(&client, 3);
+    let (control, actor, cancel) = start(Box::new(client));
+    control.capture("%1".into(), None, false).await.unwrap();
+    mock.clear_calls();
+    let c = control.clone();
+    let reply = queued(async move { c.reply("%1".into(), Some(2), false, false).await }).await;
+    barrier(&control).await;
+    let (job, release) = hold(&control, ReservationKind::Delivery, |_| async { Ok(()) }).await;
+    tokio::time::advance(Duration::from_millis(250)).await;
+    barrier(&control).await;
+    assert!(
+        !reply.is_finished(),
+        "a pacing grant must park behind the new hold"
+    );
+    assert_eq!(effects(&mock), vec![key("%9", "C-c"), key("%9", "C-c")]);
+    release.send(()).unwrap();
+    job.await.unwrap().unwrap();
+    assert_eq!(
+        reply.await.unwrap().unwrap(),
+        ReplyOutcome::Selected {
+            pane: "%1".into(),
+            option: 2
+        }
+    );
+    assert!(effects(&mock).ends_with(&[
+        MockCall::CapturePane { pane: "%1".into() },
+        key("%1", "Down"),
+        key("%1", "Enter")
+    ]));
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn paced_capture_reresolves_the_original_target_and_paces_its_new_pane() {
     let mock = MockTmuxClient::new();
     mock.set_pane_content("%1", vec!["obsolete".into()]);
@@ -255,6 +293,8 @@ async fn paced_capture_reresolves_the_original_target_and_paces_its_new_pane() {
         cancel.clone(),
     );
     control.capture("%1".into(), None, false).await.unwrap();
+    tokio::time::advance(Duration::from_millis(125)).await;
+    control.capture("%2".into(), None, false).await.unwrap();
     let c = control.clone();
     let capture = queued(async move { c.capture("moving".into(), None, false).await }).await;
     barrier(&control).await;
@@ -268,7 +308,26 @@ async fn paced_capture_reresolves_the_original_target_and_paces_its_new_pane() {
         .await
         .unwrap();
     let before = Instant::now();
-    tokio::time::advance(Duration::from_millis(250)).await;
+    tokio::time::advance(Duration::from_millis(125)).await;
+    barrier(&control).await;
+    assert_eq!(
+        effects(&mock)
+            .iter()
+            .filter(|call| matches!(call,
+                MockCall::CapturePane { pane } if pane == "%2"
+            ))
+            .count(),
+        1,
+        "the new pane must not be captured inside its occupied slot"
+    );
+    assert!(
+        !capture.is_finished(),
+        "the new pane's slot is still occupied"
+    );
+    tokio::time::advance(Duration::from_millis(124)).await;
+    barrier(&control).await;
+    assert!(!capture.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
     assert_eq!(capture.await.unwrap().unwrap(), vec!["new"]);
     assert_eq!(
         Instant::now() - before,
@@ -284,7 +343,7 @@ async fn paced_capture_reresolves_the_original_target_and_paces_its_new_pane() {
                 None
             })
             .collect::<Vec<_>>(),
-        vec!["%1", "%2"]
+        vec!["%1", "%2", "%2"]
     );
     cancel.cancel();
     actor.await.unwrap();
@@ -404,6 +463,39 @@ async fn a_huge_option_has_a_total_deadline_and_never_enters_after_it() {
             key("%1", "Down"),
             key("%9", "C-c")
         ]
+    );
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn ready_navigation_keys_recheck_the_deadline_without_yielding() {
+    let client = ScriptedTmuxClient::new();
+    let mock = client.mock();
+    script_admission(&client, 2);
+    let (control, actor, cancel) = start(Box::new(Paused {
+        inner: Box::new(client),
+        at: At::AdvanceClock {
+            deadline: Instant::now() + ACTION_TIMEOUT,
+        },
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+    }));
+    assert!(matches!(
+        control
+            .reply("%1".into(), Some(usize::MAX), false, false)
+            .await,
+        Err(ServiceError::Timeout)
+    ));
+    assert_eq!(
+        effects(&mock),
+        vec![
+            MockCall::CapturePane { pane: "%1".into() },
+            key("%1", "Down"),
+            key("%1", "Down"),
+            key("%1", "Down"),
+        ],
+        "no navigation or Enter may start at the expired deadline"
     );
     cancel.cancel();
     actor.await.unwrap();

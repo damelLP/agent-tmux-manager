@@ -433,6 +433,12 @@ fn register_control(
             let control = reply.clone();
             async move {
                 let p: ReplyParams = parse_params(params)?;
+                if p.option.is_some_and(|option| option > 99) {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "option must be at most 99",
+                    ));
+                }
                 if (p.yes && p.no) || (p.option.is_some() && (p.yes || p.no)) {
                     return Err(MethodError::new(
                         error_code::INVALID_PARAMS,
@@ -552,6 +558,54 @@ mod tests {
         services.control = Some(control.clone());
         services.org = org;
         (router(services).unwrap(), mock, cancel, task, control)
+    }
+
+    #[tokio::test]
+    async fn reply_accepts_option_99_but_refuses_100_before_control_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+        let (router, mock, cancel, task, _) = control_router(org).await;
+        mock.set_pane_content("%7", vec!["❯ 98. previous".into(), "  99. chosen".into()]);
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.reply",
+                    json!({"target":"%7","option":99})
+                )
+                .await
+                .unwrap(),
+            json!({"action":"selected","pane":"%7","option":99})
+        );
+        assert!(mock.calls().ends_with(&[
+            atm_tmux::mock::MockCall::SendKeys {
+                pane: "%7".into(),
+                keys: "Down".into()
+            },
+            atm_tmux::mock::MockCall::SendKeys {
+                pane: "%7".into(),
+                keys: "Enter".into()
+            },
+        ]));
+        mock.clear_calls();
+        let error = router
+            .call(
+                context(),
+                "session.reply",
+                json!({"target":"%7","option":100}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, error_code::INVALID_PARAMS);
+        assert_eq!(error.0.message, "option must be at most 99");
+        assert!(
+            mock.calls().is_empty(),
+            "invalid options must not enter the actor"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
     }
 
     #[tokio::test]

@@ -96,6 +96,8 @@ atm workspace attach               # inject sidebar into current session
 atm layout pair                    # two agents + ATM sidebar
 ```
 
+Known reply limit: `-y`/`-n` can wait behind reserved work and do not re-check the screen when released, so their keys go to whatever is then visible.
+
 `atm role` stores the tag on the pane, so it survives a clear or harness restart there. With no target or a `%N` target it needs only tmux, not atmd; without `$TMUX_PANE`, pass `-t`. A session-id target uses the daemon. `atm list -f json` adds `role: "coordinator"` when a session's pane is tagged and its parent does not share that pane, or `role: null` otherwise (also on failed tmux lookups). No parent, or a parent missing from the full session list, passes: a separate-process teammate on its own tagged pane can coordinate, but an in-process subagent sharing its parent's pane stays null, even when filters hide the parent. Table and ids formats are unchanged. `/atm-coordinate` tags its pane during setup. The TUI shows a bold cyan `C` on coordinator rows and puts them first within each agent group, keeping newest-first order within each band. Nested teammates stay in place. Press `c` to toggle the selected row's pane; group rows, rows without a pane and children sharing their parent's pane are unchanged. External tag changes appear on the next three-second poll; `c` updates the display immediately.
 
 ### Starting a named agent

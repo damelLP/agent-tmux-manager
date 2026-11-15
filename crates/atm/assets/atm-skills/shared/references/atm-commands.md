@@ -136,7 +136,8 @@ What it doesn't protect against:
 
 Answers a dialog by pressing keys: `-y` presses Enter on the highlighted
 option, `-n` presses Escape, `-o N` moves Claude's `❯` cursor to option N and
-presses Enter. With no flag it presses Enter.
+presses Enter. With no flag it presses Enter. `-o N` refuses values above 99
+before any pane action, bounding navigation work in the daemon.
 
 It does not check what's on screen: the keys go to whatever is there. Peek
 with `--prompt` first, and reply only when you know what you're approving.

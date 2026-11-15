@@ -9,6 +9,7 @@ pub(super) enum At {
     Capture,
     Navigation,
     OtherFrame,
+    AdvanceClock { deadline: tokio::time::Instant },
 }
 pub(super) struct Paused {
     pub inner: Box<dyn TmuxClient>,
@@ -88,6 +89,22 @@ impl TmuxClient for Paused {
             let result = self.inner.send_keys(pane, keys).await;
             if matches!(self.at, At::Navigation) && keys != "Enter" && keys != "C-c" {
                 self.wait().await;
+            }
+            if let At::AdvanceClock { deadline } = self.at {
+                // Bound a missing per-key guard without looping usize::MAX times:
+                // a fourth key is recorded above, then fails instead of hanging.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(TmuxError::NotFound);
+                }
+                // Poll only the clock change, not advance()'s subsequent yield.
+                // Every key stays ready, so timeout_at cannot enforce this guard.
+                let mut advance =
+                    Box::pin(tokio::time::advance(std::time::Duration::from_secs(10)));
+                std::future::poll_fn(|cx| {
+                    let _ = advance.as_mut().poll(cx);
+                    std::task::Poll::Ready(())
+                })
+                .await;
             }
             result
         })

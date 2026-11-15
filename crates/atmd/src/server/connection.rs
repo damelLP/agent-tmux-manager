@@ -551,19 +551,23 @@ where
                     let response = done.map_err(|e| ConnectionError::RequestTask(e.to_string()))?;
                     self.send_message(response).await?;
                 }
-                // The tail payload budget leaves room for ordinary IDs. A
-                // pathological ID can still push the complete line over 1 MiB.
+                // Bound the complete line, including IDs, for tail/capture readers.
                 // Check before admission too: overload errors must fit as well.
-                let tail_refusal = if method == "log.tail" {
+                let size_hint = match method.as_str() {
+                    "log.tail" => Some("limit"),
+                    "session.capture" => Some("tail"),
+                    _ => None,
+                };
+                let size_refusal = if let Some(size_hint) = size_hint {
                     let refusal = DaemonMessage::response_err(
                         id.clone(),
                         error_code::REFUSED,
-                        "log.tail response exceeds 1 MiB; use a shorter id or smaller limit",
+                        &format!("{method} response exceeds 1 MiB; use a shorter id or smaller {size_hint}"),
                     );
                     if !fits_response(&refusal) {
-                        return Err(ConnectionError::Io(
-                            "log.tail request id leaves no room for a response".into(),
-                        ));
+                        return Err(ConnectionError::Io(format!(
+                            "{method} request id leaves no room for a response"
+                        )));
                     }
                     Some(refusal)
                 } else {
@@ -602,7 +606,7 @@ where
                             DaemonMessage::response_err(id, &error.0.code, &error.0.message)
                         }
                     };
-                    match tail_refusal {
+                    match size_refusal {
                         Some(refusal) if !fits_response(&response) => refusal,
                         _ => response,
                     }
@@ -3417,6 +3421,76 @@ mod tests {
         );
         assert!(start.elapsed() >= READ_TIMEOUT);
         run.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_capture_is_refused_within_the_response_budget() {
+        use super::super::methods::{router, MethodServices};
+        let mock = atm_tmux::MockTmuxClient::new();
+        mock.set_pane_content("%1", vec!["😀".repeat(MAX_MESSAGE_SIZE / 4)]);
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        let actor_cancel = CancellationToken::new();
+        let (control, actor) = crate::control::service::spawn_control(
+            Box::new(mock.clone()),
+            services.registry.clone(),
+            services.org.clone(),
+            actor_cancel.clone(),
+        );
+        services.control = Some(control);
+        let (mut read, mut write, cancel, run) =
+            request_connection(Arc::new(router(services).unwrap())).await;
+        send_client(
+            &mut write,
+            ClientMessage::request(
+                "large".into(),
+                "session.capture".into(),
+                serde_json::json!({"target":"%1"}),
+                None,
+            ),
+        )
+        .await;
+        let mut line = String::new();
+        timeout(Duration::from_secs(60), read.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            line.len() <= MAX_MESSAGE_SIZE,
+            "oversized capture must not escape the daemon's line budget"
+        );
+        match serde_json::from_str::<DaemonMessage>(&line).unwrap() {
+            DaemonMessage::Response {
+                id,
+                payload: atm_protocol::ResponsePayload::Error(error),
+            } => {
+                assert_eq!(id, "large");
+                assert_eq!(error.code, error_code::REFUSED);
+                assert_eq!(
+                    error.message,
+                    "session.capture response exceeds 1 MiB; use a shorter id or smaller tail"
+                );
+            }
+            _ => panic!("oversized capture was not refused"),
+        }
+        mock.set_pane_content("%1", vec!["café  ".into(), "".into()]);
+        send_client(
+            &mut write,
+            ClientMessage::request(
+                "small".into(),
+                "session.capture".into(),
+                serde_json::json!({"target":"%1"}),
+                None,
+            ),
+        )
+        .await;
+        assert!(matches!(receive(&mut read).await,
+            DaemonMessage::Response { id, payload: atm_protocol::ResponsePayload::Result(value) }
+                if id == "small" && value == serde_json::json!({"lines":["café  ", ""]})
+        ));
+        cancel.cancel();
+        run.await.unwrap();
+        actor_cancel.cancel();
+        actor.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

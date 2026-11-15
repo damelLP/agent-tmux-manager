@@ -409,7 +409,10 @@ impl Watch {
                     row.wake = Some(at);
                 }
             }
-            AutoStep::Flag => {
+            AutoStep::Flag { look_again_at } => {
+                if let Some(row) = self.seen.get_mut(session) {
+                    row.wake = look_again_at;
+                }
                 let note = context_note(&state, session, seen.share, &settings.limits, now);
                 let Some((agent, note)) = note else {
                     return;

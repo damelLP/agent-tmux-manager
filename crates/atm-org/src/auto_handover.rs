@@ -78,7 +78,8 @@
 //! - `idle_since` is the end of the last turn it saw in this session, and the
 //!   session has been idle ever since. A harness's signal for that, and when
 //!   it misleads, are the caller's.
-//! - `Flag` is the note at the context line, once per session.
+//! - `Flag` is the note at the context line, once per session; its
+//!   `look_again_at` keeps the idle rule scheduled even when already noted.
 //! - `Run` is one handover. The caller remembers that it started one for the
 //!   session (row 4), tells the agent's manager how it ended, and for
 //!   `give_up_at` stops waiting at that time.
@@ -232,7 +233,10 @@ pub struct AutoInput<'a> {
 pub enum AutoStep {
     Nothing,
     /// Send the note at the context line; a person acts.
-    Flag,
+    Flag {
+        /// Ask again at this time even if the session was already noted.
+        look_again_at: Option<DateTime<Utc>>,
+    },
     /// Run one handover for this reason.
     Run {
         reason: HandoverReason,
@@ -266,12 +270,15 @@ pub fn auto_step(input: &AutoInput<'_>, now: DateTime<Utc>) -> AutoStep {
     }
     let settings = input.settings;
     let at_line = at_the_line(input.context_percent, settings.limits, now);
+    let cache = settings.limits.cache.filter(|_| settings.idle);
+    let look_again_at = cache
+        .and_then(|cache| later(idle_since, cache.idle_limit))
+        .filter(|wake| now < *wake);
     let flag_or_nothing = if at_line {
-        AutoStep::Flag
+        AutoStep::Flag { look_again_at }
     } else {
         AutoStep::Nothing
     };
-    let cache = settings.limits.cache.filter(|_| settings.idle);
     let idle = cache.map_or(Idle::NotDue, |cache| {
         idle_rule(input, cache, idle_since, now)
     });
@@ -281,12 +288,9 @@ pub fn auto_step(input: &AutoInput<'_>, now: DateTime<Utc>) -> AutoStep {
     let context_due = at_line && settings.context;
     if !context_due && idle == Idle::NotDue {
         if at_line {
-            return AutoStep::Flag;
+            return flag_or_nothing;
         }
-        return cache
-            .and_then(|cache| later(idle_since, cache.idle_limit))
-            .filter(|wake| now < *wake)
-            .map_or(AutoStep::Nothing, AutoStep::LookAgainAt);
+        return look_again_at.map_or(AutoStep::Nothing, AutoStep::LookAgainAt);
     }
     if !input.worked {
         return flag_or_nothing;

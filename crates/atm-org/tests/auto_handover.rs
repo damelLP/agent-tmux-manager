@@ -209,6 +209,10 @@ fn look<'a>(
     }
 }
 
+const FLAG: AutoStep = AutoStep::Flag {
+    look_again_at: None,
+};
+
 const RUN_LINE: AutoStep = AutoStep::Run {
     reason: HandoverReason::ContextLine,
     give_up_at: None,
@@ -513,7 +517,7 @@ fn at_the_line_a_seat_is_flagged_when_off_and_handed_over_when_on() {
     let (worker, session) = (worker(), session());
     let off = HandoverSettings::default();
     let on = settings("auto_handover = ['context']");
-    for (settings, at_line) in [(&off, AutoStep::Flag), (&on, RUN_LINE)] {
+    for (settings, at_line) in [(&off, FLAG), (&on, RUN_LINE)] {
         let step = |share| {
             auto_step(
                 &look(&history, settings, &worker, &session, share),
@@ -527,7 +531,9 @@ fn at_the_line_a_seat_is_flagged_when_off_and_handed_over_when_on() {
     let idle = settings("auto_handover = ['idle']\ncache_minutes = 60");
     assert_eq!(
         auto_step(&look(&history, &idle, &worker, &session, 60.0), after(0)),
-        AutoStep::Flag
+        AutoStep::Flag {
+            look_again_at: Some(after(48 * MINUTE)),
+        }
     );
 }
 
@@ -546,7 +552,7 @@ fn the_line_is_the_seats_own() {
     assert_eq!(step(&on, 69.9), AutoStep::Nothing);
     assert_eq!(step(&on, 70.0), RUN_LINE);
     assert_eq!(step(&off, 69.9), AutoStep::Nothing);
-    assert_eq!(step(&off, 70.0), AutoStep::Flag);
+    assert_eq!(step(&off, 70.0), FLAG);
 }
 
 #[test]
@@ -719,7 +725,12 @@ fn at_the_line_with_only_the_idle_switch_the_idle_rule_still_runs() {
     let idle = settings("auto_handover = ['idle']\ncache_minutes = 60\nidle_minutes = 50");
     let (worker, session) = (worker(), session());
     let step = |secs| auto_step(&look(&history, &idle, &worker, &session, 90.0), after(secs));
-    assert_eq!(step(IDLE_LIMIT - 1), AutoStep::Flag);
+    assert_eq!(
+        step(IDLE_LIMIT - 1),
+        AutoStep::Flag {
+            look_again_at: Some(after(IDLE_LIMIT)),
+        }
+    );
     assert_eq!(step(IDLE_LIMIT), run_expiring());
 }
 
@@ -739,8 +750,8 @@ fn a_cold_session_is_never_run_and_never_cleared() {
     assert_eq!(step(10.0, LIFETIME - 1), run_expiring());
     assert_eq!(step(10.0, LIFETIME), AutoStep::Nothing);
     assert_eq!(step(90.0, LIFETIME - 1), RUN_LINE);
-    assert_eq!(step(90.0, LIFETIME), AutoStep::Flag);
-    assert_eq!(step(90.0, 10 * LIFETIME), AutoStep::Flag);
+    assert_eq!(step(90.0, LIFETIME), FLAG);
+    assert_eq!(step(90.0, 10 * LIFETIME), FLAG);
 }
 
 #[test]
@@ -771,7 +782,12 @@ fn a_session_that_has_not_worked_is_not_handed_over() {
         };
         auto_step(&input, after(secs))
     };
-    assert_eq!(step(90.0, 0), AutoStep::Flag);
+    assert_eq!(
+        step(90.0, 0),
+        AutoStep::Flag {
+            look_again_at: Some(after(IDLE_LIMIT)),
+        }
+    );
     assert_eq!(step(10.0, IDLE_LIMIT), AutoStep::Nothing);
     // Until the limit it is looked at again like any session.
     assert_eq!(step(10.0, 0), AutoStep::LookAgainAt(after(IDLE_LIMIT)));
@@ -842,7 +858,7 @@ fn mail_does_not_hold_back_the_flag_of_a_seat_that_is_off() {
     let (worker, session) = (worker(), session());
     assert_eq!(
         auto_step(&look(&history, &off, &worker, &session, 90.0), after(0)),
-        AutoStep::Flag
+        FLAG
     );
 }
 

@@ -697,6 +697,30 @@ const IDLE_LIMIT: i64 = 45 * 60;
 const EXPIRY: i64 = 60 * 60;
 
 #[tokio::test]
+async fn an_idle_only_seat_above_its_line_is_noted_and_woken_at_its_idle_limit() {
+    let mut auto = Auto::new(IDLE).await;
+    auto.rig.share("s1", 700).await;
+    auto.rig.turn("s1").await;
+    assert_eq!(
+        auto.message(&[]).await,
+        ("p/lead".to_owned(), line_note("worker", 70))
+    );
+    auto.caught_up().await;
+    let asks: Vec<_> = std::iter::from_fn(|| auto.asked.try_recv().ok()).collect();
+    assert!(asks.contains(&after(IDLE_LIMIT)), "asks: {asks:?}");
+    // A later turn still schedules its limit even though the session was
+    // already noted: the once-only note must not swallow the new wake.
+    auto.set(after(7));
+    auto.rig.turn("s1").await;
+    auto.caught_up().await;
+    let asks: Vec<_> = std::iter::from_fn(|| auto.asked.try_recv().ok()).collect();
+    assert!(asks.contains(&after(IDLE_LIMIT + 7)), "asks: {asks:?}");
+    auto.set(after(IDLE_LIMIT + 7));
+    auto.asked_for(after(EXPIRY + 7)).await;
+    auto.save_requested("worker", &[]).await;
+}
+
+#[tokio::test]
 async fn an_idle_seat_that_waits_for_nothing_is_asked_to_save_until_its_cache_expires() {
     let mut auto = Auto::new(IDLE).await;
     auto.rig.share("s1", 100).await;

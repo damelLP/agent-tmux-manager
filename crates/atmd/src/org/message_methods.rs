@@ -41,7 +41,7 @@ fn recipient(address: Option<&Address>) -> Result<(), MessageError> {
     Ok(())
 }
 
-fn validate_send(p: &SendParams) -> Result<(), MessageError> {
+pub(super) fn validate_send(p: &SendParams) -> Result<(), MessageError> {
     let invalid = if p.body.is_empty() && p.attachments.is_empty() {
         Some("empty body requires an attachment")
     } else if p.body.len() > 16 * 1024 {

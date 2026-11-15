@@ -510,7 +510,7 @@ fn up_is_ready_tagged_and_announced(mode: StandInMode, bound: bool) {
 /// A linked checkout uses the main role, not a conflicting linked role. Scrub
 /// all GIT_* for fixture git commands; prove the temp gitdir before any write.
 #[test]
-#[ignore = "waits for Task 6 and a scrubbed linked-checkout Git fixture"]
+#[ignore = "covered by unit linked_root_uses_main_role; stand-in acceptance needs a scrubbed linked-checkout Git fixture"]
 fn agent_up_reads_main_checkout_role() {}
 
 /// Held Claude clear stays Clearing until a new real ID with source=clear and
@@ -745,67 +745,67 @@ fn respawn_uses_new_process_and_session() {
 /// A daemon restart retains durable identity/binding and converges after live
 /// row and foreground-baseline revalidation, without lifecycle input.
 #[test]
-#[ignore = "waits for Task 10: restart foreground revalidation"]
+#[ignore = "covered by unit restart_rederives_baseline_with_live_row; real-daemon restart/list acceptance not yet written"]
 fn restart_preserves_agent_list() {}
 
 /// Restart only the owned private tmux server; a reused pane ID with a foreign
 /// tag must never be claimed, receive input, or be killed by the old agent.
 #[test]
-#[ignore = "waits for Task 10: reused-pane restart acceptance"]
+#[ignore = "covered by unit absent_dead_and_reused_panes_are_down_without_input; reused-pane restart acceptance not yet written"]
 fn tmux_restart_does_not_claim_reused_pane() {}
 
 /// Pending discovery is liveness, not a replacement session ID. A safe idle
 /// restarted agent preserves its recorded binding and revalidates Ready.
 #[test]
-#[ignore = "waits for Task 10: pending-row restart acceptance"]
+#[ignore = "covered by unit first_list_waits_for_initial_inspection_and_preserves_pending_binding; pending-row restart acceptance not yet written"]
 fn idle_pending_restart_ready_preserves_binding() {}
 
 /// A busy/unknown restart remains Starting until a later real event and safe
 /// editor jointly permit Ready; stale idle history cannot satisfy it.
 #[test]
-#[ignore = "waits for Task 10: busy restart acceptance"]
+#[ignore = "covered by unit busy_restart_recovers_on_event_and_new_real_row_binds; busy restart acceptance not yet written"]
 fn busy_restart_starting_until_event() {}
 
 /// A Ready/null process exits without End; a later positive idle-shell
 /// observation records Down instead of trusting the retained harness frame.
 #[test]
-#[ignore = "waits for Task 10 and a full Ready/null exit-without-End fixture"]
+#[ignore = "covered by unit exit_to_shell_records_down_without_end; stand-in acceptance needs a full Ready/null exit-without-End fixture"]
 fn ready_null_exit_without_end() {}
 
 /// Exact canonical allowlist path permits No→Down→Yes→Enter once; confirm the
 /// accepted editor/start and control.sent audit, never Enter on unselected No.
 #[test]
-#[ignore = "waits for Tasks 6 and 7: Claude folder-trust acceptance"]
+#[ignore = "covered by unit claude_trust_no_down_yes_enter_editor; Claude folder-trust acceptance not yet written"]
 fn claude_folder_trust_allowlist_audited() {}
 
 /// An unallowlisted, prefix-only or changed folder goes Stuck with zero input;
 /// compare with the allowlisted positive case, not merely a timeout.
 #[test]
-#[ignore = "waits for Task 7: unauthorized-folder refusal acceptance"]
+#[ignore = "covered by units unallowlisted_folder_is_stuck_with_zero_keys and trust_folder_must_equal_a_role_dir; unauthorized-folder acceptance not yet written"]
 fn unallowlisted_folder_trust_zero_keys() {}
 
 /// One trust-selection reset permits one recovery; a second reset is Stuck.
 /// U11b currently models stable selection, so it cannot prove this sequence.
 #[test]
-#[ignore = "waits for Task 7 and the missing U11b trust-reset fixture"]
+#[ignore = "covered by units trust_reset_after_enter_recovers_with_second_select_and_accept and second_reset_after_enter_is_stuck; acceptance needs a trust-reset fixture"]
 fn first_trust_reset_recovers_second_reset_stuck() {}
 
 /// Codex update is skipped with exactly one guarded Escape; verify the
 /// subsequent accepted state and control.sent, not merely key dispatch.
 #[test]
-#[ignore = "waits for Task 7: update-dialog acceptance"]
+#[ignore = "covered by units codex_update_escape_once_with_audit and update_prompt_still_shown_after_escape_is_stuck; update-dialog acceptance not yet written"]
 fn update_skip_audited() {}
 
 /// Default-selected Codex folder trust accepts once only for the exact allowed
 /// path; verify readiness/audit and refusal of a changed selection or path.
 #[test]
-#[ignore = "waits for Task 7: Codex folder-trust acceptance"]
+#[ignore = "covered by unit codex_folder_default_enter_with_audit; Codex folder-trust acceptance not yet written"]
 fn codex_folder_trust_allowlist_audited() {}
 
 /// While hook review is parked, the review modal is Stuck with an owner note
 /// and no trust key. Deliberately replace this expectation when Task 9 lands.
 #[test]
-#[ignore = "waits for Task 7: parked hook-review refusal acceptance"]
+#[ignore = "covered by unit codex_folder_default_enter_with_audit (hook-review refusal); parked hook-review refusal acceptance not yet written"]
 fn codex_hooks_review_is_stuck_without_literal_key() {}
 
 /// Walk all hook-list pages, require the exact ATM event/count set, send the
@@ -823,13 +823,13 @@ fn codex_other_hooks_stuck() {}
 /// Unknown/permission modal yields the specific refusal/Stuck and no input or
 /// approval. Source replay can diagnose parsing, never prove a lifecycle turn.
 #[test]
-#[ignore = "waits for Task 7: unknown-modal refusal acceptance"]
+#[ignore = "covered by units permission_or_unknown_modal_sends_zero_keys and codex_warnings_modal_is_stuck; unknown-modal acceptance not yet written"]
 fn unknown_modal_zero_keys() {}
 
 /// Empty idle input with pi retry chrome is not Ready. No current U11b retry
 /// scene exists; capture-backed tests elsewhere do not implement this case.
 #[test]
-#[ignore = "waits for Task 6 and the missing U11b pi-retry fixture; agent.clear is in the base, acceptance not yet written"]
+#[ignore = "covered by unit pi_retry_empty_idle_not_ready; stand-in acceptance needs a pi-retry fixture"]
 fn retry_chrome_empty_idle_blocks_ready() {}
 
 /// Hold after clear consumption; watch clear_requested before raw session.send
@@ -842,7 +842,7 @@ fn clear_vs_raw_send_refuses_until_ready() {}
 /// With durable Clearing, restart the daemon and assert the same raw-send
 /// refusals; do not assume the pre-restart clear RPC is still alive.
 #[test]
-#[ignore = "waits for Task 10: durable-clearing restart acceptance; agent.clear is in the base"]
+#[ignore = "covered by unit reservation_durable_clearing_and_excluded_rows_survive_actor_restart; durable-clearing restart acceptance not yet written"]
 fn durable_clearing_after_restart_refuses_raw_send() {}
 
 /// Real msg.send stays queued behind held clear. Watch sent/clear_requested/

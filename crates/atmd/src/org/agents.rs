@@ -125,14 +125,18 @@ pub enum AgentError {
 /// Reads one variable of the environment a launch takes its overrides from.
 pub(super) type SpawnEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// An agent's pane, its baseline, and the refusal reason of its last observation.
+type PaneRecord = (String, PaneBaseline, Option<String>);
+
 #[derive(Clone)]
 pub(super) struct AgentRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
-    /// Each agent's pane and what was recorded about its processes. In memory
-    /// only; written under the agent's reservation.
-    baselines: Arc<std::sync::Mutex<HashMap<AgentId, (String, PaneBaseline)>>>,
+    /// Each agent's pane, what was recorded about its processes, and why its
+    /// last observation found every input to it refused, if it did. In
+    /// memory only; written under the agent's reservation.
+    baselines: Arc<std::sync::Mutex<HashMap<AgentId, PaneRecord>>>,
     /// Reads a pane's root process from procfs; scripted in tests.
     pub proc: super::agent_proc::ProcReader,
     /// The `ATM_SPAWN_*` overrides of the daemon's start environment.
@@ -149,15 +153,44 @@ impl AgentRuntime {
             .lock()
             .ok()
             .and_then(|baselines| baselines.get(agent).cloned())
-            .filter(|(recorded, _)| recorded == pane)
-            .map_or_else(PaneBaseline::unproven, |(_, baseline)| baseline)
+            .filter(|(recorded, ..)| recorded == pane)
+            .map_or_else(PaneBaseline::unproven, |(_, baseline, _)| baseline)
     }
 
     /// Record what was established about an agent's pane. A poisoned store
-    /// records nothing, and reads then refuse.
+    /// records nothing, and reads then refuse. A refusal reason read before
+    /// this goes with what it replaces.
     pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
         if let Ok(mut baselines) = self.baselines.lock() {
-            baselines.insert(agent, (pane.into(), baseline));
+            baselines.insert(agent, (pane.into(), baseline, None));
+        }
+    }
+
+    /// Why the last observation of `agent` on `pane` found every input to it
+    /// refused, if it did.
+    fn refusal(&self, agent: &AgentId, pane: &str) -> Option<String> {
+        self.baselines
+            .lock()
+            .ok()
+            .and_then(|baselines| baselines.get(agent).cloned())
+            .filter(|(recorded, ..)| recorded == pane)
+            .and_then(|(.., reason)| reason)
+    }
+
+    /// Set that reason, or with `None` drop it; the baseline stays.
+    fn set_refusal(&self, agent: &AgentId, pane: &str, reason: Option<String>) {
+        if let Ok(mut baselines) = self.baselines.lock() {
+            match baselines
+                .get_mut(agent)
+                .filter(|(recorded, ..)| recorded == pane)
+            {
+                Some(entry) => entry.2 = reason,
+                None if reason.is_some() => {
+                    let record = (pane.into(), PaneBaseline::unproven(), reason);
+                    baselines.insert(agent.clone(), record);
+                }
+                None => {}
+            }
         }
     }
 
@@ -265,6 +298,11 @@ impl AgentHandle {
     #[cfg(test)]
     pub(super) fn baseline_of(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
         self.inner.runtime.as_ref().unwrap().baseline(agent, pane)
+    }
+
+    #[cfg(test)]
+    pub(super) fn refusal_of(&self, agent: &AgentId, pane: &str) -> Option<String> {
+        self.inner.runtime.as_ref().unwrap().refusal(agent, pane)
     }
 
     #[must_use]
@@ -630,6 +668,15 @@ impl AgentHandle {
                 .filter(|a| filter.as_ref().is_none_or(|id| &a.id.project == id))
                 .map(|a| {
                     let mut entry = list_entry(&state, a, &rows);
+                    // A Ready or Starting agent has no recorded reason: what
+                    // the last observation found refused is its reason.
+                    if matches!(a.status, AgentStatus::Ready | AgentStatus::Starting) {
+                        if let Some(refusal) =
+                            a.pane.as_deref().and_then(|pane| rt.refusal(&a.id, pane))
+                        {
+                            entry.reason = Some(refusal);
+                        }
+                    }
                     if let Some(ObservationFailure { reason: error, .. }) =
                         self.inner.errors.borrow().get(&a.id)
                     {
@@ -845,8 +892,10 @@ impl AgentRuntime {
         // The harness is not known to be in front: read the pane's processes,
         // once. An idle shell under an agent that was Ready or bound is the
         // positive evidence that its harness exited, with or without an end
-        // event. Any other shape records nothing here.
+        // event. Any other shape records nothing: the agent keeps its state,
+        // and `agent.list` says why every input to it is refused.
         let mut processes = None;
+        let mut refused = None;
         let (root, command) = look
             .as_ref()
             .map(|(root, command)| (*root, command.as_str()))
@@ -871,6 +920,19 @@ impl AgentRuntime {
                 self.forget_baseline(&agent.id);
                 return Ok(());
             }
+            if agent.status == AgentStatus::Ready
+                || (agent.status == AgentStatus::Starting && agent.session_id.is_some())
+            {
+                let shape = processes.as_ref().and_then(classify_pane);
+                refused = agent
+                    .pane
+                    .as_deref()
+                    .map(|pane| refusal_text(pane, &stored, command, shape));
+            }
+        }
+        // One write per pass: the reason, or none once the harness is in front.
+        if let Some(pane) = &agent.pane {
+            self.set_refusal(&agent.id, pane, refused);
         }
         if let Some(pane) = &agent.pane {
             let reason = format!("clear interrupted by daemon restart; inspect {pane}");
@@ -1064,6 +1126,38 @@ impl AgentRuntime {
         }
         Ok(())
     }
+}
+
+/// Why every input to an agent's pane is refused while the agent keeps its
+/// recorded state: its harness is not known to be the pane's foreground
+/// program. `command` is the foreground command the inspection shows (with
+/// the root pid, or not at all), `shape` what the process read made of the
+/// pane, `stored` what was recorded about it before.
+#[must_use]
+pub(super) fn refusal_text(
+    pane: &str,
+    stored: &PaneBaseline,
+    command: Option<&str>,
+    shape: Option<PaneShape>,
+) -> String {
+    let why = match (command, shape) {
+        (None, _) => format!("tmux reports no root process or foreground command for {pane}"),
+        (_, None) => format!("the processes of {pane} could not be read"),
+        // Not reached from an observation: that records Down.
+        (_, Some(PaneShape::IdleShell)) => format!("no harness is running in {pane}"),
+        (_, Some(PaneShape::ShellHoldingChild)) => {
+            format!("the shell in {pane} has a child and atm cannot tell which is in front")
+        }
+        (Some(command), Some(_)) => {
+            match stored.harness_command().filter(|pinned| *pinned != command) {
+                Some(pinned) => format!("{command} is in front in {pane}, not {pinned}"),
+                None => format!(
+                    "the program in front in {pane} is not confirmed as the agent's harness"
+                ),
+            }
+        }
+    };
+    format!("input refused: {why}")
 }
 
 pub(super) fn matches_agent(agent: &Agent, row: &SessionView) -> bool {
@@ -1519,6 +1613,17 @@ async fn observer(
                             }
                             #[cfg(test)]
                             rt.progress("committed_scheduled", None);
+                        } else if event.kind == "agent.clear_requested" {
+                            // A clear types only after its own capture showed the harness
+                            // in front: a refusal reason still stored is out of date, and
+                            // no pass need follow the clear to drop it.
+                            if let Some((id, route)) = id.as_ref().and_then(|id| Some((id, routes.agents.get(id)?))) {
+                                if let Some(pane) = &route.pane {
+                                    rt.set_refusal(id, pane, None);
+                                }
+                            }
+                            #[cfg(test)]
+                            rt.progress("refusal_dropped", id);
                         } else if let Some(id) = id.filter(|_| event.kind == "agent.down") {
                             // The failure was about a pane the agent no longer has: it
                             // must not outlive the Down and hold the next `up`. A queued

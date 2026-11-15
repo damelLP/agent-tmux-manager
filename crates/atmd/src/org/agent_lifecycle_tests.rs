@@ -468,7 +468,12 @@ impl Adoption {
     /// the adopt's own. A Starting agent's reads its screen (and uses none of
     /// it); a Ready one's only inspects.
     fn script_follow_up(&self, starting: Option<(&str, &str)>) {
-        let tagged = Self::inspection(Some("q/lead"), "pi", "");
+        self.script_follow_up_of("pi", starting);
+    }
+    /// The same, with `command` in front at the inspection: a pane whose
+    /// pinned harness is not pi would otherwise be listed as running pi.
+    fn script_follow_up_of(&self, command: &str, starting: Option<(&str, &str)>) {
+        let tagged = Self::inspection(Some("q/lead"), command, "");
         self.rig
             .client
             .script_inspect(&pane("%1"), Some(&tagged))
@@ -847,7 +852,7 @@ async fn adopt_compact_codex_footer_stays_starting() {
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_tag();
-    adoption.script_follow_up(None);
+    adoption.script_follow_up_of("codex", None);
     assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
     let agent = adoption.agent().await.unwrap();
     assert_eq!(agent.status, AgentStatus::Ready);
@@ -978,7 +983,7 @@ async fn readopt_of_a_ready_agent_without_a_session_writes_nothing() {
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_tag();
-    adoption.script_follow_up(None);
+    adoption.script_follow_up_of("codex", None);
     assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
     adoption.followed().await;
     let recorded = adoption.agent().await.unwrap();

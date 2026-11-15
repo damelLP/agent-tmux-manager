@@ -112,6 +112,7 @@ fn lead_unknown_or_malformed_footer_forms_stay_unknown() {
         "2 background tasks",
         "2 shells · ↓ to view",
         "2 shells · ← for agent",
+        "2 shells · ← for agents · novel",
         "← for agents · 2 shells · ← for agents",
         "2 shells · novel",
         "2 shells · 3 shells",
@@ -136,6 +137,35 @@ fn lead_unknown_or_malformed_footer_forms_stay_unknown() {
     }
     let selector = format!("{IDLE}\n  ● main\n  ◯ general-purpose\n");
     assert_eq!(control(&selector).dialog, ControlDialog::Unknown);
+}
+
+#[test]
+fn lead_shell_footer_owns_status_rows_even_when_the_editor_frame_is_invalid() {
+    // Synthetic: a completion-like status slot and extra row must not make a
+    // refused pill frame stageable. The pill is not a menu description, even
+    // when its indentation happens to align with one.
+    let screen = StyledScreen::parse(IDLE).unwrap();
+    let text = screen
+        .text()
+        .lines()
+        .map(|row| {
+            if row.contains("[fixture] ctx") {
+                "  ❯ /clear  Clear conversation\n            extra status row".to_owned()
+            } else if row.trim_start().starts_with("⏵⏵") {
+                "            ⏵⏵ auto mode on · 2 shells".to_owned()
+            } else {
+                row.replace("❯\u{a0}", "❯\u{a0}/clear")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let decoded = StyledScreen::parse(&text).unwrap();
+    let rows: Vec<_> = decoded.text().lines().collect();
+    assert!(editor(&rows, Some(&decoded)).is_none());
+    assert_eq!(
+        staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
+        None
+    );
 }
 
 #[test]

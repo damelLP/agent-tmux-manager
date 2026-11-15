@@ -400,6 +400,8 @@ fn synthetic_scrolled_transcript_before_a_complete_header_is_not_fresh() {
         "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".into(),
         "  ⏸ manual mode on".into(),
         "  ⏸ manual mode on · ← for agents  right-aligned notice".into(),
+        "  ⏵⏵ auto mode on · 2 shells".into(),
+        "  ⏸ manual mode on · 2 shells".into(),
     ] {
         let text = format!("{prefix}\n{fresh}");
         for input in [ScreenInput::Styled(&text), ScreenInput::Plain(&text)] {

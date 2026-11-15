@@ -77,6 +77,11 @@
 //! selectors below the footer stay Unknown. The notice keeps its observed two-cell
 //! right margin relative to the border; neither its text elsewhere nor a novel
 //! notice is skipped. These forms do not change draft, turn or freshness rules.
+//! Manual-mode parsing belongs to the control consumer, so plain manual mode stays
+//! Unknown in the legacy observer; `⏸ manual mode on · N shells` counts because
+//! the pill frame is the bundle's own.
+//! Pill attributes rely on the 2.1.325 bundle's routing: with footer focus, a typed
+//! key or paste goes to the prompt, so staged-then-Enter submission still lands there.
 //!
 //! Fresh layout evidence does not establish that a particular clear completed.
 //! `/clear` remains in history after a successful clear. Consumers own temporal,

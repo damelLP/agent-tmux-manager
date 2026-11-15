@@ -339,6 +339,40 @@ async fn lists_gets_controls_pagination_and_cost_are_visible_and_safe() {
     assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
 }
 
+// Synthetic: running usage is a sibling of Task; unlike the accepted cost,
+// it must not disappear from text. New root fields must also stay terminal-safe.
+#[tokio::test]
+async fn get_renders_sibling_usage_without_changing_raw_json() {
+    let get = case("get");
+    for cost in [Value::Null, json!({"microdollars":9007199254740993_u64})] {
+        let mut reply = get["reply"].clone();
+        reply["result"]["task"]["state"] = json!("working");
+        reply["result"]["task"]["cost"] = Value::Null;
+        reply["result"]["usage"] = json!({"turns":5,"review_rounds":2,"changes_requested":1,"cost":cost,"peak_context_percent":40,"seconds_in_state":{"working":10}});
+        reply["result"]["future\u{001b}"] = json!({"note":"é\u{009b}"});
+        let output = invoke(&get, &[], reply.clone()).await;
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let line = text
+            .lines()
+            .find_map(|line| line.strip_prefix("  usage: "))
+            .expect("running usage must be visible in text");
+        assert_eq!(
+            serde_json::from_str::<Value>(line).unwrap(),
+            reply["result"]["usage"]
+        );
+        assert!(text.contains("  cost: null\n"));
+        assert!(text.contains("future\\u{1b}:"));
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        let output = invoke(&get, &["--format", "json"], reply.clone()).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            reply["result"]
+        );
+    }
+}
+
 // Break caught: unsupported/malformed method answers rendered as success or stdout failures swallowed.
 #[tokio::test]
 async fn old_daemons_bad_results_and_failed_writes_are_errors() {

@@ -1958,6 +1958,9 @@ const CODEX_CONVERSATION: &str = codex!("screen_control_p1_b12-completed-before-
 const CODEX_POPUP: &str = codex!("screen_styled_p1_b09-valid-new-draft-100x32");
 const CODEX_WORKTREE: &str = codex!("screen_control_p1_b31-nodaemon-clear-dialog-100x32");
 const CODEX_FRESH: &str = codex!("screen_styled_p1_b14-fresh-baseline-32-100x32");
+const CODEX_FULL_TRANSCRIPT: &str = include_str!(
+    "../../../atm-codex-adapter/tests/fixtures/screen_p6_A-80x24-plain-finished-P6_END_PLAIN_0.167.0.styled.txt"
+);
 const CODEX_DRAFT: &str = codex!("screen_styled_p1_b23-early-paste-landed-100x24");
 const CODEX_DRAFT_OVER_CONVERSATION: &str = codex!("screen_styled_p1_c03-draft-before-100x24");
 const CODEX_WORKING: &str = codex!("screen_styled_p1_c07-working-held-100x24");
@@ -2386,6 +2389,16 @@ fn codex_noop_needs_all_three() {
         let control = read(Harness::Codex, fixture);
         assert!(!clear_noop(codex, false, 0, &control), "{control:?}");
     }
+    // A real full transcript has lost its initial prompt: safe and without
+    // positive conversation evidence, but not positively fresh either.
+    let full = read(Harness::Codex, CODEX_FULL_TRANSCRIPT);
+    assert!(safe_editor(&full));
+    assert!(!full.conversation);
+    assert_eq!(
+        full.facts.fresh_editor,
+        atm_core::harness_control::FreshEditorEvidence::Unknown
+    );
+    assert!(!clear_noop(codex, false, 0, &full));
     assert!(!clear_noop(codex, false, 0, &ControlScreen::default()));
     // A harness that announces its session at the start has no such case.
     for (harness, fixture) in [
@@ -2570,9 +2583,9 @@ fn clear_table_fresh() {
         step(CODEX_FRESH, &none, Some(&row)),
         Step::Ready(Ready::Editor)
     );
-    // The command still staged under its popup, or a draft: look again. So is
-    // a screen the adapter does not read.
-    for fixture in [CODEX_POPUP, CODEX_DRAFT] {
+    // The command still staged under its popup, a draft, or a safe editor
+    // without positive freshness evidence: look again.
+    for fixture in [CODEX_POPUP, CODEX_DRAFT, CODEX_FULL_TRANSCRIPT] {
         assert_eq!(
             step(fixture, &none, None),
             Step::Wait("no fresh editor is shown")

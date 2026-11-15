@@ -3137,6 +3137,246 @@ mod reconciliation {
         task.await.unwrap();
     }
 
+    async fn list_summary(rig: &Rig, id: &str, cost: Option<i64>) {
+        rig.command(OrgCommand::RecordSummary(atm_org::SessionSummary {
+            session_id: SessionId::new(id),
+            pane: Some("%1".into()),
+            agent_id: Some("p/lead".parse().unwrap()),
+            harness: Harness::Pi,
+            model: Some("saved-model".into()),
+            cost: cost.map(atm_core::Money::from_microdollars),
+            first_prompt: None,
+            started: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ended: None,
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_captured_pi_cost_uses_live_total_once_with_history() {
+        // Captured: pi 0.73.1, 2026-10-24, private tmux TUI with pi-atm
+        // socket tap and local fake provider; adapter crate docs give details.
+        let adapter =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../atm-pi-adapter");
+        if !adapter.join("Cargo.toml").exists() {
+            eprintln!("skipped: adapter fixtures outside packaged atmd");
+            return;
+        }
+        let text =
+            std::fs::read_to_string(adapter.join("tests/fixtures/pi_session_cost_0.73.1.jsonl"))
+                .unwrap();
+        let raws: Vec<atm_pi_adapter::RawPiEvent> = text
+            .lines()
+            .map(|line| {
+                let envelope: Value = serde_json::from_str(line).unwrap();
+                serde_json::from_value(envelope["data"].clone()).unwrap()
+            })
+            .collect();
+        let id = raws.first().unwrap().session_id.as_deref().unwrap();
+        for (history, expected) in [
+            (None, [0.006975, 0.010650]),
+            (Some(1_000_000), [1.006975, 1.010650]),
+        ] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some(id)).await;
+            rig.row(id, "%1", false).await;
+            // A zero summary remains committed while each prompt costs less
+            // than the five-cent material-update threshold. No observer runs.
+            list_summary(&rig, id, Some(0)).await;
+            if let Some(cost) = history {
+                list_summary(&rig, "previous-session", Some(cost)).await;
+            }
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, task) = rig.start();
+            agents.reconciled().await.unwrap();
+            let mut costs = Vec::new();
+            for raw in &raws {
+                if raw.event == atm_pi_adapter::PiEventType::SessionShutdown {
+                    break;
+                }
+                for event in raw.to_lifecycle_events() {
+                    rig.registry
+                        .apply_lifecycle_event(
+                            SessionId::new(id),
+                            event,
+                            Harness::Pi,
+                            None,
+                            Some("%1".into()),
+                        )
+                        .await
+                        .unwrap();
+                }
+                if raw.event == atm_pi_adapter::PiEventType::AgentEnd {
+                    let cursor = rig.org.status().unwrap();
+                    let rows = agents.list(ListParams::default()).await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].model.as_deref(), Some("fake-b"));
+                    costs.push(rows[0].cost_usd.unwrap());
+                    assert_eq!(rig.org.status().unwrap(), cursor, "list is read-only");
+                }
+            }
+            assert_eq!(costs, expected);
+            assert_eq!(
+                rig.org
+                    .snapshot()
+                    .await
+                    .unwrap()
+                    .session_summary(&SessionId::new(id))
+                    .unwrap()
+                    .cost,
+                Some(atm_core::Money::zero()),
+                "list must not persist live costs"
+            );
+            rig.cancel.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_live_cost_replaces_saved_cost_including_decreases_but_not_recovery_zero() {
+        // Literal expectations distinguish substitution from max() and addition.
+        for (saved, live, expected) in [
+            (None, 0.02, Some(0.02)),
+            (None, 0.0, Some(0.0)),
+            (Some(0), 0.0, Some(0.0)),
+            (Some(10_000), 0.02, Some(0.02)),
+            (Some(40_000), 0.02, Some(0.02)),
+            (Some(40_000), 0.0, Some(0.04)),
+            (Some(40_000), f64::NAN, Some(0.04)),
+            (Some(40_000), f64::INFINITY, Some(0.04)),
+            (Some(40_000), f64::NEG_INFINITY, Some(0.04)),
+            (None, f64::NAN, None),
+        ] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("live")).await;
+            if saved.is_some() {
+                list_summary(&rig, "live", saved).await;
+            }
+            let mut row = SessionDomain::new(
+                SessionId::new("live"),
+                AgentType::GeneralPurpose,
+                Model::Unknown,
+            );
+            row.harness = Harness::Pi;
+            row.tmux_pane = Some("%1".into());
+            // Registry preserves a nonfinite cost in SessionView only if it is
+            // supplied there; the domain's Money conversion cannot represent it.
+            // Script just the registry reads while keeping the real list service.
+            let mut view = atm_core::SessionView::from_domain(&row);
+            view.cost_usd = live;
+            let (sender, mut receiver) = mpsc::channel(64);
+            let (events, _) = broadcast::channel(8);
+            let registry = RegistryHandle::new(sender, events);
+            let reader = tokio::spawn(async move {
+                while let Some(command) = receiver.recv().await {
+                    match command {
+                        crate::registry::RegistryCommand::GetAllSessions { respond_to } => {
+                            let _ = respond_to.send(vec![view.clone()]);
+                        }
+                        _ => panic!("unexpected registry operation"),
+                    }
+                }
+            });
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, task) = spawn_agents_with(
+                rig.org.clone(),
+                registry,
+                rig.control.clone(),
+                rig.cancel.child_token(),
+                rig.reader(),
+                std::sync::Arc::new(|_| None),
+            );
+            agents.reconciled().await.unwrap();
+            let cursor = rig.org.status().unwrap();
+            let rows = agents.list(ListParams::default()).await.unwrap();
+            assert_eq!(rows[0].cost_usd, expected, "saved={saved:?}, live={live}");
+            assert_eq!(rig.org.status().unwrap(), cursor);
+            rig.cancel.cancel();
+            task.await.unwrap();
+            drop(agents);
+            reader.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_live_cost_refuses_ineligible_rows_and_keeps_saved_total() {
+        for case in [
+            "missing",
+            "pane",
+            "session",
+            "harness",
+            "child",
+            "pending",
+            "ambiguous",
+            "excluded",
+        ] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("live")).await;
+            list_summary(&rig, "live", Some(40_000)).await;
+            list_summary(&rig, "previous", Some(1_000_000)).await;
+            let mut row = SessionDomain::new(
+                SessionId::new("live"),
+                AgentType::GeneralPurpose,
+                Model::Unknown,
+            );
+            row.harness = Harness::Pi;
+            row.tmux_pane = Some("%1".into());
+            row.cost = atm_core::Money::from_microdollars(900_000);
+            match case {
+                "missing" => {}
+                "pane" => row.tmux_pane = Some("%2".into()),
+                "session" => row.id = SessionId::new("occupant"),
+                "harness" => row.harness = Harness::ClaudeCode,
+                "child" => row.parent_session_id = Some(SessionId::new("parent")),
+                "pending" => row.id = SessionId::pending_from_pid(123),
+                "ambiguous" => {
+                    let mut other = row.clone();
+                    other.id = SessionId::new("other");
+                    rig.registry.register(other).await.unwrap();
+                }
+                "excluded" => {
+                    rig.command(OrgCommand::Clear {
+                        agent_id: "p/lead".parse().unwrap(),
+                    })
+                    .await;
+                }
+                _ => unreachable!(),
+            }
+            if case != "missing" {
+                rig.registry.register(row).await.unwrap();
+            }
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, task) = rig.start();
+            agents.reconciled().await.unwrap();
+            let cursor = rig.org.status().unwrap();
+            let rows = agents.list(ListParams::default()).await.unwrap();
+            assert_eq!(rows[0].cost_usd, Some(1.04), "{case}");
+            assert_eq!(rows[0].model.as_deref(), Some("saved-model"), "{case}");
+            assert_eq!(
+                rig.org.status().unwrap(),
+                cursor,
+                "{case}: list is read-only"
+            );
+            rig.cancel.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_without_live_row_or_reported_cost_remains_unknown() {
+        let rig = Rig::new().await;
+        rig.agent("lead", None, None).await;
+        list_summary(&rig, "no-cost", None).await;
+        let (agents, task) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(
+            agents.list(ListParams::default()).await.unwrap()[0].cost_usd,
+            None
+        );
+        rig.cancel.cancel();
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn list_is_sorted_read_only_uses_committed_cost_and_does_not_create_filter() {
         let rig = Rig::new().await;

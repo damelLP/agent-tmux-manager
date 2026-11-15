@@ -11,6 +11,11 @@
 //! owner gets one note.
 //! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: up, down,
 //! adopt, clear and respawn act on panes.
+//!
+//! List cost sums saved session costs, substituting the single pinned live
+//! session once without writing summaries. Known limit: live zero retains a
+//! saved nonzero cost to protect restart defaults; a genuine correction to
+//! zero remains delayed until summary persistence. Nonzero decreases are live.
 
 use super::agent_flow::{adopt_baseline, classify_pane, PaneShape};
 use super::agent_lifecycle::{deadline_answer, pin, stuck_record};
@@ -26,7 +31,7 @@ use crate::{
     control::service::ControlHandle,
     registry::{RegistryHandle, SessionEvent},
 };
-use atm_core::{DialogState, Harness, InputState, SessionId, SessionView, TurnState};
+use atm_core::{DialogState, Harness, InputState, Money, SessionId, SessionView, TurnState};
 use atm_org::{Agent, OrgCommand, OrgState};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -1290,6 +1295,27 @@ fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentLis
     };
     let summaries = state.agent_sessions(&agent.id);
     let latest = summaries.last();
+    let live_cost = live.and_then(|row| {
+        let reported = row
+            .cost_usd
+            .is_finite()
+            .then(|| Money::from_usd(row.cost_usd));
+        let saved = summaries
+            .iter()
+            .find(|s| s.session_id == row.id)
+            .and_then(|s| s.cost);
+        reported
+            .filter(|cost| !cost.is_zero())
+            .or(saved)
+            .or(reported)
+    });
+    let cost_usd = summaries
+        .iter()
+        .filter(|s| live.is_none_or(|row| row.id != s.session_id))
+        .filter_map(|s| s.cost)
+        .chain(live_cost)
+        .reduce(|a, b| a + b)
+        .map(|cost| cost.as_usd());
     AgentListEntry {
         agent_id: agent.id.clone(),
         state: agent.status,
@@ -1312,7 +1338,7 @@ fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentLis
             .map(|r| r.model.clone())
             .or_else(|| latest.and_then(|s| s.model.clone()))
             .or_else(|| agent.role.as_ref().and_then(|r| r.config.model.clone())),
-        cost_usd: state.agent_cost(&agent.id).map(|c| c.as_usd()),
+        cost_usd,
         reason: agent.reason.clone(),
     }
 }

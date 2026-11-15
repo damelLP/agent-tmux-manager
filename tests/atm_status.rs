@@ -40,7 +40,7 @@ async fn status_aggregates(
     expected: &str,
     diagnostic: Option<&str>,
     fail_stdout: bool,
-) {
+) -> std::process::Output {
     let (result, supported) = unread;
     let (decision_result, decision_supported) = decisions;
     let dir = tempfile::tempdir().unwrap();
@@ -178,6 +178,7 @@ async fn status_aggregates(
         .await
         .unwrap()
         .unwrap();
+    out
 }
 #[tokio::test]
 async fn status_decision_counts_and_failures_are_independent_of_unread() {
@@ -214,7 +215,7 @@ async fn status_rejects_decision_rows_without_printing_private_context() {
     let mut rows: Value =
         serde_json::from_str(include_str!("fixtures/atm_decide/list.json")).unwrap();
     rows["decisions"][0]["request"]["context"] = json!("SECRET DECISION");
-    status_aggregates(
+    let out = status_aggregates(
         (
             json!({"result":{"messages":[],"unread_count":0,"next_after":null}}),
             true,
@@ -225,6 +226,7 @@ async fn status_rejects_decision_rows_without_printing_private_context() {
         false,
     )
     .await;
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("SECRET DECISION"));
 }
 
 #[cfg(target_os = "linux")]

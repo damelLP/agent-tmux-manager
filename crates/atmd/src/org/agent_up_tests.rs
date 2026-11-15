@@ -609,7 +609,13 @@ async fn up_failure_at_each_step_stops_later_effects() {
         starting.effects(),
         ["split %0 Below detached=true command=None"]
     );
-    assert_down_without_pane(&mut starting, "its pane was not created").await;
+    // tmux answered the split with something that names no pane: whether it
+    // made one is not known, and the reason does not say that there is none.
+    assert_down_without_pane(
+        &mut starting,
+        "its pane may have been created and is not recorded",
+    )
+    .await;
 
     // The new pane already carries a tag: it is not tagged, recorded or typed into.
     let mut starting = Starting::new(Harness::Pi).await;

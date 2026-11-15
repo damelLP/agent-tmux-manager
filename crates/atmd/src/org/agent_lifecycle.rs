@@ -1055,8 +1055,21 @@ impl AgentRuntime {
             }
         };
         self.org.execute(begin, chrono::Utc::now()).await?;
-        waiting_for(waiting, "its pane was not created");
-        let pane = r.split(context, direction, "50%".into()).await?;
+        // Said for the call in flight: a split that is stopped, or whose
+        // answer is lost, may have made a pane that no record names.
+        waiting_for(
+            waiting,
+            "its pane may have been created and is not recorded",
+        );
+        let pane = match r.split(context, direction, "50%".into()).await {
+            Ok(pane) => pane,
+            Err(error) => {
+                if before_effect(&error) {
+                    waiting_for(waiting, "its pane was not created");
+                }
+                return Err(error.into());
+            }
+        };
         waiting_for(waiting, format!("{pane} was created and not recorded"));
         r.tag(&pane, ExpectedTag::Absent).await?;
         self.org

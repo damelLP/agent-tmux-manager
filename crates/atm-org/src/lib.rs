@@ -95,7 +95,8 @@
 //! snapshots, require a known agent when bound, and deduplicate identical facts.
 //! They accept ended before started: wall-clock steps must not drop last cost.
 //! Control audits refuse an empty pane; otherwise they always emit and do not
-//! change organisation state.
+//! change organisation state. Handover audits (SaveRequested, Saved) need a
+//! known agent and message; they too always emit and change no state.
 //!
 //! # Decision policy
 //!

@@ -517,7 +517,14 @@ async fn respawn_kill_done_and_down_not_recorded_quarantines() {
     assert_eq!(agent.pane.as_deref(), Some("%1"));
     assert_eq!(agent.reason, None);
     let state = starting.rig.org.snapshot().await.unwrap();
-    assert_eq!(state.messages().count(), 0, "nobody is told by a note");
+    // The only message is the start line of the start that made it Ready.
+    assert!(
+        state
+            .messages()
+            .all(|message| crate::org::start_line::is_start_line(&message.content)),
+        "nobody is told by a note"
+    );
+    assert_eq!(state.messages().count(), 1);
     assert!(quarantined(&starting.rig, "q/lead").await);
     assert_eq!(starting.unread_all(), 0);
 }
@@ -581,7 +588,14 @@ async fn respawn_timeout_with_no_stuck_record_stays_a_timeout() {
     assert_eq!(agent.status, AgentStatus::Ready);
     assert_eq!(agent.reason, None);
     let state = starting.rig.org.snapshot().await.unwrap();
-    assert_eq!(state.messages().count(), 0, "nobody is told by a note");
+    // The only message is the start line of the start that made it Ready.
+    assert!(
+        state
+            .messages()
+            .all(|message| crate::org::start_line::is_start_line(&message.content)),
+        "nobody is told by a note"
+    );
+    assert_eq!(state.messages().count(), 1);
     assert!(quarantined(&starting.rig, "q/lead").await);
 }
 
@@ -683,4 +697,106 @@ async fn stale_completion_after_respawn_cannot_bind() {
     assert_eq!(agent.status, AgentStatus::Ready);
     assert_eq!(agent.session_id, Some(SessionId::new("s2")));
     assert_eq!(starting.unread_all(), 0);
+}
+
+/// The start lines of `q/lead` in the organisation, oldest first.
+async fn start_lines(starting: &Starting) -> Vec<(atm_org::MessageId, atm_org::DeliveryStatus)> {
+    let state = starting.rig.org.snapshot().await.unwrap();
+    state
+        .messages()
+        .filter(|message| message.content == crate::org::start_line::start_line(&started()))
+        .map(|message| (message.id, message.status))
+        .collect()
+}
+
+/// Script a respawn of the Codex agent on `%1` onto `%2`, through its Ready.
+fn script_codex_respawn(starting: &Starting) {
+    starting.script_replace();
+    starting.script_launch_on_new();
+    starting.frame(Starting::moved(Starting::screen(CODEX_FRESH, "codex"), "%2"));
+    for _ in 0..2 {
+        starting.inspect("%2", Some("q/lead"));
+    }
+}
+
+#[tokio::test]
+async fn a_start_that_ends_ready_queues_its_start_line() {
+    // The start line is the agent's only message, queued for delivery, the
+    // start's last commit; the harness's own way to Ready does not matter.
+    for harness in [CLAUDE, CODEX] {
+        let starting = Starting::ready(harness).await;
+        let state = starting.rig.org.snapshot().await.unwrap();
+        let messages: Vec<_> = state.messages().collect();
+        assert_eq!(messages.len(), 1, "{:?}", harness.0);
+        let line = messages[0];
+        assert_eq!(
+            line.content,
+            crate::org::start_line::start_line(&started()),
+            "{:?}",
+            harness.0
+        );
+        assert_eq!(line.status, atm_org::DeliveryStatus::Queued);
+    }
+}
+
+#[tokio::test]
+async fn a_respawn_reuses_a_start_line_that_is_still_open() {
+    // Up, then a respawn before the up's line was delivered: no second line.
+    // The open one is typed to whatever session the agent then has.
+    let mut starting = Starting::ready(CODEX).await;
+    let first = start_lines(&starting).await;
+    assert_eq!(first.len(), 1);
+    let mut committed = starting.rig.org.committed.subscribe();
+    script_codex_respawn(&starting);
+    assert_eq!(starting.respawn().await.unwrap().pane, "%2");
+    let kinds = committed_kinds(&mut committed);
+    assert!(kinds.ends_with(&["agent.editor_ready".to_string()]), "{kinds:?}");
+    assert!(!kinds.iter().any(|kind| kind == "msg.sent"), "{kinds:?}");
+    assert_eq!(start_lines(&starting).await, first);
+    starting.settled().await;
+    assert_eq!(starting.unread_all(), 0);
+}
+
+#[tokio::test]
+async fn a_respawn_after_the_owner_gave_up_on_the_line_queues_a_new_one() {
+    // A failed line serves nobody: the respawn queues the next one.
+    let mut starting = Starting::ready(CODEX).await;
+    let lines = start_lines(&starting).await;
+    assert_eq!(lines.len(), 1, "one start line after the start");
+    let first = lines[0].0;
+    starting
+        .rig
+        .command(OrgCommand::DeliveryFailed {
+            message_id: first,
+            reason: "owner gave up on delivery".into(),
+            final_failure: true,
+        })
+        .await;
+    let mut committed = starting.rig.org.committed.subscribe();
+    script_codex_respawn(&starting);
+    starting.respawn().await.unwrap();
+    let kinds = committed_kinds(&mut committed);
+    assert!(
+        kinds.ends_with(&["agent.editor_ready".to_string(), "msg.sent".to_string()]),
+        "{kinds:?}"
+    );
+    let lines = start_lines(&starting).await;
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0], (first, atm_org::DeliveryStatus::Failed));
+    assert_eq!(lines[1].1, atm_org::DeliveryStatus::Queued);
+    starting.settled().await;
+}
+
+#[tokio::test]
+async fn a_start_with_start_lines_off_queues_none() {
+    // ATM_SPAWN_START_LINE=off in the daemon's start environment: Ready, and
+    // no message. Any other value leaves start lines on.
+    for (value, lines) in [("off", 0), ("on", 1), ("OFF", 1)] {
+        let mut rig = Rig::new().await;
+        rig.spawn_env
+            .insert("ATM_SPAWN_START_LINE".into(), value.into());
+        let starting = Starting::ready_on(rig, CODEX).await;
+        let state = starting.rig.org.snapshot().await.unwrap();
+        assert_eq!(state.messages().count(), lines, "{value}");
+    }
 }

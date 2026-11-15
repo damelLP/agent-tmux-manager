@@ -22,6 +22,7 @@ use super::message_history::{
     EffectCertainty, ExecutorHold, HistoryUpdate, RecipientObservation, SessionObservation,
 };
 use super::messages::{recipient_observation, MessageError, MessageRuntime};
+use super::start_line::delivery_line;
 use super::OrgServiceError;
 use crate::control::reservation::{
     CaptureFormat, PaneCapture, PaneId, PaneKey, Reservation, ReservationError, ReservationKind,
@@ -579,7 +580,7 @@ impl Attempt {
                 Err(error) => Err(error),
             };
         };
-        let reference = inbox_reference(id);
+        let reference = delivery_line(id, &snapshot.message.content);
         let paste = GuardedInput::Paste;
         if !guard_allows_input(&guard_facts(
             paste,
@@ -962,7 +963,8 @@ pub async fn deliver(
     if rt.cancel.is_cancelled() {
         return Err(shutting_down());
     }
-    let recipient = rt.history.snapshot(id, rt.clock.now()?)?.recipient;
+    let snapshot = rt.history.snapshot(id, rt.clock.now()?)?;
+    let recipient = snapshot.recipient;
     let Some(pane) = recipient.pane.as_deref() else {
         return Err(MessageError::Refused(format!(
             "agent {} has no pane",
@@ -970,7 +972,8 @@ pub async fn deliver(
         )));
     };
     let pane = PaneId::parse(pane)?;
-    rt.evidence.register(id, inbox_reference(id))?;
+    rt.evidence
+        .register(id, delivery_line(id, &snapshot.message.content))?;
     let request = ReservationRequest::new(
         recipient.id,
         Some(pane.clone()),

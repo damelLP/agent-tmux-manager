@@ -44,8 +44,9 @@
 //! writes: B and A2 must never independently settle the same active attempt.
 //! Retry retains the ID and attempt budget; give-up may later be superseded by
 //! a receipt. OwnerFocused notices stay in the inbox, without external notify.
-//! B builds the exact one-line inbox reference for every message and registers
-//! that text with evidence. Receipt means reference acceptance, not body reading.
+//! B builds the exact one-line inbox reference for every message (for a start
+//! line, its own text: see `start_line`) and registers that text with evidence.
+//! Receipt means reference acceptance, not body reading.
 //! B waits for U8c focus/read-only observe and U8's single screen dispatch; this
 //! boundary neither adds vendor parsing nor implements a second input path.
 
@@ -58,9 +59,10 @@ use super::message_scheduler::{self, Board, Effects, Resolution, Resolve};
 pub use super::message_types::*;
 use super::{
     agents::AgentHandle,
-    message_delivery::{inbox_reference, MESSAGE_RESOLUTION_BUDGET},
+    message_delivery::MESSAGE_RESOLUTION_BUDGET,
     message_evidence::{AttemptScope, MessageEvidence},
     message_history::MessageHistoryHandle,
+    start_line::delivery_line,
     EventWatch, OrgHandle, OrgServiceError,
 };
 use crate::{
@@ -618,7 +620,7 @@ impl Service {
         )?;
         if let Some(OrgEvent::MessageSent(content)) = &event {
             if *self.startup.borrow() == Startup::Ready {
-                self.expect(MessageId::new(envelope.seq), &content.to);
+                self.expect(MessageId::new(envelope.seq), content);
             }
         }
         if let Some(OrgEvent::MessageDeliveryFailed {
@@ -637,11 +639,11 @@ impl Service {
 
     /// Evidence must know a message's reference before any decision about it:
     /// an unknown ID is unavailable there, never "no receipt".
-    pub(super) fn expect(&self, id: MessageId, to: &Address) {
-        if !matches!(to, Address::Agent(_)) {
+    pub(super) fn expect(&self, id: MessageId, content: &MessageContent) {
+        if !matches!(content.to, Address::Agent(_)) {
             return;
         }
-        if let Err(error) = self.rt.evidence.register(id, inbox_reference(id)) {
+        if let Err(error) = self.rt.evidence.register(id, delivery_line(id, content)) {
             tracing::warn!(%id, %error, "Message stays held: evidence cannot expect its reference");
         }
     }
@@ -668,7 +670,7 @@ impl Service {
                 DeliveryStatus::Failed if scope.is_some() => true,
                 _ => continue,
             };
-            self.expect(id, &message.content.to);
+            self.expect(id, &message.content);
             if let Some(Err(error)) = scope.map(|scope| self.rt.evidence.arm(scope)) {
                 tracing::warn!(%id, %error, "Replayed attempt stays unconfirmable: evidence refused its scope");
             }

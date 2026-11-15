@@ -143,7 +143,9 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     /// A broken peer stops input/replies, but accepted handlers still finish.
     peer_failed: CancellationToken,
 
-    /// Full socket closure drops only the waiting session.send method future.
+    /// Full socket closure drops only the waiting session.send and
+    /// agent.handover method futures. A handover runs on as its own task; its
+    /// dropped call is how it learns that nobody takes its answer.
     caller_gone: CancellationToken,
     disconnect_monitor: Option<AsyncFd<OwnedFd>>,
 
@@ -413,7 +415,8 @@ where
         self.stop_watcher().await;
         let mut writable = result.is_ok() && !self.peer_failed.is_cancelled();
         // EOF/protocol Disconnect closes only input. Finish accepted work up to
-        // its deadline. Full socket closure separately drops session.send's wait;
+        // its deadline. Full socket closure separately drops session.send's wait
+        // (and agent.handover's, whose work is a task of its own and carries on);
         // the control actor decides whether its first effect has already begun.
         // Only daemon shutdown aborts every remaining job via this JoinSet.
         while !requests.is_empty() {
@@ -586,7 +589,9 @@ where
                 requests.spawn(async move {
                     let result = tokio::select! {
                         biased;
-                        _ = caller_gone.cancelled(), if method == "session.send" => {
+                        _ = caller_gone.cancelled(),
+                            if matches!(method.as_str(), "session.send" | "agent.handover") =>
+                        {
                             Err(MethodError::new(error_code::UNAVAILABLE, "caller disconnected"))
                         }
                         result = methods.call(context, &method, params) => result,
@@ -3586,6 +3591,61 @@ mod tests {
             release.notify_one();
             run.await.unwrap();
             assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A handover's wait ends with its caller's socket: the dropped call is
+    /// how the handover learns that nobody takes its answer. The handler is
+    /// released only after the close was seen, so one that is still polled
+    /// then completes, and one whose call was dropped never does.
+    #[tokio::test]
+    async fn full_disconnect_drops_a_waiting_agent_handover() {
+        timeout(Duration::from_secs(60), async {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+            let mut router = MethodRouter::default();
+            router
+                .register("agent.handover", Duration::from_secs(60), move |_, _| {
+                    let (entry, gate, finished) = (entry.clone(), gate.clone(), finished.clone());
+                    async move {
+                        entry.notify_one();
+                        gate.notified().await;
+                        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::Value::Null)
+                    }
+                })
+                .unwrap();
+            let (mut handler, peer) = handshake_pair();
+            handler.methods = Arc::new(router);
+            let handler = handler.with_disconnect_monitor().unwrap();
+            let gone = handler.caller_gone.clone();
+            let run = tokio::spawn(handler.run());
+            let mut peer = BufReader::new(peer);
+            send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::Connected { .. }
+            ));
+            let handover = ClientMessage::request(
+                "handover".into(),
+                "agent.handover".into(),
+                serde_json::json!({}),
+                Some("%12".into()),
+            );
+            send_client(peer.get_mut(), handover).await;
+            entered.notified().await;
+            drop(peer);
+            gone.cancelled().await;
+            release.notify_one();
+            run.await.unwrap();
+            assert!(
+                !completed.load(std::sync::atomic::Ordering::SeqCst),
+                "the handover's call was still waited for after its caller's socket closed"
+            );
         })
         .await
         .unwrap();

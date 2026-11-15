@@ -4,9 +4,9 @@ use atm_org::*;
 use serde_json::json;
 
 #[test]
-fn all_nineteen_golden_event_bodies() {
+fn all_golden_event_bodies() {
     let cases = support::bodies();
-    assert_eq!(cases.len(), 19);
+    assert_eq!(cases.len(), 21);
     for (kind, body) in cases {
         let event = OrgEvent::from_parts(kind, &body).unwrap().unwrap();
         assert_eq!(event.kind(), kind);

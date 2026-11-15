@@ -190,13 +190,16 @@ impl MessageEvidence {
         MessageError::Unavailable(reason.into())
     }
 
-    /// B registers the full exact inbox reference before any attempt, not a token
-    /// substring, body, first_prompt preview, prompt_id or turn_id.
+    /// B registers the full exact inbox reference (or a start line's own
+    /// text) before any attempt, not a token substring, body, first_prompt
+    /// preview, prompt_id or turn_id.
     /// A wrong text or a full store refuses this caller only: nothing is stored
     /// or evicted, and no input may follow a failed registration.
     pub fn register(&self, id: MessageId, expected_prompt: String) -> Result<(), MessageError> {
         let mut state = self.state()?;
-        if expected_prompt != super::message_delivery::inbox_reference(id) {
+        if expected_prompt != super::message_delivery::inbox_reference(id)
+            && expected_prompt != super::start_line::start_reference(id)
+        {
             return Err(MessageError::Refused(
                 "message reference does not match its ID".into(),
             ));

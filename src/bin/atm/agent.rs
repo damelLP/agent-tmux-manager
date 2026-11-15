@@ -1,5 +1,6 @@
 //! Thin, one-shot named-agent RPC commands. No local tmux fallback or retry.
 
+use atmd::org::agent_handover::{HandoverParams, HandoverResult};
 use atmd::org::agents::*;
 use clap::{Subcommand, ValueEnum};
 use serde::{de::DeserializeOwned, Serialize};
@@ -46,6 +47,16 @@ pub enum AgentAction {
         #[arg(long)]
         project_root: Option<PathBuf>,
         #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(5_000..=120_000))]
+        timeout_ms: u64,
+        #[arg(long, value_enum, default_value = "text")]
+        format: AgentFormat,
+    },
+    Handover {
+        #[arg(value_parser = super::agent_target::parse_agent)]
+        agent: String,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        #[arg(long, default_value_t = 600_000, value_parser = clap::value_parser!(u64).range(30_000..=1_800_000))]
         timeout_ms: u64,
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
@@ -210,6 +221,26 @@ pub(super) async fn cmd_agent_with_lookup_budget(
             .await?,
             matches!(format, AgentFormat::Json),
             &["agent_id", "session_id"][..],
+            false,
+        ),
+        AgentAction::Handover {
+            agent,
+            project_root,
+            timeout_ms,
+            format,
+        } => (
+            request::<_, HandoverResult>(
+                "agent.handover",
+                HandoverParams {
+                    agent: super::agent_target::agent(&agent, project_root, lookup_budget).await?,
+                    timeout_ms,
+                },
+                // The save, then the clear's 120 s, then room for the answer.
+                timeout_ms.div_ceil(1000) + 160,
+            )
+            .await?,
+            matches!(format, AgentFormat::Json),
+            &["agent_id", "state", "session_id", "message_id"][..],
             false,
         ),
         AgentAction::Respawn {

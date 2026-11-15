@@ -355,7 +355,10 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::DecisionResolved(_)
         | OrgEvent::DecisionOverruled(_)
         | OrgEvent::DecisionExpired { .. }
-        | OrgEvent::DecisionWithdrawn(_) => None,
+        | OrgEvent::DecisionWithdrawn(_)
+        // Audits of a handover: they name an agent and change nothing in it.
+        | OrgEvent::AgentSaveRequested { .. }
+        | OrgEvent::AgentSaved { .. } => None,
     }
 }
 

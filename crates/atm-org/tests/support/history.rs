@@ -42,7 +42,7 @@ pub struct Seed {
 }
 pub fn arb_seed() -> impl Strategy<Value = Seed> {
     (
-        0usize..23,
+        0usize..25,
         0usize..3,
         0usize..4,
         0usize..6,
@@ -196,7 +196,7 @@ impl Seed {
                     self.pane.is_multiple_of(2),
                 ))
             }
-            _ => {
+            22 => {
                 // A task this history made, or one that does not exist.
                 let tasks: Vec<_> = state.tasks().collect();
                 let task_id = tasks
@@ -235,6 +235,14 @@ impl Seed {
                     },
                 })
             }
+            23 => OrgCommand::SaveRequested {
+                agent_id,
+                message_id,
+            },
+            _ => OrgCommand::Saved {
+                agent_id,
+                message_id,
+            },
         }
     }
 }

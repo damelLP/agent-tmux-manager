@@ -2355,6 +2355,44 @@ async fn draft_appears_on_second_frame_then_one_enter() {
     assert_eq!(rig.org.status().unwrap(), before + 2);
 }
 
+/// The receipt wait ends at the event's deadline, not a fresh window from
+/// Enter or from the fold. Cleanup's capture is already unpaced at that
+/// instant, so the return itself pins the bound on the paused clock.
+async fn unconfirmed_enter_returns_at_event_deadline(delay_fold: bool) {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let attempt = rig.spawn_deliver(id);
+    let envelope = rig.committed().await;
+    assert_eq!(envelope.kind, "msg.delivery_attempted");
+    let event_at = rig.rt.clock.deadline(envelope.ts).unwrap();
+    let deadline = event_at + rig.rt.policy.settings().confirmation_timeout;
+    if delay_fold {
+        // Work is parked on this event's fold, not on real I/O.
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    rig.apply(&envelope);
+    rig.fold_rest();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert_eq!(Instant::now(), deadline);
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::TokenVisible));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unconfirmed_enter_has_no_new_confirmation_window() {
+    unconfirmed_enter_returns_at_event_deadline(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_attempt_fold_does_not_restart_confirmation_window() {
+    unconfirmed_enter_returns_at_event_deadline(true).await;
+}
+
 /// The draft never shows. The executor keeps looking, sends no key, and at
 /// the end of the confirmation window the attempt is held.
 #[tokio::test(start_paused = true)]

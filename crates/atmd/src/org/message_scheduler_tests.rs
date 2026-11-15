@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::super::{
-    message_evidence::AttemptScope,
+    message_evidence::{AttemptScope, MAX_MESSAGES},
     message_history::{EffectCertainty, PanePresence, SessionObservation},
     message_service_tests::{
         code, empty_editor, guarded, other, owner, page, pane, until, utc, worker, Rig,
@@ -1406,6 +1406,30 @@ async fn message_without_evidence_is_blocked_until_evidence_has_room() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn given_up_unattempted_messages_hold_no_evidence_reference() {
+    let mut bench = Bench::blind().await;
+    // One more message than evidence has references, each given up before
+    // any attempt: nothing could ever confirm one of them.
+    let mut failed = Vec::new();
+    for _ in 0..=MAX_MESSAGES {
+        let id = bench.send(worker(), "never attempted").await;
+        assert_eq!(bench.give_up(id).await.unwrap(), DeliveryStatus::Failed);
+        failed.push(id);
+    }
+    let evidence = bench.rig.rt.evidence.clone();
+    assert!(failed.iter().all(|id| evidence.snapshot(*id).is_err()));
+    // The fill outran the bench's event buffer; read from here on.
+    bench.events = bench.events.resubscribe();
+    // So a new message to a ready agent is expected, attempted and delivered.
+    bench.script(Act::Deliver);
+    bench.screens.set(other(), ready("%2", "s2"));
+    let id = bench.send(other(), "brief").await;
+    assert_eq!(bench.entered().await, id);
+    bench.event("delivered", |e| delivered(e) == Some(id)).await;
+    assert!(bench.notes().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn step_on_a_message_delivered_meanwhile_evaluates_again() {
     let mut bench = Bench::blind().await;
     let service = bench.rig.messages.service().unwrap();
@@ -1440,6 +1464,31 @@ async fn step_on_a_message_delivered_meanwhile_evaluates_again() {
     let step = job.step(acknowledged, &mut queued).await;
     assert!(matches!(step, Ok(Next::Change)));
     assert!(bench.rig.rt.evidence.snapshot(acknowledged).is_err());
+    assert!(bench.notes().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn step_on_a_message_failed_meanwhile_registers_nothing() {
+    let bench = Bench::blind().await;
+    let service = bench.rig.messages.service().unwrap();
+    let effects = Effects {
+        deliver: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+        observe: bench.screens.effect(),
+    };
+    let mut queued = service.board.queued.subscribe();
+    let mut job = Job::new(service.clone(), effects, worker());
+    // A wake raced the final failure's fold: the job still holds the ID as
+    // open, while history has it failed and evidence has dropped it.
+    let id = bench.send(worker(), "given up").await;
+    assert_eq!(bench.give_up(id).await.unwrap(), DeliveryStatus::Failed);
+    assert!(bench.rig.rt.evidence.snapshot(id).is_err());
+    let step = job.step(id, &mut queued).await;
+    assert!(
+        matches!(step, Ok(Next::Change)),
+        "a failed message is no error"
+    );
+    // The step must not expect it again: nothing would ever forget it.
+    assert!(bench.rig.rt.evidence.snapshot(id).is_err());
     assert!(bench.notes().await.is_empty());
 }
 

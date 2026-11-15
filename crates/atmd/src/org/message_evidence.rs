@@ -79,7 +79,7 @@ pub struct AttemptEvidence {
     pub probably_landed: bool,
 }
 
-const MAX_MESSAGES: usize = 4096;
+pub(super) const MAX_MESSAGES: usize = 4096;
 const MAX_SCOPES: usize = 16384;
 /// Bounds one scope's excluded baseline, not the sessions the daemon sees.
 const MAX_SESSIONS: usize = 4096;
@@ -332,6 +332,17 @@ impl MessageEvidence {
             state.messages.remove(&id);
         }
         Ok(())
+    }
+
+    /// A message that failed for good and has no scope can never be confirmed,
+    /// so its reference buys nothing: forget it. With a scope it stays, for a
+    /// late receipt.
+    pub(crate) fn forget_unscoped(&self, id: MessageId) {
+        if let Ok(mut state) = self.state() {
+            if (state.messages.get(&id)).is_some_and(|entry| entry.scopes.is_empty()) {
+                state.messages.remove(&id);
+            }
+        }
     }
 
     /// Only the tap's accepted original parent identity may enter here.

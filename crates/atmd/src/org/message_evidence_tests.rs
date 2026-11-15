@@ -424,6 +424,28 @@ fn acknowledgement_reclaims_scope_and_registration_capacity() {
 }
 
 #[test]
+fn only_a_reference_without_a_scope_is_forgotten() {
+    // Never attempted: nothing could confirm it, and its reference is freed.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.forget_unscoped(id());
+    assert!(e.state().unwrap().messages.is_empty());
+    assert!(matches!(
+        e.snapshot(id()),
+        Err(MessageError::Unavailable(_))
+    ));
+    // Attempted: its scope stays for a late receipt, which still confirms.
+    let e = armed();
+    e.forget_unscoped(id());
+    assert_eq!(e.state().unwrap().scopes, 1);
+    exact(&e);
+    assert!(e.receipt(id()).unwrap().is_some());
+    // An unknown ID and a disabled store have nothing to forget.
+    e.forget_unscoped(MessageId::new(99));
+    MessageEvidence::disabled(e.clock().clone(), "down").forget_unscoped(id());
+}
+
+#[test]
 fn evidence_unavailable_blocks_retry() {
     let e = MessageEvidence::disabled(evidence().clock().clone(), "retention unavailable");
     assert!(matches!(

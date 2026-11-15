@@ -961,19 +961,37 @@ mod literal_fence_tests {
                     Instant::now() + std::time::Duration::from_secs(60),
                 ),
                 move |mut r| async move {
-                    // Only unit tests can forge this cross-actor capability.
-                    r.control = foreign;
-                    let result = r
-                        .literal_key_guarded(
-                            &PaneId::parse("%0")?,
-                            r.agent().clone(),
-                            't',
-                            CaptureFormat::Plain,
-                            |_| panic!("foreign fence reached predicate"),
+                    let forged_control = foreign.clone();
+                    foreign
+                        .run_reserved(
+                            ReservationRequest::new(
+                                r.agent().clone(),
+                                Some(PaneId::parse("%0")?),
+                                ReservationKind::Up,
+                                WaitPolicy::Wait,
+                                r.deadline,
+                            ),
+                            move |foreign_r| async move {
+                                // Both first grants are in Work with the same id and pane;
+                                // only actor identity can reject the forged fence lookup.
+                                assert_eq!(r.fence.operation, foreign_r.fence.operation);
+                                // Only unit tests can forge this cross-actor capability.
+                                r.control = forged_control;
+                                let result = r
+                                    .literal_key_guarded(
+                                        &PaneId::parse("%0")?,
+                                        r.agent().clone(),
+                                        't',
+                                        CaptureFormat::Plain,
+                                        |_| panic!("foreign fence reached predicate"),
+                                    )
+                                    .await;
+                                assert!(matches!(result, Err(ReservationError::StaleReservation)));
+                                Ok::<_, ReservationError>(())
+                            },
+                            |_, _| async { Ok(()) },
                         )
-                        .await;
-                    assert!(matches!(result, Err(ReservationError::StaleReservation)));
-                    Ok::<_, ReservationError>(())
+                        .await
                 },
                 |_, _| async { Ok(()) },
             )

@@ -15,7 +15,9 @@
 //! never authorizes a stale capability. Release and cleanup invalidate older
 //! capabilities; another actor cannot accept them. Arbitrary external tmux
 //! clients are not serialized by this actor: this is not an external-client CAS.
-//! Local `atm reply`, `interrupt`, `kill` and the TUI also bypass this actor.
+//! Local `atm reply` and the TUI (its kill and Ctrl+C included) also bypass this
+//! actor. `atm kill` and `atm interrupt` go through it, without a reservation:
+//! see `pane_request.rs` for how they are ordered against one.
 //! Pane IDs can be reused after a tmux server restart; restart/reconcile atmd too.
 //!
 //! Exactly one control actor serves a daemon. U8/U9b must clone the same handle

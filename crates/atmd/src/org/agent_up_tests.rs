@@ -320,6 +320,13 @@ impl Starting {
             })
             .count();
         assert_eq!(notes, 1);
+        // Only an operation that ends Ready queues a start line.
+        assert!(
+            state
+                .messages()
+                .all(|message| !crate::org::start_line::is_start_line(&message.content)),
+            "a start line after an operation that did not end Ready"
+        );
     }
 }
 
@@ -385,6 +392,8 @@ async fn up_order_is_split_tag_pane_created_paste_enter_ready() {
                 } else {
                     "agent.editor_ready"
                 },
+                // The start line, queued once the agent is Ready.
+                "msg.sent",
             ],
             "{harness:?}"
         );
@@ -432,7 +441,11 @@ async fn up_ready_needs_session_then_safe_editor() {
         start_session(&starting.rig, harness, "s1", Some("startup")).await;
         let result = call.await.unwrap().unwrap();
         assert_eq!(result.state, AgentStatus::Ready);
-        assert_eq!(committed_kinds(&mut committed), ["agent.session_bound"]);
+        // The binding, then the start line.
+        assert_eq!(
+            committed_kinds(&mut committed),
+            ["agent.session_bound", "msg.sent"]
+        );
         starting.settled().await;
         assert_eq!(starting.unread(), 0, "{harness:?}");
     }

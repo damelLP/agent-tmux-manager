@@ -124,16 +124,29 @@ pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// One daemon request that names a target and answers with the pane it acted on.
+async fn pane_request(method: &str, target: String) -> Result<String> {
+    let result = super::rpc::call(
+        method,
+        serde_json::json!({"target": target}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    result
+        .get("pane")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("Invalid {method} response: missing pane"))
+}
+
 pub(super) async fn cmd_kill(target: String) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    let pane_id = control::kill(&RealTmuxClient::new(), &sessions, &target).await?;
+    let pane_id = pane_request("session.kill", target).await?;
     println!("Killed {pane_id}");
     Ok(())
 }
 
 pub(super) async fn cmd_interrupt(target: String) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    let pane_id = control::interrupt(&RealTmuxClient::new(), &sessions, &target).await?;
+    let pane_id = pane_request("session.interrupt", target).await?;
     println!("Interrupted {pane_id}");
     Ok(())
 }
@@ -326,6 +339,14 @@ pub(super) async fn cmd_status() -> Result<()> {
         Err(error) => {
             parts.push("? unread".into());
             eprintln!("unread count unavailable: {error}");
+        }
+    }
+    match super::decide::pending_count().await {
+        Ok(0) => {}
+        Ok(count) => parts.push(format!("{count} decisions")),
+        Err(error) => {
+            parts.push("? decisions".into());
+            eprintln!("decision count unavailable: {error}");
         }
     }
     use std::io::Write;

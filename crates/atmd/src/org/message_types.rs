@@ -2,7 +2,8 @@
 //!
 //! Delivery is harness acceptance of the one-line inbox reference for every
 //! message, not proof of body retrieval, reading or execution. Read acknowledgment
-//! is separate. The exact reference is built by message_delivery::inbox_reference.
+//! is separate. The exact line is built by start_line::delivery_line: the
+//! inbox reference, or a start line's own text.
 
 use atm_core::SessionId;
 pub use atm_org::{

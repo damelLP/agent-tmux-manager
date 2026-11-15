@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"kill-invalid","method":"session.kill","params":{"target":"%7","text":"x"}},
+  "response": {"type":"response","id":"kill-invalid","error":{"code":"invalid_params","message":"unknown field `text`, expected `caller_server` or `target`"}},
+  "ignore": []
+}

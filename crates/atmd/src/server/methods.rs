@@ -5,7 +5,9 @@
 //! dropped on timeout or daemon shutdown (already performed effects are not undone).
 //! Client EOF/protocol Disconnect drains accepted calls. A full socket closure
 //! drops only session.send's wait: the control actor discards pre-effect input
-//! but still finishes Enter after an already-started paste.
+//! but still finishes Enter after an already-started paste. It also drops
+//! agent.handover's wait: the handover is a task of its own and carries on,
+//! and tells the agent's manager if it then fails.
 
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::future::Future;
@@ -30,6 +32,8 @@ pub struct MethodServices {
     pub agents: Option<crate::org::agents::AgentHandle>,
     /// Confirmed-message service; None advertises explicitly unavailable operations.
     pub messages: Option<crate::org::messages::MessageHandle>,
+    /// Decision API and its sole restart-recoverable answer bridge.
+    pub decisions: Option<crate::org::decisions::DecisionHandle>,
     /// None leaves library callers unconfigured; the binary supplies its single
     /// config parse result. Invalid settings disable messages with that cause.
     pub delivery_policy: Option<Result<atm_org::delivery::DeliveryPolicy, String>>,
@@ -57,6 +61,7 @@ impl MethodServices {
             control: None,
             agents: None,
             messages: None,
+            decisions: None,
             delivery_policy: None,
             message_tap: None,
             state_dir: crate::eventlog::state_dir(),
@@ -180,6 +185,16 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         |error| error.to_string(),
     );
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
+    let handover_org = services.org.clone();
+    crate::org::tasks::register_task_methods(&mut router, services.org.clone())?;
+    crate::org::decisions::register_decision_methods(
+        &mut router,
+        services.decisions.unwrap_or_else(|| {
+            crate::org::decisions::DecisionHandle::disabled(
+                "decision operations are not configured",
+            )
+        }),
+    )?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();
@@ -203,11 +218,15 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     })?;
 
     register_control(&mut router, services.control)?;
-    crate::org::agents::register_agent_methods(
+    let agents = services
+        .agents
+        .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable));
+    crate::org::agents::register_agent_methods(&mut router, agents.clone())?;
+    crate::org::agent_handover::register_agent_handover_method(
         &mut router,
-        services
-            .agents
-            .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable)),
+        agents,
+        handover_org,
+        services.registry.clone(),
     )?;
 
     crate::org::messages::register_message_methods(
@@ -246,6 +265,13 @@ struct SendParams {
     caller_server: Option<String>,
     target: String,
     text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaneParams {
+    caller_server: Option<String>,
+    target: String,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +358,38 @@ fn register_control(
                 let p: SendParams = parse_params(params)?;
                 let pane = require_control(control, caller, p.caller_server)?
                     .send(p.target, p.text)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"pane": pane}))
+            }
+        },
+    )?;
+    let kill = control.clone();
+    router.register(
+        "session.kill",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = kill.clone();
+            async move {
+                let p: PaneParams = parse_params(params)?;
+                let pane = require_control(control, caller, p.caller_server)?
+                    .kill(p.target)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"pane": pane}))
+            }
+        },
+    )?;
+    let interrupt = control.clone();
+    router.register(
+        "session.interrupt",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = interrupt.clone();
+            async move {
+                let p: PaneParams = parse_params(params)?;
+                let pane = require_control(control, caller, p.caller_server)?
+                    .interrupt(p.target)
                     .await
                     .map_err(control_error)?;
                 Ok(serde_json::json!({"pane": pane}))
@@ -710,6 +768,64 @@ mod tests {
             assert_eq!(error.0.code, "unavailable");
             assert_eq!(error.0.message, message);
         }
+    }
+
+    #[tokio::test]
+    async fn kill_and_interrupt_reach_the_actor_and_a_clear_refuses_only_the_interrupt() {
+        use crate::control::reservation::{
+            PaneId, ReservationError, ReservationKind, ReservationRequest, WaitPolicy,
+        };
+        use atm_tmux::mock::MockCall;
+        let (router, mock, cancel, task, control) =
+            control_router(crate::org::OrgHandle::disabled("pane request router test")).await;
+        let call = |method: &'static str| router.call(context(), method, json!({"target":"audit"}));
+        assert_eq!(
+            call("session.interrupt").await.unwrap(),
+            json!({"pane":"%7"})
+        );
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let clear = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    ReservationRequest::new(
+                        "project/lead".parse().unwrap(),
+                        Some(PaneId::parse("%7").unwrap()),
+                        ReservationKind::Clear,
+                        WaitPolicy::Wait,
+                        tokio::time::Instant::now() + Duration::from_secs(60),
+                    ),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok::<_, ReservationError>(())
+                    },
+                    |_, _| async { Ok(()) },
+                )
+                .await
+        });
+        entry.await.unwrap();
+        let error = call("session.interrupt").await.unwrap_err();
+        assert_eq!(error.0.code, "refused");
+        assert_eq!(
+            error.0.message,
+            "Refusing to interrupt %7: agent project/lead is clearing; try again in a moment"
+        );
+        assert_eq!(call("session.kill").await.unwrap(), json!({"pane":"%7"}));
+        release.send(()).unwrap();
+        clear.await.unwrap().unwrap();
+        let effects: Vec<_> = mock
+            .calls()
+            .into_iter()
+            .filter(|call| !matches!(call, MockCall::RawCommand { .. }))
+            .collect();
+        assert!(
+            matches!(effects.as_slice(), [MockCall::SendKeys { pane, keys }, MockCall::KillPane { pane: killed }]
+                if pane == "%7" && keys == "C-c" && killed == "%7"),
+            "{effects:?}"
+        );
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test]

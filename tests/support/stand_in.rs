@@ -158,7 +158,9 @@ impl StandInRig {
             label: "stand-in".into(),
             tmux_identity: None,
             daemon: None,
-            daemon_env: Default::default(),
+            // Off unless a test turns it on: a start line typed after every
+            // agent start or clear would race the other tests' checks.
+            daemon_env: [("ATM_SPAWN_START_LINE".into(), "off".into())].into(),
             serial: 0,
             path,
         };

@@ -13,6 +13,12 @@ fn promotion_kit_contract() -> std::io::Result<()> {
     run_contract("240", "scripts/promotion_kit_test.py")
 }
 
+#[test]
+fn rollout_kit_contract() -> std::io::Result<()> {
+    // Whole rollouts on real private daemons: about a minute, far more under load.
+    run_contract("900", "scripts/rollout_kit_test.py")
+}
+
 fn run_contract(limit: &str, script: &str) -> std::io::Result<()> {
     let output = std::process::Command::new("timeout")
         .args([limit, "python3", script])

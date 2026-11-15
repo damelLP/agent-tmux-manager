@@ -39,7 +39,8 @@ pub enum RpcError {
 
 /// Connect, check capabilities, and issue exactly one request. Send uses one
 /// call; spawn uses separate prepare/split/type calls so it can print between
-/// split and type. Other session commands retain their legacy exchange.
+/// split and type. Kill and interrupt use one call each. Reply and peek retain
+/// their legacy exchange.
 pub async fn call(method: &str, mut params: Value, budget: Duration) -> Result<Value, RpcError> {
     if method.starts_with("session.")
         || matches!(method, "agent.up" | "agent.adopt" | "agent.respawn")

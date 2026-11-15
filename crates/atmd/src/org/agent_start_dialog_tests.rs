@@ -192,6 +192,8 @@ async fn claude_trust_no_down_yes_enter_editor() {
                 "control.spawned",
                 "control.sent",
                 "agent.session_bound",
+                // The start line, queued once the agent is Ready.
+                "msg.sent",
             ]
         );
         assert_eq!(

@@ -9,8 +9,8 @@ use super::agent_flow::{
     adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, decide_start,
     input_refusal, launch_enter_allowed, launch_line, launch_line_is_staged, launch_paste_allowed,
     placement, prompt_line_allowed, safe_editor, safe_to_paste, shell_baseline, shell_refusal,
-    start_view, started_session, submit_allowed, submit_step, ClearProgress, ProcFacts, Ready,
-    StartProgress, StartView, Step,
+    start_view, started_session, submit_allowed, submit_step, ClearProgress, KeyAction, ProcFacts,
+    Ready, StartProgress, StartView, Step,
 };
 use super::agent_launch::{launch_command, LaunchCommand};
 use super::agent_project::PreparedAgent;
@@ -961,8 +961,11 @@ impl AgentRuntime {
     /// line reads that prompt followed by the command and nothing else. The
     /// command is pasted once and run once, each under a guard on the control
     /// actor's own capture; an input whose outcome is unknown is never
-    /// repeated. From the Up it records onwards the flow never gives up
-    /// quietly: every failure, and the deadline, leaves the agent Starting for
+    /// repeated. A dialog the harness opens at its start is answered only
+    /// where the harness's policy and the role allow it (a trust dialog for
+    /// one of the role's trust directories, a prompt the launch may skip),
+    /// each key under a guard on that same dialog, and audited. From the Up it
+    /// records onwards the flow never gives up quietly: every failure, and the deadline, leaves the agent Starting for
     /// [`Self::settle_up`] to mark Stuck.
     pub(super) async fn up(
         &self,
@@ -1123,7 +1126,27 @@ impl AgentRuntime {
             .await?;
 
         let announces = policy.session_arrival == SessionArrival::AtStart;
-        let progress = StartProgress::default();
+        let mut progress = StartProgress::default();
+        // The key that last accepted a trust dialog, for its audit.
+        let mut accepted_with = None;
+        let audit = |dialog: &str, key: PaneKey, folder: Option<String>| {
+            let mut action = serde_json::json!({
+                "method": "agent.up",
+                "agent": tag,
+                "dialog": dialog,
+                "key": format!("{key:?}"),
+            });
+            if let Some((action, folder)) = action.as_object_mut().zip(folder) {
+                action.insert("folder".into(), folder.into());
+            }
+            self.org.execute(
+                OrgCommand::ControlSent(atm_org::ControlAudit {
+                    pane: pane.to_string(),
+                    action,
+                }),
+                chrono::Utc::now(),
+            )
+        };
         loop {
             let mut session = None;
             if announces {
@@ -1148,6 +1171,11 @@ impl AgentRuntime {
                 }
                 StartView::Harness(control) => control,
             };
+            // The first screen after an accept that is not the trust dialog:
+            // the harness took the answer.
+            if let Some((folder, key)) = progress.trust_accepted(&control).zip(accepted_with) {
+                audit("folder_trust", key, Some(folder)).await?;
+            }
             match decide_start(
                 policy,
                 &control,
@@ -1185,15 +1213,50 @@ impl AgentRuntime {
                         }
                     }
                 }
-                // Answering a start's dialogs is not built yet.
-                Step::Key { .. } => {
-                    return Err(stopped(
+                Step::Key {
+                    key,
+                    expect,
+                    action,
+                } => {
+                    // A dialog's key waits while the pane takes no input from
+                    // atm (somebody is focused on it): the guard is not asked.
+                    if let Some(reason) = input_refusal(screen, &capture, &baseline, &tag) {
+                        waiting_for(waiting, reason);
+                        continue;
+                    }
+                    let guard = {
+                        let (baseline, tag, expect) =
+                            (baseline.clone(), tag.clone(), expect.clone());
+                        move |capture: &_| {
+                            input_refusal(screen, capture, &baseline, &tag).is_none()
+                                && screen.control(capture, &baseline).dialog == expect
+                        }
+                    };
+                    // Said before the key, as for the launch's Enter.
+                    waiting_for(
                         waiting,
-                        &id,
-                        "start",
-                        "the harness asks a question at its start that atm does not answer yet"
-                            .into(),
-                    ))
+                        "the harness's start dialog was being answered and the key may have reached it",
+                    );
+                    #[cfg(test)]
+                    self.progress("up_answering", Some(id.clone()));
+                    match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
+                        Ok(()) => {
+                            progress.sent(action, &expect);
+                            match action {
+                                KeyAction::TrustAccept => accepted_with = Some(key),
+                                KeyAction::SkipLaunchPrompt => {
+                                    audit("launch_skip", key, None).await?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(error) => input_error(
+                            waiting,
+                            "answering the harness's start dialog",
+                            "the harness's start dialog changed before it was answered",
+                            error,
+                        )?,
+                    }
                 }
                 Step::Stuck(reason) => return Err(stopped(waiting, &id, "start", reason)),
             }

@@ -1044,7 +1044,7 @@ async fn shell_named_harness_is_stuck_not_ready() {
     // names the shell as its foreground program (a wrapper under the shell's
     // name): the harness can't be told from the shell, so the agent is never
     // Ready and nothing more is sent. Also: a harness that is pinned and then
-    // gives way to the shell, and a start dialog nothing answers yet.
+    // gives way to the shell.
     let mut starting = Starting::new(Harness::Codex).await;
     starting.script_launch();
     starting.frame(Starting::screen(CODEX_FRESH, "zsh"));
@@ -1068,18 +1068,6 @@ async fn shell_named_harness_is_stuck_not_ready() {
         .assert_stuck("the harness exited to its shell during the start")
         .await;
     assert_eq!(starting.effects(), starting.launched());
-    assert_eq!(starting.unread(), 0);
-
-    // Codex offers an update: a dialog a later change will dismiss.
-    let mut starting = Starting::new(Harness::Codex).await;
-    starting.script_launch();
-    starting.frame(Starting::screen(CODEX_UPDATE, "codex"));
-    let result = starting.up().await;
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(starting.effects(), starting.launched());
-    starting
-        .assert_stuck("the harness asks a question at its start that atm does not answer yet")
-        .await;
     assert_eq!(starting.unread(), 0);
 }
 

@@ -58,6 +58,29 @@ os.execv(REAL, [REAL, *sys.argv[1:]])
 '''
 
 
+def process_running(pid):
+    """A zombie has exited even while its parent leaves a /proc entry behind."""
+    try:
+        raw = Path(f'/proc/{pid}/stat').read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return raw.rsplit(')', 1)[1].split()[0] != 'Z'
+
+
+class ProcessState(unittest.TestCase):
+    def test_unreaped_zombie_is_not_running(self):
+        self.assertTrue(process_running(os.getpid()))
+        child = subprocess.Popen([sys.executable, '-c', ''], stdin=subprocess.DEVNULL)
+        try:
+            # Observe exit without reaping, so /proc still exposes the zombie.
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            self.assertTrue(Path(f'/proc/{child.pid}').exists())
+            self.assertFalse(process_running(child.pid))
+        finally:
+            child.wait(timeout=30)
+        self.assertFalse(process_running(child.pid))
+
+
 class Rig(unittest.TestCase):
     """One temp dir per test: home, installed bin, candidate install, state, tmux, a git repo."""
 
@@ -363,10 +386,10 @@ class HappyPath(Rig):
         self.assertEqual(self.pair(), new)
         daemon = self.daemon_pid()
         self.assertNotEqual(daemon, old_daemon)
-        self.assertFalse(Path(f'/proc/{old_daemon}').exists())
+        self.assertFalse(process_running(old_daemon))
         self.assertEqual(Path(f'/proc/{daemon}/exe').stat().st_ino, (self.bin / 'atmd').stat().st_ino)
         # The sidebar: a new process of the new file, in the same pane, with the same line.
-        self.assertFalse(Path(f'/proc/{old_sidebar}').exists())
+        self.assertFalse(process_running(old_sidebar))
         (sidebar,) = self.children(shell)
         self.assertEqual(Path(f'/proc/{sidebar}/exe').stat().st_ino, (self.bin / 'atm').stat().st_ino)
         self.assertEqual(Path(f'/proc/{sidebar}/cmdline').read_bytes().split(b'\0')[:-1],

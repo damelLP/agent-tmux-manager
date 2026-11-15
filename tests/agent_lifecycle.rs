@@ -1080,12 +1080,14 @@ fn atm_cli_starts_clears_and_takes_down_an_agent() {
     // the test moves it.
     let old = test.complete_fixture_turn(&pane);
     let after = test.rig.event_cursor(&pane);
-    let clear = atm(&["agent", "clear", "project/lead", "--format", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let clear = stand_in::process::OwnedChild::new(
+        atm(&["agent", "clear", "project/lead", "--format", "json"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     test.rig.wait_event(&pane, after, |e| {
         e["kind"] == "rendered" && e["state"] == "clearing"
     });

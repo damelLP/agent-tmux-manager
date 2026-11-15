@@ -1,7 +1,7 @@
 //! Linux process-exit notification for the stand-in's synchronous test boundary.
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const GUARD: Duration = Duration::from_secs(30);
@@ -47,6 +47,31 @@ pub fn wait_exit(pid: u32, timeout: Duration) -> std::io::Result<()> {
     }
 }
 
+/// Own a background command until its output is collected or its caller unwinds.
+pub struct OwnedChild(Option<Child>);
+
+impl OwnedChild {
+    pub fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    pub fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.0.take().unwrap().wait_with_output()
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            // Still unreaped and owned by us: this PID cannot name a replacement.
+            let _ = child.kill();
+            if wait_exit(child.id(), GUARD).is_ok() {
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
 pub fn run(command: &mut Command) -> Output {
     // Files retain arbitrarily large output without blocking the child on pipes.
     let mut stdout = tempfile::tempfile().unwrap();
@@ -78,6 +103,88 @@ pub fn run(command: &mut Command) -> Output {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    pub fn owned_child_drop_reaps_on_unwind() {
+        use std::io::{BufRead, BufReader};
+
+        // A pinned fallback also cleans up a mutant that omits OwnedChild's Drop.
+        struct Fallback(OwnedFd);
+        impl Drop for Fallback {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.0.as_raw_fd(),
+                        libc::SIGKILL,
+                        0,
+                        0,
+                    );
+                    let mut event = libc::pollfd {
+                        fd: self.0.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if libc::poll(&mut event, 1, 30_000) > 0 {
+                        let mut status = std::mem::zeroed();
+                        libc::waitid(
+                            libc::P_PIDFD,
+                            self.0.as_raw_fd() as u32,
+                            &mut status,
+                            libc::WEXITED | libc::WNOHANG,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf 'ready\\n'; read -r finish"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Keep stdin open independently: simply dropping Child must not release it.
+        let _input = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        assert!(raw >= 0);
+        let fallback = Fallback(unsafe { OwnedFd::from_raw_fd(raw as i32) });
+        let mut ready = String::new();
+        BufReader::new(stdout).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        let result = std::panic::catch_unwind(|| {
+            let _child = OwnedChild::new(child);
+            panic!("unwind before the background command connects");
+        });
+        assert!(result.is_err());
+        // Drop promises completion: inspect its exit event, do not wait for a race.
+        let mut event = libc::pollfd {
+            fd: fallback.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(
+            unsafe { libc::poll(&mut event, 1, 0) } > 0,
+            "Drop left the child running"
+        );
+        let mut status = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    fallback.0.as_raw_fd() as u32,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG,
+                )
+            },
+            -1,
+            "Drop did not reap the child"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
 
     pub fn command_exit_returns_complete_large_output_without_pipe_deadlock() {
         let output = run(Command::new("/usr/bin/python3").args([

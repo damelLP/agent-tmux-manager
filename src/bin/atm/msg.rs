@@ -113,7 +113,7 @@ pub(super) fn escaped(text: &str, multiline: bool) -> String {
         })
         .collect()
 }
-fn output<R: Serialize>(
+pub(super) fn output<R: Serialize>(
     result: &R,
     format: MessageFormat,
     text: &str,

@@ -117,6 +117,30 @@ For `clear`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name r
 - **A start has 60 seconds** (the command itself waits up to 85). Once `atmd` knows the start is recorded, any failure, and the deadline, leave the agent `stuck` with the reason `start did not complete: <why>; inspect %N` and one note in your inbox. When the deadline ends it, the command fails with that same reason, not with a bare timeout. `atm agent clear` at its `--timeout-ms` and `atm agent respawn` at its 60 seconds answer the same way: the command fails with the reason the agent is then `stuck` with (`clear did not complete: <why>; inspect %N` for a clear), not with a bare timeout. Two cases end otherwise: if the answer to recording the start is lost, there is no `stuck` and no note, and the agent goes `down` at the next check of its pane; and if `atmd` cannot read its log or write the `stuck` record when the start ends, the agent stays `starting` and takes no further command until `atmd` is restarted. A pane the start created stays for you to look at. If the start failed before its pane was recorded, the agent then goes `down` and its reason keeps that text.
 - **Start dialogs.** `atmd` answers two questions a harness may ask at its start, each key only while the pane still shows that same question and no tmux client is focused on it. A folder trust dialog (Claude Code's, Codex's "Folder access") is accepted only when its folder is exactly one of the role's `trust_dirs` (resolved against the project root); any other folder ends the start as stuck with no key sent. Codex's update offer is skipped with one Escape. Every other question (Codex's "Hooks need review", a startup warning, a permission dialog) is left for you: the start ends as stuck, or waits until its 60 seconds are over.
 
+### Finding your instructions and handover
+
+From a named agent's pane, start with one command:
+
+```sh
+atm me                         # identity, manager, instructions and what is waiting
+atm me --format json           # the same context as structured data
+```
+
+`atm me` reads the current `.atm/roles/<name>.md` in the project's main checkout on every call. It shows your full agent id and manager, the role's instructions, unread messages (id, kind, sender and first line), the absolute `.atm/memory/<name>.md` path and whether it exists, and open tasks (an empty array until task tracking is available). Read an existing memory file for handover. The caller's pane binding determines identity, not the working directory or `ATM_AGENT`; an unbound caller gets a clear refusal.
+
+Every unread message includes `atm inbox --id mN` to retrieve its full body and attachments. Text adds `After handling a delivered message: atm msg ack <id>` after a nonempty unread list (replace `<id>` with the message id). Fetching context does **not** mark messages read: use `atm msg ack mN` explicitly after reading a Delivered message. Unread summaries include queued and failed messages too, in message sequence order.
+
+The last line is the exact reporting template for your manager, for example:
+
+```sh
+atm msg send --to project/lead --kind report --body 'DONE: <result>'
+# Replace the body; optionally add --attach /absolute/path/report.md.
+```
+
+A missing role file is shown explicitly with `instructions: null` in JSON; the other context remains available and reports go to `owner`. A role with no manager also reports to `owner`. A bare manager name resolves in your project; a full `project/name` reaches another project. An invalid role or manager is refused, never replaced by cached instructions. Unexpected file errors are reported, not treated as missing. Memory is checked but never read or created by this command.
+
+Role files are limited to 256 KiB and the context result to 512 KiB, without silently truncating instructions or summaries. An oversized context is refused; use `atm inbox --unread` for paged messages. Each caller has five seconds total to wait for the file-read slot and its result. Overlapping calls wait without starting extra threads; at most one detached read is in flight. A stalled read times out its callers without blocking daemon shutdown or accumulating workers. The CLI allows 17 seconds including startup and transport. JSON preserves original content and additive daemon fields; text escapes terminal controls.
+
 ### Sending text
 
 `atm send` refuses input when the window has `synchronize-panes` on (Enter could

@@ -1,0 +1,9 @@
+Agent: project/worker; manager: project/lead
+Instructions (/project/.atm/roles/worker.md):
+  Follow the brief.
+  Save handover.
+Memory: /project/.atm/memory/worker.md (missing; create it to preserve handover)
+Open tasks: none
+Unread m7 brief from=owner: Read the attached brief; read: atm inbox --id m7
+After handling a delivered message: atm msg ack <id>
+Report: atm msg send --to project/lead --kind report --body 'DONE: <result>'

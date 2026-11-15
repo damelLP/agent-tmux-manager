@@ -966,3 +966,71 @@ async fn one_note_per_session_when_a_turn_ends_at_the_line() {
         ]
     );
 }
+
+fn line_note(agent: &str, share: u32) -> String {
+    format!(
+        "agent p/{agent} is at {share}% of its context (line 40%). \
+         Hand it over: atm agent handover p/{agent}"
+    )
+}
+
+/// The next `count` notes, as (to, body). The watcher reads registry events
+/// in order, so these are the first notes the steps before them produced.
+async fn notes(rig: &mut Rig, count: usize) -> Vec<(String, String)> {
+    let mut notes = Vec::new();
+    for _ in 0..count {
+        let note = rig.next("msg.sent").await;
+        notes.push((
+            note.body["to"].as_str().unwrap().to_owned(),
+            note.body["body"].as_str().unwrap().to_owned(),
+        ));
+    }
+    notes
+}
+
+#[tokio::test]
+async fn a_share_at_the_line_is_not_noted_while_the_turn_runs() {
+    let mut rig = Rig::new().await;
+    spawn_context_notes(rig.org.clone(), rig.registry.clone(), rig.cancel.clone());
+    // The worker has ended a turn, then works again and crosses the line
+    // inside that turn.
+    rig.turn("s1").await;
+    rig.report("s1", LifecycleEvent::WorkingStart).await;
+    rig.share("s1", 500).await;
+    // Meanwhile the lead's turn ends above the line: its note comes first,
+    // which shows that the worker's share was seen and not noted.
+    rig.turn("lead-1").await;
+    rig.share("lead-1", 600).await;
+    // The worker's turn ends: now it is noted.
+    rig.report("s1", LifecycleEvent::Idle).await;
+    assert_eq!(
+        notes(&mut rig, 2).await,
+        [
+            ("owner".to_owned(), line_note("lead", 60)),
+            ("p/lead".to_owned(), line_note("worker", 50)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_idle_session_is_not_noted_before_a_turn_has_ended_in_it() {
+    let mut rig = Rig::new().await;
+    spawn_context_notes(rig.org.clone(), rig.registry.clone(), rig.cancel.clone());
+    // The worker's session is first seen idle and above the line, as after
+    // a daemon restart: updates arrive, and no turn has ended.
+    rig.share("s1", 500).await;
+    rig.share("s1", 510).await;
+    // The lead's note comes first, which shows that those updates were seen
+    // and not noted.
+    rig.turn("lead-1").await;
+    rig.share("lead-1", 600).await;
+    // A turn ends in the worker's session: now it is noted.
+    rig.turn("s1").await;
+    assert_eq!(
+        notes(&mut rig, 2).await,
+        [
+            ("owner".to_owned(), line_note("lead", 60)),
+            ("p/lead".to_owned(), line_note("worker", 51)),
+        ]
+    );
+}

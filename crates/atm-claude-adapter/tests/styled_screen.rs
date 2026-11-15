@@ -128,6 +128,60 @@ fn custom_status_real_empty_and_draft() {
 }
 
 #[test]
+fn custom_status_colored_and_truncated_rows_are_idle() {
+    for (fixture, truncated) in [
+        (capture!("s1_status-color-160"), false),
+        (capture!("s1_status-color-88"), true),
+    ] {
+        let expected = facts(
+            InputState::Empty,
+            TurnState::NotRunning,
+            FreshEditorEvidence::Present,
+        );
+        check(fixture, expected.clone());
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(fixture), REFERENCE),
+            None
+        );
+        let plain = custom_status_plain(fixture);
+        assert_eq!(
+            custom_status_row(&plain)
+                .trim_end_matches(' ')
+                .ends_with('…'),
+            truncated
+        );
+        // Synthetic: neither color nor the presence of this status slot changes facts.
+        check(&plain, expected.clone());
+        check(&custom_status_free(&plain), expected.clone());
+        let control = screen::observe_control_screen(body(ScreenInput::Styled(fixture)), None);
+        assert_eq!(control.facts, expected);
+        assert_eq!(
+            control.dialog,
+            atm_core::harness_control::ControlDialog::None
+        );
+    }
+}
+
+#[test]
+fn custom_status_unsupported_decoration_stays_unknown() {
+    let plain = custom_status_plain(capture!("s1_status-color-160"));
+    let row = custom_status_row(&plain);
+    // Synthetic: the strict decoder does not support underline or strikethrough.
+    for decorated in ["  \x1b[4munderlined\x1b[24m", "  \x1b[9mstruck\x1b[29m"] {
+        let text = plain.replace(row, decorated);
+        check(&text, ScreenFacts::default());
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&text), REFERENCE),
+            None
+        );
+        assert_eq!(
+            screen::observe_control_screen(ScreenInput::Styled(&text), None).dialog,
+            atm_core::harness_control::ControlDialog::Unknown
+        );
+    }
+}
+
+#[test]
 fn custom_status_rejects_unknown_regions() {
     let fresh = custom_status_plain(capture!("s1_status-160-fresh"));
     let row = custom_status_row(&fresh);

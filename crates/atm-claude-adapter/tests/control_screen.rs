@@ -478,7 +478,7 @@ fn synthetic_headers_and_footer_damage_do_not_manufacture_freshness() {
     );
 }
 
-// Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -e, no prompt.
+// Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
 // README maps the actual -p -e -N sources and equal-width private-cwd sanitization.
 const ABOVE_COMPLETIONS: [&str; 6] = [
     include_str!("fixtures/screen_styled_s1_clear-multi-wrapped_2.1.325.txt"),
@@ -491,7 +491,7 @@ const ABOVE_COMPLETIONS: [&str; 6] = [
 const NEUTRAL_HEADER: &str = " ▐▛███▛█   Claude Code v2.1.325\n▝▜██████▀  Demo Model · API Usage Billing\n ▝▝   ▝▝   /tmp/fixture\n\n";
 
 #[test]
-fn captured_above_completion_without_header() {
+fn captured_above_completion_with_and_without_header() {
     // Removing above-menu recognition must fail on the real no-header frames.
     for (case, fixture) in ABOVE_COMPLETIONS.into_iter().enumerate() {
         let input = ScreenInput::Styled(body(fixture));

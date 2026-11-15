@@ -54,7 +54,7 @@
 //! captures.
 //!
 //! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
-//! Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -e, no prompt.
+//! Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
 //! Fullscreen also places the menu above the editor, with other matching skills
 //! and aligned wrapped descriptions. It is recognized without a startup header;
 //! its transcript tail still proves neither idle nor freshness. Both completion

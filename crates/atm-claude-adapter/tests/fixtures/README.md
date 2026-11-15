@@ -2,7 +2,7 @@
 
 ## Above-editor completion without a startup header (stage 1)
 
-Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -e, no prompt.
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
 
 `screen_styled_s1_clear-<state>_2.1.325.txt` retains actual tmux 3.8
 `capture-pane -p -e -N` rows, attributes and allocated grid padding. The source

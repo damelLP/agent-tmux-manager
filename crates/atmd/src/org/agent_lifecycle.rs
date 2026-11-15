@@ -45,6 +45,7 @@ impl AgentRuntime {
     /// A pane that is positively gone already satisfies either. A pane that
     /// carries another tag is not this agent's any more: nothing is changed
     /// and the call refuses. No keys are sent and no end event is awaited.
+    /// `operation` is the method the kill is audited under.
     pub(super) async fn down(
         &self,
         r: &Reservation,
@@ -52,6 +53,7 @@ impl AgentRuntime {
         reserved: Option<&PaneId>,
         kill: bool,
         effect: &Effect,
+        operation: &str,
     ) -> Result<DownResult, AgentError> {
         let state = self.org.snapshot().await?;
         let agent = state
@@ -85,7 +87,7 @@ impl AgentRuntime {
                     effect.store(true, Ordering::SeqCst);
                     let done = if kill {
                         let action = serde_json::json!({
-                            "method": "agent.down",
+                            "method": operation,
                             "agent": id.to_string(),
                         });
                         r.kill(pane, id.clone(), action, chrono::Utc::now()).await
@@ -788,6 +790,30 @@ impl AgentRuntime {
             .await
     }
 
+    /// The cleanup of a respawn: that of the Down it began with (a killed
+    /// pane the agent is still recorded on can't be accounted for), then that
+    /// of the start that followed.
+    pub(super) async fn settle_respawn(
+        &self,
+        id: &AgentId,
+        old: Option<&PaneId>,
+        effect: &Effect,
+        waiting: &Waiting,
+    ) -> Result<(), AgentError> {
+        let state = self.org.snapshot().await?;
+        if effect.load(Ordering::SeqCst)
+            && state.agent(id).is_some_and(|agent| {
+                agent.status != AgentStatus::Down
+                    && agent.pane.as_deref() == old.map(PaneId::as_str)
+            })
+        {
+            return Err(AgentError::Internal(format!(
+                "agent {id}'s pane was changed but its Down is not recorded"
+            )));
+        }
+        self.settle_up(id, waiting).await
+    }
+
     async fn settle(
         &self,
         id: &AgentId,
@@ -849,6 +875,14 @@ pub(super) struct Launch {
     direction: atm_tmux::PaneDirection,
     /// The agent whose pane the role's `pane` hint names, if it has one.
     beside: Option<AgentId>,
+}
+
+/// What a respawn replaces before it starts the agent again: the pane the
+/// agent was reserved with, if it had one, and the flag its kill sets.
+#[derive(Debug)]
+pub(super) struct Replace {
+    pub reserved: Option<PaneId>,
+    pub effect: Effect,
 }
 
 impl AgentRuntime {
@@ -936,10 +970,15 @@ impl AgentRuntime {
     /// each key under a guard on that same dialog, and audited. From the Up it
     /// records onwards the flow never gives up quietly: every failure, and the deadline, leaves the agent Starting for
     /// [`Self::settle_up`] to mark Stuck.
+    ///
+    /// With `replace` this is a respawn: once the pane to split is proven, and
+    /// is not the agent's own, the agent is taken down as [`Self::down`] does
+    /// with a kill, and then started as above, all in this one reservation.
     pub(super) async fn up(
         &self,
         r: &Reservation,
         launch: Launch,
+        replace: Option<Replace>,
         waiting: &Waiting,
     ) -> Result<UpResult, AgentError> {
         let Launch {
@@ -960,33 +999,62 @@ impl AgentRuntime {
         let (policy, format, tag) = (screen.policy(), screen.capture_format(), id.to_string());
         // The pane to split: read only, it grants no input.
         let target = PaneId::parse(context.target_pane.clone())?;
+        let verb = if replace.is_some() {
+            "respawned"
+        } else {
+            "started"
+        };
         let refused = |reason: String| {
             AgentError::Refused(format!(
-                "agent {id} was not started: {reason}; nothing was changed"
+                "agent {id} was not {verb}: {reason}; nothing was changed"
             ))
         };
-        let found = r
-            .inspect(&target)
-            .await?
-            .filter(|found| !found.dead)
-            .ok_or_else(|| refused(format!("the pane to split, {target}, is gone")))?;
-        if let Some(beside) = &beside {
-            if found.local_agent_tag.as_deref() != Some(&beside.to_string()) {
-                return Err(refused(format!(
-                    "{target} is no longer agent {beside}'s pane"
-                )));
-            }
+        // Why the pane to split can't be used; `None` when it can.
+        let placement = || async {
+            let found = r.inspect(&target).await?.filter(|found| !found.dead);
+            Ok::<_, AgentError>(match (found, &beside) {
+                (None, _) => Some(format!("the pane to split, {target}, is gone")),
+                (Some(found), Some(beside))
+                    if found.local_agent_tag.as_deref() != Some(&beside.to_string()) =>
+                {
+                    Some(format!("{target} is no longer agent {beside}'s pane"))
+                }
+                _ => None,
+            })
+        };
+        if let Some(reason) = placement().await? {
+            return Err(refused(reason));
         }
-        // The organisation refuses an agent that is already up.
-        self.org
-            .execute(
-                OrgCommand::Up {
+        let begin = match replace {
+            // The organisation refuses an agent that is already up.
+            None => OrgCommand::Up {
+                agent_id: id.clone(),
+                role: prepared.role.clone(),
+            },
+            Some(Replace { reserved, effect }) => {
+                // Checked before the kill: afterwards there would be no pane
+                // to split.
+                if reserved.as_ref() == Some(&target) {
+                    return Err(refused(format!(
+                        "the pane to split, {target}, is the agent's own pane, which a respawn kills; run it from another pane"
+                    )));
+                }
+                self.down(r, &id, reserved.as_ref(), true, &effect, "agent.respawn")
+                    .await?;
+                // Again, now that time has passed in the kill.
+                if let Some(reason) = placement().await? {
+                    return Err(AgentError::Refused(format!(
+                        "agent {id} was taken down and not started again: {reason}"
+                    )));
+                }
+                OrgCommand::Respawn {
                     agent_id: id.clone(),
                     role: prepared.role.clone(),
-                },
-                chrono::Utc::now(),
-            )
-            .await?;
+                    reason: "respawned".into(),
+                }
+            }
+        };
+        self.org.execute(begin, chrono::Utc::now()).await?;
         waiting_for(waiting, "its pane was not created");
         let pane = r.split(context, direction, "50%".into()).await?;
         waiting_for(waiting, format!("{pane} was created and not recorded"));

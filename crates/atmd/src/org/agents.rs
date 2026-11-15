@@ -7,8 +7,7 @@
 //! A Stuck agent recovers only when one observation finds its session row and
 //! captures a safe editor; a binding alone never clears Stuck.
 //! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: up, down,
-//! adopt and clear act on panes; respawn is not built yet and answers "not
-//! implemented" after admission.
+//! adopt, clear and respawn act on panes.
 
 pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
@@ -422,7 +421,7 @@ impl AgentHandle {
         self.lifecycle_for(
             p.caller_server,
             request,
-            move |r| async move { work.up(&r, launch, &waiting).await },
+            move |r| async move { work.up(&r, launch, None, &waiting).await },
             move |_, _| async move { cleanup.settle_up(&id, &why).await },
         )
         .await
@@ -465,27 +464,6 @@ impl AgentHandle {
             .as_ref()
             .ok_or_else(|| self.unavailable(operation))
     }
-    async fn unimplemented<T: Send + 'static>(
-        &self,
-        request: ReservationRequest,
-        operation: &'static str,
-    ) -> Result<T, AgentError> {
-        let rt = self
-            .inner
-            .runtime
-            .as_ref()
-            .ok_or_else(|| self.unavailable(operation))?;
-        let org = rt.org.clone();
-        self.lifecycle(
-            request,
-            move |_| async move { Err(AgentError::NotImplemented { operation }) },
-            move |_, _| async move {
-                org.snapshot().await?;
-                Ok(())
-            },
-        )
-        .await
-    }
     pub async fn clear(&self, p: ClearParams) -> Result<ClearResult, AgentError> {
         const OPERATION: &str = "agent.clear";
         if !matches!(*self.inner.ready.borrow(), Some(Ok(()))) {
@@ -521,15 +499,71 @@ impl AgentHandle {
     pub async fn respawn(
         &self,
         p: RespawnParams,
-        _caller: CallContext,
+        caller: CallContext,
     ) -> Result<RespawnResult, AgentError> {
-        self.checkpoint(
-            p.agent,
+        const OPERATION: &str = "agent.respawn";
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let projects = self.projects(OPERATION)?;
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let id = p.agent;
+        let state = rt.org.snapshot().await?;
+        let agent = state
+            .agent(&id)
+            .ok_or_else(|| AgentError::NotFound(format!("agent {id} was not found")))?;
+        let old = agent.pane.as_ref().map(PaneId::parse).transpose()?;
+        let root = state
+            .project(&id.project)
+            .ok_or_else(|| AgentError::NotFound(format!("agent {id}'s project was not found")))?
+            .root
+            .clone();
+        // The role is read again, and where to split is settled, before
+        // anything is reserved or killed.
+        let prepared = projects.prepare(root.into(), id.name.clone()).await?;
+        if prepared.agent_id != id {
+            return Err(AgentError::Refused(format!(
+                "agent {id} was not respawned: its project directory now belongs to project {}",
+                prepared.agent_id.project
+            )));
+        }
+        let launch = rt
+            .prepare_launch(prepared, caller, p.caller_server.clone())
+            .await?;
+        #[cfg(test)]
+        rt.progress("up_prepared", Some(id.clone()));
+        let request = ReservationRequest::new(
+            id.clone(),
+            old.clone(),
             ReservationKind::Respawn,
-            "agent.respawn",
-            Duration::from_secs(60),
-        )
-        .await
+            WaitPolicy::Wait,
+            deadline,
+        );
+        let waiting = super::agent_lifecycle::Waiting::default();
+        let replace = super::agent_lifecycle::Replace {
+            reserved: old.clone(),
+            effect: super::agent_lifecycle::Effect::default(),
+        };
+        let (work, cleanup) = (rt.clone(), rt.clone());
+        let (why, changed) = (waiting.clone(), replace.effect.clone());
+        let started = self
+            .lifecycle_for(
+                p.caller_server,
+                request,
+                move |r| async move { work.up(&r, launch, Some(replace), &waiting).await },
+                move |_, _| async move {
+                    cleanup
+                        .settle_respawn(&id, old.as_ref(), &changed, &why)
+                        .await
+                },
+            )
+            .await?;
+        Ok(RespawnResult {
+            agent_id: started.agent_id,
+            pane: started.pane,
+        })
     }
     pub async fn down(&self, p: DownParams) -> Result<DownResult, AgentError> {
         const OPERATION: &str = "agent.down";
@@ -559,36 +593,12 @@ impl AgentHandle {
         self.lifecycle(
             request,
             move |r| async move {
-                work.down(&r, &p.agent, pane.as_ref(), p.kill, &effect)
+                work.down(&r, &p.agent, pane.as_ref(), p.kill, &effect, "agent.down")
                     .await
             },
             move |_, _| async move { cleanup.settle_down(&id, &changed).await },
         )
         .await
-    }
-    async fn checkpoint<T: Send + 'static>(
-        &self,
-        id: AgentId,
-        kind: ReservationKind,
-        operation: &'static str,
-        budget: Duration,
-    ) -> Result<T, AgentError> {
-        if !matches!(*self.inner.ready.borrow(), Some(Ok(()))) {
-            return Err(self.unavailable(operation));
-        }
-        let deadline = Instant::now() + budget;
-        let rt = self
-            .inner
-            .runtime
-            .as_ref()
-            .ok_or_else(|| self.unavailable(operation))?;
-        let state = rt.org.snapshot().await?;
-        let agent = state
-            .agent(&id)
-            .ok_or_else(|| AgentError::NotFound(format!("agent {id} was not found")))?;
-        let pane = agent.pane.as_ref().map(PaneId::parse).transpose()?;
-        let request = ReservationRequest::new(id, pane, kind, WaitPolicy::Wait, deadline);
-        self.unimplemented(request, operation).await
     }
     pub async fn list(&self, p: ListParams) -> Result<ListResult, AgentError> {
         timeout(LIST_BUDGET, async {

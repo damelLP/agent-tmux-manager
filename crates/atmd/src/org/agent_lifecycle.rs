@@ -8,9 +8,9 @@
 use super::agent_flow::{
     adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, decide_start,
     input_refusal, launch_enter_allowed, launch_line, launch_line_is_staged, launch_paste_allowed,
-    placement, prompt_line_allowed, safe_editor, safe_to_paste, shell_baseline, shell_refusal,
-    start_view, started_session, submit_allowed, submit_step, ClearProgress, KeyAction, ProcFacts,
-    Ready, StartProgress, StartView, Step,
+    placement, safe_editor, safe_to_paste, shell_baseline, shell_refusal, start_view,
+    started_session, submit_allowed, submit_step, ClearProgress, KeyAction, ProcFacts, Ready,
+    StartProgress, StartView, Step,
 };
 use super::agent_launch::{launch_command, LaunchCommand};
 use super::agent_project::PreparedAgent;
@@ -1122,11 +1122,11 @@ impl AgentRuntime {
 
         waiting_for(waiting, "the shell in the new pane is not at its prompt");
         let text = command.text;
-        let mut refused_line = None;
-        let (mut baseline, before) = loop {
-            let (baseline, before) = self
-                .idle_shell(r, &id, &pane, screen, refused_line.as_deref(), waiting)
-                .await?;
+        // The prompt is read once, here, and never again: a line that reads
+        // otherwise later has something typed at it, and a launch typed
+        // after it would run that too.
+        let (mut baseline, before) = self.idle_shell(r, &id, &pane, screen, waiting).await?;
+        loop {
             let guard = {
                 let (baseline, tag, before) = (baseline.clone(), tag.clone(), before.clone());
                 move |capture: &_| launch_paste_allowed(screen, capture, &baseline, &tag, &before)
@@ -1137,19 +1137,32 @@ impl AgentRuntime {
                 .paste_guarded(&pane, id.clone(), text.clone(), format, guard)
                 .await
             {
-                Ok(()) => break (baseline, before),
-                // Nothing was sent: read the shell's line again.
-                Err(error) => {
-                    input_error(
+                Ok(()) => break,
+                Err(error) => input_error(
+                    waiting,
+                    "typing the launch command",
+                    "the shell's line changed before the launch command was typed",
+                    error,
+                )?,
+            }
+            // Nothing was sent. A pane that takes no input for now (somebody
+            // is focused on it) is waited on; a line that is not the prompt
+            // any more ends the start.
+            let capture = r.capture(&pane, format).await?;
+            match shell_refusal(screen, &capture, &baseline, &tag) {
+                Some(reason) => waiting_for(waiting, reason),
+                None if launch_line(&capture).as_deref() == Some(before.as_str()) => {}
+                None => {
+                    return Err(stopped(
                         waiting,
-                        "typing the launch command",
-                        "the shell's line changed before the launch command was typed",
-                        error,
-                    )?;
-                    refused_line = Some(before);
+                        &id,
+                        "start",
+                        "the shell's line changed after its prompt was read, so nothing was typed"
+                            .into(),
+                    ))
                 }
             }
-        };
+        }
         // Subscribed before the command runs: a session that arrives from
         // here on is an event.
         let mut events = self.registry.subscribe();
@@ -1372,15 +1385,18 @@ impl AgentRuntime {
     /// before the cursor, which the paste and its Enter are checked against.
     ///
     /// The process facts are read between two captures and used only when both
-    /// show the same root process, shell and line, and that line is not blank. A line that is
-    /// `refused_line` with more typed after it is never taken.
+    /// show the same root process, shell and line, and that line is not blank.
+    ///
+    /// Text reaches that line only from a client that selected the pane, so a
+    /// capture that shows the pane focused before the line is read ends the
+    /// start: the line could hold what was typed, and waiting for the focus to
+    /// leave would not show it.
     async fn idle_shell(
         &self,
         r: &Reservation,
         id: &AgentId,
         pane: &PaneId,
         screen: &'static AgentScreen,
-        refused_line: Option<&str>,
         waiting: &Waiting,
     ) -> Result<(PaneBaseline, String), AgentError> {
         let (format, tag) = (screen.capture_format(), id.to_string());
@@ -1390,8 +1406,21 @@ impl AgentRuntime {
                 .pane_root_pid()
                 .zip(capture.inspection.foreground_command.clone())
         };
+        let selected = |capture: &PaneCapture| {
+            match capture.focused {
+            Some(true) => Err(stopped(
+                waiting,
+                id,
+                "start",
+                "the new pane was selected before its prompt could be read, so nothing was typed; start the harness there by hand and adopt it, or take the agent down and up again"
+                    .into(),
+            )),
+            _ => Ok(()),
+        }
+        };
         loop {
             let first = r.capture(pane, format).await?;
+            selected(&first)?;
             let Some((root, command)) = seen(&first) else {
                 continue;
             };
@@ -1403,6 +1432,7 @@ impl AgentRuntime {
             };
             // The second capture must show that root and shell again.
             let second = r.capture(pane, format).await?;
+            selected(&second)?;
             if let Some(reason) = shell_refusal(screen, &second, &baseline, &tag) {
                 waiting_for(waiting, reason);
                 continue;
@@ -1411,9 +1441,7 @@ impl AgentRuntime {
                 // A blank line is a shell that has drawn no prompt yet (an idle
                 // shell can still be reading its startup files).
                 Some(line)
-                    if !line.trim().is_empty()
-                        && launch_line(&first).as_ref() == Some(&line)
-                        && prompt_line_allowed(refused_line, &line) =>
+                    if !line.trim().is_empty() && launch_line(&first).as_ref() == Some(&line) =>
                 {
                     self.record_baseline(id.clone(), pane.as_str(), baseline.clone());
                     return Ok((baseline, line));

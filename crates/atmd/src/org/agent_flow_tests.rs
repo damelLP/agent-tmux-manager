@@ -2687,23 +2687,6 @@ fn started_session_is_the_one_accepted_start_on_the_pane() {
 }
 
 #[test]
-fn a_refused_prompt_line_with_more_typed_after_it_is_never_the_prompt() {
-    // No paste guard has refused yet: any settled line is the prompt.
-    assert!(prompt_line_allowed(None, "pb> "));
-    assert!(prompt_line_allowed(None, ""));
-    // The refused line itself (the guard refused for another reason), and a
-    // prompt that was drawn again.
-    assert!(prompt_line_allowed(Some("pb> "), "pb> "));
-    assert!(prompt_line_allowed(Some("pb> "), "pb (main)> "));
-    assert!(prompt_line_allowed(Some("pb> "), ""));
-    // The refused line with something typed after it.
-    assert!(!prompt_line_allowed(Some("pb> "), "pb> rm -rf ~; "));
-    assert!(!prompt_line_allowed(Some("pb> "), "pb>  "));
-    // An empty refused line says nothing about a later one: fail closed.
-    assert!(!prompt_line_allowed(Some(""), "x"));
-}
-
-#[test]
 fn launch_guards_need_the_recorded_shell_unfocused_and_the_exact_line() {
     let screen = agent_screen(Harness::Codex).unwrap();
     let baseline = PaneBaseline::shell(ROOT, "zsh".into());

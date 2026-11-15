@@ -135,6 +135,7 @@ struct Read {
 pub struct ScriptedTmuxClient {
     mock: MockTmuxClient,
     scripts: Arc<Mutex<HashMap<PaneId, VecDeque<Read>>>>,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn error(reason: impl Into<String>) -> TmuxError {
@@ -155,6 +156,18 @@ impl ScriptedTmuxClient {
     #[must_use]
     pub fn mock(&self) -> MockTmuxClient {
         self.mock.clone()
+    }
+
+    /// While on, a kill and a tag write are recorded in mock() and then never
+    /// answer: a tmux that performs the effect and stalls. Reads are unaffected.
+    pub fn stall_pane_effects(&self, on: bool) {
+        self.stalled.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn stall(&self) {
+        if self.stalled.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
     }
 
     /// Queue one inspection (two reads), or positive missing-pane evidence (one).
@@ -396,6 +409,7 @@ impl TmuxClient for ScriptedTmuxClient {
                 ("set-option", ["-p", "-t", _, "@atm-agent", _])
                     | ("set-option", ["-p", "-u", "-t", _, "@atm-agent"])
             ) {
+                self.stall().await;
                 return Ok(output);
             }
             if let ("send-keys", ["-l", "-t", pane, "--", key]) = (subcommand, args) {
@@ -414,7 +428,18 @@ impl TmuxClient for ScriptedTmuxClient {
     forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
     forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
     forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
-    forward!(kill_pane<'a>(pane: &'a str) -> ());
+    fn kill_pane<'s, 'a, 'async_trait>(&'s self, pane: &'a str) -> Call<'async_trait, ()>
+    where
+        's: 'async_trait,
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.mock.kill_pane(pane).await?;
+            self.stall().await;
+            Ok(())
+        })
+    }
     forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
     forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
     forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());

@@ -2,6 +2,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::{json, Value};
+#[path = "support/task_review.rs"]
+mod review;
 #[path = "support/task_cli.rs"]
 mod support;
 

@@ -313,17 +313,18 @@ fn render(method: &str, raw: &Value, out: &mut impl Write) -> Result<()> {
                     key.as_str(),
                     "task_id" | "state" | "kind" | "agent_id" | "title" | "reason"
                 ) {
-                    writeln!(
-                        out,
-                        "  {}: {}",
-                        escaped(key, false),
-                        escaped(&serde_json::to_string(value)?, false)
-                    )?;
+                    write!(out, "  {}: ", escaped(key, false))?;
+                    output(value, MessageFormat::Json, "", out)?;
                 }
             }
         }
         _ => {
-            let result: MutationResult = decode(raw)?;
+            // Notification vocabularies can grow independently of the committed task.
+            let mut fields = raw.clone();
+            if let Some(fields) = fields.as_object_mut() {
+                fields.remove("notification");
+            }
+            let result: MutationResult = decode(&fields)?;
             writeln!(
                 out,
                 "{} {}",
@@ -334,18 +335,30 @@ fn render(method: &str, raw: &Value, out: &mut impl Write) -> Result<()> {
                     "unchanged"
                 }
             )?;
-            match result.notification {
-                Some(Notification::Queued { message_id }) => writeln!(
-                    out,
-                    "notification: queued {message_id} (not delivery confirmation)"
-                )?,
-                Some(Notification::Unconfirmed { error }) => writeln!(
-                    out,
-                    "notification: unconfirmed {}: {}",
-                    escaped(&error.code, false),
-                    escaped(&error.message, false)
-                )?,
-                None => (),
+            if let Some(notification) = raw.get("notification").filter(|value| !value.is_null()) {
+                let status = notification
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                match status {
+                    "queued" | "unconfirmed" => match decode(notification)? {
+                        Notification::Queued { message_id } => writeln!(
+                            out,
+                            "notification: queued {message_id} (not delivery confirmation)"
+                        )?,
+                        Notification::Unconfirmed { error } => writeln!(
+                            out,
+                            "notification: unconfirmed {}: {}",
+                            escaped(&error.code, false),
+                            escaped(&error.message, false)
+                        )?,
+                    },
+                    _ => writeln!(
+                        out,
+                        "notification: {} (task committed; status not understood by this atm)",
+                        escaped(status, false)
+                    )?,
+                }
             }
         }
     }
@@ -363,14 +376,23 @@ pub async fn cmd_task(args: TaskArgs) -> Result<()> {
         .await
         .map_err(|error| match error {
             super::rpc::RpcError::Timeout => anyhow::Error::new(TaskError::Timeout),
-            other => anyhow::Error::new(other),
+            other => anyhow::anyhow!("{}", escaped(&other.to_string(), false)),
         })?;
-    // Validate both formats before writing, but retain the complete raw JSON.
-    let mut text = Vec::new();
-    render(method, &raw, &mut text)?;
     let mut out = io::stdout().lock();
     match args.format {
-        MessageFormat::Text => Ok(out.write_all(&text)?),
+        // JSON is the raw daemon answer, independent of this build's text schema.
         MessageFormat::Json => output(&raw, args.format, "", &mut out),
+        MessageFormat::Text => {
+            let mut text = Vec::new();
+            render(method, &raw, &mut text).map_err(|error| {
+                let diagnostic = escaped(&format!("{error:#}"), false);
+                if matches!(method, "task.list" | "task.get") {
+                    anyhow::anyhow!("{diagnostic}")
+                } else {
+                    anyhow::anyhow!("{diagnostic}; task may have committed; inspect atm task list and atm task get <id> before retrying")
+                }
+            })?;
+            Ok(out.write_all(&text)?)
+        }
     }
 }

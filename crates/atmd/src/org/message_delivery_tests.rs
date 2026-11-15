@@ -4444,6 +4444,40 @@ async fn no_paste_once_the_confirmation_window_has_ended() {
     assert_eq!(rig.org.status().unwrap(), before + 2);
 }
 
+/// The pre-paste check has no speculative margin. With 1 ms left it still
+/// dispatches the paste; the subsequent paced look returns after the bound
+/// and permits the separately guarded late Enter.
+#[tokio::test(start_paused = true)]
+async fn paste_is_dispatched_with_one_millisecond_left_in_confirmation_window() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[
+        pi(IDLE),
+        pi(IDLE),
+        staged(id),
+        staged(id),
+        showing(&inbox_reference(id)),
+    ]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    let window = rig.rt.policy.settings().confirmation_timeout;
+    tokio::time::advance(window - Duration::from_millis(1)).await;
+    rig.release();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert_eq!((rig.pastes(), rig.keys()), (1, 1));
+    assert_eq!(rig.reads(), 0);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 2);
+}
+
 /// The look the executor is waiting for comes back after the window has
 /// ended, and shows the staged reference: the Enter still goes out, behind
 /// its guard like any other. Nothing waits for its receipt any more, so

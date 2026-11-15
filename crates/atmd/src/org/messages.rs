@@ -185,6 +185,8 @@ pub struct MessageRuntime {
 
 impl MessageRuntime {
     /// Pure dependency assembly; no tasks, observations, writes or input effects.
+    // One argument per shared daemon service: they have no common owner to bundle.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         org: OrgHandle,

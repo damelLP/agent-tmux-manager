@@ -13,6 +13,8 @@
 mod children;
 mod create;
 mod lifecycle;
+#[cfg(test)]
+mod pane_tests;
 mod remove;
 mod status_line;
 #[cfg(test)]
@@ -27,7 +29,7 @@ use tracing::{info, warn};
 
 use atm_core::{ChildRef, SessionDomain, SessionId, SessionView};
 
-use super::commands::{RegistryCommand, RemovalReason, SessionEvent};
+use super::commands::{PaneSession, RegistryCommand, RemovalReason, SessionEvent};
 use super::git::{GitContext, GitLookups, GitResult};
 use super::infra::SessionInfrastructure;
 
@@ -202,6 +204,9 @@ impl RegistryActor {
                 let result = self.handle_get_all_sessions();
                 let _ = respond_to.send(result);
             }
+            RegistryCommand::PaneSessions { pane, respond_to } => {
+                let _ = respond_to.send(self.handle_pane_sessions(&pane));
+            }
             RegistryCommand::Remove {
                 session_id,
                 respond_to,
@@ -263,6 +268,19 @@ impl RegistryActor {
         self.sessions_by_pid
             .values()
             .map(|(session, _)| SessionView::from_domain(session))
+            .collect()
+    }
+
+    /// Handles getting the sessions on one pane.
+    fn handle_pane_sessions(&self, pane: &str) -> Vec<PaneSession> {
+        self.sessions_by_pid
+            .values()
+            .filter(|(session, _)| session.tmux_pane.as_deref() == Some(pane))
+            .map(|(session, infra)| PaneSession {
+                view: SessionView::from_domain(session),
+                pid: infra.pid,
+                start: infra.start.clone(),
+            })
             .collect()
     }
 

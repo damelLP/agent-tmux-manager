@@ -248,10 +248,13 @@ impl RegistryActor {
         if old_id == new_id {
             return;
         }
-        let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) else {
+        let Some((session, infra)) = self.sessions_by_pid.get_mut(&pid) else {
             return;
         };
         session.id = new_id.clone();
+        // The recorded start was the old session's. A start of the new one is
+        // recorded by the lifecycle path, after its own call of this function.
+        infra.start = None;
         let agent_type = session.agent_type.clone();
 
         self.unindex(&old_id, pid);

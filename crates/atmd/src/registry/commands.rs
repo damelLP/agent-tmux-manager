@@ -15,6 +15,30 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 
 // ============================================================================
+// Per-pane read
+// ============================================================================
+
+/// One session row on a pane, read in a single actor turn.
+#[derive(Debug, Clone)]
+pub struct PaneSession {
+    /// The row as every other read shows it
+    pub view: SessionView,
+    /// The agent process, when the row tracks one. In-process child rows and
+    /// rows registered without a process have none.
+    pub pid: Option<u32>,
+    /// The latest untagged `SessionStart` accepted for this row. `None` means
+    /// the row has had none: a status line, discovery or another event made it.
+    pub start: Option<AcceptedStart>,
+}
+
+/// A `SessionStart` the registry applied to a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedStart {
+    /// Why the session opened, as its adapter reported it; not interpreted here
+    pub source: Option<String>,
+}
+
+// ============================================================================
 // Registry Commands
 // ============================================================================
 
@@ -116,6 +140,15 @@ pub enum RegistryCommand {
     GetAllSessions {
         /// Channel to send the results
         respond_to: oneshot::Sender<Vec<SessionView>>,
+    },
+
+    /// Get the sessions on one tmux pane, with what only the actor knows
+    /// about each: its process and its latest accepted start.
+    PaneSessions {
+        /// The pane's tmux id (for example `%7`)
+        pane: String,
+        /// Channel to send the results
+        respond_to: oneshot::Sender<Vec<PaneSession>>,
     },
 
     /// Remove a session from the registry.

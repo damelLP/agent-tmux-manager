@@ -17,7 +17,7 @@ use atm_core::{
     StatusLineData,
 };
 
-use super::commands::{RegistryCommand, RegistryError, SessionEvent};
+use super::commands::{PaneSession, RegistryCommand, RegistryError, SessionEvent};
 
 // ============================================================================
 // Registry Handle
@@ -218,6 +218,31 @@ impl RegistryHandle {
         }
 
         rx.await.unwrap_or_default()
+    }
+
+    /// Get the sessions on one tmux pane, each with its process and its
+    /// latest accepted start, read in one actor turn.
+    ///
+    /// Unlike [`Self::get_all_sessions`], a registry that cannot answer is an
+    /// error here, never an empty list: callers decide on input from this.
+    /// The caller bounds the wait.
+    ///
+    /// # Errors
+    ///
+    /// - `RegistryError::ChannelClosed` if the actor has shut down or dropped
+    ///   the request without answering
+    pub async fn pane_sessions(&self, pane: &str) -> Result<Vec<PaneSession>, RegistryError> {
+        let (tx, rx) = oneshot::channel();
+
+        self.sender
+            .send(RegistryCommand::PaneSessions {
+                pane: pane.to_owned(),
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| RegistryError::ChannelClosed)?;
+
+        rx.await.map_err(|_| RegistryError::ChannelClosed)
     }
 
     /// Remove a session from the registry.

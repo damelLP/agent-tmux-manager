@@ -41,6 +41,7 @@ sysinfo = { workspace = true }
 clap = { workspace = true }
 procfs = { workspace = true }
 libc = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

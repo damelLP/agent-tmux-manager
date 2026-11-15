@@ -82,6 +82,9 @@ socket2 = "0.6"
 ratatui = "0.29"
 crossterm = "0.28"
 
+# Terminal cell widths, for atmd's check of a shell prompt (already in the tree via ratatui)
+unicode-width = "0.2.0"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -6,6 +6,9 @@
 //! Delivery must independently check the screen before input.
 //! A Stuck agent recovers only when one observation finds its session row and
 //! captures a safe editor; a binding alone never clears Stuck.
+//! A flow never outlives its daemon: at the restart check an agent found
+//! Clearing, or Starting with no session bound, is recorded Stuck and its
+//! owner gets one note.
 //! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: up, down,
 //! adopt, clear and respawn act on panes.
 
@@ -16,7 +19,7 @@ pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground,
 pub use super::agent_types::*;
 use super::{agent_project::AgentProjects, OrgHandle, OrgServiceError};
 use crate::control::reservation::{
-    CaptureFormat, PaneId, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
+    CaptureFormat, PaneId, Quarantine, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
 };
 use crate::server::methods::CallContext;
 use crate::{
@@ -38,6 +41,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const LIST_BUDGET: Duration = Duration::from_secs(5);
+// The list's read of the quarantined operations, inside `LIST_BUDGET`.
+const QUARANTINE_BUDGET: Duration = Duration::from_secs(1);
 const OBSERVE_BUDGET: Duration = Duration::from_secs(30);
 const MIN_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
 // U8c has 32 active+parked slots. Observers use at most a quarter, leaving
@@ -125,14 +130,18 @@ pub enum AgentError {
 /// Reads one variable of the environment a launch takes its overrides from.
 pub(super) type SpawnEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// An agent's pane, its baseline, and the refusal reason of its last observation.
+type PaneRecord = (String, PaneBaseline, Option<String>);
+
 #[derive(Clone)]
 pub(super) struct AgentRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
-    /// Each agent's pane and what was recorded about its processes. In memory
-    /// only; written under the agent's reservation.
-    baselines: Arc<std::sync::Mutex<HashMap<AgentId, (String, PaneBaseline)>>>,
+    /// Each agent's pane, what was recorded about its processes, and why its
+    /// last observation found every input to it refused, if it did. In
+    /// memory only; written under the agent's reservation.
+    baselines: Arc<std::sync::Mutex<HashMap<AgentId, PaneRecord>>>,
     /// Reads a pane's root process from procfs; scripted in tests.
     pub proc: super::agent_proc::ProcReader,
     /// The `ATM_SPAWN_*` overrides of the daemon's start environment.
@@ -149,15 +158,44 @@ impl AgentRuntime {
             .lock()
             .ok()
             .and_then(|baselines| baselines.get(agent).cloned())
-            .filter(|(recorded, _)| recorded == pane)
-            .map_or_else(PaneBaseline::unproven, |(_, baseline)| baseline)
+            .filter(|(recorded, ..)| recorded == pane)
+            .map_or_else(PaneBaseline::unproven, |(_, baseline, _)| baseline)
     }
 
     /// Record what was established about an agent's pane. A poisoned store
-    /// records nothing, and reads then refuse.
+    /// records nothing, and reads then refuse. A refusal reason read before
+    /// this goes with what it replaces.
     pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
         if let Ok(mut baselines) = self.baselines.lock() {
-            baselines.insert(agent, (pane.into(), baseline));
+            baselines.insert(agent, (pane.into(), baseline, None));
+        }
+    }
+
+    /// Why the last observation of `agent` on `pane` found every input to it
+    /// refused, if it did.
+    fn refusal(&self, agent: &AgentId, pane: &str) -> Option<String> {
+        self.baselines
+            .lock()
+            .ok()
+            .and_then(|baselines| baselines.get(agent).cloned())
+            .filter(|(recorded, ..)| recorded == pane)
+            .and_then(|(.., reason)| reason)
+    }
+
+    /// Set that reason, or with `None` drop it; the baseline stays.
+    fn set_refusal(&self, agent: &AgentId, pane: &str, reason: Option<String>) {
+        if let Ok(mut baselines) = self.baselines.lock() {
+            match baselines
+                .get_mut(agent)
+                .filter(|(recorded, ..)| recorded == pane)
+            {
+                Some(entry) => entry.2 = reason,
+                None if reason.is_some() => {
+                    let record = (pane.into(), PaneBaseline::unproven(), reason);
+                    baselines.insert(agent.clone(), record);
+                }
+                None => {}
+            }
         }
     }
 
@@ -265,6 +303,11 @@ impl AgentHandle {
     #[cfg(test)]
     pub(super) fn baseline_of(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
         self.inner.runtime.as_ref().unwrap().baseline(agent, pane)
+    }
+
+    #[cfg(test)]
+    pub(super) fn refusal_of(&self, agent: &AgentId, pane: &str) -> Option<String> {
+        self.inner.runtime.as_ref().unwrap().refusal(agent, pane)
     }
 
     #[must_use]
@@ -625,11 +668,41 @@ impl AgentHandle {
             };
             let state = rt.org.snapshot().await?;
             let rows = rt.rows().await?;
+            // The operations whose cleanup failed. A control service that does
+            // not answer in time leaves the list without them, never without
+            // its agents.
+            let quarantines = rt
+                .control
+                .quarantines(Instant::now() + QUARANTINE_BUDGET)
+                .await
+                .unwrap_or_default();
             Ok(state
                 .agents()
                 .filter(|a| filter.as_ref().is_none_or(|id| &a.id.project == id))
                 .map(|a| {
                     let mut entry = list_entry(&state, a, &rows);
+                    // A quarantined agent takes no call at all, its owner's
+                    // included, on a pane that may be gone: that is shown in
+                    // place of a refusal read on that pane and of the failed
+                    // observation, which fails on the quarantine itself. A
+                    // recorded reason stays in front of it.
+                    if let Some(quarantine) = quarantines.iter().find(|q| q.agent == a.id) {
+                        let quarantined = quarantine_text(quarantine);
+                        entry.reason = Some(match entry.reason {
+                            Some(reason) => format!("{reason}; {quarantined}"),
+                            None => quarantined,
+                        });
+                        return entry;
+                    }
+                    // A Ready or Starting agent has no recorded reason: what
+                    // the last observation found refused is its reason.
+                    if matches!(a.status, AgentStatus::Ready | AgentStatus::Starting) {
+                        if let Some(refusal) =
+                            a.pane.as_deref().and_then(|pane| rt.refusal(&a.id, pane))
+                        {
+                            entry.reason = Some(refusal);
+                        }
+                    }
                     if let Some(ObservationFailure { reason: error, .. }) =
                         self.inner.errors.borrow().get(&a.id)
                     {
@@ -845,8 +918,10 @@ impl AgentRuntime {
         // The harness is not known to be in front: read the pane's processes,
         // once. An idle shell under an agent that was Ready or bound is the
         // positive evidence that its harness exited, with or without an end
-        // event. Any other shape records nothing here.
+        // event. Any other shape records nothing: the agent keeps its state,
+        // and `agent.list` says why every input to it is refused.
         let mut processes = None;
+        let mut refused = None;
         let (root, command) = look
             .as_ref()
             .map(|(root, command)| (*root, command.as_str()))
@@ -871,13 +946,40 @@ impl AgentRuntime {
                 self.forget_baseline(&agent.id);
                 return Ok(());
             }
-        }
-        if let Some(pane) = &agent.pane {
-            let reason = format!("clear interrupted by daemon restart; inspect {pane}");
-            if (initial && agent.status == AgentStatus::Clearing)
-                || (agent.status == AgentStatus::Stuck && agent.reason.as_ref() == Some(&reason))
+            if agent.status == AgentStatus::Ready
+                || (agent.status == AgentStatus::Starting && agent.session_id.is_some())
             {
-                if agent.status == AgentStatus::Clearing {
+                let shape = processes.as_ref().and_then(classify_pane);
+                refused = agent
+                    .pane
+                    .as_deref()
+                    .map(|pane| refusal_text(pane, &stored, command, shape));
+            }
+        }
+        // One write per pass: the reason, or none once the harness is in front.
+        if let Some(pane) = &agent.pane {
+            self.set_refusal(&agent.id, pane, refused);
+        }
+        // A flow never outlives its daemon. At the restart check a clear, and
+        // a start that has bound no session, have nobody driving them: the
+        // agent is Stuck and its owner is told, once.
+        let starting = agent.status == AgentStatus::Starting && agent.session_id.is_none();
+        let interrupted = initial && (agent.status == AgentStatus::Clearing || starting);
+        if let Some(pane) = &agent.pane {
+            let cleared = format!("clear interrupted by daemon restart; inspect {pane}");
+            let started = format!("was still starting when the daemon restarted; inspect {pane}");
+            // This pass's reason follows the status. An agent already Stuck
+            // with either reason may still lack its note.
+            let reason = if interrupted {
+                Some(if starting { started } else { cleared })
+            } else {
+                agent.reason.clone().filter(|recorded| {
+                    agent.status == AgentStatus::Stuck
+                        && (*recorded == cleared || *recorded == started)
+                })
+            };
+            if let Some(reason) = reason {
+                if interrupted {
                     self.org
                         .execute(
                             OrgCommand::Stuck {
@@ -908,7 +1010,9 @@ impl AgentRuntime {
                 }
             }
         }
-        if agent.status == AgentStatus::Clearing {
+        // The snapshot still shows an interrupted start as Starting: nothing
+        // below may pin, bind or capture for an agent just recorded Stuck.
+        if agent.status == AgentStatus::Clearing || interrupted {
             return Ok(());
         }
         let rows = self.rows().await?;
@@ -952,14 +1056,19 @@ impl AgentRuntime {
         let harness = harness(state, agent, &rows);
         let screen = agent_screen(harness);
         // Whether this pass can pin the harness by the adopt rule: nothing is
-        // recorded yet, the agent is Starting or Ready, and the inspection and
-        // the process read that followed it allow a baseline. The capture
-        // below is the rule's second look.
+        // recorded yet, the agent is Starting or Ready, the inspection and the
+        // process read that followed it allow a baseline, and the pane has a
+        // live row of the agent's harness (without one the pin must fail; the
+        // row's arrival starts its own pass). The capture below is the rule's
+        // second look.
         let pinnable = screen.zip(look.as_ref()).zip(processes.as_ref()).filter(
             |((_, (root, command)), processes)| {
                 stored == PaneBaseline::unproven()
                     && matches!(agent.status, AgentStatus::Ready | AgentStatus::Starting)
                     && adopt_baseline(processes, *root, command).is_some()
+                    && rows
+                        .iter()
+                        .any(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
             },
         );
         // A capture can change nothing for a Ready agent on an ordinary wake, or
@@ -1059,6 +1168,55 @@ impl AgentRuntime {
         }
         Ok(())
     }
+}
+
+/// Why every input to an agent's pane is refused while the agent keeps its
+/// recorded state: its harness is not known to be the pane's foreground
+/// program. `command` is the foreground command the inspection shows (with
+/// the root pid, or not at all), `shape` what the process read made of the
+/// pane, `stored` what was recorded about it before.
+#[must_use]
+pub(super) fn refusal_text(
+    pane: &str,
+    stored: &PaneBaseline,
+    command: Option<&str>,
+    shape: Option<PaneShape>,
+) -> String {
+    let why = match (command, shape) {
+        (None, _) => format!("tmux reports no root process or foreground command for {pane}"),
+        (_, None) => format!("the processes of {pane} could not be read"),
+        // Not reached from an observation: that records Down.
+        (_, Some(PaneShape::IdleShell)) => format!("no harness is running in {pane}"),
+        (_, Some(PaneShape::ShellHoldingChild)) => {
+            format!("the shell in {pane} has a child and atm cannot tell which is in front")
+        }
+        (Some(command), Some(_)) => {
+            match stored.harness_command().filter(|pinned| *pinned != command) {
+                Some(pinned) => format!("{command} is in front in {pane}, not {pinned}"),
+                None => format!(
+                    "the program in front in {pane} is not confirmed as the agent's harness"
+                ),
+            }
+        }
+    };
+    format!("input refused: {why}")
+}
+
+/// What `agent.list` says of an agent whose operation could not be settled.
+/// The reservation keeps the operation and its pane, not why its cleanup
+/// failed. The operation is named as its `agent.<kind>` method is; the
+/// observer's own reservation is an observation.
+#[must_use]
+pub(super) fn quarantine_text(quarantine: &Quarantine) -> String {
+    let kind = match quarantine.kind {
+        ReservationKind::Observe => "observation".into(),
+        kind => format!("{kind:?}").to_lowercase(),
+    };
+    let on = quarantine
+        .pane
+        .as_ref()
+        .map_or_else(String::new, |pane| format!(" on {pane}"));
+    format!("quarantined: the agent's {kind}{on} could not be settled; restart atmd and reconcile")
 }
 
 pub(super) fn matches_agent(agent: &Agent, row: &SessionView) -> bool {
@@ -1313,7 +1471,15 @@ impl AgentRoutes {
     /// A Ready agent's own session reporting in from its own pane has nothing to
     /// bind and is plainly alive: no observation. Its removal, a pane move, any
     /// other row, and agents in every other state (Stuck included) still wake.
-    fn own_ready_session(&self, ids: &mut BTreeSet<AgentId>, row: Option<&SessionView>) {
+    /// So does an agent whose last observation found its input refused: only
+    /// a pass that finds its harness in front again drops that reason, and a
+    /// resumed harness may send nothing but its own session's events.
+    fn own_ready_session(
+        &self,
+        rt: &AgentRuntime,
+        ids: &mut BTreeSet<AgentId>,
+        row: Option<&SessionView>,
+    ) {
         let Some(row) = row else {
             return;
         };
@@ -1322,6 +1488,10 @@ impl AgentRoutes {
                 route.ready
                     && route.binding.as_ref() == Some(&row.id)
                     && route.pane == row.tmux_pane
+                    && !route
+                        .pane
+                        .as_deref()
+                        .is_some_and(|pane| rt.refusal(id, pane).is_some())
             })
         });
     }
@@ -1349,7 +1519,7 @@ impl AgentRoutes {
         match event {
             Ok(SessionEvent::Updated { session }) => {
                 let mut ids = self.affected(&session.id, Some(&session));
-                self.own_ready_session(&mut ids, Some(&session));
+                self.own_ready_session(rt, &mut ids, Some(&session));
                 Ok(ids)
             }
             Ok(SessionEvent::Removed { session_id, .. }) => Ok(self.affected(&session_id, None)),
@@ -1363,7 +1533,7 @@ impl AgentRoutes {
                     .await
                     .map_err(|_| AgentError::Timeout)?;
                 let mut ids = self.affected(&session_id, row.as_ref());
-                self.own_ready_session(&mut ids, row.as_ref());
+                self.own_ready_session(rt, &mut ids, row.as_ref());
                 Ok(ids)
             }
             Err(_) => Ok(BTreeSet::new()),
@@ -1514,6 +1684,17 @@ async fn observer(
                             }
                             #[cfg(test)]
                             rt.progress("committed_scheduled", None);
+                        } else if event.kind == "agent.clear_requested" {
+                            // A clear types only after its own capture showed the harness
+                            // in front: a refusal reason still stored is out of date, and
+                            // no pass need follow the clear to drop it.
+                            if let Some((id, route)) = id.as_ref().and_then(|id| Some((id, routes.agents.get(id)?))) {
+                                if let Some(pane) = &route.pane {
+                                    rt.set_refusal(id, pane, None);
+                                }
+                            }
+                            #[cfg(test)]
+                            rt.progress("refusal_dropped", id);
                         } else if let Some(id) = id.filter(|_| event.kind == "agent.down") {
                             // The failure was about a pane the agent no longer has: it
                             // must not outlive the Down and hold the next `up`. A queued

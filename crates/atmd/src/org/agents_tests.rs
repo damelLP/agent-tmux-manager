@@ -373,9 +373,14 @@ mod reconciliation {
                     .unwrap(),
                 if capture { 3 } else { 0 }
             );
+            // The agent keeps Ready, and the list says why it takes no input:
+            // the frame's inspection names pi and the processes can't be read;
+            // the bare inspection names no foreground command at all.
             assert_eq!(
-                agents.list(ListParams::default()).await.unwrap()[0].reason,
-                None
+                agents.list(ListParams::default()).await.unwrap()[0]
+                    .reason
+                    .as_deref(),
+                Some(if capture { UNREADABLE } else { NO_COMMAND })
             );
         }
     }
@@ -1180,9 +1185,13 @@ mod reconciliation {
             rig.state("lead").await.session_id,
             Some(SessionId::new("fresh"))
         );
+        // The pass succeeded: the only reason left is that the scripted
+        // inspection names no foreground command.
         assert_eq!(
-            agents.list(ListParams::default()).await.unwrap()[0].reason,
-            None
+            agents.list(ListParams::default()).await.unwrap()[0]
+                .reason
+                .as_deref(),
+            Some(NO_COMMAND)
         );
     }
 
@@ -1422,9 +1431,13 @@ mod reconciliation {
         // The retry needs no registry event.
         rig.inspect_only("%1", "p/lead");
         progress(&mut events, "finished", Some("p/lead")).await;
+        // The pass succeeded: the only reason left is that the scripted
+        // inspection names no foreground command.
         assert_eq!(
-            agents.list(ListParams::default()).await.unwrap()[0].reason,
-            None
+            agents.list(ListParams::default()).await.unwrap()[0]
+                .reason
+                .as_deref(),
+            Some(NO_COMMAND)
         );
         let calls = rig.client.mock().calls().len();
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -1661,9 +1674,13 @@ mod reconciliation {
                 .unwrap(),
             0
         );
+        // The pass succeeded: the only reason left is that the scripted
+        // inspection names no foreground command.
         assert_eq!(
-            agents.list(ListParams::default()).await.unwrap()[0].reason,
-            None
+            agents.list(ListParams::default()).await.unwrap()[0]
+                .reason
+                .as_deref(),
+            Some(NO_COMMAND)
         );
     }
 
@@ -2324,12 +2341,16 @@ mod reconciliation {
         agents.reconciled().await.unwrap();
         release.send(()).unwrap();
         rig.org.snapshot().await.unwrap();
+        // The quarantined operation is the observation itself. The list
+        // names it, in place of the failed observation it used to show.
         let rows = agents.list(ListParams::default()).await.unwrap();
-        assert!(rows[0]
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("observation unavailable"));
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some(
+                "quarantined: the agent's observation on %1 could not be settled; \
+                 restart atmd and reconcile"
+            )
+        );
         agents
             .lifecycle(
                 request("p/healthy", None, ReservationKind::Down),
@@ -2702,12 +2723,14 @@ mod reconciliation {
         ));
     }
 
-    #[tokio::test]
-    async fn interrupted_start_without_binding_is_not_idle_revalidation() {
-        let rig = Rig::new().await;
+    const STILL_STARTING: &str = "was still starting when the daemon restarted; inspect %1";
+
+    /// `p/lead` with a role of `harness`, recorded on %1 and never bound:
+    /// what a daemon that stops during `agent.up` leaves behind.
+    async fn started(rig: &Rig, harness: &str) {
         rig.command(OrgCommand::Up {
             agent_id: "p/lead".parse().unwrap(),
-            role: atm_org::parse_role("lead", "+++\nharness='pi'\n+++\n").unwrap(),
+            role: atm_org::parse_role("lead", &format!("+++\nharness='{harness}'\n+++\n")).unwrap(),
         })
         .await;
         rig.command(OrgCommand::PaneCreated {
@@ -2715,12 +2738,297 @@ mod reconciliation {
             pane: "%1".into(),
         })
         .await;
+    }
+    /// The bodies of the notes sent so far.
+    async fn notes(rig: &Rig) -> Vec<String> {
+        let state = rig.org.snapshot().await.unwrap();
+        state
+            .messages()
+            .filter(|message| message.content.kind == atm_org::MessageKind::Note)
+            .map(|message| message.content.body.clone())
+            .collect()
+    }
+    /// Keys and pastes the mock was asked to send.
+    fn inputs(rig: &Rig) -> usize {
+        rig.client
+            .mock()
+            .calls()
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    atm_tmux::mock::MockCall::SendKeys { .. }
+                        | atm_tmux::mock::MockCall::PasteText { .. }
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn interrupted_start_without_binding_is_stuck() {
+        // The harness came up and shows its editor, with only its discovery
+        // row: the start that would have made the agent Ready is gone with
+        // its daemon, and a screen alone never makes a session-less Starting
+        // agent Ready. Stuck, its owner told; the screen is not read.
+        let rig = Rig::new().await;
+        started(&rig, "pi").await;
         rig.row("pending-100", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let scripted = unread(&rig);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let lead = rig.state("lead").await;
+        assert_eq!(lead.status, AgentStatus::Stuck);
+        assert_eq!(lead.reason.as_deref(), Some(STILL_STARTING));
+        assert!(lead.session_id.is_none());
+        assert_eq!(
+            notes(&rig).await,
+            [format!("agent p/lead: {STILL_STARTING}")]
+        );
+        assert_eq!(unread(&rig), scripted - 2, "only the inspection was read");
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+    }
+
+    #[tokio::test]
+    async fn interrupted_start_is_stuck_with_one_note() {
+        // The other panes such an agent can be found on. Each time: Stuck
+        // with the reason, one note to the owner, the list shows the reason,
+        // nothing is typed, and no capture is read.
+        const TRUST: &str = include_str!(
+            "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-default-120x40_2.1.325.txt"
+        );
+        enum Pane {
+            /// A scripted frame with `command` in front.
+            Frame(&'static str, &'static str),
+            /// An inspection only: a capture would fail.
+            Unreadable,
+        }
+        for (case, harness, processes, row, pane) in [
+            (
+                "an idle shell, the launch never ran",
+                "pi",
+                idle_shell("zsh"),
+                None,
+                Pane::Frame("$ \n", "zsh"),
+            ),
+            (
+                "a start dialog nobody answers",
+                "claude",
+                job(),
+                Some(Harness::ClaudeCode),
+                Pane::Frame(TRUST, "claude"),
+            ),
+            (
+                "a pane that cannot be captured",
+                "pi",
+                job(),
+                None,
+                Pane::Unreadable,
+            ),
+        ] {
+            let rig = Rig::new().await;
+            started(&rig, harness).await;
+            if let Some(harness) = row {
+                rig.row_of("pending-100", "%1", false, harness).await;
+            }
+            *rig.proc.lock().unwrap() = Some(processes);
+            match pane {
+                Pane::Frame(text, command) => rig.frame_of("%1", "p/lead", text, command),
+                Pane::Unreadable => inspect_with(&rig, "pi"),
+            }
+            let scripted = unread(&rig);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let lead = rig.state("lead").await;
+            assert_eq!(lead.status, AgentStatus::Stuck, "{case}");
+            assert_eq!(lead.reason.as_deref(), Some(STILL_STARTING), "{case}");
+            assert_eq!(
+                notes(&rig).await,
+                [format!("agent p/lead: {STILL_STARTING}")],
+                "{case}"
+            );
+            assert_eq!(
+                listed_reason(&agents).await.as_deref(),
+                Some(STILL_STARTING),
+                "{case}"
+            );
+            assert_eq!(inputs(&rig), 0, "{case}");
+            assert_eq!(
+                unread(&rig),
+                scripted - 2,
+                "{case}: only the inspection was read"
+            );
+        }
+
+        // A pane that is gone or dead is not the agent's any more: Down, as
+        // for every other agent, and no note.
+        let rig = Rig::new().await;
+        started(&rig, "pi").await;
+        rig.client
+            .script_inspect(
+                &PaneId::parse("%1").unwrap(),
+                Some(&Rig::inspection("%1", "p/lead", true)),
+            )
+            .unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let lead = rig.state("lead").await;
+        assert_eq!(lead.status, AgentStatus::Down);
+        assert_eq!(
+            lead.reason.as_deref(),
+            Some("recorded pane is absent, dead or no longer owned")
+        );
+        assert_eq!(notes(&rig).await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn interrupted_start_note_repairs_partial_prefix_without_duplicates() {
+        // The daemon stops again between the Stuck and its note: the next
+        // restart check sends the note, and the one after it sends no second.
+        for partial in [false, true] {
+            let rig = Rig::new().await;
+            started(&rig, "pi").await;
+            if partial {
+                rig.command(OrgCommand::Stuck {
+                    agent_id: "p/lead".parse().unwrap(),
+                    reason: STILL_STARTING.into(),
+                })
+                .await;
+            }
+            for _ in 0..2 {
+                inspect_with(&rig, "pi");
+                let cancel = rig.cancel.child_token();
+                let (agents, task) = spawn_agents_with(
+                    rig.org.clone(),
+                    rig.registry.clone(),
+                    rig.control.clone(),
+                    cancel.clone(),
+                    rig.reader(),
+                    std::sync::Arc::new(|_| None),
+                );
+                agents.reconciled().await.unwrap();
+                assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+                assert_eq!(
+                    notes(&rig).await,
+                    [format!("agent p/lead: {STILL_STARTING}")],
+                    "{partial}"
+                );
+                cancel.cancel();
+                task.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn second_interrupted_start_sends_its_own_note() {
+        let rig = Rig::new().await;
+        for round in 1..=2 {
+            started(&rig, "pi").await;
+            // Two restarts per incident: the second must not repeat the note.
+            for _ in 0..2 {
+                inspect_with(&rig, "pi");
+                let cancel = rig.cancel.child_token();
+                let (agents, task) = spawn_agents_with(
+                    rig.org.clone(),
+                    rig.registry.clone(),
+                    rig.control.clone(),
+                    cancel.clone(),
+                    rig.reader(),
+                    std::sync::Arc::new(|_| None),
+                );
+                agents.reconciled().await.unwrap();
+                assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+                assert_eq!(notes(&rig).await.len(), round);
+                cancel.cancel();
+                task.await.unwrap();
+            }
+            // The owner takes it down; the next round starts it again.
+            rig.command(OrgCommand::Down {
+                agent_id: "p/lead".parse().unwrap(),
+                reason: "taken down".into(),
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_interrupted_start_note_retries_on_next_wake() {
+        let rig = Rig::gated_with_failure(None, Some("msg.sent")).await;
+        started(&rig, "pi").await;
+        rig.row("pending-100", "%1", false).await;
+        inspect_with(&rig, "pi");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+        assert_eq!(notes(&rig).await, Vec::<String>::new());
+        assert!(listed_reason(&agents)
+            .await
+            .unwrap()
+            .starts_with(&format!("{STILL_STARTING}; observation unavailable: ")));
+        let mut events = agents.observation_events();
+        // The first recovery is the observer's own retry (paused clock); the
+        // second pass is an ordinary wake and must not repeat the note.
+        for wake in [false, true] {
+            inspect_with(&rig, "pi");
+            if wake {
+                update(&rig, "pending-100").await;
+            }
+            progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(
+                notes(&rig).await,
+                [format!("agent p/lead: {STILL_STARTING}")]
+            );
+            assert_eq!(
+                listed_reason(&agents).await.as_deref(),
+                Some(STILL_STARTING)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_starting_is_not_a_restart_failure() {
+        // An agent that is Starting without a session while its daemon runs
+        // has a flow driving it (or is an adopt waiting for its session): an
+        // observation of it is not the restart check, and changes nothing.
+        let rig = Rig::new().await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        rig.row("pending-100", "%1", false).await;
+        let mut events = agents.observation_events();
+        rig.frame("%1", "p/lead", IDLE);
+        rig.command(OrgCommand::Adopt {
+            agent_id: "p/lead".parse().unwrap(),
+            pane: "%1".into(),
+            session_id: None,
+        })
+        .await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        let lead = rig.state("lead").await;
+        assert_eq!((lead.status, lead.reason), (AgentStatus::Starting, None));
+        assert_eq!(notes(&rig).await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn starting_with_a_session_at_restart_is_not_stuck() {
+        // A Ready agent the last restart check suspended is Starting with
+        // its session: not an interrupted start. With its harness in front
+        // and its row there it is pinned and Ready again, and nobody is told.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.command(OrgCommand::Revalidate {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        rig.row("s1", "%1", false).await;
         rig.frame("%1", "p/lead", IDLE);
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
-        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
-        assert!(rig.state("lead").await.session_id.is_none());
+        assert_eq!(unread(&rig), 0);
+        let lead = rig.state("lead").await;
+        assert_eq!((lead.status, lead.reason), (AgentStatus::Ready, None));
+        assert_eq!(notes(&rig).await, Vec::<String>::new());
+        assert_eq!(listed_reason(&agents).await, None);
     }
 
     #[tokio::test]
@@ -3140,6 +3448,14 @@ mod reconciliation {
             ..idle_shell(name)
         }
     }
+    /// A shell with job control running one job in the foreground: the rig's
+    /// default answer.
+    fn job() -> ProcFacts {
+        ProcFacts {
+            foreground_group: 150,
+            ..shell_with_child("zsh")
+        }
+    }
     fn pinned_to(command: &str) -> PaneBaseline {
         PaneBaseline::adopted(100)
             .with_harness(command.into())
@@ -3371,27 +3687,24 @@ mod reconciliation {
             );
         }
         // The twin: an agent that was never Ready or bound. An idle shell
-        // under it is a start that has not happened, not an exit: it keeps
-        // Starting, and the stale frame makes nothing Ready.
+        // under it is a start that has not happened, not an exit, so it is
+        // not Down: it is a start its daemon interrupted, Stuck with a note,
+        // and the stale frame is not read.
         let rig = Rig::new().await;
-        rig.command(OrgCommand::Up {
-            agent_id: "p/lead".parse().unwrap(),
-            role: atm_org::parse_role("lead", "+++\nharness='pi'\n+++\n").unwrap(),
-        })
-        .await;
-        rig.command(OrgCommand::PaneCreated {
-            agent_id: "p/lead".parse().unwrap(),
-            pane: "%1".into(),
-        })
-        .await;
+        started(&rig, "pi").await;
         *rig.proc.lock().unwrap() = Some(idle_shell("zsh"));
         rig.frame_of("%1", "p/lead", IDLE, "zsh");
-        let before = rig.org.status().unwrap();
+        let scripted = unread(&rig);
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
-        assert_eq!(unread(&rig), 0);
-        assert_eq!(rig.org.status().unwrap(), before);
-        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        assert_eq!(unread(&rig), scripted - 2);
+        let lead = rig.state("lead").await;
+        assert_eq!(lead.status, AgentStatus::Stuck);
+        assert_eq!(lead.reason.as_deref(), Some(STILL_STARTING));
+        assert_eq!(
+            notes(&rig).await,
+            [format!("agent p/lead: {STILL_STARTING}")]
+        );
     }
 
     #[tokio::test]
@@ -3555,6 +3868,657 @@ mod reconciliation {
                 Some(SessionId::new("s1"))
             )
         );
+    }
+
+    // --- An agent that keeps its state while every input to it is refused
+    // says why in `agent.list` ---
+
+    const SHELL_HOLDS_CHILD: &str =
+        "input refused: the shell in %1 has a child and atm cannot tell which is in front";
+    const NOT_CONFIRMED: &str =
+        "input refused: the program in front in %1 is not confirmed as the agent's harness";
+    const NO_COMMAND: &str =
+        "input refused: tmux reports no root process or foreground command for %1";
+    const UNREADABLE: &str = "input refused: the processes of %1 could not be read";
+
+    /// The reason `agent.list` shows for the only agent.
+    async fn listed_reason(agents: &AgentHandle) -> Option<String> {
+        agents.list(ListParams::default()).await.unwrap()[0]
+            .reason
+            .clone()
+    }
+    /// `pinned_ready`, then its harness is suspended (the shell is in front
+    /// and holds it) and another row on the pane wakes a pass that sees it.
+    async fn refused_ready() -> (
+        Rig,
+        AgentHandle,
+        broadcast::Receiver<crate::org::agents::ObservationProgress>,
+    ) {
+        let (rig, agents) = pinned_ready().await;
+        let mut events = agents.observation_events();
+        *rig.proc.lock().unwrap() = Some(shell_with_child("zsh"));
+        inspect_with(&rig, "zsh");
+        rig.row("pending-300", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
+        (rig, agents, events)
+    }
+
+    #[test]
+    fn refusal_text_table() {
+        use super::super::agent_flow::PaneShape::{
+            IdleShell, JobInFront, RootProgram, ShellHoldingChild,
+        };
+        let (unproven, adopted, pi) = (
+            PaneBaseline::unproven(),
+            PaneBaseline::adopted(100),
+            pinned_to("pi"),
+        );
+        // Rows are tried top to bottom: what the inspection shows, what the
+        // process read made of the pane, then what was recorded before.
+        for (pane, stored, command, shape, text) in [
+            ("%1", &pi, None, Some(JobInFront), NO_COMMAND),
+            ("%1", &unproven, None, None, NO_COMMAND),
+            ("%1", &pi, Some("pi"), None, UNREADABLE),
+            ("%1", &unproven, Some("zsh"), None, UNREADABLE),
+            (
+                "%1",
+                &pi,
+                Some("zsh"),
+                Some(IdleShell),
+                "input refused: no harness is running in %1",
+            ),
+            (
+                "%1",
+                &pi,
+                Some("zsh"),
+                Some(ShellHoldingChild),
+                SHELL_HOLDS_CHILD,
+            ),
+            (
+                "%1",
+                &unproven,
+                Some("sh"),
+                Some(ShellHoldingChild),
+                SHELL_HOLDS_CHILD,
+            ),
+            (
+                "%1",
+                &pi,
+                Some("vim"),
+                Some(JobInFront),
+                "input refused: vim is in front in %1, not pi",
+            ),
+            (
+                "%7",
+                &pi,
+                Some("less"),
+                Some(RootProgram),
+                "input refused: less is in front in %7, not pi",
+            ),
+            ("%1", &unproven, Some("pi"), Some(JobInFront), NOT_CONFIRMED),
+            (
+                "%1",
+                &unproven,
+                Some("pi"),
+                Some(RootProgram),
+                NOT_CONFIRMED,
+            ),
+            // A baseline with no harness pinned, and the pinned name in front
+            // of a root process that is not the recorded one.
+            ("%1", &adopted, Some("pi"), Some(JobInFront), NOT_CONFIRMED),
+            ("%1", &pi, Some("pi"), Some(JobInFront), NOT_CONFIRMED),
+            (
+                "%7",
+                &unproven,
+                Some("pi"),
+                Some(JobInFront),
+                "input refused: the program in front in %7 is not confirmed as the agent's harness",
+            ),
+        ] {
+            assert_eq!(
+                refusal_text(pane, stored, command, shape),
+                text,
+                "{pane} {stored:?} {command:?} {shape:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_that_pins_nothing_shows_why() {
+        // After a daemon restart nothing is recorded about a pane, and a pane
+        // that pins nothing refuses every input. Its agent keeps its recorded
+        // state (a bound one is suspended, as before) and `agent.list` says
+        // why, read right after the restart check with no wake in between.
+        // The pass that pins the harness drops the reason.
+        enum Script {
+            Frame(&'static str),
+            NoCommand,
+        }
+        let cases = [
+            (
+                "a shell holding a child",
+                Some(shell_with_child("sh")),
+                Script::Frame("sh"),
+                true,
+                SHELL_HOLDS_CHILD,
+            ),
+            (
+                "unreadable processes",
+                None,
+                Script::Frame("pi"),
+                true,
+                UNREADABLE,
+            ),
+            (
+                "no foreground command",
+                Some(idle_shell("zsh")),
+                Script::NoCommand,
+                true,
+                NO_COMMAND,
+            ),
+            (
+                "a job in front and no row of the harness",
+                Some(job()),
+                Script::Frame("pi"),
+                false,
+                NOT_CONFIRMED,
+            ),
+        ];
+        for (case, processes, script, row, text) in cases {
+            for bound in [true, false] {
+                let rig = Rig::new().await;
+                rig.agent("lead", Some("%1"), bound.then_some("s1")).await;
+                let id = if bound { "s1" } else { "pending-100" };
+                if row {
+                    rig.row(id, "%1", false).await;
+                }
+                *rig.proc.lock().unwrap() = processes.clone();
+                // A bound agent's restart check reads its screen; one without
+                // a session only inspects when nothing can be pinned.
+                match (&script, bound) {
+                    (Script::Frame(command), true) => rig.frame_of("%1", "p/lead", IDLE, command),
+                    (Script::Frame(command), false) => inspect_with(&rig, command),
+                    (Script::NoCommand, true) => {
+                        rig.inspect_only("%1", "p/lead");
+                        rig.client
+                            .script_capture(&PaneCapture::new(
+                                IDLE.into(),
+                                Rig::inspection("%1", "p/lead", false),
+                                CaptureFormat::Ansi,
+                            ))
+                            .unwrap();
+                    }
+                    (Script::NoCommand, false) => rig.inspect_only("%1", "p/lead"),
+                }
+                let (agents, _) = rig.start();
+                agents.reconciled().await.unwrap();
+                assert_eq!(unread(&rig), 0, "{case} {bound}");
+                assert_eq!(
+                    listed_reason(&agents).await.as_deref(),
+                    Some(text),
+                    "{case} {bound}"
+                );
+                let lead = rig.state("lead").await;
+                let status = if bound {
+                    AgentStatus::Starting
+                } else {
+                    AgentStatus::Ready
+                };
+                assert_eq!((lead.status, lead.reason), (status, None), "{case} {bound}");
+                assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+
+                // The harness is in front with its row: the pass pins it.
+                let mut events = agents.observation_events();
+                *rig.proc.lock().unwrap() = Some(job());
+                rig.frame("%1", "p/lead", IDLE);
+                if row {
+                    update(&rig, id).await;
+                } else {
+                    rig.row(id, "%1", false).await;
+                }
+                progress(&mut events, "finished", Some("p/lead")).await;
+                assert_eq!(unread(&rig), 0, "{case} {bound}");
+                assert_eq!(told(&agents).await.2, pinned_to("pi"), "{case} {bound}");
+                assert_eq!(listed_reason(&agents).await, None, "{case} {bound}");
+                assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_harness_shows_its_refusal_until_it_is_back() {
+        // Ctrl-Z in the pane of a Ready agent: nothing is recorded, the agent
+        // stays Ready, and the list says why it takes no input. Once a pass
+        // finds the harness in front again the reason is gone. The resumed
+        // harness sends only its own session's events, which start no pass
+        // for a Ready agent: while a refusal is stored, they do. (Without
+        // one they don't: review_ready_agents_own_session_events_start_no_observation.)
+        let (rig, agents) = pinned_ready().await;
+        let before = rig.org.status().unwrap();
+        assert_eq!(listed_reason(&agents).await, None);
+        let mut events = agents.observation_events();
+        *rig.proc.lock().unwrap() = Some(shell_with_child("zsh"));
+        inspect_with(&rig, "zsh");
+        rig.row("pending-300", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+
+        inspect_with(&rig, "pi");
+        update(&rig, "s1").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(listed_reason(&agents).await, None);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn another_program_in_front_is_named() {
+        // The harness is pinned and the pane now runs something else in
+        // front (its owner quit the harness and opened an editor): the list
+        // names both. Nothing is recorded and no capture is read.
+        let (rig, agents) = pinned_ready().await;
+        let before = rig.org.status().unwrap();
+        let mut events = agents.observation_events();
+        inspect_with(&rig, "vim");
+        rig.row("pending-300", "%1", false).await;
+        assert_eq!(captures_of_pass(&mut events).await, 0);
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some("input refused: vim is in front in %1, not pi")
+        );
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert_eq!(told(&agents).await.2, pinned_to("pi"));
+    }
+
+    #[tokio::test]
+    async fn recorded_stuck_or_down_hides_the_refusal() {
+        // A refusal is the reason of an agent that has no recorded one. Once
+        // the agent is recorded Stuck its own reason is shown, at once and
+        // with no pass; the next pass over it drops the stored refusal.
+        let lead: AgentId = "p/lead".parse().unwrap();
+        let (rig, agents, mut events) = refused_ready().await;
+        rig.command(OrgCommand::Stuck {
+            agent_id: lead.clone(),
+            reason: "manual recovery".into(),
+        })
+        .await;
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some("manual recovery")
+        );
+        assert_eq!(
+            agents.refusal_of(&lead, "%1").as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
+        // A Stuck agent's pass reads the screen for its session's row; with
+        // the shell in front it reads Unknown and the agent stays Stuck.
+        rig.frame_of("%1", "p/lead", IDLE, "zsh");
+        update(&rig, "pending-300").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(agents.refusal_of(&lead, "%1"), None);
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some("manual recovery")
+        );
+
+        // The shell is found idle: Down, with Down's reason, and nothing kept.
+        let (rig, agents, mut events) = refused_ready().await;
+        *rig.proc.lock().unwrap() = Some(idle_shell("zsh"));
+        inspect_with(&rig, "zsh");
+        update(&rig, "pending-300").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Down);
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some("the harness exited to the shell in %1")
+        );
+        assert_eq!(agents.refusal_of(&lead, "%1"), None);
+    }
+
+    #[tokio::test]
+    async fn refusal_belongs_to_the_pane_it_was_read_on() {
+        let lead: AgentId = "p/lead".parse().unwrap();
+        let (_rig, agents, _) = refused_ready().await;
+        assert_eq!(
+            agents.refusal_of(&lead, "%1").as_deref(),
+            Some(SHELL_HOLDS_CHILD)
+        );
+        assert_eq!(agents.refusal_of(&lead, "%2"), None);
+    }
+
+    #[tokio::test]
+    async fn recording_a_baseline_drops_the_refusal() {
+        // What an adopt or a start does when it has placed the harness: the
+        // reason read before it is gone with no pass.
+        let (_rig, agents, _) = refused_ready().await;
+        Rig::pinned(&agents, "lead", "%1", "pi");
+        assert_eq!(listed_reason(&agents).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_clear_drops_the_refusal() {
+        // A clear types only after its own capture showed the harness in
+        // front, so a refusal stored before it is out of date. No pass need
+        // follow a clear (a harness that announces no new session wakes
+        // nobody): the recorded clear itself drops the reason.
+        let lead: AgentId = "p/lead".parse().unwrap();
+        let (rig, agents, mut events) = refused_ready().await;
+        rig.command(OrgCommand::Clear {
+            agent_id: lead.clone(),
+        })
+        .await;
+        assert_eq!(listed_reason(&agents).await, None);
+        progress(&mut events, "refusal_dropped", Some("p/lead")).await;
+        rig.command(OrgCommand::SessionBound {
+            agent_id: lead.clone(),
+            session_id: SessionId::new("s2"),
+        })
+        .await;
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert_eq!(agents.refusal_of(&lead, "%1"), None);
+        assert_eq!(listed_reason(&agents).await, None);
+    }
+
+    #[tokio::test]
+    async fn refusal_and_failed_observation_are_both_shown() {
+        // The refusal is what the last completed pass found; a pass that
+        // fails after it adds its error, as it does to a recorded reason.
+        let (rig, agents, mut events) = refused_ready().await;
+        // Nothing scripted: the next pass cannot inspect the pane.
+        update(&rig, "pending-300").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let reason = listed_reason(&agents).await.unwrap();
+        assert!(
+            reason.starts_with(&format!("{SHELL_HOLDS_CHILD}; observation unavailable: ")),
+            "{reason}"
+        );
+    }
+
+    // --- A quarantined agent says so in `agent.list` ---
+
+    const QUARANTINED_DOWN: &str =
+        "quarantined: the agent's down on %1 could not be settled; restart atmd and reconcile";
+
+    /// A down of `p/lead` on %1 that does nothing, and whose cleanup fails
+    /// (the control service then quarantines the agent and the pane) or not.
+    async fn down_whose_cleanup(agents: &AgentHandle, fails: bool) {
+        let result = agents
+            .lifecycle(
+                request(
+                    "p/lead",
+                    Some("%1"),
+                    crate::control::reservation::ReservationKind::Down,
+                ),
+                |_| async { Ok(()) },
+                move |_, _| async move {
+                    if fails {
+                        Err(AgentError::Internal("the down is not recorded".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        assert_eq!(result.is_err(), fails);
+    }
+
+    #[test]
+    fn quarantine_text_names_the_operation_and_its_pane() {
+        use crate::control::reservation::{Quarantine, ReservationKind};
+        let quarantine = |pane: Option<&str>, kind| Quarantine {
+            agent: "p/lead".parse().unwrap(),
+            pane: pane.map(|pane| PaneId::parse(pane).unwrap()),
+            kind,
+        };
+        assert_eq!(
+            quarantine_text(&quarantine(Some("%1"), ReservationKind::Down)),
+            QUARANTINED_DOWN
+        );
+        assert_eq!(
+            quarantine_text(&quarantine(Some("%12"), ReservationKind::Respawn)),
+            "quarantined: the agent's respawn on %12 could not be settled; restart atmd and reconcile"
+        );
+        assert_eq!(
+            quarantine_text(&quarantine(None, ReservationKind::Up)),
+            "quarantined: the agent's up could not be settled; restart atmd and reconcile"
+        );
+        // The other kinds are named as their `agent.<kind>` methods are; the
+        // observer's own reservation is an observation.
+        for (kind, name) in [
+            (ReservationKind::Adopt, "adopt"),
+            (ReservationKind::Clear, "clear"),
+            (ReservationKind::Observe, "observation"),
+        ] {
+            assert_eq!(
+                quarantine_text(&quarantine(Some("%1"), kind)),
+                format!(
+                    "quarantined: the agent's {name} on %1 could not be settled; \
+                     restart atmd and reconcile"
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quarantined_agent_shows_it_in_the_list_without_a_pass() {
+        // A down whose kill has an unknown outcome, or whose Down could not
+        // be written, leaves the agent Ready on a pane that may be gone, and
+        // every later call refused. The list says so at once: it reads the
+        // control service's quarantines, and waits for no observation. Only
+        // the quarantined agent's entry says it.
+        const NO_PANE: &str = "recorded pane is absent, dead or no longer owned";
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        // A second agent, never given a pane: Down at the restart check.
+        rig.agent("other", None, None).await;
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let reasons = || async {
+            let list = agents.list(ListParams::default()).await.unwrap();
+            assert_eq!(list[0].agent_id.to_string(), "p/lead");
+            assert_eq!(list[1].agent_id.to_string(), "p/other");
+            (list[0].reason.clone(), list[1].reason.clone())
+        };
+        let mut events = agents.observation_events();
+        let before = rig.org.status().unwrap();
+        // The twin: an operation that settles leaves nothing to show.
+        down_whose_cleanup(&agents, false).await;
+        assert_eq!(reasons().await, (None, Some(NO_PANE.into())));
+        down_whose_cleanup(&agents, true).await;
+        assert_eq!(
+            reasons().await,
+            (Some(QUARANTINED_DOWN.into()), Some(NO_PANE.into()))
+        );
+        assert_eq!(drain_started(&mut events), 0);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn quarantine_wins_over_a_refusal_and_a_failed_observation() {
+        // The refusal was read on a pane that may no longer exist, and a pass
+        // over a quarantined agent fails on the quarantine itself: the list
+        // shows the quarantine alone, once.
+        let (rig, agents, mut events) = refused_ready().await;
+        down_whose_cleanup(&agents, true).await;
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(QUARANTINED_DOWN)
+        );
+        update(&rig, "pending-300").await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            listed_reason(&agents).await.as_deref(),
+            Some(QUARANTINED_DOWN)
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_follows_a_recorded_reason() {
+        let (rig, agents) = pinned_ready().await;
+        rig.command(OrgCommand::Stuck {
+            agent_id: "p/lead".parse().unwrap(),
+            reason: "manual recovery".into(),
+        })
+        .await;
+        down_whose_cleanup(&agents, true).await;
+        assert_eq!(
+            listed_reason(&agents).await,
+            Some(format!("manual recovery; {QUARANTINED_DOWN}"))
+        );
+    }
+
+    // --- A capture is read only when it can pin the harness ---
+
+    /// The rig's process reader, counting its reads.
+    fn counting(
+        rig: &Rig,
+    ) -> (
+        super::super::agent_proc::ProcReader,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counter, inner) = (reads.clone(), rig.reader());
+        let reader: super::super::agent_proc::ProcReader = std::sync::Arc::new(move |pid| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inner(pid)
+        });
+        (reader, reads)
+    }
+    /// The captures `p/lead`'s next observation takes, counted until it ends.
+    async fn captures_of_pass(
+        events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+    ) -> usize {
+        let mut captures = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.agent.as_ref().map(ToString::to_string).as_deref() != Some("p/lead") {
+                    continue;
+                }
+                match event.phase {
+                    "capture" => captures += 1,
+                    "finished" => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        captures
+    }
+    /// `p/lead`, Ready and bound to `s1` on %1, with nothing recorded about
+    /// its pane and no row of its harness there: the restart pass found no
+    /// row and suspended it, and it was made Ready again without a pin.
+    async fn ready_unproven() -> (
+        Rig,
+        AgentHandle,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (reader, reads) = counting(&rig);
+        let (agents, _) = spawn_agents_with(
+            rig.org.clone(),
+            rig.registry.clone(),
+            rig.control.clone(),
+            rig.cancel.child_token(),
+            reader,
+            std::sync::Arc::new(|_| None),
+        );
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        rig.command(OrgCommand::EditorReady {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+        reads.store(0, std::sync::atomic::Ordering::SeqCst);
+        (rig, agents, reads)
+    }
+
+    #[tokio::test]
+    async fn ready_agent_without_a_live_row_is_not_captured() {
+        // A Ready agent with nothing recorded about its pane and no row of
+        // its harness there cannot be pinned: the adopt rule needs such a row.
+        // Each wake reads the pane's processes (an exit to the shell must be
+        // seen) and takes no capture. Here its session reports from another
+        // pane, which wakes it every time.
+        let (rig, agents, reads) = ready_unproven().await;
+        let mut events = agents.observation_events();
+        let before = rig.org.status().unwrap();
+        for wake in 0..5 {
+            inspect_with(&rig, "pi");
+            if wake == 0 {
+                rig.row("s1", "%2", false).await;
+            } else {
+                update(&rig, "s1").await;
+            }
+            assert_eq!(captures_of_pass(&mut events).await, 0, "wake {wake}");
+            assert_eq!(unread(&rig), 0, "wake {wake}");
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+
+        // The restart check of a Ready agent without a session, a job in
+        // front and no row: of the scripted frame only the inspection (two
+        // reads) is used, and its capture is left unread.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let before = rig.org.status().unwrap();
+        let scripted = unread(&rig);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), scripted - 2);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn ready_agent_with_a_live_row_is_captured_once_and_pinned() {
+        // The twin: a row of its harness arrives on the pane. That pass reads
+        // the processes, takes the one capture the adopt rule needs, and pins.
+        // From then on the harness is known to be in front: no process read
+        // and no capture.
+        let (rig, agents, reads) = ready_unproven().await;
+        let mut events = agents.observation_events();
+        let before = rig.org.status().unwrap();
+        rig.frame("%1", "p/lead", IDLE);
+        rig.row("pending-100", "%1", false).await;
+        assert_eq!(captures_of_pass(&mut events).await, 1);
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(told(&agents).await.2, pinned_to("pi"));
+        for wake in 0..3 {
+            inspect_with(&rig, "pi");
+            update(&rig, "pending-100").await;
+            assert_eq!(captures_of_pass(&mut events).await, 0, "wake {wake}");
+            assert_eq!(unread(&rig), 0, "wake {wake}");
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
     }
 
     mod lifecycle {

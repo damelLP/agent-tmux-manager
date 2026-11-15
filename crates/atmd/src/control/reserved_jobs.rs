@@ -181,6 +181,10 @@ pub(in crate::control) enum Command {
         deadline: Instant,
         reply: oneshot::Sender<Result<Fence, ReservationError>>,
     },
+    /// Read the quarantined operations; changes nothing.
+    Quarantines {
+        reply: oneshot::Sender<Result<Vec<super::Quarantine>, ReservationError>>,
+    },
 }
 
 impl Command {
@@ -201,6 +205,9 @@ impl Command {
                 let _ = reply.send(Err(error));
             }
             Self::Cleanup { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Quarantines { reply } => {
                 let _ = reply.send(Err(error));
             }
         }
@@ -356,6 +363,9 @@ impl Jobs {
                     }
                 }
                 let _ = reply.send(result);
+            }
+            Command::Quarantines { reply } => {
+                let _ = reply.send(Ok(self.state.quarantines()));
             }
             Command::Drain { fence, reply } => {
                 let result = self.state.check(&fence, None, now).map(|()| {

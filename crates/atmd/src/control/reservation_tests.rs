@@ -579,6 +579,79 @@ async fn reservation_deadline_stops_work_before_cleanup_and_keeps_ownership() {
     task.await.unwrap();
 }
 
+#[tokio::test]
+async fn quarantines_are_read_without_reserving_and_while_work_is_stopped() {
+    let (control, cancel, task, _) = actor();
+    let deadline = || Instant::now() + Duration::from_secs(30);
+    let ok = |_| async { Ok::<_, ReservationError>(()) };
+    assert_eq!(control.quarantines(deadline()).await.unwrap(), Vec::new());
+    // One operation whose cleanup fails, one whose cleanup succeeds.
+    let failed = control
+        .run_reserved(
+            request("p/a", Some("%1"), ReservationKind::Down),
+            ok,
+            |_, _| async {
+                Err(ReservationError::InvalidRequest {
+                    reason: "cleanup failed".into(),
+                })
+            },
+        )
+        .await;
+    assert!(matches!(
+        failed,
+        Err(ReservationError::InvalidRequest { .. })
+    ));
+    control
+        .run_reserved(
+            request("p/b", Some("%2"), ReservationKind::Observe),
+            ok,
+            noop,
+        )
+        .await
+        .unwrap();
+    let expected = vec![Quarantine {
+        agent: "p/a".parse().unwrap(),
+        pane: Some(PaneId::parse("%1").unwrap()),
+        kind: ReservationKind::Down,
+    }];
+    assert_eq!(control.quarantines(deadline()).await.unwrap(), expected);
+    // The read reserved nothing: the other agent is admitted again, and the
+    // quarantined one is refused as before.
+    control
+        .run_reserved(
+            request("p/b", Some("%2"), ReservationKind::Observe),
+            ok,
+            noop,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        control
+            .run_reserved(
+                request("p/a", Some("%1"), ReservationKind::Observe),
+                ok,
+                noop
+            )
+            .await,
+        Err(ReservationError::Quarantined { .. })
+    ));
+    // Daemon shutdown refuses new reservations; the read is still answered.
+    control.stop_reserved_work();
+    assert!(matches!(
+        control
+            .run_reserved(
+                request("p/b", Some("%2"), ReservationKind::Observe),
+                ok,
+                noop
+            )
+            .await,
+        Err(ReservationError::Unavailable)
+    ));
+    assert_eq!(control.quarantines(deadline()).await.unwrap(), expected);
+    cancel.cancel();
+    task.await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn reservation_cleanup_failure_and_timeout_quarantine_waiters() {
     for timeout in [false, true] {

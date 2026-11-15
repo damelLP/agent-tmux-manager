@@ -187,6 +187,17 @@ pub enum ReservationKind {
     Observe,
 }
 
+/// An operation whose cleanup failed, as the reservation state still holds
+/// it: its agent and panes take no mutation until the daemon restarts. Why
+/// the cleanup failed is not kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quarantine {
+    pub agent: AgentId,
+    /// The pane the operation reserved, or else the one it created.
+    pub pane: Option<PaneId>,
+    pub kind: ReservationKind,
+}
+
 /// Wait outside the tmux actor until available, or return Busy without effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitPolicy {
@@ -460,6 +471,17 @@ impl ControlHandle {
             reply,
         })
         .await
+    }
+
+    /// The operations whose cleanup failed, in the order they were admitted.
+    /// A read through the sole actor: it reserves nothing and changes
+    /// nothing, and is answered while reserved work is being stopped too.
+    pub async fn quarantines(
+        &self,
+        deadline: Instant,
+    ) -> Result<Vec<Quarantine>, ReservationError> {
+        self.reservation_request(deadline, |reply| jobs::Command::Quarantines { reply })
+            .await
     }
 
     /// Run one daemon-owned job with exclusive agent/pane ownership.

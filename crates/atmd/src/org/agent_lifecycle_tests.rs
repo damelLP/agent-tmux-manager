@@ -545,7 +545,12 @@ impl Adoption {
     /// the adopt's own. A Starting agent's reads its screen (and uses none of
     /// it); a Ready one's only inspects.
     fn script_follow_up(&self, starting: Option<(&str, &str)>) {
-        let tagged = Self::inspection(Some("q/lead"), "pi", "");
+        self.script_follow_up_of("pi", starting);
+    }
+    /// The same, with `command` in front at the inspection: a pane whose
+    /// pinned harness is not pi would otherwise be listed as running pi.
+    fn script_follow_up_of(&self, command: &str, starting: Option<(&str, &str)>) {
+        let tagged = Self::inspection(Some("q/lead"), command, "");
         self.rig
             .client
             .script_inspect(&pane("%1"), Some(&tagged))
@@ -924,7 +929,7 @@ async fn adopt_compact_codex_footer_stays_starting() {
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_tag();
-    adoption.script_follow_up(None);
+    adoption.script_follow_up_of("codex", None);
     assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
     let agent = adoption.agent().await.unwrap();
     assert_eq!(agent.status, AgentStatus::Ready);
@@ -1055,7 +1060,7 @@ async fn readopt_of_a_ready_agent_without_a_session_writes_nothing() {
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_untagged_capture(CODEX_PADDED, "codex");
     adoption.script_tag();
-    adoption.script_follow_up(None);
+    adoption.script_follow_up_of("codex", None);
     assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
     adoption.followed().await;
     let recorded = adoption.agent().await.unwrap();
@@ -1424,21 +1429,57 @@ async fn recorded_with_role(more: Vec<OrgCommand>, rows: &[(&str, bool, Harness)
         rig.row_of(id, "%1", *child, *harness).await;
     }
     let recorded = rig.org.snapshot().await.unwrap();
-    let recorded = recorded.agent(&adoptee()).unwrap();
-    // The restart check: a Starting agent's reads its screen, and uses none
-    // of it without a session; a Ready agent's reads it to pin its harness
-    // (the screen is unknown, so nothing is pinned); any other only inspects.
+    let recorded = recorded.agent(&adoptee()).unwrap().clone();
+    // An agent recorded Starting without a session before the service starts
+    // is a start its daemon interrupted: the restart check marks it Stuck.
+    // To have it Starting on %1 with its role while the service runs, it is
+    // taken down here and adopted onto %1 below, as an adopt on a screen
+    // that shows nothing leaves it.
+    let adopted = recorded.status == AgentStatus::Starting && recorded.session_id.is_none();
+    if adopted {
+        rig.command(OrgCommand::Down {
+            agent_id: adoptee(),
+            reason: "taken down".into(),
+        })
+        .await;
+    }
+    // The restart check: a Ready agent's reads its screen to pin its harness
+    // when the pane has a live row of pi (the screen is unknown, so nothing
+    // is pinned); a Starting agent's (with a session) reads it too; a Down
+    // agent has none; any other only inspects.
+    let live = rows.iter().any(|(id, child, harness)| {
+        !child
+            && *harness == Harness::Pi
+            && recorded.excluded_session_id != Some(SessionId::new(*id))
+    });
     let tagged = Adoption::inspection(Some("q/lead"), "pi", "unknown\n");
-    rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
-    if matches!(recorded.status, AgentStatus::Starting | AgentStatus::Ready) {
-        rig.client
-            .script_capture(&PaneCapture::new("unknown\n".into(), tagged, CaptureFormat::Ansi))
-            .unwrap();
+    let unknown = PaneCapture::new("unknown\n".into(), tagged.clone(), CaptureFormat::Ansi);
+    if !adopted {
+        rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
+        if recorded.status == AgentStatus::Starting
+            || (recorded.status == AgentStatus::Ready && live)
+        {
+            rig.client.script_capture(&unknown).unwrap();
+        }
     }
     let (agents, _) = rig.start();
     agents.reconciled().await.unwrap();
     assert_eq!(rig.client.pending_reads(&pane("%1")).unwrap(), 0);
-    let events = agents.observation_events();
+    let mut events = agents.observation_events();
+    if adopted {
+        // The observation the adoption's commit starts reads the screen of a
+        // Starting agent, and uses none of it without a session.
+        rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
+        rig.client.script_capture(&unknown).unwrap();
+        rig.command(OrgCommand::Adopt {
+            agent_id: adoptee(),
+            pane: "%1".into(),
+            session_id: None,
+        })
+        .await;
+        progress(&mut events, "finished", Some("q/lead")).await;
+        assert_eq!(rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    }
     Adoption {
         rig,
         agents,

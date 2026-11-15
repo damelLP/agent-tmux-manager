@@ -105,13 +105,20 @@ impl Starting {
         assert_eq!(self.unread(), 0);
     }
 
-    /// `reason`, as a start says it that sent `keys` to its trust dialog and
-    /// never saw the dialog accepted.
+    /// `reason`, as a start says it that had sent `keys` to its trust dialog.
     fn unaccepted(&self, reason: &str, keys: &str) -> String {
         format!(
-            "{reason}; atm sent {keys} to the trust dialog for {} and has not seen it accepted",
+            "{reason}; atm had sent {keys} to the trust dialog for {}",
             self.folder()
         )
+    }
+
+    /// The audit of an accept whose dialog was not seen to go, written when
+    /// the start ends.
+    fn unseen_audit(&self, key: &str) -> serde_json::Value {
+        let mut audit = self.trust_audit(key);
+        audit["action"]["dialog_gone"] = false.into();
+        audit
     }
 
     fn trust_audit(&self, key: &str) -> serde_json::Value {
@@ -235,11 +242,11 @@ async fn accept_sent_dialog_unchanged_waits_without_second_enter() {
     starting.answered(starting.asks(CLAUDE_TRUST, "claude"));
     starting.answered(starting.asks(CLAUDE_YES, "claude"));
     starting.answered(starting.asks(CLAUDE_YES, "claude"));
-    // Nothing was seen accepted: the reason names the keys that were sent,
-    // and nothing is audited as accepted.
+    // The dialog was not seen to go: the reason names the keys that were
+    // sent, and the accept is audited as such when the start ends.
     let reason = starting.unaccepted(STILL_SHOWN, "Down, Enter");
     starting.ends_stuck(&reason, &["Down", "Enter"]).await;
-    assert_eq!(sent_audits(&mut committed), Vec::<serde_json::Value>::new());
+    assert_eq!(sent_audits(&mut committed), [starting.unseen_audit("Enter")]);
 }
 
 #[tokio::test]
@@ -395,7 +402,7 @@ async fn update_prompt_still_shown_after_escape_is_stuck() {
     starting.frame(Starting::screen(CODEX_UPDATE, "codex"));
     starting
         .ends_stuck(
-            "the update prompt is still shown after it was skipped",
+            "the update prompt is still shown after it was skipped; atm had sent Escape to the update prompt",
             &["Escape"],
         )
         .await;
@@ -422,12 +429,11 @@ async fn codex_folder_default_enter_with_audit() {
     let mut committed = starting.rig.org.committed.subscribe();
     starting.answered(starting.asks(CODEX_FOLDER, "codex"));
     starting.frame(Starting::screen(CODEX_HOOKS, "codex"));
-    starting
-        .ends_stuck(
-            "the harness asks to review its hooks; review them in the pane (atm cannot trust them yet)",
-            &["Enter"],
-        )
-        .await;
+    let reason = starting.unaccepted(
+        "the harness asks to review its hooks; review them in the pane (atm cannot trust them yet)",
+        "Enter",
+    );
+    starting.ends_stuck(&reason, &["Enter"]).await;
     assert_eq!(sent_audits(&mut committed), [starting.trust_audit("Enter")]);
 }
 
@@ -509,7 +515,8 @@ async fn dialog_key_outcome_unknown_is_never_repeated() {
     let reason = starting.agent().await.unwrap().reason.unwrap_or_default();
     assert!(
         reason.starts_with(&format!(
-            "{START}: answering the harness's start dialog failed, and whether it reached the pane is unknown"
+            "{START}: sending Enter to the trust dialog for {} failed, and whether it reached the pane is unknown",
+            starting.folder()
         )),
         "{reason}"
     );
@@ -547,9 +554,10 @@ async fn deadline_during_a_dialog_key_names_the_key() {
     );
     assert_eq!(starting.effects(), starting.launched_then(&["Enter"]));
     starting
-        .assert_stuck(
-            "the harness's start dialog was being answered and the key may have reached it",
-        )
+        .assert_stuck(&format!(
+            "Enter was being sent to the trust dialog for {} and may have reached the harness",
+            starting.folder()
+        ))
         .await;
     assert_eq!(starting.unread(), 0);
 }
@@ -557,9 +565,9 @@ async fn deadline_during_a_dialog_key_names_the_key() {
 #[tokio::test]
 async fn accept_sent_then_harness_exits_names_the_key_that_was_sent() {
     // The Enter went out on the trust dialog and the harness is gone before
-    // any other screen: the harness may have saved the trust. Nothing is
-    // audited as accepted, so the reason says what was sent. Twin (the
-    // dialog goes, the acceptance is audited, the reason has no such part):
+    // any other screen: the harness may have saved the trust. The accept is
+    // audited when the start ends, as not seen to go, and the reason says
+    // what was sent. Twin (the dialog goes, the audit has no such field):
     // the hook review in codex_folder_default_enter_with_audit.
     let mut starting = Starting::trusting(Harness::Codex).await;
     let mut committed = starting.rig.org.committed.subscribe();
@@ -567,14 +575,15 @@ async fn accept_sent_then_harness_exits_names_the_key_that_was_sent() {
     starting.frame(starting.asks(CODEX_FOLDER, "zsh"));
     let reason = starting.unaccepted(EXITED, "Enter");
     starting.ends_stuck(&reason, &["Enter"]).await;
-    assert_eq!(sent_audits(&mut committed), Vec::<serde_json::Value>::new());
+    assert_eq!(sent_audits(&mut committed), [starting.unseen_audit("Enter")]);
 }
 
 #[tokio::test]
-async fn keys_of_an_accepted_round_are_not_named_again() {
-    // The dialog goes after the first Enter (another screen is seen, and the
-    // acceptance is audited), then comes back and gets its second round,
-    // which is never seen accepted. The reason names that round's keys only.
+async fn each_accept_is_audited_once_seen_to_go_or_not() {
+    // The dialog goes after the first Enter (another screen is seen: the
+    // usual audit), then comes back and gets its second round, whose Enter
+    // is never seen to take. Two accepts, two audits, the second saying that
+    // the dialog was not seen to go; the reason names every key of the start.
     let mut starting = Starting::trusting(Harness::ClaudeCode).await;
     let mut committed = starting.rig.org.committed.subscribe();
     starting.answered(starting.asks(CLAUDE_TRUST, "claude"));
@@ -583,9 +592,66 @@ async fn keys_of_an_accepted_round_are_not_named_again() {
     starting.answered(starting.asks(CLAUDE_RESET, "claude"));
     starting.answered(starting.asks(CLAUDE_YES, "claude"));
     starting.frame(starting.asks(CLAUDE_YES, "claude"));
-    let reason = starting.unaccepted(STILL_SHOWN, "Down, Enter");
+    let reason = starting.unaccepted(STILL_SHOWN, "Down, Enter, Down, Enter");
     starting
         .ends_stuck(&reason, &["Down", "Enter", "Down", "Enter"])
         .await;
-    assert_eq!(sent_audits(&mut committed), [starting.trust_audit("Enter")]);
+    assert_eq!(
+        sent_audits(&mut committed),
+        [starting.trust_audit("Enter"), starting.unseen_audit("Enter")]
+    );
+}
+
+#[tokio::test]
+async fn accept_sent_then_unknown_screen_leaves_one_audit_and_names_the_key() {
+    // After Down and Enter the next screen is one the control read does not
+    // know (Claude's real permission capture). The acceptance is never seen,
+    // so it is not audited as seen; when the start ends, the accept is
+    // audited once, as not seen to go, and the reason names the keys. Once
+    // with the frames running out, once with the start's deadline (the
+    // unknown screen for the rest of the sixty seconds).
+    for deadline in [false, true] {
+        let mut starting = Starting::trusting(Harness::ClaudeCode).await;
+        let mut committed = starting.rig.org.committed.subscribe();
+        starting.answered(starting.asks(CLAUDE_TRUST, "claude"));
+        starting.answered(starting.asks(CLAUDE_YES, "claude"));
+        for _ in 0..if deadline { 260 } else { 1 } {
+            starting.frame(Starting::screen(CLAUDE_MODAL, "claude"));
+        }
+        let result = starting.up().await;
+        if deadline {
+            assert!(
+                matches!(
+                    result,
+                    Err(AgentError::Reservation(
+                        crate::control::reservation::ReservationError::Timeout
+                    ))
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(starting.unread(), 0);
+        }
+        assert_eq!(starting.effects(), starting.launched_then(&["Down", "Enter"]));
+        starting
+            .assert_stuck(&starting.unaccepted("the screen was not recognised", "Down, Enter"))
+            .await;
+        assert_eq!(sent_audits(&mut committed), [starting.unseen_audit("Enter")]);
+    }
+}
+
+#[tokio::test]
+async fn select_alone_names_the_key_and_leaves_no_trust_audit() {
+    // A Down went out, and then somebody is focused on the pane until the
+    // start ends: nothing was accepted, so there is no folder_trust audit,
+    // and the reason names the Down.
+    let mut starting = Starting::trusting(Harness::ClaudeCode).await;
+    let mut committed = starting.rig.org.committed.subscribe();
+    starting.answered(starting.asks(CLAUDE_TRUST, "claude"));
+    starting.frame(starting.asks(CLAUDE_YES, "claude").with_focus(Some(true)));
+    starting.frame(starting.asks(CLAUDE_YES, "claude").with_focus(Some(true)));
+    let reason = starting.unaccepted("the pane is focused", "Down");
+    starting.ends_stuck(&reason, &["Down"]).await;
+    assert_eq!(sent_audits(&mut committed), Vec::<serde_json::Value>::new());
 }

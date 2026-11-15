@@ -85,7 +85,7 @@ async fn stop_with_a_held_delivery_attempt_ends_inside_the_budget() {
     assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 0));
     let snapshot = rig.snapshot(id);
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
-    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    assert_eq!(snapshot.hold, Some(ExecutorHold::EnterNotSent));
     // The attempt's event, and nothing after it.
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);

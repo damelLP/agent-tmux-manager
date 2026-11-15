@@ -164,7 +164,7 @@ count as the owner's.
 | 0 | Path and pair checks, `install.json` hashes, a connect to the socket, `atmd status`, the daemon's executable and start environment | `candidate binaries do not match install.json` · `candidate pair already installed` · `interrupted promotion` · `no daemon answers` · `atmd status names no running daemon` · `the daemon (pid N) does not run <bin>/atmd` · `the daemon was started with KEY=...` (state, config or tmux variables differ from this shell) |
 | 1 | `atm-protected-files.py <installed commit> <candidate commit>`, printed with its sha256. Accept it by typing `yes` on a terminal, or with `--report-sha256` of the report you already read. The installed commit is the one the last rollout recorded in `<bin>/.atm-promotion/rollout.json`, else `--installed-commit` | `installed build's commit is unknown` · `--installed-commit disagrees with the recorded` · `protected-file report failed` · `protected-file report not accepted` · `the report needs your yes` |
 | 2 | Smoke of the candidate pair on a private socket, state directory and tmux server in a temp directory: `agent up`, `msg send` until delivered, `agent clear`, `agent down --kill`, on the repository's pi stand-in (`tests/support/stand_in`), or on a real harness with `--real` | `smoke failed at <start, up, message, clear, down>: ...; run kept in <dir>` |
-| 3 | The state before: `atm list`, `atm agent list`, each agent's unread inbox, Claude's `statusLine`, every process on the installed pair. Sessions mid-turn are listed, not refused | `agent X is starting` · `agent X is clearing` · `message M to X is being delivered` · `pid N runs "atm ...", not a sidebar` · `sidebar pid N is not in a tmux pane` · `sidebar pid N was not started from the shell of pane %P` |
+| 3 | The state before: `atm list`, `atm agent list`, each agent's unread inbox, Claude's `statusLine`, every process on the installed pair. Sessions mid-turn are listed, not refused. An `atm` command that is not a sidebar refuses only if it is still running five seconds later: a loop's short `atm list` is waited out | `agent X is starting` · `agent X is clearing` · `message M to X is being delivered` · `pid N runs "atm ...", not a sidebar` · `sidebar pid N is not in a tmux pane` · `sidebar pid N was not started from the shell of pane %P` |
 | 4 | Each sidebar gets `C-c` in its pane and is waited for. The rollout waits for the daemon's lock (`<socket>.lock`), runs `atmd stop`, and holds the lock | `sidebar pid N in %P did not quit` · `the daemon did not stop` · `another daemon took the socket` (each after starting again what it stopped) |
 | 5 | `atm-promote` | Its own refusal, when the previous pair is still in place: the daemon and the sidebars are started again |
 | 6 | The lock is released; `atmd start -d`; wait for the socket to answer | |
@@ -205,8 +205,9 @@ a stage 0 release pair; 0.3.0 has the same lock.
   rollout then exits 4 and says that the previous build runs but named agents and
   messages are unavailable until the newer build is back. The state directory is
   never moved, edited or deleted.
-- The sidebar restart types into the pane's shell, as `atm workspace` does. It does
-  not look at what was typed there since the quit. A sidebar that the tmux
+- The sidebar restart types into the pane's shell, as `atm workspace` does, once that
+  shell is in the foreground of its terminal again. It does not look at what was
+  typed there since the quit. A sidebar that the tmux
   new-window hook starts while the daemon is down fails and is not looked for.
 - The scratch session is created on the tmux server `atm` itself uses and killed by
   its id. What a user's own tmux hooks do with a new detached session is not known.

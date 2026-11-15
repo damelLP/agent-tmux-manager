@@ -481,14 +481,20 @@ class Refusals(Rig):
         self.start_tmux()
         daemon, old = self.start_daemon(), self.pair()
         # A command of the installed atm that is still running: not the rollout's to end.
-        real = atm_rollout.Rollout.processes
-        command = dict(pid=1, start='1', name='atm', argv=[str(self.bin / 'atm'), 'agent', 'up', 'seat'],
-                       parent=1, current=True, server=None, pane=None, env={})
-        busy = patch.object(atm_rollout.Rollout, 'processes', lambda rollout: real(rollout) + [command])
-        code, out, err = self.in_process(*self.args(), patches=[busy])
+        # (This process stands in for it: a real atm command that stays is an agent start.)
+        real, me = atm_rollout.Rollout.processes, atm_rollout.identity(os.getpid())
+        command = dict(pid=me['pid'], start=me['start'], name='atm', parent=1, current=True, server=None,
+                       pane=None, env={}, argv=[str(self.bin / 'atm'), 'agent', 'up', 'seat'])
+        busy = [patch.object(atm_rollout.Rollout, 'processes', lambda rollout: real(rollout) + [command]),
+                patch.object(atm_rollout, 'COMMAND_WAIT', 0.2)]
+        code, out, err = self.in_process(*self.args(), patches=busy)
         self.assertEqual(code, 1, out + err)
-        self.assertIn(f'pid 1 runs "{self.bin}/atm agent up seat", not a sidebar', err)
+        self.assertIn(f'pid {me["pid"]} runs "{self.bin}/atm agent up seat", not a sidebar', err)
         self.assert_unchanged(old, daemon)
+        # A loop's short call that has ended by the second look is no reason to refuse.
+        command.update(pid=2 ** 22 + 1, start='0')
+        code, out, err = self.in_process(*self.args(report=False), '--dry-run', patches=busy)
+        self.assertEqual(code, 0, out + err)
         # A TUI that is its pane's own command would take the pane with it.
         pane = self.tmux('new-window', '-d', '-P', '-F', '#{pane_id}', f'{self.bin}/atm --compact')
         wait_for(lambda: self.tmux('display-message', '-p', '-t', pane, '#{pane_current_command}') == 'atm',

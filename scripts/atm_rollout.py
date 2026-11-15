@@ -35,6 +35,7 @@ WAIT_POLL = 2.0  # seconds between two looks at work in flight (--wait)
 # Hang guards, in seconds, for events that normally arrive at once: the daemon's lock after
 # its stop has returned, a sidebar's exit after its quit key, the sent text on the scratch pane.
 LOCK_WAIT = QUIT_WAIT = SEND_WAIT = 15
+COMMAND_WAIT = 5  # for a one-shot atm call (a loop's `atm list`) to end by itself
 # The smoke's daemon delivers as soon as its stand-in is idle; the default policy waits ten seconds.
 SMOKE_CONFIG = ('[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\n'
                 'stable_empty_input = { secs = 0, nanos = 1000000 }\n')
@@ -88,6 +89,15 @@ def is_sidebar(argv):
         else:
             return False
     return True
+
+
+def at_prompt(shell):
+    """Whether the shell is in the foreground of its terminal: nothing it started is in front."""
+    try:
+        fields = Path(f'/proc/{shell}/stat').read_text().rsplit(')', 1)[1].split()
+    except (OSError, IndexError):
+        return False
+    return len(fields) > 5 and fields[2] == fields[5]  # its process group is the terminal's
 
 
 def in_flight(snapshot):
@@ -410,6 +420,16 @@ class Rollout:
                     sidebars=[p for p in processes if p['name'] == 'atm' and is_sidebar(p['argv'])],
                     commands=[p for p in processes if p['name'] == 'atm' and not is_sidebar(p['argv'])])
 
+    def lingering(self, commands):
+        """The atm commands that are still running after a moment: not a loop's short call."""
+        def alive():
+            return [p for p in commands if (identity(p['pid']) or {}).get('start') == p['start']]
+        try:
+            wait_for(lambda: not alive(), 'atm commands to end', COMMAND_WAIT)
+        except TimedOut:
+            pass
+        return alive()
+
     def quiet_snapshot(self):
         """The state before, taken when nothing is in flight; refuses, or waits with --wait."""
         deadline, shown = time.monotonic() + self.args.wait, None
@@ -417,7 +437,7 @@ class Rollout:
             snapshot = self.snapshot()
             busy = in_flight(snapshot)
             busy += [f"pid {p['pid']} runs \"{shlex.join(p['argv'])}\", not a sidebar; wait for it or stop "
-                     'what calls it' for p in snapshot['commands']]
+                     'what calls it' for p in self.lingering(snapshot['commands'])]
             if not busy:
                 break
             require(time.monotonic() < deadline, '; '.join(busy))
@@ -493,15 +513,15 @@ class Rollout:
         for sidebar in self.stopped:
             line = shlex.join(sidebar['argv'])
             tmux = ['tmux', '-S', sidebar['server']]
-            children = Path(f"/proc/{sidebar['parent']}/task/{sidebar['parent']}/children")
 
             def running():
                 return [p for p in self.processes() if p['parent'] == sidebar['parent'] and p['current']]
             try:
                 shell = self.call([*tmux, 'display-message', '-p', '-t', sidebar['pane'], '#{pane_pid}'])
-                ready = shell.returncode == 0 and shell.stdout.strip() == str(sidebar['parent']) \
-                    and not children.read_text().strip()
-                if ready:  # the same line atm's own sidebar injection types
+                if shell.returncode == 0 and shell.stdout.strip() == str(sidebar['parent']):
+                    # The pane is still that shell; wait until it has its terminal back, then
+                    # type the same line atm's own sidebar injection types.
+                    wait_for(lambda: at_prompt(sidebar['parent']), 'the shell prompt', QUIT_WAIT)
                     self.call([*tmux, 'send-keys', '-l', '-t', sidebar['pane'], line])
                     self.call([*tmux, 'send-keys', '-t', sidebar['pane'], 'Enter'])
                     wait_for(running, 'the sidebar to start', 15)

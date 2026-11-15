@@ -217,6 +217,20 @@ fn annotated_peer_and_ancestor_headings_end_the_measures_section() {
     }
 }
 
+// Break caught: an annotated Setext title hiding the section boundary (probe P1c).
+#[test]
+fn annotated_setext_headings_end_the_measures_section() {
+    for underline in ["---", "==="] {
+        assert_eq!(
+            parse_intent_measures(&format!(
+                "## How we will know\n- owner\nRetired <!-- x -->\n{underline}\n- mechanical: old-check\n"
+            )),
+            Ok(vec![TaskMeasure::Owner]),
+            "{underline}"
+        );
+    }
+}
+
 // Break caught: ending the section on an annotated nested heading too.
 #[test]
 fn annotated_nested_headings_keep_the_measures_section_open() {

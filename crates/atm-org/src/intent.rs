@@ -63,7 +63,7 @@ pub fn parse_intent_measures(text: &str) -> Result<Vec<TaskMeasure>, IntentError
         }
         if commented_line(line, &mut comment) {
             // An annotated heading still ends the section it follows.
-            if let Some((level, _, _)) = heading(line, None) {
+            if let Some((level, _, _)) = heading(line, lines.peek().map(|(_, s)| *s)) {
                 if section.is_some_and(|current| level <= current) {
                     section = None;
                 }

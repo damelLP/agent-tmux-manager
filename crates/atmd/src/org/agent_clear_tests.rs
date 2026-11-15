@@ -246,6 +246,12 @@ impl Clearing {
 
 /// A SessionStart of `id` from the harness process on %1. The registry keys
 /// rows by process: a new id from the same process replaces its row.
+///
+/// The process id is one no process can have. For a real one the registry
+/// reads that process's directory from `/proc` and looks its git repository
+/// up on an OS thread, and these tests run on a paused clock, which goes only
+/// with in-memory work: on a loaded host virtual time ran past a 5 s budget
+/// before the real lookup answered.
 async fn start_session(rig: &Rig, harness: Harness, id: &str, source: Option<&str>) {
     rig.registry
         .apply_lifecycle_event(
@@ -254,7 +260,7 @@ async fn start_session(rig: &Rig, harness: Harness, id: &str, source: Option<&st
                 source: source.map(Into::into),
             },
             harness,
-            Some(std::process::id()),
+            Some(u32::MAX - 1),
             Some("%1".into()),
         )
         .await

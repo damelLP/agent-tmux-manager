@@ -60,6 +60,8 @@
 //! | reminded, flagged, cost recorded | reports of the daemon; no caller |
 //!
 //! A caller without the right is refused even where nothing would change.
+//! Assigning an open task is also subject to the stacking cap of the away
+//! module: a task whose `rests_on` names a provisional decision may be held.
 //!
 //! # Reviews and measures
 //!
@@ -732,6 +734,7 @@ impl OrgState {
                 if !(task.state == S::Open || task.held()) {
                     return Err(task.refuse("assign").into());
                 }
+                self.stacking_hold(task)?;
                 task.agent_id.as_ref() != Some(agent_id)
             }
             TaskCommand::SetState {

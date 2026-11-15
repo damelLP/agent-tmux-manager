@@ -358,7 +358,10 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::DecisionWithdrawn(_)
         // Audits of a handover: they name an agent and change nothing in it.
         | OrgEvent::AgentSaveRequested { .. }
-        | OrgEvent::AgentSaved { .. } => None,
+        | OrgEvent::AgentSaved { .. }
+        // The away switch names no agent.
+        | OrgEvent::OwnerAway(_)
+        | OrgEvent::OwnerBack(_) => None,
     }
 }
 

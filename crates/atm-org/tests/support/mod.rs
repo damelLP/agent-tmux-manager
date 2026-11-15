@@ -201,5 +201,7 @@ pub fn bodies() -> Vec<(&'static str, Value)> {
             "agent.saved",
             json!({"agent_id":"p/lead","message_id":"m10"}),
         ),
+        ("owner.away", json!({"by":"owner","stacking_caps":{"p":1}})),
+        ("owner.back", json!({"by":"owner"})),
     ]
 }

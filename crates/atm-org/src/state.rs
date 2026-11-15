@@ -119,6 +119,7 @@ pub struct OrgState {
     pub(crate) tasks: BTreeMap<u64, Task>,
     summaries: HashMap<SessionId, SessionSummary>,
     decisions: BTreeMap<DecisionId, Decision>,
+    pub(crate) owner: OwnerState,
 }
 impl OrgState {
     /// Choose an unregistered folder slug, then the first free -2, -3, ...
@@ -352,6 +353,9 @@ impl OrgState {
             }
             OrgEvent::DecisionExpired { decision_id } => {
                 self.require_decision(decision_id)?;
+            }
+            OrgEvent::OwnerAway(OwnerAway { by, .. }) | OrgEvent::OwnerBack(OwnerBack { by }) => {
+                self.validate_address(by)?;
             }
             OrgEvent::AgentSaveRequested {
                 agent_id,
@@ -608,6 +612,8 @@ impl OrgState {
                 decision.close(DecisionStatus::Withdrawn, ts);
                 decision.withdrawal = Some(withdrawal.clone());
             }
+            OrgEvent::OwnerAway(fact) => fact.fold(&mut self.owner, ts),
+            OrgEvent::OwnerBack(_) => self.owner.away_since = None,
         }
         Ok(())
     }

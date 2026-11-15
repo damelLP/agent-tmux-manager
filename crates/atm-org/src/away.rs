@@ -45,14 +45,30 @@
 //! chains (a child of a resting task, a second decision raised inside one) are
 //! not followed.
 //!
+//! # The switch
+//!
+//! Only the owner sets away and back ([`OwnerCommand`]). `owner.away` records
+//! the time and each project's cap; `owner.back` clears the time and keeps the
+//! caps, because what is still provisional stays capped until it is answered.
+//! Repeating either writes nothing. [`OwnerCommand::ApplyAway`] is the
+//! daemon's report "put this decision through the table": it is decided
+//! against the away flag and the decision in one step, so nothing is taken
+//! after the owner is back, and it writes nothing for a decision that is no
+//! longer pending.
+//!
 //! # Settings
 //!
 //! [`parse_away_settings`] reads a project's away settings: one optional key,
 //! `stacking_cap`, at least 1, default [`DEFAULT_STACKING_CAP`]. Unknown keys
 //! are refused.
 
-use crate::{DecisionClass, DecisionStatus};
-use serde::Deserialize;
+use crate::{
+    Address, Decision, DecisionClass, DecisionCommand, DecisionId, DecisionStatus, OrgEvent,
+    OrgState, ProjectId, ProvisionalChoice, Refusal, Task, TaskId, TaskState,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Why a pending decision waits for the owner.
@@ -156,4 +172,205 @@ pub fn parse_away_settings(text: &str) -> Result<AwaySettings, AwaySettingsError
         return Err(AwaySettingsError::CapBelowOne);
     }
     Ok(settings)
+}
+
+/// Body of `owner.away`: who said so, and each project's stacking cap as read
+/// at that moment. A project without an entry has [`DEFAULT_STACKING_CAP`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerAway {
+    pub by: Address,
+    pub stacking_caps: BTreeMap<ProjectId, u32>,
+}
+impl OwnerAway {
+    pub(crate) fn fold(&self, owner: &mut OwnerState, ts: DateTime<Utc>) {
+        owner.away_since = Some(ts);
+        owner.stacking_caps.clone_from(&self.stacking_caps);
+    }
+}
+
+/// Body of `owner.back`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBack {
+    pub by: Address,
+}
+
+/// The away switch as folded from the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnerState {
+    /// The time of the `owner.away` in force; `None` while the owner is present.
+    pub away_since: Option<DateTime<Utc>>,
+    /// The caps of the latest `owner.away`, kept after `owner.back`.
+    pub stacking_caps: BTreeMap<ProjectId, u32>,
+}
+impl OwnerState {
+    /// The cap for a project; the default for one not listed, and for a
+    /// requester that belongs to no project.
+    #[must_use]
+    pub fn stacking_cap(&self, project: Option<&ProjectId>) -> u32 {
+        project
+            .and_then(|id| self.stacking_caps.get(id))
+            .copied()
+            .unwrap_or(DEFAULT_STACKING_CAP)
+    }
+}
+
+/// The away switch and the daemon's report, carried by
+/// [`crate::OrgCommand::Owner`]; see the module docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerCommand {
+    Away {
+        by: Address,
+        stacking_caps: BTreeMap<ProjectId, u32>,
+    },
+    Back {
+        by: Address,
+    },
+    /// Put this decision through the away table.
+    ApplyAway {
+        decision_id: DecisionId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AwayRefusal {
+    #[error("only the owner may set away or back")]
+    NotOwner { who: Address },
+    #[error("task {task_id} rests on decision {decision_id}, which was taken provisionally for the owner: it waits until he has seen {decision_id} (stacking cap {cap})")]
+    Held {
+        task_id: TaskId,
+        decision_id: DecisionId,
+        cap: u32,
+    },
+}
+
+impl OwnerCommand {
+    /// The candidate event, from the command alone. `ApplyAway` cannot know
+    /// its option or taker without the state: its candidate only carries the
+    /// decision reference for validation, and decide builds the fact.
+    pub(crate) fn event(&self) -> OrgEvent {
+        match self.clone() {
+            Self::Away { by, stacking_caps } => {
+                OrgEvent::OwnerAway(OwnerAway { by, stacking_caps })
+            }
+            Self::Back { by } => OrgEvent::OwnerBack(OwnerBack { by }),
+            Self::ApplyAway { decision_id } => {
+                OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+                    decision_id,
+                    option: String::new(),
+                    by: Address::System,
+                })
+            }
+        }
+    }
+}
+
+impl Decision {
+    /// The away table's answer for this decision's class and recommendation.
+    /// Only meaningful while the decision is pending.
+    #[must_use]
+    pub fn away_step(&self, away: bool) -> AwayStep {
+        away_step(self.class(), self.request.recommended.is_some(), away)
+    }
+}
+
+fn owner_only(by: &Address) -> Result<(), AwayRefusal> {
+    if *by == Address::Owner {
+        Ok(())
+    } else {
+        Err(AwayRefusal::NotOwner { who: by.clone() })
+    }
+}
+
+impl OrgState {
+    #[must_use]
+    pub fn owner(&self) -> &OwnerState {
+        &self.owner
+    }
+
+    /// The tasks whose `rests_on` names this decision, in creation order.
+    pub fn resting_tasks(&self, id: DecisionId) -> impl Iterator<Item = &Task> {
+        self.tasks().filter(move |task| task.rests_on == Some(id))
+    }
+
+    /// The switch and the away table. `event` is the command's candidate,
+    /// whose references decide has already validated.
+    pub(crate) fn decide_owner(
+        &self,
+        command: &OwnerCommand,
+        event: OrgEvent,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<OrgEvent>, Refusal> {
+        let away = self.owner.away_since.is_some();
+        let changed = match command {
+            OwnerCommand::Away { by, stacking_caps } => {
+                owner_only(by)?;
+                if stacking_caps.values().any(|cap| *cap < 1) {
+                    return Err(Refusal::InvalidValue {
+                        field: "stacking_cap",
+                        reason: "must be at least 1".into(),
+                    });
+                }
+                !away
+            }
+            OwnerCommand::Back { by } => {
+                owner_only(by)?;
+                away
+            }
+            OwnerCommand::ApplyAway { decision_id } => {
+                let decision = self.require_decision(decision_id)?;
+                if decision.status != DecisionStatus::Pending {
+                    return Ok(vec![]);
+                }
+                let by = match decision.away_step(away) {
+                    AwayStep::Wait(_) => return Ok(vec![]),
+                    AwayStep::TakeProvisionally => Address::System,
+                    AwayStep::AgentDecides => decision.request.requester.clone(),
+                };
+                let Some(option) = decision.request.recommended.clone() else {
+                    return Ok(vec![]);
+                };
+                let choice = ProvisionalChoice {
+                    decision_id: decision.id,
+                    option,
+                    by,
+                };
+                // The decision policy stays the one place that lets a take through.
+                return self.decide_decision(
+                    &DecisionCommand::TakeProvisionally(choice.clone()),
+                    OrgEvent::DecisionTakenProvisionally(choice),
+                    now,
+                );
+            }
+        };
+        Ok(if changed { vec![event] } else { vec![] })
+    }
+
+    /// The stacking cap at the moment a task would start. Only a task that
+    /// has not started (it is open) is held; a missing or unknown `rests_on`
+    /// holds nothing.
+    pub(crate) fn stacking_hold(&self, task: &Task) -> Result<(), AwayRefusal> {
+        if task.state != TaskState::Open {
+            return Ok(());
+        }
+        let Some(decision) = task.rests_on.and_then(|id| self.decision(&id)) else {
+            return Ok(());
+        };
+        let started = self
+            .resting_tasks(decision.id)
+            .filter(|other| !matches!(other.state, TaskState::Open | TaskState::Cancelled))
+            .count();
+        let project = match &decision.request.requester {
+            Address::Agent(agent) => Some(&agent.project),
+            Address::Owner | Address::System => None,
+        };
+        let cap = self.owner.stacking_cap(project);
+        match stacking_step(decision.status, decision.class(), started, cap) {
+            StackingStep::Start => Ok(()),
+            StackingStep::Hold => Err(AwayRefusal::Held {
+                task_id: task.id.clone(),
+                decision_id: decision.id,
+                cap,
+            }),
+        }
+    }
 }

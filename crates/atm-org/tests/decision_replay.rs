@@ -194,7 +194,8 @@ fn refusal_name(refusal: &Refusal) -> &'static str {
         | Refusal::InvalidDeliveryState { .. }
         | Refusal::WrongRecipient { .. }
         | Refusal::InvalidRecipient(_)
-        | Refusal::Task(_) => "not a decision refusal",
+        | Refusal::Task(_)
+        | Refusal::Away(_) => "not a decision refusal",
     }
 }
 const REFUSALS: [&str; 9] = [

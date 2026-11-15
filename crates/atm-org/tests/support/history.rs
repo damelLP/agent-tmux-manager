@@ -42,7 +42,7 @@ pub struct Seed {
 }
 pub fn arb_seed() -> impl Strategy<Value = Seed> {
     (
-        0usize..25,
+        0usize..26,
         0usize..3,
         0usize..4,
         0usize..6,
@@ -239,10 +239,27 @@ impl Seed {
                 agent_id,
                 message_id,
             },
-            _ => OrgCommand::Saved {
+            24 => OrgCommand::Saved {
                 agent_id,
                 message_id,
             },
+            _ => {
+                let decisions: Vec<_> = state.decisions().collect();
+                let decision_id = decisions
+                    .get(self.value as usize % decisions.len().max(1))
+                    .map(|decision| decision.id)
+                    .unwrap_or(DecisionId::new(999_999));
+                OrgCommand::Owner(match self.to % 3 {
+                    0 => OwnerCommand::Away {
+                        by: address(self.from),
+                        stacking_caps: [(agent_id.project, self.value % 3)].into(),
+                    },
+                    1 => OwnerCommand::Back {
+                        by: address(self.from),
+                    },
+                    _ => OwnerCommand::ApplyAway { decision_id },
+                })
+            }
         }
     }
 }
@@ -744,7 +761,17 @@ impl History {
             assert_eq!(history.state.decision(&id).unwrap().status, status);
         }
         history.seed_tasks();
-        assert_eq!(history.kinds.len(), 36);
+        // The switch, on and off again: the random part starts with the owner present.
+        for command in [
+            OwnerCommand::Away {
+                by: Address::Owner,
+                stacking_caps: [(agent(0).project, 2)].into(),
+            },
+            OwnerCommand::Back { by: Address::Owner },
+        ] {
+            assert_eq!(history.step(OrgCommand::Owner(command)).unwrap().len(), 1);
+        }
+        assert_eq!(history.kinds.len(), 38);
         assert_eq!(history.state.agents().count(), 3);
         assert_eq!(history.state.projects().count(), 2);
         history

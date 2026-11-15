@@ -178,12 +178,12 @@ fn an_unknown_share_never_reaches_the_line() {
 }
 
 #[test]
-fn the_default_limits_are_the_forty_percent_line_and_no_cache_numbers() {
+fn the_default_limits_are_the_sixty_percent_line_and_no_cache_numbers() {
     let default = HandoverLimits::default();
     assert_eq!(
         default,
         HandoverLimits {
-            context_line_percent: 40,
+            context_line_percent: 60,
             cache: None
         }
     );
@@ -193,9 +193,9 @@ fn the_default_limits_are_the_forty_percent_line_and_no_cache_numbers() {
         handover_step(&waiting(WaitsFor::Nothing), &default, a_day),
         HandoverStep::Nothing
     );
-    assert_eq!(handover_step(&idle(40.0), &default, a_day), SAVE_LINE);
+    assert_eq!(handover_step(&idle(60.0), &default, a_day), SAVE_LINE);
     assert_eq!(
-        handover_step(&idle(39.99), &default, a_day),
+        handover_step(&idle(59.99), &default, a_day),
         HandoverStep::Nothing
     );
 }

@@ -28,7 +28,7 @@
 //! | `Until(t)` | yes if `t` is before the expiry (a time already due included); no at the expiry or later |
 //!
 //! Every limit is inclusive. A missing or NaN share never reaches the line.
-//! The share is compared unrounded, so a display that rounds 39.6 to "40%"
+//! The share is compared unrounded, so a display that rounds 59.6 to "60%"
 //! is not yet at the line. A cold session is cleared without a save turn,
 //! because that turn would pay for the whole context again; so row 2 comes
 //! before the context line.
@@ -55,8 +55,9 @@
 //!
 //! # Limits
 //!
-//! [`HandoverLimits::default`] holds only the context line, 40 percent for
-//! every harness and model until a measurement gives a line for each. It has
+//! [`HandoverLimits::default`] holds only the context line, 60 percent for
+//! every harness and model: the owner's choice, not a measurement, until one
+//! gives a line for each. It has
 //! no cache numbers, so rows 2 and 4 are off until the caller passes
 //! [`CacheLimits`] for the agent's harness and model. The idle limit belongs
 //! below the lifetime; at or above it row 4 never answers and the session is
@@ -107,7 +108,7 @@ pub struct HandoverLimits {
 impl Default for HandoverLimits {
     fn default() -> Self {
         Self {
-            context_line_percent: 40,
+            context_line_percent: 60,
             cache: None,
         }
     }

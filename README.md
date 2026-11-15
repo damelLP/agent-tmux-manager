@@ -139,7 +139,7 @@ atm agent handover worker --format json        # {"agent_id":…,"message_id":"m
 - **Only a `ready` agent with a known session** can be handed over, and one handover per agent runs at a time. Anyone may ask, as for messages.
 - **A restart of `atmd` during a handover** loses it: the request is still delivered and the agent saves, but nothing is cleared. Run the command again.
 
-**A note at the context line.** When a named agent's turn ends and its context is at 40% or more, `atmd` sends one note to the agent's manager (to you for an agent whose role names none, and for an adopted agent): `agent <id> is at <n>% of its context (line 40%). Hand it over: atm agent handover <id>`. It is sent once per session and nothing is cleared. After a restart of `atmd` a session that was already noted can be noted once more. The line is 40% for every harness and model until measurements give better ones.
+**A note at the context line.** When a named agent's turn ends and its context is at 60% or more, `atmd` sends one note to the agent's manager (to you for an agent whose role names none, and for an adopted agent): `agent <id> is at <n>% of its context (line 60%). Hand it over: atm agent handover <id>`. It is sent once per session and nothing is cleared. After a restart of `atmd` a session that was already noted can be noted once more. The line is 60% for every harness and model: a chosen number, not a measured one, until measurements give better ones.
 
 ### Finding your instructions and handover
 

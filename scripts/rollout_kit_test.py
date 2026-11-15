@@ -573,7 +573,9 @@ class Refusals(Rig):
         self.assertEqual(code, 1, out + err)
         self.assert_unchanged(old, daemon)
         # The one that had quit is typed back into its pane: a new process there.
-        stuck = int(re.search(r'refused, nothing changed: sidebar pid (\d+) in %\d+ did not quit', err).group(1))
+        stuck = int(re.search(r'rollout: refused before the swap; the installed build is unchanged and kept '
+                              rf'running \(daemon pid {daemon}\): sidebar pid (\d+) in %\d+ did not quit',
+                              err).group(1))
         (quit_first,) = shell_of.keys() - {stuck}
         self.assertIn('Sidebar back in ', out)
         (back,) = self.sidebar_of(shell_of[quit_first])
@@ -605,7 +607,7 @@ class Gap(Rig):
     def test_a_daemon_that_won_the_lock_is_left_running_and_nothing_is_swapped(self):
         self.start_tmux()
         old = self.pair()
-        self.start_daemon()
+        daemon = self.start_daemon()
         _, shell, sidebar = self.sidebar('--compact')
         back, real_flock, real_call = threading.Event(), atm_rollout.fcntl.flock, atm_rollout.Rollout.call
 
@@ -623,7 +625,12 @@ class Gap(Rig):
                    patch.object(atm_rollout.Rollout, 'call', call), patch.object(atm_rollout, 'LOCK_WAIT', 1)]
         code, out, err = self.in_process(*self.args(), patches=patches)
         self.assertEqual(code, 1, out + err)
-        self.assertIn('refused, nothing changed: another daemon took the socket', err)
+        # A restart is a change: it is said with both pids, checked, and compared with before.
+        self.assertIn('rollout: refused before the swap; the installed build is unchanged and was started '
+                      f'again (daemon pid {daemon} -> {self.daemon_pid()}): another daemon took the socket', err)
+        self.assertNotIn('nothing changed', err)
+        self.assertIn('Checks passed: identity, list, status, agent-list, agents.', out)
+        self.assertIn('Differs from before:', out)
         self.assert_running(old)
         self.assertNotEqual(self.sidebar_of(shell), [sidebar])
         self.assertEqual(len(self.sidebar_of(shell)), 1)
@@ -634,26 +641,63 @@ class Gap(Rig):
         old = self.pair()
         daemon = self.start_daemon()
         _, shell, sidebar = self.sidebar('--compact')
+        code, out, err, holder = self.refused_swap()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('rollout: refused before the swap; the installed build is unchanged and was started '
+                      f'again (daemon pid {daemon} -> {self.daemon_pid()}): the swap failed and the previous '
+                      f'pair is in place: promotion: running process uses socket: pid {holder}', err)
+        self.assertNotIn('nothing changed', err)
+        self.assertIn('Checks passed: identity, list, status, agent-list, agents.', out)
+        self.assertIn('Differs from before:', out)
+        self.assert_running(old)
+        self.assertNotEqual(self.daemon_pid(), daemon)
+        self.assertEqual(len(self.sidebar_of(shell)), 1)
+        self.assertNotEqual(self.sidebar_of(shell), [sidebar])
+
+    def refused_swap(self, also=lambda: None):
+        """A rollout whose swap atm-promote refuses: a process that names the socket appears
+        between the stop and the swap (and `also` happens there too)."""
         holders = []
 
-        def holder(rollout):  # a process that names the socket: atm-promote refuses it
+        def holder(rollout):
             process = subprocess.Popen(['/bin/cat'], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
             process.stdin.write(b'ready\n')
             process.stdin.flush()
             self.assertEqual(process.stdout.readline(), b'ready\n')
             holders.append(process)
+            also()
         code, out, err = self.in_process(*self.args(), patches=[self.before_step('tool', holder)])
         for process in holders:
             process.stdin.close()
             process.stdout.close()
             self.assertEqual(process.wait(timeout=30), 0)
-        self.assertEqual(code, 1, out + err)
-        self.assertIn('refused, nothing changed: the swap failed and the previous pair is in place: '
-                      f'promotion: running process uses socket: pid {holders[0].pid}', err)
+        return code, out, err, holders[0].pid
+
+    def test_a_restart_after_a_refused_swap_that_fails_a_check_needs_the_owner(self):
+        self.wrap({'status': 1}, installed=True)  # the installed build, started again, does not answer it
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        code, out, err, holder = self.refused_swap()
+        self.assertEqual(code, 4, out + err)
+        self.assertIn('rollout: NEEDS YOU: refused before the swap (the swap failed and the previous pair is in '
+                      f'place: promotion: running process uses socket: pid {holder}); the installed build was '
+                      'started again, and then check status failed', err)
+        self.assertIn('the previous pair is installed; a daemon answers', err)
         self.assert_running(old)
-        self.assertNotEqual(self.daemon_pid(), daemon)
-        self.assertEqual(len(self.sidebar_of(shell)), 1)
-        self.assertNotEqual(self.sidebar_of(shell), [sidebar])
+
+    def test_a_sidebar_that_is_not_back_after_a_refused_swap_needs_the_owner(self):
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        pane, _, _ = self.sidebar('--compact')
+        code, out, err, _ = self.refused_swap(also=lambda: self.tmux('kill-pane', '-t', pane))
+        self.assertEqual(code, 4, out + err)
+        self.assertIn(f'Sidebar in {pane} is NOT back', out)
+        self.assertIn('the installed build runs, but a sidebar is not back; the previous pair is installed; '
+                      f'a daemon answers on {self.socket}; sidebars not back: type in {pane}: '
+                      f'{self.bin}/atm --compact', err)
+        self.assert_running(old)
 
 
 class FailedChecks(Rig):
@@ -883,6 +927,57 @@ class AfterTheSwap(Rig):
         self.assertEqual(json.loads(settings.read_text()), dict(json.loads(settings.read_text()), statusLine=mine))
         self.assertEqual(json.loads(settings.read_text())['keep'], 'this')
         self.assertEqual(json.loads(settings.read_text())['statusLine'], mine)
+
+    def mine(self):
+        """A statusLine of the owner's in the fake HOME, which atm setup replaces."""
+        settings = self.home / '.claude/settings.json'
+        settings.parent.mkdir()
+        settings.write_text(json.dumps(dict(statusLine=dict(type='command', command='/home/bin/mine'))))
+        return f"atm setup CHANGED Claude's statusLine in {settings}:"
+
+    def test_a_swap_whose_recovery_failed_is_not_restarted(self):
+        # Neither build's setup works, so atm-promote's restore of the old pair fails too.
+        self.wrap({'setup': 1})
+        self.wrap({'setup': 1}, installed=True)
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 4, out + err)
+        self.assertRegex(err, r'rollout: NEEDS YOU: promotion: promotion failed: .*; recovery failed: .*; '
+                         r'do not restart yet; the daemon was not started; the previous pair is installed; '
+                         r'a daemon does NOT answer')
+        self.assertEqual(self.pair(), old)
+        self.assertFalse(atm_rollout.listening(self.socket))
+        self.assertIsNone(self.daemon_pid())
+
+    def test_a_swap_that_failed_after_setup_ran_says_what_setup_did(self):
+        note = self.mine()
+        self.wrap({'setup': 1})  # the candidate's setup fails; atm-promote reruns the old one
+        self.start_tmux()
+        old = self.pair()
+        daemon = self.start_daemon()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('rollout: refused before the swap; the installed build is unchanged and was started '
+                      f'again (daemon pid {daemon} -> {self.daemon_pid()}): the swap failed and the previous '
+                      'pair is in place: promotion: promotion failed:', err)
+        self.assertIn('atm setup ran for the new build, then again for the previous one.', out)
+        self.assertIn(note, out)
+        self.assert_running(old)
+
+    def test_the_status_line_note_is_printed_when_the_run_needs_the_owner(self):
+        note = self.mine()
+        self.wrap({'send': 1})  # the new build fails a check, and after the rollback
+        self.wrap({'send': 1}, installed=True)  # the previous one fails it too
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 4, out + err)
+        self.assertIn('rolled back, and then check send failed', err)
+        self.assertIn(note, out)
+        self.assert_running(old)
 
     def test_rollback_is_the_same_command_the_other_way(self):
         self.start_tmux()

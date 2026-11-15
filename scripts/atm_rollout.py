@@ -56,6 +56,10 @@ class NeedsYou(Exception):
     pass
 
 
+class Stopped(Exception):
+    """Refused before the swap, but after something was stopped and started again."""
+
+
 def say(text=''):
     print(text, flush=True)
 
@@ -163,7 +167,10 @@ class Rollout:
         self.source = self.manifest = self.old = self.new = None
         # What atm setup, run by the swap, edits: it runs with this HOME.
         self.settings = Path(self.env.get('HOME', '/')) / '.claude/settings.json'
-        self.stopped = []
+        self.stopped = []  # sidebars that were quit and are not back yet
+        self.servers = set()  # the tmux servers those sidebars live on
+        self.pid = None  # the daemon's, before anything was stopped
+        self.tool_ran = False  # atm-promote or atm-rollback ran, and with it atm setup
 
     # ---- helpers -------------------------------------------------------
 
@@ -178,6 +185,7 @@ class Rollout:
         return json.loads(result.stdout)
 
     def tool(self, name, *extra):
+        self.tool_ran = True
         say(f"$ {name} {' '.join(map(str, extra))} --bin-dir {self.bin} --socket {self.socket}")
         result = self.call([sys.executable, SCRIPTS / name, *extra, '--bin-dir', self.bin,
                             '--socket', self.socket], timeout=300)
@@ -249,6 +257,7 @@ class Rollout:
         require(listening(self.socket), f'no daemon answers on {self.socket}; start it and run again')
         pid = self.daemon_pid()
         require(pid, 'atmd status names no running daemon; is this shell using another state directory?')
+        self.pid = pid
         daemons = [process for process in self.processes() if process['name'] == 'atmd']
         ours = [process for process in daemons if process['pid'] == pid and process['current']]
         require(ours, f'the daemon (pid {pid}) does not run {self.atmd}')
@@ -494,6 +503,7 @@ class Rollout:
                 require(key.returncode == 0 and select.select([watched], [], [], QUIT_WAIT)[0],
                         f'{where} did not quit')
                 self.stopped.append(sidebar)
+                self.servers.add(sidebar['server'])
             finally:
                 os.close(watched)
 
@@ -521,7 +531,8 @@ class Rollout:
             raise CheckFailed('start', f'{error}: {(result.stdout + result.stderr).strip()}') from error
 
     def restart_sidebars(self):
-        for sidebar in self.stopped:
+        """Type each quit sidebar's line back; those that did not come back stay in `stopped`."""
+        for sidebar in list(self.stopped):
             line = shlex.join(sidebar['argv'])
             tmux = ['tmux', '-S', sidebar['server']]
 
@@ -537,11 +548,12 @@ class Rollout:
                     self.call([*tmux, 'send-keys', '-t', sidebar['pane'], 'Enter'])
                     wait_for(running, 'the sidebar to start', 15)
                     say(f"Sidebar back in {sidebar['pane']}: {line}")
+                    self.stopped.remove(sidebar)
                     continue
             except (TimedOut, OSError, subprocess.SubprocessError):
                 pass
             say(f"Sidebar in {sidebar['pane']} is NOT back; type there: {line}")
-        self.stopped = []
+        return self.stopped
 
     # ---- step 7: the checks -------------------------------------------------
 
@@ -565,8 +577,8 @@ class Rollout:
         finally:
             self.call([*self.tmux, 'kill-session', '-t', session])
 
-    def checks(self, before, expected):
-        """Raises CheckFailed with the first check that fails."""
+    def checks(self, before, expected, send=True):
+        """Raises CheckFailed with the first check that fails. Without `send` they only read."""
         def answers(name, *args):
             result = self.call([self.atm, *args])
             if result.returncode != 0:
@@ -598,11 +610,12 @@ class Rollout:
                     if now is None or (now['state'] != 'down' and now.get('pane') != pane):
                         raise CheckFailed('agents', f"{name} was on pane {pane or '-'} and is now "
                                           + (f"on {now.get('pane') or '-'}" if now else 'missing'))
-            self.check_send()
+            if send:
+                self.check_send()
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             raise CheckFailed('checks', str(error)) from error
         say('Checks passed: identity, list, status'
-            + ('' if listed is None else ', agent-list, agents') + ', send.')
+            + ('' if listed is None else ', agent-list, agents') + (', send.' if send else '.'))
 
     # ---- step 9: what differs -----------------------------------------------
 
@@ -613,7 +626,7 @@ class Rollout:
             say(f'Could not read the state after, to compare it with before: {error}')
             return
         panes = set()
-        for server in {row['server'] for row in self.stopped} | {None}:
+        for server in self.servers | {None}:
             panes |= self.panes(server) or set()
         def by_pane(rows):  # a row found by discovery has a placeholder id, new with every daemon
             return {row.get('tmux_pane') or row['id']: row for row in rows
@@ -642,7 +655,7 @@ class Rollout:
     def status_line_note(self, before):
         """atm setup replaces a statusLine that is not atm's own; say so, restore nothing."""
         was, now = before['status_line'], self.status_line()
-        if was is None or was == now:
+        if not self.tool_ran or was is None or was == now:
             return
 
         def command(entry):
@@ -711,12 +724,13 @@ class Rollout:
             return 0
         try:
             return self.switch(before)
-        except Refused:
+        except (Refused, Stopped):
             raise  # switch() has put back what it stopped
-        except NeedsYou as error:
-            raise NeedsYou(f'{error}; {self.state()}') from error
         except (Exception, KeyboardInterrupt) as error:
-            raise NeedsYou(f'{type(error).__name__}: {error}; {self.state()}') from error
+            # Whatever atm setup did is said on this path too.
+            self.status_line_note(before)
+            words = str(error) if isinstance(error, NeedsYou) else f'{type(error).__name__}: {error}'
+            raise NeedsYou(f'{words}; {self.state()}') from error
 
     def switch(self, before):
         lock = None
@@ -726,17 +740,17 @@ class Rollout:
             swap = self.tool('atm-rollback') if self.args.rollback else \
                 self.tool('atm-promote', '--from-bin', self.source)
             if swap.returncode != 0:
-                require(fingerprint(self.bin) != self.old, 'the swap failed and the previous pair is in place: '
-                        + (swap.stderr.strip().splitlines() or ['no message'])[-1])
+                words = (swap.stderr.strip().splitlines() or ['no message'])[-1]
+                # atm-promote's own recovery failed: its "do not restart yet" stands.
+                if 'recovery failed' in swap.stderr or 'do not restart' in swap.stderr:
+                    raise NeedsYou(f'{words}; the daemon was not started')
+                if 'setup rerun' in swap.stderr:
+                    say('atm setup ran for the new build, then again for the previous one.')
+                require(fingerprint(self.bin) != self.old,
+                        f'the swap failed and the previous pair is in place: {words}')
                 raise NeedsYou('the swap failed and did not restore the previous pair; the daemon is stopped')
         except Refused as error:
-            # Nothing is swapped: bring back what was stopped, then refuse.
-            if lock:
-                lock.release()
-            if not listening(self.socket):
-                self.start_daemon()
-            self.restart_sidebars()
-            raise Refused(error) from error
+            self.restore(before, lock, error)
         lock.release()
         try:
             self.start_daemon()
@@ -755,6 +769,32 @@ class Rollout:
                                     f' To go back: scripts/atm-rollout --rollback --bin-dir {self.bin} '
                                     f'--socket {self.socket}'))
         return 0
+
+    def restore(self, before, lock, reason):
+        """Nothing is swapped: bring back what was stopped, then refuse. A restart is a change,
+        so it is said, checked and compared; "nothing changed" is only for nothing stopped."""
+        quit_any = bool(self.stopped)
+        if lock:
+            lock.release()
+        if not listening(self.socket):
+            self.start_daemon()
+        missing = self.restart_sidebars()
+        now = self.daemon_pid()
+        if now == self.pid and not quit_any:
+            raise Refused(reason)
+        try:
+            self.checks(before, self.old, send=False)
+        except CheckFailed as failure:
+            raise NeedsYou(f'refused before the swap ({reason}); the installed build was started again, '
+                           f'and then {failure}') from failure
+        if missing:
+            raise NeedsYou(f'refused before the swap ({reason}); the installed build runs, but a sidebar '
+                           'is not back')
+        self.difference(before)
+        self.status_line_note(before)
+        daemon = f'was started again (daemon pid {self.pid} -> {now})' if now != self.pid else \
+            f'kept running (daemon pid {now})'
+        raise Stopped(f'the installed build is unchanged and {daemon}: {reason}')
 
     def roll_back(self, failure, before):
         say(f'rollout: {failure}; rolling back')
@@ -801,6 +841,9 @@ def main(argv=None):
     except NeedsYou as error:
         print(f'rollout: NEEDS YOU: {error}', file=sys.stderr)
         return 4
+    except Stopped as error:
+        print(f'rollout: refused before the swap; {error}', file=sys.stderr)
+        return 1
     except (Refused, TimedOut, OSError, ValueError, KeyError, subprocess.SubprocessError,
             KeyboardInterrupt) as error:
         print(f'rollout: refused, nothing changed: {error or "interrupted"}', file=sys.stderr)

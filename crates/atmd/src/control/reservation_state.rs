@@ -319,7 +319,7 @@ impl State {
             .filter(|entry| entry.phase == Phase::Quarantined)
             .map(|entry| Quarantine {
                 agent: entry.request.agent.clone(),
-                pane: entry.request.pane.clone().or_else(|| entry.created.clone()),
+                pane: entry.created.clone().or_else(|| entry.request.pane.clone()),
                 kind: entry.request.kind,
             })
             .collect()

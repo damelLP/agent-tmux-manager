@@ -2976,6 +2976,7 @@ mod reconciliation {
     // The lifecycle flows' tests use this module's rig; they live in their own file.
     mod lifecycle {
         include!("agent_lifecycle_tests.rs");
+        include!("agent_clear_tests.rs");
     }
 
     #[tokio::test]

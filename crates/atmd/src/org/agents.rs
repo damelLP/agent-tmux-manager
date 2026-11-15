@@ -137,7 +137,7 @@ pub(super) struct AgentRuntime {
 impl AgentRuntime {
     /// The baseline recorded for `agent` on `pane`, or one that refuses every
     /// read: none was recorded, or it belongs to a pane the agent has left.
-    fn baseline(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
+    pub(super) fn baseline(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
         self.baselines
             .lock()
             .ok()
@@ -188,7 +188,7 @@ pub(super) struct ObservationProgress {
 
 #[cfg(test)]
 impl AgentRuntime {
-    fn progress(&self, phase: &'static str, agent: Option<AgentId>) {
+    pub(super) fn progress(&self, phase: &'static str, agent: Option<AgentId>) {
         let _ = self.progress.send(ObservationProgress { phase, agent });
     }
 }
@@ -453,11 +453,34 @@ impl AgentHandle {
         .await
     }
     pub async fn clear(&self, p: ClearParams) -> Result<ClearResult, AgentError> {
-        self.checkpoint(
-            p.agent,
+        const OPERATION: &str = "agent.clear";
+        if !matches!(*self.inner.ready.borrow(), Some(Ok(()))) {
+            return Err(self.unavailable(OPERATION));
+        }
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let state = rt.org.snapshot().await?;
+        let agent = state
+            .agent(&p.agent)
+            .ok_or_else(|| AgentError::NotFound(format!("agent {} was not found", p.agent)))?;
+        let pane = agent.pane.as_ref().map(PaneId::parse).transpose()?;
+        let request = ReservationRequest::new(
+            p.agent.clone(),
+            pane.clone(),
             ReservationKind::Clear,
-            "agent.clear",
-            Duration::from_millis(p.timeout_ms),
+            WaitPolicy::Wait,
+            Instant::now() + Duration::from_millis(p.timeout_ms),
+        );
+        let waiting = super::agent_lifecycle::Waiting::default();
+        let (work, cleanup) = (rt.clone(), rt.clone());
+        let (id, why) = (p.agent.clone(), waiting.clone());
+        self.lifecycle(
+            request,
+            move |r| async move { work.clear(&r, &p.agent, pane.as_ref(), &waiting).await },
+            move |_, _| async move { cleanup.settle_clear(&id, &why).await },
         )
         .await
     }
@@ -916,14 +939,14 @@ impl AgentRuntime {
     }
 }
 
-fn matches_agent(agent: &Agent, row: &SessionView) -> bool {
+pub(super) fn matches_agent(agent: &Agent, row: &SessionView) -> bool {
     agent.pane.is_some()
         && row.tmux_pane == agent.pane
         && row.parent_session_id.is_none()
         && agent.excluded_session_id.as_ref() != Some(&row.id)
 }
 
-fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> Harness {
+pub(super) fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> Harness {
     agent
         .role
         .as_ref()

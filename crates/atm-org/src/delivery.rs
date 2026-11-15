@@ -1274,6 +1274,20 @@ mod tests {
     }
 
     #[test]
+    fn queued_retry_waits_behind_a_running_turn_without_a_busy_notice() {
+        let mut h = History::new(false);
+        h.attempt(1, 0);
+        h.failure(false, 2);
+        assert_eq!(h.message().status, DeliveryStatus::Queued);
+        let mut live = ready();
+        live.running_turn_since = Some(time(0));
+        for now in [1800, 7200] {
+            wait(h.step(&live, now), WaitReason::SessionBusy);
+            assert!(!busy_notice_due(h.message(), &live, time(now)));
+        }
+    }
+
+    #[test]
     fn running_turn_cannot_override_receipt_or_an_uncertain_attempt() {
         let mut h = History::new(false);
         let mut live = ready();

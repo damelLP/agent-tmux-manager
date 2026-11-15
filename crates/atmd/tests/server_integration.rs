@@ -2153,9 +2153,9 @@ async fn assert_no_sessions(registry: &atmd::registry::RegistryHandle) {
 async fn test_e2e_pi_captured_run_upgrades_pending_session() {
     // Discovery registers an agent it recognizes as `pending-<pid>`.
     // pi-atm's first frame names the session, and atmd renames that row
-    // rather than adding a second one. (Discovery can't see pi 0.73.1, see
-    // atm-pi-adapter's Known gaps, so today pi's row starts at that first
-    // frame, as in the new-session test below.)
+    // rather than adding a second one. (A pi that starts after atmd is not
+    // discovered first: its row starts at that first frame, as in the
+    // new-session test below.)
     let Some(events) = captured_pi_events("pi_tool_run_0.73.1.jsonl") else {
         return;
     };

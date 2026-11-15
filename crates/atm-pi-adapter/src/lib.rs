@@ -179,11 +179,16 @@
 //!   "one session id held by two pids". Older pi-atm sent no
 //!   `session_id` (it read `currentSessionId`, which no pi release has),
 //!   so each pid got its own `pending-<pid>` and the case never arose.
-//! - Discovery can't see pi. pi sets `process.title = "pi"` (found in
-//!   0.50.0, 0.65.0, 0.70.0, 0.72.1 and 0.73.1, not in 0.10.0), so
-//!   `/proc` shows cmdline `pi` and exe `node`. pi's matchers need a
-//!   path, and pi rejects bare cmdline matches. A pi already running
-//!   when atmd starts appears only with pi-atm's next event.
+//! - Discovery sees pi by its bare name. pi sets `process.title = "pi"`
+//!   (found in 0.50.0, 0.65.0, 0.70.0, 0.72.1, 0.73.1 and 1.5.0, not in
+//!   0.10.0), so `/proc` shows cmdline `pi` with NUL padding, comm `pi`
+//!   and exe `node`. Captured: pi 1.5.0, 2026-11-15, `/proc` read of
+//!   running sessions. pi's registry entry therefore matches a bare `pi`
+//!   as argv0. A pi already running when atmd starts gets a
+//!   `pending-<pid>` row, without its model, cost or session id until
+//!   pi-atm's next event. Before that match existed, such a pi had no
+//!   row until that event. Checked with a stand-in of that shape running
+//!   pi-atm; a real pi across a daemon restart is unverified.
 //! - `/new`, `/resume`, `/fork` and `/reload` replace the session in the
 //!   same process. pi (0.65.0 and later) loads pi-atm afresh, so
 //!   `session_shutdown` comes from the old instance and `session_start`

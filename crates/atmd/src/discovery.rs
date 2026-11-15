@@ -948,10 +948,25 @@ mod tests {
         assert!(!matches_harness_path("claude", "claude-dev"));
     }
 
+    /// The cmdline of a real pi. pi sets `process.title = "pi"`, which
+    /// overwrites its argv in place: `/proc` then shows the bare name and
+    /// NUL padding as the cmdline, `pi` as comm and `node` as exe.
+    ///
+    /// Captured: pi 1.5.0, 2026-11-15, read of `/proc/<pid>/cmdline` of a
+    /// running interactive session (90 bytes: `pi` and 88 NULs).
+    fn pi_title_cmdline() -> Vec<u8> {
+        let mut cmdline = b"pi".to_vec();
+        cmdline.resize(90, 0);
+        cmdline
+    }
+
     #[test]
-    fn test_pi_registry_matcher_rejects_bare_cmdline_match() {
-        let pi = atm_core::find_harness_definition("pi");
-        assert!(pi.is_some_and(|definition| !definition.allow_bare_cmdline_match));
+    fn pi_with_its_title_overwritten_cmdline_is_discovered() {
+        let pi = atm_core::find_harness_definition("pi")
+            .unwrap_or_else(atm_core::default_harness_definition);
+        assert!(cmdline_matches_definition(&pi_title_cmdline(), pi));
+        // Only the cmdline can identify that process: its exe is node.
+        assert!(!matches_harness_path("pi", "/usr/bin/node"));
         assert!(matches_harness_path("pi", "/usr/bin/pi"));
         assert!(!matches_harness_path("pi", "not-pi"));
     }
@@ -970,11 +985,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cmdline_matching_rejects_bare_pi_positional_arg() {
+    fn test_cmdline_matching_allows_bare_pi_only_on_argv0() {
         let pi = atm_core::find_harness_definition("pi")
             .unwrap_or_else(atm_core::default_harness_definition);
-        assert!(!cmdline_arg_matches_definition(0, "pi", pi));
+        assert!(cmdline_arg_matches_definition(0, "pi", pi));
+        assert!(!cmdline_arg_matches_definition(1, "pi", pi));
         assert!(!cmdline_arg_matches_definition(2, "pi", pi));
+        // A program that takes `pi` as data, or whose name only starts
+        // with it, is not a pi session.
+        assert!(!cmdline_matches_definition(b"calc\0pi\0", pi));
+        assert!(!cmdline_matches_definition(b"pip\0", pi));
         assert!(cmdline_arg_matches_definition(
             1,
             "/home/user/.npm/pi-coding-agent/bin/pi.js",

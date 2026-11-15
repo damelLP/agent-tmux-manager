@@ -228,7 +228,7 @@ Durations must be positive and fit the policy's checked timestamp arithmetic; re
 
 A task's optional `budget` on `task.create` accepts exact cost (`{"microdollars":1000000}`), turns and an RFC3339 UTC deadline. Cost and turns cross strictly **above** their limits; a deadline is due **at** its timestamp. Unavailable usage is unknown, not zero. A past deadline is valid; a newly requested negative cost is refused.
 
-A crossed limit sends the creator one ordinary system note **per task**, across all its limits and state changes. A system-created task notifies the owner. The committed message is the latch even when queued, read or failed, so restarts do not create duplicate notes. `task.get` includes `budget_status` with current crossed limits and the notification id. Deadlines include open, waiting and review time; accepted/cancelled tasks are evaluated through their completion time, not a later restart time. **Nothing is stopped, cancelled or blocked.** `[reminder] enabled=false` disables reminders only, never budget deadlines.
+A crossed limit sends the creator one ordinary system note **per task**, across all its limits and state changes. A system-created task notifies the owner. The committed message is the latch even when queued, read or failed, so restarts do not create duplicate notes. `task.get` includes `budget_status` with current crossed limits and the notification id. Deadlines include open, waiting and review time; accepted/cancelled tasks are evaluated through their completion time, not a later restart time. **Nothing is stopped, cancelled or blocked.** Notifications need a valid delivery configuration; after fixing it and restarting, budget checks catch up. With valid delivery, `[reminder] enabled=false` disables reminders only, never budget deadlines.
 
 ## Task reminders
 
@@ -246,7 +246,7 @@ enabled = true    # false turns reminders off
 delay_secs = 60   # idle time after the turn's end before the note
 ```
 
-`atmd` reads `[reminder]` when it starts. An unknown key or `delay_secs = 0` turns reminders off and logs the reason.
+`atmd` reads `[reminder]` when it starts. An unknown key or `delay_secs = 0` turns reminders off and logs the reason. They are also off while `[delivery]` is invalid: nothing could type the note.
 
 Limits:
 

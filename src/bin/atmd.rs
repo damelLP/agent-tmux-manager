@@ -609,10 +609,7 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     services.raw = raw.clone();
     services.delivery_policy = Some(config.delivery);
     // An invalid section never leaves the reminder on with guessed settings.
-    services.reminder = config.reminder.unwrap_or_else(|reason| {
-        warn!(%reason, "Invalid reminder configuration; task reminders are off");
-        None
-    });
+    services.reminder = reminder_from(config.reminder);
     let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
@@ -703,6 +700,18 @@ fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
             }
         }
     }
+}
+
+/// The reminder's settings for the server. A section that could not be read
+/// never leaves the reminder on with guessed settings: it is off, with the
+/// reason logged.
+fn reminder_from(
+    config: Result<Option<atm_org::reminder::ReminderSettings>, String>,
+) -> Option<atm_org::reminder::ReminderSettings> {
+    config.unwrap_or_else(|reason| {
+        warn!(%reason, "Invalid reminder configuration; task reminders are off");
+        None
+    })
 }
 
 /// How long atmd waits for `config.toml` before it starts without it.
@@ -993,6 +1002,31 @@ mod tests {
         // A file that cannot be read turns reminders off, with the reason.
         let config = parse_startup_config(Err(anyhow::anyhow!("config read timed out")));
         assert!(config.reminder.unwrap_err().contains("timed out"));
+    }
+
+    #[test]
+    fn an_invalid_or_unreadable_reminder_config_leaves_reminders_off() {
+        use atm_org::reminder::ReminderSettings;
+        let started =
+            |text: Result<Option<String>>| reminder_from(parse_startup_config(text).reminder);
+        let read = |text: &str| started(Ok(Some(text.into())));
+        // What the daemon hands the server: on by default, or as the file says.
+        assert_eq!(started(Ok(None)), Some(ReminderSettings::default()));
+        let five = ReminderSettings {
+            delay: std::time::Duration::from_secs(5),
+        };
+        assert_eq!(read("[reminder]\ndelay_secs=5"), Some(five));
+        assert_eq!(read("[reminder]\nenabled=false"), None);
+        // Never on with guessed settings.
+        for text in [
+            "[reminder]\nunknown=1",
+            "[reminder]\ndelay_secs=0",
+            "[reminder]\ndelay_secs='soon'",
+            "[reminder",
+        ] {
+            assert_eq!(read(text), None, "{text:?}");
+        }
+        assert_eq!(started(Err(anyhow::anyhow!("config read timed out"))), None);
     }
 
     #[test]

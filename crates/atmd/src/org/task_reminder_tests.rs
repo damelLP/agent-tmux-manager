@@ -214,9 +214,19 @@ fn a_delay_the_calendar_cannot_hold_arms_nothing() {
 
 // ------------------------------------------------------------------ the rig
 
+/// Holds the first append of one kind until the test lets it go, so the
+/// scheduler can be kept busy at a known point.
+#[derive(Default)]
+struct Gate {
+    kind: Mutex<Option<&'static str>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 /// The organisation actor over a log kept in memory.
 struct Rig {
     org: OrgHandle,
+    gate: Arc<Gate>,
     log: Arc<Mutex<Vec<Envelope>>>,
     committed: broadcast::Receiver<Arc<Envelope>>,
     rows: broadcast::Sender<SessionEvent>,
@@ -230,6 +240,7 @@ fn actor(
     state: OrgState,
     log: Arc<Mutex<Vec<Envelope>>>,
     fail: Option<&'static str>,
+    gate: Arc<Gate>,
     cancel: CancellationToken,
 ) -> OrgHandle {
     let (requests, receive) = mpsc::channel(64);
@@ -244,7 +255,17 @@ fn actor(
         cancel,
         move |mut envelope: Envelope| {
             let log = log.clone();
+            let gate = gate.clone();
             async move {
+                let held = gate
+                    .kind
+                    .lock()
+                    .unwrap()
+                    .take_if(|kind| *kind == envelope.kind);
+                if held.is_some() {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
                 if fail == Some(envelope.kind.as_str()) {
                     return Err(EventLogError::Io {
                         path: "memory".into(),
@@ -280,8 +301,10 @@ impl Rig {
     ) -> Self {
         let fresh = log.lock().unwrap().is_empty();
         let cancel = CancellationToken::new();
-        let org = actor(state, log.clone(), fail, cancel.clone());
+        let gate = Arc::<Gate>::default();
+        let org = actor(state, log.clone(), fail, gate.clone(), cancel.clone());
         let rig = Self {
+            gate,
             committed: org.committed.subscribe(),
             org,
             log,
@@ -354,13 +377,17 @@ impl Rig {
 
     /// A work task `creator` made, assigned to `to`.
     async fn task(&self, creator: Address, to: &str) -> TaskId {
+        self.titled("Do the work", creator, to).await
+    }
+
+    async fn titled(&self, title: &str, creator: Address, to: &str) -> TaskId {
         let by = TaskActor {
             who: creator.clone(),
             lead: true,
         };
         let made = self
             .run(OrgCommand::Task(TaskCommand::Create(TaskCreated {
-                title: "Do the work".into(),
+                title: title.into(),
                 kind: TaskKind::Work,
                 creator,
                 parent: None,
@@ -664,6 +691,59 @@ async fn mail_on_its_way_holds_the_reminder_until_it_is_typed() {
     assert!(matches!(event, OrgEvent::TaskReminded(fact) if fact.agent_id == agent("build")));
 }
 
+/// Registry rows are read before a wake is taken. While the scheduler is
+/// busy writing one agent's reminder, the wakes of many seats fall due and
+/// each seat starts a new turn. When the scheduler looks again, every seat
+/// has both a row to read and a wake that is over: reading the rows first
+/// drops every wait. A scheduler that took a wake first even once would
+/// remind the seats still waiting, and with this many seats it would.
+#[tokio::test(start_paused = true)]
+async fn a_turn_that_started_while_the_scheduler_was_busy_is_read_before_its_wake() {
+    const SEATS: usize = 32;
+    let mut rig = Rig::new().await;
+    let lead = Address::Agent(agent("lead"));
+    rig.task(lead.clone(), "build").await;
+    let seats: Vec<String> = (0..SEATS).map(|seat| format!("seat{seat}")).collect();
+    for (number, seat) in seats.iter().enumerate() {
+        rig.seat(seat, &format!("%{}", 10 + number), seat).await;
+        rig.task(lead.clone(), seat).await;
+    }
+    rig.seat("last", "%9", "last").await;
+    rig.task(lead, "last").await;
+    rig.committed = rig.org.committed.subscribe();
+    *rig.gate.kind.lock().unwrap() = Some("task.reminded");
+    rig.schedule();
+    rig.turn("s1").await;
+    rig.pass(3).await;
+    for seat in &seats {
+        rig.turn(seat).await;
+    }
+
+    // The builder's wait is over at 60 s; its audit event is held in the log.
+    rig.gate.entered.notified().await;
+    assert_eq!(rig.now(), at(DELAY));
+    // The seats' waits are over at 63 s. Each starts a turn at 64 s, which
+    // the busy scheduler cannot read yet.
+    rig.pass(4).await;
+    for seat in &seats {
+        rig.rows.send(working(seat)).unwrap();
+    }
+    rig.gate.release.notify_one();
+    // One more seat's turn end shows that the scheduler has moved on.
+    rig.turn("last").await;
+
+    let (first, event) = rig.next("task.reminded").await;
+    assert_eq!(first.ts, at(DELAY));
+    assert!(matches!(event, OrgEvent::TaskReminded(fact) if fact.agent_id == agent("build")));
+    let (second, event) = rig.next("task.reminded").await;
+    assert!(
+        matches!(&event, OrgEvent::TaskReminded(fact) if fact.agent_id == agent("last")),
+        "{event:?}"
+    );
+    assert_eq!(second.ts, at(DELAY + 4 + DELAY));
+    assert_eq!(rig.count("task.reminded"), 2);
+}
+
 #[tokio::test]
 async fn a_task_that_moved_since_the_snapshot_gets_no_event_and_no_note() {
     let rig = Rig::new().await;
@@ -939,6 +1019,28 @@ async fn missed_registry_events_cost_the_pending_waits_only() {
 }
 
 // ----------------------------------------------------------------- the texts
+
+#[tokio::test]
+async fn control_characters_in_a_title_cannot_break_a_note_into_lines() {
+    let rig = Rig::new().await;
+    // An escape sequence and a line break, as a careless title could hold.
+    let task = rig
+        .titled("a\u{1b}[31mb\nc\td", Address::Owner, "build")
+        .await;
+    let state = rig.state().await;
+    let builder = state.agent(&agent("build")).unwrap();
+    let held = [state.task(&task).unwrap()];
+    let reminder = reminder_note(&state, builder, &held).unwrap().body;
+    let first = format!("Your turn ended and task {task} (\"a [31mb c d\") is still assigned.");
+    assert_eq!(reminder.lines().next(), Some(first.as_str()));
+    assert_eq!(reminder.lines().count(), 2);
+    let flag = flag_note(builder, Address::Owner, &held).body;
+    assert!(
+        flag.starts_with(&format!("Task {task} (\"a [31mb c d\"): ")),
+        "{flag}"
+    );
+    assert_eq!(flag.lines().count(), 1);
+}
 
 #[tokio::test]
 async fn long_titles_are_cut_and_many_tasks_wait_for_the_next_turn_end() {

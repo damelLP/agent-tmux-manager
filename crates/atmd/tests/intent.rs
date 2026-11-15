@@ -174,6 +174,21 @@ async fn project_selection_is_explicit_when_ambiguous_and_cannot_override_a_name
     rig.create(None, first).await.unwrap();
 }
 
+// Break caught: ignoring a named caller's conflicting selector when its own policy allows the measure.
+#[tokio::test]
+async fn named_caller_cannot_select_another_project_with_an_own_listed_measure() {
+    let rig = Rig::new().await;
+    rig.project("second", "%8").await;
+    rig.intent("first", "## How we will know\n- mechanical: first-check\n");
+    rig.intent("second", "## How we will know\n- owner\n");
+    let mut request = params(json!({"kind":"mechanical","command":"first-check"}));
+    rig.create(Some("%7"), request.clone()).await.unwrap();
+    request["project_id"] = json!("first");
+    rig.create(Some("%7"), request.clone()).await.unwrap();
+    request["project_id"] = json!("second");
+    rig.refused(Some("%7"), request, "refused").await;
+}
+
 // Break caught: turning a missing project root/selector or a relative root into unchecked access.
 #[tokio::test]
 async fn no_registered_project_preserves_legacy_creation_but_bad_roots_are_refused() {

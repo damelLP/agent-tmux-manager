@@ -99,11 +99,12 @@ atm layout pair                    # two agents + ATM sidebar
 atm agent up worker                          # start the agent of role "worker" in this project
 atm agent up worker --project-root ../other  # ... in another project
 atm agent clear worker                      # clear the agent's current context
+atm agent handover worker                   # ask it to save its state, then clear it
 atm agent respawn worker                    # replace its pane and start it again
 atm agent down worker --kill                # stop the agent and kill its pane
 ```
 
-For `clear`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
+For `clear`, `handover`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
 
 `atm agent up <name>` asks `atmd` to start the agent that `.atm/roles/<name>.md` under the project root describes. The project root is the current directory unless `--project-root` is given. `atmd` splits a new pane at 50% without moving your focus, waits there for an idle shell, types one launch line and Enter, and waits for the harness. The line is `cd <the role's cwd> && ATM_AGENT=<project>/<name>`, then the role's `command_prefix`, then the harness command with the role's `spawn_args` and `model`.
 
@@ -116,6 +117,26 @@ For `clear`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name r
 - **Prompts it cannot launch into, or launches into too early.** A prompt that redraws itself after it was read, or carries a clock, ends the start as `stuck`: with nothing typed if it changes before the launch line is typed, with the line typed and not run if it changes after. A prompt whose last line is empty, and a pane too small for the launch line once it wraps, end the start as `stuck` too (nothing typed, or the line typed and not run and left at the prompt for you). Startup output that ends without a newline (`Loading...`) can be taken for the prompt: the launch line is then typed after it, before the shell's own prompt, and usually runs when the shell gets to it.
 - **A start has 60 seconds** (the command itself waits up to 85). Once `atmd` knows the start is recorded, any failure, and the deadline, leave the agent `stuck` with the reason `start did not complete: <why>; inspect %N` and one note in your inbox. When the deadline ends it, the command fails with that same reason, not with a bare timeout. `atm agent clear` at its `--timeout-ms` and `atm agent respawn` at its 60 seconds answer the same way: the command fails with the reason the agent is then `stuck` with (`clear did not complete: <why>; inspect %N` for a clear), not with a bare timeout. Two cases end otherwise: if the answer to recording the start is lost, there is no `stuck` and no note, and the agent goes `down` at the next check of its pane; and if `atmd` cannot read its log or write the `stuck` record when the start ends, the agent stays `starting` and takes no further command until `atmd` is restarted. A pane the start created stays for you to look at. If the start failed before its pane was recorded, the agent then goes `down` and its reason keeps that text.
 - **Start dialogs.** `atmd` answers two questions a harness may ask at its start, each key only while the pane still shows that same question and no tmux client is focused on it. A folder trust dialog (Claude Code's, Codex's "Folder access") is accepted only when its folder is exactly one of the role's `trust_dirs` (resolved against the project root); any other folder ends the start as stuck with no key sent. Codex's update offer is skipped with one Escape. Every other question (Codex's "Hooks need review", a startup warning, a permission dialog) is left for you: the start ends as stuck, or waits until its 60 seconds are over.
+
+### Handing an agent over
+
+`atm agent handover <agent>` does in one command what a clear by hand needs three steps for. `atmd` sends the agent one message that asks it to write what its next session needs to `.atm/memory/<name>.md` in the project's main checkout. It waits until that turn has ended and the file has changed, and then clears the agent as `atm agent clear` does. The new session finds the file through `atm me`.
+
+```bash
+atm agent handover worker                      # waits up to 10 minutes for the save, then clears
+atm agent handover worker --timeout-ms 120000  # 30000 to 1800000
+atm agent handover worker --format json        # {"agent_id":…,"message_id":"m12","state":"cleared","session_id":…}
+```
+
+- **Nothing is cleared unless the agent saved.** Saved means the memory file's size or modification time changed after the request was queued, or the file is new. Its content is not read. If the save turn ends and the file is as it was, the command fails with `<agent> ended its save turn and <file> did not change; nothing was cleared`.
+- **The request is an ordinary message** from `system`, typed as `[mN] Read: atm inbox --id mN` under the usual delivery rules: an idle agent, an empty editor, no dialog, and not the pane you are focused on. If it is not delivered within the timeout the command fails and says so. The request stays queued, the next `atm agent handover` of that agent reuses it, and `atm msg give-up mN` cancels it.
+- **If the save turn does not end in time** the command fails with `<agent>'s save turn did not end in <n> s`, and adds `it waits at a dialog in %N` when the agent is waiting for an answer, for example a permission to write the file.
+- **If the clear is refused after the save** (you are focused on the pane, a draft is in the editor, a new turn has started) the command fails with `<agent> saved its state (mN); ` followed by the clear's own reason. Run `atm agent clear <agent>` when the pane is free.
+- **An agent may hand itself over.** From its own pane the command answers `started` at once, because the request can only arrive after the agent's current turn has ended. The agent then ends its turn, is asked to save, and is cleared. If that handover fails, the agent's manager (you, when its role names none) gets one note with the reason.
+- **Only a `ready` agent with a known session** can be handed over, and one handover per agent runs at a time. Anyone may ask, as for messages.
+- **A restart of `atmd` during a handover** loses it: the request is still delivered and the agent saves, but nothing is cleared. Run the command again.
+
+**A note at the context line.** When a named agent's turn ends and its context is at 40% or more, `atmd` sends one note to the agent's manager (to you for an agent whose role names none, and for an adopted agent): `agent <id> is at <n>% of its context (line 40%). Hand it over: atm agent handover <id>`. It is sent once per session and nothing is cleared. After a restart of `atmd` a session that was already noted can be noted once more. The line is 40% for every harness and model until measurements give better ones.
 
 ### Finding your instructions and handover
 

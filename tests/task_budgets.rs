@@ -65,6 +65,18 @@ fn reminders_off_still_notifies_due_budget_once_across_restart() {
     assert_eq!(got["task"]["state"], "open");
     assert_eq!(got["budget_status"]["crossed"], json!(["deadline"]));
     assert_eq!(got["budget_status"]["notification"], message);
+    // The canonical note tells its recipient to run this exact CLI command.
+    // Check both client views, without comparing advancing usage wall time.
+    let output = rig.atm(None, &["task", "get", &task]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let displayed = text
+        .lines()
+        .find_map(|line| line.strip_prefix("  budget_status: "))
+        .map(|value| serde_json::from_str::<Value>(value).unwrap());
+    assert_eq!(displayed.as_ref(), Some(&got["budget_status"]));
+    let raw = rig.atm_json(None, &["task", "get", &task, "--format", "json"]);
+    assert_eq!(raw["budget_status"], got["budget_status"]);
     rig.call("msg.ack", json!({"ids":[message]}), None).unwrap();
     rig.test.rig.restart_daemon();
 

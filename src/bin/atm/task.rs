@@ -336,14 +336,20 @@ fn render(method: &str, raw: &Value, out: &mut impl Write) -> Result<()> {
             // Task/GetResult are serialize-only. Reuse the shared summary subset,
             // then show all remaining raw fields rather than copying the Task DTO.
             render_summary(&decode(value)?, out)?;
-            for (key, value) in task {
-                if !matches!(
+            let details = task.iter().filter(|(key, _)| {
+                !matches!(
                     key.as_str(),
                     "task_id" | "state" | "kind" | "agent_id" | "title" | "reason"
-                ) {
-                    write!(out, "  {}: ", escaped(key, false))?;
-                    output(value, MessageFormat::Json, "", out)?;
-                }
+                )
+            });
+            let extra = raw
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(key, _)| key.as_str() != "task");
+            for (key, value) in details.chain(extra) {
+                write!(out, "  {}: ", escaped(key, false))?;
+                output(value, MessageFormat::Json, "", out)?;
             }
         }
         _ => {

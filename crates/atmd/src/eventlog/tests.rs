@@ -309,8 +309,10 @@ async fn rotation_io_failure_stops_writer_without_publishing() {
         Ok(()) => {
             tokio::time::timeout(ROTATION_HANG_GUARD, async {
                 tokio::select! {
-                    _ = log.requests.closed() => {},
+                    biased;
+                    // A reply must not hide behind simultaneous receiver closure.
                     result = response => assert!(result.is_err(), "failed writer served another request: {result:?}"),
+                    _ = log.requests.closed() => {},
                 }
             })
             .await

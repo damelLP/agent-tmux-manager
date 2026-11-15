@@ -777,6 +777,19 @@ impl Rig {
         policy: DeliveryPolicy,
         scheduler: Option<Effects>,
     ) -> Self {
+        Self::start_with_harness(base, fold, agent, policy, scheduler, Harness::Pi).await
+    }
+
+    /// The Codex variant starts Ready after a clear: no binding or registry
+    /// row, but the old session is excluded from the first-prompt scope.
+    async fn start_with_harness(
+        base: u64,
+        fold: Fold,
+        agent: bool,
+        policy: DeliveryPolicy,
+        scheduler: Option<Effects>,
+        harness: Harness,
+    ) -> Self {
         let gate = Arc::new(Semaphore::new(1));
         let (enter, entered) = mpsc::unbounded_channel();
         let (requests, receive) = mpsc::channel::<Request>(64);
@@ -823,7 +836,9 @@ impl Rig {
             cancel.clone(),
         );
         let agents = if agent {
-            let seed = [
+            let codex = harness == Harness::Codex;
+            let role = if codex { "codex" } else { "pi" };
+            let mut seed = vec![
                 OrgCommand::RegisterProject {
                     project_id: "demo".parse().unwrap(),
                     root: "/demo".into(),
@@ -831,7 +846,8 @@ impl Rig {
                 },
                 OrgCommand::Up {
                     agent_id: worker(),
-                    role: atm_org::parse_role("worker", "+++\nharness='pi'\n+++\n").unwrap(),
+                    role: atm_org::parse_role("worker", &format!("+++\nharness='{role}'\n+++\n"))
+                        .unwrap(),
                 },
                 OrgCommand::PaneCreated {
                     agent_id: worker(),
@@ -839,25 +855,34 @@ impl Rig {
                 },
                 OrgCommand::SessionBound {
                     agent_id: worker(),
-                    session_id: SessionId::new("s1"),
+                    session_id: SessionId::new(if codex { "old" } else { "s1" }),
                 },
             ];
+            if codex {
+                seed.extend([
+                    OrgCommand::Clear { agent_id: worker() },
+                    OrgCommand::EditorReady { agent_id: worker() },
+                ]);
+            }
             for command in seed {
                 org.execute(command, utc()).await.unwrap();
             }
-            let mut row = SessionDomain::new(
-                SessionId::new("s1"),
-                AgentType::GeneralPurpose,
-                Model::default(),
-            );
-            row.harness = Harness::Pi;
-            row.tmux_pane = Some(pane().to_string());
-            registry.register(row).await.unwrap();
+            if !codex {
+                registry.register(row("s1")).await.unwrap();
+            }
             // The agent service's check of the pane when it starts.
-            let idle = pi(IDLE);
+            let idle = if codex {
+                codex_frame(CODEX_IDLE)
+            } else {
+                pi(IDLE)
+            };
             tmux.script_inspect(&pane(), Some(&idle.inspection))
                 .unwrap();
-            tmux.script_capture(&idle).unwrap();
+            // Ready unbound agents are inspected but need no restart
+            // capture; only a recorded binding is revalidated by a read.
+            if !codex {
+                tmux.script_capture(&idle).unwrap();
+            }
             let (agents, _task) = spawn_agents_with(
                 org.clone(),
                 registry.clone(),
@@ -868,7 +893,8 @@ impl Rig {
             );
             guarded(agents.reconciled()).await.unwrap();
             assert_eq!(tmux.pending_reads(&pane()).unwrap(), 0);
-            agents.record_baseline(worker(), "%1", baseline());
+            let baseline = if codex { codex_baseline() } else { baseline() };
+            agents.record_baseline(worker(), "%1", baseline);
             agents
         } else {
             AgentHandle::disabled("no agent service in this rig")
@@ -1038,6 +1064,10 @@ impl Rig {
     /// A message for the worker, folded, and the worker's pane observed just
     /// now as the executor will see it: idle, empty, unfocused.
     async fn queue_message(&mut self) -> MessageId {
+        self.queue_observed_message(idle_observation()).await
+    }
+
+    async fn queue_observed_message(&mut self, observation: RecipientObservation) -> MessageId {
         let seq = self.commit(Rig::message(worker())).await;
         if self.messages.is_some() {
             self.folded(seq).await;
@@ -1046,7 +1076,7 @@ impl Rig {
         }
         let observed = HistoryUpdate::Observed {
             recipient: worker(),
-            observation: idle_observation(),
+            observation,
         };
         self.rt.history.record(observed, self.now()).unwrap();
         // The recipient's job consumes the wait it reads: the hold clock runs.
@@ -1350,6 +1380,54 @@ fn staged(id: MessageId) -> PaneCapture {
         (InputState::Draft, TurnState::NotRunning, DialogState::None)
     );
     capture
+}
+
+/// Real Codex 0.167.0 fresh editor used by the restart check; provenance
+/// is recorded with the adapter's fixture. No harness process is started.
+const CODEX_IDLE: &str = include_str!(
+    "../../../atm-codex-adapter/tests/fixtures/screen_styled_u5b_rich-fresh_0.167.0.txt"
+);
+const CODEX_EMPTY: &str = include_str!(
+    "../../../atm-codex-adapter/tests/fixtures/screen_p3_120x40-r1-C-u-empty_0.167.0.styled.txt"
+);
+const CODEX_STAGED: &str = include_str!(
+    "../../../atm-codex-adapter/tests/fixtures/screen_p3_120x40-r1-C-u-staged_0.167.0.styled.txt"
+);
+
+fn codex_baseline() -> PaneBaseline {
+    PaneBaseline::adopted(100)
+        .with_harness("codex".into())
+        .unwrap()
+}
+
+fn codex_frame(fixture: &str) -> PaneCapture {
+    with(pi(fixture), |capture| {
+        capture.inspection.foreground_command = Some("codex".into());
+    })
+}
+
+async fn ready_unbound_codex() -> (Rig, MessageId) {
+    // Six seed events, then the message whose real staged frame is m123456.
+    let mut rig = Rig::start_with_harness(
+        123_449,
+        Fold::Hand,
+        true,
+        DeliveryPolicy::default(),
+        None,
+        Harness::Codex,
+    )
+    .await;
+    let recipient = rig.rt.agents.recipient(&worker()).await.unwrap();
+    assert_eq!(recipient.status, AgentStatus::Ready);
+    assert_eq!(recipient.harness, Harness::Codex);
+    assert!(recipient.session_id.is_none() && recipient.session.is_none());
+    assert_eq!(recipient.excluded, Some(SessionId::new("old")));
+    let observation = observation(&recipient, &codex_frame(CODEX_EMPTY)).unwrap();
+    let id = rig.queue_observed_message(observation).await;
+    assert_eq!(id, MessageId::new(123_456));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 1 });
+    (rig, id)
 }
 
 /// The worker's pane as the executor converts the idle frame, for history.
@@ -1734,6 +1812,79 @@ async fn history_arm_failure_has_zero_input() {
     ));
     // Nothing was typed, so the attempt is failed for a retry.
     assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+}
+
+/// A Ready Codex editor after clear has no session yet. Its first attempt
+/// must arm both stores lazily and keep the excluded pre-clear session;
+/// only a new session's exact prompt may confirm the one pasted reference.
+#[tokio::test(start_paused = true)]
+async fn unbound_codex_attempt_keeps_the_excluded_session_in_both_scopes() {
+    let (mut rig, id) = ready_unbound_codex().await;
+    rig.script(&[
+        codex_frame(CODEX_EMPTY),
+        codex_frame(CODEX_EMPTY),
+        codex_frame(CODEX_STAGED),
+        codex_frame(CODEX_STAGED),
+    ]);
+    let wakes = rig.wakes();
+    let attempt = rig.spawn_deliver(id);
+    let envelope = rig.committed().await;
+    assert_eq!(envelope.kind, "msg.delivery_attempted");
+    rig.apply(&envelope);
+    rig.fold_rest();
+    until("the lazy scope was armed", || rig.wakes() != wakes).await;
+    let scope = AttemptScope {
+        harness: Harness::Codex,
+        session_id: None,
+        excluded_sessions: HashSet::from([SessionId::new("old")]),
+        ..scope(id, envelope.seq)
+    };
+    // Same scope is idempotent; missing the exclusion is a different scope.
+    rig.rt.evidence.arm(scope.clone()).unwrap();
+    rig.rt
+        .history
+        .record(
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            rig.now(),
+        )
+        .unwrap();
+    let other = AttemptScope {
+        excluded_sessions: HashSet::new(),
+        ..scope
+    };
+    assert!(matches!(
+        rig.rt.evidence.arm(other.clone()),
+        Err(MessageError::Refused(_))
+    ));
+    assert!(matches!(
+        rig.rt
+            .history
+            .record(HistoryUpdate::Armed { scope: other }, rig.now()),
+        Err(MessageError::Conflict(_))
+    ));
+    rig.audited().await;
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    let prompt = LifecycleEvent::PromptSubmit {
+        prompt: Some(inbox_reference(id)),
+    };
+    rig.rt
+        .evidence
+        .observe(&SessionId::new("old"), Some("%1"), Harness::Codex, &prompt)
+        .unwrap();
+    assert!(rig.rt.evidence.receipt(id).unwrap().is_none());
+    rig.rt
+        .evidence
+        .observe(&SessionId::new("new"), Some("%1"), Harness::Codex, &prompt)
+        .unwrap();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
+    assert_eq!(rig.snapshot(id).hold, None);
 }
 
 /// Lifecycle moves the agent to another pane while the attempt waits for
@@ -2633,6 +2784,64 @@ async fn session_changed_before_paste_no_input() {
     assert_eq!(snapshot.last_attempt_seq, Some(before + 1));
     assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
     assert_eq!(snapshot.hold, None);
+}
+
+/// A row can arrive while delivery is waiting for its reservation. The
+/// binding observer is behind that reservation, so a Ready unbound Codex
+/// recipient with an eligible row is reachable and must spend no attempt.
+#[tokio::test(start_paused = true)]
+async fn unbound_codex_with_an_eligible_row_is_refused_before_commit() {
+    let (rig, id) = ready_unbound_codex().await;
+    let parked = rig.park().await;
+    let attempt = rig.spawn_deliver(id);
+    rig.admission_requested(id).await;
+    let mut row = row("new");
+    row.harness = Harness::Codex;
+    rig.rt.registry.register(row).await.unwrap();
+    let recipient = rig.rt.agents.recipient(&worker()).await.unwrap();
+    assert_eq!(recipient.status, AgentStatus::Ready);
+    assert!(recipient.session_id.is_none());
+    assert_eq!(
+        recipient.session.as_ref().map(|row| row.id.clone()),
+        Some(SessionId::new("new"))
+    );
+    rig.script(&[codex_frame(CODEX_EMPTY)]);
+    parked.send(()).unwrap();
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(delivered, Err(MessageError::Refused(_))),
+        "{delivered:?}"
+    );
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert!(rig.snapshot(id).message.last_attempt.is_none());
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+}
+
+/// The same arrival race for a bound agent: another session's row does not
+/// match its recorded binding even at the first capture, before any commit.
+#[tokio::test(start_paused = true)]
+async fn bound_recipient_with_another_row_is_refused_before_commit() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    let parked = rig.park().await;
+    let attempt = rig.spawn_deliver(id);
+    rig.admission_requested(id).await;
+    rig.rt.registry.remove(SessionId::new("s1")).await.unwrap();
+    rig.rt.registry.register(row("s2")).await.unwrap();
+    rig.script(&[pi(IDLE)]);
+    parked.send(()).unwrap();
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(delivered, Err(MessageError::Refused(_))),
+        "{delivered:?}"
+    );
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert!(rig.snapshot(id).message.last_attempt.is_none());
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
 }
 
 /// A change after the paste, before the draft is seen: the reference is

@@ -8,6 +8,10 @@
 //! Time is paused and only in-memory I/O runs under it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// The scheduler's production observer, tested on this file's rig.
+#[path = "message_observer_tests.rs"]
+mod observer;
+
 use super::*;
 use crate::{
     control::{
@@ -40,7 +44,9 @@ use atm_core::{
     SessionStatus, TurnState,
 };
 use atm_org::{
-    delivery::{next_delivery, DeliveryPolicy, DeliverySettings, DeliveryStep, FailureReason},
+    delivery::{
+        next_delivery, DeliveryPolicy, DeliverySettings, DeliveryStep, FailureReason, WaitReason,
+    },
     Address, AgentId, AgentStatus, DeliveryStatus, MessageContent, MessageKind, OrgCommand,
     OrgEvent, OrgState,
 };
@@ -1796,6 +1802,42 @@ async fn unfolded_attempt_fails_cleanup_and_quarantines() {
     assert!(
         matches!(refused, ReservationError::Quarantined { .. }),
         "{refused:?}"
+    );
+}
+
+/// Nothing is pinned about the pane's harness yet (a start, an adopt, the
+/// pass after a daemon restart): the recipient cannot be observed. That is a
+/// lost observation, not an observation of unknown facts: no attempt, and
+/// the policy is back at its wait for a pane it knows nothing about.
+#[tokio::test(start_paused = true)]
+async fn unpinned_harness_is_a_lost_observation() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    (rig.rt.agents).record_baseline(worker(), "%1", PaneBaseline::adopted(100));
+    rig.script(&[pi(IDLE), pi(IDLE)]);
+    let before = rig.org.status().unwrap();
+
+    let delivered = rig.deliver(id).await;
+
+    assert!(
+        matches!(delivered, Err(MessageError::Refused(_))),
+        "{delivered:?}"
+    );
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before);
+    assert_eq!((rig.pastes(), rig.reads()), (0, 3));
+    // Unknown facts would wait on the editor, with the readiness clock
+    // running. A loss leaves the focus wait, which has no clock.
+    let step = rig.step(id);
+    assert!(
+        matches!(
+            step,
+            DeliveryStep::Wait {
+                reason: WaitReason::OwnerFocused,
+                ..
+            }
+        ),
+        "{step:?}"
     );
 }
 

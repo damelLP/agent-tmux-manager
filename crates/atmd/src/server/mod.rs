@@ -703,6 +703,165 @@ mod tests {
         cancel.cancel();
     }
 
+    /// A restart reads the log the previous process left. Copying it gives
+    /// the next writer its own stream lock.
+    fn copy_log(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_log(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn started_messages_hold_and_expect_an_attempt_of_the_previous_process() {
+        use crate::org::messages::{Address, InboxParams, MessageContent, MessageId, MessageKind};
+        use atm_org::delivery::{next_delivery, DeliveryPolicy, DeliveryStep, FailureReason};
+        use atm_org::{DeliveryStatus, OrgCommand};
+        let hang = Duration::from_secs(60);
+        let worker: atm_org::AgentId = "demo/worker".parse().unwrap();
+
+        // The previous process: a message to a bound agent, attempted on its
+        // pane and never confirmed.
+        let before = tempfile::tempdir().unwrap();
+        let previous = CancellationToken::new();
+        let org = crate::org::OrgHandle::open(before.path().into(), previous.clone()).await;
+        let run = |command| {
+            let org = org.clone();
+            async move {
+                let committed = timeout(hang, org.execute(command, chrono::Utc::now())).await;
+                committed.unwrap().unwrap().last().unwrap().seq
+            }
+        };
+        run(OrgCommand::RegisterProject {
+            project_id: "demo".parse().unwrap(),
+            root: "/demo".into(),
+            move_root: false,
+        })
+        .await;
+        run(OrgCommand::Adopt {
+            agent_id: worker.clone(),
+            pane: "%1".into(),
+            session_id: Some("s1".into()),
+        })
+        .await;
+        run(OrgCommand::RecordSummary(atm_org::SessionSummary {
+            session_id: "s1".into(),
+            pane: Some("%1".into()),
+            agent_id: Some(worker.clone()),
+            harness: atm_core::Harness::Pi,
+            model: None,
+            cost: None,
+            first_prompt: None,
+            started: chrono::Utc::now(),
+            ended: None,
+        }))
+        .await;
+        let sent = run(OrgCommand::SendMessage(MessageContent {
+            from: Address::Owner,
+            to: Address::Agent(worker.clone()),
+            kind: MessageKind::Note,
+            body: "brief".into(),
+            attachments: vec![],
+            task: None,
+        }))
+        .await;
+        let id = MessageId::new(sent);
+        run(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: "%1".into(),
+        })
+        .await;
+        previous.cancel();
+
+        // This process, started as the daemon starts it.
+        let after = tempfile::tempdir().unwrap();
+        copy_log(before.path(), after.path());
+        let cancel = CancellationToken::new();
+        let mut services = methods::MethodServices::new(crate::registry::spawn_registry());
+        services.org = crate::org::OrgHandle::open(after.path().into(), cancel.clone()).await;
+        let (control, _task) = crate::control::service::spawn_control(
+            Box::new(atm_tmux::MockTmuxClient::new()),
+            services.registry.clone(),
+            services.org.clone(),
+            cancel.clone(),
+        );
+        services.control = Some(control);
+        let policy = DeliveryPolicy::default();
+        services.delivery_policy = Some(Ok(policy.clone()));
+        let stop = CancellationToken::new();
+        let task = start_messages(&mut services, &stop).unwrap();
+        let messages = services.messages.clone().unwrap();
+        let (evidence, history) = services.message_tap.clone().unwrap();
+        timeout(hang, messages.initialized())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Initialized means replayed: the inbox has the message as the
+        // previous process left it.
+        let params = InboxParams {
+            recipient: Some(Address::Agent(worker.clone())),
+            unread_only: false,
+            count_only: false,
+            id: Some(id),
+            after: None,
+            limit: 1,
+        };
+        let caller = methods::CallContext {
+            client_id: methods::CallerId("test".into()),
+            from_pane: None,
+        };
+        let inbox = timeout(hang, messages.inbox(params, caller)).await.unwrap();
+        let entry = inbox.unwrap().messages.remove(0);
+        assert_eq!(entry.content.body, "brief");
+        assert_eq!(entry.status, DeliveryStatus::Delivering);
+        assert_eq!(entry.delivery.attempt, 1);
+        // Its attempt is held for the owner: this process cannot know what
+        // the paste did, so the policy must not paste it again.
+        let held = || {
+            let now = evidence.clock().now().unwrap();
+            let snapshot = history.snapshot(id, now).unwrap();
+            next_delivery(&snapshot.message, &snapshot.live, now, &policy).unwrap()
+        };
+        let restarted = DeliveryStep::Blocked {
+            reason: FailureReason::Restarted,
+        };
+        assert_eq!(held(), restarted);
+        // And the replay came before the service was ready: evidence expects
+        // the attempted session again, on the clock history recovered with,
+        // so its late receipt confirms.
+        let recovered = evidence.clock().now().unwrap() - chrono::Utc::now();
+        assert!(recovered.abs() < chrono::TimeDelta::hours(1), "{recovered}");
+        let prompt = atm_core::LifecycleEvent::PromptSubmit {
+            prompt: Some(format!("[{id}] Read: atm inbox --id {id}")),
+        };
+        evidence
+            .tap(
+                &SessionId::new("s1"),
+                Some("%1"),
+                Some(atm_core::Harness::Pi),
+                Some(&prompt),
+                true,
+                Some(&history),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence.receipt(id).unwrap().unwrap().session_id.as_str(),
+            "s1"
+        );
+        // Messages stop while the writer they commit to is still there.
+        stop.cancel();
+        timeout(hang, task).await.unwrap().unwrap();
+        cancel.cancel();
+    }
+
     #[test]
     fn test_default_socket_path() {
         assert_eq!(DEFAULT_SOCKET_PATH, "/tmp/atm.sock");

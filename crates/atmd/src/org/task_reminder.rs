@@ -64,6 +64,16 @@
 //! - One wake answers at most [`MAX_TASKS`] reminders and as many flags; the
 //!   rest are due again at the next turn end.
 //! - A failure of the organisation service is logged and the wait dropped.
+//! - The sessions due at one wake are judged one after the other, and no
+//!   registry row is read in between. A turn that starts in that time is
+//!   still judged silent, and so is one whose message was confirmed just
+//!   before the wake and whose first row is not read yet. Either costs one
+//!   reminder too early, typed after that turn, never a second one. Reasoned
+//!   from the code; not seen.
+//! - A delay of zero makes "look again" mean "now": while a message to the
+//!   agent is on its way the scheduler then spins on the organisation
+//!   service. The config refuses zero. A caller that builds the settings
+//!   itself must not pass it.
 
 use super::{agent_context::manager_address, OrgHandle};
 use crate::registry::SessionEvent;

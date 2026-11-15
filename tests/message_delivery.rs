@@ -444,10 +444,12 @@ fn owner_retry_same_id_keeps_fifo() {
 /// The head's Enter lands and its hook is lost, so the old daemon's attempt
 /// has ended in a hold before that daemon is stopped.
 ///
-/// The restart-notice assertion catches a removed restart hold. The checks
-/// after restart are no longer vacuous: removing the hold produced a
-/// `msg.delivery_failed` event. However, the test stops at the notice wait
-/// before reaching those checks under that mutation.
+/// The restart-notice wait catches a removed restart hold, and the test
+/// stops there. Without the hold the new daemon commits a non-final
+/// `msg.delivery_failed` for the head, which the no-failure check and the
+/// head's status and phase checks would also catch. The no-input,
+/// no-attempt and follower checks would still pass: the head's own turn is
+/// never finished, so the recipient is busy after the restart.
 #[test]
 fn restart_queued_and_delivering_hold() {
     let mut rig = MessageRig::start(Confirmation::Default);
@@ -510,7 +512,6 @@ fn restart_queued_and_delivering_hold() {
 
 /// A message that was never attempted is not held by a restart: the new
 /// daemon attempts it as its first attempt once the recipient is free.
-///
 #[test]
 fn unattempted_restart_recovers() {
     let mut rig = MessageRig::start(Confirmation::Generous);

@@ -1,0 +1,13 @@
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -e, no prompt.
+
+           [1mClaude Code[0m [38;5;246mv2.1.325[39m                           
+
+  [38;5;153m❯ /[1mclear[0m[38;5;153m                                        Start a new session with empty context; previous session stays[39m    
+                                                  [38;5;153mon disk (resumable with /resume)[39m                                  
+  [38;5;246m  …ents-of-style-writing-[1m[39mclear[0m[38;5;246mly-and-concisely  Write [1m[39mclear[0m[38;5;246m neutral prose, using concise sentences and[39m            
+                                                  [38;5;246mconsistent wording for local documentation, reports, examples, …[39m  
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [38;5;153m/clear[39m                     
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m[fixture] ctx [38;5;151m▰[38;5;66m▱▱▱[38;5;246m 7% Demo Model (high)[39m                 
+  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m                    

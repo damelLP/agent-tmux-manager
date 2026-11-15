@@ -1,5 +1,40 @@
 # Claude screen fixtures
 
+## Above-editor completion without a startup header (stage 1)
+
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -e, no prompt.
+
+`screen_styled_s1_clear-<state>_2.1.325.txt` retains actual tmux 3.8
+`capture-pane -p -e -N` rows, attributes and allocated grid padding. The source
+mapping is:
+
+| State | Sealed source | Shape |
+|---|---|---|
+| `multi-wrapped` | `canonical-long/multi-native-116x12-clear.styled-N` | Clipped long skill label and wrapped descriptions, no complete startup header |
+| `single` | `attempt-3/single-native-116x14-clear.styled-N` | One match, no complete startup header |
+| `multi-80` | `attempt-3/multi-native-80x14-clear.styled-N` | Narrow multi-match viewport |
+| `multi-160` | `attempt-3/multi-native-160x14-clear.styled-N` | Wide multi-match viewport |
+| `multi-header` | `attempt-3/multi-native-116x32-clear.styled-N` | Complete startup header still visible |
+| `multi-drawn` | `attempt-3/multi-drawn-116x14-clear.styled-N` | Drawn inverse cursor rather than native cursor |
+
+The private HOME contained neutral local skills, a static colored statusLine,
+and no real credentials/hooks. The private tmux server ran in a loopback-only
+network namespace without routes, with fake credentials and a non-listening
+loopback API URL. `/clear` was pasted but never submitted; no prompt or model
+turn ran. Only private cwd run-root prefixes become equal-width generic
+`/tmp/xxx…` paths; every other captured byte is unchanged apart from the
+provenance line, which tests remove. No owner capture is included.
+
+The explicit completion reader now recognizes the complete adjacent menu
+above the editor, including unselected skills and aligned continuations,
+without a startup header. Exact staging requires both the active draft and
+selected command to equal the expected text. An invalid completion never
+falls back to the ordinary staged reader, even with a header. The menu tail
+is still not idle/freshness evidence: ordinary facts stay Draft/Unknown.
+Synthetic malformed-frame/selection/style, header and Insight variations
+are marked in the tests. The older below-editor single-item grammar stays
+supported; unsupported layouts are not inferred safe.
+
 ## Custom statusLine region (stage 1)
 
 Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e, custom statusLine.
@@ -48,8 +83,10 @@ Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, cu
 In these real fullscreen frames the selected slash menu is **above the upper
 editor rule**; the status row remains below the lower rule, and the normal
 auto-mode footer stays. The 80-column description is truncated, while the
-116-column description wraps. The ordinary staged/control readers already
-recognize the editor exactly; the older below-editor completion grammar is
+116-column description wraps. The ordinary staged/control fallback recognized these complete-header
+captures, but failed once the header was out of view and the menu obscured
+idle evidence. The explicit completion reader above now handles that case
+and validates the selected command too; the older below-editor grammar is
 unchanged. Tests also remove only the status row in a labelled Synthetic twin.
 
 `screen_styled_s1_status-color-{88,160}_2.1.325.txt` maps to

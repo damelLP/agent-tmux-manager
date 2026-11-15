@@ -102,14 +102,14 @@
 //! the restart veto. The independent agent-not-ready clock survives Starting /
 //! Clearing transitions and focus waits, but restarts when Starting or Clearing
 //! follows Stuck or Down; see [`RecipientLiveView::agent_not_ready_since`].
+//! Positive running-turn evidence clears that clock. Its first loss starts a
+//! fresh window; repeated unknown observations never restart it. Unknown focus
+//! still waits ahead of agent status, even if that window has expired.
 //! A queued, unattempted message gets one informational owner Note after
 //! [`BUSY_NOTICE_AFTER`] behind the same observed turn (measured no earlier than
 //! its sent_at). This is independent of delivery status, never a block/drop.
 //! Any lost or Unknown sample restarts the thirty-minute interval and re-arms
 //! the note, even within the same physical turn.
-//! Positive running-turn evidence clears that clock. Its first loss starts a
-//! fresh window; repeated unknown observations never restart it. Unknown focus
-//! still waits ahead of agent status, even if that window has expired.
 //! `EmptySince` means a positively recognized
 //! empty editor **and no running turn**, never a blank screen or an empty box
 //! during active work. `send_now` skips row status/stability only once the editor

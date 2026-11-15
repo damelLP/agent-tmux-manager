@@ -42,7 +42,9 @@ use super::OrgServiceError;
 use crate::{control::reservation::PaneId, eventlog::Envelope};
 use atm_core::ScreenFacts;
 use atm_org::{
-    delivery::{busy_notice_due, next_delivery, DeliveryStep, FailureReason, WaitReason},
+    delivery::{
+        busy_notice_due, next_delivery, DeliveryStep, FailureReason, WaitReason, BUSY_NOTICE_AFTER,
+    },
     Agent, AgentId, DeliveryReceipt, OrgCommand,
 };
 use std::{
@@ -654,20 +656,21 @@ impl Job {
                 Err(error) => return Err(error),
             }
         }
-        service
-            .board
-            .track_busy_turn(id, snapshot.live.running_turn_since);
         let poll = Instant::now() + rt.policy.settings().guard_poll_interval;
         match step {
             // Delivered while this round ran. Its fold, which this job has
             // yet to see, removes it from the open messages.
             DeliveryStep::Complete => Ok(Next::Change),
             DeliveryStep::Wait { until, reason } => {
+                service
+                    .board
+                    .track_busy_turn(id, snapshot.live.running_turn_since);
                 self.show(id, DeliveryPhase::Waiting, Some(reason.to_string()), None);
                 if busy_notice_due(&snapshot.message, &snapshot.live, now) {
                     let body = format!(
-                        "{} busy for 30 min; message still queued ({id})",
-                        snapshot.recipient.id
+                        "{} busy for {} min; message still queued ({id})",
+                        snapshot.recipient.id,
+                        BUSY_NOTICE_AFTER.as_secs() / 60
                     );
                     self.publish(id, BUSY_NOTICE_REASON, note(body)).await;
                 }

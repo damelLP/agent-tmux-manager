@@ -253,7 +253,6 @@ fn lost_hook_with_activity_blocks() {
 /// Nothing is typed into a pane the owner is looking at. The same message is
 /// pasted once the owner looks away, so the silence was the focus guard.
 #[test]
-#[ignore = "gate S2: no production message observer on this base (recipient observation is not configured), so no daemon reaches PasteNow and a no-paste result would prove nothing"]
 fn focused_pane_never_pasted() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Claude);
@@ -442,7 +441,6 @@ fn owner_retry_same_id_preserves_late_receipt_and_fifo() {
 /// Task 3 on top (Enter, the hook lost): in both, the old daemon's attempt
 /// has ended in a hold before it is stopped.
 #[test]
-#[ignore = "gate S2: no production message observer on this base (recipient observation is not configured), so no daemon reaches PasteNow and there is no attempt to hold"]
 fn restart_queued_and_delivering_hold() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let mut watch = rig.watch();
@@ -507,7 +505,7 @@ fn restart_queued_and_delivering_hold() {
 /// With Task 3 this also ends in `msg.delivered`; the wait for it is added
 /// when that gate opens.
 #[test]
-#[ignore = "gate S2: no production message observer on this base (recipient observation is not configured), so no daemon reaches PasteNow"]
+#[ignore = "after a daemon restart nothing derives the recipient pane's baseline again, so every observation is refused (the harness on the pane is not established yet) and the queued message is never attempted; it passes when the agent is adopted again after the restart"]
 fn unattempted_restart_recovers() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Claude);
@@ -717,7 +715,6 @@ fn lazy_codex_id_binds_only_after_prompt() {
 /// because looking away appends nothing: the attempt's own event is then the
 /// first record the log refuses.
 #[test]
-#[ignore = "gate S2: no production message observer on this base (recipient observation is not configured), so no daemon reaches PasteNow and a no-paste result would prove nothing"]
 fn unavailable_org_causes_no_paste() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Claude);

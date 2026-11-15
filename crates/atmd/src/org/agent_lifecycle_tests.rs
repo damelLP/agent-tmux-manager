@@ -1605,6 +1605,31 @@ async fn second_adopt_of_a_clearing_agent_changes_nothing() {
         assert!(mutations(&adoption.rig).is_empty());
         assert_eq!(adoption.agent().await.unwrap(), recorded);
     }
+
+    // A foreign tag refuses even when the agent is Clearing: that answer
+    // must not hide the fact that this is no longer the agent's pane.
+    let adoption = ready_with_role().await;
+    adoption.rig.command(OrgCommand::Clear { agent_id: adoptee() }).await;
+    let recorded = adoption.agent().await.unwrap();
+    assert_eq!(recorded.status, AgentStatus::Clearing);
+    let before = adoption.rig.org.status().unwrap();
+    let mut committed = adoption.rig.org.committed.subscribe();
+    adoption.rig.client.script_inspect(
+        &pane("%1"),
+        Some(&Adoption::inspection(Some("q/other"), "pi", "")),
+    ).unwrap();
+    match adoption.adopt().await {
+        Err(AgentError::Refused(reason)) => {
+            assert!(reason.contains("%1 is tagged for q/other"), "{reason}");
+            assert!(reason.contains("nothing was changed"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert!(mutations(&adoption.rig).is_empty());
+    assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
 }
 
 #[tokio::test]

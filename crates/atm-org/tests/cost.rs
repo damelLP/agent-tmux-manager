@@ -107,6 +107,27 @@ fn actor(who: &str) -> TaskActor {
 }
 
 #[test]
+fn unbound_sessions_do_not_write_task_observations() {
+    // Break caught: cockpit-only sessions fill the task writer with observations
+    // that cannot belong to any named agent. A later adopt starts a baseline.
+    let state = OrgState::default();
+    let input = TaskUsageObservation {
+        session_id: "unbound".into(),
+        pane: Some("%99".into()),
+        turn: true,
+        cumulative_cost: Some(Money::zero()),
+        context_percent: Some(10),
+    };
+    assert!(state
+        .decide(
+            &OrgCommand::ObserveTaskUsage(input),
+            "2026-01-01T00:00:00Z".parse().unwrap()
+        )
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn cumulative_samples_are_not_summed() {
     let mut r = Rig::new();
     let t = r.task();
@@ -147,6 +168,33 @@ fn ambiguous_and_unbound_samples_are_unattributed_but_advance_baselines() {
 }
 
 #[test]
+fn unknown_open_task_does_not_make_an_ambiguous_assignment_look_unique() {
+    let mut r = Rig::new();
+    let a = r.task();
+    r.assign(&a, "p/build");
+    let b = r.task();
+    r.assign(&b, "p/build");
+    // Synthetic later-version fact: the assigned task remains open, but read-only.
+    r.seq += 1;
+    r.state
+        .apply(
+            r.seq,
+            r.now,
+            &OrgEvent::TaskStateChanged(TaskStateChanged {
+                task_id: b,
+                state: TaskState::Unknown,
+                reason: None,
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    r.sample("s1", "%1", Some(0), Some(90), true);
+    assert_eq!(r.cost(&a).turns, Some(0));
+    assert_eq!(r.cost(&a).cost, None);
+    assert_eq!(r.cost(&a).peak_context_percent, None);
+}
+
+#[test]
 fn only_prompts_count_and_missing_metrics_remain_unknown() {
     let mut r = Rig::new();
     let t = r.task();
@@ -182,6 +230,7 @@ fn only_prompts_count_and_missing_metrics_remain_unknown() {
 fn normalization_requires_reported_current_context_and_valid_money() {
     for (tokens, window, want) in [
         (Some(1), Some(3), Some(34)),
+        (Some(7), Some(100), Some(7)),
         (Some(0), Some(100), Some(0)),
         (Some(999), Some(1), Some(100)),
         (Some(1), None, None),

@@ -46,9 +46,9 @@ impl TaskUsageObservation {
                 let percent = current_tokens
                     .zip(context_window_size.filter(|size| *size > 0))
                     .map(|(tokens, window)| {
-                        ((tokens as f64 / f64::from(window) * 100.0)
-                            .ceil()
-                            .min(100.0)) as u8
+                        (u128::from(tokens) * 100)
+                            .div_ceil(u128::from(window))
+                            .min(100) as u8
                     });
                 (false, cost, percent)
             }
@@ -186,14 +186,19 @@ impl OrgState {
                     && a.session_id.as_ref() == Some(&input.session_id)
                     && a.excluded_session_id.as_ref() != Some(&input.session_id)
             });
-        let mut candidates = self.tasks().filter(|task| {
-            agent.is_some_and(|a| task.agent_id.as_ref() == Some(&a.id))
-                && !terminal(task)
-                && task.state != TaskState::Unknown
-        });
+        // No bound agent means no task accounting relationship, even for a
+        // baseline. Adoption starts with a baseline rather than historical cost.
+        let Some(agent) = agent else {
+            return Ok(vec![]);
+        };
+        let mut candidates = self
+            .tasks()
+            .filter(|task| task.agent_id.as_ref() == Some(&agent.id) && !terminal(task));
         let first = candidates.next();
         let target = if candidates.next().is_none() {
-            first.map(|task| task.id.clone())
+            first
+                .filter(|task| task.state != TaskState::Unknown)
+                .map(|task| task.id.clone())
         } else {
             None
         };

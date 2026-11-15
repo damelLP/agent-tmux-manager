@@ -4,7 +4,7 @@
 #[path = "actor_tests.rs"]
 mod tests;
 
-use std::{future::Future, sync::Arc};
+use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use atm_org::{OrgCommand, OrgState};
 use chrono::{DateTime, Utc};
@@ -25,6 +25,25 @@ pub(super) async fn run<F, Fut>(
     F: FnMut(Envelope) -> Fut,
     Fut: Future<Output = Result<u64, EventLogError>>,
 {
+    // Recover a verdict/cost prefix before serving any snapshot or mutation.
+    for (command, at) in super::cost::missing(&state) {
+        if let Err(error) = execute(
+            &mut state,
+            &command,
+            at,
+            None,
+            &health,
+            &publication,
+            &mut append,
+        )
+        .await
+        {
+            tracing::warn!(%error, "Accepted task cost repair incomplete");
+            if matches!(error, OrgServiceError::Unavailable(_)) {
+                return;
+            }
+        }
+    }
     loop {
         let request = tokio::select! {
             biased;
@@ -95,9 +114,9 @@ where
     } else {
         command
     };
-    let events = state.decide(command, now)?;
+    let mut events: VecDeque<_> = state.decide(command, now)?.into();
     let mut committed = Vec::with_capacity(events.len());
-    for mut event in events {
+    while let Some(mut event) = events.pop_front() {
         if let atm_org::OrgEvent::DecisionResolved(answer)
         | atm_org::OrgEvent::DecisionOverruled(answer) = &mut event
         {
@@ -125,6 +144,9 @@ where
             let reason = format!("apply at sequence {}: {error}", envelope.seq);
             let _ = health.send_replace(Err(reason.clone()));
             return Err(OrgServiceError::Unavailable(reason));
+        }
+        if let Some(record) = super::cost::after_event(state, &event) {
+            events.push_front(record);
         }
         // One owner advances the replay fence and publishes only applied records.
         // Subscribing before reading that fence makes replay/live overlap gapless.

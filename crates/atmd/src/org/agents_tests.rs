@@ -4495,6 +4495,46 @@ mod reconciliation {
         }
     }
 
+    /// A second pass still explains a suspended binding when no row of its
+    /// harness exists. Another harness on that pane can supply the wake.
+    #[tokio::test]
+    async fn bound_agent_without_a_harness_row_keeps_its_refusal_on_another_wake() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        *rig.proc.lock().unwrap() = Some(job());
+        rig.frame("%1", "p/lead", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(listed_reason(&agents).await.as_deref(), Some(NOT_CONFIRMED));
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        let mut events = agents.observation_events();
+
+        rig.frame("%1", "p/lead", IDLE);
+        // Its recorded session reports with another harness: that binding's
+        // event wakes it, but still supplies no row eligible for pi to pin.
+        rig.row_of("s1", "%1", false, Harness::Codex).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+
+        assert_eq!(listed_reason(&agents).await.as_deref(), Some(NOT_CONFIRMED));
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Starting);
+        assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+        assert!(rig
+            .registry
+            .pane_sessions("%1")
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.view.harness != "pi"));
+        assert!(rig.client.mock().calls().iter().all(|call| matches!(
+            call,
+            atm_tmux::mock::MockCall::RawCommand { subcommand, .. }
+                if ["display-message", "capture-pane", "show-options", "list-panes"].contains(&subcommand.as_str())
+        )));
+        assert_eq!(unread(&rig), 0);
+    }
+
     #[tokio::test]
     async fn suspended_harness_shows_its_refusal_until_it_is_back() {
         // Ctrl-Z in the pane of a Ready agent: nothing is recorded, the agent

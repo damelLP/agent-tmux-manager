@@ -18,7 +18,10 @@ register!(events:
     events_replay_without_lost_wake_and_close_with_open_peer,
 );
 register!(rows: subscription_consumes_snapshot_before_returning_then_updates_and_removal);
-register!(process: command_exit_returns_complete_large_output_without_pipe_deadlock);
+register!(process:
+    command_exit_returns_complete_large_output_without_pipe_deadlock,
+    owned_child_drop_reaps_on_unwind,
+);
 register!(cleanup:
     stopped_and_replaced_private_servers_clean_up_without_stale_pid,
     vanished_or_reused_process_is_never_signalled,

@@ -1998,6 +1998,69 @@ async fn unbound_codex_attempt_keeps_the_excluded_session_in_both_scopes() {
     assert_eq!(rig.snapshot(id).hold, None);
 }
 
+/// Pin the defensive scope comparisons directly, without inventing a
+/// concurrent lifecycle change through an already-held reservation.
+#[tokio::test(start_paused = true)]
+async fn armed_lazy_scope_rejects_wrong_exclusion_pane_or_harness() {
+    let (rig, id) = ready_unbound_codex().await;
+    let scope = AttemptScope {
+        message_id: id,
+        attempt_seq: 0,
+        recipient: worker(),
+        pane: pane(),
+        harness: Harness::Codex,
+        session_id: None,
+        excluded_sessions: HashSet::from([SessionId::new("old")]),
+    };
+    let attempt = Attempt {
+        rt: rig.rt.clone(),
+        id,
+        pane: pane(),
+        progress: Arc::new(Mutex::new(Progress {
+            attempt: AttemptCommit::Absent,
+            number: 0,
+            before: 0,
+            seq: None,
+            paste: NOT_STARTED,
+            enter: NOT_STARTED,
+            format: None,
+            settled: None,
+        })),
+    };
+    attempt.still_armed(&scope).await.unwrap();
+    for (case, changed) in [
+        (
+            "exclusion",
+            AttemptScope {
+                excluded_sessions: HashSet::new(),
+                ..scope.clone()
+            },
+        ),
+        (
+            "pane",
+            AttemptScope {
+                pane: PaneId::parse("%2").unwrap(),
+                ..scope.clone()
+            },
+        ),
+        (
+            "harness",
+            AttemptScope {
+                harness: Harness::Pi,
+                ..scope.clone()
+            },
+        ),
+    ] {
+        let error = attempt.still_armed(&changed).await.unwrap_err();
+        assert!(
+            matches!(error, MessageError::Conflict(_)),
+            "{case}: {error:?}"
+        );
+    }
+    assert!(rig.effects().is_empty());
+    assert!(rig.snapshot(id).message.last_attempt.is_none());
+}
+
 /// Lifecycle moves the agent to another pane while the attempt waits for
 /// its reservation: no attempt is made against the pane it asked for.
 #[tokio::test(start_paused = true)]
@@ -3103,12 +3166,40 @@ fn foreground_unknown_masks_editor_facts() {
     }
 }
 
+/// Exercise the guard's redundant flag wiring directly: the actor normally
+/// refuses these frames before invoking the delivery predicate.
+#[test]
+fn guard_capture_flags_refuse_enter_before_actor_checks() {
+    let id = MessageId::new(123);
+    let reference = inbox_reference(id);
+    let screen = agent_screen(Harness::Pi).unwrap();
+    let good = guard_facts(
+        GuardedInput::Enter,
+        &staged(id),
+        screen,
+        &baseline(),
+        &reference,
+    );
+    assert!(guard_allows_input(&good));
+    for (in_mode, synchronized) in [(true, false), (false, true)] {
+        // Synthetic: change only the mode/synchronization flags of the staged frame.
+        let frame = with(staged(id), |capture| {
+            capture.inspection.in_mode = in_mode;
+            capture.inspection.synchronized = synchronized;
+        });
+        let facts = guard_facts(GuardedInput::Enter, &frame, screen, &baseline(), &reference);
+        assert_eq!(facts.in_mode, in_mode);
+        assert_eq!(facts.synchronized, synchronized);
+        assert!(!guard_allows_input(&facts), "{facts:?}");
+    }
+}
+
 /// Real command-completion frames (Codex 0.167.0 with `/new` typed, Claude
 /// 2.1.325 with `/clear` typed; each adapter's fixture README has the
 /// `Captured:` line): the adapter matches the draft exactly, a popup is
 /// open, and the guard gives no Enter. A match never picks a popup's row.
 #[test]
-fn command_completion_never_overrides_unknown_dialog() {
+fn completion_frames_refuse_enter_despite_an_exact_draft() {
     use crate::org::agent_screen_tests::capture as shot_of;
     let frames = [
         (
@@ -3250,6 +3341,44 @@ async fn timeout_after_enter_holds() {
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);
     assert!(rig.typed(id), "{:?}", rig.effects());
+}
+
+/// The supervisor stops work inside Enter. A visible cleanup token cannot
+/// turn its unknown result into the claim that no Enter was sent.
+#[tokio::test(start_paused = true)]
+async fn held_enter_with_visible_cleanup_token_has_unknown_outcome() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let before = rig.org.status().unwrap();
+    rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let attempt = tokio::spawn(deliver(rig.rt.clone(), id, deadline));
+    guarded(rig.tmux_gate.entered()).await;
+    assert!(rig.typed(id), "{:?}", rig.effects());
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    until("cleanup consumed its token capture", || rig.reads() == 0).await;
+    rig.tmux_gate.release();
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Timeout))
+        ),
+        "{delivered:?}"
+    );
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    // Work never received/classified the key's result: no returned-call audit,
+    // no Delivered or DeliveryFailed, just the committed attempt.
+    assert_eq!(rig.org.status().unwrap(), before + 1);
 }
 
 /// tmux took the Enter and then reported a failure. More staged frames are
@@ -3666,7 +3795,7 @@ async fn dropped_prompt_with_activity_blocks_second_paste() {
 /// again; the record that lands later carries the time of the Enter, not
 /// the time it was written.
 #[tokio::test(start_paused = true)]
-async fn audit_stall_or_overflow_never_repeats_input_and_preserves_time() {
+async fn audit_stall_never_repeats_input_and_preserves_time() {
     let mut rig = Rig::attempt().await;
     let id = rig.ready_message().await;
     rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
@@ -3805,6 +3934,36 @@ async fn activity_after_zero_effect_failure_stays_retryable() {
     }
 }
 
+/// Cancellation before the paste leaves cleanup as the only producer of
+/// NotStarted. Later session activity must still allow a no-effect retry.
+#[tokio::test(start_paused = true)]
+async fn activity_after_pre_paste_cancellation_stays_retryable() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE)]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    rig.rt.cancel.cancel();
+    rig.release();
+    rig.fold_rest();
+    let delivered = guarded(attempt).await.unwrap();
+    assert!(
+        matches!(delivered, Err(MessageError::Unavailable(_))),
+        "{delivered:?}"
+    );
+    assert_eq!((rig.pastes(), rig.keys()), (0, 0));
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+    assert_eq!(rig.snapshot(id).hold, None);
+
+    rig.prompt("s1", "another task, not the message reference".into());
+    assert!(rig.rt.evidence.snapshot(id).unwrap().probably_landed);
+    rig.copy_evidence(id);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 2 });
+}
+
 /// The same activity when an earlier attempt of the message was applied, or
 /// has an unknown outcome: that paste may be what the session is working
 /// on, so the latch stays in force and the message is blocked, although the
@@ -3814,15 +3973,15 @@ async fn prior_applied_or_unknown_attempt_keeps_activity_latch() {
     for prior in [APPLIED, UNKNOWN] {
         let mut rig = Rig::attempt().await;
         let id = rig.ready_message().await;
-        // Attempt 1: the paste lands and tmux fails the first look
-        // (applied), or tmux reports a failure for the paste itself.
+        // Attempt 1 leaves a potentially applied paste and a hold. Whether
+        // a failed look returns an error is not the latch's contract.
         rig.script(&[pi(IDLE), pi(IDLE)]);
         if prior == UNKNOWN {
             rig.tmux_gate
                 .fail_next_after_effect(Effect::PasteText)
                 .unwrap();
         }
-        rig.deliver(id).await.unwrap_err();
+        let _ = rig.deliver(id).await;
         let first = rig.snapshot(id);
         assert_eq!(first.hold, Some(ExecutorHold::InputOutcomeUnknown));
         assert_eq!(rig.pastes(), 1, "{prior:?}");
@@ -4065,7 +4224,9 @@ async fn timeout_before_effect_accounts_attempt() {
     let attempt = tokio::spawn(deliver(rig.rt.clone(), id, deadline));
     let attempted = rig.committed().await;
     assert_eq!(attempted.kind, "msg.delivery_attempted");
-    // Past the work deadline, inside cleanup's wait for the fold.
+    // Move past the work deadline before supplying the fold. This paused,
+    // single-threaded test relies on the supervisor being polled first;
+    // it has no separate witness of entry into cleanup's fold wait.
     tokio::time::advance(Duration::from_secs(2)).await;
     rig.apply(&attempted);
     rig.fold_rest();
@@ -4158,7 +4319,7 @@ no_key_tests! {
     leading_space_reference_no_enter: NOT_SENT,
         |id| drafted(&format!(" {}", inbox_reference(id)));
     // A draft that is not the reference at all.
-    unknown_or_wrapped_draft_no_enter: NO_TOKEN,
+    other_draft_no_enter: NO_TOKEN,
         |_| drafted("something the owner is typing");
     mismatched_or_unknown_staged_frame_never_blind_enter: NOT_SENT,
         |id| drafted(&format!("{} and more", inbox_reference(id)));
@@ -4227,10 +4388,10 @@ async fn typed_with(change: fn(&mut PaneCapture)) -> bool {
     rig.typed(id)
 }
 
-/// A client that has the pane selected and is not focused on it does not
-/// block: focus is `Some(false)`, and the attempt types.
+/// A capture reporting no client focused on this pane allows the attempt.
+/// There is no separate selected-client fact in the capture.
 #[tokio::test(start_paused = true)]
-async fn unfocused_selected_client_allows() {
+async fn unfocused_client_allows() {
     assert!(typed_with(|capture| capture.focused = Some(false)).await);
 }
 
@@ -4337,6 +4498,40 @@ async fn no_paste_once_the_confirmation_window_has_ended() {
     assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
     assert_eq!(snapshot.hold, None);
     // The attempt and its failure for the retry.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 2);
+}
+
+/// The pre-paste check has no speculative margin. With 1 ms left it still
+/// dispatches the paste; the subsequent paced look returns after the bound
+/// and permits the separately guarded late Enter.
+#[tokio::test(start_paused = true)]
+async fn paste_is_dispatched_with_one_millisecond_left_in_confirmation_window() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[
+        pi(IDLE),
+        pi(IDLE),
+        staged(id),
+        staged(id),
+        showing(&inbox_reference(id)),
+    ]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    let window = rig.rt.policy.settings().confirmation_timeout;
+    tokio::time::advance(window - Duration::from_millis(1)).await;
+    rig.release();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert_eq!((rig.pastes(), rig.keys()), (1, 1));
+    assert_eq!(rig.reads(), 0);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    rig.rt.control.flush_audits().await;
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 2);
 }

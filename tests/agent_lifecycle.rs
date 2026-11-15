@@ -1080,12 +1080,14 @@ fn atm_cli_starts_clears_and_takes_down_an_agent() {
     // the test moves it.
     let old = test.complete_fixture_turn(&pane);
     let after = test.rig.event_cursor(&pane);
-    let clear = atm(&["agent", "clear", "project/lead", "--format", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let clear = stand_in::process::OwnedChild::new(
+        atm(&["agent", "clear", "project/lead", "--format", "json"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     test.rig.wait_event(&pane, after, |e| {
         e["kind"] == "rendered" && e["state"] == "clearing"
     });
@@ -1141,7 +1143,8 @@ fn clear_waits_behind_admitted_delivery() {}
 /// once that is drained. The stand-in draws no screen, so the start is still
 /// in flight when the stop comes. No duration is asserted: an actor that
 /// never ends holds `atmd stop` until the rig's command guard gives up on
-/// it, and a stage that overruns its bound says so in the daemon's log.
+/// it, normally before the daemon logs its later stage-overrun bound. The
+/// log assertions below run only if the stop command returns.
 #[test]
 fn stop_during_a_start_that_draws_no_screen_does_not_overrun() {
     let mut test = AgentRig::start(StandInMode::Pi);

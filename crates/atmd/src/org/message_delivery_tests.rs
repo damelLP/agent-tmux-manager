@@ -2256,9 +2256,12 @@ async fn exact_receipt_delivered_after_fold() {
     let id = rig.ready_message().await;
     rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
     let before = rig.org.status().unwrap();
+    let unpasted = rig.snapshot(id).live.last_paste_at;
     let attempt = rig.spawn_deliver(id);
 
     let audit = rig.audited().await;
+    // Work recorded its applied paste: the pane's paste time moved.
+    assert!(rig.snapshot(id).live.last_paste_at > unpasted);
     assert_eq!(
         audit.body,
         serde_json::json!({"pane": "%1", "action": {
@@ -3588,4 +3591,223 @@ async fn timeout_before_effect_accounts_attempt() {
     assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
     assert_eq!(snapshot.hold, None);
     acquires(&rig).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The guard between the staged draft and the Enter, through the executor
+// ---------------------------------------------------------------------------
+//
+// One driver: the first look after the paste shows the staged reference and
+// allows the Enter; the Enter guard's own capture, every later look and
+// cleanup's capture show the case's frame. Each case must end with one
+// paste, no key, the message still Delivering, and a hold.
+
+const TOKEN: ExecutorHold = ExecutorHold::TokenVisible;
+const NO_TOKEN: ExecutorHold = ExecutorHold::InputOutcomeUnknown;
+
+async fn no_key(case: &str, frame: fn(MessageId) -> PaneCapture, hold: ExecutorHold) {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id)]);
+    // More frames than the confirmation window has room for.
+    let frames = 40;
+    rig.script(&vec![frame(id); frames]);
+    let before = rig.org.status().unwrap();
+
+    let _ = rig.deliver(id).await;
+
+    assert_eq!((rig.pastes(), rig.keys()), (1, 0), "{case}");
+    // It read the case's frame at least twice (the guard or a look, and
+    // cleanup), and stopped.
+    let left = rig.reads() / 3;
+    assert!(left > 0 && left <= frames - 2, "{case}: {left} frames left");
+    let snapshot = rig.snapshot(id);
+    assert_eq!(
+        snapshot.message.status,
+        DeliveryStatus::Delivering,
+        "{case}"
+    );
+    assert_eq!(snapshot.hold, Some(hold), "{case}");
+    // No failure: at most the audit of an Enter call that sent nothing.
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    while let Ok(envelope) = rig.committed.try_recv() {
+        let ours = envelope.seq > before && envelope.kind != "control.sent";
+        assert!(!ours || envelope.kind == "msg.delivery_attempted", "{case}");
+    }
+}
+
+macro_rules! no_key_tests {
+    ($($name:ident: $hold:expr, $frame:expr;)*) => {$(
+        #[tokio::test(start_paused = true)]
+        async fn $name() {
+            no_key(stringify!($name), $frame, $hold).await;
+        }
+    )*};
+}
+
+no_key_tests! {
+    // The owner's client comes to the pane after the draft was seen. The
+    // draft matches exactly, so the hold names the token, not a mismatch.
+    focus_changes_before_guard_no_input: TOKEN,
+        |id| with(staged(id), |capture| capture.focused = Some(true));
+    exact_draft_guard_refusal_holds_token_visible: TOKEN,
+        |id| with(staged(id), |capture| capture.inspection.synchronized = true);
+    // tmux could not say whether a client is on the pane.
+    unknown_focus_blocks: TOKEN,
+        |id| with(staged(id), |capture| capture.focused = None);
+    // A shell took the foreground: every screen fact is unknown.
+    shell_before_enter_no_key: TOKEN,
+        |id| with(staged(id), |capture| {
+            capture.inspection.foreground_command = Some("zsh".into());
+        });
+    // Leading whitespace is part of the draft.
+    leading_space_reference_no_enter: TOKEN,
+        |id| drafted(&format!(" {}", inbox_reference(id)));
+    // A draft that is not the reference at all.
+    unknown_or_wrapped_draft_no_enter: NO_TOKEN,
+        |_| drafted("something the owner is typing");
+    mismatched_or_unknown_staged_frame_never_blind_enter: TOKEN,
+        |id| drafted(&format!("{} and more", inbox_reference(id)));
+    // The reference in the transcript above an empty editor.
+    same_reference_in_history_is_not_staged_proof: TOKEN,
+        |id| showing(&inbox_reference(id));
+    // A real pi 1.5.0 frame with its slash-command popup open.
+    modal_before_enter_no_key: NO_TOKEN, |_| pi(POPUP);
+}
+
+/// A real pi editor with the slash-command popup open (the adapter's
+/// fixture README has its `Captured:` line).
+const POPUP: &str = include_str!(
+    "../../../atm-pi-adapter/tests/fixtures/screen_p5_120x40-typed-popup_1.5.0.styled.txt"
+);
+
+/// Any client that is on the pane blocks, also beside one that is not: the
+/// capture's focus sample is "some client is focused here".
+#[tokio::test(start_paused = true)]
+async fn any_focused_client_blocks() {
+    let frame = |id| with(staged(id), |capture| capture.focused = Some(true));
+    no_key("the Enter guard", frame, TOKEN).await;
+    // And when the client is there from the first capture on: no attempt.
+    // History's last observation, from before the reservation, said
+    // unfocused. The executor records its own capture and the policy
+    // decides on that: a wait, answered Ok, and not a refused paste guard.
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[focused(), focused()]);
+    rig.deliver(id).await.unwrap();
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert_eq!(
+        (rig.reads(), rig.snapshot(id).message.last_attempt),
+        (3, None)
+    );
+    let step = rig.step(id);
+    let focused = WaitReason::OwnerFocused;
+    assert!(
+        matches!(step, DeliveryStep::Wait { reason, .. } if reason == focused),
+        "{step:?}"
+    );
+}
+
+/// Copy mode on the pane, and another agent's tag on it: no key for either.
+/// The tag is refused by the control actor itself, which ends the keys.
+#[tokio::test(start_paused = true)]
+async fn copy_mode_and_foreign_tag_no_input() {
+    let mode = |id| with(staged(id), |capture| capture.inspection.in_mode = true);
+    no_key("copy mode", mode, TOKEN).await;
+    let tag = |id| {
+        with(staged(id), |capture| {
+            capture.inspection.local_agent_tag = Some("demo/other".into());
+        })
+    };
+    no_key("a foreign tag", tag, TOKEN).await;
+}
+
+/// The whole attempt with `change` applied to every frame it reads; whether
+/// the paste and the Enter were sent.
+async fn typed_with(change: fn(&mut PaneCapture)) -> bool {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    let (idle, draft) = (with(pi(IDLE), change), with(staged(id), change));
+    rig.script(&[idle.clone(), idle, draft.clone(), draft.clone(), draft]);
+    let _ = rig.deliver(id).await;
+    rig.typed(id)
+}
+
+/// A client that has the pane selected and is not focused on it does not
+/// block: focus is `Some(false)`, and the attempt types.
+#[tokio::test(start_paused = true)]
+async fn unfocused_selected_client_allows() {
+    assert!(typed_with(|capture| capture.focused = Some(false)).await);
+}
+
+/// tmux before 3.7 does not report the bracketed-paste flag: allowed, for
+/// the one printable ASCII line the reference is. A reported "off" refuses
+/// the Enter as it refuses the paste.
+#[tokio::test(start_paused = true)]
+async fn bracket_unknown_ascii_allowed_false_refused() {
+    assert!(typed_with(|capture| capture.inspection.bracketed_paste = None).await);
+    let off = |id| {
+        with(staged(id), |capture| {
+            capture.inspection.bracketed_paste = Some(false);
+        })
+    };
+    no_key("bracketed paste is off", off, TOKEN).await;
+}
+
+/// A capture in another format than the harness's adapter reads proves
+/// nothing: every screen fact is unknown and neither input is allowed.
+#[test]
+fn capture_format_mismatch_no_input() {
+    let id = MessageId::new(5);
+    let (screen, reference) = (agent_screen(Harness::Pi).unwrap(), inbox_reference(id));
+    for (input, frame) in [
+        (GuardedInput::Paste, pi(IDLE)),
+        (GuardedInput::Enter, staged(id)),
+    ] {
+        let facts = guard_facts(input, &frame, screen, &baseline(), &reference);
+        assert!(guard_allows_input(&facts), "{facts:?}");
+        let plain = with(frame, |capture| capture.format = CaptureFormat::Plain);
+        let facts = guard_facts(input, &plain, screen, &baseline(), &reference);
+        assert_eq!(facts.screen, ScreenFacts::default());
+        assert!(!guard_allows_input(&facts), "{facts:?}");
+    }
+}
+
+/// Real Claude 2.1.325 folder-trust dialogs, with "No, exit" selected (the
+/// default) and with "Yes" selected (the adapter's fixture README has the
+/// `Captured:` lines). The control read names the dialog, and no delivery
+/// input is allowed on it, whichever row is selected: the executor never
+/// answers a dialog.
+#[test]
+fn trust_default_no_never_gets_a_key() {
+    use crate::org::agent_screen_tests::capture as shot_of;
+    let screen = agent_screen(Harness::ClaudeCode).unwrap();
+    let baseline = (PaneBaseline::adopted(100).with_harness("claude".into())).unwrap();
+    let reference = inbox_reference(MessageId::new(123));
+    for (selected, fixture) in [
+        (
+            false,
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-default-120x40_2.1.325.txt"
+            ),
+        ),
+        (
+            true,
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-selected-120x40_2.1.325.txt"
+            ),
+        ),
+    ] {
+        let capture = shot_of(fixture, CaptureFormat::Ansi, Some(100), Some("claude"))
+            .with_focus(Some(false));
+        for input in [GuardedInput::Paste, GuardedInput::Enter] {
+            let facts = guard_facts(input, &capture, screen, &baseline, &reference);
+            assert!(
+                matches!(&facts.control_dialog, ControlDialog::FolderTrust { selected_accept, .. } if *selected_accept == selected),
+                "{facts:?}"
+            );
+            assert!(!guard_allows_input(&facts), "{facts:?}");
+        }
+    }
 }

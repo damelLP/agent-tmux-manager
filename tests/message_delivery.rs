@@ -513,7 +513,6 @@ fn restart_queued_and_delivering_hold() {
 /// daemon attempts it as its first attempt once the recipient is free.
 ///
 #[test]
-#[ignore = "the daemon does not yet re-derive an adopted agent's baseline after restart"]
 fn unattempted_restart_recovers() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Claude);

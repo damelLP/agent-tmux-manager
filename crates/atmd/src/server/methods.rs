@@ -183,6 +183,7 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     );
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
     let handover_org = services.org.clone();
+    crate::org::tasks::register_task_methods(&mut router, services.org.clone())?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();

@@ -62,6 +62,8 @@ mod start_line;
 mod start_line_tests;
 mod storage;
 mod summary;
+mod task_methods;
+pub mod tasks;
 mod watch;
 
 pub(crate) use watch::message as event_message;

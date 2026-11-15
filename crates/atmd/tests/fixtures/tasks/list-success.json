@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"list","method":"task.list","params":{}},"response":{"type":"response","id":"list","result":{"tasks":[{"task_id":"t6","title":"Task","kind":"work","state":"open","agent_id":null,"reason":null}],"next_after":null}}}

@@ -37,7 +37,7 @@ pub struct MemoryFile {
     pub exists: bool,
 }
 
-/// `open_tasks` is reserved for task summaries; E1 always returns an empty array.
+/// Entry context includes assigned unfinished tasks in creation order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentContext {
     pub agent_id: AgentId,
@@ -133,7 +133,12 @@ fn assemble_context(
             path: memory_path,
             exists: memory_exists,
         },
-        open_tasks: Vec::new(),
+        open_tasks: state
+            .tasks()
+            .filter(|task| task.agent_id.as_ref() == Some(&agent.id) && super::tasks::is_open(task))
+            .map(|task| serde_json::to_value(super::tasks::summarize(task)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AgentError::Internal(error.to_string()))?,
     })
 }
 
@@ -264,7 +269,7 @@ pub fn register_agent_context_method(
             let value = serde_json::to_value(context).map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))?;
             let bytes = serde_json::to_vec(&value).map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))?.len();
             if bytes > CONTEXT_BYTES {
-                return Err(MethodError::new(error_code::REFUSED, format!("agent context exceeds {CONTEXT_BYTES} bytes; use atm inbox --unread for messages")));
+                return Err(MethodError::new(error_code::REFUSED, format!("agent context exceeds {CONTEXT_BYTES} bytes; use atm inbox --unread for messages and atm task list for tasks")));
             }
             Ok(value)
         }

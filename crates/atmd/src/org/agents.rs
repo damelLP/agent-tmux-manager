@@ -952,14 +952,19 @@ impl AgentRuntime {
         let harness = harness(state, agent, &rows);
         let screen = agent_screen(harness);
         // Whether this pass can pin the harness by the adopt rule: nothing is
-        // recorded yet, the agent is Starting or Ready, and the inspection and
-        // the process read that followed it allow a baseline. The capture
-        // below is the rule's second look.
+        // recorded yet, the agent is Starting or Ready, the inspection and the
+        // process read that followed it allow a baseline, and the pane has a
+        // live row of the agent's harness (without one the pin must fail; the
+        // row's arrival starts its own pass). The capture below is the rule's
+        // second look.
         let pinnable = screen.zip(look.as_ref()).zip(processes.as_ref()).filter(
             |((_, (root, command)), processes)| {
                 stored == PaneBaseline::unproven()
                     && matches!(agent.status, AgentStatus::Ready | AgentStatus::Starting)
                     && adopt_baseline(processes, *root, command).is_some()
+                    && rows
+                        .iter()
+                        .any(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
             },
         );
         // A capture can change nothing for a Ready agent on an ordinary wake, or

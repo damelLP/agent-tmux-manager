@@ -3557,6 +3557,143 @@ mod reconciliation {
         );
     }
 
+    // --- A capture is read only when it can pin the harness ---
+
+    /// The rig's process reader, counting its reads.
+    fn counting(
+        rig: &Rig,
+    ) -> (
+        super::super::agent_proc::ProcReader,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counter, inner) = (reads.clone(), rig.reader());
+        let reader: super::super::agent_proc::ProcReader = std::sync::Arc::new(move |pid| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inner(pid)
+        });
+        (reader, reads)
+    }
+    /// The captures `p/lead`'s next observation takes, counted until it ends.
+    async fn captures_of_pass(
+        events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+    ) -> usize {
+        let mut captures = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.agent.as_ref().map(ToString::to_string).as_deref() != Some("p/lead") {
+                    continue;
+                }
+                match event.phase {
+                    "capture" => captures += 1,
+                    "finished" => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        captures
+    }
+    /// `p/lead`, Ready and bound to `s1` on %1, with nothing recorded about
+    /// its pane and no row of its harness there: the restart pass found no
+    /// row and suspended it, and it was made Ready again without a pin.
+    async fn ready_unproven() -> (
+        Rig,
+        AgentHandle,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let (reader, reads) = counting(&rig);
+        let (agents, _) = spawn_agents_with(
+            rig.org.clone(),
+            rig.registry.clone(),
+            rig.control.clone(),
+            rig.cancel.child_token(),
+            reader,
+            std::sync::Arc::new(|_| None),
+        );
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        rig.command(OrgCommand::EditorReady {
+            agent_id: "p/lead".parse().unwrap(),
+        })
+        .await;
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+        reads.store(0, std::sync::atomic::Ordering::SeqCst);
+        (rig, agents, reads)
+    }
+
+    #[tokio::test]
+    async fn ready_agent_without_a_live_row_is_not_captured() {
+        // A Ready agent with nothing recorded about its pane and no row of
+        // its harness there cannot be pinned: the adopt rule needs such a row.
+        // Each wake reads the pane's processes (an exit to the shell must be
+        // seen) and takes no capture. Here its session reports from another
+        // pane, which wakes it every time.
+        let (rig, agents, reads) = ready_unproven().await;
+        let mut events = agents.observation_events();
+        let before = rig.org.status().unwrap();
+        for wake in 0..5 {
+            inspect_with(&rig, "pi");
+            if wake == 0 {
+                rig.row("s1", "%2", false).await;
+            } else {
+                update(&rig, "s1").await;
+            }
+            assert_eq!(captures_of_pass(&mut events).await, 0, "wake {wake}");
+            assert_eq!(unread(&rig), 0, "wake {wake}");
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+
+        // The restart check of a Ready agent without a session, a job in
+        // front and no row: of the scripted frame only the inspection (two
+        // reads) is used, and its capture is left unread.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let before = rig.org.status().unwrap();
+        let scripted = unread(&rig);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), scripted - 2);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn ready_agent_with_a_live_row_is_captured_once_and_pinned() {
+        // The twin: a row of its harness arrives on the pane. That pass reads
+        // the processes, takes the one capture the adopt rule needs, and pins.
+        // From then on the harness is known to be in front: no process read
+        // and no capture.
+        let (rig, agents, reads) = ready_unproven().await;
+        let mut events = agents.observation_events();
+        let before = rig.org.status().unwrap();
+        rig.frame("%1", "p/lead", IDLE);
+        rig.row("pending-100", "%1", false).await;
+        assert_eq!(captures_of_pass(&mut events).await, 1);
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(told(&agents).await.2, pinned_to("pi"));
+        for wake in 0..3 {
+            inspect_with(&rig, "pi");
+            update(&rig, "pending-100").await;
+            assert_eq!(captures_of_pass(&mut events).await, 0, "wake {wake}");
+            assert_eq!(unread(&rig), 0, "wake {wake}");
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
     mod lifecycle {
         include!("agent_lifecycle_tests.rs");
         include!("agent_clear_tests.rs");

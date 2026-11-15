@@ -525,6 +525,109 @@ fn reminder_text(task: &TaskId, state: &str, told: &str) -> String {
 
 // ----------------------------------------------------------------- the loop
 
+// Break caught: ready registry rows indefinitely hide a committed usage
+// crossing. Usage goes through the real command and single accounting ledger.
+#[tokio::test(start_paused = true)]
+async fn ready_registry_rows_cannot_starve_a_committed_turn_crossing() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let mut rig = Rig::new().await;
+    let task = usage_task(&rig, None, Some(0)).await;
+    let flood = Arc::new(AtomicBool::new(false));
+    let steps = Arc::new(AtomicU64::new(0));
+    let (progress, mut observed) = watch::channel(0_u64);
+    let rows = rig.rows.clone();
+    let clock_flood = flood.clone();
+    let clock_steps = steps.clone();
+    let clock = move || {
+        if clock_flood.load(Ordering::SeqCst) {
+            // Keep the next row ready before selection, without sleeps.
+            rows.send(working("unrelated-session")).unwrap();
+            let count = clock_steps.fetch_add(1, Ordering::SeqCst) + 1;
+            progress.send_replace(count);
+        }
+        at(0)
+    };
+    let scheduler = tokio::spawn(run(
+        rig.org.clone(),
+        rig.rows.subscribe(),
+        settings(),
+        clock,
+        rig.cancel.clone(),
+    ));
+    rig.report(working("s1")).await;
+    flood.store(true, Ordering::SeqCst);
+    rig.rows.send(working("unrelated-session")).unwrap();
+    let crossing = usage_sample(&rig, None, true).await;
+    assert_eq!(crossing.first().unwrap().kind, "task.usage_observed");
+    let target = steps.load(Ordering::SeqCst) + 512;
+    observed.wait_for(|count| *count >= target).await.unwrap();
+    let during_flood = rig.count("msg.sent");
+    flood.store(false, Ordering::SeqCst);
+    let (_, note, _) = rig.sent().await;
+    assert_eq!(note.task, Some(task));
+    assert_eq!(rig.count("msg.sent"), 1);
+    rig.cancel.cancel();
+    scheduler.await.unwrap();
+    assert_eq!(
+        during_flood, 1,
+        "committed usage was starved by ready registry rows"
+    );
+}
+
+// Break caught: ready committed events prevent even an unbudgeted task's
+// due reminder. Re-publication keeps the receiver ready without log writes.
+#[tokio::test(start_paused = true)]
+async fn ready_committed_events_cannot_starve_an_unbudgeted_reminder() {
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+    let mut rig = Rig::new().await;
+    let task = rig.task(Address::Owner, "build").await;
+    assert!(rig.state().await.task(&task).unwrap().budget.is_none());
+    let flood = Arc::new(AtomicBool::new(false));
+    let seconds = Arc::new(AtomicI64::new(0));
+    let steps = Arc::new(AtomicU64::new(0));
+    let (progress, mut observed) = watch::channel(0_u64);
+    let publication = rig.org.committed.clone();
+    let envelope = Arc::new(rig.log.lock().unwrap().first().unwrap().clone());
+    let clock_flood = flood.clone();
+    let clock_seconds = seconds.clone();
+    let clock_steps = steps.clone();
+    let clock = move || {
+        if clock_flood.load(Ordering::SeqCst) {
+            let _ = publication.send(envelope.clone());
+            let count = clock_steps.fetch_add(1, Ordering::SeqCst) + 1;
+            progress.send_replace(count);
+        }
+        at(clock_seconds.load(Ordering::SeqCst))
+    };
+    let scheduler = tokio::spawn(run(
+        rig.org.clone(),
+        rig.rows.subscribe(),
+        settings(),
+        clock,
+        rig.cancel.clone(),
+    ));
+    rig.turn("s1").await;
+    seconds.store(DELAY, Ordering::SeqCst);
+    flood.store(true, Ordering::SeqCst);
+    // Wake the waiting select; subsequent clock reads keep the bus ready.
+    let envelope = Arc::new(rig.log.lock().unwrap().first().unwrap().clone());
+    rig.org.committed.send(envelope).unwrap();
+    observed.wait_for(|count| *count >= 512).await.unwrap();
+    let during_flood = rig.count("task.reminded");
+    flood.store(false, Ordering::SeqCst);
+    let (_, note, _) = rig.sent().await;
+    assert_eq!(note.task, Some(task));
+    assert!(note.body.contains("Your turn ended"));
+    rig.cancel.cancel();
+    scheduler.await.unwrap();
+    assert_eq!(
+        during_flood, 1,
+        "unbudgeted reminder was starved by ready committed events"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_silent_turn_end_is_answered_after_the_delay_audit_first() {
     let mut rig = Rig::new().await;

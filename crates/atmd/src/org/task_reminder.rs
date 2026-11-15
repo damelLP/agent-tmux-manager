@@ -90,7 +90,10 @@ use atm_org::{
 };
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use std::collections::HashMap;
-use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::broadcast::{
+    self,
+    error::{RecvError, TryRecvError},
+};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -436,8 +439,9 @@ async fn budget_wake(org: &OrgHandle, clock: &impl Fn() -> DateTime<Utc>) -> Opt
 }
 
 /// Registry events are read before a reminder wake (`biased`), so a turn
-/// that started before its wait was over has dropped it. Budget deadlines
-/// are independent: check them after every event so busy rows cannot starve them.
+/// that started before its wait was over has dropped it. Each selection also
+/// reads a ready commit and services due wakes once queued rows are applied:
+/// rows cannot starve budget changes, nor commits starve reminder timers.
 async fn run(
     org: OrgHandle,
     mut rows: broadcast::Receiver<SessionEvent>,
@@ -465,6 +469,7 @@ async fn run(
                 None => std::future::pending().await,
             }
         };
+        let mut budget_changed = false;
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
@@ -476,19 +481,28 @@ async fn run(
                 Err(RecvError::Closed) => return,
             },
             event = committed.recv() => match event {
-                Ok(event) if event.kind.starts_with("task.") => {
-                    budget_at = budget_wake(&org, &clock).await;
-                },
-                Err(RecvError::Lagged(_)) => budget_at = budget_wake(&org, &clock).await,
+                Ok(event) => budget_changed = event.kind.starts_with("task."),
+                Err(RecvError::Lagged(_)) => budget_changed = true,
                 Err(RecvError::Closed) => return,
-                _ => {},
             },
-            () = wake => if let Some(settings) = &settings {
-                settle(&org, &mut watch, settings, clock()).await;
-            },
+            () = wake => {}
         }
-        if budget_at.is_some_and(|at| at <= clock()) {
+        // A ready registry receiver must not hide committed usage forever.
+        match committed.try_recv() {
+            Ok(event) => budget_changed |= event.kind.starts_with("task."),
+            Err(TryRecvError::Lagged(_)) => budget_changed = true,
+            Err(TryRecvError::Closed) => return,
+            Err(TryRecvError::Empty) => {}
+        }
+        if budget_changed || budget_at.is_some_and(|at| at <= clock()) {
             budget_at = budget_wake(&org, &clock).await;
+        }
+        // Even a continuously ready commit stream must service due reminders,
+        // but never before a queued registry row can cancel its pending wait.
+        if rows.is_empty() {
+            if let Some(settings) = &settings {
+                settle(&org, &mut watch, settings, clock()).await;
+            }
         }
     }
 }

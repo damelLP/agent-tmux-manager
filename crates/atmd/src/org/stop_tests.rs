@@ -28,6 +28,7 @@ fn sharing(
         proc: rig.proc.clone(),
         proc_after_enter: rig.proc_after_enter.clone(),
         proc_script: rig.proc_script.clone(),
+        spawn_env: rig.spawn_env.clone(),
     }
 }
 

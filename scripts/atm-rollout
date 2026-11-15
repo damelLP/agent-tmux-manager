@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Roll a candidate pair out, or the previous pair back, in one command; see atm-promotion.md."""
+import sys
+sys.dont_write_bytecode = True
+from atm_rollout import main
+
+sys.exit(main())

@@ -6,7 +6,7 @@ use atm_claude_adapter::ClaudeEventType;
 use serde_json::{json, Map, Value};
 
 use super::atm_config_path;
-use super::hooks::{add_hook_entries, install_executable_script, is_marker_command};
+use super::hooks::{add_hook_entries, install_executable_script};
 use super::json::{read_json_file_or_empty, write_json_file_pretty};
 use super::skills::setup_atm_skills;
 use super::{Result, SetupError};
@@ -68,8 +68,9 @@ pub(super) fn status_line_backup_path() -> Option<PathBuf> {
 /// have been lost or reset since, leaving the backup as the only copy.
 /// Returns whether `settings` changed.
 fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) -> Result<bool> {
+    let atm_entry = create_status_line_entry();
     match settings.get("statusLine") {
-        Some(existing) if has_atm_status_line(existing) => {
+        Some(existing) if has_atm_status_line(existing, &atm_entry) => {
             println!("    statusLine - already configured");
             return Ok(false);
         }
@@ -87,20 +88,24 @@ fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) ->
         ),
         None => println!("    statusLine - added"),
     }
-    settings.insert("statusLine".to_string(), create_status_line_entry());
+    settings.insert("statusLine".to_string(), atm_entry);
     Ok(true)
 }
 
 /// Uninstall's statusLine step: replaces ATM's statusLine in `settings`
 /// with `backup` (the user's own, saved by an older setup), or removes it when
-/// there is none. Any other statusLine replaced ATM's after setup, so it
-/// stays. Returns whether `settings` changed.
+/// there is none. Only an exact generated entry is ATM's; custom commands
+/// and modified entries stay. Returns whether `settings` changed.
 #[must_use]
 pub(super) fn uninstall_status_line(
     settings: &mut Map<String, Value>,
     backup: Option<Value>,
+    atm_entry: &Value,
 ) -> bool {
-    if !settings.get("statusLine").is_some_and(has_atm_status_line) {
+    if !settings
+        .get("statusLine")
+        .is_some_and(|entry| has_atm_status_line(entry, atm_entry))
+    {
         return false;
     }
     match backup {
@@ -110,9 +115,12 @@ pub(super) fn uninstall_status_line(
     true
 }
 
-/// Checks if atm-hook is configured for statusLine
-pub(super) fn has_atm_status_line(status_line: &Value) -> bool {
-    is_marker_command(status_line, "atm-hook")
+/// Matches only the exact current entry or the historical no-home fallback.
+/// Since c2a89f0, setup has written these two fields and a raw hook path,
+/// never shell wrappers, quoted commands, arguments or extra fields.
+pub(super) fn has_atm_status_line(status_line: &Value, atm_entry: &Value) -> bool {
+    status_line == atm_entry
+        || status_line == &json!({"type": "command", "command": "/usr/local/bin/atm-hook"})
 }
 
 /// Creates a hook entry for the given hook type.
@@ -191,7 +199,9 @@ pub(super) fn setup_claude_code() -> Result<()> {
 
 #[cfg(test)]
 mod status_line_backup_tests {
-    use super::{create_status_line_entry, install_status_line, uninstall_status_line};
+    use super::{
+        create_status_line_entry, has_atm_status_line, install_status_line, uninstall_status_line,
+    };
     use serde_json::{json, Map, Value};
     use std::fs;
     use std::path::Path;
@@ -214,13 +224,107 @@ mod status_line_backup_tests {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    #[test]
-    fn install_keeps_the_users_status_line_and_saves_nothing() {
-        for status_line in [
+    /// Synthetic custom entries: the old shell-marker rule would claim many of these.
+    fn custom_status_lines(command: &str) -> Vec<Value> {
+        let mut entries: Vec<_> = [
+            format!("input=$(cat); printf '%s' \"$input\" | '{command}'; echo my-status"),
+            format!("printf '%s' status | {command}"),
+            format!("echo my-status; {command}"),
+            format!("{command}; :"),
+            format!("ATM_DEBUG=1 {command}"),
+            format!("{command} --verbose"),
+            format!("'{command}'"),
+            format!("\"{command}\""),
+            format!("{command} "),
+            "$HOME/.local/bin/atm-hook".to_string(),
+            "~/.local/bin/atm-hook".to_string(),
+            "/another-home/.local/bin/atm-hook".to_string(),
+            "/opt/elsewhere/bin/atm-hook".to_string(),
+            "~/bin/atm-hook-wrapper.sh".to_string(),
+        ]
+        .into_iter()
+        .map(|command| json!({"type": "command", "command": command}))
+        .collect();
+        entries.extend([
             user_status_line(),
             json!({"type": "command", "command": "~/bin/atm-hook-wrapper.sh", "padding": 2}),
+            json!({"type": "command", "command": command, "padding": 2}),
+            json!({"type": "command", "command": "/usr/local/bin/atm-hook", "padding": 2}),
+            json!({"type": "prompt", "command": command}),
+            json!({"command": command}),
+            json!({"type": "command"}),
+            json!({"type": "command", "command": null}),
+            json!(command),
+            json!([{"type": "command", "command": command}]),
             Value::Null,
+        ]);
+        entries
+    }
+
+    #[test]
+    fn status_line_ownership_requires_an_exact_generated_entry() {
+        for command in [
+            "/test/home/.local/bin/atm-hook",
+            "/test/user's home/.local/bin/atm-hook",
         ] {
+            let atm_entry = json!({"type": "command", "command": command});
+            assert!(has_atm_status_line(&atm_entry, &atm_entry));
+            // Source-derived legacy shape: unchanged since c2a89f0, including the fallback.
+            let fallback = json!({"type": "command", "command": "/usr/local/bin/atm-hook"});
+            assert!(has_atm_status_line(&fallback, &atm_entry));
+            for custom in custom_status_lines(command) {
+                assert!(
+                    !has_atm_status_line(&custom, &atm_entry),
+                    "claimed custom entry: {custom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uninstall_keeps_inline_and_modified_status_lines_with_or_without_a_backup() {
+        let atm_entry = json!({"type": "command", "command": "/test/home/.local/bin/atm-hook"});
+        for custom in custom_status_lines("/test/home/.local/bin/atm-hook") {
+            for backup in [None, Some(user_status_line())] {
+                let mut settings = settings_with(custom.clone());
+                settings.insert("userKey".to_string(), json!("kept"));
+                let before = settings.clone();
+
+                assert!(
+                    !uninstall_status_line(&mut settings, backup, &atm_entry),
+                    "{custom}"
+                );
+
+                assert_eq!(settings, before, "changed custom entry: {custom}");
+            }
+        }
+    }
+
+    #[test]
+    fn uninstall_removes_and_restores_history_entries() {
+        let atm_entry = json!({"type": "command", "command": "/test/home/.local/bin/atm-hook"});
+        // The original generator and its /usr/local fallback, not a new shell-command shape.
+        for command in ["/test/home/.local/bin/atm-hook", "/usr/local/bin/atm-hook"] {
+            for backup in [None, Some(user_status_line())] {
+                let mut settings = settings_with(json!({"type": "command", "command": command}));
+                settings.insert("userKey".to_string(), json!("kept"));
+
+                assert!(uninstall_status_line(
+                    &mut settings,
+                    backup.clone(),
+                    &atm_entry
+                ));
+
+                assert_eq!(settings.get("statusLine"), backup.as_ref());
+                assert_eq!(settings.get("userKey"), Some(&json!("kept")));
+            }
+        }
+    }
+
+    #[test]
+    fn install_keeps_the_users_status_line_and_saves_nothing() {
+        let atm_entry = create_status_line_entry();
+        for status_line in custom_status_lines(atm_entry["command"].as_str().unwrap()) {
             let dir = tempfile::tempdir().unwrap();
             let backup = dir.path().join("atm/backup.json");
             let mut settings = settings_with(status_line);
@@ -315,7 +419,8 @@ mod status_line_backup_tests {
 
         assert!(uninstall_status_line(
             &mut settings,
-            Some(user_status_line())
+            Some(user_status_line()),
+            &create_status_line_entry()
         ));
 
         assert_eq!(settings, settings_with(user_status_line()));
@@ -325,7 +430,11 @@ mod status_line_backup_tests {
     fn uninstall_without_a_backup_removes_atms_status_line() {
         let mut settings = settings_with(create_status_line_entry());
 
-        assert!(uninstall_status_line(&mut settings, None));
+        assert!(uninstall_status_line(
+            &mut settings,
+            None,
+            &create_status_line_entry()
+        ));
 
         assert!(settings.is_empty(), "{settings:?}");
     }
@@ -337,7 +446,8 @@ mod status_line_backup_tests {
 
         assert!(!uninstall_status_line(
             &mut settings,
-            Some(user_status_line())
+            Some(user_status_line()),
+            &create_status_line_entry()
         ));
 
         assert_eq!(settings, settings_with(newer));
@@ -348,7 +458,11 @@ mod status_line_backup_tests {
         let mut settings = settings_with(user_status_line());
         let before = serde_json::to_vec(&settings).unwrap();
 
-        assert!(!uninstall_status_line(&mut settings, None));
+        assert!(!uninstall_status_line(
+            &mut settings,
+            None,
+            &create_status_line_entry()
+        ));
 
         assert_eq!(serde_json::to_vec(&settings).unwrap(), before);
     }
@@ -359,7 +473,8 @@ mod status_line_backup_tests {
 
         assert!(!uninstall_status_line(
             &mut settings,
-            Some(user_status_line())
+            Some(user_status_line()),
+            &create_status_line_entry()
         ));
 
         assert!(settings.is_empty(), "{settings:?}");

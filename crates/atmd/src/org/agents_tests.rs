@@ -386,6 +386,31 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn restart_ready_unbound_shell_with_child_attempts_no_capture() {
+        // A shell holding a child cannot pin a harness. A Ready, unbound
+        // agent needs no capture, including one that would fail unscripted.
+        let rig = Rig::new().await;
+        *rig.proc.lock().unwrap() = Some(shell_with_child("sh"));
+        rig.agent("lead", Some("%1"), None).await;
+        rig.row("pending-100", "%1", false).await;
+        inspect_with(&rig, "sh");
+        let before = rig.org.status().unwrap();
+        let (agents, _) = rig.start();
+        // This current-thread test subscribes before yielding to the observer.
+        let mut events = agents.observation_events();
+        agents.reconciled().await.unwrap();
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.phase, "capture", "unnecessary capture was attempted");
+        }
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert_eq!(
+            told(&agents).await,
+            (AgentStatus::Ready, None, PaneBaseline::unproven(), None)
+        );
+    }
+
+    #[tokio::test]
     async fn review_safe_restart_ready_has_zero_writes() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
@@ -815,6 +840,31 @@ mod reconciliation {
                 .await,
             Err(AgentError::Unavailable(_))
         ));
+    }
+
+    // The append gates below can wait for a write that broken observation
+    // never attempts. A paused Tokio clock can keep advancing mirror retries;
+    // use a real-clock watchdog that wakes the test independently of that clock.
+    async fn with_wall_clock_hang_guard(test: impl std::future::Future<Output = ()>) {
+        let (done, completed) = std::sync::mpsc::channel::<()>();
+        let (expired, deadline) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("test-hang-guard".into())
+            .spawn(move || {
+                if matches!(
+                    completed.recv_timeout(std::time::Duration::from_secs(30)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    let _ = expired.send(());
+                }
+            })
+            .unwrap();
+        tokio::select! {
+            _ = test => {},
+            _ = deadline => panic!("test exceeded its 30-second wall-clock hang guard"),
+        }
+        // Channel closure also stops the watchdog when the test panics.
+        drop(done);
     }
 
     // Adapted from the A1 review probes: assertions describe the desired behavior.
@@ -1533,82 +1583,85 @@ mod reconciliation {
 
     #[tokio::test(start_paused = true)]
     async fn review_transient_schedule_failure_does_not_stop_service() {
-        let (gate, mut entered) = mpsc::channel(1);
-        let rig = Rig::gated(Some(("agent.session_lost", gate))).await;
-        rig.agent("lead", Some("%1"), Some("recorded")).await;
-        rig.row("recorded", "%1", false).await;
-        // A Ready agent's own session no longer wakes it; another row on its pane does.
-        rig.row("pending-100", "%1", false).await;
-        rig.frame("%1", "p/lead", IDLE);
-        let (agents, _) = rig.start();
-        agents.reconciled().await.unwrap();
-        let mut events = agents.observation_events();
-        let org = rig.org.clone();
-        let held = tokio::spawn(async move {
-            org.execute(
-                OrgCommand::SessionLost {
-                    agent_id: "p/lead".parse().unwrap(),
-                },
-                chrono::Utc::now(),
-            )
-            .await
-        });
-        let release = entered.recv().await.unwrap();
-        update(&rig, "pending-100").await;
-        progress(&mut events, "scheduling", None).await;
-        tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        progress(&mut events, "schedule_failed", None).await;
-        release.send(()).unwrap();
-        let _ = held.await.unwrap();
-        rig.org.snapshot().await.unwrap();
-        assert!(agents.list(ListParams::default()).await.is_ok());
-        agents
-            .lifecycle(
-                request(
-                    "p/other",
-                    None,
-                    crate::control::reservation::ReservationKind::Down,
-                ),
-                |_| async { Ok(()) },
-                cleanup,
-            )
-            .await
-            .unwrap();
-        // The filesystem lane must survive too; resume real time before I/O.
-        tokio::time::resume();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".atm/roles")).unwrap();
-        std::fs::write(
-            dir.path().join(".atm/roles/lead.md"),
-            "+++\nharness='pi'\n+++\n",
-        )
-        .unwrap();
-        // The role is read, and the start then finds no pane to split: refused
-        // with nothing recorded.
-        rig.client
-            .script_inspect(&PaneId::parse("%0").unwrap(), None)
-            .unwrap();
-        assert!(matches!(
-            agents
-                .up(
-                    UpParams {
-                        project_root: dir.path().into(),
-                        name: "lead".into(),
-                        caller_server: None,
+        with_wall_clock_hang_guard(async {
+            let (gate, mut entered) = mpsc::channel(1);
+            let rig = Rig::gated(Some(("agent.session_lost", gate))).await;
+            rig.agent("lead", Some("%1"), Some("recorded")).await;
+            rig.row("recorded", "%1", false).await;
+            // A Ready agent's own session no longer wakes it; another row on its pane does.
+            rig.row("pending-100", "%1", false).await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let mut events = agents.observation_events();
+            let org = rig.org.clone();
+            let held = tokio::spawn(async move {
+                org.execute(
+                    OrgCommand::SessionLost {
+                        agent_id: "p/lead".parse().unwrap(),
                     },
-                    caller(),
+                    chrono::Utc::now(),
                 )
-                .await,
-            Err(AgentError::Refused(_))
-        ));
-        assert!(dir.path().join(".atm/project.toml").is_file());
-        assert!(agents
-            .list(ListParams {
-                project_root: Some(dir.path().into())
-            })
-            .await
-            .unwrap()
-            .is_empty());
+                .await
+            });
+            let release = entered.recv().await.unwrap();
+            update(&rig, "pending-100").await;
+            progress(&mut events, "scheduling", None).await;
+            tokio::time::advance(std::time::Duration::from_secs(6)).await;
+            progress(&mut events, "schedule_failed", None).await;
+            release.send(()).unwrap();
+            let _ = held.await.unwrap();
+            rig.org.snapshot().await.unwrap();
+            assert!(agents.list(ListParams::default()).await.is_ok());
+            agents
+                .lifecycle(
+                    request(
+                        "p/other",
+                        None,
+                        crate::control::reservation::ReservationKind::Down,
+                    ),
+                    |_| async { Ok(()) },
+                    cleanup,
+                )
+                .await
+                .unwrap();
+            // The filesystem lane must survive too; resume real time before I/O.
+            tokio::time::resume();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".atm/roles")).unwrap();
+            std::fs::write(
+                dir.path().join(".atm/roles/lead.md"),
+                "+++\nharness='pi'\n+++\n",
+            )
+            .unwrap();
+            // The role is read, and the start then finds no pane to split: refused
+            // with nothing recorded.
+            rig.client
+                .script_inspect(&PaneId::parse("%0").unwrap(), None)
+                .unwrap();
+            assert!(matches!(
+                agents
+                    .up(
+                        UpParams {
+                            project_root: dir.path().into(),
+                            name: "lead".into(),
+                            caller_server: None,
+                        },
+                        caller(),
+                    )
+                    .await,
+                Err(AgentError::Refused(_))
+            ));
+            assert!(dir.path().join(".atm/project.toml").is_file());
+            assert!(agents
+                .list(ListParams {
+                    project_root: Some(dir.path().into())
+                })
+                .await
+                .unwrap()
+                .is_empty());
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2311,140 +2364,146 @@ mod reconciliation {
 
     #[tokio::test(start_paused = true)]
     async fn ready_append_unknown_quarantines_before_release() {
-        use crate::control::reservation::{ReservationError, ReservationKind};
-        let (gate, mut entered) = mpsc::channel(1);
-        let rig = Rig::gated(Some(("agent.editor_ready", gate))).await;
-        rig.agent("lead", Some("%1"), Some("recorded")).await;
-        rig.command(OrgCommand::Revalidate {
-            agent_id: "p/lead".parse().unwrap(),
+        with_wall_clock_hang_guard(async {
+            use crate::control::reservation::{ReservationError, ReservationKind};
+            let (gate, mut entered) = mpsc::channel(1);
+            let rig = Rig::gated(Some(("agent.editor_ready", gate))).await;
+            rig.agent("lead", Some("%1"), Some("recorded")).await;
+            rig.command(OrgCommand::Revalidate {
+                agent_id: "p/lead".parse().unwrap(),
+            })
+            .await;
+            rig.row("pending-100", "%1", false).await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            let release = entered.recv().await.unwrap();
+            tokio::time::advance(std::time::Duration::from_secs(7)).await;
+            let result = rig
+                .control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Observe),
+                    |_| async { Ok::<_, AgentError>(()) },
+                    cleanup,
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(AgentError::Reservation(
+                    ReservationError::Quarantined { .. }
+                ))
+            ));
+            agents.reconciled().await.unwrap();
+            release.send(()).unwrap();
+            rig.org.snapshot().await.unwrap();
+            // The quarantined operation is the observation itself. The list
+            // names it, in place of the failed observation it used to show.
+            let rows = agents.list(ListParams::default()).await.unwrap();
+            assert_eq!(
+                rows[0].reason.as_deref(),
+                Some(
+                    "quarantined: the agent's observation on %1 could not be settled; \
+                     restart atmd and reconcile"
+                )
+            );
+            agents
+                .lifecycle(
+                    request("p/healthy", None, ReservationKind::Down),
+                    |_| async { Ok(()) },
+                    cleanup,
+                )
+                .await
+                .unwrap();
+            rig.control
+                .run_reserved(
+                    request("p/other", None, ReservationKind::Observe),
+                    |_| async { Ok::<_, AgentError>(()) },
+                    cleanup,
+                )
+                .await
+                .unwrap();
         })
         .await;
-        rig.row("pending-100", "%1", false).await;
-        rig.frame("%1", "p/lead", IDLE);
-        let (agents, _) = rig.start();
-        let release = entered.recv().await.unwrap();
-        tokio::time::advance(std::time::Duration::from_secs(7)).await;
-        let result = rig
-            .control
-            .run_reserved(
-                request("p/lead", Some("%1"), ReservationKind::Observe),
-                |_| async { Ok::<_, AgentError>(()) },
-                cleanup,
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(AgentError::Reservation(
-                ReservationError::Quarantined { .. }
-            ))
-        ));
-        agents.reconciled().await.unwrap();
-        release.send(()).unwrap();
-        rig.org.snapshot().await.unwrap();
-        // The quarantined operation is the observation itself. The list
-        // names it, in place of the failed observation it used to show.
-        let rows = agents.list(ListParams::default()).await.unwrap();
-        assert_eq!(
-            rows[0].reason.as_deref(),
-            Some(
-                "quarantined: the agent's observation on %1 could not be settled; \
-                 restart atmd and reconcile"
-            )
-        );
-        agents
-            .lifecycle(
-                request("p/healthy", None, ReservationKind::Down),
-                |_| async { Ok(()) },
-                cleanup,
-            )
-            .await
-            .unwrap();
-        rig.control
-            .run_reserved(
-                request("p/other", None, ReservationKind::Observe),
-                |_| async { Ok::<_, AgentError>(()) },
-                cleanup,
-            )
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
     async fn clear_reply_lost_cleanup_sees_committed_clear() {
-        use crate::control::reservation::ReservationKind;
-        use std::{
-            future::{poll_fn, Future},
-            task::Poll,
-        };
-        let (gate, mut entered) = mpsc::channel(1);
-        let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
-        rig.agent("lead", Some("%1"), Some("recorded")).await;
-        rig.row("recorded", "%1", false).await;
-        rig.frame("%1", "p/lead", IDLE);
-        let (agents, _) = rig.start();
-        agents.reconciled().await.unwrap();
-        let org = rig.org.clone();
-        let cleanup_org = org.clone();
-        let (read, reading) = tokio::sync::oneshot::channel();
-        let job = tokio::spawn(async move {
-            agents
-                .lifecycle(
-                    request("p/lead", Some("%1"), ReservationKind::Clear),
-                    move |_| async move {
-                        let mut execute = Box::pin(org.execute(
-                            OrgCommand::Clear {
-                                agent_id: "p/lead".parse().unwrap(),
-                            },
-                            chrono::Utc::now(),
-                        ));
-                        poll_fn(|cx| {
-                            assert!(execute.as_mut().poll(cx).is_pending());
-                            Poll::Ready(())
-                        })
-                        .await;
-                        drop(execute);
-                        Err::<(), _>(AgentError::Refused("lost reply".into()))
-                    },
-                    move |_, _| async move {
-                        let mut snapshot = Box::pin(cleanup_org.snapshot());
-                        poll_fn(|cx| {
-                            assert!(snapshot.as_mut().poll(cx).is_pending());
-                            Poll::Ready(())
-                        })
-                        .await;
-                        read.send(()).unwrap();
-                        let state = snapshot.await?;
-                        assert_eq!(
-                            state.agent(&"p/lead".parse().unwrap()).unwrap().status,
-                            AgentStatus::Clearing
-                        );
-                        cleanup_org
-                            .execute(
-                                OrgCommand::Stuck {
+        with_wall_clock_hang_guard(async {
+            use crate::control::reservation::ReservationKind;
+            use std::{
+                future::{poll_fn, Future},
+                task::Poll,
+            };
+            let (gate, mut entered) = mpsc::channel(1);
+            let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
+            rig.agent("lead", Some("%1"), Some("recorded")).await;
+            rig.row("recorded", "%1", false).await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let org = rig.org.clone();
+            let cleanup_org = org.clone();
+            let (read, reading) = tokio::sync::oneshot::channel();
+            let job = tokio::spawn(async move {
+                agents
+                    .lifecycle(
+                        request("p/lead", Some("%1"), ReservationKind::Clear),
+                        move |_| async move {
+                            let mut execute = Box::pin(org.execute(
+                                OrgCommand::Clear {
                                     agent_id: "p/lead".parse().unwrap(),
-                                    reason: "clear outcome was not acknowledged".into(),
                                 },
                                 chrono::Utc::now(),
-                            )
-                            .await?;
-                        Ok(())
-                    },
+                            ));
+                            poll_fn(|cx| {
+                                assert!(execute.as_mut().poll(cx).is_pending());
+                                Poll::Ready(())
+                            })
+                            .await;
+                            drop(execute);
+                            Err::<(), _>(AgentError::Refused("lost reply".into()))
+                        },
+                        move |_, _| async move {
+                            let mut snapshot = Box::pin(cleanup_org.snapshot());
+                            poll_fn(|cx| {
+                                assert!(snapshot.as_mut().poll(cx).is_pending());
+                                Poll::Ready(())
+                            })
+                            .await;
+                            read.send(()).unwrap();
+                            let state = snapshot.await?;
+                            assert_eq!(
+                                state.agent(&"p/lead".parse().unwrap()).unwrap().status,
+                                AgentStatus::Clearing
+                            );
+                            cleanup_org
+                                .execute(
+                                    OrgCommand::Stuck {
+                                        agent_id: "p/lead".parse().unwrap(),
+                                        reason: "clear outcome was not acknowledged".into(),
+                                    },
+                                    chrono::Utc::now(),
+                                )
+                                .await?;
+                            Ok(())
+                        },
+                    )
+                    .await
+            });
+            let release = entered.recv().await.unwrap();
+            reading.await.unwrap();
+            release.send(()).unwrap();
+            assert!(matches!(job.await.unwrap(), Err(AgentError::Refused(_))));
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
+            rig.control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Observe),
+                    |_| async { Ok::<_, AgentError>(()) },
+                    cleanup,
                 )
                 .await
-        });
-        let release = entered.recv().await.unwrap();
-        reading.await.unwrap();
-        release.send(()).unwrap();
-        assert!(matches!(job.await.unwrap(), Err(AgentError::Refused(_))));
-        assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
-        rig.control
-            .run_reserved(
-                request("p/lead", Some("%1"), ReservationKind::Observe),
-                |_| async { Ok::<_, AgentError>(()) },
-                cleanup,
-            )
-            .await
-            .unwrap();
+                .unwrap();
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3547,6 +3606,66 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn restart_changed_foreground_between_looks_pins_nothing() {
+        // A foreground job changes between the inspection and capture: the
+        // capture alone cannot establish which harness owns the pane.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        inspect_with(&rig, "node");
+        let capture = PaneCapture::new(
+            IDLE.into(),
+            Rig::inspection("%1", "p/lead", false).with_foreground_process(None, Some("pi".into())),
+            CaptureFormat::Ansi,
+        );
+        rig.client.script_capture(&capture).unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+    }
+
+    #[tokio::test]
+    async fn restart_capture_tagged_for_another_pins_nothing() {
+        // The pane changes owner after the first look, before the capture.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        inspect_with(&rig, "pi");
+        let capture = PaneCapture::new(
+            IDLE.into(),
+            Rig::inspection("%1", "p/other", false)
+                .with_foreground_process(None, Some("pi".into())),
+            CaptureFormat::Ansi,
+        );
+        rig.client.script_capture(&capture).unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+    }
+
+    #[tokio::test]
+    async fn restart_dead_capture_pins_nothing() {
+        // A pane alive at inspection dies before its capture is returned.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        inspect_with(&rig, "pi");
+        let capture = PaneCapture::new(
+            IDLE.into(),
+            Rig::inspection("%1", "p/lead", true).with_foreground_process(None, Some("pi".into())),
+            CaptureFormat::Ansi,
+        );
+        rig.client.script_capture(&capture).unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+    }
+
+    #[tokio::test]
     async fn restart_without_row_keeps_starting() {
         // The same pane with no row of the harness yet (the registry is empty
         // until discovery or the harness's next event): nothing is pinned, the
@@ -3653,6 +3772,28 @@ mod reconciliation {
             agents.baseline_of(&"p/lead".parse().unwrap(), "%1"),
             PaneBaseline::unproven()
         );
+    }
+
+    #[tokio::test]
+    async fn gone_pane_forgets_its_baseline() {
+        for inspection in [
+            None,
+            Some(Rig::inspection("%1", "p/lead", true)),
+            Some(Rig::inspection("%1", "p/other", false)),
+        ] {
+            let (rig, agents) = pinned_ready().await;
+            let mut events = agents.observation_events();
+            rig.client
+                .script_inspect(&PaneId::parse("%1").unwrap(), inspection.as_ref())
+                .unwrap();
+            rig.row("pending-300", "%1", false).await;
+            progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Down);
+            assert_eq!(
+                agents.baseline_of(&"p/lead".parse().unwrap(), "%1"),
+                PaneBaseline::unproven()
+            );
+        }
     }
 
     #[tokio::test]

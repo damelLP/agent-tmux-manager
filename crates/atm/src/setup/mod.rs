@@ -5,9 +5,10 @@
 //!
 //! - **Claude Code**: writes the `atm-hook` bash script to
 //!   `~/.local/bin/`, then registers it in `~/.claude/settings.json`'s
-//!   `hooks` and `statusLine` blocks. A statusLine of the user's own is
-//!   saved first to `claude-statusline-backup.json` in ATM's config dir
-//!   (`~/.config/atm/` on Linux), and `atm uninstall` restores it.
+//!   `hooks` block and adds a `statusLine` only when absent. A user's own
+//!   statusLine is preserved without a backup; its command should forward
+//!   stdin to `atm-hook` for context, model and cost updates. `atm uninstall`
+//!   still restores `claude-statusline-backup.json` from older setups.
 //! - **pi** (<https://pi.dev/>): writes the `pi-atm` TypeScript
 //!   extension to `~/.pi/agent/packages/pi-atm/`, then adds
 //!   `"packages/pi-atm"` to `~/.pi/agent/settings.json`'s `packages`

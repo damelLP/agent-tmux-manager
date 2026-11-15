@@ -56,15 +56,14 @@ pub(super) fn create_status_line_entry() -> Value {
     })
 }
 
-/// Where setup saves the user's own Claude Code statusLine when it
-/// replaces it, for uninstall to restore.
+/// Where older setup versions saved a replaced Claude Code statusLine,
+/// for uninstall to restore.
 pub(super) fn status_line_backup_path() -> Option<PathBuf> {
     atm_config_path().map(|config| config.with_file_name("claude-statusline-backup.json"))
 }
 
-/// Setup's statusLine step: puts ATM's statusLine in `settings`. A
-/// statusLine of the user's own is first saved to `backup_path` as
-/// `{"statusLine": <theirs>}`; if that fails, `settings` is untouched.
+/// Setup's statusLine step: adds ATM's statusLine only when absent,
+/// leaving a user's own entry unchanged without writing a backup.
 /// With no statusLine, an existing backup is kept: settings.json may
 /// have been lost or reset since, leaving the backup as the only copy.
 /// Returns whether `settings` changed.
@@ -74,13 +73,13 @@ fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) ->
             println!("    statusLine - already configured");
             return Ok(false);
         }
-        Some(existing) => {
-            let backup = Map::from_iter([("statusLine".to_string(), existing.clone())]);
-            write_json_file_pretty(backup_path, &backup)?;
+        Some(_) => {
+            let hook_path = hook_script_path();
+            let command = hook_path.to_string_lossy().replace('\'', "'\\''");
             println!(
-                "    statusLine - replaced yours; saved to {}; `atm uninstall` restores it",
-                backup_path.display()
+                "    statusLine - kept yours; atm reads Claude Code context, model and cost only through atm-hook; pass your command's stdin to atm-hook (e.g. input=$(cat); printf '%s' \"$input\" | '{command}'), or remove your statusLine and run atm setup again."
             );
+            return Ok(false);
         }
         None if backup_path.exists() => println!(
             "    statusLine - added; your earlier one is still saved in {}, and `atm uninstall` restores it",
@@ -192,7 +191,7 @@ pub(super) fn setup_claude_code() -> Result<()> {
 
 #[cfg(test)]
 mod status_line_backup_tests {
-    use super::{create_status_line_entry, install_status_line, uninstall_status_line, SetupError};
+    use super::{create_status_line_entry, install_status_line, uninstall_status_line};
     use serde_json::{json, Map, Value};
     use std::fs;
     use std::path::Path;
@@ -216,18 +215,38 @@ mod status_line_backup_tests {
     }
 
     #[test]
-    fn install_saves_the_users_status_line_then_replaces_it() {
+    fn install_keeps_the_users_status_line_and_saves_nothing() {
+        for status_line in [
+            user_status_line(),
+            json!({"type": "command", "command": "~/bin/atm-hook-wrapper.sh", "padding": 2}),
+            Value::Null,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let backup = dir.path().join("atm/backup.json");
+            let mut settings = settings_with(status_line);
+            let before = serde_json::to_vec(&settings).unwrap();
+
+            assert!(!install_status_line(&mut settings, &backup).unwrap());
+
+            assert_eq!(serde_json::to_vec(&settings).unwrap(), before);
+            assert!(!backup.exists());
+            assert!(!dir.path().join("atm").exists());
+        }
+    }
+
+    #[test]
+    fn install_over_the_users_status_line_keeps_an_earlier_backup() {
         let dir = tempfile::tempdir().unwrap();
-        let backup = dir.path().join("atm/backup.json");
+        let backup = dir.path().join("backup.json");
+        let earlier = b"{\n  \"statusLine\": {\"command\": \"older-status\"}\n}\n";
+        fs::write(&backup, earlier).unwrap();
         let mut settings = settings_with(user_status_line());
+        let before = serde_json::to_vec(&settings).unwrap();
 
-        assert!(install_status_line(&mut settings, &backup).unwrap());
+        assert!(!install_status_line(&mut settings, &backup).unwrap());
 
-        assert_eq!(settings, settings_with(create_status_line_entry()));
-        assert_eq!(
-            read_backup(&backup),
-            json!({"statusLine": user_status_line()})
-        );
+        assert_eq!(serde_json::to_vec(&settings).unwrap(), before);
+        assert_eq!(fs::read(&backup).unwrap(), earlier);
     }
 
     #[test]
@@ -259,19 +278,17 @@ mod status_line_backup_tests {
     }
 
     #[test]
-    fn install_leaves_the_users_status_line_if_the_backup_fails() {
+    fn install_keeps_the_users_status_line_without_accessing_the_backup() {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("atm");
         fs::write(&blocker, "not a directory").unwrap();
         let mut settings = settings_with(user_status_line());
+        let before = serde_json::to_vec(&settings).unwrap();
 
-        let err = install_status_line(&mut settings, &blocker.join("backup.json")).unwrap_err();
+        assert!(!install_status_line(&mut settings, &blocker.join("backup.json")).unwrap());
 
-        assert!(
-            matches!(err, SetupError::Io { op: "create", ref path, .. } if path == &blocker),
-            "{err:?}"
-        );
-        assert_eq!(settings, settings_with(user_status_line()));
+        assert_eq!(serde_json::to_vec(&settings).unwrap(), before);
+        assert_eq!(fs::read(&blocker).unwrap(), b"not a directory");
     }
 
     /// A backup may outlive the statusLine it came from: settings.json
@@ -324,6 +341,16 @@ mod status_line_backup_tests {
         ));
 
         assert_eq!(settings, settings_with(newer));
+    }
+
+    #[test]
+    fn uninstall_without_a_backup_keeps_the_users_status_line() {
+        let mut settings = settings_with(user_status_line());
+        let before = serde_json::to_vec(&settings).unwrap();
+
+        assert!(!uninstall_status_line(&mut settings, None));
+
+        assert_eq!(serde_json::to_vec(&settings).unwrap(), before);
     }
 
     #[test]

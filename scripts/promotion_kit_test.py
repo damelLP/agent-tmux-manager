@@ -269,17 +269,19 @@ if mode == 'failure':
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 return atm_promotion.main(operation)
 
-    # Missing either rename or setup's exact destination invocation breaks this.
+    # Missing either rename or setup's destination/socket override breaks this.
     def test_promote_and_idempotent_rollback_keep_regular_pairs_and_setup_routing(self):
-        self.call(env=dict(self.env, TMUX='foreign', TMUX_PANE='%99'))
+        inherited = dict(self.env, ATM_SOCKET=str(self.root / 'inherited.sock'),
+                         TMUX='foreign', TMUX_PANE='%99')
+        self.call(env=inherited)
         self.assertEqual(self.pair_bytes(self.bin), self.new)
         self.assertEqual(self.pair_bytes(self.previous()), self.old)
         self.assertFalse((self.bin / 'atm').is_symlink())
         self.assertFalse((self.bin / 'atmd').is_symlink())
-        self.call('rollback')
+        self.call('rollback', env=inherited)
         archives = list((self.bin / '.atm-promotion/pairs').iterdir())
         self.assertIn(self.new, [self.pair_bytes(path) for path in archives])
-        self.call('rollback')
+        self.call('rollback', env=inherited)
         self.assertEqual(list((self.bin / '.atm-promotion/pairs').iterdir()), archives)
         self.assertEqual(self.pair_bytes(self.bin), self.old)
         records = self.records()

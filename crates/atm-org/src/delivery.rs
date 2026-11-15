@@ -102,6 +102,9 @@
 //! the restart veto. The independent agent-not-ready clock survives Starting /
 //! Clearing transitions and focus waits, but restarts when Starting or Clearing
 //! follows Stuck or Down; see [`RecipientLiveView::agent_not_ready_since`].
+//! A queued, unattempted message gets one informational owner Note after
+//! [`BUSY_NOTICE_AFTER`] behind the same observed turn (measured no earlier than
+//! its sent_at). This is independent of delivery status, never a block/drop.
 //! Positive running-turn evidence clears that clock. Its first loss starts a
 //! fresh window; repeated unknown observations never restart it. Unknown focus
 //! still waits ahead of agent status, even if that window has expired.
@@ -130,6 +133,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::time::Duration;
 use thiserror::Error;
+
+/// One informational owner notice after a message waits behind a continuously
+/// observed running turn. Never a readiness timeout or permission to drop it.
+pub const BUSY_NOTICE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// Config-file settings. Durations serialize as `{secs, nanos}`; omitted fields
 /// take defaults, unknown keys are errors. Validate via `DeliveryPolicy::new`.
@@ -350,6 +357,27 @@ impl RecipientLiveView {
             probably_landed: false,
         }
     }
+}
+
+/// Whether an unattempted queued message has waited behind one observed turn
+/// for thirty minutes. The executor deduplicates by message and observed turn,
+/// and publishes a normal owner Note without changing delivery state.
+#[must_use]
+pub fn busy_notice_due(message: &Message, live: &RecipientLiveView, now: DateTime<Utc>) -> bool {
+    message.status == DeliveryStatus::Queued
+        && matches!(message.content.to, Address::Agent(_))
+        && message.last_attempt.is_none()
+        && live.confirmation.is_none()
+        && !live.probably_landed
+        && matches!(
+            live.agent_status,
+            AgentStatus::Starting | AgentStatus::Clearing | AgentStatus::Ready
+        )
+        && live.running_turn_since.is_some_and(|since| {
+            now.signed_duration_since(since.max(message.sent_at))
+                .to_std()
+                .is_ok_and(|elapsed| elapsed >= BUSY_NOTICE_AFTER)
+        })
 }
 
 /// Fold an applied agent transition into its independent readiness clock.
@@ -1199,6 +1227,76 @@ mod tests {
                 assert_eq!(live.hold_since, since);
             }
         }
+    }
+
+    #[test]
+    fn busy_notice_requires_thirty_minutes_of_this_messages_observed_turn() {
+        let h = History::new(false);
+        let mut live = ready();
+        for start in [-900, 0, 900] {
+            live.running_turn_since = Some(time(start));
+            let due = time(if start == 900 { 2700 } else { 1800 });
+            assert!(!busy_notice_due(h.message(), &live, time(-1000)));
+            assert!(!busy_notice_due(
+                h.message(),
+                &live,
+                due - TimeDelta::milliseconds(1)
+            ));
+            assert!(busy_notice_due(h.message(), &live, due));
+            assert!(busy_notice_due(
+                h.message(),
+                &live,
+                due + TimeDelta::hours(1)
+            ));
+        }
+        live.running_turn_since = None;
+        assert!(!busy_notice_due(h.message(), &live, time(86400)));
+        live.running_turn_since = Some(time(0));
+        for status in [AgentStatus::Stuck, AgentStatus::Down] {
+            live.agent_status = status;
+            assert!(!busy_notice_due(h.message(), &live, time(86400)));
+        }
+        live.agent_status = AgentStatus::Starting;
+        assert!(busy_notice_due(h.message(), &live, time(1800)));
+        live.agent_status = AgentStatus::Clearing;
+        assert!(busy_notice_due(h.message(), &live, time(1800)));
+        assert!(!busy_notice_due(
+            History::new(true).message(),
+            &live,
+            time(1800)
+        ));
+    }
+
+    #[test]
+    fn running_turn_cannot_override_receipt_or_an_uncertain_attempt() {
+        let mut h = History::new(false);
+        let mut live = ready();
+        live.running_turn_since = Some(time(0));
+        h.attempt(1, 0);
+        assert!(!busy_notice_due(h.message(), &live, time(1800)));
+        live.probably_landed = true;
+        assert_eq!(
+            h.step(&live, 1800),
+            DeliveryStep::Blocked {
+                reason: FailureReason::ProbablyDelivered
+            }
+        );
+        h.failure(false, 1800);
+        assert!(!busy_notice_due(h.message(), &live, time(3600)));
+        live.last_attempt_before_start = true;
+        assert_eq!(
+            h.step(&live, 3600),
+            DeliveryStep::Blocked {
+                reason: FailureReason::Restarted
+            }
+        );
+        let receipt = DeliveryReceipt {
+            session_id: "s1".into(),
+            confirmation: "token".into(),
+        };
+        live.confirmation = Some(receipt.clone());
+        assert_eq!(h.step(&live, 3600), DeliveryStep::Confirm { receipt });
+        assert!(!busy_notice_due(h.message(), &live, time(3600)));
     }
 
     #[test]

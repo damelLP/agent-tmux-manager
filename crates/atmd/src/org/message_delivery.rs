@@ -660,6 +660,12 @@ impl Attempt {
         if rt.cancel.is_cancelled() {
             return Err(shutting_down());
         }
+        if Instant::now() >= confirm_by {
+            // The window ended before anything was typed (a slow commit or
+            // fold). No paste: cleanup records that, and the attempt is
+            // failed for its retry instead of leaving a draft staged.
+            return Ok(());
+        }
         self.set(|progress| progress.paste = EffectCertainty::Unknown)?;
         // Every decision about an input is this one function of one capture:
         // the actor's own for each input, a fresh one for each look between.
@@ -710,6 +716,10 @@ impl Attempt {
                 if rt.cancel.is_cancelled() {
                     return Err(shutting_down());
                 }
+                // The window may have ended during this look. The Enter
+                // still goes out: it is as guarded as any other, a receipt
+                // that comes late is honoured, and a key refused here would
+                // leave the reference staged for the owner to clear.
                 let key = PaneKey::Enter;
                 let entered =
                     (r.keys_guarded(pane, agent.clone(), key, format, guard(enter))).await;

@@ -1193,6 +1193,12 @@ impl Rig {
         for _ in 0..100 {
             for _ in 0..100 {
                 if self.pastes() == 1 {
+                    // tmux has the paste; the executor has yet to hear of
+                    // it. With the clock standing still it runs on to the
+                    // pacing timer of its first look and no further.
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
                     return;
                 }
                 tokio::task::yield_now().await;
@@ -3812,4 +3818,85 @@ fn trust_default_no_never_gets_a_key() {
             assert!(!guard_allows_input(&facts), "{facts:?}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The confirmation window and the inputs
+// ---------------------------------------------------------------------------
+
+/// The attempt's append takes longer than the confirmation window (and less
+/// than the writer's reply deadline, so the commit succeeds). The window
+/// started at the attempt's event and has ended before anything was typed:
+/// no paste. An attempt that typed nothing is failed for its retry, where a
+/// paste now could only be left staged in the editor.
+#[tokio::test(start_paused = true)]
+async fn no_paste_once_the_confirmation_window_has_ended() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    // The first capture; a paste guard and a look nobody may ask for.
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id)]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    let window = rig.rt.policy.settings().confirmation_timeout;
+    tokio::time::advance(window).await;
+    rig.release();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 2 * 3);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.last_attempt_seq, Some(before + 1));
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    assert_eq!(snapshot.hold, None);
+    // The attempt and its failure for the retry.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 2);
+}
+
+/// The look the executor is waiting for comes back after the window has
+/// ended, and shows the staged reference: the Enter still goes out, behind
+/// its guard like any other. Nothing waits for its receipt any more, so
+/// the attempt is held. The session's prompt event arrives late and still
+/// delivers the message, as attempt 1 and with no second paste.
+///
+/// Refusing the key at the bound would leave the reference staged in the
+/// editor and the queue behind it waiting for the owner.
+#[tokio::test(start_paused = true)]
+async fn enter_after_the_window_is_sent_and_a_late_receipt_delivers() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let before = rig.org.status().unwrap();
+    let attempt = rig.spawn_deliver(id);
+    rig.pasted().await;
+    // The executor is parked before its first look; the window ends.
+    let window = rig.rt.policy.settings().confirmation_timeout;
+    tokio::time::advance(window).await;
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+
+    rig.prompt("s1", inbox_reference(id));
+    // The executor's one capture: a paste guard would find no frame.
+    rig.script(&[pi(IDLE)]);
+    rig.deliver(id).await.unwrap();
+
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+    assert_eq!(snapshot.message.last_attempt.map(|a| a.attempt), Some(1));
+    // The attempt, the Enter's audit and the delivery.
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 3);
 }

@@ -540,22 +540,34 @@ if mode == 'failure':
         self.assertEqual(self.pair_bytes(self.bin), self.old)
         self.assertEqual(self.records(), [])
 
-    def child(self, executable, env):
-        # cat blocks on a pipe, not a timing guess. /proc/exe identifies our copy.
-        process = subprocess.Popen([str(executable)], env=env, stdin=subprocess.PIPE,
+    def child(self, executable, env, *args):
+        # Both holders echo pipe input to signal readiness and exit on stdin EOF.
+        process = subprocess.Popen([str(executable), *args], env=env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         def cleanup():
             process.stdin.close()
-            process.wait(timeout=30)
+            self.assertEqual(process.wait(timeout=30), 0)
             process.stdout.close(); process.stderr.close()
         self.addCleanup(cleanup)
         process.stdin.write(b'ready\n'); process.stdin.flush()
         self.assertEqual(process.stdout.readline(), b'ready\n')
         return process
 
+    def installed_child(self, env):
+        # A renamed multi-call cat can refuse to start; the running Python is portable.
+        executable = self.bin / 'atmd'
+        shutil.copy2(sys.executable, executable)
+        process = self.child(executable, env, '-I', '-S', '-c',
+                             'import sys\nfor line in sys.stdin.buffer:\n'
+                             '    sys.stdout.buffer.write(line); sys.stdout.buffer.flush()')
+        proc = Path('/proc') / str(process.pid)
+        self.assertEqual(os.readlink(proc / 'exe'), str(executable))
+        self.assertEqual((proc / 'comm').read_text().strip(), 'atmd')
+        self.assertEqual((proc / 'cmdline').read_bytes().split(b'\0')[0], os.fsencode(executable))
+        return process
+
     def test_running_installed_binary_refuses_but_foreign_process_does_not(self):
-        shutil.copy2('/bin/cat', self.bin / 'atmd')
-        process = self.child(self.bin / 'atmd', dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
+        process = self.installed_child(dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
         self.call(ok=False)
         self.assertIsNone(process.poll())
         process.stdin.close(); process.wait(timeout=30)
@@ -575,8 +587,7 @@ if mode == 'failure':
             return real_readlink(path, *args, **kwargs)
         with patch.object(atm_promotion.os, 'readlink', side_effect=readlink):
             self.assertEqual(self.in_process(), 0)
-        shutil.copy2('/bin/cat', self.bin / 'atmd')
-        relevant = self.child(self.bin / 'atmd', dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
+        relevant = self.installed_child(dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
         denied = Path(f'/proc/{relevant.pid}/exe')
         with patch.object(atm_promotion.os, 'readlink', side_effect=readlink):
             self.assertNotEqual(self.in_process(), 0)

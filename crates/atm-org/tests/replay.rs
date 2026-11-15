@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test generators/helpers only
+#[path = "support/decision.rs"]
+mod decision_support;
 #[path = "support/history.rs"]
 mod history;
 mod support;
@@ -106,6 +108,12 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::ControlKilled(_) => 17,
         OrgEvent::AgentEditorReady { .. } => 18,
         OrgEvent::AgentRevalidationRequested { .. } => 19,
+        OrgEvent::DecisionRequested(_) => 20,
+        OrgEvent::DecisionTakenProvisionally(_) => 21,
+        OrgEvent::DecisionResolved(_) => 22,
+        OrgEvent::DecisionOverruled(_) => 23,
+        OrgEvent::DecisionExpired { .. } => 24,
+        OrgEvent::DecisionWithdrawn(_) => 25,
     }
 }
 
@@ -191,7 +199,8 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
         16 => OrgEvent::ControlSpawned(audit),
         17 => OrgEvent::ControlKilled(audit),
         18 => OrgEvent::AgentEditorReady { agent_id },
-        _ => OrgEvent::AgentRevalidationRequested { agent_id },
+        19 => OrgEvent::AgentRevalidationRequested { agent_id },
+        _ => decision_support::decision_event_case(slot - 20, text, n, flag),
     }
 }
 
@@ -218,6 +227,7 @@ fn command_slot(command: &OrgCommand) -> usize {
         OrgCommand::ControlKilled(_) => 18,
         OrgCommand::EditorReady { .. } => 19,
         OrgCommand::Revalidate { .. } => 20,
+        OrgCommand::Decision(_) => 21,
     }
 }
 
@@ -302,22 +312,36 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
         17 => OrgCommand::ControlSpawned(audit),
         18 => OrgCommand::ControlKilled(audit),
         19 => OrgCommand::EditorReady { agent_id },
-        _ => OrgCommand::Revalidate { agent_id },
+        20 => OrgCommand::Revalidate { agent_id },
+        _ => OrgCommand::Decision(decision_support::decision_command(
+            n,
+            DecisionId::new(n),
+            Address::Agent(agent_id),
+            flag.then(|| time() + chrono::Duration::milliseconds(n as i64)),
+            flag,
+        )),
     }
 }
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..20)
+    let events: Vec<_> = (0..26)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..20).collect::<Vec<_>>());
-    let commands: Vec<_> = (0..21)
+    assert_eq!(events, (0..26).collect::<Vec<_>>());
+    let commands: Vec<_> = (0..22)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
-    assert_eq!(commands, (0..21).collect::<Vec<_>>());
+    assert_eq!(commands, (0..22).collect::<Vec<_>>());
+    let picks: Vec<_> = (0..5)
+        .map(|pick| match command_case(21, pick, true) {
+            OrgCommand::Decision(command) => decision_support::decision_command_pick(&command),
+            other => panic!("not a decision command: {other:?}"),
+        })
+        .collect();
+    assert_eq!(picks, (0..5).collect::<Vec<_>>());
     let history = history::History::seeded();
-    let wide_commands: Vec<_> = (0..21)
+    let wide_commands: Vec<_> = (0..22)
         .map(|slot| {
             let seed = history::Seed {
                 slot,
@@ -331,7 +355,7 @@ fn case_generators_cover_every_event_and_command_variant() {
             command_slot(&seed.command(&history.state))
         })
         .collect();
-    assert_eq!(wide_commands, (0..21).collect::<Vec<_>>());
+    assert_eq!(wide_commands, (0..22).collect::<Vec<_>>());
 }
 
 // Synthetic: a restart-style history exercising clear, retry, owner delivery
@@ -486,7 +510,7 @@ impl ExcludedReach {
 
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..20, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..26, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
@@ -504,7 +528,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
         ..Config::default()
     });
     let inputs = (
-        prop::collection::vec((0usize..21, 0u64..50, any::<bool>()), 0..80),
+        prop::collection::vec((0usize..22, 0u64..50, any::<bool>()), 0..80),
         any::<usize>(),
     );
     runner
@@ -534,7 +558,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
                 }
                 // Every command is tried at every generated reachable state, not
                 // only the randomly selected command that advanced the history.
-                for candidate in 0..21 {
+                for candidate in 0..22 {
                     let mut probe = reachable.clone();
                     let command = command_case(candidate, n, flag);
                     let result = probe.decide(&command, time());

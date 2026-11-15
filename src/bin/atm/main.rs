@@ -162,6 +162,61 @@ mod agent_contract_tests {
         }
     }
 
+    /// Changing only one side's validation or default must not leave a CLI
+    /// value that the daemon rejects, or silently default to a different budget.
+    #[tokio::test]
+    async fn clear_parser_and_daemon_validation_stay_in_sync() {
+        use atmd::server::methods::{router, CallContext, CallerId, MethodServices};
+        use serde_json::json;
+
+        let (send, _receive) = mpsc::channel(1);
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        let registry = atmd::registry::RegistryHandle::new(send, events);
+        let router = router(MethodServices::new(registry)).unwrap();
+        for timeout in [0, 1, 4999, 5000, 30000, 120000, 120001, u64::MAX] {
+            let value = timeout.to_string();
+            let cli = Args::try_parse_from([
+                "atm",
+                "agent",
+                "clear",
+                "project/lead",
+                "--timeout-ms",
+                &value,
+            ]);
+            let error = router
+                .call(
+                    CallContext {
+                        client_id: CallerId("validation".into()),
+                        from_pane: None,
+                    },
+                    "agent.clear",
+                    json!({"agent":"project/lead", "timeout_ms":timeout}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.0.code,
+                if cli.is_ok() {
+                    "unavailable"
+                } else {
+                    "invalid_params"
+                },
+                "{timeout}: {cli:?}"
+            );
+        }
+        let cli = Args::try_parse_from(["atm", "agent", "clear", "project/lead"]).unwrap();
+        let Some(Command::Agent {
+            action: agent::AgentAction::Clear { timeout_ms, .. },
+        }) = cli.command
+        else {
+            panic!("expected the clear command");
+        };
+        let daemon: atmd::org::agents::ClearParams =
+            serde_json::from_value(json!({"agent":"project/lead"})).unwrap();
+        assert_eq!(timeout_ms, daemon.timeout_ms);
+        assert_eq!(timeout_ms, 30_000);
+    }
+
     #[test]
     fn clear_rejects_bad_ids_and_timeout_bounds() {
         for args in [

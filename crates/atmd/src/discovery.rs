@@ -8,6 +8,12 @@
 //! (Codex, but not under its default shared daemon: see
 //! atm-codex-adapter's Known gaps).
 //!
+//! With a non-empty `ATM_TMUX_SOCKET`, discovery admits only processes mapped
+//! to a pane of that tmux server; an empty or failed pane list admits none.
+//! Without it, discovery is host-wide (including when only `ATM_SOCKET` moves),
+//! and a failed pane list only means no pane information. Hooks and events can
+//! register sessions in either mode.
+//!
 //! # Async Safety
 //!
 //! All filesystem operations are run via `spawn_blocking` to avoid

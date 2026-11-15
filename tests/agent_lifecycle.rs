@@ -113,6 +113,16 @@ fn down_kill_removes_pane_and_records_audit() {
         .filter(|e| e["kind"] == "control.killed")
         .collect();
     assert_eq!(kills.len(), 1, "{events:?}");
+    // A submitted /exit in one input chunk can leave only the allowed journal
+    // records, so the kill must also be the only audited control action.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["kind"].as_str().unwrap().starts_with("control."))
+            .count(),
+        1,
+        "{events:?}"
+    );
     assert_eq!(
         kills[0]["body"],
         json!({"pane": pane.pane_id, "action": {"method":"agent.down", "agent":id}})

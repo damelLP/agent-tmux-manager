@@ -213,6 +213,39 @@ async fn respawn_kills_then_ups_in_one_reservation() {
 }
 
 #[tokio::test]
+async fn respawn_launch_and_dialog_audits_name_respawn() {
+    // A launch that skips Codex's update offer audits both the launch and
+    // its dialog key under the respawn, just as it audits the old pane's kill.
+    let mut starting = Starting::ready(CODEX).await;
+    let mut committed = starting.rig.org.committed.subscribe();
+    starting.script_replace();
+    starting.script_launch_on_new();
+    starting.answered(Starting::moved(Starting::screen(CODEX_UPDATE, "codex"), "%2"));
+    starting.frame(Starting::moved(Starting::screen(CODEX_FRESH, "codex"), "%2"));
+    for _ in 0..2 {
+        starting.inspect("%2", Some("q/lead"));
+    }
+    starting.respawn().await.unwrap();
+    let mut audits = Vec::new();
+    while let Ok(event) = committed.try_recv() {
+        if event.kind.starts_with("control.") {
+            audits.push((event.kind.clone(), event.body["action"]["method"].clone()));
+        }
+    }
+    assert_eq!(audits, [
+        ("control.killed".into(), serde_json::json!("agent.respawn")),
+        ("control.spawned".into(), serde_json::json!("agent.respawn")),
+        ("control.sent".into(), serde_json::json!("agent.respawn")),
+    ]);
+    let mut effects = starting.respawned();
+    effects.push("keys %2 Escape".into());
+    assert_eq!(starting.effects(), effects);
+    assert_eq!(starting.agent().await.unwrap().status, AgentStatus::Ready);
+    starting.settled().await;
+    assert_eq!(starting.unread_all(), 0);
+}
+
+#[tokio::test]
 async fn respawn_failed_new_start_is_stuck_on_new_pane_with_owner_note() {
     // The old pane was killed, but somebody selected the new pane before
     // its prompt was read: nothing is typed and cleanup accounts for the

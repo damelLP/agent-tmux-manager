@@ -1090,10 +1090,10 @@ impl AgentRuntime {
         let (policy, format, tag) = (screen.policy(), screen.capture_format(), id.to_string());
         // The pane to split: read only, it grants no input.
         let target = PaneId::parse(context.target_pane.clone())?;
-        let verb = if replace.is_some() {
-            "respawned"
+        let (verb, method) = if replace.is_some() {
+            ("respawned", "agent.respawn")
         } else {
-            "started"
+            ("started", "agent.up")
         };
         let refused = |reason: String| {
             AgentError::Refused(format!(
@@ -1270,7 +1270,7 @@ impl AgentRuntime {
                 OrgCommand::ControlSpawned(atm_org::ControlAudit {
                     pane: pane.to_string(),
                     action: serde_json::json!({
-                        "method": "agent.up",
+                        "method": method,
                         "agent": tag,
                         "binary": command.binary,
                     }),
@@ -1289,7 +1289,7 @@ impl AgentRuntime {
         // seen to go; the audit of one that was has no such field.
         let audit_of = |dialog: &str, key: PaneKey, folder: Option<&str>, gone: Option<bool>| {
             let mut action = serde_json::json!({
-                "method": "agent.up",
+                "method": method,
                 "agent": tag,
                 "dialog": dialog,
                 "key": format!("{key:?}"),

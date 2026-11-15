@@ -4,9 +4,9 @@
 //! Each handler owns its parameter schema; mutation handlers must tolerate being
 //! dropped on timeout or daemon shutdown (already performed effects are not undone).
 //! Client EOF/protocol Disconnect drains accepted calls. A full socket closure
-//! drops only session.send's wait: the control actor discards pre-effect input
-//! but still finishes Enter after an already-started paste. It also drops
-//! agent.handover's wait: the handover is a task of its own and carries on,
+//! drops send/reply/capture waits: the actor discards pre-effect input, but
+//! finishes an admitted paste and bounds reply navigation by its total deadline.
+//! It also drops handover's wait: the handover is its own task and carries on,
 //! and tells the agent's manager if it then fails.
 
 use std::collections::{btree_map::Entry, BTreeMap};
@@ -264,6 +264,28 @@ struct PaneParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReplyParams {
+    caller_server: Option<String>,
+    target: String,
+    option: Option<usize>,
+    #[serde(default)]
+    yes: bool,
+    #[serde(default)]
+    no: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureParams {
+    caller_server: Option<String>,
+    target: String,
+    tail: Option<usize>,
+    #[serde(default)]
+    prompt: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PrepareParams {
     caller_server: Option<String>,
     target_pane: Option<String>,
@@ -384,6 +406,45 @@ fn register_control(
             }
         },
     )?;
+    let reply = control.clone();
+    router.register(
+        "session.reply",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = reply.clone();
+            async move {
+                let p: ReplyParams = parse_params(params)?;
+                if (p.yes && p.no) || (p.option.is_some() && (p.yes || p.no)) {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "choose at most one of option, yes or no",
+                    ));
+                }
+                let result = require_control(control, caller, p.caller_server)?
+                    .reply(p.target, p.option, p.yes, p.no)
+                    .await
+                    .map_err(control_error)?;
+                serde_json::to_value(result)
+                    .map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))
+            }
+        },
+    )?;
+    let capture = control.clone();
+    router.register(
+        "session.capture",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = capture.clone();
+            async move {
+                let p: CaptureParams = parse_params(params)?;
+                let lines = require_control(control, caller, p.caller_server)?
+                    .capture(p.target, p.tail, p.prompt)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"lines": lines}))
+            }
+        },
+    )?;
     let prepare = control.clone();
     router.register("session.spawn_prepare", Duration::from_secs(35), move |caller, params| {
         let control = prepare.clone();
@@ -472,6 +533,123 @@ mod tests {
         services.control = Some(control.clone());
         services.org = org;
         (router(services).unwrap(), mock, cancel, task, control)
+    }
+
+    #[tokio::test]
+    async fn reply_and_capture_keep_legacy_results_and_only_reply_is_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+        let (router, mock, cancel, task, control) = control_router(org.clone()).await;
+        mock.set_pane_content(
+            "%7",
+            vec![
+                "earlier".into(),
+                "Choose café?".into(),
+                "❯ 1. Sí".into(),
+                "  2. No".into(),
+                "Enter to select".into(),
+                "".into(),
+            ],
+        );
+        for (params, expected) in [
+            (
+                json!({"target":"audit"}),
+                json!({"action":"enter","pane":"%7"}),
+            ),
+            (
+                json!({"target":"%7","yes":true}),
+                json!({"action":"enter","pane":"%7"}),
+            ),
+            (
+                json!({"target":"%7","no":true}),
+                json!({"action":"escape","pane":"%7"}),
+            ),
+            (
+                json!({"target":"%7","option":2}),
+                json!({"action":"selected","pane":"%7","option":2}),
+            ),
+        ] {
+            assert_eq!(
+                router
+                    .call(context(), "session.reply", params)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.capture",
+                    json!({"target":"audit","tail":0})
+                )
+                .await
+                .unwrap(),
+            json!({"lines":[]})
+        );
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.capture",
+                    json!({"target":"%7","tail":0,"prompt":true})
+                )
+                .await
+                .unwrap(),
+            json!({"lines":["Choose café?","❯ 1. Sí","  2. No","Enter to select"]})
+        );
+        assert_eq!(
+            router
+                .call(context(), "session.capture", json!({"target":"%7"}))
+                .await
+                .unwrap(),
+            json!({"lines":["earlier","Choose café?","❯ 1. Sí","  2. No","Enter to select",""]})
+        );
+        for (method, params) in [
+            ("session.reply", json!({"target":"%7","yes":true,"no":true})),
+            (
+                "session.reply",
+                json!({"target":"%7","yes":true,"option":2}),
+            ),
+            ("session.reply", json!({"target":"%7","option":-1})),
+            ("session.reply", json!({"target":"%7","extra":true})),
+            ("session.capture", json!({"target":"%7","tail":-1})),
+            ("session.capture", json!({"target":"%7","prompt":"yes"})),
+            ("session.capture", json!({"target":"%7","extra":true})),
+        ] {
+            assert_eq!(
+                router
+                    .call(context(), method, params)
+                    .await
+                    .unwrap_err()
+                    .0
+                    .code,
+                error_code::INVALID_PARAMS
+            );
+        }
+        for method in ["session.reply", "session.capture"] {
+            let error = router
+                .call(context(), method, json!({"target":"missing"}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.0.code, error_code::NOT_FOUND);
+            assert_eq!(error.0.message, "No session matching 'missing'");
+        }
+        control.flush_audits().await;
+        let records = org.tail(crate::org::TailParams::default()).await.unwrap();
+        assert_eq!(records.len(), 4, "read-only capture must not flood the log");
+        for record in records {
+            assert_eq!(record.kind, "control.sent");
+            assert_eq!(
+                record.body,
+                json!({"pane":"%7","action":{"method":"session.reply","outcome":"ok","error":null,"client_id":"client","from_pane":"%12"}})
+            );
+        }
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
     }
 
     async fn successful_control_actions(router: &MethodRouter) {

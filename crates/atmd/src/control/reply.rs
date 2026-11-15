@@ -10,7 +10,8 @@ use atm_tmux::TmuxClient;
 use super::{resolve_pane_id, ControlError};
 
 /// The successfully completed reply, for the caller to render.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum ReplyOutcome {
     Escape { pane: String },
     Enter { pane: String },

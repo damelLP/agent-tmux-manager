@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"capture-invalid","method":"session.capture","params":{"target":"%7","unknown":true}},"response":{"type":"response","id":"capture-invalid","error":{"code":"invalid_params","message":"ignored"}},"ignore":["/error/message"]}

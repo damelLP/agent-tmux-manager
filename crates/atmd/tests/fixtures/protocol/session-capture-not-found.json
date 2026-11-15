@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"capture-missing","method":"session.capture","params":{"target":"missing"}},"response":{"type":"response","id":"capture-missing","error":{"code":"not_found","message":"No session matching 'missing'"}},"ignore":[]}

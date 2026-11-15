@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"reply-invalid","method":"session.reply","params":{"target":"%7","unknown":true}},"response":{"type":"response","id":"reply-invalid","error":{"code":"invalid_params","message":"ignored"}},"ignore":["/error/message"]}

@@ -17,7 +17,10 @@
 //! kinds are unchanged. Older readers skip it and may incorrectly retain Ready;
 //! this is another reason downgrading a newer log is not a safety guarantee.
 
-use crate::{Address, AgentId, MessageId, ProjectId, RoleSpec, TaskId};
+use crate::{
+    Address, AgentId, DecisionId, DecisionRequest, DecisionResolution, DecisionWithdrawal,
+    MessageId, ProjectId, ProvisionalChoice, RoleSpec, TaskId,
+};
 use atm_core::{Harness, Money, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -168,6 +171,18 @@ pub enum OrgEvent {
     ControlSpawned(ControlAudit),
     #[serde(rename = "control.killed")]
     ControlKilled(ControlAudit),
+    #[serde(rename = "decision.requested")]
+    DecisionRequested(DecisionRequest),
+    #[serde(rename = "decision.taken_provisionally")]
+    DecisionTakenProvisionally(ProvisionalChoice),
+    #[serde(rename = "decision.resolved")]
+    DecisionResolved(DecisionResolution),
+    #[serde(rename = "decision.overruled")]
+    DecisionOverruled(DecisionResolution),
+    #[serde(rename = "decision.expired")]
+    DecisionExpired { decision_id: DecisionId },
+    #[serde(rename = "decision.withdrawn")]
+    DecisionWithdrawn(DecisionWithdrawal),
 }
 
 impl OrgEvent {
@@ -194,6 +209,12 @@ impl OrgEvent {
             Self::ControlSent(_) => "control.sent",
             Self::ControlSpawned(_) => "control.spawned",
             Self::ControlKilled(_) => "control.killed",
+            Self::DecisionRequested(_) => "decision.requested",
+            Self::DecisionTakenProvisionally(_) => "decision.taken_provisionally",
+            Self::DecisionResolved(_) => "decision.resolved",
+            Self::DecisionOverruled(_) => "decision.overruled",
+            Self::DecisionExpired { .. } => "decision.expired",
+            Self::DecisionWithdrawn(_) => "decision.withdrawn",
         }
     }
 
@@ -233,6 +254,12 @@ impl OrgEvent {
                 | "control.sent"
                 | "control.spawned"
                 | "control.killed"
+                | "decision.requested"
+                | "decision.taken_provisionally"
+                | "decision.resolved"
+                | "decision.overruled"
+                | "decision.expired"
+                | "decision.withdrawn"
         ) {
             return Ok(None);
         }

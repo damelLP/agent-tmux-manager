@@ -1,0 +1,13 @@
+{"seq":1,"ts":"2026-01-15T12:00:01Z","kind":"project.registered","body":{"project_id":"p","root":"/project"}}
+{"seq":2,"ts":"2026-01-15T12:00:02Z","kind":"agent.adopted","body":{"agent_id":"p/builder","pane":"%1","session_id":null}}
+{"seq":3,"ts":"2026-01-15T12:00:03Z","kind":"decision.requested","body":{"requester":"p/builder","kind":"plan","title":"Approve the D2 plan","context":"Two shapes for the list method; A is smaller.","files":["docs/d2-plan.md"],"options":["a","b"],"recommended":"a","may_be_undone":true,"changes_intent":true,"deadline":"2026-11-15T18:00:00Z"}}
+{"seq":4,"ts":"2026-01-15T12:00:04Z","kind":"decision.taken_provisionally","body":{"decision_id":"d3","option":"a","by":"system"}}
+{"seq":5,"ts":"2026-01-15T12:00:05Z","kind":"decision.overruled","body":{"decision_id":"d3","option":"b","by":"owner","note":"B keeps the wire smaller","standing_rule":true}}
+{"seq":6,"ts":"2026-01-15T12:00:06Z","kind":"decision.requested","body":{"requester":"p/builder","kind":"policy","title":"Name the list method","context":"","files":[],"options":["list","query"],"recommended":"list","may_be_undone":true,"changes_intent":false,"deadline":null}}
+{"seq":7,"ts":"2026-01-15T12:00:07Z","kind":"decision.taken_provisionally","body":{"decision_id":"d6","option":"list","by":"p/builder"}}
+{"seq":8,"ts":"2026-01-15T12:00:08Z","kind":"decision.resolved","body":{"decision_id":"d6","option":"list","by":"owner","note":null,"standing_rule":false}}
+{"seq":9,"ts":"2026-01-15T12:00:09Z","kind":"decision.requested","body":{"requester":"system","kind":"action","title":"Push the release branch","context":"The gate passed.","files":[],"options":["yes","no"],"recommended":"yes","may_be_undone":false,"changes_intent":false,"deadline":"2026-01-15T12:00:10Z"}}
+{"seq":10,"ts":"2026-01-15T12:00:10Z","kind":"decision.expired","body":{"decision_id":"d9"}}
+{"seq":11,"ts":"2026-01-15T12:00:11Z","kind":"decision.requested","body":{"requester":"p/builder","kind":"budget","title":"Raise the budget of the review","context":"Two more rounds.","files":[],"options":["raise","keep"],"recommended":null,"may_be_undone":true,"changes_intent":true,"deadline":null}}
+{"seq":12,"ts":"2026-01-15T12:00:12Z","kind":"decision.withdrawn","body":{"decision_id":"d11","by":"p/builder","reason":"answered by the lead"}}
+{"seq":13,"ts":"2026-01-15T12:00:13Z","kind":"decision.requested","body":{"requester":"p/builder","kind":"hire","title":"Add a second reviewer","context":"","files":[],"options":["yes","no"],"recommended":null,"may_be_undone":false,"changes_intent":true,"deadline":null}}

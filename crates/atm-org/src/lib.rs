@@ -137,6 +137,7 @@
 
 mod command;
 mod config;
+mod decision;
 pub mod delivery;
 mod event;
 mod ids;
@@ -144,6 +145,7 @@ mod replay;
 mod state;
 pub use command::*;
 pub use config::*;
+pub use decision::*;
 pub use event::*;
 pub use ids::*;
 pub use replay::*;

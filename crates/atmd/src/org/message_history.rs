@@ -339,7 +339,13 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::SessionSummary(_)
         | OrgEvent::ControlSent(_)
         | OrgEvent::ControlSpawned(_)
-        | OrgEvent::ControlKilled(_) => None,
+        | OrgEvent::ControlKilled(_)
+        | OrgEvent::DecisionRequested(_)
+        | OrgEvent::DecisionTakenProvisionally(_)
+        | OrgEvent::DecisionResolved(_)
+        | OrgEvent::DecisionOverruled(_)
+        | OrgEvent::DecisionExpired { .. }
+        | OrgEvent::DecisionWithdrawn(_) => None,
     }
 }
 

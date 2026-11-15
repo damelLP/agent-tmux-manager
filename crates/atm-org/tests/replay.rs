@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test generators/helpers only
+#[path = "support/decision.rs"]
+mod decision_support;
 #[path = "support/history.rs"]
 mod history;
 mod support;
@@ -106,6 +108,12 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::ControlKilled(_) => 17,
         OrgEvent::AgentEditorReady { .. } => 18,
         OrgEvent::AgentRevalidationRequested { .. } => 19,
+        OrgEvent::DecisionRequested(_) => 20,
+        OrgEvent::DecisionTakenProvisionally(_) => 21,
+        OrgEvent::DecisionResolved(_) => 22,
+        OrgEvent::DecisionOverruled(_) => 23,
+        OrgEvent::DecisionExpired { .. } => 24,
+        OrgEvent::DecisionWithdrawn(_) => 25,
     }
 }
 
@@ -191,7 +199,8 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
         16 => OrgEvent::ControlSpawned(audit),
         17 => OrgEvent::ControlKilled(audit),
         18 => OrgEvent::AgentEditorReady { agent_id },
-        _ => OrgEvent::AgentRevalidationRequested { agent_id },
+        19 => OrgEvent::AgentRevalidationRequested { agent_id },
+        _ => decision_support::decision_event_case(slot - 20, text, n, flag),
     }
 }
 
@@ -308,10 +317,10 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..20)
+    let events: Vec<_> = (0..26)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..20).collect::<Vec<_>>());
+    assert_eq!(events, (0..26).collect::<Vec<_>>());
     let commands: Vec<_> = (0..21)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
@@ -486,7 +495,7 @@ impl ExcludedReach {
 
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..20, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..26, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));

@@ -21,6 +21,10 @@ pub enum ApplyError {
     DuplicateMessage(MessageId),
     #[error("pane {pane} is held by {holder}")]
     PaneOccupied { pane: String, holder: AgentId },
+    #[error("unknown decision {0}")]
+    UnknownDecision(DecisionId),
+    #[error("decision {0} already exists")]
+    DuplicateDecision(DecisionId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +113,7 @@ pub struct OrgState {
     agents: BTreeMap<AgentId, Agent>,
     messages: BTreeMap<MessageId, Message>,
     summaries: HashMap<SessionId, SessionSummary>,
+    decisions: BTreeMap<DecisionId, Decision>,
 }
 impl OrgState {
     /// Choose an unregistered folder slug, then the first free -2, -3, ...
@@ -159,6 +164,13 @@ impl OrgState {
     pub fn messages(&self) -> impl Iterator<Item = &Message> {
         self.messages.values()
     }
+    #[must_use]
+    pub fn decision(&self, id: &DecisionId) -> Option<&Decision> {
+        self.decisions.get(id)
+    }
+    pub fn decisions(&self) -> impl Iterator<Item = &Decision> {
+        self.decisions.values()
+    }
     /// All addressed messages, including read/failed ones, ordered by sequence.
     #[must_use]
     pub fn inbox(&self, who: &Address) -> Vec<&Message> {
@@ -195,6 +207,9 @@ impl OrgState {
     }
     pub(crate) fn require_message(&self, id: &MessageId) -> Result<&Message, ApplyError> {
         self.message(id).ok_or(ApplyError::UnknownMessage(*id))
+    }
+    pub(crate) fn require_decision(&self, id: &DecisionId) -> Result<&Decision, ApplyError> {
+        self.decision(id).ok_or(ApplyError::UnknownDecision(*id))
     }
     pub(crate) fn require_project(&self, id: &ProjectId) -> Result<(), ApplyError> {
         self.project(id)
@@ -296,6 +311,25 @@ impl OrgState {
             }
             OrgEvent::ControlSent(_) | OrgEvent::ControlSpawned(_) | OrgEvent::ControlKilled(_) => {
             }
+            OrgEvent::DecisionRequested(request) => self.validate_address(&request.requester)?,
+            OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+                decision_id, by, ..
+            })
+            | OrgEvent::DecisionResolved(DecisionResolution {
+                decision_id, by, ..
+            })
+            | OrgEvent::DecisionOverruled(DecisionResolution {
+                decision_id, by, ..
+            })
+            | OrgEvent::DecisionWithdrawn(DecisionWithdrawal {
+                decision_id, by, ..
+            }) => {
+                self.require_decision(decision_id)?;
+                self.validate_address(by)?;
+            }
+            OrgEvent::DecisionExpired { decision_id } => {
+                self.require_decision(decision_id)?;
+            }
         }
         Ok(())
     }
@@ -313,6 +347,11 @@ impl OrgState {
             && self.messages.contains_key(&MessageId::new(seq))
         {
             return Err(ApplyError::DuplicateMessage(MessageId::new(seq)));
+        }
+        if matches!(event, OrgEvent::DecisionRequested(_))
+            && self.decisions.contains_key(&DecisionId::new(seq))
+        {
+            return Err(ApplyError::DuplicateDecision(DecisionId::new(seq)));
         }
         match event {
             OrgEvent::ProjectRegistered { project_id, root } => {
@@ -489,8 +528,45 @@ impl OrgState {
             }
             OrgEvent::ControlSent(_) | OrgEvent::ControlSpawned(_) | OrgEvent::ControlKilled(_) => {
             }
+            OrgEvent::DecisionRequested(request) => {
+                let id = DecisionId::new(seq);
+                self.decisions
+                    .insert(id, Decision::new(id, request.clone(), ts));
+            }
+            OrgEvent::DecisionTakenProvisionally(choice) => {
+                let decision = self.decision_mut(&choice.decision_id)?;
+                decision.status = DecisionStatus::TakenProvisionally;
+                decision.provisional = Some(choice.clone());
+                decision.taken_at = Some(ts);
+            }
+            OrgEvent::DecisionResolved(resolution) | OrgEvent::DecisionOverruled(resolution) => {
+                let decision = self.decision_mut(&resolution.decision_id)?;
+                decision.close(
+                    if matches!(event, OrgEvent::DecisionResolved(_)) {
+                        DecisionStatus::Resolved
+                    } else {
+                        DecisionStatus::Overruled
+                    },
+                    ts,
+                );
+                decision.resolution = Some(resolution.clone());
+            }
+            OrgEvent::DecisionExpired { decision_id } => {
+                self.decision_mut(decision_id)?
+                    .close(DecisionStatus::Expired, ts);
+            }
+            OrgEvent::DecisionWithdrawn(withdrawal) => {
+                let decision = self.decision_mut(&withdrawal.decision_id)?;
+                decision.close(DecisionStatus::Withdrawn, ts);
+                decision.withdrawal = Some(withdrawal.clone());
+            }
         }
         Ok(())
+    }
+    fn decision_mut(&mut self, id: &DecisionId) -> Result<&mut Decision, ApplyError> {
+        self.decisions
+            .get_mut(id)
+            .ok_or(ApplyError::UnknownDecision(*id))
     }
     fn agent_mut(&mut self, id: &AgentId) -> Result<&mut Agent, ApplyError> {
         self.agents

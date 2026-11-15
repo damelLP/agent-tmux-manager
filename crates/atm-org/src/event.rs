@@ -73,7 +73,7 @@ pub struct SessionSummary {
     pub ended: Option<DateTime<Utc>>,
 }
 
-mod optional_money {
+pub(crate) mod optional_money {
     use super::*;
     #[derive(Serialize, Deserialize)]
     struct Amount {
@@ -160,6 +160,26 @@ pub enum OrgEvent {
     },
     #[serde(rename = "msg.read")]
     MessageRead { message_ids: Vec<MessageId> },
+    #[serde(rename = "task.created")]
+    TaskCreated(crate::TaskCreated),
+    #[serde(rename = "task.assigned")]
+    TaskAssigned(crate::TaskAssigned),
+    #[serde(rename = "task.state_changed")]
+    TaskStateChanged(crate::TaskStateChanged),
+    #[serde(rename = "task.submitted")]
+    TaskSubmitted(crate::TaskSubmitted),
+    #[serde(rename = "task.review_started")]
+    TaskReviewStarted(crate::TaskReviewStarted),
+    #[serde(rename = "task.verdict")]
+    TaskVerdict(crate::TaskVerdictGiven),
+    #[serde(rename = "task.attached")]
+    TaskAttached(crate::TaskAttached),
+    #[serde(rename = "task.reminded")]
+    TaskReminded(crate::TaskReminded),
+    #[serde(rename = "task.flagged")]
+    TaskFlagged(crate::TaskFlagged),
+    #[serde(rename = "task.cost_recorded")]
+    TaskCostRecorded(crate::TaskCostRecorded),
     #[serde(rename = "session.summary")]
     SessionSummary(SessionSummary),
     #[serde(rename = "control.sent")]
@@ -190,6 +210,16 @@ impl OrgEvent {
             Self::MessageDelivered { .. } => "msg.delivered",
             Self::MessageDeliveryFailed { .. } => "msg.delivery_failed",
             Self::MessageRead { .. } => "msg.read",
+            Self::TaskCreated(_) => "task.created",
+            Self::TaskAssigned(_) => "task.assigned",
+            Self::TaskStateChanged(_) => "task.state_changed",
+            Self::TaskSubmitted(_) => "task.submitted",
+            Self::TaskReviewStarted(_) => "task.review_started",
+            Self::TaskVerdict(_) => "task.verdict",
+            Self::TaskAttached(_) => "task.attached",
+            Self::TaskReminded(_) => "task.reminded",
+            Self::TaskFlagged(_) => "task.flagged",
+            Self::TaskCostRecorded(_) => "task.cost_recorded",
             Self::SessionSummary(_) => "session.summary",
             Self::ControlSent(_) => "control.sent",
             Self::ControlSpawned(_) => "control.spawned",
@@ -229,6 +259,16 @@ impl OrgEvent {
                 | "msg.delivered"
                 | "msg.delivery_failed"
                 | "msg.read"
+                | "task.created"
+                | "task.assigned"
+                | "task.state_changed"
+                | "task.submitted"
+                | "task.review_started"
+                | "task.verdict"
+                | "task.attached"
+                | "task.reminded"
+                | "task.flagged"
+                | "task.cost_recorded"
                 | "session.summary"
                 | "control.sent"
                 | "control.spawned"

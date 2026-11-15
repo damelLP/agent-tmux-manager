@@ -41,7 +41,7 @@ pub struct Seed {
 }
 pub fn arb_seed() -> impl Strategy<Value = Seed> {
     (
-        0usize..21,
+        0usize..22,
         0usize..3,
         0usize..4,
         0usize..6,
@@ -177,8 +177,61 @@ impl Seed {
             17 => OrgCommand::ControlSpawned(audit),
             18 => OrgCommand::ControlKilled(audit),
             19 => OrgCommand::EditorReady { agent_id },
-            _ => OrgCommand::Revalidate { agent_id },
+            20 => OrgCommand::Revalidate { agent_id },
+            _ => {
+                // A task this history made, or one that does not exist.
+                let tasks: Vec<_> = state.tasks().collect();
+                let task_id = tasks
+                    .get(self.value as usize % tasks.len().max(1))
+                    .map_or_else(|| "t999999".parse().unwrap(), |task| task.id.clone());
+                let by = TaskActor {
+                    who: address(self.from),
+                    lead: self.flag,
+                };
+                OrgCommand::Task(match self.pane {
+                    0 => TaskCommand::Create(task_body(by.who, TaskKind::Work, None)),
+                    1 => TaskCommand::Assign {
+                        task_id,
+                        agent_id,
+                        by,
+                    },
+                    2 => TaskCommand::Submit {
+                        task_id,
+                        what: TaskSubmission::Result,
+                        files: vec![],
+                        by: TaskActor {
+                            who: Address::Agent(agent_id),
+                            lead: false,
+                        },
+                    },
+                    _ => TaskCommand::Verdict {
+                        task_id,
+                        verdict: if self.value.is_multiple_of(2) {
+                            TaskVerdict::Accepted
+                        } else {
+                            TaskVerdict::ChangesRequested
+                        },
+                        review_task: None,
+                        note: None,
+                        by,
+                    },
+                })
+            }
         }
+    }
+}
+
+fn task_body(creator: Address, kind: TaskKind, judges: Option<TaskId>) -> TaskCreated {
+    TaskCreated {
+        title: "Work".into(),
+        kind,
+        creator,
+        parent: None,
+        judges,
+        measure: TaskMeasure::Owner,
+        budget: None,
+        files: vec![],
+        rests_on: None,
     }
 }
 
@@ -247,6 +300,91 @@ impl History {
             1
         );
         MessageId::new(self.seq)
+    }
+
+    fn task(&mut self, command: TaskCommand) -> TaskId {
+        assert_eq!(self.step(OrgCommand::Task(command)).unwrap().len(), 1);
+        format!("t{}", self.seq).parse().unwrap()
+    }
+
+    /// One task from its creation to an accepted result with a cost record,
+    /// through a reminder and a review: every task event kind.
+    fn seed_tasks(&mut self) {
+        let lead = TaskActor {
+            who: Address::Agent(agent(0)),
+            lead: false,
+        };
+        let worker = TaskActor {
+            who: Address::Agent(agent(1)),
+            lead: false,
+        };
+        let work = self.task(TaskCommand::Create(task_body(
+            lead.who.clone(),
+            TaskKind::Work,
+            None,
+        )));
+        let review = self.task(TaskCommand::Create(task_body(
+            lead.who.clone(),
+            TaskKind::Review,
+            Some(work.clone()),
+        )));
+        for command in [
+            TaskCommand::Assign {
+                task_id: work.clone(),
+                agent_id: agent(1),
+                by: lead.clone(),
+            },
+            TaskCommand::SetState {
+                task_id: work.clone(),
+                state: TaskState::Working,
+                reason: None,
+                by: worker.clone(),
+            },
+            TaskCommand::Reminded {
+                task_id: work.clone(),
+                agent_id: agent(1),
+            },
+            TaskCommand::Flagged {
+                task_id: work.clone(),
+                to: lead.who.clone(),
+            },
+            TaskCommand::Attach {
+                task_id: work.clone(),
+                file: TaskFile {
+                    path: "run.log".into(),
+                    kind: TaskFileKind::Evidence,
+                    note: None,
+                },
+                by: worker.clone(),
+            },
+            TaskCommand::Submit {
+                task_id: work.clone(),
+                what: TaskSubmission::Result,
+                files: vec![],
+                by: worker,
+            },
+            TaskCommand::StartReview {
+                task_id: work.clone(),
+                review_task: review,
+                by: lead,
+            },
+            TaskCommand::Verdict {
+                task_id: work.clone(),
+                verdict: TaskVerdict::Accepted,
+                review_task: None,
+                note: None,
+                by: TaskActor {
+                    who: Address::Owner,
+                    lead: false,
+                },
+            },
+            TaskCommand::RecordCost {
+                task_id: work,
+                record: TaskCost::default(),
+            },
+        ] {
+            assert_eq!(self.step(OrgCommand::Task(command)).unwrap().len(), 1);
+        }
     }
 
     /// Mandatory prefix covers every event kind, all senders, cross-project
@@ -529,7 +667,8 @@ impl History {
                 history.step(command).unwrap();
             }
         }
-        assert_eq!(history.kinds.len(), 20);
+        history.seed_tasks();
+        assert_eq!(history.kinds.len(), 30);
         assert_eq!(history.state.agents().count(), 3);
         assert_eq!(history.state.projects().count(), 2);
         history

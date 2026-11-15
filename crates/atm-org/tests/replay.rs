@@ -106,6 +106,16 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::ControlKilled(_) => 17,
         OrgEvent::AgentEditorReady { .. } => 18,
         OrgEvent::AgentRevalidationRequested { .. } => 19,
+        OrgEvent::TaskCreated(_) => 20,
+        OrgEvent::TaskAssigned(_) => 21,
+        OrgEvent::TaskStateChanged(_) => 22,
+        OrgEvent::TaskSubmitted(_) => 23,
+        OrgEvent::TaskReviewStarted(_) => 24,
+        OrgEvent::TaskVerdict(_) => 25,
+        OrgEvent::TaskAttached(_) => 26,
+        OrgEvent::TaskReminded(_) => 27,
+        OrgEvent::TaskFlagged(_) => 28,
+        OrgEvent::TaskCostRecorded(_) => 29,
     }
 }
 
@@ -191,7 +201,130 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
         16 => OrgEvent::ControlSpawned(audit),
         17 => OrgEvent::ControlKilled(audit),
         18 => OrgEvent::AgentEditorReady { agent_id },
-        _ => OrgEvent::AgentRevalidationRequested { agent_id },
+        19 => OrgEvent::AgentRevalidationRequested { agent_id },
+        _ => task_event_case(slot, text, n, cost, flag),
+    }
+}
+
+const TASK_STATES: [TaskState; 10] = [
+    TaskState::Open,
+    TaskState::Assigned,
+    TaskState::Working,
+    TaskState::Waiting,
+    TaskState::Blocked,
+    TaskState::Submitted,
+    TaskState::InReview,
+    TaskState::Accepted,
+    TaskState::ChangesRequested,
+    TaskState::Cancelled,
+];
+
+/// Slots 20 to 29: one task event of each kind, with arbitrary text and ids.
+fn task_event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEvent {
+    let pick = n as usize;
+    let task_id: TaskId = format!("t{n}").parse().unwrap();
+    let by = if flag {
+        Address::Owner
+    } else {
+        Address::Agent(id())
+    };
+    let file = TaskFile {
+        path: text.clone(),
+        kind: [
+            TaskFileKind::Brief,
+            TaskFileKind::Report,
+            TaskFileKind::Evidence,
+            TaskFileKind::Plan,
+            TaskFileKind::Contract,
+        ][pick % 5],
+        note: flag.then(|| text.clone()),
+    };
+    match slot {
+        20 => OrgEvent::TaskCreated(TaskCreated {
+            title: text.clone(),
+            kind: [
+                TaskKind::Work,
+                TaskKind::Review,
+                TaskKind::Plan,
+                TaskKind::Errand,
+                TaskKind::DriftCheck,
+            ][pick % 5],
+            creator: by,
+            parent: flag.then(|| task_id.clone()),
+            judges: (!flag).then(|| task_id.clone()),
+            measure: match pick % 3 {
+                0 => TaskMeasure::Mechanical {
+                    command: text.clone(),
+                },
+                1 => TaskMeasure::Reviewed {
+                    rubric: text.clone(),
+                },
+                _ => TaskMeasure::Owner,
+            },
+            budget: flag.then(|| TaskBudget {
+                cost: pick
+                    .is_multiple_of(2)
+                    .then(|| Money::from_microdollars(cost)),
+                turns: Some(n as u32),
+                deadline: Some(time()),
+            }),
+            files: vec![file],
+            rests_on: flag.then_some(n),
+        }),
+        21 => OrgEvent::TaskAssigned(TaskAssigned {
+            task_id,
+            agent_id: id(),
+            by,
+        }),
+        22 => OrgEvent::TaskStateChanged(TaskStateChanged {
+            task_id,
+            state: TASK_STATES[pick % 10],
+            reason: flag.then_some(text),
+            by,
+        }),
+        23 => OrgEvent::TaskSubmitted(TaskSubmitted {
+            task_id,
+            what: if flag {
+                TaskSubmission::Plan
+            } else {
+                TaskSubmission::Result
+            },
+            files: vec![file],
+            by,
+        }),
+        24 => OrgEvent::TaskReviewStarted(TaskReviewStarted {
+            task_id: task_id.clone(),
+            review_task: task_id,
+            by,
+        }),
+        25 => OrgEvent::TaskVerdict(TaskVerdictGiven {
+            task_id: task_id.clone(),
+            verdict: if flag {
+                TaskVerdict::Accepted
+            } else {
+                TaskVerdict::ChangesRequested
+            },
+            review_task: flag.then_some(task_id),
+            note: (!flag).then_some(text),
+            by,
+        }),
+        26 => OrgEvent::TaskAttached(TaskAttached { task_id, file, by }),
+        27 => OrgEvent::TaskReminded(TaskReminded {
+            task_id,
+            agent_id: id(),
+        }),
+        28 => OrgEvent::TaskFlagged(TaskFlagged { task_id, to: by }),
+        _ => OrgEvent::TaskCostRecorded(TaskCostRecorded {
+            task_id,
+            record: TaskCost {
+                turns: Some(n as u32),
+                review_rounds: flag.then_some(1),
+                changes_requested: None,
+                cost: flag.then(|| Money::from_microdollars(cost)),
+                peak_context_percent: Some((n % 101) as u8),
+                seconds_in_state: [(TASK_STATES[pick % 10], n)].into(),
+            },
+        }),
     }
 }
 
@@ -218,6 +351,7 @@ fn command_slot(command: &OrgCommand) -> usize {
         OrgCommand::ControlKilled(_) => 18,
         OrgCommand::EditorReady { .. } => 19,
         OrgCommand::Revalidate { .. } => 20,
+        OrgCommand::Task(_) => 21,
     }
 }
 
@@ -302,22 +436,99 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
         17 => OrgCommand::ControlSpawned(audit),
         18 => OrgCommand::ControlKilled(audit),
         19 => OrgCommand::EditorReady { agent_id },
-        _ => OrgCommand::Revalidate { agent_id },
+        20 => OrgCommand::Revalidate { agent_id },
+        _ => OrgCommand::Task(task_command_case(n, flag)),
+    }
+}
+
+/// Slot 21: a task command. A task made at event `s` of a history has the id
+/// `t<s>`, so the target ids range over the positions a history reaches.
+fn task_command_case(n: u64, flag: bool) -> TaskCommand {
+    let task_id: TaskId = format!("t{}", 20 + n).parse().unwrap();
+    let by = TaskActor {
+        who: if flag {
+            Address::Owner
+        } else {
+            Address::Agent(id())
+        },
+        lead: false,
+    };
+    match n % 10 {
+        0 | 1 => TaskCommand::Create(TaskCreated {
+            title: "Work".into(),
+            kind: TaskKind::Work,
+            creator: by.who,
+            parent: None,
+            judges: None,
+            measure: TaskMeasure::Owner,
+            budget: None,
+            files: vec![],
+            rests_on: None,
+        }),
+        2 => TaskCommand::Assign {
+            task_id,
+            agent_id: id(),
+            by,
+        },
+        3 => TaskCommand::SetState {
+            task_id,
+            state: TaskState::Working,
+            reason: None,
+            by,
+        },
+        4 => TaskCommand::SetState {
+            task_id,
+            state: TaskState::Blocked,
+            reason: Some("late".into()),
+            by,
+        },
+        5 => TaskCommand::Submit {
+            task_id,
+            what: TaskSubmission::Result,
+            files: vec![],
+            by,
+        },
+        6 => TaskCommand::Verdict {
+            task_id,
+            verdict: TaskVerdict::Accepted,
+            review_task: None,
+            note: None,
+            by,
+        },
+        7 => TaskCommand::Attach {
+            task_id,
+            file: TaskFile {
+                path: "run.log".into(),
+                kind: TaskFileKind::Evidence,
+                note: None,
+            },
+            by,
+        },
+        8 => TaskCommand::Reminded {
+            task_id,
+            agent_id: id(),
+        },
+        _ => TaskCommand::SetState {
+            task_id,
+            state: TaskState::Cancelled,
+            reason: None,
+            by,
+        },
     }
 }
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..20)
+    let events: Vec<_> = (0..30)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..20).collect::<Vec<_>>());
-    let commands: Vec<_> = (0..21)
+    assert_eq!(events, (0..30).collect::<Vec<_>>());
+    let commands: Vec<_> = (0..22)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
-    assert_eq!(commands, (0..21).collect::<Vec<_>>());
+    assert_eq!(commands, (0..22).collect::<Vec<_>>());
     let history = history::History::seeded();
-    let wide_commands: Vec<_> = (0..21)
+    let wide_commands: Vec<_> = (0..22)
         .map(|slot| {
             let seed = history::Seed {
                 slot,
@@ -331,7 +542,7 @@ fn case_generators_cover_every_event_and_command_variant() {
             command_slot(&seed.command(&history.state))
         })
         .collect();
-    assert_eq!(wide_commands, (0..21).collect::<Vec<_>>());
+    assert_eq!(wide_commands, (0..22).collect::<Vec<_>>());
 }
 
 // Synthetic: a restart-style history exercising clear, retry, owner delivery
@@ -486,7 +697,7 @@ impl ExcludedReach {
 
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..20, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..30, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
@@ -504,7 +715,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
         ..Config::default()
     });
     let inputs = (
-        prop::collection::vec((0usize..21, 0u64..50, any::<bool>()), 0..80),
+        prop::collection::vec((0usize..22, 0u64..50, any::<bool>()), 0..80),
         any::<usize>(),
     );
     runner
@@ -534,7 +745,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
                 }
                 // Every command is tried at every generated reachable state, not
                 // only the randomly selected command that advanced the history.
-                for candidate in 0..21 {
+                for candidate in 0..22 {
                     let mut probe = reachable.clone();
                     let command = command_case(candidate, n, flag);
                     let result = probe.decide(&command, time());

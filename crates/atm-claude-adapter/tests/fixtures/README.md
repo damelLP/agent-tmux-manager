@@ -1,5 +1,44 @@
 # Claude screen fixtures
 
+## Custom statusLine region (stage 1)
+
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e, custom statusLine.
+
+`screen_styled_s1_status-<width>-<state>_2.1.325.txt` contains six real
+unprompted captures, at 80, 116 and 160 columns, each fresh and with the
+unsubmitted draft `[m42] Read: atm inbox --id m42`. The corresponding source
+stems are `narrow`, `medium` and `wide`, followed by `-fresh.styled` or
+`-draft.styled`. All have a complete supported startup header. No Enter was
+sent and no model turn ran. Initial suggestions were disabled in the sealed
+settings; the fresh editor is actually blank. The subsequent draft captures
+also contain a late auto-mode disclaimer that this adapter does not recognize
+as idle history: their input is Draft, but their turn remains Unknown, exactly
+as in a status-free twin. Exact staged text is not permission to submit it.
+
+The private HOME's statusLine command printed these neutral static values:
+
+| Width | Output |
+|---|---|
+| 80 | `[neutral] load ▰▰▰▱ 83% Demo Model (low)` |
+| 116 | `[sample] ctx ▰▰▱▱ 42% Haiku 5.5 (medium)` |
+| 160 | `[fixture] ctx ▰▱▱▱ 7% Fable 5.2 (high)` |
+
+Claude adds two leading spaces and places this one row immediately after the
+lower editor rule, before the mode footer. The adapter recognizes the slot,
+not these values. The rest of that region may contain only blank padding.
+Additional/displaced rows, wrapped status output and unknown footers remain
+unsupported. Values printed in the slot never count as staged editor text.
+
+The probe used a private tmux 3.8 server, empty tmux config, sealed HOME,
+allowlisted environment and a loopback-only network namespace with no routes;
+no real credentials, daemon or user hooks were loaded. Only the private
+run-root prefix in the header becomes an equal-width generic `/tmp/xxx…`
+prefix. Otherwise the captured bytes, rows, columns, attributes and input are
+unchanged; the added provenance line is not a terminal row. No owner username,
+hostname, home path or account identifier is present. Composed running,
+conversation, style and modal cases in tests are explicitly Synthetic, not
+new real state captures.
+
 ## Staged message references (P3)
 
 Captured: Claude Code 2.1.325, 2026-11-14, sealed loopback-only private tmux

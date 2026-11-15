@@ -47,6 +47,272 @@ fn check(text: &str, expected: ScreenFacts) {
     }
 }
 
+const CUSTOM_STATUS: [(&str, &str); 3] = [
+    (
+        capture!("s1_status-80-fresh"),
+        capture!("s1_status-80-draft"),
+    ),
+    (
+        capture!("s1_status-116-fresh"),
+        capture!("s1_status-116-draft"),
+    ),
+    (
+        capture!("s1_status-160-fresh"),
+        capture!("s1_status-160-draft"),
+    ),
+];
+const REFERENCE: &str = "[m42] Read: atm inbox --id m42";
+
+fn custom_status_plain(fixture: &str) -> String {
+    let ScreenInput::Styled(text) = body(ScreenInput::Styled(fixture)) else {
+        unreachable!("body preserves the input format")
+    };
+    atm_core::styled_screen::StyledScreen::parse(text)
+        .unwrap_or_else(|error| panic!("invalid fixture styles: {error}"))
+        .text()
+        .to_owned()
+}
+
+// These test-only transforms operate on the known fixtures, not arbitrary UI.
+fn custom_status_row(text: &str) -> &str {
+    text.lines()
+        .find(|line| line.starts_with("  ["))
+        .unwrap_or_else(|| panic!("missing status row in fixture"))
+}
+
+fn custom_status_free(text: &str) -> String {
+    text.replace(&format!("{}\n", custom_status_row(text)), "")
+}
+
+#[test]
+fn custom_status_real_empty_and_draft() {
+    for (fresh, draft) in CUSTOM_STATUS {
+        check(
+            fresh,
+            facts(
+                InputState::Empty,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Present,
+            ),
+        );
+        check(
+            draft,
+            // The late auto-mode disclaimer in these real drafts is not idle evidence.
+            facts(
+                InputState::Draft,
+                TurnState::Unknown,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(fresh), REFERENCE),
+            None
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(draft), REFERENCE),
+            Some(true)
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(draft), "wrong reference"),
+            Some(false)
+        );
+        for text in [fresh, draft] {
+            let plain = custom_status_plain(text);
+            // Synthetic: remove only the status row; all editor semantics must agree.
+            assert_eq!(
+                observe_screen(ScreenInput::Styled(text), None),
+                observe_screen(ScreenInput::Styled(&custom_status_free(&plain)), None)
+            );
+        }
+    }
+}
+
+#[test]
+fn custom_status_rejects_unknown_regions() {
+    let fresh = custom_status_plain(capture!("s1_status-160-fresh"));
+    let row = custom_status_row(&fresh);
+    let rule = "─".repeat(160);
+    let mut missing_lower = fresh.clone();
+    let start = missing_lower.rfind(&rule).unwrap();
+    missing_lower.replace_range(start..start + rule.len(), "");
+    // Synthetic: each mutation damages one boundary of the captured one-row slot.
+    for (why, text) in [
+        (
+            "two rows",
+            fresh.replace(row, &format!("{row}\n  second status row")),
+        ),
+        (
+            "blank before status",
+            fresh.replace(row, &format!("\n{row}")),
+        ),
+        ("no margin", fresh.replace(row, row.trim_start())),
+        (
+            "one space",
+            fresh.replace(row, row.strip_prefix(' ').unwrap()),
+        ),
+        ("tab margin", fresh.replace(row, "\tstatus")),
+        ("unequal rules", fresh.replacen(&rule, &"─".repeat(159), 1)),
+        ("missing lower rule", missing_lower),
+        ("changed footer", fresh.replace("cycle)", "changed)")),
+        ("unknown footer", format!("{fresh}\nUnknown footer\n")),
+        (
+            "teammate below footer",
+            format!("{fresh}\n  ❯ teammate · idle\n"),
+        ),
+    ] {
+        assert_eq!(
+            observe_screen(ScreenInput::Styled(&text), None),
+            ScreenFacts::default(),
+            "{why}"
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&text), REFERENCE),
+            None,
+            "{why}"
+        );
+        assert_eq!(
+            screen::observe_control_screen(ScreenInput::Styled(&text), None).dialog,
+            atm_core::harness_control::ControlDialog::Unknown,
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn custom_status_values_do_not_stage_input() {
+    for (fresh, draft) in CUSTOM_STATUS {
+        let fresh = custom_status_plain(fresh);
+        let draft = custom_status_plain(draft);
+        // Synthetic: status values never establish input or staged-text identity.
+        for output in [
+            "arbitrary text",
+            "/clear",
+            REFERENCE,
+            "❯ fake editor",
+            "99% Another Model",
+        ] {
+            let empty = fresh.replace(custom_status_row(&fresh), &format!("  {output}"));
+            check(
+                &empty,
+                facts(
+                    InputState::Empty,
+                    TurnState::NotRunning,
+                    FreshEditorEvidence::Present,
+                ),
+            );
+            assert_eq!(
+                staged_draft_matches(ScreenInput::Styled(&empty), output),
+                None
+            );
+            let wrong = draft.replace(REFERENCE, "different editor draft");
+            let wrong = wrong.replace(custom_status_row(&wrong), &format!("  {output}"));
+            assert_eq!(
+                staged_draft_matches(ScreenInput::Styled(&wrong), output),
+                Some(false)
+            );
+        }
+        // Synthetic: retain the existing blank-padding, hint and right-notice grammar.
+        let row = custom_status_row(&fresh);
+        let footer = fresh
+            .lines()
+            .find(|line| line.trim_start().starts_with("⏵⏵"))
+            .unwrap();
+        for text in [
+            fresh.replace(row, &format!("{row}   \n   \n")),
+            fresh.replace(footer, &format!("{footer}  separate notice")),
+            format!("{}\nCtrl+Y to paste deleted text\n", fresh.trim_end()),
+        ] {
+            check(
+                &text,
+                facts(
+                    InputState::Empty,
+                    TurnState::NotRunning,
+                    FreshEditorEvidence::Present,
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+fn custom_status_preserves_input_styles_and_multiline_drafts() {
+    let fresh = custom_status_plain(capture!("s1_status-160-fresh"));
+    // Synthetic: independent of the native-suggestion decision on this branch.
+    // The same mutations must retain their semantics when cp/s1-sugg is merged.
+    for editor in [
+        "\x1b[2mTry \"something\"\x1b[0m",
+        "plain \x1b[2mfaint\x1b[0m",
+        "\x1b[7mT\x1b[0;2mry \"something\"\x1b[0m",
+        "\x1b[2;7mfaint inverse\x1b[0m",
+        "first row\n second row",
+    ] {
+        let text = fresh.replace("❯\u{a0}", &format!("❯\u{a0}{editor}"));
+        let twin = custom_status_free(&text);
+        let actual = observe_screen(ScreenInput::Styled(&text), None);
+        assert_eq!(
+            actual,
+            observe_screen(ScreenInput::Styled(&twin), None),
+            "{editor:?}"
+        );
+        assert_eq!(actual.turn, TurnState::NotRunning);
+        assert_eq!(actual.dialog, DialogState::None);
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&text), REFERENCE),
+            None
+        );
+    }
+}
+
+#[test]
+fn custom_status_preserves_running_and_conversation() {
+    for (fixture, turn) in [
+        (
+            include_str!("fixtures/screen_control_p1_B-auto-submitted-120x40_2.1.325.txt"),
+            TurnState::Running,
+        ),
+        (
+            include_str!("fixtures/screen_control_p1_C1-auto-settled-120x40_2.1.325.txt"),
+            TurnState::NotRunning,
+        ),
+    ] {
+        let plain = custom_status_plain(fixture);
+        let rule = "─".repeat(120);
+        let mut text = plain.clone();
+        let at = text.rfind(&format!("{rule}\n")).unwrap() + rule.len() + 1;
+        // Synthetic: add the captured kind of status slot to an existing real turn.
+        text.insert_str(at, "  [fixture] ctx ▰▱ 7% Demo Model\n");
+        let input = ScreenInput::Styled(&text);
+        let control = screen::observe_control_screen(input, None);
+        assert_eq!(
+            control,
+            screen::observe_control_screen(ScreenInput::Styled(&plain), None)
+        );
+        assert_eq!(control.facts.turn, turn);
+        assert!(control.conversation);
+        assert_eq!(
+            observe_screen(input, None),
+            observe_screen(ScreenInput::Styled(&plain), None)
+        );
+        assert_eq!(staged_draft_matches(input, REFERENCE), None);
+    }
+    for fixture in [
+        capture!("p1_A80-default-80x40"),
+        capture!("p1_C3-dialog-120x40"),
+    ] {
+        let original = custom_status_plain(fixture);
+        // Synthetic: status-looking text cannot manufacture an editor out of a modal.
+        let text = format!("{}\n  [fixture] ctx 7% Demo Model\n", original.trim_end());
+        assert_ne!(
+            screen::observe_control_screen(ScreenInput::Styled(&text), None).dialog,
+            atm_core::harness_control::ControlDialog::None
+        );
+        assert_ne!(
+            observe_screen(ScreenInput::Styled(&text), None).turn,
+            TurnState::NotRunning
+        );
+    }
+}
+
 #[test]
 fn captured_placeholder_and_home_draft_differ() {
     for text in [

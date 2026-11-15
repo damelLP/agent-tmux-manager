@@ -489,6 +489,31 @@ fn start_candidate_table() {
 }
 
 #[test]
+fn custom_status_claude_dispatch() {
+    let screen = agent_screen(Harness::ClaudeCode).unwrap();
+    let baseline = pinned("claude");
+    for (fresh, draft) in [
+        (include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-80-fresh_2.1.325.txt"), include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-80-draft_2.1.325.txt")),
+        (include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-116-fresh_2.1.325.txt"), include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-116-draft_2.1.325.txt")),
+        (include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-160-fresh_2.1.325.txt"), include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-160-draft_2.1.325.txt")),
+    ] {
+        for (fixture, input) in [(fresh, InputState::Empty), (draft, InputState::Draft)] {
+            let frame = capture(fixture, CaptureFormat::Ansi, Some(ROOT), Some("claude"));
+            let facts = screen.facts(&frame, &baseline);
+            assert_eq!(facts.input, input);
+            // The real draft has a late, unsupported auto-mode disclaimer.
+            assert_eq!(facts.turn, if input == InputState::Empty {
+                TurnState::NotRunning
+            } else { TurnState::Unknown });
+            assert_eq!(facts.dialog, DialogState::None);
+            assert_eq!(screen.control(&frame, &baseline).dialog, ControlDialog::None);
+            assert_eq!(screen.staged(&frame, &baseline, "[m42] Read: atm inbox --id m42"), (input == InputState::Draft).then_some(true));
+            assert_eq!(screen.facts(&frame, &PaneBaseline::unproven()), ScreenFacts::default());
+        }
+    }
+}
+
+#[test]
 fn hooks_valid_is_false_without_a_hook_list() {
     let entries = [HookListEntry::new("SessionStart".into(), 1, 1, None)];
     for harness in [Harness::ClaudeCode, Harness::Pi] {

@@ -26,6 +26,7 @@ fn sharing(
         control,
         cancel: cancel.clone(),
         proc: rig.proc.clone(),
+        proc_after_enter: rig.proc_after_enter.clone(),
         proc_script: rig.proc_script.clone(),
     }
 }

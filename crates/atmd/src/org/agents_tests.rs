@@ -4583,6 +4583,110 @@ mod reconciliation {
         assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn list_answers_without_quarantines_when_control_stalls() {
+        use crate::control::reservation::ReservationKind;
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        use tokio::time::{Duration, Instant};
+
+        // The old independent one-second read fails the late case; returning
+        // its error instead of omitting quarantines fails both cases.
+        for earlier_work in [Duration::ZERO, Duration::from_millis(4_500)] {
+            let (gate, mut entered) = mpsc::channel(1);
+            let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
+            rig.agent("lead", Some("%1"), Some("s1")).await;
+            rig.row("s1", "%1", false).await;
+            rig.frame("%1", "p/lead", IDLE);
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            down_whose_cleanup(&agents, true).await;
+            assert_eq!(
+                listed_reason(&agents).await.as_deref(),
+                Some(QUARANTINED_DOWN)
+            );
+
+            // Hold a write ahead of the list's snapshot. This is an append
+            // gate, not a wall-clock delay or real socket I/O.
+            let org = rig.org.clone();
+            let write = tokio::spawn(async move {
+                org.execute(
+                    OrgCommand::Clear {
+                        agent_id: "p/lead".parse().unwrap(),
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+            });
+            let release = tokio::time::timeout(Duration::from_secs(60), entered.recv())
+                .await
+                .expect("clear write must reach the append gate")
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut list = Box::pin(agents.list(ListParams::default()));
+            poll_fn(|cx| {
+                assert!(list.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(earlier_work).await;
+
+            // A different pane's tag write never answers. Enqueue it before
+            // releasing the list: the control actor's FIFO cannot answer the
+            // quarantine read while this operation is in flight.
+            rig.inspect_only("%2", "p/blocker");
+            rig.client.stall_pane_effects(true);
+            let control = rig.control.clone();
+            let (queued, enqueued) = tokio::sync::oneshot::channel();
+            let blocked = tokio::spawn(async move {
+                control
+                    .run_reserved(
+                        request("p/blocker", Some("%2"), ReservationKind::Down),
+                        move |reservation| async move {
+                            let pane = PaneId::parse("%2").unwrap();
+                            let mut untag =
+                                Box::pin(reservation.untag(&pane, "p/blocker".parse().unwrap()));
+                            poll_fn(|cx| {
+                                assert!(untag.as_mut().poll(cx).is_pending());
+                                Poll::Ready(())
+                            })
+                            .await;
+                            queued.send(()).unwrap();
+                            untag.await.map_err(AgentError::from)
+                        },
+                        cleanup,
+                    )
+                    .await
+            });
+            enqueued.await.unwrap();
+            release.send(()).unwrap();
+            // The clock is paused: this checks the list's virtual budget,
+            // not a tight wall-time assertion. Synchronize on its answer.
+            let entries = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => panic!("list exhausted its budget"),
+                result = &mut list => result.expect("quarantine timeout must not fail the list"),
+            };
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].agent_id.to_string(), "p/lead");
+            assert_eq!(entries[0].state, AgentStatus::Clearing);
+            assert_eq!(entries[0].reason, None);
+            write.await.unwrap().unwrap();
+            assert!(
+                !blocked.is_finished(),
+                "control must still be stalled at the list's answer"
+            );
+            rig.cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(60), blocked)
+                .await
+                .expect("stalled operation must drain on shutdown")
+                .unwrap()
+                .unwrap_err();
+        }
+    }
+
     #[tokio::test]
     async fn quarantine_wins_over_a_refusal_and_a_failed_observation() {
         // The refusal was read on a pane that may no longer exist, and a pass

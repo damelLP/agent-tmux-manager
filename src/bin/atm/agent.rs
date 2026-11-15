@@ -42,7 +42,7 @@ pub enum AgentAction {
     },
     Clear {
         agent: AgentId,
-        #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=120_000))]
+        #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(5_000..=120_000))]
         timeout_ms: u64,
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,

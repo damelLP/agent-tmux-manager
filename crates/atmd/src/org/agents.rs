@@ -650,6 +650,7 @@ impl AgentHandle {
         .await
     }
     pub async fn list(&self, p: ListParams) -> Result<ListResult, AgentError> {
+        let deadline = Instant::now() + LIST_BUDGET;
         timeout(LIST_BUDGET, async {
             self.reconciled().await?;
             let rt = self
@@ -675,10 +676,12 @@ impl AgentHandle {
             let rows = rt.rows().await?;
             // The operations whose cleanup failed. A control service that does
             // not answer in time leaves the list without them, never without
-            // its agents.
+            // its agents. Leave a timer tick to finish the list after the read.
             let quarantines = rt
                 .control
-                .quarantines(Instant::now() + QUARANTINE_BUDGET)
+                .quarantines(
+                    (Instant::now() + QUARANTINE_BUDGET).min(deadline - Duration::from_millis(1)),
+                )
                 .await
                 .unwrap_or_default();
             Ok(state

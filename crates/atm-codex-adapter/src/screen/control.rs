@@ -3,6 +3,9 @@
 //! and zero-count vocabulary rows. Only ATM rows are returned for P6 validation;
 //! known uninstalled extras are checked, never silently discarded if installed.
 //! Counts cannot identify commands: same-event/count replacement is undetectable.
+//! Captured: codex-cli 0.167.0, 2026-11-14, P5 sealed private tmux 3.8
+//! capture-pane -p -e -N, 80/100/120 columns. Only the exact sole inverse-selected
+//! `/new` completion is non-modal for control; delivery facts remain Other.
 use super::*;
 use crate::CodexEventType;
 use atm_core::harness_control::{
@@ -60,14 +63,14 @@ pub fn observe_control_screen(
 ) -> ControlScreen {
     let mut result = ControlScreen::default();
     let decoded;
-    let text = match input {
-        ScreenInput::Plain(text) if cursor.is_none() => text,
+    let (text, styled) = match input {
+        ScreenInput::Plain(text) if cursor.is_none() => (text, None),
         ScreenInput::Styled(text) => {
             let Ok(screen) = StyledScreen::parse(text) else {
                 return result;
             };
             decoded = screen;
-            decoded.text()
+            (decoded.text(), Some(&decoded))
         }
         _ => return result,
     };
@@ -87,6 +90,11 @@ pub fn observe_control_screen(
         };
     } else if let Some(dialog) = start_dialog(&body).or_else(|| hook_list(&body, text)) {
         result.dialog = dialog;
+    } else if result.facts.dialog == DialogState::Other
+        && staged_draft_matches(input, CLEAR_COMMAND) == Some(true)
+        && styled.is_some_and(clear_completion)
+    {
+        result.dialog = ControlDialog::None;
     } else if result.facts.dialog == DialogState::None {
         result.dialog = ControlDialog::None;
         // Composer comes after the last blank separator and before model/footer.
@@ -98,6 +106,36 @@ pub fn observe_control_screen(
         }
     }
     result
+}
+
+fn clear_completion(screen: &StyledScreen) -> bool {
+    let lines: Vec<_> = screen
+        .text()
+        .lines()
+        .map(|s| s.trim_end_matches(' '))
+        .collect();
+    let Some(composer) = lines.iter().rposition(|s| *s == "› /new") else {
+        return false;
+    };
+    let Some([.., upper, menu, lower]) = lines.get(..composer) else {
+        return false;
+    };
+    if !upper.is_empty()
+        || !lower.is_empty()
+        || *menu != "› /new  start a new chat during a conversation"
+    {
+        return false;
+    }
+    // The menu precedes the blank separator and composer. Offsets are decoded
+    // UTF-8 bytes, not columns; retain original padding when counting rows.
+    let offset = screen
+        .text()
+        .split_inclusive('\n')
+        .take(composer.saturating_sub(2))
+        .map(str::len)
+        .sum::<usize>();
+    menu.char_indices()
+        .all(|(i, _)| screen.inverse_at(offset + i) == Some(true))
 }
 
 fn full_folder(folder: &str) -> bool {

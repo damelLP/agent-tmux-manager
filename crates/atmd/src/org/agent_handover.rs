@@ -340,6 +340,48 @@ impl Handovers {
         caller: CallContext,
         deadline: Deadline,
     ) -> Result<HandoverResult, MethodError> {
+        let Admitted { job, own, manager } = self.admit(p, caller, deadline).await?;
+        let (agent_id, message_id) = (job.agent.clone(), job.message_id);
+        let org = self.org.clone();
+        let task = tokio::spawn(async move {
+            let agent = job.agent.clone();
+            let result = job.run().await;
+            if let (true, Err(error)) = (own, &result) {
+                // Nobody waits for this answer: tell the agent's manager.
+                let note = MessageContent {
+                    from: Address::System,
+                    to: manager,
+                    kind: MessageKind::Note,
+                    body: format!("handover of {agent} did not complete: {}", error.0.message),
+                    attachments: Vec::new(),
+                    task: None,
+                };
+                if let Err(error) = org.execute(OrgCommand::SendMessage(note), Utc::now()).await {
+                    tracing::warn!(%agent, %error, "Handover failure note was not recorded");
+                }
+            }
+            result
+        });
+        if own {
+            return Ok(HandoverResult {
+                agent_id,
+                message_id,
+                state: HandoverState::Started,
+                session_id: None,
+            });
+        }
+        task.await
+            .map_err(|error| AgentError::Internal(format!("handover task: {error}")))?
+    }
+
+    /// The checks, the save request and its audit: everything before the
+    /// handover waits. Refused here, nothing was sent.
+    pub(super) async fn admit(
+        &self,
+        p: HandoverParams,
+        caller: CallContext,
+        deadline: Deadline,
+    ) -> Result<Admitted, MethodError> {
         self.clearer.available().await?;
         // Subscribed before anything is read or sent: what follows is an
         // event, and what is read below is what was there before.
@@ -406,41 +448,21 @@ impl Handovers {
             needs_input: false,
             _running: running,
         };
-        let org = self.org.clone();
-        let task = tokio::spawn(async move {
-            let agent = job.agent.clone();
-            let result = job.run().await;
-            if let (true, Err(error)) = (own, &result) {
-                // Nobody waits for this answer: tell the agent's manager.
-                let note = MessageContent {
-                    from: Address::System,
-                    to: manager,
-                    kind: MessageKind::Note,
-                    body: format!("handover of {agent} did not complete: {}", error.0.message),
-                    attachments: Vec::new(),
-                    task: None,
-                };
-                if let Err(error) = org.execute(OrgCommand::SendMessage(note), Utc::now()).await {
-                    tracing::warn!(%agent, %error, "Handover failure note was not recorded");
-                }
-            }
-            result
-        });
-        if own {
-            return Ok(HandoverResult {
-                agent_id: p.agent,
-                message_id,
-                state: HandoverState::Started,
-                session_id: None,
-            });
-        }
-        task.await
-            .map_err(|error| AgentError::Internal(format!("handover task: {error}")))?
+        Ok(Admitted { job, own, manager })
     }
 }
 
+/// A handover that passed admission: its request is queued and recorded.
+pub(super) struct Admitted {
+    pub job: Job,
+    /// The caller is the agent itself, so nobody waits for the answer.
+    pub own: bool,
+    /// Who is told when a handover nobody waits for fails.
+    pub manager: Address,
+}
+
 /// One handover from its save request on.
-struct Job {
+pub(super) struct Job {
     service: Handovers,
     agent: AgentId,
     pane: Option<String>,
@@ -460,7 +482,7 @@ struct Job {
 }
 
 impl Job {
-    async fn run(mut self) -> Result<HandoverResult, MethodError> {
+    pub(super) async fn run(mut self) -> Result<HandoverResult, MethodError> {
         self.saved().await?;
         self.service
             .execute(OrgCommand::Saved {

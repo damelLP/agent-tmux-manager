@@ -295,7 +295,7 @@ async fn rotation_io_failure_stops_writer_without_publishing() {
     ));
     // Probe termination without spending a minute on a writer that keeps
     // serving. This private-channel diagnostic owns a separate permit: the
-    // Tokio 1.49 send/receiver-drop race previously observed here can strand a
+    // Tokio 1.49 send/receiver-drop race observed in a channel probe can strand a
     // queued request, so the probe must not retain the public handle's slot.
     let (reply, response) = oneshot::channel();
     let probe = Append {

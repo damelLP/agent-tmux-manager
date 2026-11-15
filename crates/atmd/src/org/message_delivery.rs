@@ -125,9 +125,9 @@ pub struct DeliveryGuardFacts {
     pub input: GuardedInput,
     /// The facts of the dispatch's control read of the capture.
     pub screen: ScreenFacts,
-    /// That same read's dialog. It knows popups `screen.dialog` does not
-    /// model (a slash completion, the clear and new-session popups), where
-    /// Enter picks a row and a paste filters the list. It only ever refuses.
+    /// That same read's dialog: a recognised start dialog, Blocked, or
+    /// Unknown also refuses input. Completion popups may instead be refused
+    /// by the screen facts; this additional check only ever refuses.
     pub control_dialog: ControlDialog,
     /// The adapter's exact match of the staged draft with the reference.
     pub staged: Option<bool>,

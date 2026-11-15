@@ -3108,7 +3108,7 @@ fn foreground_unknown_masks_editor_facts() {
 /// `Captured:` line): the adapter matches the draft exactly, a popup is
 /// open, and the guard gives no Enter. A match never picks a popup's row.
 #[test]
-fn command_completion_never_overrides_unknown_dialog() {
+fn completion_frames_refuse_enter_despite_an_exact_draft() {
     use crate::org::agent_screen_tests::capture as shot_of;
     let frames = [
         (
@@ -3666,7 +3666,7 @@ async fn dropped_prompt_with_activity_blocks_second_paste() {
 /// again; the record that lands later carries the time of the Enter, not
 /// the time it was written.
 #[tokio::test(start_paused = true)]
-async fn audit_stall_or_overflow_never_repeats_input_and_preserves_time() {
+async fn audit_stall_never_repeats_input_and_preserves_time() {
     let mut rig = Rig::attempt().await;
     let id = rig.ready_message().await;
     rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
@@ -4065,7 +4065,9 @@ async fn timeout_before_effect_accounts_attempt() {
     let attempt = tokio::spawn(deliver(rig.rt.clone(), id, deadline));
     let attempted = rig.committed().await;
     assert_eq!(attempted.kind, "msg.delivery_attempted");
-    // Past the work deadline, inside cleanup's wait for the fold.
+    // Move past the work deadline before supplying the fold. This paused,
+    // single-threaded test relies on the supervisor being polled first;
+    // it has no separate witness of entry into cleanup's fold wait.
     tokio::time::advance(Duration::from_secs(2)).await;
     rig.apply(&attempted);
     rig.fold_rest();
@@ -4158,7 +4160,7 @@ no_key_tests! {
     leading_space_reference_no_enter: NOT_SENT,
         |id| drafted(&format!(" {}", inbox_reference(id)));
     // A draft that is not the reference at all.
-    unknown_or_wrapped_draft_no_enter: NO_TOKEN,
+    other_draft_no_enter: NO_TOKEN,
         |_| drafted("something the owner is typing");
     mismatched_or_unknown_staged_frame_never_blind_enter: NOT_SENT,
         |id| drafted(&format!("{} and more", inbox_reference(id)));
@@ -4227,10 +4229,10 @@ async fn typed_with(change: fn(&mut PaneCapture)) -> bool {
     rig.typed(id)
 }
 
-/// A client that has the pane selected and is not focused on it does not
-/// block: focus is `Some(false)`, and the attempt types.
+/// A capture reporting no client focused on this pane allows the attempt.
+/// There is no separate selected-client fact in the capture.
 #[tokio::test(start_paused = true)]
-async fn unfocused_selected_client_allows() {
+async fn unfocused_client_allows() {
     assert!(typed_with(|capture| capture.focused = Some(false)).await);
 }
 

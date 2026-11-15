@@ -681,7 +681,8 @@ impl AgentHandle {
             let rows = rt.rows().await?;
             // The operations whose cleanup failed. A control service that does
             // not answer in time leaves the list without them, never without
-            // its agents. Leave a timer tick to finish the list after the read.
+            // its agents. Reserve the final timer tick to finish the list:
+            // even a healthy control read first reached then is omitted.
             let quarantines = rt
                 .control
                 .quarantines(

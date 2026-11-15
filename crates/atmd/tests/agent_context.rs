@@ -19,6 +19,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/context_tasks.rs"]
+mod context_tasks;
+
 struct Rig {
     dir: tempfile::TempDir,
     org: OrgHandle,

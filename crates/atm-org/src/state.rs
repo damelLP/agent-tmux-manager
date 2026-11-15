@@ -330,11 +330,19 @@ impl OrgState {
             OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
                 decision_id, by, ..
             })
-            | OrgEvent::DecisionResolved(DecisionResolution {
-                decision_id, by, ..
+            | OrgEvent::DecisionResolved(DecisionResolutionEvent {
+                resolution:
+                    DecisionResolution {
+                        decision_id, by, ..
+                    },
+                ..
             })
-            | OrgEvent::DecisionOverruled(DecisionResolution {
-                decision_id, by, ..
+            | OrgEvent::DecisionOverruled(DecisionResolutionEvent {
+                resolution:
+                    DecisionResolution {
+                        decision_id, by, ..
+                    },
+                ..
             })
             | OrgEvent::DecisionWithdrawn(DecisionWithdrawal {
                 decision_id, by, ..
@@ -578,7 +586,8 @@ impl OrgState {
                 decision.provisional = Some(choice.clone());
                 decision.taken_at = Some(ts);
             }
-            OrgEvent::DecisionResolved(resolution) | OrgEvent::DecisionOverruled(resolution) => {
+            OrgEvent::DecisionResolved(answer) | OrgEvent::DecisionOverruled(answer) => {
+                let resolution = &answer.resolution;
                 let decision = self.decision_mut(&resolution.decision_id)?;
                 decision.close(
                     if matches!(event, OrgEvent::DecisionResolved(_)) {

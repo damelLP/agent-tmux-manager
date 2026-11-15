@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"attach","method":"task.attach","params":{"task_id":"t6","file":{"path":"evidence.log","kind":"evidence"}}},"response":{"type":"response","id":"attach","result":{"task_id":"t6","changed":true,"notification":null}}}

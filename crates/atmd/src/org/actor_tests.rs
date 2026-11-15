@@ -434,6 +434,7 @@ async fn failed_second_event_preserves_committed_prefix() {
         &mut state,
         &command,
         now(),
+        None,
         &health,
         &broadcast::channel(1024).0,
         &mut |envelope: Envelope| {

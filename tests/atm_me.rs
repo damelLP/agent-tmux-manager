@@ -17,6 +17,9 @@ use tokio::{
     process::Command,
 };
 
+#[path = "support/me_tasks.rs"]
+mod task_context;
+
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/atm_me/context.json")).unwrap()
 }

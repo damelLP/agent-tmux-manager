@@ -238,6 +238,87 @@ async fn half_close_then_full_disconnect_discards_parked_send() {
 }
 
 #[tokio::test]
+async fn daemon_disconnect_preserves_earlier_parked_survivor() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let mock = MockTmuxClient::new();
+        let registry = crate::registry::spawn_registry();
+        let cancel = CancellationToken::new();
+        let (control, actor) = spawn_control(
+            Box::new(mock.clone()), registry.clone(),
+            OrgHandle::disabled("disconnect test"), cancel.clone(),
+        );
+        let mut services = methods::MethodServices::new(registry);
+        services.control = Some(control.clone());
+        let daemon = Arc::new(crate::server::DaemonServer::with_services(
+            &socket, services, cancel.clone(),
+        ));
+        let serving = daemon.clone();
+        let mut server = Box::pin(async move { serving.run().await });
+        std::future::poll_fn(|cx| {
+            assert!(server.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+        let server = tokio::spawn(server);
+        let (job, release) = hold(&control, ReservationKind::Delivery).await;
+        let mut survivor = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        let mut abandoned = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        for peer in [&mut survivor, &mut abandoned] {
+            write(peer, ClientMessage::connect(None)).await;
+            assert!(matches!(read(peer).await, DaemonMessage::Connected { .. }));
+        }
+        write(&mut abandoned, ClientMessage::subscribe(None)).await;
+        assert!(matches!(read(&mut abandoned).await, DaemonMessage::SessionList { .. }));
+        assert_eq!(daemon.subscriber_count().await, 1);
+        for (index, (peer, text)) in [(&mut survivor, "survivor"), (&mut abandoned, "abandoned")].into_iter().enumerate() {
+            // Identity verification runs once per send inside actor dispatch,
+            // unlike readiness notifications or repeatedly resolved aliases.
+            // The fake reports the same existing private path as the caller.
+            mock.set_next_raw_output(socket.to_str().unwrap());
+            write(peer, ClientMessage::request(
+                text.into(), "session.send".into(),
+                serde_json::json!({"target":"%1", "text":text, "caller_server":socket}), None,
+            )).await;
+            while mock.calls().iter().filter(|call| matches!(call,
+                MockCall::RawCommand { subcommand, args }
+                    if subcommand == "display-message" && args.iter().any(|arg| arg == "#{socket_path}")
+            )).count() != index + 1 {
+                tokio::task::yield_now().await;
+            }
+            barrier(&control).await; // each send is parked before the next starts
+        }
+        assert!(input_calls(&mock).is_empty());
+        drop(abandoned);
+        // DaemonServer removes this subscriber only after its handler finishes.
+        // If the monitor was not attached, that requires the abandoned send's
+        // deadline, by which time the earlier survivor has also expired.
+        while daemon.subscriber_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+        untagged(&mock, "%1");
+        mock.set_next_raw_output("0 1");
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        let reply = read(&mut survivor).await;
+        assert!(
+            matches!(&reply, DaemonMessage::Response { id, payload: ResponsePayload::Result(value) }
+                if id == "survivor" && *value == serde_json::json!({"pane":"%1"})),
+            "earlier parked survivor must succeed, not time out: {reply:?}"
+        );
+        control.flush_audits().await;
+        assert_eq!(input_calls(&mock), vec![
+            MockCall::PasteText { pane: "%1".into(), text: "survivor".into() },
+            MockCall::SendKeys { pane: "%1".into(), keys: "Enter".into() },
+        ]);
+        drop(survivor);
+        cancel.cancel();
+        actor.await.unwrap();
+        server.await.unwrap().unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn full_disconnect_after_paste_still_finishes_enter() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mock = MockTmuxClient::new();

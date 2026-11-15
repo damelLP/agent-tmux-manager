@@ -13,11 +13,11 @@ use std::{path::PathBuf, time::Duration};
 // 10 s agent.list router + 10 s startup/transport margin = 20 s.
 pub(super) const AGENT_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
-async fn list(root: Option<PathBuf>) -> Result<ListResult> {
+async fn list(root: Option<PathBuf>, budget: Duration) -> Result<ListResult> {
     let value = super::rpc::call(
         "agent.list",
         serde_json::to_value(ListParams { project_root: root })?,
-        AGENT_LIST_TIMEOUT,
+        budget,
     )
     .await
     .map_err(|error| match error {
@@ -63,14 +63,14 @@ fn unique_name(rows: &[AgentListEntry], name: &str, searched: &str) -> Result<Ag
     Ok(first.agent_id.clone())
 }
 
-pub(super) async fn address(to: &str, root: Option<PathBuf>) -> Result<Address> {
+pub(super) async fn address(to: &str, root: Option<PathBuf>, budget: Duration) -> Result<Address> {
     if to == "owner" || to == "system" {
         return Ok(to.parse()?);
     }
-    Ok(Address::Agent(agent(to, root).await?))
+    Ok(Address::Agent(agent(to, root, budget).await?))
 }
 
-pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
+pub(super) async fn agent(to: &str, root: Option<PathBuf>, budget: Duration) -> Result<AgentId> {
     if to.contains('/') {
         return Ok(to.parse()?);
     }
@@ -81,7 +81,7 @@ pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
         .transpose()?;
     if root.is_none() {
         if let Some(pane) = pane {
-            let rows = list(None).await?;
+            let rows = list(None, budget).await?;
             let mut bindings = rows.iter().filter(|row| {
                 row.state != AgentStatus::Down && row.pane.as_deref() == Some(pane.as_str())
             });
@@ -108,7 +108,7 @@ pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
         Some(root) => std::env::current_dir()?.join(root),
         None => std::env::current_dir()?,
     };
-    let rows = list(Some(root.clone())).await?;
+    let rows = list(Some(root.clone()), budget).await?;
     let searched = match rows.first() {
         Some(row) => format!("project {} ({source})", row.agent_id.project),
         None => format!(

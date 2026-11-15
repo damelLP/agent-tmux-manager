@@ -293,8 +293,35 @@ async fn rotation_io_failure_stops_writer_without_publishing() {
             .await,
         Err(EventLogError::Io { .. })
     ));
-    // The failure reply precedes writer.close(), which syncs raw data again.
-    // Wait for receiver drop, not for a later append to race that cleanup.
+    // Probe termination without spending a minute on a writer that keeps
+    // serving. This private-channel diagnostic owns a separate permit: the
+    // Tokio 1.49 send/receiver-drop race previously observed here can strand a
+    // queued request, so the probe must not retain the public handle's slot.
+    let (reply, response) = oneshot::channel();
+    let probe = Append {
+        ts: ts(),
+        kind: "must-not-be-served".into(),
+        body: serde_json::Value::Null,
+        reply,
+        _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+    };
+    match log.requests.try_send(probe) {
+        Ok(()) => {
+            tokio::time::timeout(ROTATION_HANG_GUARD, async {
+                tokio::select! {
+                    _ = log.requests.closed() => {},
+                    result = response => assert!(result.is_err(), "failed writer served another request: {result:?}"),
+                }
+            })
+            .await
+            .expect("failed writer neither stopped nor answered the diagnostic");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(error) => panic!("unexpected diagnostic admission failure: {error}"),
+    }
+    // The failure reply precedes final raw-data sync. Receiver closure avoids
+    // both that cleanup overlap and sends racing receiver destruction; only
+    // after it may the public later append safely test the Closed contract.
     tokio::time::timeout(ROTATION_HANG_GUARD, log.requests.closed())
         .await
         .expect("failed writer did not close its request receiver");

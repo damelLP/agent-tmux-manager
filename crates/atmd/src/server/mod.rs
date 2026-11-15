@@ -187,6 +187,15 @@ impl DaemonServer {
                     self.registry.clone(),
                     agents_cancel.clone(),
                 );
+                // The reminder on a silent turn end stops with them too.
+                if let Some(settings) = reminder_settings(&services) {
+                    crate::org::task_reminder::spawn_task_reminders(
+                        services.org.clone(),
+                        self.registry.subscribe(),
+                        settings,
+                        agents_cancel.clone(),
+                    );
+                }
                 task
             })
         } else {
@@ -435,6 +444,17 @@ impl DaemonServer {
     }
 }
 
+/// The reminder's settings when its notes can be delivered. Without a valid
+/// delivery policy no message runtime starts, so a reminder would be recorded
+/// and its note never typed.
+fn reminder_settings(
+    services: &methods::MethodServices,
+) -> Option<atm_org::reminder::ReminderSettings> {
+    services
+        .reminder
+        .filter(|_| matches!(services.delivery_policy, Some(Ok(_))))
+}
+
 /// Start the confirmed-message service and install its tap, unless a handle
 /// was injected (that one stays authoritative) or no delivery policy was
 /// configured (the methods then stay explicitly unavailable). An invalid
@@ -532,6 +552,27 @@ pub enum ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reminders_start_only_when_their_notes_can_be_delivered() {
+        let settings = atm_org::reminder::ReminderSettings::default();
+        let mut services = methods::MethodServices::new(crate::registry::spawn_registry());
+        let policy = || Some(Ok(atm_org::delivery::DeliveryPolicy::default()));
+
+        // Off unless the caller asks, whatever the policy.
+        assert_eq!(reminder_settings(&services), None);
+        services.delivery_policy = policy();
+        assert_eq!(reminder_settings(&services), None);
+
+        services.reminder = Some(settings);
+        assert_eq!(reminder_settings(&services), Some(settings));
+        // No message runtime starts without a policy or with an invalid one:
+        // a reminder would be recorded and its note never typed.
+        services.delivery_policy = None;
+        assert_eq!(reminder_settings(&services), None);
+        services.delivery_policy = Some(Err("invalid [delivery] settings".into()));
+        assert_eq!(reminder_settings(&services), None);
+    }
 
     #[tokio::test]
     async fn message_evidence_connections_use_enriched_services() {

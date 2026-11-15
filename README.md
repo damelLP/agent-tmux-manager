@@ -313,6 +313,30 @@ A task mutation and its automatic message enqueue are separate durable operation
 
 Mutations allow 35 seconds including startup/transport; list/get allow 15. A mutation timeout, lost connection or unreadable text answer does not prove rollback: accepted work may finish. Inspect `atm task list`, `atm task get <id>` and the inbox before considering another mutation; do not blindly resubmit. The shared transport cannot distinguish an early connection failure from one after the request was admitted, so mutation connection errors conservatively include this advice. Read timeouts are reported as read failures, not uncertain commits. Service/refusal/output errors exit 1 (also with `--format json`, with terminal-safe diagnostics on stderr); malformed command syntax exits 2 before contacting the daemon. A successful committed task with an unconfirmed or newer notification status still exits 0 and includes its notification outcome.
 
+## Task reminders
+
+When a named agent's turn ends and a task assigned to it is still `assigned`, `working` or `changes_requested`, `atmd` waits and then sends the agent one note. The note names the task and the commands that say where it stands: `atm task submit <id>`, or `atm task set-state <id> waiting --reason '...'` (or `blocked`). If the agent's next turn ends the same way, the task's creator gets one note. When the creator is `system` or the agent itself, the note goes to the agent's manager, or to you if it has none.
+
+- A task that is `waiting` or `blocked` is not reminded: the agent has said why it stopped.
+- It happens once per state. A change of state allows one more reminder.
+- Nothing is sent before the agent has been idle for the delay, while its session shows background work, or while a message to it is still on its way.
+- Each note is an ordinary message. It starts a model turn nobody typed, and the delivery guards hold it like any other message: a running turn, a draft, your focused pane.
+- The event log records `task.reminded` and `task.flagged`.
+
+```toml
+[reminder]
+enabled = true    # false turns reminders off
+delay_secs = 60   # idle time after the turn's end before the note
+```
+
+`atmd` reads `[reminder]` when it starts. An unknown key or `delay_secs = 0` turns reminders off and logs the reason. They are also off while `[delivery]` is invalid: nothing could type the note.
+
+Limits:
+
+- A pending wait is kept in memory, so a daemon restart drops it. The marks are in the event log, so a restart never sends a second reminder.
+- A turn whose end the harness does not report is not reminded: Esc during a reply in Claude Code or Codex, or a denied dialog.
+- A session that reads idle while the harness still answers (a blocked `Stop` hook, an auto-compact) for longer than the delay gets a reminder it may no longer need, typed after the turn really ends.
+
 ## Decisions
 
 Named agents raise questions through `decision.request`; the owner answers from an **unbound** shell:

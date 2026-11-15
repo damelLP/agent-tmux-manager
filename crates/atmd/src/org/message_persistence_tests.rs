@@ -92,6 +92,22 @@ impl Process {
             .unwrap()
     }
 
+    /// The first system note in the log, once the service has folded it.
+    /// Synchronized on the log's own watch, not on time.
+    async fn notice(&self) -> (MessageId, String) {
+        let mut events = self.org.watch(Vec::new(), 0).unwrap();
+        loop {
+            let envelope = guarded(events.next()).await.unwrap().unwrap();
+            let event = atm_org::OrgEvent::from_parts(&envelope.kind, &envelope.body).unwrap();
+            if let Some(atm_org::OrgEvent::MessageSent(content)) = event {
+                if content.from == Address::System {
+                    guarded(self.rt.history.folded(envelope.seq)).await.unwrap();
+                    return (MessageId::new(envelope.seq), content.body);
+                }
+            }
+        }
+    }
+
     fn step(&self, id: MessageId) -> DeliveryStep {
         let snapshot = self.rt.history.snapshot(id, utc()).unwrap();
         next_delivery(&snapshot.message, &snapshot.live, utc(), &self.rt.policy).unwrap()
@@ -186,6 +202,19 @@ async fn restart_replays_messages_read_state_and_attempts() {
     copy_log(before.path(), after.path());
     let second = Process::start(after.path()).await;
 
+    // The scheduler of this process holds the previous process's attempt for
+    // the owner and says so once; the message that was never attempted and
+    // sits before it in the queue is not waiting behind it.
+    let (notice, body) = second.notice().await;
+    assert_eq!(
+        body,
+        format!(
+            "{attempted} blocked: daemon restarted after an unconfirmed attempt; owner \
+             resolution required; waiting behind it: none. Inspect the pane; atm msg retry \
+             {attempted} --accept-duplicate-risk or atm msg give-up {attempted}"
+        )
+    );
+
     let owner = second.inbox(None).await;
     assert_eq!(
         owner
@@ -193,11 +222,11 @@ async fn restart_replays_messages_read_state_and_attempts() {
             .iter()
             .map(|m| m.message_id)
             .collect::<Vec<_>>(),
-        [report, unread]
+        [report, unread, notice]
     );
     assert!(owner.messages[0].read_at.is_some());
     assert!(owner.messages[1].read_at.is_none());
-    assert_eq!(owner.unread_count, 1);
+    assert_eq!(owner.unread_count, 2);
     assert_eq!(
         owner.messages[0].content.from,
         Address::Agent(worker.clone())
@@ -246,7 +275,7 @@ async fn restart_replays_messages_read_state_and_attempts() {
         .send(Some("%1"), Address::Owner, "after restart")
         .await;
     assert!(live > attempted);
-    assert_eq!(second.inbox(None).await.messages.len(), 3);
+    assert_eq!(second.inbox(None).await.messages.len(), 4);
     let repeated = guarded(
         second
             .messages

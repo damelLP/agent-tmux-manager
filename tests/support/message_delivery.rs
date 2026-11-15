@@ -346,12 +346,15 @@ const SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
 /// A running daemon whose organisation log refuses its next append, until
 /// this is dropped. Nothing in the daemon is changed: the log's one segment
 /// is filled to its limit with real owner messages, so the next record needs
-/// a new segment file, and the log's directory is read-only.
+/// a new segment file. The directory is then moved aside and replaced with a
+/// regular file: opening a child fails with ENOTDIR, even for root. The open
+/// segment stays intact in the moved directory.
 ///
 /// The first refused append disables the daemon's writer until a restart, so
 /// nothing here probes the fault with a write of its own.
 pub struct RefusedAppends {
     directory: PathBuf,
+    parked: PathBuf,
     size: u64,
 }
 
@@ -372,7 +375,6 @@ impl RefusedAppends {
     }
 
     pub fn start(rig: &MessageRig) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let directory = rig.test.rig.root().join("state/log/events");
         let owner = |body: usize, attachments: usize| {
             let params = json!({
@@ -399,14 +401,21 @@ impl RefusedAppends {
         owner(usize::try_from(room - overhead - 40).unwrap(), 0);
         let room = left(&directory);
         assert!(room < 80, "{room} bytes are left in the segment");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
         let size = Self::segment(&directory).1;
-        Self { directory, size }
+        let parked = directory.with_file_name("events-parked");
+        std::fs::rename(&directory, &parked).unwrap();
+        std::fs::write(&directory, b"rotation blocked\n").unwrap();
+        Self {
+            directory,
+            parked,
+            size,
+        }
     }
 
     /// Nothing was written since the fault began, and no attempt is on record.
     pub fn assert_nothing_appended(&self) {
-        let (file, size) = Self::segment(&self.directory);
+        assert!(self.directory.is_file(), "the rotation blocker was removed");
+        let (file, size) = Self::segment(&self.parked);
         assert_eq!(size, self.size, "a refused append was written");
         let log = std::fs::read_to_string(file).unwrap();
         assert!(
@@ -418,9 +427,9 @@ impl RefusedAppends {
 
 impl Drop for RefusedAppends {
     fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        // The rig removes its directory when it closes.
-        let _ = std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o755));
+        // Put the intact log back before the rig removes its directory.
+        let _ = std::fs::remove_file(&self.directory);
+        let _ = std::fs::rename(&self.parked, &self.directory);
     }
 }
 

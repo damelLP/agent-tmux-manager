@@ -1428,9 +1428,10 @@ async fn settle(adoption: &Adoption) {
 #[tokio::test]
 async fn adopt_of_an_agent_with_a_role_reads_the_screen_only_of_its_live_harness() {
     // A Starting agent with a pi role. With no row of pi on the pane its
-    // screen is not read at all (a row of another harness is no evidence that
-    // pi runs there): nothing is pinned and it stays Starting.
-    let adoption = recorded_with_role(Vec::new(), &[("other", false, Harness::Codex)]).await;
+    // screen is not read at all: nothing is pinned and it stays Starting.
+    // (With only a row of another harness the adopt is refused:
+    // adopt_refuses_a_role_whose_harness_is_not_the_panes.)
+    let adoption = recorded_with_role(Vec::new(), &[]).await;
     let before = adoption.rig.org.status().unwrap();
     script_readopt(&adoption, PI_PADDED, "pi");
     *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
@@ -1629,4 +1630,106 @@ async fn second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready() {
         assert!(mutations(&adoption.rig).is_empty(), "{bound}");
         adoption.followed().await;
     }
+}
+
+// --- cp-u8-21 D: a role whose harness is not the pane's ---
+
+/// `q/lead` was started with a pi role and taken down: it has a role and no
+/// pane. `rows` are the top-level session rows on %1.
+async fn taken_down_with_role(rows: &[(&str, Harness)]) -> Adoption {
+    let rig = Rig::new().await;
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("q")).unwrap();
+    let root = project.path().join("q").canonicalize().unwrap();
+    rig.command(OrgCommand::RegisterProject {
+        project_id: "q".parse().unwrap(),
+        root: root.to_str().unwrap().into(),
+        move_root: false,
+    })
+    .await;
+    rig.command(OrgCommand::Up {
+        agent_id: adoptee(),
+        role: atm_org::parse_role("lead", "+++\nharness='pi'\n+++\n").unwrap(),
+    })
+    .await;
+    rig.command(OrgCommand::Down {
+        agent_id: adoptee(),
+        reason: "taken down".into(),
+    })
+    .await;
+    for (id, harness) in rows {
+        rig.row_of(id, "%1", false, *harness).await;
+    }
+    *rig.proc.lock().unwrap() = Some(job_in_front());
+    let (agents, _) = rig.start();
+    agents.reconciled().await.unwrap();
+    let events = agents.observation_events();
+    Adoption {
+        rig,
+        agents,
+        project,
+        events,
+    }
+}
+
+#[tokio::test]
+async fn adopt_refuses_a_role_whose_harness_is_not_the_panes() {
+    // Decision D. The agent's role names pi and the only session on the pane
+    // is a Codex one: nothing could ever bind, and the agent would be
+    // Starting for good. Refused before the tag, with nothing recorded.
+    let refused = |result: Result<AdoptResult, AgentError>| match result {
+        Err(AgentError::Refused(reason)) => {
+            assert!(reason.contains("%1 runs codex"), "{reason}");
+            assert!(reason.contains("role names pi"), "{reason}");
+            assert!(reason.contains("nothing was changed"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    };
+    // A real session row, and a discovery row: both show which harness runs.
+    for row in ["other", "pending-100"] {
+        let adoption = taken_down_with_role(&[(row, Harness::Codex)]).await;
+        let recorded = adoption.agent().await.unwrap();
+        let before = adoption.rig.org.status().unwrap();
+        adoption
+            .rig
+            .client
+            .script_inspect(&pane("%1"), Some(&Adoption::inspection(None, "codex", "")))
+            .unwrap();
+        refused(adoption.adopt().await);
+        assert!(mutations(&adoption.rig).is_empty(), "refused before the tag");
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(adoption.rig.org.status().unwrap(), before, "{row}");
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{row}");
+        assert!(!quarantined(&adoption.rig, "q/lead").await);
+    }
+
+    // The same for an agent that is already recorded on the pane and tagged.
+    let adoption = recorded_with_role(Vec::new(), &[("other", false, Harness::Codex)]).await;
+    let recorded = adoption.agent().await.unwrap();
+    let before = adoption.rig.org.status().unwrap();
+    adoption
+        .rig
+        .client
+        .script_inspect(
+            &pane("%1"),
+            Some(&Adoption::inspection(Some("q/lead"), "codex", "")),
+        )
+        .unwrap();
+    refused(adoption.adopt().await);
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
+
+    // The twin: the pane's session is a pi one, and the agent is adopted.
+    let mut adoption = taken_down_with_role(&[("s1", Harness::Pi)]).await;
+    adoption.script_tagging();
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(adoption.tags_set(), 1);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.pane.as_deref(), Some("%1"));
+    assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+    adoption.followed().await;
 }

@@ -285,7 +285,24 @@ impl AgentRuntime {
             Ok(first)
         };
         // Before the tag: an ambiguous pane is refused with nothing changed.
-        candidates(&self.pane_sessions(pane).await?)?;
+        let rows = self.pane_sessions(pane).await?;
+        candidates(&rows)?;
+        // So is a pane whose sessions are all of another harness than the
+        // role's: none of them could ever be bound to this agent.
+        if let Some(wanted) = role.map(|role| role.config.harness.short_tag()) {
+            let found: Vec<&str> = rows
+                .iter()
+                .filter(|row| {
+                    row.view.parent_session_id.is_none() && excluded.as_ref() != Some(&row.view.id)
+                })
+                .map(|row| row.view.harness.as_str())
+                .collect();
+            if let Some(other) = found.first().filter(|_| !found.contains(&wanted)) {
+                return Err(AgentError::Refused(format!(
+                    "{pane} runs {other}, but agent {id}'s role names {wanted}; nothing was changed"
+                )));
+            }
+        }
         if !tagged {
             effect.store(true, Ordering::SeqCst);
             changed(effect, r.tag(pane, ExpectedTag::Absent).await)?;

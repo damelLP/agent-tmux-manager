@@ -68,15 +68,19 @@ fn variant(error: &ReservationError) -> usize {
         ReservationError::Unavailable => 9,
         ReservationError::Timeout => 10,
         ReservationError::Control(_) => 11,
+        ReservationError::PacingRefused { .. } => 12,
+        ReservationError::PaneInputRefused { .. } => 13,
+        ReservationError::UnsafePaste { .. } => 14,
     }
 }
-const VARIANTS: usize = 12;
+const VARIANTS: usize = 15;
 
 fn control_errors() -> Vec<ControlError> {
     let pane = || "%1".to_string();
     vec![
         // Documented as before effect, and still Unknown here: the executor
-        // never tells one `Control` from another.
+        // never tells one `Control` from another. Reserved input reports a
+        // pane that refuses input as `PaneInputRefused` instead.
         ControlError::SendRefused {
             pane: pane(),
             reason: "pane is in a mode",
@@ -132,6 +136,19 @@ fn reservation_error_certainty_table() {
             ReservationError::ScreenChanged { pane: pane() },
             NOT_STARTED,
         ),
+        (
+            ReservationError::PacingRefused { pane: pane() },
+            NOT_STARTED,
+        ),
+        // A pane in a mode, dead, synchronized or with its input off.
+        (
+            ReservationError::PaneInputRefused {
+                pane: pane(),
+                reason: "pane is in a mode",
+            },
+            NOT_STARTED,
+        ),
+        (ReservationError::UnsafePaste { pane: pane() }, NOT_STARTED),
         (
             ReservationError::TagMismatch {
                 pane: pane(),

@@ -55,6 +55,9 @@ pub fn certainty(error: &ReservationError) -> EffectCertainty {
         | ReservationError::Busy { .. }
         | ReservationError::StaleReservation
         | ReservationError::ScreenChanged { .. }
+        | ReservationError::PacingRefused { .. }
+        | ReservationError::PaneInputRefused { .. }
+        | ReservationError::UnsafePaste { .. }
         | ReservationError::TagMismatch { .. }
         | ReservationError::PaneGone { .. }
         | ReservationError::InvalidObservation { .. }

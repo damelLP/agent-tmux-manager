@@ -93,6 +93,24 @@ atm layout pair                    # two agents + ATM sidebar
 
 `atm role` stores the tag on the pane, so it survives a clear or harness restart there. With no target or a `%N` target it needs only tmux, not atmd; without `$TMUX_PANE`, pass `-t`. A session-id target uses the daemon. `atm list -f json` adds `role: "coordinator"` when a session's pane is tagged and its parent does not share that pane, or `role: null` otherwise (also on failed tmux lookups). No parent, or a parent missing from the full session list, passes: a separate-process teammate on its own tagged pane can coordinate, but an in-process subagent sharing its parent's pane stays null, even when filters hide the parent. Table and ids formats are unchanged. `/atm-coordinate` tags its pane during setup. The TUI shows a bold cyan `C` on coordinator rows and puts them first within each agent group, keeping newest-first order within each band. Nested teammates stay in place. Press `c` to toggle the selected row's pane; group rows, rows without a pane and children sharing their parent's pane are unchanged. External tag changes appear on the next three-second poll; `c` updates the display immediately.
 
+### Starting a named agent
+
+```bash
+atm agent up worker                          # start the agent of role "worker" in this project
+atm agent up worker --project-root ../other  # ... in another project
+```
+
+`atm agent up <name>` asks `atmd` to start the agent that `.atm/roles/<name>.md` under the project root describes. The project root is the current directory unless `--project-root` is given. `atmd` splits a new pane at 50% without moving your focus, waits there for an idle shell, types one launch line and Enter, and waits for the harness. The line is `cd <the role's cwd> && ATM_AGENT=<project>/<name>`, then the role's `command_prefix`, then the harness command with the role's `spawn_args` and `model`.
+
+- **Where the pane goes.** Below the pane you ran the command from. A role can say `pane = "<left|right|above|below>:<agent name>"` to split on that side of another agent of the same project; that agent must have a pane. Any other form of `pane` is refused, before anything is changed.
+- **It does not read `[harness.<name>]` in `config.toml`.** The binary and its default arguments are atm's built-in ones for the role's harness. `atm spawn` reads that table; `atm agent up` does not.
+- **`ATM_SPAWN_<HARNESS>_BIN/ARGS` and `ATM_SPAWN_BIN/ARGS` come from the environment `atmd` was started in**, read once at its start. Setting them in the shell where you run `atm agent up` has no effect; restart `atmd` to change them.
+- **A `command_prefix` takes the binary out of command position.** Without a prefix the binary is the command word of the line, so a shell alias for it still expands. Behind a prefix (`command_prefix = ["mise", "x", "--"]`) the shell expands no alias: a harness that is installed only as an alias will not launch with a prefix.
+- **Printable ASCII only.** If the role's cwd, its model, an argument, a prefix word or an `ATM_SPAWN_*` override holds anything else, the start is refused before anything is changed.
+- **A focused pane gets no input.** `atmd` types into the new pane only while no tmux client is focused on it. If you switch to that pane during the start, nothing is typed until you leave it.
+- **A start has 60 seconds** (the command itself waits up to 85). Once the start is recorded, any failure, and the deadline, leave the agent `stuck` with the reason `start did not complete: <why>; inspect %N` and one note in your inbox. A pane the start created stays for you to look at. If the start failed before its pane was recorded, the agent then goes `down` and its reason keeps that text.
+- **Start dialogs are not answered yet.** A harness that asks a question at its start (Claude Code in a folder it does not trust yet, a Codex update offer) ends the start as stuck.
+
 ### Sending text
 
 `atm send` refuses input when the window has `synchronize-panes` on (Enter could

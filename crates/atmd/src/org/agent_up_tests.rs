@@ -683,6 +683,24 @@ async fn up_waits_for_idle_shell_before_paste() {
     assert!(starting.rig.proc_script.lock().unwrap().is_empty());
     assert_eq!(starting.unread(), 0);
 
+    // The shell is idle and has drawn no prompt yet (it is still reading its
+    // startup files, with builtins only): an empty line is not a prompt, and
+    // nothing is typed ahead of the prompt.
+    let mut starting = Starting::new(Harness::Codex).await;
+    starting.script_pane();
+    starting.frame(Starting::shell(""));
+    starting.frame(Starting::shell(""));
+    starting.frame(Starting::shell("   "));
+    starting.frame(Starting::shell("   "));
+    starting.script_paste();
+    starting.frame(starting.staged());
+    starting.frame(starting.staged());
+    starting.frame(Starting::screen(CODEX_FRESH, "codex"));
+    let result = starting.up().await.unwrap();
+    assert_eq!(result.state, AgentStatus::Ready);
+    assert_eq!(starting.effects(), starting.launched());
+    assert_eq!(starting.unread(), 0);
+
     // The prompt is still being drawn between the two captures of the proof:
     // that pass is not taken, the next is.
     let mut starting = Starting::new(Harness::Codex).await;

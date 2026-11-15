@@ -1094,6 +1094,116 @@ async fn adopt_tag_refused_before_any_effect_does_not_quarantine() {
     assert!(!quarantined(&adoption.rig, "q/lead").await);
 }
 
+#[test]
+fn only_a_before_effect_error_clears_the_effect_flag() {
+    use crate::org::agent_lifecycle::{changed, Effect};
+    use crate::control::reservation::{ExpectedTag, ReservationError as E};
+    use crate::control::ControlError as C;
+    use std::sync::atomic::Ordering;
+    // What `ReservationError` documents for a general pane operation. No
+    // wildcard arm on the outer match: a new variant needs a row here.
+    fn before_effect(error: &E) -> bool {
+        match error {
+            E::NotImplemented { .. }
+            | E::Busy { .. }
+            | E::StaleReservation
+            | E::ScreenChanged { .. }
+            | E::PacingRefused { .. }
+            | E::PaneInputRefused { .. }
+            | E::UnsafePaste { .. }
+            | E::TagMismatch { .. }
+            | E::PaneGone { .. }
+            | E::InvalidObservation { .. }
+            | E::Quarantined { .. } => true,
+            E::InvalidRequest { .. } | E::Unavailable | E::Timeout => false,
+            E::Control(C::SendRefused { .. }) => true,
+            E::Control(
+                C::NoSession { .. }
+                | C::NoPane { .. }
+                | C::AmbiguousTarget { .. }
+                | C::AgentClearing { .. }
+                | C::PaneQuarantined { .. }
+                | C::OrganisationUnavailable { .. }
+                | C::Tmux { .. },
+            ) => false,
+        }
+    }
+    let p = || pane("%1");
+    let s = || "%1".to_owned();
+    let errors = || {
+        vec![
+            E::NotImplemented { operation: "x" },
+            E::InvalidRequest { reason: "x".into() },
+            E::Busy {
+                agent: lead(),
+                pane: Some(p()),
+            },
+            E::StaleReservation,
+            E::ScreenChanged { pane: p() },
+            E::PacingRefused { pane: p() },
+            E::PaneInputRefused {
+                pane: p(),
+                reason: "x",
+            },
+            E::UnsafePaste { pane: p() },
+            E::TagMismatch {
+                pane: p(),
+                expected: ExpectedTag::Absent,
+                actual: None,
+            },
+            E::PaneGone { pane: p() },
+            E::InvalidObservation {
+                pane: p(),
+                reason: "x".into(),
+            },
+            E::Quarantined {
+                agent: lead(),
+                pane: None,
+            },
+            E::Unavailable,
+            E::Timeout,
+            E::Control(C::SendRefused {
+                pane: s(),
+                reason: "x",
+            }),
+            E::Control(C::NoSession { target: s() }),
+            E::Control(C::NoPane { session: s() }),
+            E::Control(C::AmbiguousTarget {
+                target: s(),
+                count: 2,
+                ids: s(),
+            }),
+            E::Control(C::AgentClearing {
+                pane: s(),
+                agent: lead(),
+            }),
+            E::Control(C::PaneQuarantined {
+                pane: s(),
+                agent: lead(),
+            }),
+            E::Control(C::OrganisationUnavailable { pane: s() }),
+            E::Control(C::Tmux {
+                context: "x".into(),
+                source: atm_tmux::TmuxError::ParseError("x".into()),
+            }),
+        ]
+    };
+    assert_eq!(errors().len(), 22, "one of each variant");
+    for error in errors() {
+        let (label, expected) = (format!("{error:?}"), !before_effect(&error));
+        // The flow sets the flag before its call.
+        let effect = Effect::default();
+        effect.store(true, Ordering::SeqCst);
+        assert!(changed(&effect, Err(error)).is_err());
+        assert_eq!(effect.load(Ordering::SeqCst), expected, "{label}");
+    }
+    // A call that succeeded changed the pane.
+    let effect = Effect::default();
+    effect.store(true, Ordering::SeqCst);
+    assert!(changed(&effect, Ok(())).is_ok());
+    assert!(effect.load(Ordering::SeqCst));
+}
+
 #[tokio::test(start_paused = true)]
 async fn pane_effect_whose_call_outlives_the_deadline_quarantines() {
     // Review 22, probe v06. tmux performs the kill (or removes the tag) and

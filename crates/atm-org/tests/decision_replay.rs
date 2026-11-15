@@ -193,7 +193,8 @@ fn refusal_name(refusal: &Refusal) -> &'static str {
         | Refusal::RoleNameMismatch { .. }
         | Refusal::InvalidDeliveryState { .. }
         | Refusal::WrongRecipient { .. }
-        | Refusal::InvalidRecipient(_) => "not a decision refusal",
+        | Refusal::InvalidRecipient(_)
+        | Refusal::Task(_) => "not a decision refusal",
     }
 }
 const REFUSALS: [&str; 9] = [

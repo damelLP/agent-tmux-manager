@@ -336,6 +336,16 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::MessageDelivered { .. }
         | OrgEvent::MessageDeliveryFailed { .. }
         | OrgEvent::MessageRead { .. }
+        | OrgEvent::TaskCreated(_)
+        | OrgEvent::TaskAssigned(_)
+        | OrgEvent::TaskStateChanged(_)
+        | OrgEvent::TaskSubmitted(_)
+        | OrgEvent::TaskReviewStarted(_)
+        | OrgEvent::TaskVerdict(_)
+        | OrgEvent::TaskAttached(_)
+        | OrgEvent::TaskReminded(_)
+        | OrgEvent::TaskFlagged(_)
+        | OrgEvent::TaskCostRecorded(_)
         | OrgEvent::SessionSummary(_)
         | OrgEvent::ControlSent(_)
         | OrgEvent::ControlSpawned(_)

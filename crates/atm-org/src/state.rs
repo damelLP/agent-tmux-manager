@@ -19,6 +19,10 @@ pub enum ApplyError {
     UnknownMessage(MessageId),
     #[error("message {0} already exists")]
     DuplicateMessage(MessageId),
+    #[error("unknown task {0}")]
+    UnknownTask(TaskId),
+    #[error("task {0} already exists")]
+    DuplicateTask(TaskId),
     #[error("pane {pane} is held by {holder}")]
     PaneOccupied { pane: String, holder: AgentId },
     #[error("unknown decision {0}")]
@@ -112,6 +116,7 @@ pub struct OrgState {
     projects: BTreeMap<ProjectId, Project>,
     agents: BTreeMap<AgentId, Agent>,
     messages: BTreeMap<MessageId, Message>,
+    pub(crate) tasks: BTreeMap<u64, Task>,
     summaries: HashMap<SessionId, SessionSummary>,
     decisions: BTreeMap<DecisionId, Decision>,
 }
@@ -300,6 +305,16 @@ impl OrgState {
                     self.require_message(id)?;
                 }
             }
+            OrgEvent::TaskCreated(fact) => fact.check(self)?,
+            OrgEvent::TaskAssigned(fact) => fact.check(self)?,
+            OrgEvent::TaskStateChanged(fact) => fact.check(self)?,
+            OrgEvent::TaskSubmitted(fact) => fact.check(self)?,
+            OrgEvent::TaskReviewStarted(fact) => fact.check(self)?,
+            OrgEvent::TaskVerdict(fact) => fact.check(self)?,
+            OrgEvent::TaskAttached(fact) => fact.check(self)?,
+            OrgEvent::TaskReminded(fact) => fact.check(self)?,
+            OrgEvent::TaskFlagged(fact) => fact.check(self)?,
+            OrgEvent::TaskCostRecorded(fact) => fact.check(self)?,
             OrgEvent::SessionSummary(summary) => {
                 valid_external_id("session id", summary.session_id.as_str())?;
                 if let Some(pane) = &summary.pane {
@@ -522,6 +537,16 @@ impl OrgState {
                     }
                 }
             }
+            OrgEvent::TaskCreated(fact) => fact.fold(&mut self.tasks, seq, ts)?,
+            OrgEvent::TaskAssigned(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskStateChanged(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskSubmitted(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskReviewStarted(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskVerdict(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskAttached(fact) => fact.fold(self.task_mut(&fact.task_id)?),
+            OrgEvent::TaskReminded(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskFlagged(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskCostRecorded(fact) => fact.fold(self.task_mut(&fact.task_id)?),
             OrgEvent::SessionSummary(summary) => {
                 self.summaries
                     .insert(summary.session_id.clone(), summary.clone());

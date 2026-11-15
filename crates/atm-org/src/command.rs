@@ -85,6 +85,7 @@ pub enum OrgCommand {
         who: Address,
         message_ids: Vec<MessageId>,
     },
+    Task(TaskCommand),
     RecordSummary(SessionSummary),
     ControlSent(ControlAudit),
     ControlSpawned(ControlAudit),
@@ -125,6 +126,8 @@ pub enum Refusal {
     WrongRecipient { message_id: MessageId, who: Address },
     #[error("invalid recipient {0}")]
     InvalidRecipient(Address),
+    #[error(transparent)]
+    Task(#[from] TaskRefusal),
     #[error("invalid {field}: {reason}")]
     InvalidValue { field: &'static str, reason: String },
     #[error(transparent)]
@@ -193,6 +196,7 @@ impl OrgCommand {
                 final_failure,
             },
             Self::ReadMessages { message_ids, .. } => OrgEvent::MessageRead { message_ids },
+            Self::Task(command) => command.event(),
             Self::RecordSummary(summary) => OrgEvent::SessionSummary(summary),
             Self::ControlSent(audit) => OrgEvent::ControlSent(audit),
             Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
@@ -423,6 +427,7 @@ impl OrgState {
                 }
                 unread
             }
+            OrgCommand::Task(command) => return self.decide_task(command, event),
             OrgCommand::RecordSummary(summary) => {
                 self.session_summary(&summary.session_id) != Some(summary)
             }
@@ -479,7 +484,7 @@ fn terminal(message: &Message) -> bool {
         DeliveryStatus::Delivered | DeliveryStatus::Failed
     )
 }
-fn nonempty(field: &'static str, value: &str) -> Result<(), Refusal> {
+pub(crate) fn nonempty(field: &'static str, value: &str) -> Result<(), Refusal> {
     if value.is_empty() {
         Err(Refusal::InvalidValue {
             field,

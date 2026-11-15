@@ -121,6 +121,13 @@
 //! not after `now`. Whether the owner is away is not known here: the caller decides
 //! when to take a decision provisionally, this policy whether it may.
 //!
+//! # Tasks
+//!
+//! [`TaskCommand`] is wrapped in [`OrgCommand::Task`] and has its own policy:
+//! the transition table, who may ask, and the review and measure rules are in
+//! the module docs at the top of `task.rs`. `tests/task_golden.rs` states the
+//! body of every `task.*` event. Every task stays in memory, in creation order.
+//!
 //! # Delivery policy
 //!
 //! [`delivery::next_delivery`] is pure: the executor supplies observations and
@@ -175,6 +182,7 @@ pub mod idle;
 mod ids;
 mod replay;
 mod state;
+mod task;
 pub use command::*;
 pub use config::*;
 pub use decision::*;
@@ -182,3 +190,4 @@ pub use event::*;
 pub use ids::*;
 pub use replay::*;
 pub use state::*;
+pub use task::*;

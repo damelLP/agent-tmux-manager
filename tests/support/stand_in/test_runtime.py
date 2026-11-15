@@ -46,6 +46,71 @@ def journal(r):
 
 
 class ControlTests(unittest.TestCase):
+    # Synthetic: acknowledging but ignoring the control would forward the paste.
+    def test_refuse_next_paste_never_reaches_model_and_next_paste_works(self):
+        for mode in ["claude", "codex", "pi"]:
+            with self.subTest(mode=mode):
+                r = runtime()
+                r.mode, r.model = mode, make(mode)
+                sent = []
+                r.forward = sent.append
+                text = "/atm/dialog\nλ not submitted;"
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.render())
+                    r.control({"id": 1, "command": "refuse_next_paste"})
+                    for byte in ("\x1b[200~" + text + "\x1b[201~\r").encode():
+                        r.input(bytes([byte]))
+                    self.assertEqual(sent, [], "a refused paste must forward nothing")
+                    self.assertFalse(any(e["kind"] in ("accepted", "queued", "selection")
+                                         for e in journal(r)))
+                    rejected = [e for e in journal(r) if e["kind"] == "rejected"]
+                    self.assertEqual([(e["reason"], e["text"]) for e in rejected],
+                                     [("refuse_next_paste", text)])
+                    self.assertEqual(r.model.state, "idle")
+                    self.assertEqual(r.parser.draft, b"")
+                    r.input(b"\x1b[200~next paste\x1b[201~\r")
+                self.assertEqual(r.model.active_prompt, "next paste")
+                self.assertEqual(r.model.state, "working")
+                self.assertTrue(sent)
+
+    def test_refusal_preserves_draft_and_does_not_answer_dialog(self):
+        r = runtime()
+        r.forward = lambda data: self.fail("refused paste reached forwarding")
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.render())
+            r.input(b"keep me")
+            r.control({"id": 1, "command": "refuse_next_paste"})
+            r.input(b"\x1b[200~/clear\x1b[201~\r")
+        self.assertEqual(r.parser.draft, b"keep me")
+        self.assertEqual(r.generation, 1)
+        r = runtime()
+        r.model = make(folder_trust=True)
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.start())
+            r.control({"id": 2, "command": "refuse_next_paste"})
+            r.input(b"\x1b[200~yes\x1b[201~\r")
+        self.assertEqual(r.model.dialog, "folder-trust")
+        self.assertTrue(r.running)
+        self.assertFalse(any(e["kind"] == "selection" for e in journal(r)))
+
+    def test_invalid_refusal_control_leaves_draft_and_arm_intact(self):
+        r = runtime()
+        r.parser.draft.extend(b"keep me")
+        r.control({"id": 1, "command": "refuse_next_paste"})
+        self.assertNotIn("error", journal(r)[-1])
+        r.control({"id": 2, "command": "refuse_next_paste"})
+        self.assertIn("error", journal(r)[-1])
+        with redirect_stdout(io.StringIO()):
+            r.input(b"\x1b[200~rejected once\x1b[201~\r")
+        self.assertEqual(r.parser.draft, b"keep me")
+        self.assertEqual([e["text"] for e in journal(r) if e["kind"] == "rejected"],
+                         ["rejected once"])
+        for prefix in [b"\x1b", b"\x1b[200~partial"]:
+            r = runtime()
+            r.parser.feed(prefix)
+            r.control({"id": 3, "command": "refuse_next_paste"})
+            self.assertIn("error", journal(r)[-1])
+
     def test_status_record_follows_forwarding_not_the_draft_redraw(self):
         r = runtime()
         sent = []

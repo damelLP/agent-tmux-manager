@@ -169,6 +169,11 @@ class Runtime:
             else:
                 self.clock_ms = value
                 self.effects(self.model.tick(value))
+        elif message.get("command") == "refuse_next_paste":
+            try:
+                self.parser.arm_paste_refusal()
+            except ValueError as error:
+                reply["error"] = str(error)
         elif message.get("command") == "render_source":
             spec = next((s for s in self.screen_catalog if s["key"] == message.get("key")
                          and s["mode"] == self.mode), None)
@@ -356,6 +361,9 @@ class Runtime:
             self.effects([self.last_render])
 
     def action(self, action):
+        if action[0] == "paste_refused":
+            self.record({"kind": "rejected", "reason": "refuse_next_paste", "text": action[1]})
+            return
         if self.model.dialog is None and action == ("submit", "/clear" if self.mode == "claude" else "/new"):
             self.generation += 1
         self.effects(self.model.handle(action, self.now_ms(), self.next_id()))

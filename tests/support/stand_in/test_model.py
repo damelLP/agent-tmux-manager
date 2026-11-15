@@ -31,6 +31,55 @@ class InputTests(unittest.TestCase):
             actual += parser.feed(bytes([byte]))
         self.assertEqual(actual, [("submit", "/clear\nλ hello\rworld;")])
 
+    # Synthetic: adversarial paste non-acceptance, not vendor editor behavior.
+    # Break caught: ignoring the refusal or consuming only one input fragment.
+    def test_refused_fragmented_paste_preserves_draft_and_consumes_its_enter(self):
+        parser = model.InputParser()
+        parser.feed(b"keep draft")
+        parser.arm_paste_refusal()
+        text = "/clear\nλ hello\x1b[1;1R;"
+        actions = []
+        for byte in ("\x1b[200~" + text + "\x1b[201~\r").encode():
+            actions += parser.feed(bytes([byte]))
+        self.assertEqual(actions, [("paste_refused", text)])
+        self.assertEqual(parser.draft, b"keep draft")
+        self.assertEqual(parser.feed(b"\x1b[200~ + next\x1b[201~\r"),
+                         [("submit", "keep draft + next")])
+
+    def test_refusal_ignores_typing_cursor_reports_and_empty_paste_is_consumed(self):
+        parser = model.InputParser()
+        parser.arm_paste_refusal()
+        self.assertEqual(parser.feed(b"typed\r\x1b[3;4R"),
+                         [("submit", "typed"), ("cursor_report", "3;4")])
+        self.assertEqual(parser.feed(b"\x1b[200~\x1b[201~\x1b[3;4R\r"),
+                         [("paste_refused", ""), ("cursor_report", "3;4")])
+        self.assertEqual(parser.feed(b"normal\r"), [("submit", "normal")])
+
+    def test_typing_after_refusal_is_not_swallowed_with_its_enter(self):
+        parser = model.InputParser()
+        parser.arm_paste_refusal()
+        self.assertEqual(parser.feed(b"\x1b[200~discard\x1b[201~"),
+                         [("paste_refused", "discard")])
+        self.assertEqual(parser.feed(b"typed instead\r"), [("submit", "typed instead")])
+
+    def test_duplicate_or_incomplete_paste_refusal_cannot_overwrite_input(self):
+        for prefix in [b"\x1b", b"\x1b[200~partial"]:
+            with self.subTest(prefix=prefix):
+                parser = model.InputParser()
+                parser.feed(prefix)
+                with self.assertRaises(ValueError):
+                    parser.arm_paste_refusal()
+        parser = model.InputParser()
+        parser.arm_paste_refusal()
+        with self.assertRaises(ValueError):
+            parser.arm_paste_refusal()
+        self.assertEqual(parser.feed(b"\x1b[200~kept armed\x1b[201~"),
+                         [("paste_refused", "kept armed")])
+        with self.assertRaises(ValueError):
+            parser.arm_paste_refusal()
+        parser.feed(b"\r")
+        parser.arm_paste_refusal()
+
     def test_keys_and_empty_input(self):
         parser = model.InputParser()
         self.assertEqual(parser.feed(b"draft\x15new\x7f!\r"), [("submit", "ne!")])

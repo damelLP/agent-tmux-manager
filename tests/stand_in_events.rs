@@ -58,6 +58,45 @@ fn manual_time_holds_real_pane_work_and_clear() {
     rig.close();
 }
 
+/// Synthetic non-acceptance after tmux pasted bytes, not a pre-send guard refusal.
+#[test]
+fn refused_paste_is_one_shot_and_never_submitted() {
+    let mut rig = StandInRig::start();
+    for mode in [StandInMode::Claude, StandInMode::Codex, StandInMode::Pi] {
+        let mut config = StandInConfig::new(mode);
+        config.manual_clock = true;
+        let pane = rig.launch(&config);
+        let cursor = rig.event_cursor(&pane);
+        let armed = rig.control(&pane, json!({"command": "refuse_next_paste"}));
+        assert_eq!(armed["state"], "idle");
+        let text = "/atm/dialog\nλ not submitted;";
+        rig.paste(&pane, text);
+        rig.wait_event(&pane, cursor, |e| {
+            e["kind"] == "rejected" && e["reason"] == "refuse_next_paste" && e["text"] == text
+        });
+        let fence = rig.control(&pane, json!({"command": "barrier"}));
+        assert_eq!(fence["state"], "idle");
+        assert!(!rig.journal(&pane).iter().any(|e| {
+            e["event_sequence"].as_u64().is_some_and(|s| s > cursor)
+                && (e["kind"] == "accepted"
+                    || e["kind"] == "queued"
+                    || e["kind"] == "selection"
+                    || e["event"] == "UserPromptSubmit"
+                    || e["event"] == "input")
+        }));
+        let cursor = rig.event_cursor(&pane);
+        rig.paste(&pane, "next paste works");
+        rig.wait_event(&pane, cursor, |e| {
+            e["kind"] == "accepted" && e["text"] == "next paste works"
+        });
+        let row = rig.wait_for_row(&pane, |r| r.status == atm_core::SessionStatus::Working);
+        assert_eq!(row.first_prompt.as_deref(), Some("next paste works"));
+        rig.paste(&pane, "/atm/exit");
+        rig.wait_for_shell(&pane);
+    }
+    rig.close();
+}
+
 #[test]
 fn event_replay_is_scoped_to_restarted_process_not_reused_pane_or_log() {
     let mut rig = StandInRig::start();

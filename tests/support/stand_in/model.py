@@ -34,6 +34,14 @@ class InputParser:
         self.pending = bytearray()
         self.draft = bytearray()
         self.pasting = False
+        self.refuse_paste = False
+        self.rejected_paste = None
+        self.skip_submit = False
+
+    def arm_paste_refusal(self):
+        if self.pending or self.pasting or self.refuse_paste or self.skip_submit:
+            raise ValueError("paste refusal requires complete input and no pending refusal")
+        self.refuse_paste = True
 
     def feed(self, data):
         self.pending.extend(data)
@@ -42,6 +50,15 @@ class InputParser:
             marker = b"\x1b[201~" if self.pasting else b"\x1b[200~"
             if self.pending.startswith(marker):
                 del self.pending[:len(marker)]
+                if not self.pasting:
+                    self.skip_submit = False
+                    if self.refuse_paste:
+                        self.refuse_paste = False
+                        self.rejected_paste = bytearray()
+                elif self.rejected_paste is not None:
+                    actions.append(("paste_refused", self.rejected_paste.decode("utf-8", errors="replace")))
+                    self.rejected_paste = None
+                    self.skip_submit = True
                 self.pasting = not self.pasting
                 continue
             if marker.startswith(self.pending):
@@ -62,8 +79,13 @@ class InputParser:
                         actions.append(("cursor_report", position))
                 continue
             byte = self.pending.pop(0)
+            if not self.pasting and self.skip_submit:
+                self.skip_submit = False
+                if byte in (10, 13):
+                    continue  # Consume this refused paste's Enter, not an older draft.
             if self.pasting:
-                self.draft.append(byte)
+                target = self.draft if self.rejected_paste is None else self.rejected_paste
+                target.append(byte)
             elif byte in (10, 13):
                 actions.append(("submit", self.draft.decode("utf-8", errors="replace")))
                 self.draft.clear()

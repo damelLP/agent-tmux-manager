@@ -267,6 +267,35 @@ unset ATM_SOCKET to use a default.
 
 ## Controls and fidelity
 
+### One-shot paste refusal (synthetic)
+
+Use the existing private control/event stream, not editor text:
+
+```rust,ignore
+rig.control(&pane, serde_json::json!({"command": "refuse_next_paste"}));
+let after = rig.event_cursor(&pane);
+rig.paste(&pane, "this input is not taken");
+rig.wait_event(&pane, after, |e| e["kind"] == "rejected"
+    && e["reason"] == "refuse_next_paste");
+```
+
+The arm acknowledgment precedes the action; the `rejected` event (with `text`)
+proves the entire next bracketed paste was consumed without entering the editor,
+model, queue, slash commands or dialog selection. Fragmented/multiline input is
+one paste. Its immediately following Enter is swallowed so an older draft is not
+submitted; the draft is preserved. New ordinary typing or another paste resumes
+normal input. Cursor reports and control messages do not consume that Enter.
+Ordinary typing/CLI prompts do not consume the arm. A duplicate arm, an unfinished
+paste/escape sequence, or a refusal still awaiting its Enter rejects arming without
+changing the existing input/arm. The next paste after the rejected submission is
+normal. No fake dialog or readiness frame is drawn.
+
+This is **harness non-acceptance after tmux pasted bytes**, not proof that the
+sender sent nothing. It cannot justify a known-zero-effect automatic retry or
+unignore `message_delivery::safe_retry_after_known_zero_effect`.
+
+### Lifecycle fidelity
+
 | Mode | Startup | Prompt / completion | Clear | Interrupt |
 |---|---|---|---|---|
 | Claude | SessionStart + status | UserPromptSubmit / Stop + status | `/clear`: SessionEnd, gap, new SessionStart(source=clear) + status | no ending hook; restores interrupted prompt as draft |

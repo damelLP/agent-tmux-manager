@@ -169,7 +169,7 @@ fn persist_with(
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(if permissions.is_some() { 0o600 } else { 0o666 })
             .open(&temp)
             .map_err(|e| file_error(&temp, e))?;
         if let Some(permissions) = permissions {
@@ -291,6 +291,30 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), first);
+    }
+
+    // Break caught: publishing a new rules file with private temp-file mode 0600.
+    #[test]
+    fn new_rule_files_use_normal_umask_applied_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for policy_dir_present in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ordinary = dir.path().join("ordinary.md");
+            fs::write(&ordinary, "Ordinary repository file").unwrap();
+            let expected = fs::metadata(ordinary).unwrap().permissions().mode() & 0o777;
+            if policy_dir_present {
+                fs::create_dir(dir.path().join(".atm")).unwrap();
+            }
+            persist_with(dir.path(), &decision(), |from, to| fs::rename(from, to)).unwrap();
+            assert_eq!(
+                fs::metadata(dir.path().join(".atm/rules.md"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                expected
+            );
+        }
     }
 
     // Break caught: dropping a write waiter releases its slot while the filesystem thread is still in flight.

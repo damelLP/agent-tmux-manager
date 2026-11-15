@@ -700,6 +700,88 @@ class Gap(Rig):
         self.assert_running(old)
 
 
+# A swap tool that says when it started, then does its real work only once the test lets go.
+GATED = '''#!/usr/bin/python3
+import os, signal, sys, time
+sys.dont_write_bytecode = True
+from pathlib import Path
+marks = Path(MARKS)
+for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(number, lambda n, frame: (marks / 'signalled').write_text(str(n)))
+(marks / 'started').write_text(str(os.getsid(0)))
+deadline = time.monotonic() + 60
+while not (marks / 'release').exists() and time.monotonic() < deadline:
+    time.sleep(.02)  # bounded poll on the test's release, not a settling delay
+from atm_promotion import main
+code = main(OPERATION)
+(marks / 'finished').write_text(str(code))
+sys.exit(code)
+'''
+
+
+class Interrupted(Rig):
+    """Ctrl-C while the swap tool runs: the tool finishes, unsignalled, then the rollout acts."""
+
+    def gated(self, name, operation):
+        """Patches for a run whose `name` is the gated tool and whose first wait for it is
+        interrupted after the tool has started; the second wait releases the tool."""
+        tools, marks = self.root / 'tools', self.root / 'marks'
+        tools.mkdir()
+        marks.mkdir()
+        for kept in ('atm-promote', 'atm-rollback', 'atm_promotion.py', 'atm-protected-files.py',
+                     'protected-files.txt'):
+            shutil.copy2(SCRIPTS / kept, tools / kept)
+        (tools / name).write_text(GATED.replace('MARKS', repr(str(marks))).replace('OPERATION', repr(operation)))
+        real, waits = subprocess.Popen.communicate, []
+
+        def communicate(process, *args, **kwargs):
+            if str(tools / name) in process.args:
+                waits.append(process)
+                if len(waits) == 1:
+                    wait_for(lambda: (marks / 'started').exists(), 'the swap tool to start')
+                    raise KeyboardInterrupt
+                (marks / 'release').write_text('go')
+            return real(process, *args, **kwargs)
+        return marks, [patch.object(atm_rollout, 'SCRIPTS', tools),
+                       patch.object(subprocess.Popen, 'communicate', communicate)]
+
+    def assert_finished_unsignalled(self, marks):
+        self.assertEqual((marks / 'finished').read_text(), '0', 'the swap tool did not run to its end')
+        self.assertFalse((marks / 'signalled').exists(), 'the swap tool got a signal')
+        self.assertNotEqual(int((marks / 'started').read_text()), os.getsid(0), 'the tool shares our session')
+
+    def test_ctrl_c_during_atm_promote_lets_it_finish_then_rolls_back(self):
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        _, shell, _ = self.sidebar('--compact')
+        marks, patches = self.gated('atm-promote', 'install')
+        code, out, err = self.in_process(*self.args(), patches=patches)
+        self.assertEqual(code, 3, out + err)
+        self.assert_finished_unsignalled(marks)
+        self.assertIn('interrupted; waiting for the swap to finish', out)
+        self.assertIn('rollout: ROLLED BACK: check interrupted failed: Ctrl-C during the swap; the previous '
+                      'build is running and passed the checks.', out)
+        self.assert_running(old)
+        self.assertEqual(len(self.sidebar_of(shell)), 1)
+        self.assertEqual(list(self.bin.glob('.atm-stage-*')), [])
+
+    def test_ctrl_c_during_atm_rollback_lets_it_finish_and_the_run_goes_on(self):
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        marks, patches = self.gated('atm-rollback', 'rollback')
+        code, out, err = self.in_process('--rollback', '--bin-dir', self.bin, '--socket', self.socket,
+                                         patches=patches)
+        self.assertEqual(code, 0, out + err)
+        self.assert_finished_unsignalled(marks)
+        self.assertIn('interrupted; waiting for the swap to finish', out)
+        self.assertIn('rollout: DONE: the previous build is running and passed the checks.', out)
+        self.assert_running(old)
+
+
 class FailedChecks(Rig):
     """Exit 3: the check is named, the previous pair is back and its daemon answers."""
 

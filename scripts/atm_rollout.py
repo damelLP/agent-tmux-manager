@@ -13,6 +13,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -36,6 +37,7 @@ WAIT_POLL = 2.0  # seconds between two looks at work in flight (--wait)
 # its stop has returned, a sidebar's exit after its quit key, the sent text on the scratch pane.
 LOCK_WAIT = QUIT_WAIT = SEND_WAIT = 15
 COMMAND_WAIT = 5  # for a one-shot atm call (a loop's `atm list`) to end by itself
+SWAP_WAIT = 300  # for atm-promote or atm-rollback; its own atm setup gives up after 60
 # The smoke's daemon delivers as soon as its stand-in is idle; the default policy waits ten seconds.
 SMOKE_CONFIG = ('[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\n'
                 'stable_empty_input = { secs = 0, nanos = 1000000 }\n')
@@ -171,6 +173,7 @@ class Rollout:
         self.servers = set()  # the tmux servers those sidebars live on
         self.pid = None  # the daemon's, before anything was stopped
         self.tool_ran = False  # atm-promote or atm-rollback ran, and with it atm setup
+        self.interrupted = False  # Ctrl-C arrived while that tool ran
 
     # ---- helpers -------------------------------------------------------
 
@@ -185,13 +188,28 @@ class Rollout:
         return json.loads(result.stdout)
 
     def tool(self, name, *extra):
+        """atm-promote or atm-rollback, in its own session: a Ctrl-C on this terminal reaches
+        only the rollout, which waits for the tool instead of ending it in the middle of a swap."""
         self.tool_ran = True
         say(f"$ {name} {' '.join(map(str, extra))} --bin-dir {self.bin} --socket {self.socket}")
-        result = self.call([sys.executable, SCRIPTS / name, *extra, '--bin-dir', self.bin,
-                            '--socket', self.socket], timeout=300)
-        print(result.stdout, end='', flush=True)
-        print(result.stderr, end='', file=sys.stderr, flush=True)
-        return result
+        argv = [str(arg) for arg in (sys.executable, SCRIPTS / name, *extra, '--bin-dir', self.bin,
+                                     '--socket', self.socket)]
+        process = subprocess.Popen(argv, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, errors='replace', start_new_session=True)
+        while True:
+            try:
+                out, err = process.communicate(timeout=SWAP_WAIT)
+                break
+            except KeyboardInterrupt:
+                self.interrupted = True
+                say('interrupted; waiting for the swap to finish')
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)  # hung: the tool and the atm setup it started
+                process.wait()
+                raise
+        print(out, end='', flush=True)
+        print(err, end='', file=sys.stderr, flush=True)
+        return subprocess.CompletedProcess(argv, process.returncode, out, err)
 
     def daemon_pid(self):
         result = self.call([self.atmd, 'status'])
@@ -752,6 +770,9 @@ class Rollout:
         except Refused as error:
             self.restore(before, lock, error)
         lock.release()
+        if self.interrupted and not self.args.rollback:
+            # Ctrl-C during atm-promote means "not this build": the swap finished, now back.
+            return self.roll_back(CheckFailed('interrupted', 'Ctrl-C during the swap'), before)
         try:
             self.start_daemon()
             self.checks(before, self.new)

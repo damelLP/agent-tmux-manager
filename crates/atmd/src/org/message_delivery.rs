@@ -359,11 +359,20 @@ fn agent_error(error: AgentError) -> MessageError {
 ///
 /// Shared by the executor, under its reservation, and the scheduler's
 /// observer, so that both describe a recipient to history in one way. An
-/// error means the recipient could not be observed as a delivery needs it.
+/// error means the recipient could not be observed as a delivery needs it,
+/// and the caller records a lost observation: also while the agent service
+/// has not pinned the pane's harness (a start, an adopt, the pass after a
+/// daemon restart), when the screen dispatch would answer unknown facts.
 pub(super) fn observation(
     recipient: &Recipient,
     capture: &PaneCapture,
 ) -> Result<(Option<SessionId>, RecipientObservation), MessageError> {
+    if recipient.baseline.harness_command().is_none() {
+        return Err(MessageError::Refused(format!(
+            "the harness on {} is not established yet",
+            recipient.pane
+        )));
+    }
     let session_id = attempt_session(
         recipient.status,
         recipient.session_id.as_ref(),
@@ -439,21 +448,24 @@ impl Attempt {
                 )))
             }
         };
-        let capture = match r.capture(pane, format).await {
-            Ok(capture) => tagged(capture),
+        let seen = match r.capture(pane, format).await {
+            Ok(capture) => tagged(capture).and_then(|capture| {
+                let (session_id, observation) = observation(&recipient, &capture)?;
+                Ok((capture, session_id, observation))
+            }),
             Err(error) => Err(error.into()),
         };
         let now = rt.clock.now()?;
-        let capture = match capture {
-            Ok(capture) => capture,
+        let (capture, session_id, observation) = match seen {
+            Ok(seen) => seen,
             Err(error) => {
-                // What history knew about the pane is no longer continuous.
+                // The recipient could not be observed: what history knew
+                // about the pane is no longer continuous.
                 let lost = HistoryUpdate::ObservationLost { recipient: agent };
                 let _ = rt.history.record(lost, now);
                 return Err(error);
             }
         };
-        let (session_id, observation) = observation(&recipient, &capture)?;
         let observed = HistoryUpdate::Observed {
             recipient: agent.clone(),
             observation,

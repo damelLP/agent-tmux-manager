@@ -2472,6 +2472,33 @@ async fn enter_unknown_outcome_sends_no_second_key() {
     }
 }
 
+/// Copy mode is a no-effect error, but unlike ScreenChanged it must end
+/// the attempt immediately. Only cleanup may read another frame; even an
+/// exact staged draft after the refusal must not lead to another Enter.
+#[tokio::test(start_paused = true)]
+async fn enter_pane_input_refusal_ends_attempt_without_another_look() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    let mode = with(staged(id), |capture| capture.inspection.in_mode = true);
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), mode]);
+    // One cleanup frame, then three frames nobody may read.
+    rig.script(&vec![staged(id); 4]);
+
+    let delivered = rig.deliver(id).await;
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(
+                ReservationError::PaneInputRefused { .. }
+            ))
+        ),
+        "{delivered:?}"
+    );
+    assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 3 * 3));
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::EnterNotSent));
+}
+
 /// The wait for the receipt wakes on evidence's own change counter and reads
 /// what evidence retained. A change that is no receipt (the session is
 /// active) keeps it waiting; the exact prompt then ends it.

@@ -3806,7 +3806,10 @@ mod reconciliation {
     async fn suspended_harness_shows_its_refusal_until_it_is_back() {
         // Ctrl-Z in the pane of a Ready agent: nothing is recorded, the agent
         // stays Ready, and the list says why it takes no input. Once a pass
-        // finds the harness in front again the reason is gone.
+        // finds the harness in front again the reason is gone. The resumed
+        // harness sends only its own session's events, which start no pass
+        // for a Ready agent: while a refusal is stored, they do. (Without
+        // one they don't: review_ready_agents_own_session_events_start_no_observation.)
         let (rig, agents) = pinned_ready().await;
         let before = rig.org.status().unwrap();
         assert_eq!(listed_reason(&agents).await, None);
@@ -3823,7 +3826,7 @@ mod reconciliation {
         assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
 
         inspect_with(&rig, "pi");
-        update(&rig, "pending-300").await;
+        update(&rig, "s1").await;
         progress(&mut events, "finished", Some("p/lead")).await;
         assert_eq!(unread(&rig), 0);
         assert_eq!(listed_reason(&agents).await, None);

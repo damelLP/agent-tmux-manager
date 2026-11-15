@@ -1412,7 +1412,15 @@ impl AgentRoutes {
     /// A Ready agent's own session reporting in from its own pane has nothing to
     /// bind and is plainly alive: no observation. Its removal, a pane move, any
     /// other row, and agents in every other state (Stuck included) still wake.
-    fn own_ready_session(&self, ids: &mut BTreeSet<AgentId>, row: Option<&SessionView>) {
+    /// So does an agent whose last observation found its input refused: only
+    /// a pass that finds its harness in front again drops that reason, and a
+    /// resumed harness may send nothing but its own session's events.
+    fn own_ready_session(
+        &self,
+        rt: &AgentRuntime,
+        ids: &mut BTreeSet<AgentId>,
+        row: Option<&SessionView>,
+    ) {
         let Some(row) = row else {
             return;
         };
@@ -1421,6 +1429,10 @@ impl AgentRoutes {
                 route.ready
                     && route.binding.as_ref() == Some(&row.id)
                     && route.pane == row.tmux_pane
+                    && !route
+                        .pane
+                        .as_deref()
+                        .is_some_and(|pane| rt.refusal(id, pane).is_some())
             })
         });
     }
@@ -1448,7 +1460,7 @@ impl AgentRoutes {
         match event {
             Ok(SessionEvent::Updated { session }) => {
                 let mut ids = self.affected(&session.id, Some(&session));
-                self.own_ready_session(&mut ids, Some(&session));
+                self.own_ready_session(rt, &mut ids, Some(&session));
                 Ok(ids)
             }
             Ok(SessionEvent::Removed { session_id, .. }) => Ok(self.affected(&session_id, None)),
@@ -1462,7 +1474,7 @@ impl AgentRoutes {
                     .await
                     .map_err(|_| AgentError::Timeout)?;
                 let mut ids = self.affected(&session_id, row.as_ref());
-                self.own_ready_session(&mut ids, row.as_ref());
+                self.own_ready_session(rt, &mut ids, row.as_ref());
                 Ok(ids)
             }
             Err(_) => Ok(BTreeSet::new()),

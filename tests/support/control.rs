@@ -29,8 +29,18 @@ pub async fn wait_for_socket(socket: &Path) {
         );
         let fd = tokio::io::unix::AsyncFd::new(fd).unwrap();
         loop {
-            if tokio::net::UnixStream::connect(socket).await.is_ok() {
-                break;
+            match tokio::net::UnixStream::connect(socket).await {
+                Ok(_) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionRefused && socket.exists() =>
+                {
+                    // bind creates the path before listen makes it connectable;
+                    // listen emits no inotify event. Poll the connection condition
+                    // within the outer guard, not a delay assumed to mean ready.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+                Err(_) => {}
             }
             let mut ready = fd.readable().await.unwrap();
             let _ = ready.try_io(|fd| {
@@ -231,4 +241,96 @@ fn owned(pid: u32, dir: &Path) -> bool {
     };
     let socket = format!("ATM_SOCKET={}", dir.join("atmd.sock").display());
     exe == expected && env.split(|b| *b == 0).any(|v| v == socket.as_bytes())
+}
+
+#[cfg(test)]
+mod socket_readiness_tests {
+    use super::*;
+    use std::future::{poll_fn, Future};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn wait_for_socket_retries_bound_socket_until_listen() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("atmd.sock");
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path = std::ffi::CString::new(socket.as_os_str().as_bytes()).unwrap();
+        assert!(path.as_bytes_with_nul().len() <= address.sun_path.len());
+        for (dst, src) in address.sun_path.iter_mut().zip(path.as_bytes_with_nul()) {
+            *dst = *src as libc::c_char;
+        }
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    std::ptr::from_ref(&address).cast(),
+                    std::mem::size_of_val(&address) as libc::socklen_t,
+                )
+            },
+            0,
+            "bind: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            UnixStream::connect(&socket).unwrap_err().raw_os_error(),
+            Some(libc::ECONNREFUSED)
+        );
+
+        let ready = wait_for_socket(&socket);
+        tokio::pin!(ready);
+        poll_fn(|cx| {
+            assert!(ready.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // Only listen changes now: no new filesystem event can wake the helper.
+        assert_eq!(unsafe { libc::listen(fd.as_raw_fd(), 1) }, 0);
+        let listener = UnixListener::from(fd);
+        ready.await;
+        listener
+            .accept()
+            .expect("readiness required a real connect");
+    }
+
+    #[tokio::test]
+    async fn wait_for_socket_observes_creation_after_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("atmd.sock");
+        let ready = wait_for_socket(&socket);
+        tokio::pin!(ready);
+        poll_fn(|cx| {
+            assert!(ready.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        ready.await;
+        listener
+            .accept()
+            .expect("readiness required a real connect");
+    }
+
+    #[tokio::test]
+    async fn wait_for_socket_connects_to_existing_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("atmd.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        wait_for_socket(&socket).await;
+        listener
+            .accept()
+            .expect("readiness required a real connect");
+    }
 }

@@ -16,6 +16,13 @@
 //! permit and no reservation. The owner's decisions wait per recipient, at
 //! most as many as the service admits requests.
 //!
+//! Known limit of that bound: a job lives while its recipient has an open
+//! message, and a held message (blocked, waiting for the owner, or for a
+//! recipient that cannot be observed) keeps it. With 32 recipients each
+//! holding one, a 33rd recipient is not observed, its messages show no
+//! reason, and the owner's give-up or retry for it answers `Timeout` although
+//! nothing was started.
+//!
 //! Every step is evaluated on evidence copied immediately before it. An
 //! error is never permission: no step, no input, and the round is tried again
 //! later. After an attempt whose outcome cannot be accounted for, the job

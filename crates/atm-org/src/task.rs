@@ -217,21 +217,14 @@ pub struct TaskCost {
     pub seconds_in_state: BTreeMap<TaskState, u64>,
 }
 
-// serde's internally tagged fallback can accept numeric identifiers through
-// from_value. Only new words gain a fallback; preserve all known decoding.
+// The tagged event buffers its body; that path accepts numeric fallback tags.
+// Materializing this field restores strict JSON-value identifier decoding.
 fn task_measure<'de, D>(deserializer: D) -> Result<TaskMeasure, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let word = value.get("kind").is_some_and(serde_json::Value::is_string);
-    let measure = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-    if measure == TaskMeasure::Unknown && !word {
-        return Err(serde::de::Error::custom(
-            "unknown measure kind must be a string",
-        ));
-    }
-    Ok(measure)
+    serde_json::from_value(serde_json::Value::deserialize(deserializer)?)
+        .map_err(serde::de::Error::custom)
 }
 
 fn seconds_in_state<'de, D>(deserializer: D) -> Result<BTreeMap<TaskState, u64>, D::Error>

@@ -85,7 +85,7 @@ atm reply <id> --yes               # accept a permission prompt
 atm peek <id> --prompt             # extract the active prompt
 atm list -f json --status working  # list working agents as JSON
 atm decisions                      # pending/provisional decisions for you
-atm decide d41 yes 'Approved'        # owner answer; --rule records a rule mark
+atm decide d41 yes 'Approved'      # owner answer; --rule records a rule mark
 atm status                         # one-line summary for tmux status bar
 
 atm workspace create               # new session with ATM sidebar + agent + shell
@@ -250,7 +250,7 @@ Bounds are UTF-8 bytes: title 1–512; context ≤16384; 2–32 distinct nonempt
 
 The org event log retains requests and answers across daemon restarts. Recording an answer does **not** mean a harness accepted it: one daemon bridge durably enqueues a `system` / `answer` message to the requester, then the existing FIFO/guard/confirmation runtime delivers its one-line inbox reference. Read the body with `atm inbox --id m…`, then explicitly acknowledge it. Focused panes and occupied editors stay protected; no separate decision paste path bypasses those guards. Internal `system` requesters have no inbox and consume the durable resolution event instead.
 
-The final decision is the bridge's recoverable work item; an exact canonical answer `msg.sent` is its completion marker, regardless of delivery/read status. Restart fills a missing enqueue and does not duplicate an existing one. An uncertain enqueue stops the bridge until restart; reads remain available when org persistence is healthy. Delivery failures/holds retain the normal message recovery rules. The canonical answer text is therefore a persistence correlation contract, not presentation-only text to change without considering old logs.
+The final decision is the bridge's recoverable work item; an exact canonical answer `msg.sent` is its completion marker, regardless of delivery/read status. Restart fills a missing enqueue and does not duplicate an existing one. An organisation snapshot or enqueue timeout backs off and reconciles from fresh committed state; the serial actor and exact-content check prevent duplicate late enqueues. A stopped actor or other terminal bridge failure requires restart; reads remain available when org persistence is healthy. Delivery failures/holds retain the normal message recovery rules. The canonical answer text is therefore a persistence correlation contract, not presentation-only text to change without considering old logs.
 
 New pending requests also run the owner's existing `[notify]` command, using a short `d41 from project/worker: atm decisions` reference, not private title/context/options. This shares the owner-message notifier described below; resolved, provisional, withdrawn or expired decisions suppress a delayed notice. External notices remain best effort, not the durable decision record.
 

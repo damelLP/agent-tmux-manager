@@ -22,6 +22,15 @@ use support::{AgentRig, Started};
 /// make them long.
 const DELIVERY: &str = "[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\nstable_empty_input = { secs = 0, nanos = 1000000 }\n";
 
+/// The longest save the method accepts. No test here is about the save's
+/// deadline, so none may race it on a loaded machine: the passing paths never
+/// wait for it, and the rig's event waits are the hang guards.
+const SAVE_TIMEOUT_MS: &str = "1800000";
+
+fn save_timeout_ms() -> u64 {
+    SAVE_TIMEOUT_MS.parse().unwrap()
+}
+
 struct Handover {
     test: AgentRig,
     config: stand_in::StandInConfig,
@@ -193,7 +202,7 @@ fn atm_agent_handover_saves_then_clears_pi() {
             "handover",
             &h.id,
             "--timeout-ms",
-            "30000",
+            SAVE_TIMEOUT_MS,
             "--format",
             "json",
         ])
@@ -233,7 +242,7 @@ fn a_turn_that_does_not_save_is_not_cleared_pi() {
     let mut h = Handover::start(StandInMode::Pi);
     let call = h.test.call_in_background(
         "agent.handover",
-        json!({"agent": h.id, "timeout_ms": 30000}),
+        json!({"agent": h.id, "timeout_ms": save_timeout_ms()}),
     );
     h.save_turn_started();
     let before_idle = h.test.rig.event_cursor(&h.pane);
@@ -271,7 +280,7 @@ fn an_agent_hands_itself_over_claude() {
     let mut h = Handover::start(StandInMode::Claude);
     let answer = h.test.rpc(
         "agent.handover",
-        json!({"agent": h.id, "timeout_ms": 30000}),
+        json!({"agent": h.id, "timeout_ms": save_timeout_ms()}),
         Some(h.pane.pane_id.clone()),
     );
     assert_eq!(answer["state"], "started", "{answer}");

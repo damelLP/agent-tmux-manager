@@ -553,8 +553,8 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     // Subscribed before discovery, so the notifier sees every session.
     let message_notify_cancel = cancel_token.child_token();
     let config = read_startup_config(atm_tui::setup::atm_config_path()).await;
-    // A2 consumes this policy when assembling the active message runtime.
-    // Until then the seam remains unavailable, including for valid policies.
+    // The server starts the message service on this policy. An invalid one
+    // leaves the message methods unavailable with this reason.
     if let Err(reason) = &config.delivery {
         warn!(%reason, "Invalid delivery configuration; message delivery is unavailable");
     }
@@ -607,6 +607,7 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     services.state_dir = state_dir;
     services.org = org;
     services.raw = raw.clone();
+    services.delivery_policy = Some(config.delivery);
     let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");

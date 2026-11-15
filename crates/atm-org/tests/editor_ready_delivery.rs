@@ -36,6 +36,7 @@ fn editor_ready_delivery_uses_missing_row_path() {
         pane: PaneLiveness::Alive,
         agent_status: agent.status,
         agent_not_ready_since: None,
+        running_turn_since: None,
         other_delivery_in_flight: false,
         last_paste_at: None,
         hold_since: None,

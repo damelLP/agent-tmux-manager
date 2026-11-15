@@ -331,9 +331,11 @@ normalization or path substitution. They contain only private run-dir paths.
 | `resources-wide`, `resources-narrow` | Loaded context, skill and prompt, 224x48 / 40x40 |
 | `changelog-condensed-wide`, `changelog-condensed-narrow` | Unread core changelog, 224x48 / 40x40, nonfaint body; already Unknown |
 | `changelog-detailed-narrow` | Unread expanded core changelog, 40x60; unsupported underline SGR, already Unknown |
+| `atmd_before`, `atmd_after` | Before/after real atmd clear at 224x16; live update box before 1.5.0 clear |
 
-The four offline/resource stems also have `_pi_1.5.2.txt` captures from the
-installed 1.5.2 CLI. Startup was synchronized on complete footer, expected
+The four offline/resource stems and both `atmd_*` stems also have
+`_pi_1.5.2.txt` captures from the installed 1.5.2 CLI. Startup was synchronized
+on complete footer, expected
 resources/notice and the post-init tmux warning, never a fixed delay or resize.
 
 Cause: the update's full-width rules equal the editor lower border. Requiring
@@ -350,6 +352,14 @@ The installed 1.5.2 normal notice markup and editor border rendering match
 1.5.0. The custom editor is identical; the base editor's only difference is
 paste-marker renumbering. The optional release-note Markdown rendering changed,
 but that notice form was already unsupported and stays Unknown.
+
+Each real daemon check used one guarded `/new` through `atm agent clear`, with
+start lines disabled. Both versions changed session ID and returned Ready/Idle,
+with an empty inbox, zero first prompts and no model-turn events. The 1.5.0
+before-frame is Unknown under the old observer and safe under the fixed one;
+pi removed the update box after `/new`. The 1.5.2 check had no update box. All
+servers, sockets and HOME directories were private; no resize/retry or direct
+terminal input was used to make clear succeed.
 
 Known limits intentionally remain refused: condensed/expanded unread core and
 extension changelogs, package-update notices, Update Available with a release

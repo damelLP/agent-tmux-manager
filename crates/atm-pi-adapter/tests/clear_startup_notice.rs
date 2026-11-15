@@ -111,6 +111,23 @@ fn ordinary_startup_stays_ready_at_both_versions() {
     }
 }
 
+// Captured: pi 1.5.0, 2026-11-15, real atmd clear in sealed private tmux.
+// Captured: pi 1.5.2, 2026-11-15, real atmd clear in sealed private tmux.
+// Before/after one guarded /new per version; no prompt or direct rig input.
+#[test]
+fn real_daemon_clear_frames_stay_safe_at_both_versions() {
+    for text in [
+        capture!("atmd_before", "1.5.0"),
+        capture!("atmd_after", "1.5.0"),
+        capture!("atmd_before", "1.5.2"),
+        capture!("atmd_after", "1.5.2"),
+    ] {
+        let result = editor(text, InputState::Empty, TurnState::NotRunning);
+        assert!(safe(&result));
+        assert!(!result.conversation);
+    }
+}
+
 #[test]
 fn staged_new_under_notice_is_exact() {
     // Synthetic: the actual composer holds the command, not a history match.

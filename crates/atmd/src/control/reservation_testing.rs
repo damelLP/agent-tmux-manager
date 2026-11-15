@@ -158,8 +158,9 @@ impl ScriptedTmuxClient {
         self.mock.clone()
     }
 
-    /// While on, a kill and a tag write are recorded in mock() and then never
-    /// answer: a tmux that performs the effect and stalls. Reads are unaffected.
+    /// While on, a kill, a tag write, a key and a paste are recorded in mock()
+    /// and then never answer: a tmux that performs the effect and stalls.
+    /// Reads are unaffected.
     pub fn stall_pane_effects(&self, on: bool) {
         self.stalled.store(on, std::sync::atomic::Ordering::SeqCst);
     }
@@ -441,8 +442,40 @@ impl TmuxClient for ScriptedTmuxClient {
         })
     }
     forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
-    forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
-    forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());
+    fn send_keys<'s, 'a, 'b, 'async_trait>(
+        &'s self,
+        pane: &'a str,
+        keys: &'b str,
+    ) -> Call<'async_trait, ()>
+    where
+        's: 'async_trait,
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.mock.send_keys(pane, keys).await?;
+            self.stall().await;
+            Ok(())
+        })
+    }
+    fn paste_text<'s, 'a, 'b, 'async_trait>(
+        &'s self,
+        pane: &'a str,
+        text: &'b str,
+    ) -> Call<'async_trait, ()>
+    where
+        's: 'async_trait,
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.mock.paste_text(pane, text).await?;
+            self.stall().await;
+            Ok(())
+        })
+    }
     forward!(list_panes<>() -> Vec<PaneInfo>);
     forward!(display_popup<'a, 'b, 'c>(width: &'a str, height: &'b str, command: &'c str) -> ());
     forward!(select_pane<'a>(pane: &'a str) -> ());

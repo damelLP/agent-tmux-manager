@@ -6,24 +6,25 @@
 //! Delivery must independently check the screen before input.
 //! A Stuck agent recovers only when one observation finds its session row and
 //! captures a safe editor; a binding alone never clears Stuck.
-//! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: down,
-//! adopt and clear act on panes; up and respawn are not built yet and answer
-//! "not implemented" after admission.
+//! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: up, down,
+//! adopt and clear act on panes; respawn is not built yet and answers "not
+//! implemented" after admission.
 
+use super::agent_flow::{adopt_baseline, classify_pane, PaneShape};
+use super::agent_lifecycle::pin;
 pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
 pub use super::agent_types::*;
 use super::{agent_project::AgentProjects, OrgHandle, OrgServiceError};
 use crate::control::reservation::{
-    CaptureFormat, PaneCapture, PaneId, Reservation, ReservationKind, ReservationRequest,
-    WaitPolicy,
+    CaptureFormat, PaneId, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
 };
 use crate::server::methods::CallContext;
 use crate::{
     control::service::ControlHandle,
     registry::{RegistryHandle, SessionEvent},
 };
-use atm_core::{DialogState, Harness, InputState, ScreenFacts, SessionId, SessionView, TurnState};
+use atm_core::{DialogState, Harness, InputState, SessionId, SessionView, TurnState};
 use atm_org::{Agent, OrgCommand, OrgState};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -122,6 +123,9 @@ pub enum AgentError {
     Organisation(#[from] OrgServiceError),
 }
 
+/// Reads one variable of the environment a launch takes its overrides from.
+pub(super) type SpawnEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 #[derive(Clone)]
 pub(super) struct AgentRuntime {
     pub org: OrgHandle,
@@ -132,6 +136,8 @@ pub(super) struct AgentRuntime {
     baselines: Arc<std::sync::Mutex<HashMap<AgentId, (String, PaneBaseline)>>>,
     /// Reads a pane's root process from procfs; scripted in tests.
     pub proc: super::agent_proc::ProcReader,
+    /// The `ATM_SPAWN_*` overrides of the daemon's start environment.
+    pub spawn_env: SpawnEnv,
     #[cfg(test)]
     progress: broadcast::Sender<ObservationProgress>,
 }
@@ -386,21 +392,39 @@ impl AgentHandle {
             .map_err(|_| AgentError::Unavailable("lifecycle dispatcher stopped".into()))?
     }
 
-    pub async fn up(&self, p: UpParams, _caller: CallContext) -> Result<UpResult, AgentError> {
+    pub async fn up(&self, p: UpParams, caller: CallContext) -> Result<UpResult, AgentError> {
+        const OPERATION: &str = "agent.up";
         let deadline = Instant::now() + Duration::from_secs(60);
         let prepared = self
-            .projects("agent.up")?
+            .projects(OPERATION)?
             .prepare(p.project_root, p.name)
             .await?;
-        self.unimplemented(
-            ReservationRequest::new(
-                prepared.agent_id,
-                None,
-                ReservationKind::Up,
-                WaitPolicy::Wait,
-                deadline,
-            ),
-            "agent.up",
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let id = prepared.agent_id.clone();
+        let launch = rt
+            .prepare_launch(prepared, caller, p.caller_server.clone())
+            .await?;
+        #[cfg(test)]
+        rt.progress("up_prepared", Some(id.clone()));
+        let request = ReservationRequest::new(
+            id.clone(),
+            None,
+            ReservationKind::Up,
+            WaitPolicy::Wait,
+            deadline,
+        );
+        let waiting = super::agent_lifecycle::Waiting::default();
+        let (work, cleanup) = (rt.clone(), rt.clone());
+        let why = waiting.clone();
+        self.lifecycle_for(
+            p.caller_server,
+            request,
+            move |r| async move { work.up(&r, launch, &waiting).await },
+            move |_, _| async move { cleanup.settle_up(&id, &why).await },
         )
         .await
     }
@@ -771,12 +795,15 @@ impl AgentRuntime {
         // Registry failure is never evidence that every agent is gone.
         self.rows().await?;
         let mut in_mode = false;
+        // The root process and foreground command the inspection shows.
+        let mut look = None;
         let gone = match &agent.pane {
             None => true,
             Some(pane) => match r.inspect(&PaneId::parse(pane)?).await? {
                 None => true,
                 Some(p) => {
                     in_mode = p.in_mode;
+                    look = p.pane_root_pid().zip(p.foreground_command.clone());
                     p.dead || p.local_agent_tag.as_deref() != Some(&agent.id.to_string())
                 }
             },
@@ -794,7 +821,46 @@ impl AgentRuntime {
                     chrono::Utc::now(),
                 )
                 .await?;
+            self.forget_baseline(&agent.id);
             return Ok(());
+        }
+        // What is recorded about the pane's processes: nothing after a daemon
+        // restart, until a pass (or an adopt) pins the harness.
+        let stored = agent
+            .pane
+            .as_deref()
+            .map_or_else(PaneBaseline::unproven, |pane| {
+                self.baseline(&agent.id, pane)
+            });
+        // The harness is not known to be in front: read the pane's processes,
+        // once. An idle shell under an agent that was Ready or bound is the
+        // positive evidence that its harness exited, with or without an end
+        // event. Any other shape records nothing here.
+        let mut processes = None;
+        let (root, command) = look
+            .as_ref()
+            .map(|(root, command)| (*root, command.as_str()))
+            .unzip();
+        if foreground(&stored, root, command) != Some(Foreground::Harness) {
+            if let Some(root) = root {
+                processes = (self.proc)(root).await;
+            }
+            if let Some(pane) = agent.pane.as_ref().filter(|_| {
+                (agent.status == AgentStatus::Ready || agent.session_id.is_some())
+                    && processes.as_ref().and_then(classify_pane) == Some(PaneShape::IdleShell)
+            }) {
+                self.org
+                    .execute(
+                        OrgCommand::Down {
+                            agent_id: agent.id.clone(),
+                            reason: format!("the harness exited to the shell in {pane}"),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                self.forget_baseline(&agent.id);
+                return Ok(());
+            }
         }
         if let Some(pane) = &agent.pane {
             let reason = format!("clear interrupted by daemon restart; inspect {pane}");
@@ -873,10 +939,26 @@ impl AgentRuntime {
             }
             binding = None;
         }
+        let harness = harness(state, agent, &rows);
+        let screen = agent_screen(harness);
+        // Whether this pass can pin the harness by the adopt rule: nothing is
+        // recorded yet, the agent is Starting or Ready, and the inspection and
+        // the process read that followed it allow a baseline. The capture
+        // below is the rule's second look.
+        let pinnable = screen.zip(look.as_ref()).zip(processes.as_ref()).filter(
+            |((_, (root, command)), processes)| {
+                stored == PaneBaseline::unproven()
+                    && matches!(agent.status, AgentStatus::Ready | AgentStatus::Starting)
+                    && adopt_baseline(processes, *root, command).is_some()
+            },
+        );
         // A capture can change nothing for a Ready agent on an ordinary wake, or
-        // for a session-less one at the restart check: don't read, or fail on, it.
+        // for a session-less one at the restart check, unless it can pin: don't
+        // read, or fail on, it.
         if (stuck && binding.is_none())
-            || (agent.status == AgentStatus::Ready && (!initial || agent.session_id.is_none()))
+            || (agent.status == AgentStatus::Ready
+                && (!initial || agent.session_id.is_none())
+                && pinnable.is_none())
         {
             return Ok(());
         }
@@ -885,22 +967,39 @@ impl AgentRuntime {
         };
         #[cfg(test)]
         self.progress("capture", Some(agent.id.clone()));
-        let harness = harness(state, agent, &rows);
-        let screen = agent_screen(harness);
         let capture = r
             .capture(
                 &PaneId::parse(pane)?,
                 screen.map_or(CaptureFormat::Plain, AgentScreen::capture_format),
             )
             .await?;
-        let facts = screen
-            .map(|screen| unchecked_facts(screen, &capture))
-            .unwrap_or_default();
         let rows = self.rows().await?;
         let live: Vec<_> = rows
             .iter()
             .filter(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
             .collect();
+        // The adopt rule also needs a live row of the agent's harness, and the
+        // pane must still be the agent's on the capture.
+        let pinned = pinnable
+            .filter(|_| {
+                !live.is_empty()
+                    && !capture.inspection.dead
+                    && capture.inspection.local_agent_tag.as_deref() == Some(&agent.id.to_string())
+            })
+            .and_then(|((screen, (root, command)), processes)| {
+                pin(screen, (*root, command), processes, &capture)
+            });
+        let baseline = match pinned {
+            Some((baseline, _)) => {
+                self.record_baseline(agent.id.clone(), pane, baseline.clone());
+                baseline
+            }
+            None => stored,
+        };
+        // Unknown unless the recorded harness is the pane's foreground program.
+        let facts = screen
+            .map(|screen| screen.facts(&capture, &baseline))
+            .unwrap_or_default();
         let parents = live.iter().filter(|row| !row.id.is_pending()).count();
         let safe = !capture.inspection.dead
             && !capture.inspection.in_mode
@@ -979,22 +1078,6 @@ pub(super) fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> 
         })
 }
 
-// Verdict off: the observer records no pane baseline yet, so it reads the screen
-// against the capture's own process facts (Unknown when tmux reports no root
-// process or command). The flow slice replaces this with the recorded baseline;
-// until then nothing here tells a harness from a shell showing a stale frame.
-fn unchecked_facts(screen: &AgentScreen, capture: &PaneCapture) -> ScreenFacts {
-    let inspection = &capture.inspection;
-    inspection
-        .pane_root_pid()
-        .zip(inspection.foreground_command.clone())
-        .and_then(|(root, command)| PaneBaseline::adopted(root).with_harness(command))
-        // The control observer's facts: it is the adapters' complete read of an
-        // editor (Claude's legacy observer knows fewer real idle footers).
-        .map(|baseline| screen.control(capture, &baseline).facts)
-        .unwrap_or_default()
-}
-
 fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentListEntry {
     let expected = harness(state, agent, rows);
     let eligible: Vec<_> = rows
@@ -1049,7 +1132,13 @@ pub fn spawn_agents(
     cancel: CancellationToken,
 ) -> (AgentHandle, JoinHandle<()>) {
     let proc = super::agent_proc::procfs_reader();
-    spawn_agents_with(org, registry, control, cancel, proc)
+    // Read once: a launch takes its overrides from the daemon's start.
+    let env: HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| key.starts_with("ATM_SPAWN_"))
+        .collect();
+    let spawn_env: SpawnEnv = Arc::new(move |key| env.get(key).cloned());
+    spawn_agents_with(org, registry, control, cancel, proc, spawn_env)
 }
 
 /// [`spawn_agents`] with the procfs reader given, so tests can script it.
@@ -1059,6 +1148,7 @@ pub(super) fn spawn_agents_with(
     control: ControlHandle,
     cancel: CancellationToken,
     proc: super::agent_proc::ProcReader,
+    spawn_env: SpawnEnv,
 ) -> (AgentHandle, JoinHandle<()>) {
     let rt = AgentRuntime {
         org,
@@ -1066,6 +1156,7 @@ pub(super) fn spawn_agents_with(
         control,
         baselines: Arc::default(),
         proc,
+        spawn_env,
         #[cfg(test)]
         progress: broadcast::channel(4096).0,
     };

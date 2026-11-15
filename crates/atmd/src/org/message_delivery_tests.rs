@@ -28,6 +28,7 @@ use crate::{
         agent_screen::{agent_screen, PaneBaseline},
         agent_screen_tests::body,
         agents::{spawn_agents_with, AgentHandle},
+        message_delivery_gate::{Effect, GatedTmux},
         message_evidence::{AttemptScope, MessageEvidence},
         message_history::{
             DeliverySnapshot, HistoryUpdate, MessageHistoryHandle, RecipientObservation,
@@ -697,6 +698,9 @@ struct Rig {
     org: OrgHandle,
     rt: MessageRuntime,
     tmux: ScriptedTmuxClient,
+    /// The control actor's client: `tmux`, with a paste's or a key's return
+    /// held or failed when a test arms it.
+    tmux_gate: GatedTmux,
     /// Keeps the service (the fold loop) alive.
     messages: Option<MessageHandle>,
     /// Every committed envelope from the first one on.
@@ -722,14 +726,29 @@ impl Rig {
         policy: DeliveryPolicy,
         scheduler: Option<Effects>,
     ) -> Self {
+        Self::start_at(0, fold, agent, policy, scheduler).await
+    }
+
+    /// As `start`, on a log whose last sequence is `base`: the first event
+    /// is `base + 1`, so a message can have the id a real capture shows.
+    /// History is given `base` events of no known kind first, as it folds
+    /// every sequence. Only with the test folding: the message service
+    /// keeps a projection of its own, which starts at zero.
+    async fn start_at(
+        base: u64,
+        fold: Fold,
+        agent: bool,
+        policy: DeliveryPolicy,
+        scheduler: Option<Effects>,
+    ) -> Self {
         let gate = Arc::new(Semaphore::new(1));
         let (enter, entered) = mpsc::unbounded_channel();
         let (requests, receive) = mpsc::channel::<Request>(64);
-        let (health, status) = watch::channel(Ok(0));
+        let (health, status) = watch::channel(Ok(base));
         let (committed, _) = broadcast::channel(1024);
         let cancel = CancellationToken::new();
         let org_stop = cancel.child_token();
-        let next = Arc::new(AtomicU64::new(0));
+        let next = Arc::new(AtomicU64::new(base));
         let held = gate.clone();
         tokio::spawn(crate::org::actor::run(
             OrgState::default(),
@@ -760,8 +779,9 @@ impl Rig {
         let (registry, registry_tasks) =
             crate::registry::spawn_registry_with_cancel(registry_stop.clone());
         let tmux = ScriptedTmuxClient::new();
+        let tmux_gate = GatedTmux::new(tmux.clone());
         let (control, _task) = spawn_control(
-            Box::new(tmux.clone()),
+            Box::new(tmux_gate.clone()),
             registry.clone(),
             org.clone(),
             cancel.clone(),
@@ -807,7 +827,21 @@ impl Rig {
                 registry.clone(),
                 control.clone(),
                 cancel.child_token(),
-                Arc::new(|_| Box::pin(async { None })),
+                // The pane's processes: a shell with job control (the pane's
+                // root) running pi as its foreground job. The agent service
+                // pins pi from that when it starts.
+                Arc::new(|_| {
+                    Box::pin(async {
+                        Some(crate::org::agent_flow::ProcFacts {
+                            process_group: 100,
+                            foreground_group: 150,
+                            system_shell: true,
+                            children: 1,
+                            name: "zsh".into(),
+                        })
+                    })
+                }),
+                Arc::new(|_| None),
             );
             guarded(agents.reconciled()).await.unwrap();
             assert_eq!(tmux.pending_reads(&pane()).unwrap(), 0);
@@ -838,6 +872,12 @@ impl Rig {
             policy,
             cancel.child_token(),
         );
+        assert!(base == 0 || fold == Fold::Hand);
+        for seq in 1..=base {
+            let (at, event) = (utc(), None);
+            let earlier = HistoryUpdate::Applied { seq, at, event };
+            rt.history.record(earlier, at).unwrap();
+        }
         let messages = if fold == Fold::Hand {
             None
         } else {
@@ -851,6 +891,7 @@ impl Rig {
             org,
             rt,
             tmux,
+            tmux_gate,
             messages,
             committed: folding,
             gate,
@@ -1003,6 +1044,18 @@ impl Rig {
         tokio::time::advance(Duration::from_secs(10)).await;
         assert_eq!(self.step(id), DeliveryStep::PasteNow { attempt: 1 });
         id
+    }
+
+    /// Copy evidence's facts for the message into history, as the
+    /// recipient's job does before each of its evaluations.
+    fn copy_evidence(&self, id: MessageId) {
+        let evidence = self.rt.evidence.snapshot(id).unwrap();
+        let copy = HistoryUpdate::Evidence {
+            id,
+            receipt: evidence.receipt,
+            probably_landed: evidence.probably_landed,
+        };
+        self.rt.history.record(copy, self.now()).unwrap();
     }
 
     fn snapshot(&self, id: MessageId) -> DeliverySnapshot {
@@ -2216,9 +2269,12 @@ async fn exact_receipt_delivered_after_fold() {
     let id = rig.ready_message().await;
     rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
     let before = rig.org.status().unwrap();
+    let unpasted = rig.snapshot(id).live.last_paste_at;
     let attempt = rig.spawn_deliver(id);
 
     let audit = rig.audited().await;
+    // Work recorded its applied paste: the pane's paste time moved.
+    assert!(rig.snapshot(id).live.last_paste_at > unpasted);
     assert_eq!(
         audit.body,
         serde_json::json!({"pane": "%1", "action": {
@@ -2612,5 +2668,1159 @@ fn command_completion_never_overrides_unknown_dialog() {
         });
         let facts = guard_facts(GuardedInput::Enter, &mutated, screen, &baseline, &reference);
         assert!(!guard_allows_input(&facts), "{command}: {facts:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settlement: effects whose return is held or lost, cancellation, lost replies
+// ---------------------------------------------------------------------------
+
+/// The paste is in tmux and its call has not returned when the work deadline
+/// passes. The attempt marked it unknown before the call, so cleanup holds
+/// and writes no failure; it also records the paste, which work no longer
+/// could: the pane's paste time is set.
+#[tokio::test(start_paused = true)]
+async fn timeout_after_uncertain_paste_holds() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE)]);
+    let before = rig.org.status().unwrap();
+    rig.tmux_gate.hold_next(Effect::PasteText).unwrap();
+    // A work deadline that passes while the paste's return is held.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let attempt = tokio::spawn(deliver(rig.rt.clone(), id, deadline));
+    guarded(rig.tmux_gate.entered()).await;
+    assert_eq!(rig.pastes(), 1);
+    // Work is inside the paste call and has recorded nothing about it.
+    let recorded = rig.snapshot(id).live.last_paste_at;
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Timeout))
+        ),
+        "{delivered:?}"
+    );
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
+    assert!(snapshot.live.last_paste_at > recorded);
+    rig.tmux_gate.release();
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+    assert_eq!((rig.pastes(), rig.keys()), (1, 0));
+}
+
+/// tmux took the paste and then reported a failure: the outcome is unknown.
+/// Held, no failure, and no second paste.
+#[tokio::test(start_paused = true)]
+async fn paste_sent_then_failed_holds() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id)]);
+    let before = rig.org.status().unwrap();
+    rig.tmux_gate
+        .fail_next_after_effect(Effect::PasteText)
+        .unwrap();
+
+    let delivered = rig.deliver(id).await;
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Control(_)))
+        ),
+        "{delivered:?}"
+    );
+    assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 0));
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+}
+
+/// The Enter is in tmux and its call has not returned when the work deadline
+/// passes: held, no failure, no second key.
+#[tokio::test(start_paused = true)]
+async fn timeout_after_enter_holds() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    let before = rig.org.status().unwrap();
+    rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let attempt = tokio::spawn(deliver(rig.rt.clone(), id, deadline));
+    guarded(rig.tmux_gate.entered()).await;
+    assert!(rig.typed(id), "{:?}", rig.effects());
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Timeout))
+        ),
+        "{delivered:?}"
+    );
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert!(snapshot.hold.is_some());
+    rig.tmux_gate.release();
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+    assert!(rig.typed(id), "{:?}", rig.effects());
+}
+
+/// tmux took the Enter and then reported a failure. More staged frames are
+/// waiting, and no second key follows: held, audited once as an error.
+#[tokio::test(start_paused = true)]
+async fn enter_sent_then_failed_is_not_repeated() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    // Cleanup's frame, and two nobody may read.
+    rig.script(&[staged(id), staged(id), staged(id)]);
+    rig.tmux_gate
+        .fail_next_after_effect(Effect::SendKeys)
+        .unwrap();
+
+    let delivered = rig.deliver(id).await;
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Control(_)))
+        ),
+        "{delivered:?}"
+    );
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 2 * 3);
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::TokenVisible));
+    let audit = rig.audited().await;
+    assert_eq!(audit.body["action"]["outcome"], "error");
+}
+
+/// The Enter's call returns after the confirmation window has ended. That
+/// is no failure and no reason for another input: the attempt is held.
+#[tokio::test(start_paused = true)]
+async fn deadline_already_past_at_enter_return_is_not_failure() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let before = rig.org.status().unwrap();
+    rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+    let attempt = rig.spawn_deliver(id);
+    guarded(rig.tmux_gate.entered()).await;
+    let window = rig.rt.policy.settings().confirmation_timeout;
+    tokio::time::advance(window).await;
+    rig.tmux_gate.release();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    // The attempt and the Enter's audit: no failure.
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 2);
+}
+
+/// The reply to `Delivered` is lost while its append is on its way. The
+/// receipt is acknowledged only after `Delivered` is folded, so it is still
+/// retained when cleanup gives up, and the message is delivered once the
+/// append lands. Nothing is typed again.
+#[tokio::test(start_paused = true)]
+async fn delivered_reply_lost_is_folded_before_ack() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    let attempt = rig.spawn_deliver(id);
+    rig.audited().await;
+    rig.hold();
+    rig.prompt("s1", inbox_reference(id));
+
+    // `Delivered` is entered and held: the receipt must not be gone yet.
+    let seq = rig.entered().await;
+    assert!(rig.rt.evidence.receipt(id).unwrap().is_some());
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivering);
+    // The writer's reply deadline passes, and cleanup gives up on the write.
+    tokio::time::advance(Duration::from_secs(7)).await;
+    guarded(attempt).await.unwrap().unwrap();
+    assert!(rig.rt.evidence.receipt(id).unwrap().is_some());
+    assert_eq!(rig.snapshot(id).hold, None);
+
+    rig.release();
+    rig.folded(seq).await;
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
+    assert!(rig.typed(id), "{:?}", rig.effects());
+}
+
+/// Shutdown begins after the paste and before the Enter: no Enter, and the
+/// attempt is held with the token as its reason.
+#[tokio::test(start_paused = true)]
+async fn cancel_between_paste_and_enter_holds_without_enter() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    // The look that would allow the Enter, and cleanup's capture.
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    let before = rig.org.status().unwrap();
+    rig.fold_rest();
+    let attempt = rig.spawn_deliver(id);
+    rig.pasted().await;
+    rig.rt.cancel.cancel();
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(delivered, Err(MessageError::Unavailable(_))),
+        "{delivered:?}"
+    );
+    assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 0));
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+}
+
+/// Shutdown begins while the attempt waits for its receipt: it is held, not
+/// failed. The session's prompt event arrives afterwards and still wins:
+/// the hold does not stand in the way of `Delivered`.
+#[tokio::test(start_paused = true)]
+async fn cancel_while_awaiting_receipt_holds_and_receipt_still_wins() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    rig.fold_rest();
+    let attempt = rig.spawn_deliver(id);
+    rig.audited().await;
+    rig.rt.cancel.cancel();
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(delivered, Err(MessageError::Unavailable(_))),
+        "{delivered:?}"
+    );
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+
+    rig.prompt("s1", inbox_reference(id));
+    let receipt = rig.rt.evidence.receipt(id).unwrap().unwrap();
+    let seq = rig
+        .commit(OrgCommand::Delivered {
+            message_id: id,
+            session_id: receipt.session_id.clone(),
+            confirmation: receipt.confirmation.clone(),
+        })
+        .await;
+    rig.folded(seq).await;
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
+    assert!(rig.typed(id), "{:?}", rig.effects());
+}
+
+// ---------------------------------------------------------------------------
+// The reference in real editors
+// ---------------------------------------------------------------------------
+//
+// Captured with the reference pasted and never submitted, in each harness's
+// editor at three widths; each adapter's fixture README has the `Captured:`
+// lines. `r0` frames hold `[m123] ...`, `r1` frames `[m123456] ...`.
+
+macro_rules! p3 {
+    ($vendor:literal, $name:literal, $version:literal) => {
+        include_str!(concat!(
+            "../../../atm-",
+            $vendor,
+            "-adapter/tests/fixtures/screen_p3_",
+            $name,
+            "_",
+            $version,
+            ".styled.txt"
+        ))
+    };
+}
+
+/// On every real frame of 80 and 120 columns the guard allows a paste into
+/// the empty editor and an Enter on the staged reference, and neither the
+/// other way round. At 28 columns the reference wraps: no adapter proves a
+/// wrapped draft, so no frame there gets an Enter.
+#[test]
+fn real_staged_reference_frames_allow_enter_only_unwrapped() {
+    use crate::org::agent_screen_tests::capture as shot_of;
+    let (paste, enter) = (GuardedInput::Paste, GuardedInput::Enter);
+    // (harness, its command, [(message id, the empty frame, the staged one)])
+    let harnesses = [
+        (
+            Harness::ClaudeCode,
+            "claude",
+            [
+                (
+                    123,
+                    p3!("claude", "80x40-r0-C-u-empty", "2.1.325"),
+                    p3!("claude", "80x40-r0-C-u-staged", "2.1.325"),
+                ),
+                (
+                    123_456,
+                    p3!("claude", "120x40-r1-C-u-empty", "2.1.325"),
+                    p3!("claude", "120x40-r1-C-u-staged", "2.1.325"),
+                ),
+                (
+                    123_456,
+                    p3!("claude", "28x40-r1-C-u-empty", "2.1.325"),
+                    p3!("claude", "28x40-r1-C-u-staged", "2.1.325"),
+                ),
+            ],
+        ),
+        (
+            Harness::Codex,
+            "codex",
+            [
+                (
+                    123,
+                    p3!("codex", "80x40-r0-C-u-empty", "0.167.0"),
+                    p3!("codex", "80x40-r0-C-u-staged", "0.167.0"),
+                ),
+                (
+                    123_456,
+                    p3!("codex", "120x40-r1-C-u-empty", "0.167.0"),
+                    p3!("codex", "120x40-r1-C-u-staged", "0.167.0"),
+                ),
+                (
+                    123_456,
+                    p3!("codex", "28x40-r1-C-u-empty", "0.167.0"),
+                    p3!("codex", "28x40-r1-C-u-staged", "0.167.0"),
+                ),
+            ],
+        ),
+        (
+            Harness::Pi,
+            "pi",
+            [
+                (
+                    123,
+                    p3!("pi", "80x40-r0-C-u-empty", "1.5.0"),
+                    p3!("pi", "80x40-r0-C-u-staged", "1.5.0"),
+                ),
+                (
+                    123_456,
+                    p3!("pi", "120x40-r1-C-u-empty", "1.5.0"),
+                    p3!("pi", "120x40-r1-C-u-staged", "1.5.0"),
+                ),
+                (
+                    123_456,
+                    p3!("pi", "28x40-r1-C-u-empty", "1.5.0"),
+                    p3!("pi", "28x40-r1-C-u-staged", "1.5.0"),
+                ),
+            ],
+        ),
+    ];
+    for (harness, command, frames) in harnesses {
+        let screen = agent_screen(harness).unwrap();
+        let baseline = (PaneBaseline::adopted(100).with_harness(command.into())).unwrap();
+        let allows = |input, fixture: &str, reference: &str| {
+            let capture = shot_of(fixture, CaptureFormat::Ansi, Some(100), Some(command))
+                .with_focus(Some(false));
+            guard_allows_input(&guard_facts(input, &capture, screen, &baseline, reference))
+        };
+        for (wrapped, (id, empty, staged)) in [false, false, true].into_iter().zip(frames) {
+            let reference = inbox_reference(MessageId::new(id));
+            let case = format!("{command}, m{id}, wrapped: {wrapped}");
+            assert_eq!(allows(enter, staged, &reference), !wrapped, "{case}");
+            assert!(!allows(paste, staged, &reference), "{case}");
+            assert!(!allows(enter, empty, &reference), "{case}");
+            // Only pi's editor is read as empty at 28 columns.
+            let pastes = !wrapped || harness == Harness::Pi;
+            assert_eq!(allows(paste, empty, &reference), pastes, "{case}");
+            // Another message's reference is not this draft.
+            let other = inbox_reference(MessageId::new(id + 1));
+            assert!(!allows(enter, staged, &other), "{case}");
+        }
+    }
+}
+
+/// A real pi frame of S1's, as %1 reports it at `width` columns.
+fn p3_pi(fixture: &str, width: u16) -> PaneCapture {
+    with(pi(fixture), |capture| capture.inspection.pane.width = width)
+}
+
+/// The worker on a log that makes its first message `m123456`, the id in
+/// the `r1` captures: the seed is four events, the message the fifth. The
+/// test's own task folds: the message service's projection starts at zero.
+async fn rig_for_m123456() -> (Rig, MessageId) {
+    let policy = DeliveryPolicy::default();
+    let mut rig = Rig::start_at(123_451, Fold::Hand, true, policy, None).await;
+    let id = rig.ready_message().await;
+    assert_eq!(id, MessageId::new(123_456));
+    rig.fold_rest();
+    (rig, id)
+}
+
+/// The whole attempt on real pi 1.5.0 frames at 120 columns: the empty
+/// editor takes the paste, the staged reference gets its one Enter, and the
+/// session's prompt event delivers the message.
+#[tokio::test(start_paused = true)]
+async fn real_pi_reference_is_staged_submitted_and_confirmed() {
+    let (mut rig, id) = rig_for_m123456().await;
+    let empty = p3_pi(p3!("pi", "120x40-r1-C-u-empty", "1.5.0"), 120);
+    let staged = p3_pi(p3!("pi", "120x40-r1-C-u-staged", "1.5.0"), 120);
+    rig.script(&[empty.clone(), empty, staged.clone(), staged]);
+    let attempt = rig.spawn_deliver(id);
+
+    let audit = rig.audited().await;
+    assert_eq!(audit.body["action"]["outcome"], "ok");
+    rig.prompt("s1", inbox_reference(id));
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
+}
+
+/// Real pi 1.5.0 frames at 28 columns, where the reference wraps. The empty
+/// editor is read as empty, so the reference is pasted; the wrapped draft is
+/// never proven, so no Enter is sent; at the end of the confirmation window
+/// the attempt is held with the token as its reason, and nothing is failed.
+/// The reference stays in the editor: the executor removes no text.
+#[tokio::test(start_paused = true)]
+async fn narrow_reference_and_trailing_padding_ambiguity_no_enter() {
+    let (rig, id) = rig_for_m123456().await;
+    let empty = p3_pi(p3!("pi", "28x40-r1-C-u-empty", "1.5.0"), 28);
+    let staged = p3_pi(p3!("pi", "28x40-r1-C-u-staged", "1.5.0"), 28);
+    rig.script(&[empty.clone(), empty]);
+    // More looks than the window has room for, and cleanup's capture.
+    rig.script(&vec![staged; 40]);
+    let before = rig.org.status().unwrap();
+
+    rig.deliver(id).await.unwrap();
+
+    assert_eq!((rig.pastes(), rig.keys()), (1, 0));
+    assert!(rig.reads() > 0 && rig.reads() < 38 * 3, "{}", rig.reads());
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    // The attempt is the last event: no failure, so no retry.
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Settlement against the policy: holds block, a proven no-effect retries
+// ---------------------------------------------------------------------------
+
+/// One whole attempt whose Enter is sent and never confirmed, optionally
+/// with other activity in the session while it waits (a prompt event that
+/// is not the reference: the hook for ours was dropped). Returns the rig
+/// after the attempt ended at the confirmation window.
+async fn unconfirmed_enter(activity: bool) -> (Rig, MessageId) {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let attempt = rig.spawn_deliver(id);
+    rig.audited().await;
+    if activity {
+        rig.prompt("s1", "something else the session was told".into());
+    }
+    guarded(attempt).await.unwrap().unwrap();
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    (rig, id)
+}
+
+/// After an unconfirmed Enter the policy blocks the message for as long as
+/// nobody resolves it, and an executor run for it types nothing and writes
+/// nothing: no failure, no retry, no second paste.
+async fn stays_blocked(rig: &mut Rig, id: MessageId) {
+    let blocked = DeliveryStep::Blocked {
+        reason: FailureReason::ProbablyDelivered,
+    };
+    let before = rig.org.status().unwrap();
+    for _ in 0..2 {
+        assert_eq!(rig.step(id), blocked);
+        // The executor's one capture; it must not ask for a paste guard.
+        rig.script(&[pi(IDLE)]);
+        rig.deliver(id).await.unwrap();
+        assert!(rig.typed(id), "{:?}", rig.effects());
+        assert_eq!(rig.reads(), 0);
+        assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivering);
+        tokio::time::advance(Duration::from_secs(600)).await;
+    }
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before);
+}
+
+/// The Enter was applied; no receipt and no activity followed. Held with
+/// the token as the reason, and blocked: never an automatic retry.
+#[tokio::test(start_paused = true)]
+async fn token_visible_after_enter_blocks_retry() {
+    let (mut rig, id) = unconfirmed_enter(false).await;
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::TokenVisible));
+    assert!(!rig.rt.evidence.snapshot(id).unwrap().probably_landed);
+    stays_blocked(&mut rig, id).await;
+}
+
+/// The same with the session active while the attempt waited: the hook for
+/// our prompt was dropped, the turn is visibly running. No second paste.
+#[tokio::test(start_paused = true)]
+async fn dropped_prompt_with_activity_blocks_second_paste() {
+    let (mut rig, id) = unconfirmed_enter(true).await;
+    assert!(rig.rt.evidence.snapshot(id).unwrap().probably_landed);
+    stays_blocked(&mut rig, id).await;
+}
+
+/// The audit of the Enter cannot be written for a while (the organisation
+/// writer is held). The attempt does not wait for it and types nothing
+/// again; the record that lands later carries the time of the Enter, not
+/// the time it was written.
+#[tokio::test(start_paused = true)]
+async fn audit_stall_or_overflow_never_repeats_input_and_preserves_time() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let attempt = rig.spawn_deliver(id);
+    rig.pasted().await;
+    rig.hold();
+    // The next append is the audit: the Enter's call has just returned.
+    let seq = rig.entered().await;
+    let sent = rig.now();
+    assert!(rig.typed(id), "{:?}", rig.effects());
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    let ended = rig.now();
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::TokenVisible));
+    rig.release();
+    let audit = rig.audited().await;
+    assert_eq!(audit.seq, seq);
+    assert_eq!(audit.ts, sent);
+    assert!(audit.ts < ended);
+    assert_eq!(audit.body["action"]["outcome"], "ok");
+}
+
+/// Four attempts that each type nothing (the owner's client is on the pane
+/// when the paste is guarded). The executor fails the first three for
+/// their retries, which the policy times 1, 2 and 4 seconds later, and
+/// leaves the fourth, the final one by the policy's count, to the policy.
+/// Nothing is ever pasted.
+#[tokio::test(start_paused = true)]
+async fn proven_no_effect_retries_1_2_4_then_final() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    let before = rig.org.status().unwrap();
+    for (attempt, delay) in [(1, Some(1)), (2, Some(2)), (3, Some(4)), (4, None)] {
+        assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt });
+        rig.script(&[pi(IDLE), focused()]);
+        rig.deliver(id).await.unwrap();
+        assert_eq!((rig.pastes(), rig.reads()), (0, 0), "attempt {attempt}");
+        let snapshot = rig.snapshot(id);
+        assert_eq!(snapshot.hold, None, "attempt {attempt}");
+        let Some(delay) = delay else {
+            // The final attempt: no failure from the executor.
+            assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+            break;
+        };
+        assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+        let step = rig.step(id);
+        assert!(matches!(step, DeliveryStep::RetryAt { .. }), "{step:?}");
+        // Not a moment before its delay has passed.
+        tokio::time::advance(Duration::from_secs(delay) - Duration::from_millis(1)).await;
+        let step = rig.step(id);
+        assert!(matches!(step, DeliveryStep::RetryAt { .. }), "{step:?}");
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    // Four attempts and three failures were written, and no fourth failure.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 7);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let failed = DeliveryStep::Fail {
+        reason: FailureReason::ConfirmationTimeout,
+    };
+    assert_eq!(rig.step(id), failed);
+}
+
+/// Attempt 1 was armed, typed nothing and was failed for its retry. Before
+/// the retry the session reports the exact reference for attempt 1's scope
+/// (the owner pasted and submitted it himself, say). The next run of the
+/// executor finds the receipt: no attempt 2, no paste, delivered.
+#[tokio::test(start_paused = true)]
+async fn receipt_between_failure_and_retry_cancels() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), focused()]);
+    rig.deliver(id).await.unwrap();
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+    let before = rig.org.status().unwrap();
+    rig.prompt("s1", inbox_reference(id));
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    // The executor's one capture: a paste guard would find no frame.
+    rig.script(&[pi(IDLE)]);
+    rig.deliver(id).await.unwrap();
+
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+    assert_eq!(snapshot.message.last_attempt.map(|a| a.attempt), Some(1));
+    // Only `Delivered` was written.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Activity after an attempt that typed nothing
+// ---------------------------------------------------------------------------
+
+/// The message's first attempt is armed and types nothing (the owner's
+/// client is on the pane at the paste guard), and the session is active
+/// around it: its own turn started, which is why the latch is set although
+/// nothing of ours was typed. The executor records the paste as not
+/// started, and history then discounts the latch: the message stays
+/// retryable. In both orders: the activity before that record, and after.
+#[tokio::test(start_paused = true)]
+async fn activity_after_zero_effect_failure_stays_retryable() {
+    for early in [true, false] {
+        let mut rig = Rig::attempt().await;
+        let id = rig.ready_message().await;
+        rig.script(&[pi(IDLE), focused()]);
+        let armed = rig.wakes();
+        let attempt = rig.spawn_deliver(id);
+        let other = || "something else the session was told".to_string();
+        if early {
+            // Armed, and parked before the paste guard's paced capture.
+            until("the attempt was armed", || rig.wakes() != armed).await;
+            rig.prompt("s1", other());
+        }
+        guarded(attempt).await.unwrap().unwrap();
+        if !early {
+            rig.prompt("s1", other());
+        }
+
+        assert!(rig.rt.evidence.snapshot(id).unwrap().probably_landed);
+        rig.copy_evidence(id);
+        assert_eq!((rig.pastes(), rig.reads()), (0, 0), "early: {early}");
+        assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let step = rig.step(id);
+        assert_eq!(
+            step,
+            DeliveryStep::PasteNow { attempt: 2 },
+            "early: {early}"
+        );
+    }
+}
+
+/// The same activity when an earlier attempt of the message was applied, or
+/// has an unknown outcome: that paste may be what the session is working
+/// on, so the latch stays in force and the message is blocked, although the
+/// current attempt typed nothing. An exact receipt still wins.
+#[tokio::test(start_paused = true)]
+async fn prior_applied_or_unknown_attempt_keeps_activity_latch() {
+    for prior in [APPLIED, UNKNOWN] {
+        let mut rig = Rig::attempt().await;
+        let id = rig.ready_message().await;
+        // Attempt 1: the paste lands and tmux fails the first look
+        // (applied), or tmux reports a failure for the paste itself.
+        rig.script(&[pi(IDLE), pi(IDLE)]);
+        if prior == UNKNOWN {
+            rig.tmux_gate
+                .fail_next_after_effect(Effect::PasteText)
+                .unwrap();
+        }
+        rig.deliver(id).await.unwrap_err();
+        let first = rig.snapshot(id);
+        assert_eq!(first.hold, Some(ExecutorHold::InputOutcomeUnknown));
+        assert_eq!(rig.pastes(), 1, "{prior:?}");
+
+        // The owner retries, accepting the risk: the recipient's job
+        // releases the latch and fails the attempt for its retry. The
+        // editor is empty and quiet again by then.
+        let held = first.last_attempt_seq.unwrap();
+        rig.rt.evidence.release(id, held).unwrap();
+        let retry = HistoryUpdate::OwnerRetry {
+            id,
+            attempt_seq: held,
+        };
+        rig.rt.history.record(retry, rig.now()).unwrap();
+        let failed = rig
+            .commit(OrgCommand::DeliveryFailed {
+                message_id: id,
+                reason: "retried by the owner".into(),
+                final_failure: false,
+            })
+            .await;
+        rig.folded(failed).await;
+        let observed = HistoryUpdate::Observed {
+            recipient: worker(),
+            observation: idle_observation(),
+        };
+        rig.rt.history.record(observed, rig.now()).unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 2 });
+
+        // Attempt 2 types nothing, and the session is active after it.
+        rig.script(&[pi(IDLE), focused()]);
+        rig.deliver(id).await.unwrap();
+        assert_eq!((rig.pastes(), rig.reads()), (1, 0), "{prior:?}");
+        assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+        rig.prompt("s1", "something else the session was told".into());
+        rig.copy_evidence(id);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let blocked = DeliveryStep::Blocked {
+            reason: FailureReason::ProbablyDelivered,
+        };
+        assert_eq!(rig.step(id), blocked, "{prior:?}");
+
+        rig.prompt("s1", inbox_reference(id));
+        rig.copy_evidence(id);
+        let step = rig.step(id);
+        assert!(matches!(step, DeliveryStep::Confirm { .. }), "{step:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup under a stalled or lost organisation write, and zero-effect exits
+// ---------------------------------------------------------------------------
+
+/// A reservation of the worker and its pane that acquires and returns.
+async fn acquires(rig: &Rig) -> Result<(), ReservationError> {
+    let acquired = rig.rt.control.run_reserved(
+        rig.reservation(),
+        |_| async { Ok::<_, ReservationError>(()) },
+        no_cleanup,
+    );
+    guarded(acquired).await
+}
+
+/// The attempt typed nothing and its failure cannot be written: the
+/// organisation writer stalls for longer than cleanup may wait. Cleanup
+/// retains a hold instead and succeeds, so the agent is not quarantined and
+/// a later reservation acquires while the writer still stalls. The hold
+/// stands when the failure lands after all: no retry is granted.
+#[tokio::test(start_paused = true)]
+async fn org_stall_in_cleanup_holds_without_quarantine() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), focused()]);
+    let (before, armed) = (rig.org.status().unwrap(), rig.wakes());
+    let attempt = rig.spawn_deliver(id);
+    // The attempt is committed and armed; every later append stalls.
+    until("the attempt was armed", || rig.wakes() != armed).await;
+    rig.hold();
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    assert_eq!((rig.pastes(), rig.reads()), (0, 0));
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
+    acquires(&rig).await.unwrap();
+
+    rig.release();
+    rig.folded(before + 2).await;
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let step = rig.step(id);
+    assert!(matches!(step, DeliveryStep::Blocked { .. }), "{step:?}");
+}
+
+/// One recipient's attempt waits on a stalled append. Control work for
+/// another agent and pane is not behind it.
+#[tokio::test(start_paused = true)]
+async fn stalled_append_does_not_block_other_recipient_control() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), focused()]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+
+    let other = ReservationRequest::new(
+        "demo/other".parse().unwrap(),
+        Some(PaneId::parse("%2").unwrap()),
+        ReservationKind::Observe,
+        WaitPolicy::Wait,
+        Instant::now() + ATTEMPT_WORK_BUDGET,
+    );
+    let ran = rig.rt.control.run_reserved(
+        other,
+        |_| async { Ok::<_, ReservationError>(()) },
+        no_cleanup,
+    );
+    guarded(ran).await.unwrap();
+    assert!(!attempt.is_finished());
+    assert_eq!(rig.org.status().unwrap(), before);
+
+    rig.release();
+    guarded(attempt).await.unwrap().unwrap();
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+}
+
+/// The second attempt of a message is committed and never folded. History
+/// knows the message's first attempt only, so nothing can be recorded or
+/// held under the second: cleanup fails, and the agent is quarantined.
+#[tokio::test(start_paused = true)]
+async fn cleanup_failure_quarantines() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    // Attempt 1 types nothing and is failed for its retry, folded by hand.
+    rig.script(&[pi(IDLE), focused()]);
+    let first = rig.spawn_deliver(id);
+    let attempted = rig.committed().await;
+    rig.apply(&attempted);
+    let failed = rig.committed().await;
+    assert_eq!(failed.kind, "msg.delivery_failed");
+    rig.apply(&failed);
+    guarded(first).await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 2 });
+
+    rig.script(&[pi(IDLE), pi(IDLE)]);
+    let second = rig.spawn_deliver(id);
+    let attempted = rig.committed().await;
+    assert_eq!(attempted.kind, "msg.delivery_attempted");
+
+    // Work waits for the fold until its deadline, cleanup until its own.
+    let delivered = guarded(second).await.unwrap();
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Timeout))
+        ),
+        "{delivered:?}"
+    );
+    assert_eq!((rig.pastes(), rig.reads()), (0, 3));
+    // Nothing was written or held for the attempt nobody could account for.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), attempted.seq);
+    assert_eq!(rig.snapshot(id).hold, None);
+    let refused = acquires(&rig).await.unwrap_err();
+    assert!(
+        matches!(refused, ReservationError::Quarantined { .. }),
+        "{refused:?}"
+    );
+}
+
+/// Whoever asked for the attempt goes away while its commit is on its way.
+/// The control supervisor owns the attempt: it still runs and settles.
+#[tokio::test(start_paused = true)]
+async fn client_gone_still_settles() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), focused()]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    attempt.abort();
+    assert!(guarded(attempt).await.unwrap_err().is_cancelled());
+    rig.release();
+
+    // The attempt, then its failure for a retry: it typed nothing.
+    rig.folded(before + 2).await;
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    assert_eq!((snapshot.hold, rig.pastes()), (None, 0));
+    acquires(&rig).await.unwrap();
+}
+
+/// Shutdown begins after the attempt's commit and before its paste: no
+/// input, and cleanup still accounts for the attempt by failing it.
+#[tokio::test(start_paused = true)]
+async fn cancel_before_effect_is_zero_effect() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE)]);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    let attempt = rig.spawn_deliver(id);
+    assert_eq!(rig.entered().await, before + 1);
+    rig.rt.cancel.cancel();
+    rig.release();
+    rig.fold_rest();
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(delivered, Err(MessageError::Unavailable(_))),
+        "{delivered:?}"
+    );
+    // The paste guard's frame was never read.
+    assert_eq!((rig.pastes(), rig.reads()), (0, 3));
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.last_attempt_seq, Some(before + 1));
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    assert_eq!(snapshot.hold, None);
+}
+
+/// The work deadline passes while the attempt waits for its own fold. The
+/// fold arrives during cleanup: the attempt is known, typed nothing, and is
+/// failed for a retry.
+#[tokio::test(start_paused = true)]
+async fn timeout_before_effect_accounts_attempt() {
+    let mut rig = Rig::hand().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE)]);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let attempt = tokio::spawn(deliver(rig.rt.clone(), id, deadline));
+    let attempted = rig.committed().await;
+    assert_eq!(attempted.kind, "msg.delivery_attempted");
+    // Past the work deadline, inside cleanup's wait for the fold.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    rig.apply(&attempted);
+    rig.fold_rest();
+
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Timeout))
+        ),
+        "{delivered:?}"
+    );
+    assert_eq!((rig.pastes(), rig.reads()), (0, 3));
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    assert_eq!(snapshot.hold, None);
+    acquires(&rig).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The guard between the staged draft and the Enter, through the executor
+// ---------------------------------------------------------------------------
+//
+// One driver: the first look after the paste shows the staged reference and
+// allows the Enter; the Enter guard's own capture, every later look and
+// cleanup's capture show the case's frame. Each case must end with one
+// paste, no key, the message still Delivering, and a hold.
+
+const TOKEN: ExecutorHold = ExecutorHold::TokenVisible;
+const NO_TOKEN: ExecutorHold = ExecutorHold::InputOutcomeUnknown;
+
+async fn no_key(case: &str, frame: fn(MessageId) -> PaneCapture, hold: ExecutorHold) {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id)]);
+    // More frames than the confirmation window has room for.
+    let frames = 40;
+    rig.script(&vec![frame(id); frames]);
+    let before = rig.org.status().unwrap();
+
+    let _ = rig.deliver(id).await;
+
+    assert_eq!((rig.pastes(), rig.keys()), (1, 0), "{case}");
+    // It read the case's frame at least twice (the guard or a look, and
+    // cleanup), and stopped.
+    let left = rig.reads() / 3;
+    assert!(left > 0 && left <= frames - 2, "{case}: {left} frames left");
+    let snapshot = rig.snapshot(id);
+    assert_eq!(
+        snapshot.message.status,
+        DeliveryStatus::Delivering,
+        "{case}"
+    );
+    assert_eq!(snapshot.hold, Some(hold), "{case}");
+    // No failure: at most the audit of an Enter call that sent nothing.
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    while let Ok(envelope) = rig.committed.try_recv() {
+        let ours = envelope.seq > before && envelope.kind != "control.sent";
+        assert!(!ours || envelope.kind == "msg.delivery_attempted", "{case}");
+    }
+}
+
+macro_rules! no_key_tests {
+    ($($name:ident: $hold:expr, $frame:expr;)*) => {$(
+        #[tokio::test(start_paused = true)]
+        async fn $name() {
+            no_key(stringify!($name), $frame, $hold).await;
+        }
+    )*};
+}
+
+no_key_tests! {
+    // The owner's client comes to the pane after the draft was seen. The
+    // draft matches exactly, so the hold names the token, not a mismatch.
+    focus_changes_before_guard_no_input: TOKEN,
+        |id| with(staged(id), |capture| capture.focused = Some(true));
+    exact_draft_guard_refusal_holds_token_visible: TOKEN,
+        |id| with(staged(id), |capture| capture.inspection.synchronized = true);
+    // tmux could not say whether a client is on the pane.
+    unknown_focus_blocks: TOKEN,
+        |id| with(staged(id), |capture| capture.focused = None);
+    // A shell took the foreground: every screen fact is unknown.
+    shell_before_enter_no_key: TOKEN,
+        |id| with(staged(id), |capture| {
+            capture.inspection.foreground_command = Some("zsh".into());
+        });
+    // Leading whitespace is part of the draft.
+    leading_space_reference_no_enter: TOKEN,
+        |id| drafted(&format!(" {}", inbox_reference(id)));
+    // A draft that is not the reference at all.
+    unknown_or_wrapped_draft_no_enter: NO_TOKEN,
+        |_| drafted("something the owner is typing");
+    mismatched_or_unknown_staged_frame_never_blind_enter: TOKEN,
+        |id| drafted(&format!("{} and more", inbox_reference(id)));
+    // The reference in the transcript above an empty editor.
+    same_reference_in_history_is_not_staged_proof: TOKEN,
+        |id| showing(&inbox_reference(id));
+    // A real pi 1.5.0 frame with its slash-command popup open.
+    modal_before_enter_no_key: NO_TOKEN, |_| pi(POPUP);
+}
+
+/// A real pi editor with the slash-command popup open (the adapter's
+/// fixture README has its `Captured:` line).
+const POPUP: &str = include_str!(
+    "../../../atm-pi-adapter/tests/fixtures/screen_p5_120x40-typed-popup_1.5.0.styled.txt"
+);
+
+/// Any client that is on the pane blocks, also beside one that is not: the
+/// capture's focus sample is "some client is focused here".
+#[tokio::test(start_paused = true)]
+async fn any_focused_client_blocks() {
+    let frame = |id| with(staged(id), |capture| capture.focused = Some(true));
+    no_key("the Enter guard", frame, TOKEN).await;
+    // And when the client is there from the first capture on: no attempt.
+    // History's last observation, from before the reservation, said
+    // unfocused. The executor records its own capture and the policy
+    // decides on that: a wait, answered Ok, and not a refused paste guard.
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[focused(), focused()]);
+    rig.deliver(id).await.unwrap();
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert_eq!(
+        (rig.reads(), rig.snapshot(id).message.last_attempt),
+        (3, None)
+    );
+    let step = rig.step(id);
+    let focused = WaitReason::OwnerFocused;
+    assert!(
+        matches!(step, DeliveryStep::Wait { reason, .. } if reason == focused),
+        "{step:?}"
+    );
+}
+
+/// Copy mode on the pane, and another agent's tag on it: no key for either.
+/// The tag is refused by the control actor itself, which ends the keys.
+#[tokio::test(start_paused = true)]
+async fn copy_mode_and_foreign_tag_no_input() {
+    let mode = |id| with(staged(id), |capture| capture.inspection.in_mode = true);
+    no_key("copy mode", mode, TOKEN).await;
+    let tag = |id| {
+        with(staged(id), |capture| {
+            capture.inspection.local_agent_tag = Some("demo/other".into());
+        })
+    };
+    no_key("a foreign tag", tag, TOKEN).await;
+}
+
+/// The whole attempt with `change` applied to every frame it reads; whether
+/// the paste and the Enter were sent.
+async fn typed_with(change: fn(&mut PaneCapture)) -> bool {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    let (idle, draft) = (with(pi(IDLE), change), with(staged(id), change));
+    rig.script(&[idle.clone(), idle, draft.clone(), draft.clone(), draft]);
+    let _ = rig.deliver(id).await;
+    rig.typed(id)
+}
+
+/// A client that has the pane selected and is not focused on it does not
+/// block: focus is `Some(false)`, and the attempt types.
+#[tokio::test(start_paused = true)]
+async fn unfocused_selected_client_allows() {
+    assert!(typed_with(|capture| capture.focused = Some(false)).await);
+}
+
+/// tmux before 3.7 does not report the bracketed-paste flag: allowed, for
+/// the one printable ASCII line the reference is. A reported "off" refuses
+/// the Enter as it refuses the paste.
+#[tokio::test(start_paused = true)]
+async fn bracket_unknown_ascii_allowed_false_refused() {
+    assert!(typed_with(|capture| capture.inspection.bracketed_paste = None).await);
+    let off = |id| {
+        with(staged(id), |capture| {
+            capture.inspection.bracketed_paste = Some(false);
+        })
+    };
+    no_key("bracketed paste is off", off, TOKEN).await;
+}
+
+/// A capture in another format than the harness's adapter reads proves
+/// nothing: every screen fact is unknown and neither input is allowed.
+#[test]
+fn capture_format_mismatch_no_input() {
+    let id = MessageId::new(5);
+    let (screen, reference) = (agent_screen(Harness::Pi).unwrap(), inbox_reference(id));
+    for (input, frame) in [
+        (GuardedInput::Paste, pi(IDLE)),
+        (GuardedInput::Enter, staged(id)),
+    ] {
+        let facts = guard_facts(input, &frame, screen, &baseline(), &reference);
+        assert!(guard_allows_input(&facts), "{facts:?}");
+        let plain = with(frame, |capture| capture.format = CaptureFormat::Plain);
+        let facts = guard_facts(input, &plain, screen, &baseline(), &reference);
+        assert_eq!(facts.screen, ScreenFacts::default());
+        assert!(!guard_allows_input(&facts), "{facts:?}");
+    }
+}
+
+/// Real Claude 2.1.325 folder-trust dialogs, with "No, exit" selected (the
+/// default) and with "Yes" selected (the adapter's fixture README has the
+/// `Captured:` lines). The control read names the dialog, and no delivery
+/// input is allowed on it, whichever row is selected: the executor never
+/// answers a dialog.
+#[test]
+fn trust_default_no_never_gets_a_key() {
+    use crate::org::agent_screen_tests::capture as shot_of;
+    let screen = agent_screen(Harness::ClaudeCode).unwrap();
+    let baseline = (PaneBaseline::adopted(100).with_harness("claude".into())).unwrap();
+    let reference = inbox_reference(MessageId::new(123));
+    for (selected, fixture) in [
+        (
+            false,
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-default-120x40_2.1.325.txt"
+            ),
+        ),
+        (
+            true,
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-selected-120x40_2.1.325.txt"
+            ),
+        ),
+    ] {
+        let capture = shot_of(fixture, CaptureFormat::Ansi, Some(100), Some("claude"))
+            .with_focus(Some(false));
+        for input in [GuardedInput::Paste, GuardedInput::Enter] {
+            let facts = guard_facts(input, &capture, screen, &baseline, &reference);
+            assert!(
+                matches!(&facts.control_dialog, ControlDialog::FolderTrust { selected_accept, .. } if *selected_accept == selected),
+                "{facts:?}"
+            );
+            assert!(!guard_allows_input(&facts), "{facts:?}");
+        }
     }
 }

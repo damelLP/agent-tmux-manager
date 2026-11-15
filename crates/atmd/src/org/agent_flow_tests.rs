@@ -2634,3 +2634,155 @@ fn clear_table_fresh() {
         "a dialog opened during the clear"
     );
 }
+
+#[test]
+fn placement_reads_a_side_and_an_agent_name() {
+    use atm_tmux::PaneDirection::{Above, Below, Left, Right};
+    for (hint, expected) in [
+        ("below:lead", Some((Below, "lead"))),
+        ("above:lead", Some((Above, "lead"))),
+        ("left:a-b", Some((Left, "a-b"))),
+        ("right:lead", Some((Right, "lead"))),
+        // Only the first colon divides; the name is checked as an agent's later.
+        ("right:a:b", Some((Right, "a:b"))),
+        ("below:", None),
+        ("under:lead", None),
+        ("Below:lead", None),
+        ("lead", None),
+        ("", None),
+    ] {
+        assert_eq!(placement(hint), expected, "{hint:?}");
+    }
+}
+
+#[test]
+fn started_session_is_the_one_accepted_start_on_the_pane() {
+    let found = |rows: &[PaneSession]| started_session("claude", rows);
+    let started = |id| pane_row(id, Harness::ClaudeCode, Some(Some("startup")));
+    assert_eq!(found(&[]), Ok(None));
+    assert_eq!(found(&[started("s1")]), Ok(Some(SessionId::new("s1"))));
+    // Any accepted start counts, whatever its source.
+    let resumed = pane_row("s1", Harness::ClaudeCode, Some(None));
+    assert_eq!(found(&[resumed]), Ok(Some(SessionId::new("s1"))));
+    // A row no start created waits.
+    let status_only = pane_row("s1", Harness::ClaudeCode, None);
+    assert_eq!(found(&[status_only]), Ok(None));
+    // Another harness's row, a child row and a pending row are not the agent's.
+    let other = pane_row("p1", Harness::Pi, Some(Some("startup")));
+    let mut child = started("c1");
+    child.view.parent_session_id = Some(SessionId::new("s1"));
+    let pending = started("pending-100");
+    assert!(pending.view.id.is_pending());
+    assert_eq!(
+        found(&[other.clone(), child.clone(), pending.clone()]),
+        Ok(None)
+    );
+    assert_eq!(
+        found(&[other, child, pending, started("s1")]),
+        Ok(Some(SessionId::new("s1")))
+    );
+    // Two of the agent's harness: nothing says which is the agent's.
+    assert!(found(&[started("s1"), started("s2")]).is_err());
+    assert!(found(&[started("s1"), pane_row("s2", Harness::ClaudeCode, None)]).is_err());
+}
+
+#[test]
+fn a_refused_prompt_line_with_more_typed_after_it_is_never_the_prompt() {
+    // No paste guard has refused yet: any settled line is the prompt.
+    assert!(prompt_line_allowed(None, "pb> "));
+    assert!(prompt_line_allowed(None, ""));
+    // The refused line itself (the guard refused for another reason), and a
+    // prompt that was drawn again.
+    assert!(prompt_line_allowed(Some("pb> "), "pb> "));
+    assert!(prompt_line_allowed(Some("pb> "), "pb (main)> "));
+    assert!(prompt_line_allowed(Some("pb> "), ""));
+    // The refused line with something typed after it.
+    assert!(!prompt_line_allowed(Some("pb> "), "pb> rm -rf ~; "));
+    assert!(!prompt_line_allowed(Some("pb> "), "pb>  "));
+    // An empty refused line says nothing about a later one: fail closed.
+    assert!(!prompt_line_allowed(Some(""), "x"));
+}
+
+#[test]
+fn launch_guards_need_the_recorded_shell_unfocused_and_the_exact_line() {
+    let screen = agent_screen(Harness::Codex).unwrap();
+    let baseline = PaneBaseline::shell(ROOT, "zsh".into());
+    let text = "cd '/proj' && ATM_AGENT='p/lead' codex";
+    let shell = |line: &str| {
+        shell_capture(&[line, ""], 80, (line.len() as u32, 0), CaptureFormat::Ansi)
+            .with_focus(Some(false))
+    };
+    let staged = format!("pb> {text}");
+    let allowed = |before: &PaneCapture, after: &PaneCapture| {
+        (
+            shell_refusal(screen, before, &baseline, "p/lead"),
+            launch_paste_allowed(screen, before, &baseline, "p/lead", "pb> "),
+            launch_enter_allowed(screen, after, &baseline, "p/lead", ("pb> ", text)),
+        )
+    };
+    assert_eq!(allowed(&shell("pb> "), &shell(&staged)), (None, true, true));
+    // Each change to the pane refuses both guards, with its reason.
+    type Change = fn(&mut PaneCapture);
+    let changes: [(Change, &str); 8] = [
+        (
+            |c| c.inspection.local_agent_tag = Some("p/other".into()),
+            "the pane no longer carries the agent's tag",
+        ),
+        (
+            |c| c.inspection.dead = true,
+            "the shell in the pane has exited",
+        ),
+        (|c| c.inspection.in_mode = true, "the pane is in copy mode"),
+        (
+            |c| c.inspection.pane.pane_pid += 1,
+            "the pane's shell is not known to be its foreground program",
+        ),
+        (
+            |c| c.inspection.foreground_command = Some("vim".into()),
+            "the pane's shell is not known to be its foreground program",
+        ),
+        (
+            |c| c.inspection.foreground_command = None,
+            "the pane's shell is not known to be its foreground program",
+        ),
+        (|c| c.focused = Some(true), "the pane is focused"),
+        (
+            |c| c.focused = None,
+            "whether the pane is focused could not be read",
+        ),
+    ];
+    for (change, reason) in changes {
+        let (mut before, mut after) = (shell("pb> "), shell(&staged));
+        change(&mut before);
+        change(&mut after);
+        assert_eq!(
+            allowed(&before, &after),
+            (Some(reason), false, false),
+            "{reason}"
+        );
+    }
+    // The line: the paste needs it to read the prompt, the Enter the prompt
+    // followed by the command.
+    assert_eq!(
+        allowed(&shell("pb> x"), &shell(&format!("pb> x{text}"))),
+        (None, false, false)
+    );
+    assert_eq!(
+        allowed(&shell(&staged), &shell("pb> ")),
+        (None, false, false)
+    );
+    // A harness's screen in a pane whose shell is in front (a stale frame):
+    // nothing is typed under it. Real capture: Codex's fresh editor.
+    let fresh = include_str!(
+        "../../../atm-codex-adapter/tests/fixtures/screen_styled_p1_b14-fresh-baseline-32-100x32_0.167.0.txt"
+    );
+    let mut stale =
+        capture(fresh, CaptureFormat::Ansi, Some(ROOT), Some("zsh")).with_focus(Some(false));
+    stale.inspection.local_agent_tag = Some("p/lead".into());
+    assert_eq!(
+        shell_refusal(screen, &stale, &baseline, "p/lead"),
+        Some("the pane shows a harness's screen before anything was launched")
+    );
+    assert!(screen.recognises(&stale));
+    assert!(!screen.recognises(&shell("pb> ")));
+}

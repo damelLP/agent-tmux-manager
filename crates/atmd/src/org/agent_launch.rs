@@ -4,9 +4,6 @@
 //! A safe bare binary keeps shell alias expansion; a command prefix puts that
 //! binary outside command position, so alias-only installs cannot use a prefix.
 
-// Not called until slice B's Task 6 wires up the launch flow.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::{agent_flow::launch_text_is_safe, agent_project::PreparedAgent, agents::AgentError};
 use crate::control::{build_spawn_command, launch_policy, shell_quote, spawn_env_override};
 

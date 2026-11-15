@@ -31,10 +31,14 @@ pub struct MethodServices {
     /// None leaves library callers unconfigured; the binary supplies its single
     /// config parse result. Invalid settings disable messages with that cause.
     pub delivery_policy: Option<Result<atm_org::delivery::DeliveryPolicy, String>>,
-    /// One shared receipt/activity store, installed before connections and jobs.
-    pub message_evidence: Option<crate::org::message_evidence::MessageEvidence>,
-    /// Activity tap destination; Applied remains the service watch's sole write.
-    pub message_history: Option<crate::org::message_history::MessageHistoryHandle>,
+    /// The connection tap's two destinations, as one pair: the shared
+    /// receipt/activity store and the history its Activity is forwarded to.
+    /// The server builds both with the message runtime, before it accepts a
+    /// connection, so the tap never has evidence without its history.
+    pub message_tap: Option<(
+        crate::org::message_evidence::MessageEvidence,
+        crate::org::message_history::MessageHistoryHandle,
+    )>,
     /// Production resolves this before daemonization; tests can inject a path.
     /// daemon.info displays non-UTF-8 paths lossily; filesystem use stays exact.
     pub state_dir: PathBuf,
@@ -52,8 +56,7 @@ impl MethodServices {
             agents: None,
             messages: None,
             delivery_policy: None,
-            message_evidence: None,
-            message_history: None,
+            message_tap: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
             raw: crate::org::RawHandle::default(),

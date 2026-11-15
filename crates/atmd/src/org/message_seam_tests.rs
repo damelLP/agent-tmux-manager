@@ -252,6 +252,7 @@ async fn message_runtime_shares_eight_admissions_and_deliver_is_unavailable() {
         org,
         registry,
         control,
+        super::agents::AgentHandle::disabled("no agent service in the seam"),
         MessageEvidence::disabled(clock.clone(), "A2 pending"),
         MessageHistoryHandle::disabled("A1/A2 pending"),
         Default::default(),
@@ -275,7 +276,8 @@ async fn message_runtime_shares_eight_admissions_and_deliver_is_unavailable() {
             Instant::now() + Duration::from_secs(30),
         ))
         .await,
-        "message delivery executor is not configured",
+        // The executor reads history first, and history is disabled.
+        "A1/A2 pending",
     );
     assert!(mock.calls().is_empty());
     cancel.cancel();
@@ -355,36 +357,6 @@ fn message_reference_and_focus_notice_have_one_shared_representation() {
         }
         assert!(!is_focus_notice(&other));
     }
-}
-
-#[test]
-fn message_capture_converter_remains_unavailable() {
-    use crate::control::reservation::{CaptureFormat, PaneCapture, PaneInspection};
-    let capture = PaneCapture::new(
-        String::new(),
-        PaneInspection::new(
-            atm_tmux::PaneInfo {
-                pane_id: "%1".into(),
-                session_name: "private".into(),
-                window_index: 0,
-                pane_pid: 1,
-                width: 80,
-                height: 24,
-                is_active: false,
-            },
-            None,
-            false,
-            false,
-            None,
-            0,
-            0,
-        ),
-        CaptureFormat::Plain,
-    );
-    unavailable(
-        super::messages::recipient_observation(&capture, None, ScreenFacts::default()),
-        "message observation converter is not configured",
-    );
 }
 
 #[test]

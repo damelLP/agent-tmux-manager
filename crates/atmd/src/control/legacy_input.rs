@@ -195,7 +195,40 @@ async fn prepare(
     };
     let pane = canonical(client, target, "send to").await?;
     *audit_pane = Some(pane.to_string());
-    let held = match jobs.input_gate(&pane) {
+    let view = mirror.view();
+    if !admit_input(client, &pane, jobs.input_gate(&pane), &view).await? {
+        return Ok(None);
+    }
+    if let View::Ready(state) = view {
+        sessions.retain(|row| {
+            !row.tmux_pane
+                .as_deref()
+                .and_then(|pane| state.agent_for_pane(pane))
+                .is_some_and(|owner| {
+                    owner
+                        .excluded_session_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == row.id.as_str())
+                })
+        });
+        // Resolve again only after exclusion; never redirect an obsolete prefix.
+        if let Request::Send { target, .. } = &pending.request {
+            crate::control::resolve_pane_id(&sessions, target)?;
+        }
+    }
+    Ok(Some(Prepared { pane, sessions }))
+}
+
+/// Shared reservation/mirror admission: true acts, false parks. No snapshot or
+/// persistence I/O runs here; unavailable organisation state fails closed unless
+/// a fresh pane inspection positively establishes that the pane is untagged.
+pub(super) async fn admit_input(
+    client: &dyn TmuxClient,
+    pane: &PaneId,
+    gate: InputGate,
+    view: &View,
+) -> Result<bool, ServiceError> {
+    let held = match gate {
         InputGate::Free => false,
         InputGate::Held => true,
         InputGate::Clearing(agent) => {
@@ -214,11 +247,11 @@ async fn prepare(
         }
         InputGate::Unavailable => return Err(ServiceError::Unavailable),
     };
-    match mirror.view() {
-        View::Loading => return Ok(None),
-        View::Unavailable if held => return Ok(None),
+    match view {
+        View::Loading => return Ok(false),
+        View::Unavailable if held => return Ok(false),
         View::Unavailable => {
-            if !matches!(pane_ops::inspect(client, &pane).await, Ok(Some(info)) if info.local_agent_tag.is_none())
+            if !matches!(pane_ops::inspect(client, pane).await, Ok(Some(info)) if info.local_agent_tag.is_none())
             {
                 return Err(ControlError::OrganisationUnavailable {
                     pane: pane.to_string(),
@@ -238,24 +271,9 @@ async fn prepare(
                 .into());
             }
             if held {
-                return Ok(None);
-            }
-            sessions.retain(|row| {
-                !row.tmux_pane
-                    .as_deref()
-                    .and_then(|pane| state.agent_for_pane(pane))
-                    .is_some_and(|owner| {
-                        owner
-                            .excluded_session_id
-                            .as_ref()
-                            .is_some_and(|id| id.as_str() == row.id.as_str())
-                    })
-            });
-            // Resolve again only after exclusion; never redirect an obsolete prefix.
-            if let Request::Send { target, .. } = &pending.request {
-                crate::control::resolve_pane_id(&sessions, target)?;
+                return Ok(false);
             }
         }
     }
-    Ok(Some(Prepared { pane, sessions }))
+    Ok(true)
 }

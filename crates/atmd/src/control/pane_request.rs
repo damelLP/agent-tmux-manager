@@ -106,7 +106,7 @@ pub(super) async fn dispatch(
             let operation = format!("{} {target}", operation.verb());
             verify_server(client, server, operation).await?;
         }
-        resolve(client, registry, operation, &target).await
+        resolve(client, registry, operation.verb(), &target).await
     })
     .await;
     // Set once the request is an action: resolved, in time, its caller there.
@@ -144,10 +144,10 @@ pub(super) async fn dispatch(
 }
 
 /// The registry's whole list, as the CLI's `ListSessions` read it before.
-async fn resolve(
+pub(super) async fn resolve(
     client: &dyn TmuxClient,
     registry: &RegistryHandle,
-    operation: Operation,
+    operation: &str,
     target: &str,
 ) -> Result<PaneId, ServiceError> {
     if !registry.is_connected() {
@@ -158,5 +158,5 @@ async fn resolve(
         return Err(ServiceError::Unavailable);
     }
     let pane = crate::control::resolve_pane_id(&sessions, target)?;
-    legacy_input::canonical(client, pane, operation.verb()).await
+    legacy_input::canonical(client, pane, operation).await
 }

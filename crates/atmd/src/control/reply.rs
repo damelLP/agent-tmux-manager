@@ -1,5 +1,9 @@
 //! Legacy prompt navigation, returning the action instead of printing it.
 
+#[cfg(test)]
+#[path = "reply_tests.rs"]
+mod tests;
+
 use atm_core::SessionView;
 use atm_tmux::TmuxClient;
 
@@ -22,18 +26,37 @@ pub async fn reply(
     yes: bool,
     no: bool,
 ) -> Result<ReplyOutcome, ControlError> {
-    let pane_id = resolve_pane_id(sessions, target)?;
+    let pane = resolve_pane_id(sessions, target)?;
+    let prepared = prepare_reply(client, pane, option, yes, no).await?;
+    finish_reply(client, prepared, || Ok(())).await
+}
 
+/// Captured navigation, with no input sent yet. Keep the existing outcome as
+/// the single description of what the caller renders.
+pub(super) struct PreparedReply {
+    outcome: ReplyOutcome,
+    navigation: Option<(&'static str, usize)>,
+}
+
+pub(super) async fn prepare_reply(
+    client: &(impl TmuxClient + ?Sized),
+    pane_id: String,
+    option: Option<usize>,
+    yes: bool,
+    no: bool,
+) -> Result<PreparedReply, ControlError> {
     if no {
-        // Escape dismisses/cancels the prompt
-        send_key(client, &pane_id, "Escape").await?;
-        return Ok(ReplyOutcome::Escape { pane: pane_id });
+        return Ok(PreparedReply {
+            outcome: ReplyOutcome::Escape { pane: pane_id },
+            navigation: None,
+        });
     }
 
     if yes || option.is_none() {
-        // Just press Enter to accept current selection
-        send_key(client, &pane_id, "Enter").await?;
-        return Ok(ReplyOutcome::Enter { pane: pane_id });
+        return Ok(PreparedReply {
+            outcome: ReplyOutcome::Enter { pane: pane_id },
+            navigation: None,
+        });
     }
 
     // Navigate to the desired option number
@@ -50,27 +73,44 @@ pub async fn reply(
 
     let current = find_selected_option(&lines).unwrap_or(1);
 
-    if desired == current {
-        // Already on the right option, just press Enter
-        send_key(client, &pane_id, "Enter").await?;
-    } else if desired > current {
-        // Navigate down
-        for _ in 0..(desired - current) {
-            send_key(client, &pane_id, "Down").await?;
-        }
-        send_key(client, &pane_id, "Enter").await?;
-    } else {
-        // Navigate up
-        for _ in 0..(current - desired) {
-            send_key(client, &pane_id, "Up").await?;
-        }
-        send_key(client, &pane_id, "Enter").await?;
-    }
-
-    Ok(ReplyOutcome::Selected {
-        pane: pane_id,
-        option: desired,
+    Ok(PreparedReply {
+        outcome: ReplyOutcome::Selected {
+            pane: pane_id,
+            option: desired,
+        },
+        navigation: Some((
+            if desired > current { "Down" } else { "Up" },
+            desired.abs_diff(current),
+        )),
     })
+}
+
+/// Admission is checked for every key, even when tmux futures are immediately
+/// ready. The legacy caller supplies a no-op; the daemon supplies its deadline.
+pub(super) async fn finish_reply<E: From<ControlError>>(
+    client: &(impl TmuxClient + ?Sized),
+    prepared: PreparedReply,
+    mut before_key: impl FnMut() -> Result<(), E>,
+) -> Result<ReplyOutcome, E> {
+    let pane = match &prepared.outcome {
+        ReplyOutcome::Escape { pane }
+        | ReplyOutcome::Enter { pane }
+        | ReplyOutcome::Selected { pane, .. } => pane,
+    };
+    if let Some((key, count)) = prepared.navigation {
+        for _ in 0..count {
+            before_key()?;
+            send_key(client, pane, key).await?;
+        }
+    }
+    before_key()?;
+    let key = if matches!(prepared.outcome, ReplyOutcome::Escape { .. }) {
+        "Escape"
+    } else {
+        "Enter"
+    };
+    send_key(client, pane, key).await?;
+    Ok(prepared.outcome)
 }
 
 async fn send_key(

@@ -814,12 +814,16 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
     // A session no ready agent is bound to gets no note.
     let unbound = SessionId::new("other");
     assert_eq!(context_note(&state, &unbound, 90.0, &limits, now), None);
-    rig.run(OrgCommand::Clear {
+    // An agent that is not ready gets none, though it keeps its session.
+    rig.run(OrgCommand::Stuck {
         agent_id: id("worker"),
+        reason: "a dialog nobody answered".into(),
     })
     .await;
-    let clearing = rig.state().await;
-    assert_eq!(context_note(&clearing, &s1, 90.0, &limits, now), None);
+    let stuck = rig.state().await;
+    let worker = stuck.agent(&id("worker")).unwrap();
+    assert_eq!(worker.session_id.as_ref(), Some(&s1));
+    assert_eq!(context_note(&stuck, &s1, 90.0, &limits, now), None);
 }
 
 #[tokio::test]

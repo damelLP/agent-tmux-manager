@@ -246,6 +246,12 @@ impl Clearing {
 
 /// A SessionStart of `id` from the harness process on %1. The registry keys
 /// rows by process: a new id from the same process replaces its row.
+///
+/// The process id is one no process can have. For a real one the registry
+/// reads that process's directory from `/proc` and looks its git repository
+/// up on an OS thread, and these tests run on a paused clock, which goes only
+/// with in-memory work: on a loaded host virtual time ran past a 5 s budget
+/// before the real lookup answered.
 async fn start_session(rig: &Rig, harness: Harness, id: &str, source: Option<&str>) {
     rig.registry
         .apply_lifecycle_event(
@@ -254,7 +260,7 @@ async fn start_session(rig: &Rig, harness: Harness, id: &str, source: Option<&st
                 source: source.map(Into::into),
             },
             harness,
-            Some(std::process::id()),
+            Some(u32::MAX - 1),
             Some("%1".into()),
         )
         .await
@@ -785,6 +791,150 @@ async fn clear_enter_outcome_unknown_never_repeats_enter() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_guard_refusal_that_sent_nothing_is_not_an_unknown_outcome() {
+    // Review 23, probes r2 and r2b. The flow's own capture was clean, and the
+    // control actor refuses on the capture of the paste's guard (`at_paste`)
+    // or of the Enter's. Twins with an uncertain error: the two
+    // *_outcome_unknown_* tests.
+    type Change = fn(&mut PaneCapture);
+    let passing: [(&str, Change); 2] = [
+        ("copy mode", |capture| capture.inspection.in_mode = true),
+        ("a dead pane", |capture| capture.inspection.dead = true),
+    ];
+    for at_paste in [true, false] {
+        // The pane refuses input for now: nothing was sent, and the flow
+        // looks again. The pane allows it later, and the clear completes.
+        for (label, change) in passing {
+            let mut clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+            clearing.frame(CLAUDE_CONVERSATION);
+            if at_paste {
+                clearing.frame_with(CLAUDE_CONVERSATION, change);
+            }
+            clearing.frame(CLAUDE_CONVERSATION);
+            clearing.frame(CLAUDE_STAGED);
+            if !at_paste {
+                clearing.frame_with(CLAUDE_STAGED, change);
+                clearing.frame(CLAUDE_STAGED);
+            }
+            clearing.frame(CLAUDE_STAGED);
+            clearing.frame(CLAUDE_CLEARED);
+            clearing.follow_up();
+            clearing.follow_up();
+            let call = clearing.start();
+            clearing.awaiting_session().await;
+            clearing.session_start("new", Some("clear")).await;
+            let result = call.await.unwrap();
+            assert!(result.is_ok(), "{label}, at the paste {at_paste}: {result:?}");
+            assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+            clearing.settled().await;
+            assert_eq!(clearing.unread(), 0, "{label}, at the paste {at_paste}");
+        }
+        // The pane is not the agent's any more, or is gone: nothing was sent,
+        // and the clear stops saying so.
+        for gone in [false, true] {
+            let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+            clearing.frame(CLAUDE_CONVERSATION);
+            if !at_paste {
+                clearing.frame(CLAUDE_CONVERSATION);
+                clearing.frame(CLAUDE_STAGED);
+            }
+            if gone {
+                clearing.rig.client.script_inspect(&pane("%1"), None).unwrap();
+            } else {
+                clearing.frame_with(CLAUDE_STAGED, |capture| {
+                    capture.inspection.local_agent_tag = Some("p/other".into());
+                });
+            }
+            let result = clearing.clear().await;
+            assert!(
+                matches!(result, Err(AgentError::Reservation(_))),
+                "{result:?}"
+            );
+            let sent: &[&str] = if at_paste { &[] } else { &["paste %1 /clear"] };
+            assert_eq!(clearing.sent(), sent, "gone {gone}");
+            let what = if at_paste { "typing" } else { "submitting" };
+            clearing
+                .assert_stuck_with(&format!(
+                    "{what} the clear command was refused, and nothing was sent by it (pane %1"
+                ))
+                .await;
+            assert_eq!(clearing.unread(), 0, "gone {gone}, at the paste {at_paste}");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_during_the_enter_says_the_command_may_have_been_submitted() {
+    // Review 23, follow-up 1. tmux takes the Enter and its call does not
+    // return before the clear's deadline: the agent is Stuck, and the reason
+    // must not say that the command never appeared in the editor.
+    let mut clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+    clearing.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+    let call = clearing.start();
+    progress(&mut clearing.events, "clear_submitting", Some("p/lead")).await;
+    clearing.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+    clearing
+        .assert_stuck("the clear command was being submitted and may have reached the harness")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_that_starts_before_the_enter_is_not_the_clears_proof() {
+    // Review 23, probe r3. Somebody clears by hand in the agent's pane after
+    // the flow's first read and before its Enter: that session is not what
+    // the flow's Enter produced. The flow waits for one that starts after it.
+    // Twin: clear_types_submits_and_binds_the_new_session.
+    for (harness, command, conversation, staged, cleared) in ANNOUNCING {
+        let mut clearing = Clearing::new(harness, Old::SameProcess).await;
+        let mut committed = clearing.rig.org.committed.subscribe();
+        clearing.frames_through_enter(conversation, staged);
+        clearing.frame(cleared);
+        let call = clearing.start();
+        // The Clear is committed after the precheck's capture, and the
+        // paste's guard is paced after that capture.
+        loop {
+            if committed.recv().await.unwrap().kind == "agent.clear_requested" {
+                break;
+            }
+        }
+        clearing.session_start("early", Some("clear")).await;
+        clearing.awaiting_session().await;
+        assert_eq!(
+            clearing.sent(),
+            [format!("paste %1 {command}"), "keys %1 Enter".to_owned()],
+        );
+        let agent = clearing.agent().await;
+        assert_eq!(
+            (agent.status, agent.session_id.clone()),
+            (AgentStatus::Clearing, None),
+            "{harness:?}"
+        );
+        clearing.session_start("new", Some("clear")).await;
+        let result = call.await.unwrap().unwrap();
+        assert_eq!(
+            result.session_id,
+            Some(SessionId::new("new")),
+            "{harness:?}"
+        );
+        assert_eq!(
+            clearing.agent().await.session_id,
+            Some(SessionId::new("new"))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn clear_paste_outcome_unknown_never_repeats_paste() {
     let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
     let mut committed = clearing.rig.org.committed.subscribe();
@@ -1134,4 +1284,44 @@ async fn missed_hook_conversation_not_noop() {
         ["agent.clear_requested", "agent.editor_ready"]
     );
     assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
+}
+
+#[tokio::test]
+async fn clear_timeout_outside_its_range_is_refused_with_the_agent_unchanged() {
+    // Through the method, with a Ready agent behind it: a timeout under the
+    // floor (or over the ceiling) is refused before the clear is asked for,
+    // so nothing is read, sent or recorded. Twin: the floor itself reaches
+    // the clear's own precheck, which refuses for another reason.
+    const RANGE: &str = "invalid agent parameters: timeout_ms must be in 5000..=120000";
+    let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+    let mut router = crate::server::methods::MethodRouter::default();
+    crate::org::agent_methods::register_agent_methods(&mut router, clearing.agents.clone())
+        .unwrap();
+    let before = clearing.rig.org.snapshot().await.unwrap();
+    let mut committed = clearing.rig.org.committed.subscribe();
+    let clear = |timeout: u64| {
+        router.call(
+            caller(),
+            "agent.clear",
+            serde_json::json!({"agent": "p/lead", "timeout_ms": timeout}),
+        )
+    };
+    for timeout in [0, 1, 4_999, 120_001] {
+        let error = clear(timeout).await.unwrap_err().0;
+        assert_eq!(error.code, "invalid_params", "{timeout}");
+        assert_eq!(error.message, RANGE, "{timeout}");
+    }
+    assert_eq!(clearing.rig.org.snapshot().await.unwrap(), before);
+    assert!(committed_kinds(&mut committed).is_empty());
+    assert!(mutations(&clearing.rig).is_empty());
+
+    clearing.frame_with(CLAUDE_CONVERSATION, |c| c.focused = Some(true));
+    let error = clear(5_000).await.unwrap_err().0;
+    assert_eq!(error.code, "refused");
+    assert!(
+        error.message.contains("the pane is focused"),
+        "{}",
+        error.message
+    );
+    assert_eq!(clearing.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
 }

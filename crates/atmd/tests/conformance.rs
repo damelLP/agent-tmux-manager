@@ -410,7 +410,7 @@ async fn agent_methods_are_advertised_enabled_or_explicitly_disabled() {
         client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"invalid","method":"agent.clear","params":{"agent":"project/lead","timeout_ms":0}})).await;
         assert_eq!(
             client.recv().await,
-            json!({"type":"response","id":"invalid","error":{"code":"invalid_params","message":"invalid agent parameters: timeout_ms must be in 1..=120000"}})
+            json!({"type":"response","id":"invalid","error":{"code":"invalid_params","message":"invalid agent parameters: timeout_ms must be in 5000..=120000"}})
         );
         client.require_next_pong().await;
         server.stop().await;

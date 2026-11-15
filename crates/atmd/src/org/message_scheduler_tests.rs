@@ -1047,6 +1047,70 @@ async fn unobservable_recipient_says_so_tells_the_owner_once_and_never_pastes() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn unobservable_stuck_recipient_keeps_its_reason_and_resumes_when_ready() {
+    let mut rig = ManualJob::new().await;
+    rig.command(OrgCommand::Stuck {
+        agent_id: worker(),
+        reason: "needs recovery".into(),
+    })
+    .await;
+    let id = rig.send().await;
+    rig.round(0).await;
+    assert!(rig.job.lost.is_some());
+    let now = rig.job.service.rt.clock.now().unwrap();
+    let live = rig.job.service.rt.history.snapshot(id, now).unwrap().live;
+    assert_eq!(live.agent_status, atm_org::AgentStatus::Stuck);
+    assert!(live.owner_focused);
+    let notice = blocked_notice(id, "recipient agent is stuck or down", &[], false);
+    // Completed rounds before, at and beyond the 120 s loss deadline must
+    // keep the blocked reason and never add an unobserved notice or paste.
+    for elapsed in [0, 119_999, 1, 3_600_000] {
+        rig.round(elapsed).await;
+        let inbox = rig
+            .messages
+            .inbox(
+                InboxParams {
+                    recipient: Some(Address::Agent(worker())),
+                    id: Some(id),
+                    ..page()
+                },
+                owner(),
+            )
+            .await
+            .unwrap();
+        let entry = inbox.messages.first().unwrap();
+        assert_eq!(entry.status, DeliveryStatus::Queued);
+        assert_eq!(entry.delivery.phase, DeliveryPhase::Blocked);
+        assert_eq!(
+            entry.delivery.reason.as_deref(),
+            Some("recipient agent is stuck or down")
+        );
+        assert_eq!(entry.delivery.attempt, 0);
+        assert_eq!(rig.notes().await, std::slice::from_ref(&notice));
+    }
+    // The fake executor panics on any earlier dispatch. Now allow a real
+    // scheduled attempt through the rig, including its receipt and fold.
+    rig.job.effects.deliver = Arc::new(|rt, id, _| Box::pin(perform(rt, id, Act::Deliver)));
+    rig.screens.set(worker(), ready("%1", "s1"));
+    rig.command(OrgCommand::Adopt {
+        agent_id: worker(),
+        pane: "%1".into(),
+        session_id: Some("s1".into()),
+    })
+    .await;
+    rig.round(0).await;
+    assert!(rig.job.lost.is_none());
+    rig.round(10_000).await;
+    rig.round(0).await;
+    let now = rig.job.service.rt.clock.now().unwrap();
+    let snapshot = rig.job.service.rt.history.snapshot(id, now).unwrap();
+    assert_eq!(snapshot.live.agent_status, atm_org::AgentStatus::Ready);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+    assert_eq!(snapshot.message.last_attempt.unwrap().attempt, 1);
+    assert_eq!(rig.notes().await, [notice]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn one_unobserved_notice_for_the_oldest_open_message() {
     let bench = Bench::blind().await;
     let first = bench.send(worker(), "first").await;

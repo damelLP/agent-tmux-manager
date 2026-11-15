@@ -393,19 +393,25 @@ fn render(method: &str, raw: &Value, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-pub async fn cmd_task(args: TaskArgs) -> Result<()> {
-    let (method, params) = command(args.action)?;
-    let budget = if matches!(method, "task.list" | "task.get") {
+fn request_budget(method: &str) -> Duration {
+    if matches!(method, "task.list" | "task.get") {
         READ_BUDGET
     } else {
         MUTATION_BUDGET
-    };
-    let raw = super::rpc::call(method, params, budget)
+    }
+}
+fn request_error(error: super::rpc::RpcError) -> anyhow::Error {
+    match error {
+        super::rpc::RpcError::Timeout => anyhow::Error::new(TaskError::Timeout),
+        other => anyhow::anyhow!("{}", escaped(&other.to_string(), false)),
+    }
+}
+
+pub async fn cmd_task(args: TaskArgs) -> Result<()> {
+    let (method, params) = command(args.action)?;
+    let raw = super::rpc::call(method, params, request_budget(method))
         .await
-        .map_err(|error| match error {
-            super::rpc::RpcError::Timeout => anyhow::Error::new(TaskError::Timeout),
-            other => anyhow::anyhow!("{}", escaped(&other.to_string(), false)),
-        })?;
+        .map_err(request_error)?;
     let mut out = io::stdout().lock();
     match args.format {
         // JSON is the raw daemon answer, independent of this build's text schema.
@@ -422,5 +428,39 @@ pub async fn cmd_task(args: TaskArgs) -> Result<()> {
             })?;
             Ok(out.write_all(&text)?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Break caught: swapping read/mutation budgets reports accepted slow work as timed out.
+    #[test]
+    fn each_task_method_gets_its_router_budget_plus_margin() {
+        for (method, seconds) in [
+            ("task.create", 35),
+            ("task.assign", 35),
+            ("task.set_state", 35),
+            ("task.submit", 35),
+            ("task.attach", 35),
+            ("task.review", 35),
+            ("task.verdict", 35),
+            ("task.list", 15),
+            ("task.get", 15),
+        ] {
+            assert_eq!(
+                request_budget(method),
+                Duration::from_secs(seconds),
+                "{method}"
+            );
+        }
+    }
+
+    // Break caught: removing the Timeout arm loses the task outcome-unknown warning.
+    #[test]
+    fn task_timeout_keeps_outcome_unknown_advice() {
+        assert_eq!(request_error(super::super::rpc::RpcError::Timeout).to_string(),
+            "task request timed out; accepted work may complete; inspect tasks and inbox before retrying");
     }
 }

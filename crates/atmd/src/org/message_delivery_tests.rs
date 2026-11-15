@@ -729,7 +729,7 @@ enum Fold {
 /// A real organisation writer whose appends stay in memory and pass a gate,
 /// one `Applied` writer (the service's fold loop, or the test by hand), the
 /// real control actor over per-pane tmux scripts and, for the attempt tests,
-/// the real agent service with a pi agent on %1.
+/// the real agent service with a pi or unbound Codex agent on %1.
 struct Rig {
     org: OrgHandle,
     rt: MessageRuntime,
@@ -1382,8 +1382,9 @@ fn staged(id: MessageId) -> PaneCapture {
     capture
 }
 
-/// Real Codex 0.167.0 fresh editor used by the restart check; provenance
-/// is recorded with the adapter's fixture. No harness process is started.
+/// Real Codex 0.167.0 fresh editor supplying the startup inspection's
+/// metadata; a Ready unbound agent needs no restart capture. Provenance is
+/// recorded with the adapter's fixture. No harness process is started.
 const CODEX_IDLE: &str = include_str!(
     "../../../atm-codex-adapter/tests/fixtures/screen_styled_u5b_rich-fresh_0.167.0.txt"
 );

@@ -125,13 +125,26 @@ fn persist_with(
     if text.len() > RULE_BYTES {
         return Err(refused(&path, "rules plus answer exceed 1048576 bytes"));
     }
-    fs::create_dir_all(&dir).map_err(|e| file_error(&dir, e))?;
+    fs::create_dir(&dir)
+        .or_else(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| file_error(&dir, e))?;
     if !fs::symlink_metadata(&dir)
         .map_err(|e| file_error(&dir, e))?
         .is_dir()
     {
         return Err(refused(&dir, "not a regular policy directory"));
     }
+    // Persist the .atm directory's parent entry too when this command creates it.
+    // Never recreate a missing checkout or any of its ancestors.
+    fs::File::open(root)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| file_error(root, e))?;
     let permissions = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
         Ok(_) => return Err(refused(&path, "not a regular policy file")),

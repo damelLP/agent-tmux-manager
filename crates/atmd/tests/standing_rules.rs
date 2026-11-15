@@ -262,6 +262,31 @@ async fn overruled_rule_records_the_final_owner_answer() {
     assert!(!text.contains("Answer: no"));
 }
 
+// Break caught: a stale registered root causing the daemon to recreate an entire project tree.
+#[tokio::test]
+async fn missing_project_root_is_not_recreated_by_a_rule_command() {
+    let rig = Rig::new().await;
+    let missing = rig.dir.path().join("missing-project");
+    rig.org
+        .execute(
+            OrgCommand::RegisterProject {
+                project_id: "p".parse().unwrap(),
+                root: missing.to_str().unwrap().into(),
+                move_root: true,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let id = rig.request().await;
+    let error = rig.resolve(id, None, true).await.unwrap_err();
+    assert!(error.0.message.contains("committed"));
+    assert!(
+        !missing.exists(),
+        "only the policy directory/file may be created, not a missing checkout"
+    );
+}
+
 // Break caught: following a rules symlink, changing permissions, or publishing an unreadable-sized file.
 #[tokio::test]
 async fn rule_files_are_bounded_regular_and_keep_existing_permissions() {

@@ -32,6 +32,10 @@ pub mod agents;
 #[cfg(test)]
 mod agents_tests;
 pub mod message_delivery;
+#[cfg(test)]
+mod message_delivery_gate;
+#[cfg(test)]
+mod message_delivery_gate_tests;
 pub mod message_evidence;
 pub mod message_history;
 #[cfg(test)]

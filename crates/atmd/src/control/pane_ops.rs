@@ -232,8 +232,9 @@ pub(super) async fn execute(
                         .await
                 }
                 Input::LiteralKey(key) => {
-                    // tmux parses a bare semicolon as a command separator even
-                    // after --. Verified with a raw receiver on private tmux 3.8.
+                    // On tmux 3.8, a bare ';' returns success but delivers nothing,
+                    // even after --; '\;' delivers ';'. Keep the escape to avoid
+                    // reporting a key sent when none arrived (private raw-byte probe).
                     let encoded = if key == ';' {
                         "\\;".into()
                     } else {

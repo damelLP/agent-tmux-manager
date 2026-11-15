@@ -1557,7 +1557,11 @@ async fn second_adopt_of_a_clearing_agent_changes_nothing() {
     // own proof: an adopt answers Clearing and reads, tags and writes nothing,
     // on a safe idle screen, with only a discovery row and with a new session
     // on the pane. Twin: second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready.
-    for session in [None, Some("s2")] {
+    for (session, another) in [
+        (None, None),
+        (Some("s2"), None),
+        (Some("s2"), Some("s3")),
+    ] {
         let adoption = ready_with_role().await;
         adoption
             .rig
@@ -1566,6 +1570,10 @@ async fn second_adopt_of_a_clearing_agent_changes_nothing() {
             })
             .await;
         if let Some(session) = session {
+            row_arrives(&adoption, session).await;
+        }
+        // Even two eligible sessions cannot override the Clearing answer.
+        if let Some(session) = another {
             row_arrives(&adoption, session).await;
         }
         let recorded = adoption.agent().await.unwrap();

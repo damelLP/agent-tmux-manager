@@ -418,6 +418,12 @@ mod legacy_input_tests;
 mod legacy_input;
 #[path = "org_mirror.rs"]
 mod org_mirror;
+#[path = "pane_request.rs"]
+mod pane_request;
+
+#[cfg(test)]
+#[path = "pane_request_tests.rs"]
+mod pane_request_tests;
 
 use std::{
     collections::VecDeque,
@@ -514,6 +520,14 @@ enum Request {
         pane: String,
         command: String,
         reply: Reply<()>,
+    },
+    Kill {
+        target: String,
+        reply: Reply<String>,
+    },
+    Interrupt {
+        target: String,
+        reply: Reply<String>,
     },
 }
 
@@ -697,6 +711,19 @@ impl ControlHandle {
             reply,
         })
         .await
+    }
+
+    /// Close the target's pane and return its id. Acts in the actor's order
+    /// without waiting for a reservation on the pane, and is never refused by one.
+    pub async fn kill(&self, target: String) -> Result<String, ServiceError> {
+        self.request(|reply| Request::Kill { target, reply }).await
+    }
+
+    /// Send Ctrl+C to the target's pane and return its id. Never waits for a
+    /// reservation on the pane; refused while the pane is cleared or quarantined.
+    pub async fn interrupt(&self, target: String) -> Result<String, ServiceError> {
+        self.request(|reply| Request::Interrupt { target, reply })
+            .await
     }
 
     pub async fn prepare_spawn(
@@ -896,6 +923,9 @@ where
                                 }
                             }
                             jobs.dispatch(command, Instant::now(), work.is_cancelled(), &*client).await;
+                        }
+                        pending if pane_request::is_pane_request(&pending) => {
+                            pane_request::dispatch(&*client, &registry, &mut jobs, pending, &audits).await;
                         }
                         pending if legacy_input::is_input(&pending) => {
                             if let Some(pending) = legacy_input::dispatch(&*client, &registry, &mut jobs, &mirror, pending, &audits, !stopping && parked.len() < CAPACITY).await {

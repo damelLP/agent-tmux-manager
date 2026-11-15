@@ -147,7 +147,12 @@ pub(super) async fn dispatch(
     None
 }
 
-async fn canonical(client: &dyn TmuxClient, target: String) -> Result<PaneId, ServiceError> {
+/// `operation` is the refusal's verb phrase: "send to", "kill", "interrupt".
+pub(super) async fn canonical(
+    client: &dyn TmuxClient,
+    target: String,
+    operation: &str,
+) -> Result<PaneId, ServiceError> {
     if let Ok(pane) = PaneId::parse(target.clone()) {
         return Ok(pane);
     }
@@ -160,7 +165,7 @@ async fn canonical(client: &dyn TmuxClient, target: String) -> Result<PaneId, Se
         })?;
     PaneId::parse(resolved.trim_end_matches('\n')).map_err(|_| {
         ServiceError::ServerRefused(format!(
-            "Refusing to send to {target}: cannot resolve a canonical pane"
+            "Refusing to {operation} {target}: cannot resolve a canonical pane"
         ))
     })
 }
@@ -188,7 +193,7 @@ async fn prepare(
         Request::Type { pane, .. } => pane.clone(),
         _ => return Err(ServiceError::Unavailable),
     };
-    let pane = canonical(client, target).await?;
+    let pane = canonical(client, target, "send to").await?;
     *audit_pane = Some(pane.to_string());
     let held = match jobs.input_gate(&pane) {
         InputGate::Free => false,

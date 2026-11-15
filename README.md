@@ -84,6 +84,8 @@ atm send <id> "fix the tests"     # send text to agent
 atm reply <id> --yes               # accept a permission prompt
 atm peek <id> --prompt             # extract the active prompt
 atm list -f json --status working  # list working agents as JSON
+atm decisions                      # pending/provisional decisions for you
+atm decide d41 yes 'Approved'      # owner answer; --rule records a rule mark
 atm status                         # one-line summary for tmux status bar
 
 atm workspace create               # new session with ATM sidebar + agent + shell
@@ -99,11 +101,12 @@ atm layout pair                    # two agents + ATM sidebar
 atm agent up worker                          # start the agent of role "worker" in this project
 atm agent up worker --project-root ../other  # ... in another project
 atm agent clear worker                      # clear the agent's current context
+atm agent handover worker                   # ask it to save its state, then clear it
 atm agent respawn worker                    # replace its pane and start it again
 atm agent down worker --kill                # stop the agent and kill its pane
 ```
 
-For `clear`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
+For `clear`, `handover`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
 
 `atm agent up <name>` asks `atmd` to start the agent that `.atm/roles/<name>.md` under the project root describes. The project root is the current directory unless `--project-root` is given. `atmd` splits a new pane at 50% without moving your focus, waits there for an idle shell, types one launch line and Enter, and waits for the harness. The line is `cd <the role's cwd> && ATM_AGENT=<project>/<name>`, then the role's `command_prefix`, then the harness command with the role's `spawn_args` and `model`.
 
@@ -117,6 +120,26 @@ For `clear`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name r
 - **A start has 60 seconds** (the command itself waits up to 85). Once `atmd` knows the start is recorded, any failure, and the deadline, leave the agent `stuck` with the reason `start did not complete: <why>; inspect %N` and one note in your inbox. When the deadline ends it, the command fails with that same reason, not with a bare timeout. `atm agent clear` at its `--timeout-ms` and `atm agent respawn` at its 60 seconds answer the same way: the command fails with the reason the agent is then `stuck` with (`clear did not complete: <why>; inspect %N` for a clear), not with a bare timeout. Two cases end otherwise: if the answer to recording the start is lost, there is no `stuck` and no note, and the agent goes `down` at the next check of its pane; and if `atmd` cannot read its log or write the `stuck` record when the start ends, the agent stays `starting` and takes no further command until `atmd` is restarted. A pane the start created stays for you to look at. If the start failed before its pane was recorded, the agent then goes `down` and its reason keeps that text.
 - **Start dialogs.** `atmd` answers two questions a harness may ask at its start, each key only while the pane still shows that same question and no tmux client is focused on it. A folder trust dialog (Claude Code's, Codex's "Folder access") is accepted only when its folder is exactly one of the role's `trust_dirs` (resolved against the project root); any other folder ends the start as stuck with no key sent. Codex's update offer is skipped with one Escape. Every other question (Codex's "Hooks need review", a startup warning, a permission dialog) is left for you: the start ends as stuck, or waits until its 60 seconds are over.
 - **The start line.** When `atm agent up`, `atm agent respawn` or `atm agent clear` ends with the agent `ready`, `atmd` queues one note from `system` to the agent and types it into the agent's editor as `[mN] New session: run atm me`, so that the new session finds its role, memory file and messages by itself. This starts a model turn. It is delivered like any message (see [Confirmed messages and inbox](#confirmed-messages-and-inbox)): only into an empty editor of an idle session, never into a draft or the pane you are focused on, and confirmed by the harness's own prompt event; you see it in `atm inbox --for <agent>`, and `atm me` does not list it. Messages to an agent are typed oldest first, so one queued before the start line is typed before it. A second start line is not queued while one to the agent is still waiting. A start or clear that does not end `ready` queues none, and neither does `atm agent adopt`. If the agent goes `down` or `stuck` before its start line is delivered (a respawn records it `down` for a moment, so it can do this too), the line is blocked: you get a `mN blocked: recipient agent is stuck or down` note and your `[notify]` command runs. Delivery resumes when the agent is `ready` again, and `atm msg give-up mN` cancels it. Set `ATM_SPAWN_START_LINE=off` in the environment `atmd` was started in to turn start lines off.
+
+### Handing an agent over
+
+`atm agent handover <agent>` does in one command what a clear by hand needs three steps for. `atmd` sends the agent one message that asks it to write what its next session needs to `.atm/memory/<name>.md` in the project's main checkout. It waits until that turn has ended and the file has changed, and then clears the agent as `atm agent clear` does. The new session finds the file through `atm me`.
+
+```bash
+atm agent handover worker                      # waits up to 10 minutes for the save, then clears
+atm agent handover worker --timeout-ms 120000  # 30000 to 1800000
+atm agent handover worker --format json        # {"agent_id":…,"message_id":"m12","state":"cleared","session_id":…}
+```
+
+- **Nothing is cleared unless the agent saved.** `atmd` notes the memory file's size and modification time when the command starts, just before it queues the request. Saved means that, once the save turn has ended, the file is there and either differs from that or is new. A change made before the request reaches the agent counts too, for example by an agent that writes its file and asks for its own handover in the same turn. The content is not read. If the save turn ends and the file is as it was, or it has been removed, the command fails with `<agent> ended its save turn and <file> did not change; nothing was cleared`.
+- **The request is an ordinary message** from `system`, typed as `[mN] Read: atm inbox --id mN` under the usual delivery rules: an idle agent, an empty editor, no dialog, and not the pane you are focused on. If it is not delivered within the timeout the command fails and says so. The request stays queued, the next `atm agent handover` of that agent reuses it, and `atm msg give-up mN` cancels it.
+- **If the save turn does not end in time** the command fails with `<agent>'s save turn did not end in <n> s`, and adds `it waits at a dialog in %N` when the agent is waiting for an answer, for example a permission to write the file.
+- **If the clear is refused after the save** (you are focused on the pane, a draft is in the editor, a new turn has started) the command fails with `<agent> saved its state (mN); ` followed by the clear's own reason. Run `atm agent clear <agent>` when the pane is free.
+- **An agent may hand itself over.** From its own pane the command answers `started` at once, because the request can only arrive after the agent's current turn has ended. The agent then ends its turn, is asked to save, and is cleared. If that handover fails, the agent's manager (you, when its role names none) gets one note with the reason. The same note is sent when another caller's command is gone before the handover fails, for example a command that was killed while it waited: the handover carries on, and its failure goes to the agent's manager instead. From an agent's shell, whose tools may stop a long command, run a handover in the background.
+- **Only a `ready` agent with a known session** can be handed over, and one handover per agent runs at a time. Anyone may ask, as for messages.
+- **A restart of `atmd` during a handover** loses it: the request is still delivered and the agent saves, but nothing is cleared. Run the command again.
+
+**A note at the context line.** When a named agent's turn ends and its context is at 40% or more, `atmd` sends one note to the agent's manager (to you for an agent whose role names none, and for an adopted agent): `agent <id> is at <n>% of its context (line 40%). Hand it over: atm agent handover <id>`. It is sent once per session and nothing is cleared. After a restart of `atmd` a session that was already noted can be noted once more. The line is 40% for every harness and model until measurements give better ones.
 
 ### Finding your instructions and handover
 
@@ -201,6 +224,57 @@ pane_gone_grace = { secs = 2, nanos = 0 }
 
 Durations must be positive and fit the policy's checked timestamp arithmetic; retry delays must be nondecreasing. Maximum attempts are the number of retry delays plus one (four by default); an empty retry list permits one attempt. Timing defaults do not prove a harness editor is safe: observations and safety guards still control delivery.
 
+## Decisions
+
+Named agents raise questions through `decision.request`; the owner answers from an **unbound** shell:
+
+```sh
+atm decisions                         # pending + taken provisionally
+atm decisions --status resolved        # repeat --status to combine states
+atm decisions --all --format json
+atm decisions --after d41 --limit 20
+atm decide d41 yes 'Use the smaller interface'
+atm decide d41 yes 'Always use this shape' --rule --format json
+```
+
+IDs are `d` plus the request event's sequence (`d41`, not `d041`). Options and notes are exact strings: quote multiword values; there is no trimming or case folding. `--format json` preserves the complete daemon result, including additive fields; text escapes terminal controls. `--all` conflicts with `--status`. Request creation and withdrawal are API methods, not extra CLI commands.
+
+An agent pane sees its own requests; an unbound owner caller sees all. Pending and provisional decisions remain on the default list, with separate `pending_count` and `provisional_count` totals. Counts cover the caller's scope, not just the page or status filter. `atm status` independently asks for the global **Pending-only** count, even from an agent pane: nonzero adds `N decisions`, zero adds nothing, and missing/unavailable/bad aggregate data adds `? decisions` plus a diagnostic without hiding session or unread counts. A provisional decision is not counted as pending; it remains in `atm decisions`.
+
+Only the owner resolves. A pane bound to an agent is refused; an unbound pane (or absent pane) counts as owner, just as for messages. This is **attribution, not authentication**: clients supply their pane, and processes running as the owner can claim an unbound one. Resolved/overruled log bodies include the optional caller pane; the fold and repeat rule ignore that audit metadata. Old bodies without it still replay unchanged.
+
+The exact same answer (option, note and rule mark) again is an accepted no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. `--rule` currently **records the standing-rule mark only**; it does not append a project rules file. Away/provisional scheduling, automatic deadline expiry, and rule-file updates are separate features; D2 stores a deadline but does not run an expiry timer.
+
+### Decision API
+
+After the normal 1.1 connect handshake, a named agent can send this request envelope (one JSON line):
+
+```json
+{"protocol_version":{"major":1,"minor":1},"type":"request","id":"question-1","method":"decision.request","from_pane":"%7","params":{"kind":"plan","title":"Approve this plan","context":"Choose the smaller interface","files":["plan.md"],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true,"deadline":null}}
+```
+
+`requester` and `by` are never accepted params; the daemon derives them from the caller pane. Owner/unbound callers cannot request; internal system requests are separate. All params reject unknown fields; IDs and timestamps are validated. New kinds must be `action`, `hire`, `budget`, `policy`, `plan` or `dialog`; later kinds replay as `unknown` but cannot be newly requested through this daemon.
+
+| Method | Params | Result |
+|---|---|---|
+| `decision.request` | Required `kind`, `title`, `options`, `may_be_undone`, `changes_intent`; optional `context=""`, `files=[]`, `recommended=null`, `deadline=null` | `{"decision_id":"d41"}` |
+| `decision.list` | Optional `statuses=null` (pending + provisional), `after=null`, `limit=100` (1–1000), `count_only=false` | `decisions`, `pending_count`, `provisional_count`, `next_after` |
+| `decision.get` | `id` | `{"decision":<entry>}` |
+| `decision.resolve` | `id`, `option`; optional `note=null`, `standing_rule=false` | `{"decision":<entry>,"changed":true}` |
+| `decision.withdraw` | `id`; optional `reason=null`; requester or owner only | Same mutation result |
+
+An entry reuses the decision's `id`, `request`, timestamps, `status`, provisional/resolution/withdrawal facts, and derived `class`. Status is authoritative; historical logs may retain an earlier fact under another status. Optional facts are null. `count_only=true` returns empty rows/null cursor and global owner counts to any caller; it excludes `after` and explicit `statuses`. Pages/get are bounded to 512 KiB without truncating facts; an oversized first row is refused. Continue with `next_after` while preserving your filters. There is no project filter for a system request with no structured project.
+
+Bounds are UTF-8 bytes: title 1–512; context ≤16384; 2–32 distinct nonempty options, each ≤1024; ≤32 nonempty file paths, each ≤4096; note/reason ≤8192. Recommendation must match an option exactly and a request deadline must be in the future. Unknown IDs return `not_found`, invalid params `invalid_params`, policy/identity refusals `refused`, unavailable persistence `unavailable`, and timeouts `timeout`. Accepted work can finish after timeout: inspect the list/get/inbox before retrying, rather than creating another request.
+
+### Answers and persistence
+
+The org event log retains requests and answers across daemon restarts. Recording an answer does **not** mean a harness accepted it: one daemon bridge durably enqueues a `system` / `answer` message to the requester, then the existing FIFO/guard/confirmation runtime delivers its one-line inbox reference. Read the body with `atm inbox --id m…`, then explicitly acknowledge it. Focused panes and occupied editors stay protected; no separate decision paste path bypasses those guards. Internal `system` requesters have no inbox and consume the durable resolution event instead.
+
+The final decision is the bridge's recoverable work item; an exact canonical answer `msg.sent` is its completion marker, regardless of delivery/read status. Restart fills a missing enqueue and does not duplicate an existing one. An organisation snapshot or enqueue timeout backs off and reconciles from fresh committed state; the serial actor and exact-content check prevent duplicate late enqueues. A stopped actor or other terminal bridge failure requires restart; reads remain available when org persistence is healthy. Delivery failures/holds retain the normal message recovery rules. The canonical answer text is therefore a persistence correlation contract, not presentation-only text to change without considering old logs.
+
+New pending requests also run the owner's existing `[notify]` command, using a short `d41 from project/worker: atm decisions` reference, not private title/context/options. This shares the owner-message notifier described below; resolved, provisional, withdrawn or expired decisions suppress a delayed notice. External notices remain best effort, not the durable decision record.
+
 ## Notifications
 
 `atmd` can run a command of yours whenever a session starts needing input: a permission dialog, an MCP input dialog, or an agent asking you something, in any supported harness. The same command also handles newly committed Owner inbox messages, under the separate rules below. Add a `[notify]` section to `config.toml`. `atm setup` writes this example commented out, but it never rewrites an existing file, so add the section by hand if you already have one:
@@ -218,7 +292,7 @@ command = ["notify-send", "atm", "--"]
 - The command runs in `atmd`'s environment, which comes from whoever started `atmd` (usually a TUI). Use absolute paths: with no shell, `~` and `$VAR` aren't expanded.
 - Stdin and stdout are closed. After 30 seconds `atmd` kills the command (but not processes it started). A failure is logged, with the command's stderr, to the daemon log.
 
-For Owner inbox messages, a separate consumer subscribes to committed events before service admission, skips startup history and deduplicates replay overlap within the process. It notifies only new Owner messages; OwnerFocused notices remain **inbox-only** (no `[notify]`). Its notification contains bounded metadata and an inbox reference with `--for owner`, not the body. `delay_secs` delays launch, and committed read state is checked again just before launch: reading while queued suppresses it, as does an unavailable state read. It has one running/delayed command and at most 32 pending commands; overflow is logged without changing the durable inbox. Commands use the same no-shell runner and 30-second timeout as attention notifications, which retain their independent per-session behavior. Notification failure never generates another message or retries the command. This external effect is **best effort**, not durable/exactly-once: shutdown cancels pending work and a crash can lose a notification. A watch error stops Owner notifications until restart and logs one warning; consult the inbox/status for durable state.
+For Owner inbox messages and pending decisions, one consumer subscribes to committed events before service admission, skips startup history and deduplicates replay overlap within the process. It notifies new Owner messages and decision requests; OwnerFocused notices remain **inbox-only** (no `[notify]`). A message notice contains bounded metadata and an inbox reference with `--for owner`, not the body; a decision notice points to `atm decisions`. `delay_secs` delays launch, and committed unread/pending state is checked again just before launch: reading a message or closing/taking a decision while queued suppresses it, as does an unavailable state read. The shared queue has one running/delayed command and at most 32 pending commands; overflow is logged without changing durable state. Commands use the same no-shell runner and 30-second timeout as attention notifications, which retain their independent per-session behavior. Notification failure never generates another message or retries the command. This external effect is **best effort**, not durable/exactly-once: shutdown cancels pending work and a crash can lose a notification. A watch error stops Owner notifications until restart and logs one warning; consult the inbox/status for durable state.
 
 [ntfy](https://ntfy.sh), through curl. `--data-raw` sends the message as it is; `-d` would read a file for a message that starts with `@`:
 

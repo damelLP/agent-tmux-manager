@@ -4568,6 +4568,68 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn a_session_kill_of_an_agents_pane_wakes_its_observation() {
+        // A Ready agent whose session has no row: the registry will never
+        // report its pane gone. The kill's own audit event starts the pass
+        // that finds the pane gone and records the agent Down.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        inspect_with(&rig, "pi");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        let mut events = agents.observation_events();
+        let killed = |pane: &str, method: &str, outcome: &str| {
+            OrgCommand::ControlKilled(atm_org::ControlAudit {
+                pane: pane.into(),
+                action: serde_json::json!({"method": method, "outcome": outcome}),
+            })
+        };
+        // A row on another pane is the barrier: the observer takes committed
+        // events first, so everything logged before it has been looked at.
+        // Answers whether a kill woke an agent, and whether a pass finished.
+        async fn woken(
+            rig: &Rig,
+            events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+            row: &str,
+        ) -> (bool, bool) {
+            rig.row(row, "%9", false).await;
+            let (mut woken, mut finished) = (false, false);
+            loop {
+                let event = events.recv().await.unwrap();
+                woken |= event.phase == "killed_scheduled";
+                finished |= event.phase == "finished";
+                if event.phase == "scheduled" {
+                    return (woken, finished);
+                }
+            }
+        }
+        // Not this agent's pane, not a kill that happened, and not a kill
+        // without a reservation (a lifecycle flow records its own agent).
+        rig.command(killed("%2", "session.kill", "ok")).await;
+        rig.command(killed("%1", "session.kill", "error")).await;
+        rig.command(killed("%1", "agent.down", "ok")).await;
+        assert_eq!(woken(&rig, &mut events, "s8").await, (false, false));
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+
+        rig.client
+            .script_inspect(&PaneId::parse("%1").unwrap(), None)
+            .unwrap();
+        rig.command(killed("%1", "session.kill", "ok")).await;
+        let (woken, finished) = woken(&rig, &mut events, "s9").await;
+        assert!(woken, "the kill of the agent's pane started no observation");
+        if !finished {
+            progress(&mut events, "finished", Some("p/lead")).await;
+        }
+        let lead = rig.state("lead").await;
+        assert_eq!(lead.status, AgentStatus::Down);
+        assert_eq!(
+            lead.reason.as_deref(),
+            Some("recorded pane is absent, dead or no longer owned")
+        );
+    }
+
+    #[tokio::test]
     async fn another_program_in_front_is_named() {
         // The harness is pinned and the pane now runs something else in
         // front (its owner quit the harness and opened an editor): the list

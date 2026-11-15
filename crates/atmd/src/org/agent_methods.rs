@@ -69,13 +69,16 @@ impl From<AgentError> for MethodError {
                     Refusal::Invariant(
                         ApplyError::UnknownProject(_)
                         | ApplyError::UnknownAgent(_)
-                        | ApplyError::UnknownMessage(_),
+                        | ApplyError::UnknownMessage(_)
+                        | ApplyError::UnknownDecision(_),
                     ) => error_code::NOT_FOUND,
                     Refusal::Invariant(ApplyError::InvalidId(_)) | Refusal::InvalidValue { .. } => {
                         error_code::INVALID_PARAMS
                     }
                     Refusal::Invariant(
-                        ApplyError::PaneOccupied { .. } | ApplyError::DuplicateMessage(_),
+                        ApplyError::PaneOccupied { .. }
+                        | ApplyError::DuplicateMessage(_)
+                        | ApplyError::DuplicateDecision(_),
                     )
                     | Refusal::AgentAlreadyBound { .. }
                     | Refusal::ProjectRootConflict { .. } => error_code::CONFLICT,
@@ -352,6 +355,12 @@ mod tests {
                 "not_found",
             ),
             (
+                O::Refused(R::Invariant(A::UnknownDecision(atm_org::DecisionId::new(
+                    1,
+                )))),
+                "not_found",
+            ),
+            (
                 O::Refused(R::Invariant(A::InvalidId(
                     "bad/id/extra".parse::<atm_org::AgentId>().unwrap_err(),
                 ))),
@@ -375,6 +384,12 @@ mod tests {
                 O::Refused(R::Invariant(A::DuplicateMessage(atm_org::MessageId::new(
                     1,
                 )))),
+                "conflict",
+            ),
+            (
+                O::Refused(R::Invariant(A::DuplicateDecision(
+                    atm_org::DecisionId::new(1),
+                ))),
                 "conflict",
             ),
             (

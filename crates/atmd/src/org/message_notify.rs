@@ -1,7 +1,7 @@
-//! Best-effort notifications from committed owner messages, never delivery work.
+//! Best-effort notifications from owner messages and pending decisions, never delivery work.
 //! Startup captures a cursor before subscribing; watch replays only the gap and
 //! recovers lag. At most 32 pending commands plus one running/delayed command;
-//! overflow keeps the durable inbox entry. A crash may lose an external notice.
+//! overflow keeps the durable item. A crash may lose an external notice.
 
 use super::{messages::is_focus_notice, EventWatch, OrgHandle, OrgServiceError};
 use crate::{
@@ -9,15 +9,39 @@ use crate::{
     notify::{notify_argv, run_notify, NotifyConfig, NotifyError, NOTIFY_TIMEOUT},
     org::message_delivery::inbox_reference,
 };
-use atm_org::{Address, MessageId, OrgEvent};
-use std::{future::Future, time::Duration};
+use atm_org::{Address, DecisionId, DecisionStatus, MessageId, OrgEvent, OrgState};
+use std::{fmt, future::Future, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subject {
+    Message(MessageId),
+    Decision(DecisionId),
+}
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(id) => id.fmt(f),
+            Self::Decision(id) => id.fmt(f),
+        }
+    }
+}
+fn still_open(state: &OrgState, subject: Subject) -> bool {
+    match subject {
+        Subject::Message(id) => state
+            .message(&id)
+            .is_some_and(|m| m.content.to == Address::Owner && m.read_at.is_none()),
+        Subject::Decision(id) => state
+            .decision(&id)
+            .is_some_and(|d| d.status == DecisionStatus::Pending),
+    }
+}
+
 #[derive(Debug)]
 struct Pending {
-    id: MessageId,
+    id: Subject,
     due: Instant,
     message: String,
 }
@@ -39,25 +63,34 @@ fn enqueue(
         return Ok(Admission::Ignored);
     }
     *cursor = record.seq;
-    let Some(OrgEvent::MessageSent(content)) = OrgEvent::from_parts(&record.kind, &record.body)
-        .map_err(|_| {
-            OrgServiceError::Unavailable("invalid committed message notification".into())
-        })?
-    else {
-        return Ok(Admission::Ignored);
+    let event = OrgEvent::from_parts(&record.kind, &record.body)
+        .map_err(|_| OrgServiceError::Unavailable("invalid committed owner notification".into()))?;
+    let (id, message) = match event {
+        Some(OrgEvent::MessageSent(content))
+            if content.to == Address::Owner && !is_focus_notice(&content) =>
+        {
+            let id = MessageId::new(record.seq);
+            (
+                Subject::Message(id),
+                format!(
+                    "{id} from {}: {} --for owner",
+                    content.from,
+                    inbox_reference(id)
+                ),
+            )
+        }
+        Some(OrgEvent::DecisionRequested(request)) => {
+            let id = DecisionId::new(record.seq);
+            (
+                Subject::Decision(id),
+                format!("{id} from {}: atm decisions", request.requester),
+            )
+        }
+        _ => return Ok(Admission::Ignored),
     };
-    if content.to != Address::Owner || is_focus_notice(&content) {
-        return Ok(Admission::Ignored);
-    }
-    let id = MessageId::new(record.seq);
     let due = now.checked_add(delay).ok_or_else(|| {
         OrgServiceError::Unavailable("notification delay exceeds clock range".into())
     })?;
-    let message = format!(
-        "{id} from {}: {} --for owner",
-        content.from,
-        inbox_reference(id)
-    );
     match tx.try_send(Pending { id, due, message }) {
         Ok(()) => Ok(Admission::Queued),
         Err(mpsc::error::TrySendError::Full(_)) => Ok(Admission::Overflow),
@@ -82,7 +115,7 @@ async fn consume(
             Ok(Some(record)) => match enqueue(&record, &mut cursor, &tx, delay, Instant::now()) {
                 Ok(Admission::Overflow) => warn!(
                     seq = record.seq,
-                    "Owner notification queue full; message remains in inbox"
+                    "Owner notification queue full; item remains in durable state"
                 ),
                 Err(error) => warn!(%error, seq = record.seq, "Owner notification skipped"),
                 _ => {}
@@ -103,7 +136,7 @@ async fn run_queue<C, CF, R, RF>(
     mut unread: C,
     mut run: R,
 ) where
-    C: FnMut(MessageId) -> CF,
+    C: FnMut(Subject) -> CF,
     CF: Future<Output = Result<bool, OrgServiceError>>,
     R: FnMut(String) -> RF,
     RF: Future<Output = Result<(), NotifyError>>,
@@ -140,7 +173,7 @@ pub fn spawn_message_notifier(
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>, OrgServiceError> {
     let cursor = org.status()?;
-    let watch = org.watch(vec!["msg.sent".into()], cursor)?;
+    let watch = org.watch(vec!["msg.sent".into(), "decision.requested".into()], cursor)?;
     let (tx, rx) = mpsc::channel(32);
     Ok(tokio::spawn(async move {
         let reader = org.clone();
@@ -149,13 +182,7 @@ pub fn spawn_message_notifier(
             cancel.clone(),
             move |id| {
                 let org = reader.clone();
-                async move {
-                    Ok(org
-                        .snapshot()
-                        .await?
-                        .message(&id)
-                        .is_some_and(|m| m.content.to == Address::Owner && m.read_at.is_none()))
-                }
+                async move { Ok(still_open(&org.snapshot().await?, id)) }
             },
             move |message| {
                 let argv = notify_argv(&config.command, &message);

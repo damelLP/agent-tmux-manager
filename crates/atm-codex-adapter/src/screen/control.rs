@@ -6,6 +6,10 @@
 //! Captured: codex-cli 0.167.0, 2026-11-14, P5 sealed private tmux 3.8
 //! capture-pane -p -e -N, 80/100/120 columns. Only the exact sole inverse-selected
 //! `/new` completion is non-modal for control; delivery facts remain Other.
+//! Captured: codex-cli 0.167.0, 2026-11-15, P6 sealed private tmux 3.8
+//! capture-pane -p -e -N, 80x24/100x32/120x40, full and short transcripts.
+//! The upper boundary is blank or a faint, non-inverse finished-turn status
+//! after a blank. A nearby candidate across that separator remains ambiguous.
 use super::*;
 use crate::CodexEventType;
 use atm_core::harness_control::{
@@ -117,12 +121,35 @@ fn clear_completion(screen: &StyledScreen) -> bool {
     let Some(composer) = lines.iter().rposition(|s| *s == "› /new") else {
         return false;
     };
-    let Some([.., upper, menu, lower]) = lines.get(..composer) else {
+    let Some([history @ .., upper, menu, lower]) = lines.get(..composer) else {
         return false;
     };
-    if !upper.is_empty()
-        || !lower.is_empty()
-        || *menu != "› /new  start a new chat during a conversation"
+    if !lower.is_empty() || *menu != "› /new  start a new chat during a conversation" {
+        return false;
+    }
+    if !upper.is_empty() {
+        let offset = screen
+            .text()
+            .split_inclusive('\n')
+            .take(history.len())
+            .map(str::len)
+            .sum::<usize>();
+        if history.last() != Some(&"")
+            || !upper.strip_prefix("  ").is_some_and(worked_status)
+            || !upper.char_indices().all(|(i, _)| {
+                screen.faint_at(offset + i) == Some(true)
+                    && screen.inverse_at(offset + i) == Some(false)
+            })
+        {
+            return false;
+        }
+    }
+    // Do not mistake a candidate separated by blanks for transcript history.
+    if history
+        .iter()
+        .rev()
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| completion_candidate(line))
     {
         return false;
     }
@@ -136,6 +163,17 @@ fn clear_completion(screen: &StyledScreen) -> bool {
         .sum::<usize>();
     menu.char_indices()
         .all(|(i, _)| screen.inverse_at(offset + i) == Some(true))
+}
+
+fn completion_candidate(line: &str) -> bool {
+    let line = line.trim_start_matches(' ');
+    let line = line.strip_prefix("› ").unwrap_or(line);
+    line.split_once("  ").is_some_and(|(command, description)| {
+        command
+            .strip_prefix('/')
+            .is_some_and(|name| !name.is_empty() && !name.chars().any(char::is_whitespace))
+            && !description.trim_matches(' ').is_empty()
+    })
 }
 
 fn full_folder(folder: &str) -> bool {

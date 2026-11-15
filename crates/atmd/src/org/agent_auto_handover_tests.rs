@@ -12,6 +12,7 @@ use super::*;
 use atm_core::{BackgroundActivity, LifecycleContext, SessionView};
 use atm_org::auto_handover::{handover_settings, HandoverSettings};
 use atm_org::idle::HandoverReason;
+use atm_org::{DecisionCommand, DecisionKind, DecisionRequest};
 use chrono::{DateTime, TimeDelta, TimeZone};
 use std::collections::BTreeMap;
 use tokio::sync::watch;
@@ -685,4 +686,90 @@ async fn a_session_that_was_removed_is_seen_anew() {
     auto.rig.turn("s1").await;
     auto.one_started().await;
     auto.save_requested("worker", &[]).await;
+}
+
+// The idle rule.
+
+/// `"idle"` on with a one-hour cache and an idle limit of forty-five minutes,
+/// so that the time left for the save is not the ten minutes of the line.
+const IDLE: &str = "auto_handover = ['idle']\ncache_minutes = 60\nidle_minutes = 45";
+const IDLE_LIMIT: i64 = 45 * 60;
+const EXPIRY: i64 = 60 * 60;
+
+#[tokio::test]
+async fn an_idle_seat_that_waits_for_nothing_is_asked_to_save_until_its_cache_expires() {
+    let mut auto = Auto::new(IDLE).await;
+    auto.rig.share("s1", 100).await;
+    auto.rig.turn("s1").await;
+    // Nothing is due at the turn end: the watcher asks for the idle limit.
+    auto.asked_for(after(IDLE_LIMIT)).await;
+    auto.quiet(&[]).await;
+    auto.set(after(IDLE_LIMIT));
+    // The handover may wait for the save until the cache expires, no longer.
+    auto.asked_for(after(EXPIRY)).await;
+    let request = auto.save_requested("worker", &[]).await;
+    // Nobody delivers the request. At the expiry the handover gives up, and
+    // the manager is told why it was started.
+    auto.set(after(EXPIRY));
+    let (to, body) = auto.message(&[]).await;
+    assert_eq!(to, "p/lead");
+    let start = format!(
+        "automatic handover of p/worker (idle 45 min; nothing it waits for comes before its \
+         cache expires at 60 min) did not complete: the save request {request} was not \
+         delivered to p/worker in 900 s;"
+    );
+    assert!(body.starts_with(&start), "{body}");
+    assert!(body.ends_with(
+        "nothing was cleared. Nothing more is tried in this session. \
+         By hand: atm agent handover p/worker"
+    ));
+    assert!(auto.rig.cleared.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn an_idle_seat_that_waits_for_the_owners_answer_keeps_its_session() {
+    let mut auto = Auto::new(IDLE).await;
+    auto.rig
+        .run(OrgCommand::Decision(DecisionCommand::Request(
+            DecisionRequest {
+                requester: Address::Agent(id("worker")),
+                kind: DecisionKind::Policy,
+                title: "Which".into(),
+                context: String::new(),
+                files: Vec::new(),
+                options: vec!["a".into(), "b".into()],
+                recommended: Some("a".into()),
+                may_be_undone: true,
+                changes_intent: true,
+                deadline: None,
+            },
+        )))
+        .await;
+    auto.rig.turn("s1").await;
+    auto.asked_for(after(IDLE_LIMIT)).await;
+    auto.set(after(IDLE_LIMIT));
+    // The watcher is woken at the limit; a share that moves makes it look
+    // once more, in step with the registry. Neither look starts a handover:
+    // the owner is taken to be present, so his answer comes in time.
+    auto.rig.share("s1", 100).await;
+    auto.quiet(&["decision.requested"]).await;
+    // The lead waits for nothing: the same look at the limit hands it over.
+    auto.role("lead", IDLE);
+    auto.rig.turn("lead-1").await;
+    auto.set(after(2 * IDLE_LIMIT));
+    auto.asked_for(after(IDLE_LIMIT + EXPIRY)).await;
+    auto.save_requested("lead", &[]).await;
+}
+
+#[tokio::test]
+async fn a_new_turn_end_starts_the_idle_wait_again() {
+    let mut auto = Auto::new(IDLE).await;
+    auto.rig.turn("s1").await;
+    auto.asked_for(after(IDLE_LIMIT)).await;
+    // A turn runs across the first limit: it is measured from its own end.
+    auto.rig.report("s1", LifecycleEvent::WorkingStart).await;
+    auto.set(after(IDLE_LIMIT + 7));
+    auto.rig.report("s1", LifecycleEvent::Idle).await;
+    auto.asked_for(after(2 * IDLE_LIMIT + 7)).await;
+    auto.quiet(&[]).await;
 }

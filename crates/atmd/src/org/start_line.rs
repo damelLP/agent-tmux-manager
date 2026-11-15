@@ -22,6 +22,10 @@
 //!   one until he retries or gives up, and giving up queues no replacement.
 //! - Nobody acknowledges a start line: it stays unread in `atm inbox`. `atm me`
 //!   does not list it.
+//! - An agent that goes down or stuck before its line is delivered (a respawn
+//!   records it down for a moment, so it can too) leaves the line blocked: the
+//!   owner gets a "blocked: recipient agent is stuck or down" notice, and his
+//!   `[notify]` command runs. The line resumes once the agent is Ready again.
 
 use super::agents::AgentRuntime;
 use super::message_delivery::inbox_reference;

@@ -67,6 +67,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+include!("stop_message_tests.rs");
+
 const NOT_STARTED: EffectCertainty = EffectCertainty::NotStarted;
 const APPLIED: EffectCertainty = EffectCertainty::Applied;
 const UNKNOWN: EffectCertainty = EffectCertainty::Unknown;

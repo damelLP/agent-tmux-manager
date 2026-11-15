@@ -5,6 +5,13 @@ refuses and what to do instead. It follows atm's code after #119, #145, #154,
 #158 and #163 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run
 `atm <command> --help` for the full flags.
 
+## Named-agent start line
+
+After a named agent starts, respawns or clears to `ready`, atmd types
+`[mN] New session: run the shell command atm me`. Run `atm me` in the shell
+for the agent's role, memory path and unread messages, not a personal skill.
+`atm me` omits both current and historical start notes from its unread list.
+
 ## Targets: use the pane
 
 Commands that target an agent take a session id prefix or a tmux pane id (`%12`).

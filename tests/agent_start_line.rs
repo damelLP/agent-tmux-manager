@@ -1,5 +1,6 @@
 //! The start line on a private daemon, end to end: once `agent.up` and
-//! `agent.clear` end Ready, the daemon types `[mN] New session: run atm me`
+//! `agent.clear` end Ready, the daemon types
+//! `[mN] New session: run the shell command atm me`
 //! into the agent's stand-in through the message runtime, and the stand-in's
 //! own prompt event confirms it. The stand-ins are model-free and never
 //! execute what they are given. Waits are on committed events (`Watch`),
@@ -23,7 +24,7 @@ use support::{about, notice, reference, Confirmation, MessageRig, Watch};
 
 /// The text typed for start line `id`.
 fn line(id: &str) -> String {
-    format!("[{id}] New session: run atm me")
+    format!("[{id}] New session: run the shell command atm me")
 }
 
 /// A message's id is its `msg.sent` event's sequence number.
@@ -41,7 +42,7 @@ fn start_line_for(agent: &str) -> impl Fn(&Value) -> bool {
         "from": "system",
         "to": agent,
         "kind": "note",
-        "body": "New session: run atm me",
+        "body": "New session: run the shell command atm me",
         "attachments": [],
         "task": null,
     });

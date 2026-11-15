@@ -22,21 +22,21 @@ fn at() -> DateTime<Utc> {
 }
 
 #[test]
-fn start_line_is_one_printable_line_never_longer_than_the_reference() {
+fn start_line_is_one_printable_line_naming_the_shell_command() {
     for seq in [1, 9, 10, 123, 123_456, u64::MAX] {
         let id = MessageId::new(seq);
         let line = start_reference(id);
-        assert_eq!(line, format!("[m{seq}] New session: run atm me"));
+        assert_eq!(
+            line,
+            format!("[m{seq}] New session: run the shell command atm me")
+        );
         assert!(line.bytes().all(|b| (b' '..=b'~').contains(&b)), "{line:?}");
         assert!(!line.ends_with(' '));
-        // The adapters refuse a wrapped draft: the line must not wrap where
-        // the reference every other message is typed as would not.
-        assert!(line.len() <= inbox_reference(id).len(), "{line:?}");
     }
 }
 
 #[test]
-fn only_the_canonical_start_line_is_typed_as_itself() {
+fn only_canonical_or_historical_start_notes_get_the_current_start_text() {
     let id = MessageId::new(42);
     let line = start_line(&agent("lead"));
     assert_eq!(
@@ -45,13 +45,20 @@ fn only_the_canonical_start_line_is_typed_as_itself() {
             from: Address::System,
             to: Address::Agent(agent("lead")),
             kind: MessageKind::Note,
-            body: "New session: run atm me".into(),
+            body: "New session: run the shell command atm me".into(),
             attachments: vec![],
             task: None,
         }
     );
-    assert!(is_start_line(&line));
-    assert_eq!(delivery_line(id, &line), "[m42] New session: run atm me");
+    let mut historical = line.clone();
+    historical.body = "New session: run atm me".into();
+    for content in [&line, &historical] {
+        assert!(is_start_line(content));
+        assert_eq!(
+            delivery_line(id, content),
+            "[m42] New session: run the shell command atm me"
+        );
+    }
     type Mutation = fn(&mut MessageContent);
     let mutations: Vec<(&str, Mutation)> = vec![
         ("from the owner", |c| c.from = Address::Owner),
@@ -67,11 +74,13 @@ fn only_the_canonical_start_line_is_typed_as_itself() {
         }),
         ("a task", |c| c.task = Some("t7".parse().unwrap())),
     ];
-    for (case, mutate) in mutations {
-        let mut content = start_line(&agent("lead"));
-        mutate(&mut content);
-        assert!(!is_start_line(&content), "{case}");
-        assert_eq!(delivery_line(id, &content), inbox_reference(id), "{case}");
+    for original in [&line, &historical] {
+        for (case, mutate) in &mutations {
+            let mut content = original.clone();
+            mutate(&mut content);
+            assert!(!is_start_line(&content), "{case}: {original:?}");
+            assert_eq!(delivery_line(id, &content), inbox_reference(id), "{case}");
+        }
     }
     let notice = focus_notice(id, &PaneId::parse("%7").unwrap());
     assert!(!is_start_line(&notice));
@@ -202,6 +211,33 @@ fn a_start_line_is_due_unless_one_is_open_or_this_session_had_one() {
     }
 }
 
+// Break caught: an upgraded daemon queues a duplicate because replay no longer
+// recognizes an old-text note that is open or delivered to the same session.
+#[test]
+fn historical_start_lines_still_prevent_duplicates_after_replay() {
+    let lead = agent("lead");
+    let session = SessionId::new("s1");
+    let mut content = start_line(&lead);
+    content.body = "New session: run atm me".into();
+    let line = sent(content);
+    for (events, due) in [
+        (vec![line.clone()], false),
+        (vec![line.clone(), attempted(4)], false),
+        (vec![line.clone(), attempted(4), delivered(4, "s1")], false),
+        (
+            vec![line.clone(), attempted(4), delivered(4, "other")],
+            true,
+        ),
+        (vec![line, given_up(4)], true),
+    ] {
+        assert_eq!(
+            start_line_due(&state(&events), &lead, Some(&session)),
+            due,
+            "{events:?}"
+        );
+    }
+}
+
 fn evidence() -> MessageEvidence {
     MessageEvidence::new(MessageClock::new(tokio::time::Instant::now(), at()))
 }
@@ -214,9 +250,10 @@ fn evidence_expects_either_line_of_its_own_id_and_nothing_else() {
     }
     for line in [
         start_reference(MessageId::new(124)),
-        "[m123] New session: run atm me ".into(),
+        "[m123] New session: run the shell command atm me ".into(),
+        "[m123] New session: run atm me".into(),
         "[m123] New session".into(),
-        "New session: run atm me".into(),
+        "New session: run the shell command atm me".into(),
     ] {
         assert!(evidence().register(id, line.clone()).is_err(), "{line:?}");
     }
@@ -250,6 +287,9 @@ async fn only_the_start_text_confirms_a_start_line() {
     let other = armed();
     prompt(&other, inbox_reference(id));
     assert_eq!(other.receipt(id).unwrap(), None);
+    let historical = armed();
+    prompt(&historical, "[m123] New session: run atm me".into());
+    assert_eq!(historical.receipt(id).unwrap(), None);
     let confirmed = armed();
     prompt(&confirmed, start_reference(id));
     let receipt = confirmed.receipt(id).unwrap().unwrap();

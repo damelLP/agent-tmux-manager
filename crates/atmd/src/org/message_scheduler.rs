@@ -41,6 +41,9 @@
 //! message is open, after the state that caused them is applied. A focus
 //! notice needs a positive observation of the owner's focus: an unknown focus
 //! waits like a focused pane, but does not claim the owner is there.
+//! A positively running turn gets one informational owner note per queued,
+//! unattempted message after thirty minutes; a new observed interval may notify
+//! again. Lost observations break that interval, including across restart.
 
 use super::message_delivery::{deliver, inbox_reference, ATTEMPT_WORK_BUDGET};
 use super::message_history::{
@@ -55,7 +58,9 @@ use super::OrgServiceError;
 use crate::{control::reservation::PaneId, eventlog::Envelope};
 use atm_core::ScreenFacts;
 use atm_org::{
-    delivery::{next_delivery, DeliveryStep, FailureReason, WaitReason},
+    delivery::{
+        busy_notice_due, next_delivery, DeliveryStep, FailureReason, WaitReason, BUSY_NOTICE_AFTER,
+    },
     Agent, AgentId, DeliveryReceipt, OrgCommand,
 };
 use std::{
@@ -86,6 +91,7 @@ const COMMIT_BUDGET: Duration = Duration::from_secs(10);
 /// Accounting after an attempt: the 5 s FIFO snapshot and the same 4 s margin.
 const ACCOUNTING_BUDGET: Duration = Duration::from_secs(9);
 const GIVE_UP_REASON: &str = "owner gave up on delivery";
+const BUSY_NOTICE_REASON: &str = "running turn";
 
 type Boxed<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// The executor of one reserved attempt: `message_delivery::deliver`.
@@ -154,6 +160,8 @@ struct Shared {
     progress: HashMap<MessageId, Progress>,
     /// Notices already published for an open message, by reason.
     noticed: HashMap<MessageId, HashSet<String>>,
+    /// Only the current observed turn, never an unbounded set of past turns.
+    busy_turn: HashMap<MessageId, chrono::DateTime<chrono::Utc>>,
     /// The owner's decisions, waiting for their recipient's slot.
     resolutions: HashMap<AgentId, VecDeque<Resolution>>,
 }
@@ -191,6 +199,27 @@ impl Board {
         if let Ok(mut shared) = self.shared.lock() {
             shared.progress.remove(&id);
             shared.noticed.remove(&id);
+            shared.busy_turn.remove(&id);
+        }
+    }
+
+    fn track_busy_turn(&self, id: MessageId, since: Option<chrono::DateTime<chrono::Utc>>) {
+        let Ok(mut shared) = self.shared.lock() else {
+            return;
+        };
+        if shared.busy_turn.get(&id).copied() == since {
+            return;
+        }
+        match since {
+            Some(since) => {
+                shared.busy_turn.insert(id, since);
+            }
+            None => {
+                shared.busy_turn.remove(&id);
+            }
+        }
+        if let Some(reasons) = shared.noticed.get_mut(&id) {
+            reasons.remove(BUSY_NOTICE_REASON);
         }
     }
 
@@ -686,7 +715,18 @@ impl Job {
                 reason: WaitReason::OwnerFocused,
             } if self.lost.is_some() => self.unobserved(&snapshot, until).await,
             DeliveryStep::Wait { until, reason } => {
+                service
+                    .board
+                    .track_busy_turn(id, snapshot.live.running_turn_since);
                 self.show(id, DeliveryPhase::Waiting, Some(reason.to_string()), None);
+                if busy_notice_due(&snapshot.message, &snapshot.live, now) {
+                    let body = format!(
+                        "{} busy for {} min; message still queued ({id})",
+                        snapshot.recipient.id,
+                        BUSY_NOTICE_AFTER.as_secs() / 60
+                    );
+                    self.publish(id, BUSY_NOTICE_REASON, note(body)).await;
+                }
                 if reason == WaitReason::OwnerFocused && self.focused == Some(true) {
                     self.focus_notice(id, &snapshot.recipient).await;
                 }

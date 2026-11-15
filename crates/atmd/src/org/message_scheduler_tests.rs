@@ -420,6 +420,359 @@ impl Bench {
     }
 }
 
+/// Drive completed scheduler rounds, not elapsed delays: the service and
+/// organisation writer are real, but no background recipient job is spawned.
+/// This lets negative notice assertions synchronize on the returned round.
+struct ManualJob {
+    job: Job,
+    messages: super::super::messages::MessageHandle,
+    screens: Screens,
+    gate: Arc<Semaphore>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl ManualJob {
+    async fn new() -> Self {
+        use super::super::{
+            message_service_tests::runtime, messages::spawn_service_for_test, Request,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (requests, receive) = mpsc::channel::<Request>(64);
+        let (health, status) = watch::channel(Ok(0));
+        let (committed, _) = broadcast::channel(1024);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let seq = AtomicU64::new(0);
+        let gate = Arc::new(Semaphore::new(1));
+        let append_gate = gate.clone();
+        tokio::spawn(super::super::actor::run(
+            atm_org::OrgState::default(),
+            receive,
+            health,
+            committed.clone(),
+            cancel.clone(),
+            move |_| {
+                let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
+                let gate = append_gate.clone();
+                async move {
+                    let _permit = gate.acquire().await.unwrap();
+                    Ok::<u64, crate::eventlog::EventLogError>(next)
+                }
+            },
+        ));
+        let org = super::super::OrgHandle {
+            requests,
+            health: status,
+            committed,
+            reads: None,
+        };
+        let rt = runtime(org.clone(), 0, &cancel);
+        let (messages, _) = spawn_service_for_test(rt, org.committed.subscribe(), 0, None);
+        guarded(messages.initialized()).await.unwrap();
+        let screens = Screens::default();
+        let service = messages.service().unwrap();
+        let job = Job::new(
+            service,
+            Effects {
+                deliver: Arc::new(|_, _, _| {
+                    Box::pin(async { panic!("busy message must not dispatch input") })
+                }),
+                observe: screens.effect(),
+            },
+            worker(),
+        );
+        let rig = Self {
+            job,
+            messages,
+            screens,
+            gate,
+            cancel,
+        };
+        rig.command(OrgCommand::RegisterProject {
+            project_id: "demo".parse().unwrap(),
+            root: "/demo".into(),
+            move_root: false,
+        })
+        .await;
+        rig.command(OrgCommand::Adopt {
+            agent_id: worker(),
+            pane: "%1".into(),
+            session_id: Some("s1".into()),
+        })
+        .await;
+        rig
+    }
+
+    async fn command(&self, command: OrgCommand) {
+        guarded(self.job.commit(command)).await.unwrap();
+    }
+
+    async fn send(&self) -> MessageId {
+        self.messages
+            .send(
+                super::super::message_service_tests::note(Address::Agent(worker()), "brief"),
+                owner(),
+            )
+            .await
+            .unwrap()
+            .message_id
+    }
+
+    fn turn(&self, turn: atm_core::TurnState) {
+        self.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| {
+                o.facts.turn = turn;
+                o.facts.input = InputState::Draft;
+            }),
+        );
+    }
+
+    async fn round(&mut self, advance_ms: u64) {
+        tokio::time::advance(Duration::from_millis(advance_ms)).await;
+        // Supply a new observation even at the 1 ms boundary; this tests the
+        // decision, not polling cadence. All work finishes before assertions.
+        self.job.observed = None;
+        let mut queued = self.job.service.board.queued.subscribe();
+        guarded(self.job.round(&mut queued)).await.unwrap();
+    }
+
+    async fn notes(&self) -> Vec<String> {
+        self.messages
+            .inbox(page(), owner())
+            .await
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|entry| entry.content.from == Address::System)
+            .map(|entry| entry.content.body)
+            .collect()
+    }
+}
+
+impl Drop for ManualJob {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_terminal_evaluation_does_not_retain_busy_turn_bookkeeping() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    guarded(rig.job.observe()).await.unwrap();
+    // Model a terminal commit racing the first evaluation after observation.
+    rig.command(OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: "owner cancelled".into(),
+        final_failure: true,
+    })
+    .await;
+    let mut queued = rig.job.service.board.queued.subscribe();
+    let next = guarded(rig.job.step(id, &mut queued)).await.unwrap();
+    assert!(matches!(next, Next::Change));
+    assert!(!rig.job.shown.contains(&id));
+    let shared = rig.job.service.board.shared.lock().unwrap();
+    assert!(!shared.busy_turn.contains_key(&id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_turn_notice_at_30_minutes_once() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    rig.round(0).await;
+    rig.command(OrgCommand::Revalidate { agent_id: worker() })
+        .await;
+    rig.round(1_799_999).await;
+    assert!(rig.notes().await.is_empty());
+    rig.round(1).await;
+    let expected = format!("demo/worker busy for 30 min; message still queued ({id})");
+    assert_eq!(rig.notes().await, std::slice::from_ref(&expected));
+    rig.round(1_800_000).await;
+    assert_eq!(rig.notes().await, [expected]);
+    let now = rig.job.service.rt.clock.now().unwrap();
+    let snapshot = rig.job.service.rt.history.snapshot(id, now).unwrap();
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    assert!(snapshot.message.last_attempt.is_none());
+    assert!(snapshot.message.failure.is_none());
+    assert_eq!(
+        rig.job.service.board.progress(id).phase,
+        Some(DeliveryPhase::Waiting)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_notice_waits_for_each_messages_own_time_and_goes_to_owner() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let first = rig.send().await;
+    rig.round(0).await;
+    rig.round(900_000).await;
+    // Even an agent sender receives no new note addressed to its pane.
+    let second = rig
+        .messages
+        .send(
+            super::super::message_service_tests::note(Address::Agent(worker()), "second"),
+            pane("%1"),
+        )
+        .await
+        .unwrap()
+        .message_id;
+    rig.round(900_000).await;
+    assert_eq!(
+        rig.notes().await,
+        [format!(
+            "demo/worker busy for 30 min; message still queued ({first})"
+        )]
+    );
+    rig.round(900_000).await;
+    assert_eq!(rig.notes().await.len(), 2);
+    assert_eq!(
+        rig.notes().await.last().unwrap(),
+        &format!("demo/worker busy for 30 min; message still queued ({second})")
+    );
+    let inbox = rig
+        .messages
+        .inbox(
+            InboxParams {
+                recipient: Some(Address::Agent(worker())),
+                ..page()
+            },
+            owner(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.messages.len(), 2);
+    assert!(inbox
+        .messages
+        .iter()
+        .all(|entry| entry.status == DeliveryStatus::Queued));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ended_turn_has_no_busy_notice_and_a_new_turn_restarts_the_interval() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    rig.round(0).await;
+    rig.turn(atm_core::TurnState::NotRunning);
+    rig.round(1_799_999).await;
+    assert!(rig.notes().await.is_empty());
+    rig.turn(atm_core::TurnState::Running);
+    rig.round(1).await;
+    rig.round(1_799_999).await;
+    assert!(rig.notes().await.is_empty());
+    rig.round(1).await;
+    assert_eq!(rig.notes().await.len(), 1);
+    rig.turn(atm_core::TurnState::NotRunning);
+    rig.round(1).await;
+    rig.turn(atm_core::TurnState::Running);
+    rig.round(1).await;
+    rig.round(1_799_999).await;
+    assert_eq!(rig.notes().await.len(), 1);
+    rig.round(1).await;
+    assert_eq!(rig.notes().await.len(), 2);
+    // Terminal cleanup discards the per-turn marker and notice dedupe.
+    rig.command(OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: "owner cancelled".into(),
+        final_failure: true,
+    })
+    .await;
+    rig.round(0).await;
+    let shared = rig.job.service.board.shared.lock().unwrap();
+    assert!(!shared.busy_turn.contains_key(&id));
+    assert!(!shared.noticed.contains_key(&id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_observations_clear_busy_notice_evidence_without_restarting_readiness() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    rig.round(0).await;
+    rig.command(OrgCommand::Revalidate { agent_id: worker() })
+        .await;
+    rig.screens.lose(&worker());
+    rig.round(10_000).await;
+    let lost = rig.job.service.rt.clock.now().unwrap();
+    let loss_notice = unobserved(id);
+    for (elapsed, loss_noted) in [(0, false), (120_000, true), (1_800_000, true)] {
+        rig.round(elapsed).await;
+        let now = rig.job.service.rt.clock.now().unwrap();
+        let live = rig.job.service.rt.history.snapshot(id, now).unwrap().live;
+        assert_eq!(live.running_turn_since, None);
+        assert_eq!(live.agent_not_ready_since, Some(lost));
+        assert_eq!(
+            rig.job.service.board.progress(id).reason.as_deref(),
+            Some("recipient cannot be observed")
+        );
+        if loss_noted {
+            assert_eq!(rig.notes().await, std::slice::from_ref(&loss_notice));
+        } else {
+            assert!(rig.notes().await.is_empty());
+        }
+    }
+    rig.turn(atm_core::TurnState::Running);
+    rig.round(0).await;
+    let resumed = rig.job.service.rt.clock.now().unwrap();
+    let live = rig
+        .job
+        .service
+        .rt
+        .history
+        .snapshot(id, resumed)
+        .unwrap()
+        .live;
+    assert_eq!(live.running_turn_since, Some(resumed));
+    assert_eq!(live.agent_not_ready_since, None);
+    rig.round(1_799_999).await;
+    assert_eq!(rig.notes().await, std::slice::from_ref(&loss_notice));
+    rig.round(1).await;
+    assert_eq!(
+        rig.notes().await,
+        [
+            loss_notice,
+            format!("demo/worker busy for 30 min; message still queued ({id})")
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_notice_unknown_commit_is_not_repeated_and_known_refusal_can_retry() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    rig.round(0).await;
+    rig.gate.forget_permits(usize::MAX);
+    // The real writer accepts but cannot append until released. The paused
+    // clock reaches the commit budget; its unknown outcome stays deduplicated.
+    rig.round(1_800_000).await;
+    rig.gate.add_permits(1);
+    guarded(rig.job.service.settled()).await.unwrap();
+    rig.round(0).await;
+    rig.round(1_800_000).await;
+    assert_eq!(rig.notes().await.len(), 1);
+    assert_eq!(
+        rig.job.service.board.progress(id).phase,
+        Some(DeliveryPhase::Waiting)
+    );
+
+    // A known refusal is different: the same publication key can retry.
+    let mut invalid = note("known refusal".into());
+    invalid.to = Address::System;
+    rig.job.publish(id, "test refusal", invalid).await;
+    rig.job
+        .publish(id, "test refusal", note("retry accepted".into()))
+        .await;
+    rig.job
+        .publish(id, "test refusal", note("duplicate".into()))
+        .await;
+    assert_eq!(rig.notes().await.len(), 2);
+    assert_eq!(rig.notes().await.last().unwrap(), "retry accepted");
+}
+
 fn system_note(event: &OrgEvent) -> bool {
     matches!(event, OrgEvent::MessageSent(note) if note.from == Address::System)
 }

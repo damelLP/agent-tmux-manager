@@ -201,6 +201,7 @@ struct RecipientHistory {
     pane: PaneLiveness,
     input: InputLine,
     not_ready_since: Option<DateTime<Utc>>,
+    running_turn_since: Option<DateTime<Utc>>,
 }
 
 impl Default for RecipientHistory {
@@ -212,12 +213,23 @@ impl Default for RecipientHistory {
             pane: PaneLiveness::Unknown,
             input: InputLine::Unknown,
             not_ready_since: None,
+            running_turn_since: None,
         }
     }
 }
 
 impl RecipientHistory {
-    fn lose(&mut self) {
+    fn track_running(&mut self, running: bool, status: AgentStatus, now: DateTime<Utc>) {
+        if running {
+            self.running_turn_since.get_or_insert(now);
+            self.not_ready_since = None;
+        } else if self.running_turn_since.take().is_some() && status != AgentStatus::Ready {
+            self.not_ready_since = Some(now);
+        }
+    }
+
+    fn lose(&mut self, status: AgentStatus, now: DateTime<Utc>) {
+        self.track_running(false, status, now);
         self.observation = None;
         self.status_since = None;
         self.last_event_at = None;
@@ -432,7 +444,10 @@ impl MessageHistory {
     ) -> RecipientLiveView {
         let mut live = RecipientLiveView::new(message, agent, std::iter::empty());
         if let Some(history) = history {
-            live.agent_not_ready_since = history.not_ready_since;
+            live.agent_not_ready_since = history
+                .not_ready_since
+                .map(|since| since.max(self.recovery_time));
+            live.running_turn_since = history.running_turn_since;
             live.pane = history.pane;
             live.input_line = history.input;
             if let Some(obs) = &history.observation {
@@ -647,7 +662,7 @@ impl MessageHistory {
                 .as_ref()
                 .is_none_or(|old| (&old.1, &old.2, &old.3) != (&after.1, &after.2, &after.3));
             if moved {
-                history.lose();
+                history.lose(after.0, at);
                 // A paste time is kept only while some agent holds its pane.
                 if let Some(left) = before.as_ref().and_then(|old| old.1.as_deref()) {
                     if self.state.agent_for_pane(left).is_none() {
@@ -656,6 +671,9 @@ impl MessageHistory {
                         }
                     }
                 }
+            }
+            if history.running_turn_since.is_some() {
+                history.not_ready_since = None;
             }
             let status_changed = before.as_ref().is_some_and(|old| old.0 != after.0);
             if moved || status_changed {
@@ -779,6 +797,7 @@ impl MessageHistory {
                         .and_then(|o| o.session.as_ref().map(|s| s.status))
                         == observation.session.as_ref().map(|s| s.status);
                 if !same_source {
+                    history.track_running(false, agent.status, now);
                     history.input = InputLine::Unknown;
                     history.pane = PaneLiveness::Unknown;
                     history.last_event_at = observation.session.as_ref().and_then(|row| {
@@ -822,16 +841,29 @@ impl MessageHistory {
                         _ => InputLine::Unknown,
                     }
                 };
+                history.track_running(
+                    observation.presence == PanePresence::Alive
+                        && observation.facts.turn == TurnState::Running,
+                    agent.status,
+                    now,
+                );
                 history.observation = Some(observation);
                 let clocks = self.short_clocks(&recipient, &history, !same_status, now)?;
                 self.recipients.insert(recipient, history);
                 self.set_short_clocks(clocks);
             }
             HistoryUpdate::ObservationLost { recipient } => {
+                let status = self
+                    .state
+                    .agent(&recipient)
+                    .ok_or_else(|| {
+                        MessageError::NotFound(format!("agent {recipient} was not found"))
+                    })?
+                    .status;
                 let history = self.recipients.get_mut(&recipient).ok_or_else(|| {
                     MessageError::NotFound(format!("agent {recipient} was not found"))
                 })?;
-                history.lose();
+                history.lose(status, now);
                 self.reset_clocks(&recipient, false);
             }
             HistoryUpdate::Activity {

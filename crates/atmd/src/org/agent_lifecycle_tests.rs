@@ -69,6 +69,45 @@ async fn down(agents: &AgentHandle, kill: bool) -> Result<DownResult, AgentError
         .await
 }
 
+/// Hold a preceding job until the test has changed the committed pane record.
+async fn hold_agent_reservation(
+    rig: &Rig,
+    agent: &str,
+    held_pane: &str,
+) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let control = rig.control.clone();
+    let request = request(agent, Some(held_pane), ReservationKind::Up);
+    let held = tokio::spawn(async move {
+        control.run_reserved(
+            request,
+            move |_| async move {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                Ok(())
+            },
+            cleanup,
+        ).await.unwrap();
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), entry).await.unwrap().unwrap();
+    (release, held)
+}
+
+async fn move_recorded_pane(rig: &Rig, agent: AgentId, harness: &str) {
+    for command in [
+        OrgCommand::Respawn {
+            agent_id: agent.clone(),
+            role: atm_org::parse_role(&agent.name, &format!("+++\nharness='{harness}'\n+++\n")).unwrap(),
+            reason: "preceding job replaced the pane".into(),
+        },
+        OrgCommand::PaneCreated { agent_id: agent.clone(), pane: "%2".into() },
+        OrgCommand::EditorReady { agent_id: agent },
+    ] {
+        rig.command(command).await;
+    }
+}
+
 #[tokio::test]
 async fn down_kill_true_kills_once_and_records_down() {
     let (rig, agents) = ready_agent().await;
@@ -227,6 +266,39 @@ async fn down_foreign_tag_refuses_without_mutation() {
         assert_eq!(rig.client.pending_reads(&pane("%1")).unwrap(), 0);
         assert_eq!(rig.org.status().unwrap(), before);
         assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+}
+
+#[tokio::test]
+async fn down_refuses_when_recorded_pane_changed_before_acquisition() {
+    // The call's first snapshot names %1, but a preceding reservation leaves
+    // the agent on %2: refuse the stale call before inspecting or changing
+    // the replacement pane, rather than relying on the actor's kill fence.
+    for kill in [true, false] {
+        let (rig, agents) = ready_agent().await;
+        let (release, held) = hold_agent_reservation(&rig, "p/lead", "%1").await;
+        let call = down(&agents, kill);
+        tokio::pin!(call);
+        tokio::select! {
+            biased;
+            result = &mut call => panic!("snapshot cannot have replied yet: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        // FIFO on the organisation channel: the call's snapshot has replied
+        // with %1 before the preceding job changes the record.
+        rig.org.snapshot().await.unwrap();
+        move_recorded_pane(&rig, lead(), "pi").await;
+        let before = rig.org.status().unwrap();
+        release.send(()).unwrap();
+        held.await.unwrap();
+        let result = call.await;
+        assert!(matches!(&result, Err(AgentError::Conflict(reason))
+            if reason.contains("changed its pane")), "{result:?}");
+        assert!(mutations(&rig).is_empty());
+        assert_eq!(rig.org.status().unwrap(), before);
+        let agent = rig.state("lead").await;
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.pane.as_deref(), Some("%2"));
     }
 }
 

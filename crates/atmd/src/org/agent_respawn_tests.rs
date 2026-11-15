@@ -131,8 +131,15 @@ const CLAUDE: (Harness, &str, &str) = (Harness::ClaudeCode, CLAUDE_READY, "claud
 async fn respawn_kills_then_ups_in_one_reservation() {
     // The old pane is killed (audited under agent.respawn), the agent is
     // recorded down and requested up again, and the new pane is split,
-    // tagged, launched into and waited on exactly as agent.up does.
-    let mut starting = Starting::ready(CODEX).await;
+    // tagged, launched into and waited on exactly as agent.up does. Hold
+    // the launch's audit append: both the agent and its old pane must still
+    // be reserved while the new start is in progress.
+    let (gate, mut entered) = mpsc::channel(1);
+    let rig = Rig::gated(Some(("control.spawned", gate))).await;
+    let ready = tokio::spawn(Starting::ready_on(rig, CODEX));
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
+        .await.unwrap().unwrap().send(()).unwrap();
+    let mut starting = ready.await.unwrap();
     let mut committed = starting.rig.org.committed.subscribe();
     starting.script_replace();
     starting.script_launch_on_new();
@@ -140,7 +147,28 @@ async fn respawn_kills_then_ups_in_one_reservation() {
     for _ in 0..2 {
         starting.inspect("%2", Some("q/lead"));
     }
-    let result = starting.respawn().await.unwrap();
+    let call = starting.respawning(None).await;
+    let release = tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
+        .await.unwrap().unwrap();
+    for (agent, held_pane) in [("q/lead", None), ("q/other", Some("%1"))] {
+        let request = crate::control::reservation::ReservationRequest::new(
+            agent.parse().unwrap(),
+            held_pane.map(pane),
+            ReservationKind::Observe,
+            crate::control::reservation::WaitPolicy::Refuse,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        let observed = starting.rig.control.run_reserved(
+            request,
+            |_| async { Ok::<_, AgentError>(()) },
+            cleanup,
+        ).await;
+        assert!(matches!(observed, Err(AgentError::Reservation(
+            crate::control::reservation::ReservationError::Busy { .. }
+        ))), "{agent} {held_pane:?}: {observed:?}");
+    }
+    release.send(()).unwrap();
+    let result = call.await.unwrap().unwrap();
     assert_eq!(result.agent_id, started());
     assert_eq!(result.pane, "%2");
     assert_eq!(starting.effects(), starting.respawned());
@@ -182,6 +210,73 @@ async fn respawn_kills_then_ups_in_one_reservation() {
             .unwrap()
     );
     starting.settled().await;
+    assert_eq!(starting.unread_all(), 0);
+}
+
+#[tokio::test]
+async fn respawn_launch_and_dialog_audits_name_respawn() {
+    // A launch that skips Codex's update offer audits both the launch and
+    // its dialog key under the respawn, just as it audits the old pane's kill.
+    let mut starting = Starting::ready(CODEX).await;
+    let mut committed = starting.rig.org.committed.subscribe();
+    starting.script_replace();
+    starting.script_launch_on_new();
+    starting.answered(Starting::moved(Starting::screen(CODEX_UPDATE, "codex"), "%2"));
+    starting.frame(Starting::moved(Starting::screen(CODEX_FRESH, "codex"), "%2"));
+    for _ in 0..2 {
+        starting.inspect("%2", Some("q/lead"));
+    }
+    starting.respawn().await.unwrap();
+    let mut audits = Vec::new();
+    while let Ok(event) = committed.try_recv() {
+        if event.kind.starts_with("control.") {
+            audits.push((event.kind.clone(), event.body["action"]["method"].clone()));
+        }
+    }
+    assert_eq!(audits, [
+        ("control.killed".into(), serde_json::json!("agent.respawn")),
+        ("control.spawned".into(), serde_json::json!("agent.respawn")),
+        ("control.sent".into(), serde_json::json!("agent.respawn")),
+    ]);
+    let mut effects = starting.respawned();
+    effects.push("keys %2 Escape".into());
+    assert_eq!(starting.effects(), effects);
+    assert_eq!(starting.agent().await.unwrap().status, AgentStatus::Ready);
+    starting.settled().await;
+    assert_eq!(starting.unread_all(), 0);
+}
+
+#[tokio::test]
+async fn respawn_failed_new_start_is_stuck_on_new_pane_with_owner_note() {
+    // The old pane was killed, but somebody selected the new pane before
+    // its prompt was read: nothing is typed and cleanup accounts for the
+    // unfinished start on that new pane, with one note to the owner.
+    let mut starting = Starting::ready(CODEX).await;
+    starting.script_replace();
+    starting.frame(Starting::moved(
+        Starting::shell(PROMPT).with_focus(Some(true)),
+        "%2",
+    ));
+    let result = starting.respawn().await;
+    assert!(matches!(result, Err(AgentError::Refused(_))), "{result:?}");
+    let agent = starting.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Stuck);
+    assert_eq!(agent.pane.as_deref(), Some("%2"));
+    assert_eq!(agent.session_id, None);
+    let reason = agent.reason.as_deref().unwrap();
+    assert!(reason.starts_with("start did not complete: the new pane was selected"));
+    assert!(reason.ends_with("; inspect %2"));
+    let state = starting.rig.org.snapshot().await.unwrap();
+    let notes: Vec<_> = state.messages()
+        .filter(|message| message.content.to == atm_org::Address::Owner)
+        .collect();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].content.body, format!("agent q/lead: {reason}"));
+    assert_eq!(starting.effects(), [
+        "kill %1",
+        "split %0 Below detached=true command=None",
+        "set-option -p -t %2 @atm-agent q/lead",
+    ]);
     assert_eq!(starting.unread_all(), 0);
 }
 
@@ -365,6 +460,30 @@ async fn respawn_kill_done_and_down_not_recorded_quarantines() {
     let state = starting.rig.org.snapshot().await.unwrap();
     assert_eq!(state.messages().count(), 0, "nobody is told by a note");
     assert!(quarantined(&starting.rig, "q/lead").await);
+    assert_eq!(starting.unread_all(), 0);
+}
+
+#[tokio::test]
+async fn respawn_refuses_when_recorded_pane_changed_before_acquisition() {
+    // The respawn prepared against %1 while a preceding job held the agent;
+    // that job leaves it Ready on %2. The stale respawn must not take down
+    // or replace the newly recorded pane.
+    let mut starting = Starting::ready(CODEX).await;
+    let (release, held) = hold_agent_reservation(&starting.rig, "q/lead", "%1").await;
+    starting.inspect("%0", None);
+    let call = starting.respawning(None).await;
+    move_recorded_pane(&starting.rig, started(), "codex").await;
+    let before = starting.rig.org.status().unwrap();
+    release.send(()).unwrap();
+    held.await.unwrap();
+    let result = call.await.unwrap();
+    assert!(matches!(&result, Err(AgentError::Conflict(reason))
+        if reason.contains("changed its pane")), "{result:?}");
+    assert!(starting.effects().is_empty());
+    assert_eq!(starting.rig.org.status().unwrap(), before);
+    let agent = starting.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.pane.as_deref(), Some("%2"));
     assert_eq!(starting.unread_all(), 0);
 }
 

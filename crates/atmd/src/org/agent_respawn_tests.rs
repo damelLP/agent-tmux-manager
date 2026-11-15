@@ -213,6 +213,65 @@ async fn respawn_kills_then_ups_in_one_reservation() {
 }
 
 #[tokio::test]
+async fn respawn_waiter_after_kill_sees_ready_on_new_pane() {
+    // Hold the Down append after the kill and admit a waiting reservation of
+    // the agent. It must wait for the entire respawn, not enter between the
+    // kill and the new start and see an agent that is temporarily Down.
+    let (gate, mut entered) = mpsc::channel(1);
+    let rig = Rig::gated(Some(("agent.down", gate))).await;
+    let mut starting = Starting::ready_with(rig, CODEX).await;
+    starting.script_replace();
+    starting.script_launch_on_new();
+    starting.frame(Starting::moved(Starting::screen(CODEX_FRESH, "codex"), "%2"));
+    for _ in 0..2 {
+        starting.inspect("%2", Some("q/lead"));
+    }
+    let call = starting.respawning(None).await;
+    let release = tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
+        .await.unwrap().unwrap();
+    let org = starting.rig.org.clone();
+    let request = crate::control::reservation::ReservationRequest::new(
+        started(),
+        None,
+        ReservationKind::Up,
+        crate::control::reservation::WaitPolicy::Wait,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(50),
+    );
+    let waiter = starting.rig.control.run_reserved(
+        request,
+        move |_| async move {
+            let state = org.snapshot().await.unwrap();
+            Ok::<_, AgentError>(state.agent(&started()).map(|agent| (agent.status, agent.pane.clone())))
+        },
+        cleanup,
+    );
+    tokio::pin!(waiter);
+    tokio::select! {
+        biased;
+        result = &mut waiter => panic!("the waiter cannot have run yet: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    // FIFO on the control actor: this later independent request answers
+    // only after the waiter's admission has been handled.
+    let barrier = crate::control::reservation::ReservationRequest::new(
+        "q/unrelated".parse().unwrap(),
+        None,
+        ReservationKind::Observe,
+        crate::control::reservation::WaitPolicy::Refuse,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+    );
+    starting.rig.control.run_reserved(
+        barrier,
+        |_| async { Ok::<_, AgentError>(()) },
+        cleanup,
+    ).await.unwrap();
+    release.send(()).unwrap();
+    let result = call.await.unwrap().unwrap();
+    assert_eq!(result.pane, "%2");
+    assert_eq!(waiter.await.unwrap(), Some((AgentStatus::Ready, Some("%2".into()))));
+}
+
+#[tokio::test]
 async fn respawn_launch_and_dialog_audits_name_respawn() {
     // A launch that skips Codex's update offer audits both the launch and
     // its dialog key under the respawn, just as it audits the old pane's kill.

@@ -1,7 +1,7 @@
 //! The start line: after a start, respawn or clear of a named agent ends
 //! Ready, the daemon queues one note from `system` to the agent, and the
-//! message runtime types it as `[mN] New session: run atm me`, the note's
-//! text itself rather than an inbox reference. It goes through the runtime
+//! message runtime types it as `[mN] New session: run the shell command atm me`,
+//! the note's text itself rather than an inbox reference. It goes through the runtime
 //! unchanged: its guards (an idle session, an empty editor, no dialog, not
 //! the owner's focused pane), its exact confirmation and its holds.
 //!
@@ -35,7 +35,7 @@ use atm_org::{
 };
 
 /// The note's body, and the typed line after its `[mN]` token.
-const START_LINE: &str = "New session: run atm me";
+const START_LINE: &str = "New session: run the shell command atm me";
 
 /// The `ATM_SPAWN_*` variable that turns start lines off when it is `off`.
 const SWITCH: &str = "ATM_SPAWN_START_LINE";
@@ -53,14 +53,19 @@ pub fn start_line(agent: &AgentId) -> MessageContent {
     }
 }
 
-/// Only the complete canonical start line, never a lookalike. Nobody but the
-/// daemon sends as `system`.
+/// Only a complete current or historical start note, never a lookalike.
+/// Accept the old body when reading persisted messages; emit only START_LINE.
+/// Nobody but the daemon sends as `system`.
 #[must_use]
 pub fn is_start_line(content: &MessageContent) -> bool {
-    matches!(&content.to, Address::Agent(agent) if content == &start_line(agent))
+    matches!(&content.to, Address::Agent(agent) if content == &start_line(agent)
+    || content == &MessageContent {
+        body: "New session: run atm me".into(),
+        ..start_line(agent)
+    })
 }
 
-/// The line typed for start line `id`: never longer than its inbox reference.
+/// The current line typed for start line `id`, including historical notes.
 #[must_use]
 pub fn start_reference(id: MessageId) -> String {
     format!("[{id}] {START_LINE}")

@@ -4398,7 +4398,10 @@ async fn a_start_line_is_typed_and_confirmed_as_its_own_text() {
     let mut rig = Rig::attempt().await;
     let id = rig.ready_start_line().await;
     let line = crate::org::start_line::start_reference(id);
-    assert_eq!(line, format!("[{id}] New session: run atm me"));
+    assert_eq!(
+        line,
+        format!("[{id}] New session: run the shell command atm me")
+    );
     let staged = drafted(&line);
     rig.script(&[pi(IDLE), pi(IDLE), staged.clone(), staged]);
     let attempt = rig.spawn_deliver(id);

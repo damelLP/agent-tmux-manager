@@ -352,8 +352,8 @@ mod tests {
         ));
     }
 
-    // Break caught: atm me listing the start line, whose only text is "run atm
-    // me", as an unread message to handle and acknowledge.
+    // Break caught: atm me listing current or historical start notes replayed
+    // from the event log as unread messages to handle and acknowledge.
     #[test]
     fn context_omits_start_lines_and_keeps_other_system_notes() {
         use atm_org::{MessageContent, OrgEvent};
@@ -379,6 +379,10 @@ mod tests {
                 session_id: None,
             },
             OrgEvent::MessageSent(super::super::start_line::start_line(&id)),
+            OrgEvent::MessageSent(MessageContent {
+                body: "New session: run atm me".into(),
+                ..super::super::start_line::start_line(&id)
+            }),
             OrgEvent::MessageSent(note),
         ]
         .into_iter()
@@ -395,7 +399,7 @@ mod tests {
         assert_eq!(
             listed,
             [(
-                "m4".to_string(),
+                "m5".to_string(),
                 "New session: run atm me later".to_string()
             )]
         );

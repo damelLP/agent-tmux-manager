@@ -940,7 +940,15 @@ impl Rig {
             observation: idle_observation(),
         };
         self.rt.history.record(observed, self.now()).unwrap();
-        MessageId::new(seq)
+        // The recipient's job consumes the wait it reads: the hold clock runs.
+        let id = MessageId::new(seq);
+        let waiting = HistoryUpdate::Consumed {
+            id,
+            step: self.step(id),
+        };
+        self.rt.history.record(waiting, self.now()).unwrap();
+        assert!(self.snapshot(id).live.hold_since.is_some());
+        id
     }
 
     /// As `queue_message`, then the stable-idle time passes: the policy's
@@ -1386,6 +1394,8 @@ async fn attempt_append_precedes_paste() {
     let snapshot = rig.snapshot(id);
     assert_eq!(snapshot.last_attempt_seq, Some(before + 1));
     assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    // The executor consumed its PasteNow: the wait's hold clock is reset.
+    assert_eq!(snapshot.live.hold_since, None);
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);
 }

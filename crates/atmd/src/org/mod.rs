@@ -56,6 +56,8 @@ pub mod messages;
 mod raw;
 mod storage;
 mod summary;
+mod task_methods;
+pub mod tasks;
 mod watch;
 
 pub(crate) use watch::message as event_message;

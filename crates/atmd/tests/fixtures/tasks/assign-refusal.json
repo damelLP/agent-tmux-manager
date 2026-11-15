@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"assign","method":"task.assign","from_pane":"%4","params":{"task_id":"t6","agent_id":"project/worker"}},"response":{"error":{"code":"refused"}}}

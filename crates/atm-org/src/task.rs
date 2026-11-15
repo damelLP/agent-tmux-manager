@@ -261,8 +261,9 @@ pub struct TaskCostRecorded {
     pub record: TaskCost,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
+    #[serde(rename = "task_id")]
     pub id: TaskId,
     pub title: String,
     pub kind: TaskKind,

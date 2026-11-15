@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"interrupt-not-found","method":"session.interrupt","params":{"target":"nope"}},
+  "response": {"type":"response","id":"interrupt-not-found","error":{"code":"not_found","message":"No session matching 'nope'"}},
+  "ignore": []
+}

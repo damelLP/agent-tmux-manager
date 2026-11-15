@@ -452,7 +452,7 @@ class Refusals(Rig):
             process = subprocess.Popen([sys.executable, str(SCRIPTS / 'atm-rollout'), *self.args(report=False)],
                                        cwd=self.repo, env=self.env, stdin=slave, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True)
-            os.write(master, answer.encode() + b'\n')
+            os.write(master, answer if isinstance(answer, bytes) else answer.encode() + b'\n')
             out, err = process.communicate(timeout=300)
         finally:
             os.close(master)
@@ -462,10 +462,12 @@ class Refusals(Rig):
     def test_a_typed_no_refuses_and_a_typed_yes_rolls_out(self):
         self.start_tmux()
         daemon, old = self.start_daemon(), self.pair()
-        code, out, err = self.on_terminal('no')
-        self.assertEqual(code, 1, out + err)
-        self.assertIn('protected-file report not accepted', err)
-        self.assert_unchanged(old, daemon)
+        for answer in ('no', b'\x04'):  # typed, and Ctrl-D at the prompt
+            code, out, err = self.on_terminal(answer)
+            self.assertEqual(code, 1, out + err)
+            self.assertIn('rollout: refused, nothing changed: protected-file report not accepted', err)
+            self.assertNotIn('Traceback', err)
+            self.assert_unchanged(old, daemon)
         code, out, err = self.on_terminal('yes')
         self.assertEqual(code, 0, out + err)
         self.assert_running(self.pair(self.candidate / 'bin'))

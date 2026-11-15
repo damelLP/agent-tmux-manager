@@ -321,7 +321,10 @@ class Rollout:
                     '--report-sha256 is not the hash of this report')
             return
         require(sys.stdin.isatty(), 'the report needs your yes: use a terminal or --report-sha256 <hash>')
-        answer = input('Type yes to accept this report: ')
+        try:
+            answer = input('Type yes to accept this report: ')
+        except EOFError:  # Ctrl-D is a no
+            answer = ''
         require(answer.strip() == 'yes', 'protected-file report not accepted')
 
     # ---- step 2: the smoke, private ---------------------------------------

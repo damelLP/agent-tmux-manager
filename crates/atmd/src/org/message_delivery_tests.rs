@@ -3315,6 +3315,44 @@ async fn timeout_after_enter_holds() {
     assert!(rig.typed(id), "{:?}", rig.effects());
 }
 
+/// The supervisor stops work inside Enter. A visible cleanup token cannot
+/// turn its unknown result into the claim that no Enter was sent.
+#[tokio::test(start_paused = true)]
+async fn held_enter_with_visible_cleanup_token_has_unknown_outcome() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let before = rig.org.status().unwrap();
+    rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let attempt = tokio::spawn(deliver(rig.rt.clone(), id, deadline));
+    guarded(rig.tmux_gate.entered()).await;
+    assert!(rig.typed(id), "{:?}", rig.effects());
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    until("cleanup consumed its token capture", || rig.reads() == 0).await;
+    rig.tmux_gate.release();
+    let delivered = guarded(attempt).await.unwrap();
+
+    assert!(
+        matches!(
+            delivered,
+            Err(MessageError::Reservation(ReservationError::Timeout))
+        ),
+        "{delivered:?}"
+    );
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    // Work never received/classified the key's result: no returned-call audit,
+    // no Delivered or DeliveryFailed, just the committed attempt.
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+}
+
 /// tmux took the Enter and then reported a failure. More staged frames are
 /// waiting, and no second key follows: held, audited once as an error.
 #[tokio::test(start_paused = true)]

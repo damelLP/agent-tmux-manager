@@ -556,6 +556,27 @@ impl Drop for ManualJob {
 }
 
 #[tokio::test(start_paused = true)]
+async fn first_terminal_evaluation_does_not_retain_busy_turn_bookkeeping() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    guarded(rig.job.observe()).await.unwrap();
+    // Model a terminal commit racing the first evaluation after observation.
+    rig.command(OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: "owner cancelled".into(),
+        final_failure: true,
+    })
+    .await;
+    let mut queued = rig.job.service.board.queued.subscribe();
+    let next = guarded(rig.job.step(id, &mut queued)).await.unwrap();
+    assert!(matches!(next, Next::Change));
+    assert!(!rig.job.shown.contains(&id));
+    let shared = rig.job.service.board.shared.lock().unwrap();
+    assert!(!shared.busy_turn.contains_key(&id));
+}
+
+#[tokio::test(start_paused = true)]
 async fn running_turn_notice_at_30_minutes_once() {
     let mut rig = ManualJob::new().await;
     rig.turn(atm_core::TurnState::Running);

@@ -386,6 +386,7 @@ mod tests {
                     dropped: Arc::new(AtomicU64::new(0)),
                 },
                 caller: None,
+                work: CancellationToken::new(),
             };
             let start = Instant::now();
             assert!(matches!(
@@ -601,9 +602,19 @@ pub struct ControlHandle {
     sender: mpsc::Sender<Pending>,
     audits: AuditQueue,
     caller: Option<CallContext>,
+    /// Stops reserved work; a child of the actor's own token.
+    work: CancellationToken,
 }
 
 impl ControlHandle {
+    /// Daemon shutdown: stop every reserved job's work now and keep its
+    /// cleanup. Running work ends as `Completion::WorkerStopped`; waiting and
+    /// new reservations, and unreserved observes, are refused. The actor
+    /// keeps serving cleanups, legacy input and audits until it is cancelled.
+    pub(crate) fn stop_reserved_work(&self) {
+        self.work.cancel();
+    }
+
     /// Optional server identity supplied by a caller; absent retains legacy behavior.
     #[must_use]
     pub fn for_server(mut self, server: Option<String>) -> Self {
@@ -778,6 +789,8 @@ where
         dropped: Arc::new(AtomicU64::new(0)),
     };
     let handle_audits = audits.clone();
+    let work = cancel.child_token();
+    let handle_work = work.clone();
     let task = tokio::spawn(async move {
         let mut forwarder = tokio::spawn(async move {
             while let Some(audit) = receive.recv().await {
@@ -803,7 +816,7 @@ where
                 }
             }
         });
-        let mut jobs = Jobs::new(cancel.clone(), audits.clone());
+        let mut jobs = Jobs::new(work.clone(), audits.clone());
         let mut parked = VecDeque::<Pending>::new();
         #[cfg(test)]
         let mut audit_barriers = Vec::new();
@@ -813,8 +826,10 @@ where
             if stopping && jobs.idle() {
                 requests.close();
             }
+            // Reserved work can stop before the service does.
+            let work_stopped = work.is_cancelled();
             jobs.ready(Instant::now());
-            jobs.capture_ready(&*client, stopping).await;
+            jobs.capture_ready(&*client, work_stopped).await;
             // One pass per wake, not a busy retry loop. Re-resolve original targets
             // against current registry, org projection and reservation ownership.
             for _ in 0..parked.len() {
@@ -848,6 +863,8 @@ where
                     stopping = true;
                     jobs.stop_waiting();
                 }
+                // Wake only: the next pass rejects what waits.
+                _ = work.cancelled(), if !work_stopped => {}
                 () = jobs.join_next(), if !jobs.is_empty() => {}
                 () = mirror.changed() => {}
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {}
@@ -866,7 +883,7 @@ where
                         self::Pending { request: Request::Reserved(command), server, deadline, .. } => {
                             // A capability is minted only after U7's server-identity
                             // guard; later operations carry its same actor fence.
-                            if !stopping && matches!(command, Command::Acquire(_) | Command::Observe { .. }) {
+                            if !work_stopped && matches!(command, Command::Acquire(_) | Command::Observe { .. }) {
                                 if let Some(server) = server {
                                     let budget = deadline.min(Instant::now() + ACTION_TIMEOUT);
                                     if let Err(error) = outcome(budget, verify_server(&*client, server, "reserve pane control".into())).await {
@@ -875,7 +892,7 @@ where
                                     }
                                 }
                             }
-                            jobs.dispatch(command, Instant::now(), stopping, &*client).await;
+                            jobs.dispatch(command, Instant::now(), work.is_cancelled(), &*client).await;
                         }
                         pending if legacy_input::is_input(&pending) => {
                             if let Some(pending) = legacy_input::dispatch(&*client, &registry, &mut jobs, &mirror, pending, &audits, !stopping && parked.len() < CAPACITY).await {
@@ -914,6 +931,7 @@ where
             sender,
             audits: handle_audits,
             caller: None,
+            work: handle_work,
         },
         task,
     )

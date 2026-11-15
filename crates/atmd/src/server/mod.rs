@@ -38,6 +38,7 @@
 
 mod connection;
 pub mod methods;
+pub mod stop;
 
 pub use connection::{
     parse_status_line, ConnectionError, ConnectionHandler, Subscriber, SubscriberWriter,
@@ -72,7 +73,7 @@ pub const DEFAULT_SOCKET_PATH: &str = "/tmp/atm.sock";
 pub const MAX_TUI_CLIENTS: usize = 64;
 
 /// How long shutdown waits for connection handlers before aborting them
-const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECTION_DRAIN_TIMEOUT: Duration = stop::CONNECTIONS;
 
 /// How long the accept loop pauses after a failed accept
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
@@ -167,6 +168,8 @@ impl DaemonServer {
         } else {
             None
         };
+        // Only a control this server started is this server's to stop.
+        let own_control = control_task.as_ref().and(services.control.clone());
         let agents_cancel = CancellationToken::new();
         let agents_task = if services.agents.is_none() && services.org.status().is_ok() {
             services.control.clone().map(|control| {
@@ -186,21 +189,31 @@ impl DaemonServer {
         let messages_cancel = CancellationToken::new();
         let messages_task = start_messages(&mut services, &messages_cancel);
         let result = self.run_with_services(services).await;
+        // Reserved work stops at once and its cleanups run while control and
+        // the organisation writer still exist; then each stage, in order and
+        // by its bound (see `stop`), which logs a stage that overruns.
         // Messages stop first: an attempt in flight settles while agents,
         // control and the organisation writer are still there for it.
-        messages_cancel.cancel();
-        if let Some(task) = messages_task {
-            let _ = task.await;
-        }
-        // Drain agent reservations while the shared control and org still exist.
-        agents_cancel.cancel();
-        if let Some(task) = agents_task {
-            let _ = task.await;
-        }
-        control_cancel.cancel();
-        if let Some(task) = control_task {
-            let _ = task.await;
-        }
+        let stages = stop::Stages {
+            messages: stop::Stage {
+                cancel: messages_cancel,
+                task: messages_task,
+            },
+            agents: stop::Stage {
+                cancel: agents_cancel,
+                task: agents_task,
+            },
+            control: stop::Stage {
+                cancel: control_cancel,
+                task: control_task,
+            },
+        };
+        let stop_work = || {
+            if let Some(control) = &own_control {
+                control.stop_reserved_work();
+            }
+        };
+        stop::stop_stages(stop_work, stages).await;
         result
     }
 

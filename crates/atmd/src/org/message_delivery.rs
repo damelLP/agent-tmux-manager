@@ -716,6 +716,10 @@ impl Attempt {
                 if rt.cancel.is_cancelled() {
                     return Err(shutting_down());
                 }
+                // The window may have ended during this look. The Enter
+                // still goes out: it is as guarded as any other, a receipt
+                // that comes late is honoured, and a key refused here would
+                // leave the reference staged for the owner to clear.
                 let key = PaneKey::Enter;
                 let entered =
                     (r.keys_guarded(pane, agent.clone(), key, format, guard(enter))).await;

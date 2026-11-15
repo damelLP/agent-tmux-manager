@@ -624,7 +624,7 @@ fn a_broken_task_body_is_an_error_and_an_added_field_is_tolerated() {
             "{seq} {kind}"
         );
     }
-    // Ids and enumerations are checked, not passed through.
+    // IDs and enum JSON types remain checked; future words have read fallbacks.
     for (kind, body) in [
         (
             "task.assigned",
@@ -636,11 +636,11 @@ fn a_broken_task_body_is_an_error_and_an_added_field_is_tolerated() {
         ),
         (
             "task.state_changed",
-            json!({"task_id": "t12", "state": "merged", "reason": null, "by": "owner"}),
+            json!({"task_id": "t12", "state": 99, "reason": null, "by": "owner"}),
         ),
         (
             "task.verdict",
-            json!({"task_id": "t12", "verdict": "maybe", "review_task": null, "note": null, "by": "owner"}),
+            json!({"task_id": "t12", "verdict": 99, "review_task": null, "note": null, "by": "owner"}),
         ),
     ] {
         assert!(OrgEvent::from_parts(kind, &body).is_err(), "{kind} {body}");

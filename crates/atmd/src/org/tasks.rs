@@ -177,6 +177,7 @@ pub fn notification(
             let what = match submitted.what {
                 TaskSubmission::Plan => "plan",
                 TaskSubmission::Result => "result",
+                TaskSubmission::Unknown => "unknown",
             };
             let instruction = if files.is_empty() {
                 "No submission file is attached."

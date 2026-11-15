@@ -250,6 +250,13 @@ impl Clearing {
             })
             .count();
         assert_eq!(notes, 1);
+        // Only an operation that ends Ready queues a start line.
+        assert!(
+            state
+                .messages()
+                .all(|message| !crate::org::start_line::is_start_line(&message.content)),
+            "a start line after an operation that did not end Ready"
+        );
     }
 
     /// The agent is Stuck for a reason that contains `part`.
@@ -328,9 +335,10 @@ async fn clear_types_submits_and_binds_the_new_session() {
             let agent = clearing.agent().await;
             assert_eq!(agent.status, AgentStatus::Ready);
             assert_eq!(agent.session_id, Some(SessionId::new("new")));
+            // The new session's binding, then its start line.
             assert_eq!(
                 committed_kinds(&mut committed),
-                ["agent.clear_requested", "agent.session_bound"]
+                ["agent.clear_requested", "agent.session_bound", "msg.sent"]
             );
             // One paste, one Enter, nothing else, ever.
             assert_eq!(clearing.sent().len(), 2, "{harness:?} {old:?}");
@@ -1200,7 +1208,8 @@ async fn duplicate_clear_conflicts_while_first_waits_for_delivery() {
         [
             "agent.session_bound",
             "agent.clear_requested",
-            "agent.session_bound"
+            "agent.session_bound",
+            "msg.sent"
         ]
     );
     assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
@@ -1231,7 +1240,7 @@ async fn clear_never_binds_a_pending_row_before_clearing() {
     );
     assert_eq!(
         committed_kinds(&mut committed),
-        ["agent.clear_requested", "agent.session_bound"]
+        ["agent.clear_requested", "agent.session_bound", "msg.sent"]
     );
     assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
 }
@@ -1258,7 +1267,7 @@ async fn codex_clear_goes_from_conversation_to_fresh_editor() {
     assert_eq!(clearing.unread(), 9, "polls 002 through 004 were not needed");
     assert_eq!(
         committed_kinds(&mut committed),
-        ["agent.clear_requested", "agent.editor_ready"]
+        ["agent.clear_requested", "agent.editor_ready", "msg.sent"]
     );
     let agent = clearing.agent().await;
     assert_eq!(agent.status, AgentStatus::Ready);
@@ -1618,7 +1627,7 @@ async fn missed_hook_conversation_not_noop() {
     assert_eq!(clearing.unread(), 0);
     assert_eq!(
         committed_kinds(&mut committed),
-        ["agent.clear_requested", "agent.editor_ready"]
+        ["agent.clear_requested", "agent.editor_ready", "msg.sent"]
     );
     assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
 }
@@ -1661,4 +1670,58 @@ async fn clear_timeout_outside_its_range_is_refused_with_the_agent_unchanged() {
         error.message
     );
     assert_eq!(clearing.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clear_queues_one_start_line_and_a_second_clear_reuses_it() {
+    // The clear's start line is the canonical note to the agent, queued. A
+    // second clear while that line is still open queues no second one: the
+    // open line is typed to the newest session.
+    let clearing = Clearing::new(Harness::Codex, Old::Unbound).await;
+    let lines = || async {
+        let state = clearing.rig.org.snapshot().await.unwrap();
+        state
+            .messages()
+            .map(|message| (message.content.clone(), message.status))
+            .collect::<Vec<_>>()
+    };
+    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+    clearing.frame(CODEX_FRESH);
+    clearing.clear().await.unwrap();
+    let once = vec![(
+        crate::org::start_line::start_line(&lead()),
+        atm_org::DeliveryStatus::Queued,
+    )];
+    assert_eq!(lines().await, once);
+
+    let mut committed = clearing.rig.org.committed.subscribe();
+    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+    clearing.frame(CODEX_FRESH);
+    clearing.clear().await.unwrap();
+    assert_eq!(
+        clearing.sent(),
+        ["paste %1 /new", "keys %1 Enter", "paste %1 /new", "keys %1 Enter"]
+    );
+    assert_eq!(
+        committed_kinds(&mut committed),
+        ["agent.clear_requested", "agent.editor_ready"]
+    );
+    assert_eq!(lines().await, once);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clear_with_start_lines_off_queues_none() {
+    let mut rig = Rig::new().await;
+    rig.spawn_env
+        .insert("ATM_SPAWN_START_LINE".into(), "off".into());
+    let clearing = Clearing::on(rig, Harness::Codex, Old::Unbound).await;
+    let mut committed = clearing.rig.org.committed.subscribe();
+    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+    clearing.frame(CODEX_FRESH);
+    clearing.clear().await.unwrap();
+    assert_eq!(
+        committed_kinds(&mut committed),
+        ["agent.clear_requested", "agent.editor_ready"]
+    );
+    assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
 }

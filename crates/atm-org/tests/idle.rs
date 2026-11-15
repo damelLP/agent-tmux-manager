@@ -133,6 +133,24 @@ fn a_share_exactly_at_the_line_is_flagged() {
 }
 
 #[test]
+fn the_context_line_is_data() {
+    let seventy = HandoverLimits {
+        context_line_percent: 70,
+        ..limits()
+    };
+    let at = |share| HandoverInput {
+        automatic: false,
+        ..idle(share)
+    };
+    let now = after(MINUTE);
+    assert_eq!(
+        handover_step(&at(69.99), &seventy, now),
+        HandoverStep::Nothing
+    );
+    assert_eq!(handover_step(&at(70.0), &seventy, now), FLAG_LINE);
+}
+
+#[test]
 fn at_the_line_an_automatic_role_is_asked_to_save() {
     assert_eq!(step(idle(40.0), MINUTE), SAVE_LINE);
     assert_eq!(step(idle(39.99), MINUTE), HandoverStep::Nothing);
@@ -202,13 +220,29 @@ fn the_owner_answers_in_time_unless_he_is_away() {
 }
 
 #[test]
-fn away_changes_nothing_for_an_agent_that_waits_for_another_agent() {
-    let input = HandoverInput {
+fn away_changes_nothing_for_an_agent_that_does_not_wait_for_the_owner() {
+    let expiry = after(LIFETIME);
+    for (waits_for, expected) in [
+        (WaitsFor::Agent, HandoverStep::Nothing),
+        (WaitsFor::Nothing, SAVE_EXPIRING),
+        (WaitsFor::Until(expiry), SAVE_EXPIRING),
+        (
+            WaitsFor::Until(expiry - TimeDelta::seconds(1)),
+            HandoverStep::Nothing,
+        ),
+    ] {
+        let here = waiting(waits_for);
+        let away = HandoverInput { away: true, ..here };
+        for input in [here, away] {
+            assert_eq!(step(input, IDLE_LIMIT), expected, "{input:?}");
+            assert_eq!(step(input, IDLE_LIMIT - 1), HandoverStep::Nothing);
+        }
+    }
+    let agent_away = HandoverInput {
         away: true,
         ..waiting(WaitsFor::Agent)
     };
-    assert_eq!(step(input, IDLE_LIMIT), HandoverStep::Nothing);
-    assert_eq!(step(input, LIFETIME - 1), HandoverStep::Nothing);
+    assert_eq!(step(agent_away, LIFETIME - 1), HandoverStep::Nothing);
 }
 
 #[test]

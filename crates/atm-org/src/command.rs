@@ -91,6 +91,16 @@ pub enum OrgCommand {
     ControlSpawned(ControlAudit),
     ControlKilled(ControlAudit),
     Decision(DecisionCommand),
+    /// Audit: a handover asked the agent to save with this message.
+    SaveRequested {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
+    /// Audit: the agent's save turn ended with its memory file changed.
+    Saved {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -202,6 +212,20 @@ impl OrgCommand {
             Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
             Self::ControlKilled(audit) => OrgEvent::ControlKilled(audit),
             Self::Decision(command) => command.event(),
+            Self::SaveRequested {
+                agent_id,
+                message_id,
+            } => OrgEvent::AgentSaveRequested {
+                agent_id,
+                message_id,
+            },
+            Self::Saved {
+                agent_id,
+                message_id,
+            } => OrgEvent::AgentSaved {
+                agent_id,
+                message_id,
+            },
         }
     }
 }
@@ -438,6 +462,18 @@ impl OrgState {
                 true
             }
             OrgCommand::Decision(command) => return self.decide_decision(command, event, now),
+            OrgCommand::SaveRequested {
+                agent_id,
+                message_id,
+            }
+            | OrgCommand::Saved {
+                agent_id,
+                message_id,
+            } => {
+                self.require_agent(agent_id)?;
+                self.require_message(message_id)?;
+                true
+            }
         };
         Ok(if changed { vec![event] } else { vec![] })
     }

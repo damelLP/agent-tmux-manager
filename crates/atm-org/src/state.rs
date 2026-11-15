@@ -330,11 +330,19 @@ impl OrgState {
             OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
                 decision_id, by, ..
             })
-            | OrgEvent::DecisionResolved(DecisionResolution {
-                decision_id, by, ..
+            | OrgEvent::DecisionResolved(DecisionResolutionEvent {
+                resolution:
+                    DecisionResolution {
+                        decision_id, by, ..
+                    },
+                ..
             })
-            | OrgEvent::DecisionOverruled(DecisionResolution {
-                decision_id, by, ..
+            | OrgEvent::DecisionOverruled(DecisionResolutionEvent {
+                resolution:
+                    DecisionResolution {
+                        decision_id, by, ..
+                    },
+                ..
             })
             | OrgEvent::DecisionWithdrawn(DecisionWithdrawal {
                 decision_id, by, ..
@@ -344,6 +352,17 @@ impl OrgState {
             }
             OrgEvent::DecisionExpired { decision_id } => {
                 self.require_decision(decision_id)?;
+            }
+            OrgEvent::AgentSaveRequested {
+                agent_id,
+                message_id,
+            }
+            | OrgEvent::AgentSaved {
+                agent_id,
+                message_id,
+            } => {
+                self.require_agent(agent_id)?;
+                self.require_message(message_id)?;
             }
         }
         Ok(())
@@ -551,8 +570,11 @@ impl OrgState {
                 self.summaries
                     .insert(summary.session_id.clone(), summary.clone());
             }
-            OrgEvent::ControlSent(_) | OrgEvent::ControlSpawned(_) | OrgEvent::ControlKilled(_) => {
-            }
+            OrgEvent::ControlSent(_)
+            | OrgEvent::ControlSpawned(_)
+            | OrgEvent::ControlKilled(_)
+            | OrgEvent::AgentSaveRequested { .. }
+            | OrgEvent::AgentSaved { .. } => {}
             OrgEvent::DecisionRequested(request) => {
                 let id = DecisionId::new(seq);
                 self.decisions
@@ -564,7 +586,8 @@ impl OrgState {
                 decision.provisional = Some(choice.clone());
                 decision.taken_at = Some(ts);
             }
-            OrgEvent::DecisionResolved(resolution) | OrgEvent::DecisionOverruled(resolution) => {
+            OrgEvent::DecisionResolved(answer) | OrgEvent::DecisionOverruled(answer) => {
+                let resolution = &answer.resolution;
                 let decision = self.decision_mut(&resolution.decision_id)?;
                 decision.close(
                     if matches!(event, OrgEvent::DecisionResolved(_)) {

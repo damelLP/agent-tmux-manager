@@ -64,6 +64,9 @@ mod reconciliation {
                 std::collections::VecDeque<Option<super::super::agent_flow::ProcFacts>>,
             >,
         >,
+        /// The daemon's `ATM_SPAWN_*` start environment the service reads;
+        /// empty by default.
+        spawn_env: std::collections::HashMap<String, String>,
     }
     impl Rig {
         async fn new() -> Self {
@@ -163,6 +166,7 @@ mod reconciliation {
                 ))),
                 proc_after_enter: Default::default(),
                 proc_script: Default::default(),
+                spawn_env: Default::default(),
             }
         }
         async fn command(&self, command: OrgCommand) {
@@ -275,7 +279,10 @@ mod reconciliation {
                 self.control.clone(),
                 self.cancel.child_token(),
                 self.reader(),
-                std::sync::Arc::new(|_| None),
+                {
+                    let env = self.spawn_env.clone();
+                    std::sync::Arc::new(move |key| env.get(key).cloned())
+                },
             )
         }
         /// The scripted procfs reader. Every test starts the service with it:
@@ -4558,6 +4565,68 @@ mod reconciliation {
         assert_eq!(told(&agents).await.2, pinned_to("pi"));
         assert_eq!(listed_reason(&agents).await, None);
         assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_session_kill_of_an_agents_pane_wakes_its_observation() {
+        // A Ready agent whose session has no row: the registry will never
+        // report its pane gone. The kill's own audit event starts the pass
+        // that finds the pane gone and records the agent Down.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        inspect_with(&rig, "pi");
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        let mut events = agents.observation_events();
+        let killed = |pane: &str, method: &str, outcome: &str| {
+            OrgCommand::ControlKilled(atm_org::ControlAudit {
+                pane: pane.into(),
+                action: serde_json::json!({"method": method, "outcome": outcome}),
+            })
+        };
+        // A row on another pane is the barrier: the observer takes committed
+        // events first, so everything logged before it has been looked at.
+        // Answers whether a kill woke an agent, and whether a pass finished.
+        async fn woken(
+            rig: &Rig,
+            events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
+            row: &str,
+        ) -> (bool, bool) {
+            rig.row(row, "%9", false).await;
+            let (mut woken, mut finished) = (false, false);
+            loop {
+                let event = events.recv().await.unwrap();
+                woken |= event.phase == "killed_scheduled";
+                finished |= event.phase == "finished";
+                if event.phase == "scheduled" {
+                    return (woken, finished);
+                }
+            }
+        }
+        // Not this agent's pane, not a kill that happened, and not a kill
+        // without a reservation (a lifecycle flow records its own agent).
+        rig.command(killed("%2", "session.kill", "ok")).await;
+        rig.command(killed("%1", "session.kill", "error")).await;
+        rig.command(killed("%1", "agent.down", "ok")).await;
+        assert_eq!(woken(&rig, &mut events, "s8").await, (false, false));
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+
+        rig.client
+            .script_inspect(&PaneId::parse("%1").unwrap(), None)
+            .unwrap();
+        rig.command(killed("%1", "session.kill", "ok")).await;
+        let (woken, finished) = woken(&rig, &mut events, "s9").await;
+        assert!(woken, "the kill of the agent's pane started no observation");
+        if !finished {
+            progress(&mut events, "finished", Some("p/lead")).await;
+        }
+        let lead = rig.state("lead").await;
+        assert_eq!(lead.status, AgentStatus::Down);
+        assert_eq!(
+            lead.reason.as_deref(),
+            Some("recorded pane is absent, dead or no longer owned")
+        );
     }
 
     #[tokio::test]

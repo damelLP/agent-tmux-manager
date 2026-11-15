@@ -1159,7 +1159,17 @@ impl Rig {
     }
 
     async fn queue_observed_message(&mut self, observation: RecipientObservation) -> MessageId {
-        let seq = self.commit(Rig::message(worker())).await;
+        self.queue_observed(Rig::message(worker()), observation)
+            .await
+    }
+
+    /// As `queue_observed_message`, for the message `send` sends.
+    async fn queue_observed(
+        &mut self,
+        send: OrgCommand,
+        observation: RecipientObservation,
+    ) -> MessageId {
+        let seq = self.commit(send).await;
         if self.messages.is_some() {
             self.folded(seq).await;
         } else {
@@ -1185,6 +1195,15 @@ impl Rig {
     /// next step for the message is the first paste.
     async fn ready_message(&mut self) -> MessageId {
         let id = self.queue_message().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(self.step(id), DeliveryStep::PasteNow { attempt: 1 });
+        id
+    }
+
+    /// As `ready_message`, for the worker's start line.
+    async fn ready_start_line(&mut self) -> MessageId {
+        let line = OrgCommand::SendMessage(crate::org::start_line::start_line(&worker()));
+        let id = self.queue_observed(line, idle_observation()).await;
         tokio::time::advance(Duration::from_secs(10)).await;
         assert_eq!(self.step(id), DeliveryStep::PasteNow { attempt: 1 });
         id
@@ -4365,4 +4384,74 @@ async fn enter_after_the_window_is_sent_and_a_late_receipt_delivers() {
     rig.rt.control.flush_audits().await;
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 3);
+}
+
+// ---------------------------------------------------------------------------
+// The start line: typed as its own text, through the same guards
+// ---------------------------------------------------------------------------
+
+/// The whole attempt for a start line: its own text is pasted, the draft is
+/// read as staged against that text, one Enter, and the session's prompt
+/// event with that exact text confirms it.
+#[tokio::test(start_paused = true)]
+async fn a_start_line_is_typed_and_confirmed_as_its_own_text() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_start_line().await;
+    let line = crate::org::start_line::start_reference(id);
+    assert_eq!(line, format!("[{id}] New session: run atm me"));
+    let staged = drafted(&line);
+    rig.script(&[pi(IDLE), pi(IDLE), staged.clone(), staged]);
+    let attempt = rig.spawn_deliver(id);
+    rig.audited().await;
+    assert_eq!(
+        rig.effects(),
+        [
+            MockCall::PasteText {
+                pane: "%1".into(),
+                text: line.clone(),
+            },
+            MockCall::SendKeys {
+                pane: "%1".into(),
+                keys: "Enter".into(),
+            },
+        ]
+    );
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivering);
+    rig.prompt("s1", line);
+    guarded(attempt).await.unwrap().unwrap();
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+    assert_eq!(
+        snapshot.message.receipt.map(|receipt| receipt.confirmation),
+        Some("prompt_submit_exact_reference".to_string())
+    );
+}
+
+/// The draft must match the start line's own text: the inbox reference in
+/// its place gets no Enter, and the attempt is held for the owner.
+#[tokio::test(start_paused = true)]
+async fn a_start_line_staged_as_another_text_gets_no_enter() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_start_line().await;
+    let line = crate::org::start_line::start_reference(id);
+    rig.script(&[pi(IDLE), pi(IDLE), drafted(&line)]);
+    rig.script(&vec![drafted(&inbox_reference(id)); 40]);
+    let _ = rig.deliver(id).await;
+    assert_eq!((rig.pastes(), rig.keys()), (1, 0));
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.hold, Some(ExecutorHold::EnterNotSent));
+}
+
+/// A start line never goes into an editor that holds a draft.
+#[tokio::test(start_paused = true)]
+async fn a_start_line_is_never_typed_into_a_draft() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_start_line().await;
+    let draft = drafted("something the owner is typing");
+    rig.script(&[draft.clone(), draft]);
+    let _ = rig.deliver(id).await;
+    assert_eq!(rig.pastes(), 0, "{:?}", rig.effects());
+    assert_eq!(rig.keys(), 0);
+    assert_eq!(rig.snapshot(id).message.last_attempt, None);
 }

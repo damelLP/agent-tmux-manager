@@ -90,6 +90,50 @@ fn every_decision_kind_has_a_golden_body_that_round_trips() {
     }
 }
 
+// Break caught: dropping caller audit data, changing old JSON, or comparing a
+// pane instead of only the answer when matching resolution events and repeats.
+#[test]
+fn resolution_audit_golden_bodies_round_trip_without_changing_answers() {
+    let mut previous = None;
+    for line in include_str!("fixtures/decision_resolution_events.jsonl").lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let kind = row["kind"].as_str().unwrap();
+        let body = &row["body"];
+        let event = OrgEvent::from_parts(kind, body).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_string(&event.to_body()).unwrap(),
+            serde_json::to_string(body).unwrap(),
+            "caller audit must round-trip without changing the old flat body"
+        );
+        if let Some(old) = previous.take() {
+            assert_eq!(event, old, "caller pane is audit, not the answer");
+        } else {
+            previous = Some(event.clone());
+        }
+        let mut state = folded();
+        state.apply(15, at(15), &event).unwrap();
+        let resolution = state.decision(&d(3)).unwrap().resolution.clone().unwrap();
+        assert_eq!(
+            resolution,
+            DecisionResolution {
+                decision_id: d(3),
+                option: "b".into(),
+                by: Address::Owner,
+                note: Some("audit check".into()),
+                standing_rule: false,
+            }
+        );
+        assert_eq!(
+            state.decide(
+                &OrgCommand::Decision(DecisionCommand::Resolve(resolution)),
+                at(40)
+            ),
+            Ok(vec![]),
+            "the command is still the answer alone, regardless of recorded caller"
+        );
+    }
+}
+
 #[test]
 fn malformed_decision_bodies_error_and_additive_fields_are_tolerated() {
     for kind in DECISION_KINDS {
@@ -305,13 +349,16 @@ fn fold_records_facts_without_enforcing_the_table() {
     // was never taken, a provisional choice on one that must wait, an answer
     // after the end, and a second provisional choice replacing the first.
     let mut state = folded();
-    let overrule = OrgEvent::DecisionOverruled(DecisionResolution {
-        decision_id: d(13),
-        option: "elsewhere".into(),
-        by: Address::Agent(builder()),
-        note: None,
-        standing_rule: false,
-    });
+    let overrule = OrgEvent::DecisionOverruled(
+        DecisionResolution {
+            decision_id: d(13),
+            option: "elsewhere".into(),
+            by: Address::Agent(builder()),
+            note: None,
+            standing_rule: false,
+        }
+        .into(),
+    );
     state.apply(20, at(20), &overrule).unwrap();
     let decision = state.decision(&d(13)).unwrap();
     assert_eq!(decision.status, DecisionStatus::Overruled);
@@ -393,19 +440,19 @@ fn unknown_references_and_duplicate_ids_leave_the_state_unchanged() {
             unknown_agent.clone(),
         ),
         (
-            OrgEvent::DecisionResolved(resolution(d(4), &owner)),
+            OrgEvent::DecisionResolved(resolution(d(4), &owner).into()),
             ApplyError::UnknownDecision(d(4)),
         ),
         (
-            OrgEvent::DecisionResolved(resolution(d(13), &stranger)),
+            OrgEvent::DecisionResolved(resolution(d(13), &stranger).into()),
             unknown_agent.clone(),
         ),
         (
-            OrgEvent::DecisionOverruled(resolution(d(4), &owner)),
+            OrgEvent::DecisionOverruled(resolution(d(4), &owner).into()),
             ApplyError::UnknownDecision(d(4)),
         ),
         (
-            OrgEvent::DecisionOverruled(resolution(d(13), &stranger)),
+            OrgEvent::DecisionOverruled(resolution(d(13), &stranger).into()),
             unknown_agent.clone(),
         ),
         (
@@ -681,7 +728,7 @@ fn emitted_events_carry_the_command_and_apply_stamps_the_time() {
     );
     let taken_at = at(rig.seq as u32);
     let events = rig.run(resolve(id, "a"), at(41)).unwrap();
-    assert_eq!(events, [OrgEvent::DecisionResolved(answer(id, "a"))]);
+    assert_eq!(events, [OrgEvent::DecisionResolved(answer(id, "a").into())]);
     let decision = rig.state.decision(&id).unwrap();
     assert_eq!(decision.provisional, Some(choice));
     assert_eq!(decision.taken_at, Some(taken_at));
@@ -771,7 +818,10 @@ fn an_irreversible_decision_waits_even_on_a_nonrecommended_option() {
 fn another_option_on_a_provisional_decision_is_an_overrule() {
     let (mut rig, id) = Rig::with(DecisionStatus::TakenProvisionally);
     let events = rig.run(resolve(id, "b"), at(40)).unwrap();
-    assert_eq!(events, [OrgEvent::DecisionOverruled(answer(id, "b"))]);
+    assert_eq!(
+        events,
+        [OrgEvent::DecisionOverruled(answer(id, "b").into())]
+    );
     let decision = rig.state.decision(&id).unwrap();
     assert_eq!(decision.status, DecisionStatus::Overruled);
     assert_eq!(decision.provisional.as_ref().unwrap().option, "a");

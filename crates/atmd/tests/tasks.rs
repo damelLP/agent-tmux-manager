@@ -550,6 +550,139 @@ async fn caller_attribution_authority_and_direct_states_are_enforced() {
     );
 }
 
+// Break caught: a replay-only enum fallback reaches the task worker (or a list query).
+// The disabled router distinguishes RPC-edge validation from atm-org's later refusal.
+async fn assert_unknown_task_param(
+    method: &str,
+    params: Value,
+    pointer: &str,
+    field: &str,
+    pane: Option<&str>,
+) {
+    let rig = Rig::new().await;
+    match method {
+        "task.set_state" | "task.submit" => rig.assign().await,
+        "task.verdict" => rig.submitted().await,
+        _ => (),
+    }
+    let disabled = router(MethodServices::new(spawn_registry())).unwrap();
+    let before = rig.snapshot().await;
+    let cursor = rig.org.status().unwrap();
+    for word in ["bogus", "unknown"] {
+        let mut bad = params.clone();
+        *bad.pointer_mut(pointer).unwrap() = json!(word);
+        let result = rig.call(pane, method, bad.clone()).await;
+        assert_eq!(rig.snapshot().await, before, "{method} {bad}");
+        assert_eq!(rig.org.status().unwrap(), cursor, "{method} {bad}");
+        let error = result.unwrap_err().0;
+        assert_eq!(error.code, "invalid_params", "{method} {bad}: {error:?}");
+        assert!(error.message.contains(field), "{method} {bad}: {error:?}");
+        let error = disabled
+            .call(caller(pane), method, bad.clone())
+            .await
+            .unwrap_err()
+            .0;
+        assert_eq!(error.code, "invalid_params", "{method} {bad}: {error:?}");
+        assert!(error.message.contains(field), "{method} {bad}: {error:?}");
+    }
+    // The unchanged fixture is valid, so a policy refusal cannot mask the check.
+    let result = rig.ok(pane, method, params).await;
+    if method == "task.list" {
+        assert_eq!(result["tasks"].as_array().unwrap().len(), 1);
+    } else {
+        assert_eq!(result["changed"], true);
+    }
+}
+
+macro_rules! unknown_task_param_test {
+    ($name:ident, $method:literal, $params:expr, $pointer:literal, $field:literal, $pane:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            assert_unknown_task_param($method, $params, $pointer, $field, $pane).await;
+        }
+    };
+}
+unknown_task_param_test!(
+    unknown_create_kind_is_invalid_params,
+    "task.create",
+    json!({"title":"Known task","kind":"work","measure":{"kind":"owner"}}),
+    "/kind",
+    "kind",
+    None
+);
+unknown_task_param_test!(
+    unknown_create_measure_is_invalid_params,
+    "task.create",
+    json!({"title":"Known task","measure":{"kind":"owner"}}),
+    "/measure/kind",
+    "measure.kind",
+    None
+);
+unknown_task_param_test!(
+    unknown_create_file_kind_is_invalid_params,
+    "task.create",
+    json!({"title":"Known task","measure":{"kind":"owner"},"files":[{"path":"brief.md","kind":"brief"}]}),
+    "/files/0/kind",
+    "kind",
+    None
+);
+unknown_task_param_test!(
+    unknown_set_state_is_invalid_params,
+    "task.set_state",
+    json!({"task_id":"t6","state":"working"}),
+    "/state",
+    "state",
+    Some("%2")
+);
+unknown_task_param_test!(
+    unknown_submit_what_is_invalid_params,
+    "task.submit",
+    json!({"task_id":"t6","what":"result"}),
+    "/what",
+    "what",
+    Some("%2")
+);
+unknown_task_param_test!(
+    unknown_submit_file_kind_is_invalid_params,
+    "task.submit",
+    json!({"task_id":"t6","files":[{"path":"report.md","kind":"report"}]}),
+    "/files/0/kind",
+    "kind",
+    Some("%2")
+);
+unknown_task_param_test!(
+    unknown_attach_file_kind_is_invalid_params,
+    "task.attach",
+    json!({"task_id":"t6","file":{"path":"evidence.md","kind":"evidence"}}),
+    "/file/kind",
+    "kind",
+    None
+);
+unknown_task_param_test!(
+    unknown_verdict_is_invalid_params,
+    "task.verdict",
+    json!({"task_id":"t6","verdict":"accepted"}),
+    "/verdict",
+    "verdict",
+    None
+);
+unknown_task_param_test!(
+    unknown_list_state_is_invalid_params,
+    "task.list",
+    json!({"state":"open"}),
+    "/state",
+    "state",
+    None
+);
+unknown_task_param_test!(
+    unknown_list_kind_is_invalid_params,
+    "task.list",
+    json!({"kind":"work"}),
+    "/kind",
+    "kind",
+    None
+);
+
 // Break caught: task endpoints inherit TaskId's legacy free-text message references, or skip bounds/schema validation.
 #[tokio::test]
 async fn strict_schemas_ids_bounds_and_disabled_advertisement() {

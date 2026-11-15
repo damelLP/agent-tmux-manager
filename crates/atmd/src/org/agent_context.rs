@@ -61,7 +61,7 @@ fn context_agent<'s>(state: &'s OrgState, caller: &CallContext) -> Result<&'s Ag
         .ok_or_else(|| MessageError::NotFound(format!("agent {id} was not found")))
 }
 
-fn paths(state: &OrgState, agent: &Agent) -> Result<(PathBuf, PathBuf), AgentError> {
+pub(super) fn paths(state: &OrgState, agent: &Agent) -> Result<(PathBuf, PathBuf), AgentError> {
     let project = state.project(&agent.id.project).ok_or_else(|| {
         AgentError::NotFound(format!("project {} was not found", agent.id.project))
     })?;
@@ -78,6 +78,19 @@ fn paths(state: &OrgState, agent: &Agent) -> Result<(PathBuf, PathBuf), AgentErr
     ))
 }
 
+/// The address a role names as its manager: the owner when it names none or
+/// `owner`, an agent of the same project for a bare name, the address as
+/// written for a full id. `None` when the name is not a valid address.
+pub(super) fn manager_address(agent: &AgentId, role: Option<&RoleSpec>) -> Option<Address> {
+    match role.and_then(|r| r.config.manager.as_deref()) {
+        None | Some("owner") => Some(Address::Owner),
+        Some(name) if name.contains('/') => name.parse::<Address>().ok(),
+        Some(name) => AgentId::new(agent.project.clone(), name)
+            .map(Address::Agent)
+            .ok(),
+    }
+}
+
 fn assemble_context(
     state: &OrgState,
     agent: &Agent,
@@ -85,23 +98,15 @@ fn assemble_context(
     memory_exists: bool,
 ) -> Result<AgentContext, AgentError> {
     let (role_file, memory_path) = paths(state, agent)?;
-    let manager = match role.as_ref().and_then(|r| r.config.manager.as_deref()) {
-        None | Some("owner") => Address::Owner,
-        Some(name) => {
-            let address = if name.contains('/') {
-                name.parse::<Address>()
-            } else {
-                AgentId::new(agent.id.project.clone(), name).map(Address::Agent)
-            };
-            address.map_err(|_| {
-                AgentError::Refused(format!("{}: invalid role manager", role_file.display()))
-            })?
-        }
-    };
+    let manager = manager_address(&agent.id, role.as_ref()).ok_or_else(|| {
+        AgentError::Refused(format!("{}: invalid role manager", role_file.display()))
+    })?;
     let unread_messages = state
         .inbox(&Address::Agent(agent.id.clone()))
         .into_iter()
         .filter(|message| message.read_at.is_none())
+        // The start line only points here; listing it would point here again.
+        .filter(|message| !super::start_line::is_start_line(&message.content))
         .map(|message| ContextMessage {
             message_id: message.id,
             kind: message.content.kind,
@@ -206,7 +211,7 @@ fn read_files(
 
 /// A worker owns the slot, not its waiting future. Timeouts/cancellation cannot
 /// multiply stalled filesystem threads, and Tokio never joins a hung read.
-async fn detached_read<T: Send + 'static>(
+pub(super) async fn detached_read<T: Send + 'static>(
     slot: Arc<Semaphore>,
     role_file: &Path,
     read: impl FnOnce() -> Result<T, AgentError> + Send + 'static,
@@ -345,6 +350,55 @@ mod tests {
             assemble_context(&state, state.agent(&id).unwrap(), None, false),
             Err(AgentError::Refused(_))
         ));
+    }
+
+    // Break caught: atm me listing the start line, whose only text is "run atm
+    // me", as an unread message to handle and acknowledge.
+    #[test]
+    fn context_omits_start_lines_and_keeps_other_system_notes() {
+        use atm_org::{MessageContent, OrgEvent};
+        let now = "2026-01-15T12:00:00Z".parse().unwrap();
+        let id: AgentId = "project/worker".parse().unwrap();
+        let note = MessageContent {
+            from: Address::System,
+            to: Address::Agent(id.clone()),
+            kind: MessageKind::Note,
+            body: "New session: run atm me later".into(),
+            attachments: vec![],
+            task: None,
+        };
+        let mut state = OrgState::default();
+        for (seq, event) in [
+            OrgEvent::ProjectRegistered {
+                project_id: id.project.clone(),
+                root: "/project".into(),
+            },
+            OrgEvent::AgentAdopted {
+                agent_id: id.clone(),
+                pane: "%7".into(),
+                session_id: None,
+            },
+            OrgEvent::MessageSent(super::super::start_line::start_line(&id)),
+            OrgEvent::MessageSent(note),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.apply(seq as u64 + 1, now, &event).unwrap();
+        }
+        let context = assemble_context(&state, state.agent(&id).unwrap(), None, false).unwrap();
+        let listed: Vec<_> = context
+            .unread_messages
+            .iter()
+            .map(|message| (message.message_id.to_string(), message.first_line.clone()))
+            .collect();
+        assert_eq!(
+            listed,
+            [(
+                "m4".to_string(),
+                "New session: run atm me later".to_string()
+            )]
+        );
     }
 
     // Break caught: caller timeout drops the worker's permit and permits an

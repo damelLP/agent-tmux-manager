@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"kill","method":"session.kill","params":{"target":"%7"}},"response":{"type":"response","id":"kill","result":{"pane":"%7"}},"ignore":[]}

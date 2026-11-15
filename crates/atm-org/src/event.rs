@@ -18,7 +18,7 @@
 //! this is another reason downgrading a newer log is not a safety guarantee.
 
 use crate::{
-    Address, AgentId, DecisionId, DecisionRequest, DecisionResolution, DecisionWithdrawal,
+    Address, AgentId, DecisionId, DecisionRequest, DecisionResolutionEvent, DecisionWithdrawal,
     MessageId, ProjectId, ProvisionalChoice, RoleSpec, TaskId,
 };
 use atm_core::{Harness, Money, SessionId};
@@ -140,6 +140,20 @@ pub enum OrgEvent {
     AgentStuck { agent_id: AgentId, reason: String },
     #[serde(rename = "agent.down")]
     AgentDown { agent_id: AgentId, reason: String },
+    /// Audit of a handover: the agent was asked, by this message, to save
+    /// its state. Changes no state.
+    #[serde(rename = "agent.save_requested")]
+    AgentSaveRequested {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
+    /// Audit of a handover: the agent's save turn ended and its memory file
+    /// had changed. Changes no state.
+    #[serde(rename = "agent.saved")]
+    AgentSaved {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
     #[serde(rename = "msg.sent")]
     MessageSent(MessageContent),
     #[serde(rename = "msg.delivery_attempted")]
@@ -196,9 +210,9 @@ pub enum OrgEvent {
     #[serde(rename = "decision.taken_provisionally")]
     DecisionTakenProvisionally(ProvisionalChoice),
     #[serde(rename = "decision.resolved")]
-    DecisionResolved(DecisionResolution),
+    DecisionResolved(DecisionResolutionEvent),
     #[serde(rename = "decision.overruled")]
-    DecisionOverruled(DecisionResolution),
+    DecisionOverruled(DecisionResolutionEvent),
     #[serde(rename = "decision.expired")]
     DecisionExpired { decision_id: DecisionId },
     #[serde(rename = "decision.withdrawn")]
@@ -220,6 +234,8 @@ impl OrgEvent {
             Self::AgentClearRequested { .. } => "agent.clear_requested",
             Self::AgentStuck { .. } => "agent.stuck",
             Self::AgentDown { .. } => "agent.down",
+            Self::AgentSaveRequested { .. } => "agent.save_requested",
+            Self::AgentSaved { .. } => "agent.saved",
             Self::MessageSent(_) => "msg.sent",
             Self::MessageDeliveryAttempted { .. } => "msg.delivery_attempted",
             Self::MessageDelivered { .. } => "msg.delivered",
@@ -275,6 +291,8 @@ impl OrgEvent {
                 | "agent.clear_requested"
                 | "agent.stuck"
                 | "agent.down"
+                | "agent.save_requested"
+                | "agent.saved"
                 | "msg.sent"
                 | "msg.delivery_attempted"
                 | "msg.delivered"

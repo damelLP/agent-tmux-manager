@@ -7,8 +7,8 @@ use super::{
 use crate::server::methods::{parse_params, MethodError, MethodRouter};
 use atm_org::{
     Address, AgentId, ApplyError, DecisionId, Refusal, TaskActor, TaskBudget, TaskCommand,
-    TaskCreated, TaskFile, TaskId, TaskKind, TaskMeasure, TaskRefusal, TaskState, TaskSubmission,
-    TaskVerdict,
+    TaskCreated, TaskFile, TaskFileKind, TaskId, TaskKind, TaskMeasure, TaskRefusal, TaskState,
+    TaskSubmission, TaskVerdict,
 };
 use atm_protocol::error_code;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,12 @@ fn org_error(error: OrgServiceError) -> MethodError {
     };
     MethodError::new(code, message)
 }
+fn known(field: &str, known: bool) -> Result<(), TaskError> {
+    if !known {
+        return Err(TaskError::InvalidParams(format!("{field} must be known")));
+    }
+    Ok(())
+}
 fn size(field: &str, text: &str, max: usize) -> Result<(), TaskError> {
     if text.len() > max {
         return Err(TaskError::InvalidParams(format!(
@@ -111,6 +117,7 @@ fn optional_size(field: &str, text: Option<&str>, max: usize) -> Result<(), Task
     Ok(())
 }
 fn file(file: &TaskFile) -> Result<(), TaskError> {
+    known("file.kind", file.kind != TaskFileKind::Unknown)?;
     size("file path", &file.path, 4096)?;
     optional_size("file note", file.note.as_deref(), 4096)
 }
@@ -123,6 +130,7 @@ fn files(files: &[TaskFile]) -> Result<(), TaskError> {
     files.iter().try_for_each(file)
 }
 fn create(p: &CreateParams) -> Result<(), TaskError> {
+    known("kind", p.kind != TaskKind::Unknown)?;
     size("title", &p.title, 1024)?;
     files(&p.files)?;
     for id in p.parent.iter().chain(&p.judges) {
@@ -132,6 +140,11 @@ fn create(p: &CreateParams) -> Result<(), TaskError> {
         TaskMeasure::Mechanical { command } => size("measure command", command, 16384)?,
         TaskMeasure::Reviewed { rubric } => size("measure rubric", rubric, 4096)?,
         TaskMeasure::Owner => (),
+        TaskMeasure::Unknown => {
+            return Err(TaskError::InvalidParams(
+                "measure.kind must be known".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -150,6 +163,8 @@ fn state(p: &SetStateParams) -> Result<(), TaskError> {
     optional_size("reason", p.reason.as_deref(), 16384)
 }
 fn listing(p: &ListParams) -> Result<(), TaskError> {
+    known("state", p.state != Some(TaskState::Unknown))?;
+    known("kind", p.kind != Some(TaskKind::Unknown))?;
     if !(1..=1000).contains(&p.limit) {
         return Err(TaskError::InvalidParams(
             "limit must be between 1 and 1000".into(),
@@ -222,6 +237,7 @@ pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Resul
         SubmitParams,
         |p: &SubmitParams| {
             sequence(&p.task_id)?;
+            known("what", p.what != TaskSubmission::Unknown)?;
             files(&p.files)
         },
         |p: SubmitParams, by| TaskCommand::Submit {
@@ -262,6 +278,7 @@ pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Resul
         VerdictParams,
         |p: &VerdictParams| {
             sequence(&p.task_id)?;
+            known("verdict", p.verdict != TaskVerdict::Unknown)?;
             if let Some(id) = &p.review_task {
                 sequence(id)?;
             }

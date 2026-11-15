@@ -163,7 +163,6 @@ class Rollout:
         self.source = self.manifest = self.old = self.new = None
         # What atm setup, run by the swap, edits: it runs with this HOME.
         self.settings = Path(self.env.get('HOME', '/')) / '.claude/settings.json'
-        self.org = True
         self.stopped = []
 
     # ---- helpers -------------------------------------------------------
@@ -405,15 +404,18 @@ class Rollout:
         except (OSError, ValueError, AttributeError):
             return None
 
-    def snapshot(self):
-        sessions = self.atm_json('list', '--format', 'json')
+    def named_agents(self):
+        """The installed build's agent list; None for a build from before named agents."""
         listed = self.call([self.atm, 'agent', 'list', '--format', 'json'])
         if listed.returncode == 2 and 'unrecognized subcommand' in listed.stderr:
-            agents = None  # a build from before named agents
-        elif listed.returncode != 0:
-            raise OSError(f'atm agent list failed (exit {listed.returncode}): {listed.stderr.strip()}')
-        else:
-            agents = json.loads(listed.stdout)
+            return None
+        if listed.returncode != 0:
+            raise OSError(f'atm agent list exit {listed.returncode}: {listed.stderr.strip()}')
+        return json.loads(listed.stdout)
+
+    def snapshot(self):
+        sessions = self.atm_json('list', '--format', 'json')
+        agents = self.named_agents()
         messages = {agent['agent_id']: self.unread(agent['agent_id']) for agent in agents or []}
         processes = self.processes()
         return dict(sessions=sessions, agents=agents, messages=messages, status_line=self.status_line(),
@@ -445,7 +447,6 @@ class Rollout:
                 say('Waiting for a quiet moment: ' + '; '.join(busy))
                 shown = busy
             time.sleep(WAIT_POLL)  # bounded poll on the condition above, not a settling delay
-        self.org = snapshot['agents'] is not None
         for sidebar in snapshot['sidebars']:
             where = f"sidebar pid {sidebar['pid']}"
             require(sidebar['server'] and sidebar['pane'], f'{where} is not in a tmux pane; quit it yourself')
@@ -460,8 +461,8 @@ class Rollout:
                 f"{row.get('id_short')} {row.get('tmux_pane') or '-'}" for row in working) if working else ''))
         for agent in snapshot['agents'] or []:
             say(f"Agent {agent['agent_id']}: {agent['state']}, pane {agent.get('pane') or '-'}")
-        if not self.org:
-            say('The installed build has no named agents; those checks are skipped for it.')
+        if snapshot['agents'] is None:
+            say('The installed build has no named agents.')
         for sidebar in snapshot['sidebars']:
             say(f"Sidebar pid {sidebar['pid']} in {sidebar['pane']}: {shlex.join(sidebar['argv'])}")
         return snapshot
@@ -554,7 +555,7 @@ class Rollout:
         finally:
             self.call([*self.tmux, 'kill-session', '-t', session])
 
-    def checks(self, before, expected, org):
+    def checks(self, before, expected):
         """Raises CheckFailed with the first check that fails."""
         def answers(name, *args):
             result = self.call([self.atm, *args])
@@ -571,9 +572,15 @@ class Rollout:
             say(f"Version: {answers('identity', '--version').strip()}, daemon pid {pid}")
             json.loads(answers('list', 'list', '--format', 'json'))
             answers('status', 'status')
-            if org:
-                after = {agent['agent_id']: agent.get('pane')
-                         for agent in json.loads(answers('agent-list', 'agent', 'list', '--format', 'json'))}
+            try:
+                listed = self.named_agents()
+            except (OSError, ValueError) as error:
+                raise CheckFailed('agent-list', str(error)) from error
+            if listed is None:  # the build now installed is from before named agents
+                say(f"This build has no named agents; the {len(before['agents'] or [])} of before are in "
+                    'the state directory, untouched, and not visible to it.')
+            else:
+                after = {agent['agent_id']: agent.get('pane') for agent in listed}
                 for agent in before['agents'] or []:
                     name, pane = agent['agent_id'], agent.get('pane')
                     if name not in after or after[name] != pane:
@@ -582,7 +589,8 @@ class Rollout:
             self.check_send()
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             raise CheckFailed('checks', str(error)) from error
-        say('Checks passed: identity, list, status' + (', agent-list, agents' if org else '') + ', send.')
+        say('Checks passed: identity, list, status'
+            + ('' if listed is None else ', agent-list, agents') + ', send.')
 
     # ---- step 9: what differs -----------------------------------------------
 
@@ -597,15 +605,21 @@ class Rollout:
             listed = self.call([*(['tmux', '-S', server] if server else self.tmux),
                                 'list-panes', '-a', '-F', '#{pane_id}'])
             panes |= set(listed.stdout.split())
-        old = {row['id']: row for row in before['sessions']}
-        new = {row['id']: row for row in after['sessions']}
-        lines = []
-        for key in old.keys() - new.keys():
-            pane = old[key].get('tmux_pane')
-            lines.append(f"session {old[key].get('id_short')} on {pane or '-'}: no row "
-                         + ('until its next event' if pane in panes else '(its pane is gone)'))
-        lines += [f"session {new[key].get('id_short')} on {new[key].get('tmux_pane') or '-'}: new"
-                  for key in new.keys() - old.keys()]
+        def by_pane(rows):  # a row found by discovery has a placeholder id, new with every daemon
+            return {row.get('tmux_pane') or row['id']: row for row in rows
+                    if row.get('tmux_pane') or not row['id'].startswith('pending-')}
+        old, new, lines = by_pane(before['sessions']), by_pane(after['sessions']), []
+        for key, row in old.items():
+            name, now = f"session {row.get('id_short')} on {row.get('tmux_pane') or '-'}", new.get(key)
+            if now is None:
+                pane = row.get('tmux_pane')
+                lines.append(f'{name}: no row ' + ('until its next event' if pane in panes else
+                                                   '(its pane is gone)' if pane else '(it had no pane)'))
+            elif now['id'] != row['id']:
+                lines.append(f"{name}: " + ('only a placeholder row until its next event'
+                                            if now['id'].startswith('pending-') else f"now {now.get('id_short')}"))
+        lines += [f"session {row.get('id_short')} on {row.get('tmux_pane') or '-'}: new"
+                  for key, row in new.items() if key not in old]
         states = {agent['agent_id']: agent['state'] for agent in after['agents'] or []}
         changed = [(agent['agent_id'], agent['state'], states.get(agent['agent_id']))
                    for agent in before['agents'] or [] if states.get(agent['agent_id']) != agent['state']]
@@ -651,7 +665,9 @@ class Rollout:
             now = fingerprint(self.bin)
         except OSError:
             now = None
-        which = 'the previous pair' if now == self.old else 'the new pair' if now == self.new else 'a MIXED pair'
+        was, target = ('the newer pair', 'the previous pair') if self.args.rollback else \
+            ('the previous pair', 'the new pair')
+        which = was if now == self.old else target if now == self.new else 'a MIXED pair'
         back = '; '.join(f"type in {s['pane']}: {shlex.join(s['argv'])}" for s in self.stopped)
         return (f"{which} is installed; a daemon {'answers' if listening(self.socket) else 'does NOT answer'} "
                 f'on {self.socket}' + (f'; sidebars not back: {back}' if back else ''))
@@ -714,7 +730,7 @@ class Rollout:
         lock.release()
         try:
             self.start_daemon()
-            self.checks(before, self.new, True if not self.args.rollback else self.org)
+            self.checks(before, self.new)
         except CheckFailed as failure:
             if self.args.rollback:
                 raise NeedsYou(f'the previous pair is installed, but {failure}') from failure
@@ -742,7 +758,7 @@ class Rollout:
             raise NeedsYou(f'{failure}, and atm-rollback failed; the daemon is stopped')
         try:
             self.start_daemon()
-            self.checks(before, self.old, self.org)
+            self.checks(before, self.old)
         except CheckFailed as second:
             if second.name == 'agent-list':
                 raise NeedsYou(f'{failure}; the previous build runs but cannot read the organisation log the '

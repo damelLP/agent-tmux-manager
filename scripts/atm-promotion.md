@@ -168,7 +168,7 @@ count as the owner's.
 | 4 | Each sidebar gets `C-c` in its pane and is waited for. The rollout waits for the daemon's lock (`<socket>.lock`), runs `atmd stop`, and holds the lock | `sidebar pid N in %P did not quit` · `the daemon did not stop` · `another daemon took the socket` (each after starting again what it stopped) |
 | 5 | `atm-promote` | Its own refusal, when the previous pair is still in place: the daemon and the sidebars are started again |
 | 6 | The lock is released; `atmd start -d`; wait for the socket to answer | |
-| 7 | Checks: `identity` (the installed bytes and modes are the candidate's, and the answering daemon runs the installed file), `list`, `status`, `agent-list`, `agents` (every named agent of step 3, on the same pane), `send` (one `atm send` into a detached scratch tmux session, closed again) | |
+| 7 | Checks: `identity` (the installed bytes and modes are the candidate's, and the answering daemon runs the installed file), `list`, `status`, `agent-list`, `agents` (every named agent of step 3, on the same pane; both are skipped, in words, for a build whose `atm` has no `agent` command), `send` (one `atm send` into a detached scratch tmux session, closed again) | |
 | 8 | On a failed start or check: stop, `atm-rollback`, start, the same checks against the previous pair. **Exit 3** names the failed check | |
 | 9 | Each sidebar's command line is typed back into its pane. What differs from step 3 is printed: sessions gone or new, agents whose state changed, a `statusLine` that `atm setup` replaced (with the command that puts yours back; nothing is restored for you). The installed commit is recorded | |
 
@@ -198,13 +198,17 @@ a stage 0 release pair; 0.3.0 has the same lock.
   that was being delivered held until `atm msg retry`. Step 3 refuses those; work
   that begins between step 3 and the stop is not seen.
 - Agent states are compared in words only (step 9): a state the new daemon recorded
-  is in the log, and a rollback would not undo it. Idle sessions of a harness that
-  only reports on its next event show as "no row until its next event".
+  is in the log, and a rollback would not undo it. Sessions are compared by pane: an
+  idle session of a harness that only reports on its next event shows as "only a
+  placeholder row until its next event".
 - **Rollback onto newer state.** An older daemon skips event kinds it does not know.
   A log it cannot replay makes it start with the organisation methods disabled: the
   rollout then exits 4 and says that the previous build runs but named agents and
   messages are unavailable until the newer build is back. The state directory is
-  never moved, edited or deleted.
+  never moved, edited or deleted. Run on a private copy with real release pairs:
+  0.3.0, which has no named agents at all, started and answered on a state
+  directory a stage 0 build had written its organisation log and messages to, left
+  that log byte for byte as it was, and the stage 0 build read it back afterwards.
 - The sidebar restart types into the pane's shell, as `atm workspace` does, once that
   shell is in the foreground of its terminal again. It does not look at what was
   typed there since the quit. A sidebar that the tmux

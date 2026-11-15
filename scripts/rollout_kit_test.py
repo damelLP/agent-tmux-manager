@@ -32,15 +32,18 @@ from atm_candidate import wait_for  # noqa: E402
 NAMES = ('atm', 'atmd')
 LABEL = 'rollout-test'
 # A wrapper `atm`: every command goes to the real binary except those the test names in
-# modes.json, which exit with the given code, or print the given text and exit 0.
+# modes.json, which exit with the given code (a pair adds the error text), or print the
+# given text and exit 0.
 WRAPPER = '''#!/usr/bin/python3
 import json, os, sys
 modes = json.load(open(MODES))
 for words, action in modes.items():
     if sys.argv[1:1 + len(words.split())] == words.split():
         if isinstance(action, int):
-            print('injected failure: ' + words, file=sys.stderr)
-            sys.exit(action)
+            action = [action, 'injected failure: ' + words]
+        if isinstance(action, list) and action and isinstance(action[0], int):
+            print(action[1], file=sys.stderr)
+            sys.exit(action[0])
         print(action if isinstance(action, str) else json.dumps(action))
         sys.exit(0)
 os.execv(REAL, [REAL, *sys.argv[1:]])
@@ -344,6 +347,22 @@ class HappyPath(Rig):
                      f'Sidebar back in {pane}', 'rollout: DONE'):
             self.assertIn(line, result.stdout)
         self.assertEqual(list(self.root.glob('atm-rollout-smoke-*')), [], 'the smoke left its run')
+
+    def test_what_differs_is_told_by_pane_and_placeholder_rows_are_not_news(self):
+        self.start_tmux()
+        self.start_daemon()
+        seat = self.agent()
+        short = [row['id_short'] for row in json.loads(self.checked([self.bin / 'atm', 'list', '--format', 'json']))
+                 if row['tmux_pane'] == seat['pane']]
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        # The idle seat reports on its next event only; until then discovery shows its pane
+        # under a placeholder id, which is neither a lost session nor a new one.
+        differs = out[out.index('Differs from before:'):out.index('Still yours:')].splitlines()[1:]
+        self.assertIn(f"  session {short[0]} on {seat['pane']}: only a placeholder row until its next event", differs)
+        self.assertEqual([line for line in differs if 'pending-' in line or line.endswith(': new')], [])
+        self.assertEqual([(agent['agent_id'], agent['pane']) for agent in self.agents()],
+                         [(seat['agent_id'], seat['pane'])])
 
 
 class Refusals(Rig):
@@ -828,6 +847,26 @@ class AfterTheSwap(Rig):
         code, out, err = self.in_process('--rollback', *target)
         self.assertEqual(code, 1, out + err)
         self.assertIn('refused, nothing changed: the previous pair is already installed', err)
+        self.assert_running(old)
+
+    def test_a_previous_build_without_named_agents_is_rolled_back_to_and_says_so(self):
+        # As 0.3.0: its atm has no `agent` and no `inbox` command at all.
+        unknown = lambda word: [2, f"error: unrecognized subcommand '{word}'"]  # noqa: E731
+        self.wrap({'agent': unknown('agent'), 'inbox': unknown('inbox')}, installed=True)
+        self.start_tmux()
+        old, new = self.pair(), self.pair(self.candidate / 'bin')
+        self.start_daemon()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('The installed build has no named agents.', out)
+        self.assertIn('Checks passed: identity, list, status, agent-list, agents, send.', out)
+        self.assert_running(new)
+        self.agent()  # which the newer build then has
+        code, out, err = self.in_process('--rollback', '--bin-dir', self.bin, '--socket', self.socket)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('This build has no named agents; the 1 of before are in the state directory, '
+                      'untouched, and not visible to it.', out)
+        self.assertIn('Checks passed: identity, list, status, send.', out)
         self.assert_running(old)
 
 

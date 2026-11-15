@@ -105,6 +105,15 @@ impl Starting {
         assert_eq!(self.unread(), 0);
     }
 
+    /// `reason`, as a start says it that sent `keys` to its trust dialog and
+    /// never saw the dialog accepted.
+    fn unaccepted(&self, reason: &str, keys: &str) -> String {
+        format!(
+            "{reason}; atm sent {keys} to the trust dialog for {} and has not seen it accepted",
+            self.folder()
+        )
+    }
+
     fn trust_audit(&self, key: &str) -> serde_json::Value {
         serde_json::json!({
             "pane": "%1",
@@ -226,8 +235,10 @@ async fn accept_sent_dialog_unchanged_waits_without_second_enter() {
     starting.answered(starting.asks(CLAUDE_TRUST, "claude"));
     starting.answered(starting.asks(CLAUDE_YES, "claude"));
     starting.answered(starting.asks(CLAUDE_YES, "claude"));
-    starting.ends_stuck(STILL_SHOWN, &["Down", "Enter"]).await;
-    // Nothing was accepted, so nothing is audited as accepted.
+    // Nothing was seen accepted: the reason names the keys that were sent,
+    // and nothing is audited as accepted.
+    let reason = starting.unaccepted(STILL_SHOWN, "Down, Enter");
+    starting.ends_stuck(&reason, &["Down", "Enter"]).await;
     assert_eq!(sent_audits(&mut committed), Vec::<serde_json::Value>::new());
 }
 
@@ -241,11 +252,12 @@ async fn second_reset_after_enter_is_stuck() {
     starting.answered(starting.asks(CLAUDE_RESET, "claude"));
     starting.answered(starting.asks(CLAUDE_YES, "claude"));
     starting.frame(starting.asks(CLAUDE_RESET, "claude"));
+    let reason = starting.unaccepted(
+        "the trust dialog reset again after it was accepted",
+        "Down, Enter, Down, Enter",
+    );
     starting
-        .ends_stuck(
-            "the trust dialog reset again after it was accepted",
-            &["Down", "Enter", "Down", "Enter"],
-        )
+        .ends_stuck(&reason, &["Down", "Enter", "Down", "Enter"])
         .await;
 }
 
@@ -259,7 +271,8 @@ async fn trust_selection_changes_before_guard_sends_no_enter() {
     starting.frame(starting.asks(CLAUDE_YES, "claude"));
     starting.frame(starting.asks(CLAUDE_RESET, "claude"));
     starting.frame(starting.asks(CLAUDE_RESET, "claude"));
-    starting.ends_stuck(NOT_SELECTED, &["Down"]).await;
+    let reason = starting.unaccepted(NOT_SELECTED, "Down");
+    starting.ends_stuck(&reason, &["Down"]).await;
 }
 
 #[tokio::test]
@@ -305,7 +318,8 @@ async fn start_dialog_frame_with_shell_in_foreground_sends_zero_keys() {
     starting.frame(starting.asks(CLAUDE_YES, "claude"));
     starting.frame(starting.asks(CLAUDE_YES, "zsh"));
     starting.frame(starting.asks(CLAUDE_YES, "zsh"));
-    starting.ends_stuck(EXITED, &["Down"]).await;
+    let reason = starting.unaccepted(EXITED, "Down");
+    starting.ends_stuck(&reason, &["Down"]).await;
 }
 
 #[tokio::test]
@@ -538,4 +552,40 @@ async fn deadline_during_a_dialog_key_names_the_key() {
         )
         .await;
     assert_eq!(starting.unread(), 0);
+}
+
+#[tokio::test]
+async fn accept_sent_then_harness_exits_names_the_key_that_was_sent() {
+    // The Enter went out on the trust dialog and the harness is gone before
+    // any other screen: the harness may have saved the trust. Nothing is
+    // audited as accepted, so the reason says what was sent. Twin (the
+    // dialog goes, the acceptance is audited, the reason has no such part):
+    // the hook review in codex_folder_default_enter_with_audit.
+    let mut starting = Starting::trusting(Harness::Codex).await;
+    let mut committed = starting.rig.org.committed.subscribe();
+    starting.answered(starting.asks(CODEX_FOLDER, "codex"));
+    starting.frame(starting.asks(CODEX_FOLDER, "zsh"));
+    let reason = starting.unaccepted(EXITED, "Enter");
+    starting.ends_stuck(&reason, &["Enter"]).await;
+    assert_eq!(sent_audits(&mut committed), Vec::<serde_json::Value>::new());
+}
+
+#[tokio::test]
+async fn keys_of_an_accepted_round_are_not_named_again() {
+    // The dialog goes after the first Enter (another screen is seen, and the
+    // acceptance is audited), then comes back and gets its second round,
+    // which is never seen accepted. The reason names that round's keys only.
+    let mut starting = Starting::trusting(Harness::ClaudeCode).await;
+    let mut committed = starting.rig.org.committed.subscribe();
+    starting.answered(starting.asks(CLAUDE_TRUST, "claude"));
+    starting.answered(starting.asks(CLAUDE_YES, "claude"));
+    starting.frame(Starting::screen(CLAUDE_RUNNING, "claude"));
+    starting.answered(starting.asks(CLAUDE_RESET, "claude"));
+    starting.answered(starting.asks(CLAUDE_YES, "claude"));
+    starting.frame(starting.asks(CLAUDE_YES, "claude"));
+    let reason = starting.unaccepted(STILL_SHOWN, "Down, Enter");
+    starting
+        .ends_stuck(&reason, &["Down", "Enter", "Down", "Enter"])
+        .await;
+    assert_eq!(sent_audits(&mut committed), [starting.trust_audit("Enter")]);
 }

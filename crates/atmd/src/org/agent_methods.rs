@@ -140,8 +140,8 @@ pub fn register_agent_methods(
         })?;
     });
     register!("agent.clear", 135, clear; p: ClearParams => {
-        if !(1..=120_000).contains(&p.timeout_ms) {
-            return Err(AgentError::InvalidParams("timeout_ms must be in 1..=120000".into()).into());
+        if !(5_000..=120_000).contains(&p.timeout_ms) {
+            return Err(AgentError::InvalidParams("timeout_ms must be in 5000..=120000".into()).into());
         }
     });
     register!("agent.respawn", 75, respawn, caller; p: RespawnParams => {});
@@ -556,10 +556,12 @@ mod tests {
     #[tokio::test]
     async fn clear_timeout_is_bounded_before_calling_disabled_service() {
         for (timeout, valid) in [
-            (json!(1), true),
+            (json!(5000), true),
             (json!(30000), true),
             (json!(120000), true),
             (json!(0), false),
+            (json!(1), false),
+            (json!(4999), false),
             (json!(120001), false),
             (json!(u64::MAX), false),
             (json!(-1), false),

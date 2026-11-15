@@ -1285,3 +1285,43 @@ async fn missed_hook_conversation_not_noop() {
     );
     assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
 }
+
+#[tokio::test]
+async fn clear_timeout_outside_its_range_is_refused_with_the_agent_unchanged() {
+    // Through the method, with a Ready agent behind it: a timeout under the
+    // floor (or over the ceiling) is refused before the clear is asked for,
+    // so nothing is read, sent or recorded. Twin: the floor itself reaches
+    // the clear's own precheck, which refuses for another reason.
+    const RANGE: &str = "invalid agent parameters: timeout_ms must be in 5000..=120000";
+    let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+    let mut router = crate::server::methods::MethodRouter::default();
+    crate::org::agent_methods::register_agent_methods(&mut router, clearing.agents.clone())
+        .unwrap();
+    let before = clearing.rig.org.snapshot().await.unwrap();
+    let mut committed = clearing.rig.org.committed.subscribe();
+    let clear = |timeout: u64| {
+        router.call(
+            caller(),
+            "agent.clear",
+            serde_json::json!({"agent": "p/lead", "timeout_ms": timeout}),
+        )
+    };
+    for timeout in [0, 1, 4_999, 120_001] {
+        let error = clear(timeout).await.unwrap_err().0;
+        assert_eq!(error.code, "invalid_params", "{timeout}");
+        assert_eq!(error.message, RANGE, "{timeout}");
+    }
+    assert_eq!(clearing.rig.org.snapshot().await.unwrap(), before);
+    assert!(committed_kinds(&mut committed).is_empty());
+    assert!(mutations(&clearing.rig).is_empty());
+
+    clearing.frame_with(CLAUDE_CONVERSATION, |c| c.focused = Some(true));
+    let error = clear(5_000).await.unwrap_err().0;
+    assert_eq!(error.code, "refused");
+    assert!(
+        error.message.contains("the pane is focused"),
+        "{}",
+        error.message
+    );
+    assert_eq!(clearing.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+}

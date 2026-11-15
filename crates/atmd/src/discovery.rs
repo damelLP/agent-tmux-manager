@@ -565,7 +565,17 @@ fn check_via_cmdline(
     let cmdline_path = format!("/proc/{pid}/cmdline");
     let cmdline_bytes = std::fs::read(&cmdline_path).ok()?;
 
-    let matched = cmdline_bytes
+    if !cmdline_matches_definition(&cmdline_bytes, definition) {
+        return None;
+    }
+
+    get_process_info(pid, definition.harness)
+}
+
+/// True if some argument of a NUL-separated `/proc/{pid}/cmdline` can
+/// identify the harness (see [`cmdline_arg_matches_definition`]).
+fn cmdline_matches_definition(cmdline: &[u8], definition: &'static HarnessDefinition) -> bool {
+    cmdline
         .split(|&b| b == 0)
         .filter_map(|bytes| std::str::from_utf8(bytes).ok())
         .filter(|s| !s.is_empty())
@@ -576,13 +586,7 @@ fn check_via_cmdline(
                 return false;
             }
             cmdline_arg_matches_definition(index, arg, definition)
-        });
-
-    if !matched {
-        return None;
-    }
-
-    get_process_info(pid, definition.harness)
+        })
 }
 
 /// Returns true if one cmdline argument can identify a harness.

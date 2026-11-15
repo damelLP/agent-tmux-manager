@@ -1,5 +1,78 @@
 # Claude screen fixtures
 
+## Custom statusLine region (stage 1)
+
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e, custom statusLine.
+
+`screen_styled_s1_status-<width>-<state>_2.1.325.txt` contains six real
+unprompted captures, at 80, 116 and 160 columns, each fresh and with the
+unsubmitted draft `[m42] Read: atm inbox --id m42`. The corresponding source
+stems are `narrow`, `medium` and `wide`, followed by `-fresh.styled` or
+`-draft.styled`. All have a complete supported startup header. No Enter was
+sent and no model turn ran. Initial suggestions were disabled in the sealed
+settings; the fresh editor is actually blank. The subsequent draft captures
+also contain a late auto-mode disclaimer that this adapter does not recognize
+as idle history: their input is Draft, but their turn remains Unknown, exactly
+as in a status-free twin. Exact staged text is not permission to submit it.
+
+The private HOME's statusLine command printed these neutral static values:
+
+| Width | Output |
+|---|---|
+| 80 | `[neutral] load ▰▰▰▱ 83% Demo Model (low)` |
+| 116 | `[sample] ctx ▰▰▱▱ 42% Haiku 5.5 (medium)` |
+| 160 | `[fixture] ctx ▰▱▱▱ 7% Fable 5.2 (high)` |
+
+Claude adds two leading spaces and places this one row immediately after the
+lower editor rule, before the mode footer. The adapter recognizes the slot,
+not these values. The rest of that region may contain only blank padding.
+Additional/displaced rows, wrapped status output and unknown footers remain
+unsupported. Values printed in the slot never count as staged editor text.
+
+The probe used a private tmux 3.8 server, empty tmux config, sealed HOME,
+allowlisted environment and a loopback-only network namespace with no routes;
+no real credentials, daemon or user hooks were loaded. Only the private
+run-root prefix in the header becomes an equal-width generic `/tmp/xxx…`
+prefix. Otherwise the captured bytes, rows, columns, attributes and input are
+unchanged; the added provenance line is not a terminal row. No owner username,
+hostname, home path or account identifier is present. Composed running,
+conversation, style and modal cases in tests are explicitly Synthetic, not
+new real state captures.
+
+### Slash-menu, color and truncation follow-up
+
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, custom statusLine.
+
+`screen_styled_s1_status-clear-{80,116}_2.1.325.txt` maps to
+`slash-{80,116}-clear.styled-N`. `/clear` was pasted but never submitted.
+In these real fullscreen frames the selected slash menu is **above the upper
+editor rule**; the status row remains below the lower rule, and the normal
+auto-mode footer stays. The 80-column description is truncated, while the
+116-column description wraps. The ordinary staged/control readers already
+recognize the editor exactly; the older below-editor completion grammar is
+unchanged. Tests also remove only the status row in a labelled Synthetic twin.
+
+`screen_styled_s1_status-color-{88,160}_2.1.325.txt` maps to
+`color-{88,160}-fresh.styled-N`. The neutral status command prints SGR
+`38;5;246`, `38;5;151`, `38;5;66` and reset `39` around the same text. At 160
+columns it is complete; at 88 Claude truncates that single row with `…` rather
+than wrapping it. Both real blank editors are Empty/NotRunning with a fresh
+layout. Color, labels, percentages, model names and truncation text never
+supply readiness evidence.
+
+The same private HOME/config, loopback-only/no-route namespace, fake
+credentials and verified private tmux isolation described above were used.
+No model turn or Enter was sent. Only the private run-root prefix becomes an
+equal-width generic `/tmp/xxx…` prefix; every other byte, including retained
+grid padding, is unchanged apart from the provenance line. No owner identity
+or infrastructure path is present.
+
+**Known limit:** underline (`4`/`24`) and strikethrough (`9`/`29`) in a status
+row remain unsupported by the strict styled-screen decoder. Synthetic
+mutations test that facts/control stay Unknown and staging stays None.
+These decorations were not present in the real colored captures. There is
+no decoder relaxation here, and multi-row status output remains unverified.
+
 ## Staged message references (P3)
 
 Captured: Claude Code 2.1.325, 2026-11-14, sealed loopback-only private tmux

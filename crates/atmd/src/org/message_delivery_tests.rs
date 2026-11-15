@@ -291,6 +291,82 @@ fn control_dialogs() -> Vec<ControlDialog> {
 }
 
 #[test]
+fn custom_status_delivery_guard_reads_actual_capture() {
+    use crate::org::agent_screen_tests::{
+        capture, pinned, CLAUDE_STATUS_116_DRAFT, CLAUDE_STATUS_116_FRESH, ROOT,
+    };
+    let reader = agent_screen(Harness::ClaudeCode).unwrap();
+    let baseline = pinned("claude");
+    let reference = "[m42] Read: atm inbox --id m42";
+    let mut frame = capture(
+        CLAUDE_STATUS_116_FRESH,
+        CaptureFormat::Ansi,
+        Some(ROOT),
+        Some("claude"),
+    );
+    frame.focused = Some(false);
+    let paste = guard_facts(GuardedInput::Paste, &frame, reader, &baseline, reference);
+    assert_eq!(paste.screen.input, InputState::Empty);
+    assert!(guard_allows_input(&paste));
+    assert!(!guard_allows_input(&guard_facts(
+        GuardedInput::Enter,
+        &frame,
+        reader,
+        &baseline,
+        reference
+    )));
+    assert!(!guard_allows_input(&guard_facts(
+        GuardedInput::Paste,
+        &frame,
+        reader,
+        &PaneBaseline::unproven(),
+        reference
+    )));
+    frame.focused = Some(true);
+    assert!(!guard_allows_input(&guard_facts(
+        GuardedInput::Paste,
+        &frame,
+        reader,
+        &baseline,
+        reference
+    )));
+    frame.focused = Some(false);
+
+    // Synthetic: stage the reference in the actual empty frame without altering history.
+    frame.text = frame
+        .text
+        .replace("❯\u{a0}", &format!("❯\u{a0}{reference}"));
+    assert!(guard_allows_input(&guard_facts(
+        GuardedInput::Enter,
+        &frame,
+        reader,
+        &baseline,
+        reference
+    )));
+    assert!(!guard_allows_input(&guard_facts(
+        GuardedInput::Paste,
+        &frame,
+        reader,
+        &baseline,
+        reference
+    )));
+    assert!(!guard_allows_input(&guard_facts(
+        GuardedInput::Enter,
+        &frame,
+        reader,
+        &baseline,
+        "wrong reference"
+    )));
+
+    // The real draft's late disclaimer still leaves turn Unknown: matching is not permission.
+    frame.text = body(CLAUDE_STATUS_116_DRAFT).into();
+    let enter = guard_facts(GuardedInput::Enter, &frame, reader, &baseline, reference);
+    assert_eq!(enter.staged, Some(true));
+    assert_eq!(enter.screen.turn, TurnState::Unknown);
+    assert!(!guard_allows_input(&enter));
+}
+
+#[test]
 fn delivery_guard_plain_facts_table() {
     type Change = Box<dyn Fn(&mut DeliveryGuardFacts)>;
     for input in [GuardedInput::Paste, GuardedInput::Enter] {

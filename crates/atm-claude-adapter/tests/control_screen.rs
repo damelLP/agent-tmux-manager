@@ -82,6 +82,76 @@ fn captured_completion_verifies_editor_and_selected_command() {
 }
 
 #[test]
+fn custom_status_control_preserves_editor() {
+    for (fresh, draft) in [
+        (
+            include_str!("fixtures/screen_styled_s1_status-80-fresh_2.1.325.txt"),
+            include_str!("fixtures/screen_styled_s1_status-80-draft_2.1.325.txt"),
+        ),
+        (
+            include_str!("fixtures/screen_styled_s1_status-116-fresh_2.1.325.txt"),
+            include_str!("fixtures/screen_styled_s1_status-116-draft_2.1.325.txt"),
+        ),
+        (
+            include_str!("fixtures/screen_styled_s1_status-160-fresh_2.1.325.txt"),
+            include_str!("fixtures/screen_styled_s1_status-160-draft_2.1.325.txt"),
+        ),
+    ] {
+        for (fixture, input, fresh_editor) in [
+            (fresh, InputState::Empty, FreshEditorEvidence::Present),
+            (draft, InputState::Draft, FreshEditorEvidence::Unknown),
+        ] {
+            let control = observe(fixture);
+            assert_eq!(control.dialog, ControlDialog::None);
+            assert_eq!(control.facts.input, input);
+            // The real draft has a late, unsupported auto-mode disclaimer.
+            assert_eq!(
+                control.facts.turn,
+                if input == InputState::Empty {
+                    TurnState::NotRunning
+                } else {
+                    TurnState::Unknown
+                }
+            );
+            assert_eq!(control.facts.fresh_editor, fresh_editor);
+            assert!(!control.conversation);
+        }
+    }
+}
+
+#[test]
+fn custom_status_clear_menu_above_editor() {
+    for fixture in [
+        include_str!("fixtures/screen_styled_s1_status-clear-80_2.1.325.txt"),
+        include_str!("fixtures/screen_styled_s1_status-clear-116_2.1.325.txt"),
+    ] {
+        let original = body(fixture);
+        // Synthetic: remove only the known fixture's status row, retaining styles.
+        let without_status = original
+            .lines()
+            .filter(|line| !line.contains("[slash]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [original, without_status.as_str()] {
+            let input = ScreenInput::Styled(text);
+            assert_eq!(screen::staged_draft_matches(input, "/clear"), Some(true));
+            assert_eq!(
+                screen::staged_draft_matches(input, "/clear-other"),
+                Some(false)
+            );
+            assert_eq!(screen::staged_draft_matches(input, " /clear"), Some(false));
+            let control = observe(text);
+            assert_eq!(control.dialog, ControlDialog::None);
+            assert_eq!(control.facts.input, InputState::Draft);
+            // Menu history is not evidence of an idle turn; exact staging is separate.
+            assert_eq!(control.facts.turn, TurnState::Unknown);
+            assert_eq!(control.facts.fresh_editor, FreshEditorEvidence::Unknown);
+        }
+        assert_eq!(observe(original), observe(&without_status));
+    }
+}
+
+#[test]
 fn policy_reuses_existing_constants() {
     assert_eq!(CONTROL_POLICY.capture, screen::SCREEN_TEXT_FORMAT);
     assert_eq!(CONTROL_POLICY.clear_command, screen::CLEAR_COMMAND);

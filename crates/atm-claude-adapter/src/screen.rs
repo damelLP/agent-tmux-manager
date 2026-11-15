@@ -44,6 +44,15 @@
 //! beside faint ones stays Unknown. Not captured: a suggestion after a turn under
 //! the drawn cursor (stays Unknown), and one that wraps to a second row (Draft).
 //!
+//! Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e,
+//! custom statusLine. At 80, 116 and 160 columns a custom status line occupies
+//! one two-space-indented row immediately below the editor's lower rule and
+//! above the exact mode footer. Its values are opaque, never input or turn
+//! evidence. Only that optional slot is accepted; a nonblank second row, a
+//! displaced/unindented row or unknown footer still refuses. Multiline status
+//! output and teammate lists below the footer are not established by these
+//! captures.
+//!
 //! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
 //! Legacy facts stay Unknown; the staged matcher accepts only the complete
 //! captured completion layout with both editor and selected command exact.
@@ -239,11 +248,13 @@ fn editor_facts(
     before_footer: &[&str],
 ) -> Option<(ScreenFacts, Option<String>)> {
     let lower = before_footer.iter().rposition(|line| rule(line, '─'))?;
-    if !before_footer
-        .get(lower + 1..)?
-        .iter()
-        .all(|line| line.trim().is_empty())
-    {
+    let below = before_footer.get(lower + 1..)?;
+    // The captured status slot is adjacent to the rule, not arbitrary footer text.
+    let below = match below.split_first() {
+        Some((row, rest)) if row.starts_with("  ") && !row.trim().is_empty() => rest,
+        _ => below,
+    };
+    if !below.iter().all(|line| line.trim().is_empty()) {
         return None;
     }
     let before_lower = lines.get(..lower)?;

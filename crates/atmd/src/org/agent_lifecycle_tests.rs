@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::control::reservation::ReservationKind;
+use crate::org::agent_screen_tests::CLAUDE_STATUS_116_FRESH;
 use atm_tmux::mock::MockCall;
 
 fn pane(id: &str) -> PaneId {
@@ -671,6 +672,120 @@ async fn adopt_tags_absent_pane_and_binds_one_eligible_row() {
         PaneBaseline::adopted(100).with_harness("pi".into()).unwrap()
     );
     adoption.followed().await;
+}
+
+#[tokio::test]
+async fn adopt_claude_custom_status_binds_ready() {
+    let fixture = body(CLAUDE_STATUS_116_FRESH);
+    // Synthetic: a second nonblank status-region row is not the captured layout.
+    let malformed = fixture.replace("[sample] ctx", "second row\n  [sample] ctx");
+    for (text, ready) in [(fixture, true), (malformed.as_str(), false)] {
+        let mut adoption = Adoption::new().await;
+        adoption
+            .rig
+            .row_of("claude-status", "%1", false, Harness::ClaudeCode)
+            .await;
+        *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+        let untagged = Adoption::inspection(None, "claude", "");
+        adoption
+            .rig
+            .client
+            .script_inspect(&pane("%1"), Some(&untagged))
+            .unwrap();
+        adoption.script_untagged_capture(text, "claude");
+        adoption.script_untagged_capture(text, "claude");
+        adoption.rig.client.script_tag_check(&untagged).unwrap();
+        adoption.script_follow_up_of("claude", (!ready).then_some((text, "claude")));
+        let expected = if ready {
+            AgentStatus::Ready
+        } else {
+            AgentStatus::Starting
+        };
+        assert_eq!(adoption.adopt().await.unwrap().state, expected);
+        let agent = adoption.agent().await.unwrap();
+        assert_eq!(agent.status, expected);
+        assert_eq!(
+            agent.session_id,
+            ready.then(|| SessionId::new("claude-status"))
+        );
+        assert_eq!(
+            adoption.agents.baseline_of(&adoptee(), "%1"),
+            if ready {
+                PaneBaseline::adopted(100)
+                    .with_harness("claude".into())
+                    .unwrap()
+            } else {
+                PaneBaseline::unproven()
+            }
+        );
+        assert_eq!(adoption.tags_set(), 1);
+        assert!(adoption.only_tags(), "adopt must send no input");
+        adoption.followed().await;
+    }
+}
+
+#[tokio::test]
+async fn custom_status_repins_after_identity_only_binding() {
+    let mut adoption = Adoption::new().await;
+    adoption
+        .rig
+        .row_of("claude-status", "%1", false, Harness::ClaudeCode)
+        .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    let untagged = Adoption::inspection(None, "claude", "");
+    adoption
+        .rig
+        .client
+        .script_inspect(&pane("%1"), Some(&untagged))
+        .unwrap();
+    adoption.script_untagged_capture("unknown\n", "claude");
+    adoption.script_untagged_capture("unknown\n", "claude");
+    adoption.rig.client.script_tag_check(&untagged).unwrap();
+    adoption.script_follow_up_of("claude", Some(("unknown\n", "claude")));
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    adoption.followed().await;
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::unproven()
+    );
+
+    // The identity event makes Ready but reads no screen and establishes no pin.
+    adoption.script_follow_up_of("claude", None);
+    update(&adoption.rig, "claude-status").await;
+    progress(&mut adoption.events, "finished", Some("q/lead")).await;
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, Some(SessionId::new("claude-status")));
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::unproven()
+    );
+    assert_eq!(
+        adoption.agents.refusal_of(&adoptee(), "%1").as_deref(),
+        Some(NOT_CONFIRMED)
+    );
+
+    // Its next observation sees the actual status-bearing editor and pins it.
+    let before = adoption.rig.org.status().unwrap();
+    adoption.script_follow_up_of("claude", Some((body(CLAUDE_STATUS_116_FRESH), "claude")));
+    update(&adoption.rig, "claude-status").await;
+    adoption.followed().await;
+    assert_eq!(
+        adoption.agents.baseline_of(&adoptee(), "%1"),
+        PaneBaseline::adopted(100)
+            .with_harness("claude".into())
+            .unwrap()
+    );
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, Some(SessionId::new("claude-status")));
+    assert_eq!(
+        adoption.rig.org.status().unwrap(),
+        before,
+        "repin is in memory, not a second binding"
+    );
+    assert!(adoption.only_tags(), "observation must send no input");
 }
 
 #[tokio::test]

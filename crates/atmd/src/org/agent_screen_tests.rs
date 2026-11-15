@@ -16,6 +16,24 @@ const CLAUDE_FRESH: &str = include_str!(
 const CLAUDE_DRAFT: &str = include_str!(
     "../../../atm-claude-adapter/tests/fixtures/screen_styled_p1_B-auto-pasted-120x40_2.1.325.txt"
 );
+const CLAUDE_STATUS_80_FRESH: &str = include_str!(
+    "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-80-fresh_2.1.325.txt"
+);
+const CLAUDE_STATUS_80_DRAFT: &str = include_str!(
+    "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-80-draft_2.1.325.txt"
+);
+pub(super) const CLAUDE_STATUS_116_FRESH: &str = include_str!(
+    "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-116-fresh_2.1.325.txt"
+);
+pub(super) const CLAUDE_STATUS_116_DRAFT: &str = include_str!(
+    "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-116-draft_2.1.325.txt"
+);
+const CLAUDE_STATUS_160_FRESH: &str = include_str!(
+    "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-160-fresh_2.1.325.txt"
+);
+const CLAUDE_STATUS_160_DRAFT: &str = include_str!(
+    "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-160-draft_2.1.325.txt"
+);
 const CODEX_FRESH: &str = include_str!(
     "../../../atm-codex-adapter/tests/fixtures/screen_styled_u5b_rich-fresh_0.167.0.txt"
 );
@@ -518,6 +536,45 @@ fn start_candidate_table() {
             screen.facts(&frame(Some(ROOT), Some(name)), &shell),
             ScreenFacts::default()
         );
+    }
+}
+
+#[test]
+fn custom_status_claude_dispatch() {
+    let screen = agent_screen(Harness::ClaudeCode).unwrap();
+    let baseline = pinned("claude");
+    for (fresh, draft) in [
+        (CLAUDE_STATUS_80_FRESH, CLAUDE_STATUS_80_DRAFT),
+        (CLAUDE_STATUS_116_FRESH, CLAUDE_STATUS_116_DRAFT),
+        (CLAUDE_STATUS_160_FRESH, CLAUDE_STATUS_160_DRAFT),
+    ] {
+        for (fixture, input) in [(fresh, InputState::Empty), (draft, InputState::Draft)] {
+            let frame = capture(fixture, CaptureFormat::Ansi, Some(ROOT), Some("claude"));
+            let facts = screen.facts(&frame, &baseline);
+            assert_eq!(facts.input, input);
+            // The real draft has a late, unsupported auto-mode disclaimer.
+            assert_eq!(
+                facts.turn,
+                if input == InputState::Empty {
+                    TurnState::NotRunning
+                } else {
+                    TurnState::Unknown
+                }
+            );
+            assert_eq!(facts.dialog, DialogState::None);
+            assert_eq!(
+                screen.control(&frame, &baseline).dialog,
+                ControlDialog::None
+            );
+            assert_eq!(
+                screen.staged(&frame, &baseline, "[m42] Read: atm inbox --id m42"),
+                (input == InputState::Draft).then_some(true)
+            );
+            assert_eq!(
+                screen.facts(&frame, &PaneBaseline::unproven()),
+                ScreenFacts::default()
+            );
+        }
     }
 }
 

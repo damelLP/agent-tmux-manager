@@ -1,8 +1,7 @@
 # Repository-relative fnmatchcase patterns: * includes directory separators.
 # Report-only judges, fixtures and promotion tools; not write protection.
 .github/workflows/*
-.githooks/pre-commit
-.githooks/pre-push
+.githooks/*
 clippy.toml
 crates/*/tests/fixtures/*
 tests/support/stand_in/fixtures/*

@@ -1,0 +1,41 @@
+Captured: pi 1.5.0, 2026-11-14, P5 sealed loopback-only private tmux 3.8 capture-pane -p -N; typed-cleanup-escape.
+
+ ▀▀█  v1.5.0        
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash ·       
+ ctrl+o more        
+ Press ctrl+o to show full startup help and loaded resources.                   
+
+ Pi can explain its own features and look up its docs. Ask it how to use or     
+ extend Pi.         
+
+
+ fd not found. Downloading...           
+ Warning: Failed to download fd: fetch failed: getaddrinfo EAI_AGAIN github.com 
+
+ Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set 
+ -g extended-keys on` to ~/.tmux.conf and restart tmux.                         
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+                    
+────────────────────────────────────────────────────────────────────────────────
+/tmp/xxxxxxxxxxxxxxxxxx/project         
+0.0%/200k (auto)                                           (sealed) sealed-model

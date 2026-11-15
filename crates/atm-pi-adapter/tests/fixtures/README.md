@@ -1,5 +1,49 @@
 # Pi screen fixtures
 
+## Staged clear command and typed popup (P5)
+
+Captured: pi 1.5.0, 2026-11-14, P5 sealed loopback-only private tmux 3.8
+`capture-pane -p -e -N` (styled) and `-p -N` (plain).
+Each row maps `a-pi-cleanup/A-pi-<size>-<state>.{styled-N,plain-N}.txt`
+to `screen_p5_<size>-<state>_1.5.0.{styled,plain}.txt`.
+
+| Size | State |
+|---|---|
+| 80x40 | staged |
+| 80x40 | typed-staged |
+| 80x40 | typed-popup |
+| 80x40 | typed-first-after-down |
+| 80x40 | typed-popup-remains |
+| 80x40 | typed-cleanup-escape |
+| 100x40 | staged |
+| 100x40 | typed-staged |
+| 100x40 | typed-popup |
+| 100x40 | typed-first-after-down |
+| 100x40 | typed-popup-remains |
+| 100x40 | typed-cleanup-escape |
+| 120x40 | staged |
+| 120x40 | typed-staged |
+| 120x40 | typed-popup |
+| 120x40 | typed-first-after-down |
+| 120x40 | typed-popup-remains |
+| 120x40 | typed-cleanup-escape |
+
+Only private run roots become equal-width generic `/tmp/xxx…` paths. All
+terminal rows, ANSI sequences and spaces remain; tests strip only the added
+provenance line. Distinct samples are retained even when bytes coincide.
+ATM pastes `/new`: P5's paste had no completion popup and matches exactly,
+with control None and delivery Draft / NotRunning / None. Typing the same
+text opens a colored `→ new` candidate between the editor border and cwd
+footer; this human path deliberately remains control Unknown with no staged
+match. Its inverse cell is the editor cursor, not candidate selection.
+
+Ctrl-U removed the typed draft but left the candidate (`typed-popup-remains`),
+still Unknown. Escape removed it (`typed-cleanup-escape`), restoring a Styled
+Empty editor with control None. This is captured probe cleanup, not permission
+for production cleanup or retry. Plain staged matching always returns None;
+plain cleanup reads Draft, not Empty. `tests/staged_clear.rs` pins these facts
+and labels editor/text mutations Synthetic. Conversation is outside this unit.
+
 ## Lifecycle control observations (B0)
 
 Captured: pi 1.5.0, 2026-11-14, sealed P1 private tmux

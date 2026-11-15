@@ -2,14 +2,16 @@
 //!
 //! Ready adoption types the launcher into interactive bash: `rig.launch` uses
 //! a noninteractive child/retained-shell shape and is only for refusal tests.
-//! Each agent has its own detached window, sized before launch (200x50 here).
+//! Each agent has its own detached window, sized before launch (200x50 by
+//! default; styled Claude/Codex starts use 100x30).
 //! An `agent.up` or `agent.respawn` is called from a placement window born at
 //! twice the stand-in's height plus the border, so the daemon's vertical split
 //! leaves the stand-in its size. Never split/resize a running stand-in or attach.
 //! Take an event cursor before each action; wait for rendered/row events and
-//! release manual-clock gates explicitly. Only initial shell readiness lacks
-//! an event and uses the shared bounded condition poll. Journal observations
-//! are assertions, not production readiness evidence or a raw-key transcript.
+//! release manual-clock gates explicitly. Initial shell readiness and audit-log
+//! delivery completion lack subscriptions and use the shared bounded condition
+//! poll. Journal observations are assertions, not production readiness evidence
+//! or a raw-key transcript.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;

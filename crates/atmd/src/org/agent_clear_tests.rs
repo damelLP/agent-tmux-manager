@@ -391,15 +391,7 @@ async fn editor_before_event_stays_clearing() {
         assert_eq!(clearing.agent().await.status, AgentStatus::Clearing);
         // Nothing more happens: the call ends at its deadline (virtual time).
         let result = call.await.unwrap();
-        assert!(
-            matches!(
-                result,
-                Err(AgentError::Reservation(
-                    crate::control::reservation::ReservationError::Timeout
-                ))
-            ),
-            "{result:?}"
-        );
+        assert_told_stuck(&result, &clearing.agent().await);
         clearing
             .assert_stuck("the harness has not announced a new session")
             .await;
@@ -891,6 +883,40 @@ async fn deadline_during_the_enter_says_the_command_may_have_been_submitted() {
     progress(&mut clearing.events, "clear_submitting", Some("p/lead")).await;
     clearing.rig.client.stall_pane_effects(true);
     let result = call.await.unwrap();
+    assert_told_stuck(&result, &clearing.agent().await);
+    assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+    clearing
+        .assert_stuck("the clear command was being submitted and may have reached the harness")
+        .await;
+}
+
+/// A clear that its deadline ends while tmux holds its Enter, as
+/// deadline_during_the_enter_says_the_command_may_have_been_submitted, on an
+/// organisation whose first write of an event of `kind` fails. Returns the
+/// rig and the caller's answer.
+async fn clear_ended_at_its_deadline_with_one_failed_write(
+    kind: &'static str,
+) -> (Clearing, Result<ClearResult, AgentError>) {
+    let rig = Rig::gated_with_failure(None, Some(kind)).await;
+    let mut clearing = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+    clearing.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+    let call = clearing.start();
+    progress(&mut clearing.events, "clear_submitting", Some("p/lead")).await;
+    clearing.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    (clearing, result)
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_stuck_write_at_the_deadline_keeps_the_timeout() {
+    // The cleanup's Stuck write fails: nothing says why the clear ended, so
+    // the caller is not told a reason either. The answer stays the timeout,
+    // the agent is still Clearing with no reason and no note, and the
+    // reservation is quarantined. Twin:
+    // failed_note_at_the_deadline_still_answers_with_the_recorded_reason
+    // (the Stuck write succeeds).
+    let (clearing, result) =
+        clear_ended_at_its_deadline_with_one_failed_write("agent.stuck").await;
     assert!(
         matches!(
             result,
@@ -900,10 +926,69 @@ async fn deadline_during_the_enter_says_the_command_may_have_been_submitted() {
         ),
         "{result:?}"
     );
-    assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
-    clearing
-        .assert_stuck("the clear command was being submitted and may have reached the harness")
+    let agent = clearing.agent().await;
+    assert_eq!(agent.status, AgentStatus::Clearing, "{agent:?}");
+    assert_eq!(agent.reason, None);
+    let state = clearing.rig.org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 0, "nobody is told by a note");
+    assert!(quarantined(&clearing.rig, "p/lead").await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_note_at_the_deadline_still_answers_with_the_recorded_reason() {
+    // The cleanup's Stuck write succeeds and the owner's note cannot be
+    // written. The choice: the record is written, so the caller is told its
+    // reason, whatever follows. The agent is Stuck with that reason, there is
+    // no note, and the reservation is quarantined. Twin:
+    // failed_stuck_write_at_the_deadline_keeps_the_timeout (no record).
+    const REASON: &str = "clear did not complete: the clear command was being submitted \
+        and may have reached the harness; inspect %1";
+    let (clearing, result) = clear_ended_at_its_deadline_with_one_failed_write("msg.sent").await;
+    let agent = clearing.agent().await;
+    assert_eq!(agent.reason.as_deref(), Some(REASON));
+    assert_told_stuck(&result, &agent);
+    let state = clearing.rig.org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 0, "the note was not written");
+    assert!(quarantined(&clearing.rig, "p/lead").await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_waiting_for_the_reservation_is_not_answered_with_an_earlier_stuck_reason() {
+    // The agent is Stuck since an earlier call, and another job holds its
+    // reservation. A clear waits to be admitted and runs out of its time
+    // there: its flow never ran, and its cleanup recorded nothing. The
+    // caller keeps the timeout. The earlier reason is not this call's
+    // outcome, and the record keeps it. Twin:
+    // deadline_during_the_enter_says_the_command_may_have_been_submitted
+    // (a timeout this call's own cleanup recorded Stuck for).
+    const EARLIER: &str = "start did not complete: an earlier call; inspect %1";
+    let (rig, agents) = ready_agent().await;
+    rig.command(OrgCommand::Stuck {
+        agent_id: lead(),
+        reason: EARLIER.into(),
+    })
+    .await;
+    let (release, held) = hold_agent_reservation(&rig, "p/lead", "%1").await;
+    let result = agents
+        .clear(ClearParams {
+            agent: lead(),
+            timeout_ms: 5_000,
+        })
         .await;
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    let agent = rig.state("lead").await;
+    assert_eq!(agent.status, AgentStatus::Stuck);
+    assert_eq!(agent.reason.as_deref(), Some(EARLIER));
+    release.send(()).unwrap();
+    held.await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

@@ -16,6 +16,60 @@ fn lead() -> AgentId {
     "p/lead".parse().unwrap()
 }
 
+/// A flow that ended on a timeout told its caller the Stuck reason its
+/// cleanup recorded for `agent`, in the words of the owner's note.
+fn assert_told_stuck<T: std::fmt::Debug>(
+    result: &Result<T, AgentError>,
+    agent: &atm_org::Agent,
+) {
+    assert_eq!(agent.status, AgentStatus::Stuck, "{agent:?}");
+    let reason = agent.reason.as_deref().expect("a stuck agent has a reason");
+    let expected = format!("agent {}: {reason}", agent.id);
+    assert!(
+        matches!(result, Err(AgentError::Refused(told)) if *told == expected),
+        "{result:?}\nexpected: {expected}"
+    );
+}
+
+#[test]
+fn a_timeout_is_answered_with_the_stuck_reason_only_when_one_was_recorded() {
+    use crate::control::reservation::ReservationError;
+    use crate::org::agent_lifecycle::deadline_answer;
+    let timeout = || AgentError::Reservation(ReservationError::Timeout);
+    const REASON: &str = "start did not complete: no harness screen was recognised; inspect %1";
+    let stuck = || Some(REASON.to_owned());
+    // The flow's cleanup recorded the agent Stuck: the caller is told why,
+    // with the code of every other stuck ending.
+    let told = deadline_answer(timeout(), &lead(), stuck());
+    assert!(
+        matches!(&told, AgentError::Refused(text) if *text == format!("agent p/lead: {REASON}")),
+        "{told:?}"
+    );
+    let wire = crate::server::methods::MethodError::from(told).0;
+    assert_eq!(wire.code, "refused");
+    assert_eq!(wire.message, format!("agent p/lead: {REASON}"));
+    // No record of this call's own: the timeout stays what it is.
+    let kept = deadline_answer(timeout(), &lead(), None);
+    assert!(
+        matches!(kept, AgentError::Reservation(ReservationError::Timeout)),
+        "{kept:?}"
+    );
+    // Any other error is the caller's as it is, stuck or not.
+    for record in [stuck(), None] {
+        let gone = AgentError::Reservation(ReservationError::PaneGone { pane: pane("%1") });
+        let kept = deadline_answer(gone, &lead(), record.clone());
+        assert!(
+            matches!(
+                kept,
+                AgentError::Reservation(ReservationError::PaneGone { .. })
+            ),
+            "{kept:?}"
+        );
+        let kept = deadline_answer(AgentError::Timeout, &lead(), record);
+        assert!(matches!(kept, AgentError::Timeout), "{kept:?}");
+    }
+}
+
 /// The pane mutations the mock saw: kills, and raw commands that set or unset
 /// a pane option (the agent tag).
 fn mutations(rig: &Rig) -> Vec<String> {

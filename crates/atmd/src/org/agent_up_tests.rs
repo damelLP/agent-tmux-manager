@@ -996,15 +996,7 @@ async fn line_changed_after_the_paste_waits_and_only_the_exact_line_is_run() {
         starting.frame(Starting::shell(&format!("{PROMPT}{} --yolo", starting.text)));
     }
     let result = starting.up().await;
-    assert!(
-        matches!(
-            result,
-            Err(AgentError::Reservation(
-                crate::control::reservation::ReservationError::Timeout
-            ))
-        ),
-        "{result:?}"
-    );
+    assert_told_stuck(&result, &starting.agent().await.unwrap());
     assert_eq!(starting.effects().len(), 3, "{:?}", starting.effects());
     starting
         .assert_stuck(&format!(
@@ -1201,15 +1193,7 @@ async fn launch_enter_that_never_answers_is_reported_as_unknown() {
     progress(&mut starting.events, "up_running", Some("q/lead")).await;
     starting.rig.client.stall_pane_effects(true);
     let result = call.await.unwrap();
-    assert!(
-        matches!(
-            result,
-            Err(AgentError::Reservation(
-                crate::control::reservation::ReservationError::Timeout
-            ))
-        ),
-        "{result:?}"
-    );
+    assert_told_stuck(&result, &starting.agent().await.unwrap());
     assert_eq!(starting.effects(), starting.launched());
     let reason = starting.agent().await.unwrap().reason.unwrap_or_default();
     assert!(
@@ -1245,15 +1229,7 @@ async fn deadline_during_the_launch_enter_says_the_command_may_have_run() {
     progress_within(&mut starting.events, "up_running", Some("q/lead"), 59).await;
     starting.rig.client.stall_pane_effects(true);
     let result = call.await.unwrap();
-    assert!(
-        matches!(
-            result,
-            Err(AgentError::Reservation(
-                crate::control::reservation::ReservationError::Timeout
-            ))
-        ),
-        "{result:?}"
-    );
+    assert_told_stuck(&result, &starting.agent().await.unwrap());
     assert_eq!(starting.effects(), starting.launched());
     starting
         .assert_stuck("the launch command was being run and may have started the harness")
@@ -1297,21 +1273,14 @@ async fn shell_named_harness_is_stuck_not_ready() {
 #[tokio::test]
 async fn up_deadline_is_stuck_with_owner_note() {
     // The harness's editor is up and its session never arrives: the call's
-    // 60 seconds pass on the paused clock, the caller gets a timeout, and the
-    // agent is Stuck with what the start last waited for.
+    // 60 seconds pass on the paused clock, the agent is Stuck with what the
+    // start last waited for, and the caller is told that reason, not a bare
+    // timeout.
     let mut starting = Starting::new(Harness::Pi).await;
     starting.script_launch();
     starting.frame(Starting::screen(PI_PADDED, "pi"));
     let result = starting.up().await;
-    assert!(
-        matches!(
-            result,
-            Err(AgentError::Reservation(
-                crate::control::reservation::ReservationError::Timeout
-            ))
-        ),
-        "{result:?}"
-    );
+    assert_told_stuck(&result, &starting.agent().await.unwrap());
     starting
         .assert_stuck("the harness has not announced its session")
         .await;

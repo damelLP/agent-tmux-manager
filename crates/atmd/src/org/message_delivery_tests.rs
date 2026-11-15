@@ -1397,7 +1397,7 @@ fn staged(id: MessageId) -> PaneCapture {
     capture
 }
 
-/// Real Codex 0.167.0 fresh editor for the startup inspection and capture.
+/// Real Codex 0.167.0 fresh editor for the startup inspection (no capture).
 /// Provenance is recorded with the adapter's fixture. No harness process is
 /// started.
 const CODEX_IDLE: &str = include_str!(

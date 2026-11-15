@@ -239,14 +239,22 @@ fn repair_warns_with_path_line_and_dropped_byte_count() {
     drop(log);
 }
 
+// Real filesystem I/O must not be a five-second append performance test.
+const ROTATION_HANG_GUARD: Duration = Duration::from_secs(60);
+
 #[tokio::test]
 async fn public_rotation_keeps_oversized_records_whole() {
     let dir = tempfile::tempdir().unwrap();
     let log = EventLog::open(dir.path(), Stream::Raw).unwrap();
     let body = serde_json::json!("x".repeat(16 * 1024 * 1024));
-    assert_eq!(log.append(ts(), "large", body.clone()).await.unwrap(), 1);
     assert_eq!(
-        log.append(ts(), "small", serde_json::Value::Null)
+        log.append_with_timeout(ts(), "large", body.clone(), ROTATION_HANG_GUARD)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        log.append_with_timeout(ts(), "small", serde_json::Value::Null, ROTATION_HANG_GUARD)
             .await
             .unwrap(),
         2
@@ -281,17 +289,24 @@ async fn rotation_io_failure_stops_writer_without_publishing() {
     // Plant only after open so failure occurs on the actual writer thread.
     fs::create_dir(dir.path().join("log/raw/00000002.jsonl")).unwrap();
     assert!(matches!(
-        log.append(ts(), "fail", serde_json::Value::Null).await,
+        log.append_with_timeout(ts(), "fail", serde_json::Value::Null, ROTATION_HANG_GUARD)
+            .await,
         Err(EventLogError::Io { .. })
     ));
+    // The failure reply precedes writer.close(), which syncs raw data again.
+    // Wait for receiver drop, not for a later append to race that cleanup.
+    tokio::time::timeout(ROTATION_HANG_GUARD, log.requests.closed())
+        .await
+        .expect("failed writer did not close its request receiver");
     assert!(live.try_recv().is_err(), "published a failed append");
     assert!(matches!(
-        log.append(ts(), "later", serde_json::Value::Null).await,
+        log.append_with_timeout(ts(), "later", serde_json::Value::Null, ROTATION_HANG_GUARD)
+            .await,
         Err(EventLogError::Closed)
     ));
     drop(log);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), live.recv())
+        tokio::time::timeout(ROTATION_HANG_GUARD, live.recv())
             .await
             .unwrap(),
         Err(broadcast::error::RecvError::Closed)

@@ -219,9 +219,9 @@ async fn agent_cli_timeout_boundaries_full_ids_and_down_default_are_transmitted(
     let session = "full-session-id-never-abbreviated-0123456789";
     for (args, method, params, result, text) in [
         (
-            vec!["agent", "clear", id, "--timeout-ms", "1"],
+            vec!["agent", "clear", id, "--timeout-ms", "5000"],
             "agent.clear",
-            json!({"agent":id,"timeout_ms":1}),
+            json!({"agent":id,"timeout_ms":5000}),
             json!({"agent_id":id,"session_id":session}),
             format!("{id}\t{session}\n"),
         ),
@@ -263,7 +263,16 @@ async fn agent_cli_timeout_boundaries_full_ids_and_down_default_are_transmitted(
 #[tokio::test]
 async fn agent_cli_parse_failures_exit_two_without_connecting() {
     let mut cases = Vec::new();
-    for timeout in ["0", "120001", "-1", "1.5", "no", "18446744073709551616"] {
+    for timeout in [
+        "0",
+        "1",
+        "4999",
+        "120001",
+        "-1",
+        "1.5",
+        "no",
+        "18446744073709551616",
+    ] {
         cases.push(vec![
             "agent",
             "clear",

@@ -165,6 +165,15 @@ mod agent_contract_tests {
     fn clear_rejects_bad_ids_and_timeout_bounds() {
         for args in [
             vec!["atm", "agent", "clear", "project/lead", "--timeout-ms", "0"],
+            vec!["atm", "agent", "clear", "project/lead", "--timeout-ms", "1"],
+            vec![
+                "atm",
+                "agent",
+                "clear",
+                "project/lead",
+                "--timeout-ms",
+                "4999",
+            ],
             vec![
                 "atm",
                 "agent",
@@ -174,9 +183,10 @@ mod agent_contract_tests {
                 "120001",
             ],
         ] {
-            assert!(Args::try_parse_from(args).is_err());
+            let error = Args::try_parse_from(args).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
         }
-        for timeout in ["1", "120000"] {
+        for timeout in ["5000", "120000"] {
             assert!(Args::try_parse_from([
                 "atm",
                 "agent",

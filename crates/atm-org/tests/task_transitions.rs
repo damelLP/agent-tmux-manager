@@ -824,6 +824,59 @@ fn rule_8_a_verdict_that_names_a_review_task_moves_the_judged_task_and_closes_th
 }
 
 #[test]
+fn probe_review_handed_in_as_plan_is_closed_as() {
+    for (given, ends) in [
+        (TaskVerdict::Accepted, S::Accepted),
+        (TaskVerdict::ChangesRequested, S::ChangesRequested),
+    ] {
+        for in_review in [false, true] {
+            let (mut rig, task) = handed_in(mechanical(), TaskSubmission::Result);
+            let review = rig.review_task(&task);
+            rig.ok(assign(&review, REVIEWER, by(LEAD)));
+            rig.ok(submit(
+                &review,
+                TaskSubmission::Plan,
+                "review-plan.md",
+                by(REVIEWER),
+            ));
+            if in_review {
+                rig.ok(start_review(&task, &review, by(LEAD)));
+            }
+            let before = rig.state.clone();
+            let log = rig.log.clone();
+            let seq = rig.seq;
+            for who in [by(LEAD), by("owner")] {
+                assert_eq!(
+                    rig.run(verdict(&task, given, Some(&review), who)),
+                    Err(Refusal::Task(TaskRefusal::ReviewNotSubmitted {
+                        review_task: review.clone(),
+                        state: S::Submitted,
+                    }))
+                );
+                assert_eq!(rig.state, before);
+                assert_eq!(rig.log, log);
+                assert_eq!(rig.seq, seq);
+            }
+            // A review's plan stop is legal, but its plan is not the review result.
+            rig.ok(verdict(&review, TaskVerdict::Accepted, None, by(LEAD)));
+            assert_eq!(rig.task(&review).state, S::Working);
+            rig.ok(submit(
+                &review,
+                TaskSubmission::Result,
+                "review.md",
+                by(REVIEWER),
+            ));
+            assert_eq!(
+                rig.ok(verdict(&task, given, Some(&review), by(LEAD))).len(),
+                2
+            );
+            assert_eq!(rig.task(&task).state, ends);
+            assert_eq!(rig.task(&review).state, S::Accepted);
+        }
+    }
+}
+
+#[test]
 fn rule_8_the_named_task_must_be_a_handed_in_review_of_this_task() {
     let mut case = situation(Sit::SubmittedResult);
     let task = case.task.clone();

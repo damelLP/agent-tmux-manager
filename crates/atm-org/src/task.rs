@@ -366,7 +366,7 @@ pub enum TaskRefusal {
         task_id: TaskId,
         review_task: TaskId,
     },
-    #[error("review task {review_task} is {state:?}, not submitted")]
+    #[error("review task {review_task} has no submitted result (state: {state:?})")]
     ReviewNotSubmitted {
         review_task: TaskId,
         state: TaskState,
@@ -704,7 +704,9 @@ impl OrgState {
                 let review = match review_task {
                     Some(id) => {
                         let review = self.review_of(task, id)?;
-                        if review.state != S::Submitted {
+                        if review.state != S::Submitted
+                            || review.submission != Some(TaskSubmission::Result)
+                        {
                             return Err(TaskRefusal::ReviewNotSubmitted {
                                 review_task: id.clone(),
                                 state: review.state,

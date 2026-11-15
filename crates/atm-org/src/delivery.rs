@@ -105,6 +105,8 @@
 //! A queued, unattempted message gets one informational owner Note after
 //! [`BUSY_NOTICE_AFTER`] behind the same observed turn (measured no earlier than
 //! its sent_at). This is independent of delivery status, never a block/drop.
+//! Any lost or Unknown sample restarts the thirty-minute interval and re-arms
+//! the note, even within the same physical turn.
 //! Positive running-turn evidence clears that clock. Its first loss starts a
 //! fresh window; repeated unknown observations never restart it. Unknown focus
 //! still waits ahead of agent status, even if that window has expired.
@@ -136,6 +138,8 @@ use thiserror::Error;
 
 /// One informational owner notice after a message waits behind a continuously
 /// observed running turn. Never a readiness timeout or permission to drop it.
+/// Any lost or Unknown sample restarts the interval and re-arms the note,
+/// even within the same physical turn.
 pub const BUSY_NOTICE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// Config-file settings. Durations serialize as `{secs, nanos}`; omitted fields

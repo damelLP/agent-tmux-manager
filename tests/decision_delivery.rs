@@ -18,12 +18,18 @@ fn raise(rig: &MessageRig, seat: &Recipient) -> String {
     result["decision_id"].as_str().unwrap().to_owned()
 }
 fn resolve(rig: &MessageRig, id: &str) -> Value {
-    rig.call(
-        "decision.resolve",
-        json!({"id":id,"option":"yes","note":"owner answer","standing_rule":true}),
+    rig.atm_json(
         None,
+        &[
+            "decide",
+            id,
+            "yes",
+            "owner answer",
+            "--rule",
+            "--format",
+            "json",
+        ],
     )
-    .unwrap()
 }
 fn sent(watch: &mut Watch, seat: &Recipient, decision: &str) -> String {
     let record = watch.wait("the resolution answer", |e| {
@@ -57,6 +63,12 @@ fn decision_answer_reference_and_state_survive_real_daemon_restart() {
     let mut watch = rig.watch();
     let cursor = rig.test.rig.event_cursor(&seat.pane);
     let decision = raise(&rig, &seat);
+    let pending = rig.atm_json(None, &["decisions", "--format", "json"]);
+    assert_eq!(pending["pending_count"], 1);
+    assert_eq!(pending["decisions"][0]["id"], decision);
+    assert!(String::from_utf8(rig.atm(None, &["status"]).stdout)
+        .unwrap()
+        .contains("1 decisions"));
     let answer = resolve(&rig, &decision);
     assert_eq!(answer["changed"], true);
     let id = sent(&mut watch, &seat, &decision);

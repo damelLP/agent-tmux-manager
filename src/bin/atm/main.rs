@@ -43,6 +43,7 @@ use atm_tui::tmux;
 mod agent;
 mod agent_target;
 mod cli;
+mod decide;
 mod me;
 mod msg;
 pub mod rpc;
@@ -205,6 +206,10 @@ mod agent_contract_tests {
 enum Command {
     /// Show your identity, instructions, handover, unread work and reporting command
     Me(me::MeArgs),
+    /// Record the owner's answer to a decision
+    Decide(decide::DecideArgs),
+    /// List pending and provisional decisions
+    Decisions(decide::DecisionsArgs),
     /// Send, acknowledge or resolve durable messages
     Msg {
         #[command(subcommand)]
@@ -434,6 +439,8 @@ async fn main() -> Result<()> {
     // Handle subcommands first (before TUI initialization)
     match args.command {
         Some(Command::Me(args)) => return me::cmd_me(args).await,
+        Some(Command::Decide(args)) => return decide::cmd_decide(args).await,
+        Some(Command::Decisions(args)) => return decide::cmd_decisions(args).await,
         Some(Command::Msg { action }) => return msg::cmd_msg(action).await,
         Some(Command::Inbox(args)) => return msg::cmd_inbox(args).await,
         Some(Command::Agent { action }) => return agent::cmd_agent(action).await,

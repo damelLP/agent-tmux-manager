@@ -84,6 +84,8 @@ atm send <id> "fix the tests"     # send text to agent
 atm reply <id> --yes               # accept a permission prompt
 atm peek <id> --prompt             # extract the active prompt
 atm list -f json --status working  # list working agents as JSON
+atm decisions                      # pending/provisional decisions for you
+atm decide d41 yes 'Approved'        # owner answer; --rule records a rule mark
 atm status                         # one-line summary for tmux status bar
 
 atm workspace create               # new session with ATM sidebar + agent + shell
@@ -200,6 +202,57 @@ pane_gone_grace = { secs = 2, nanos = 0 }
 
 Durations must be positive and fit the policy's checked timestamp arithmetic; retry delays must be nondecreasing. Maximum attempts are the number of retry delays plus one (four by default); an empty retry list permits one attempt. Timing defaults do not prove a harness editor is safe: observations and safety guards still control delivery.
 
+## Decisions
+
+Named agents raise questions through `decision.request`; the owner answers from an **unbound** shell:
+
+```sh
+atm decisions                         # pending + taken provisionally
+atm decisions --status resolved        # repeat --status to combine states
+atm decisions --all --format json
+atm decisions --after d41 --limit 20
+atm decide d41 yes 'Use the smaller interface'
+atm decide d41 yes 'Always use this shape' --rule --format json
+```
+
+IDs are `d` plus the request event's sequence (`d41`, not `d041`). Options and notes are exact strings: quote multiword values; there is no trimming or case folding. `--format json` preserves the complete daemon result, including additive fields; text escapes terminal controls. `--all` conflicts with `--status`. Request creation and withdrawal are API methods, not extra CLI commands.
+
+An agent pane sees its own requests; an unbound owner caller sees all. Pending and provisional decisions remain on the default list, with separate `pending_count` and `provisional_count` totals. Counts cover the caller's scope, not just the page or status filter. `atm status` independently asks for the global **Pending-only** count, even from an agent pane: nonzero adds `N decisions`, zero adds nothing, and missing/unavailable/bad aggregate data adds `? decisions` plus a diagnostic without hiding session or unread counts. A provisional decision is not counted as pending; it remains in `atm decisions`.
+
+Only the owner resolves. A pane bound to an agent is refused; an unbound pane (or absent pane) counts as owner, just as for messages. This is **attribution, not authentication**: clients supply their pane, and processes running as the owner can claim an unbound one. Resolved/overruled log bodies include the optional caller pane; the fold and repeat rule ignore that audit metadata. Old bodies without it still replay unchanged.
+
+The exact same answer (option, note and rule mark) again is an accepted no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. `--rule` currently **records the standing-rule mark only**; it does not append a project rules file. Away/provisional scheduling, automatic deadline expiry, and rule-file updates are separate features; D2 stores a deadline but does not run an expiry timer.
+
+### Decision API
+
+After the normal 1.1 connect handshake, a named agent can send this request envelope (one JSON line):
+
+```json
+{"protocol_version":{"major":1,"minor":1},"type":"request","id":"question-1","method":"decision.request","from_pane":"%7","params":{"kind":"plan","title":"Approve this plan","context":"Choose the smaller interface","files":["plan.md"],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true,"deadline":null}}
+```
+
+`requester` and `by` are never accepted params; the daemon derives them from the caller pane. Owner/unbound callers cannot request; internal system requests are separate. All params reject unknown fields; IDs and timestamps are validated. New kinds must be `action`, `hire`, `budget`, `policy`, `plan` or `dialog`; later kinds replay as `unknown` but cannot be newly requested through this daemon.
+
+| Method | Params | Result |
+|---|---|---|
+| `decision.request` | Required `kind`, `title`, `options`, `may_be_undone`, `changes_intent`; optional `context=""`, `files=[]`, `recommended=null`, `deadline=null` | `{"decision_id":"d41"}` |
+| `decision.list` | Optional `statuses=null` (pending + provisional), `after=null`, `limit=100` (1–1000), `count_only=false` | `decisions`, `pending_count`, `provisional_count`, `next_after` |
+| `decision.get` | `id` | `{"decision":<entry>}` |
+| `decision.resolve` | `id`, `option`; optional `note=null`, `standing_rule=false` | `{"decision":<entry>,"changed":true}` |
+| `decision.withdraw` | `id`; optional `reason=null`; requester or owner only | Same mutation result |
+
+An entry reuses the decision's `id`, `request`, timestamps, `status`, provisional/resolution/withdrawal facts, and derived `class`. Status is authoritative; historical logs may retain an earlier fact under another status. Optional facts are null. `count_only=true` returns empty rows/null cursor and global owner counts to any caller; it excludes `after` and explicit `statuses`. Pages/get are bounded to 512 KiB without truncating facts; an oversized first row is refused. Continue with `next_after` while preserving your filters. There is no project filter for a system request with no structured project.
+
+Bounds are UTF-8 bytes: title 1–512; context ≤16384; 2–32 distinct nonempty options, each ≤1024; ≤32 nonempty file paths, each ≤4096; note/reason ≤8192. Recommendation must match an option exactly and a request deadline must be in the future. Unknown IDs return `not_found`, invalid params `invalid_params`, policy/identity refusals `refused`, unavailable persistence `unavailable`, and timeouts `timeout`. Accepted work can finish after timeout: inspect the list/get/inbox before retrying, rather than creating another request.
+
+### Answers and persistence
+
+The org event log retains requests and answers across daemon restarts. Recording an answer does **not** mean a harness accepted it: one daemon bridge durably enqueues a `system` / `answer` message to the requester, then the existing FIFO/guard/confirmation runtime delivers its one-line inbox reference. Read the body with `atm inbox --id m…`, then explicitly acknowledge it. Focused panes and occupied editors stay protected; no separate decision paste path bypasses those guards. Internal `system` requesters have no inbox and consume the durable resolution event instead.
+
+The final decision is the bridge's recoverable work item; an exact canonical answer `msg.sent` is its completion marker, regardless of delivery/read status. Restart fills a missing enqueue and does not duplicate an existing one. An uncertain enqueue stops the bridge until restart; reads remain available when org persistence is healthy. Delivery failures/holds retain the normal message recovery rules. The canonical answer text is therefore a persistence correlation contract, not presentation-only text to change without considering old logs.
+
+New pending requests also run the owner's existing `[notify]` command, using a short `d41 from project/worker: atm decisions` reference, not private title/context/options. This shares the owner-message notifier described below; resolved, provisional, withdrawn or expired decisions suppress a delayed notice. External notices remain best effort, not the durable decision record.
+
 ## Notifications
 
 `atmd` can run a command of yours whenever a session starts needing input: a permission dialog, an MCP input dialog, or an agent asking you something, in any supported harness. The same command also handles newly committed Owner inbox messages, under the separate rules below. Add a `[notify]` section to `config.toml`. `atm setup` writes this example commented out, but it never rewrites an existing file, so add the section by hand if you already have one:
@@ -217,7 +270,7 @@ command = ["notify-send", "atm", "--"]
 - The command runs in `atmd`'s environment, which comes from whoever started `atmd` (usually a TUI). Use absolute paths: with no shell, `~` and `$VAR` aren't expanded.
 - Stdin and stdout are closed. After 30 seconds `atmd` kills the command (but not processes it started). A failure is logged, with the command's stderr, to the daemon log.
 
-For Owner inbox messages, a separate consumer subscribes to committed events before service admission, skips startup history and deduplicates replay overlap within the process. It notifies only new Owner messages; OwnerFocused notices remain **inbox-only** (no `[notify]`). Its notification contains bounded metadata and an inbox reference with `--for owner`, not the body. `delay_secs` delays launch, and committed read state is checked again just before launch: reading while queued suppresses it, as does an unavailable state read. It has one running/delayed command and at most 32 pending commands; overflow is logged without changing the durable inbox. Commands use the same no-shell runner and 30-second timeout as attention notifications, which retain their independent per-session behavior. Notification failure never generates another message or retries the command. This external effect is **best effort**, not durable/exactly-once: shutdown cancels pending work and a crash can lose a notification. A watch error stops Owner notifications until restart and logs one warning; consult the inbox/status for durable state.
+For Owner inbox messages and pending decisions, one consumer subscribes to committed events before service admission, skips startup history and deduplicates replay overlap within the process. It notifies new Owner messages and decision requests; OwnerFocused notices remain **inbox-only** (no `[notify]`). A message notice contains bounded metadata and an inbox reference with `--for owner`, not the body; a decision notice points to `atm decisions`. `delay_secs` delays launch, and committed unread/pending state is checked again just before launch: reading a message or closing/taking a decision while queued suppresses it, as does an unavailable state read. The shared queue has one running/delayed command and at most 32 pending commands; overflow is logged without changing durable state. Commands use the same no-shell runner and 30-second timeout as attention notifications, which retain their independent per-session behavior. Notification failure never generates another message or retries the command. This external effect is **best effort**, not durable/exactly-once: shutdown cancels pending work and a crash can lose a notification. A watch error stops Owner notifications until restart and logs one warning; consult the inbox/status for durable state.
 
 [ntfy](https://ntfy.sh), through curl. `--data-raw` sends the message as it is; `-d` would read a file for a message that starts with `@`:
 

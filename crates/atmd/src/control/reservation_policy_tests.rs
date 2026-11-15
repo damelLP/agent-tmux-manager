@@ -119,6 +119,47 @@ fn reservation_lifecycle_contention_holds_agent_and_pane_atomically() {
 }
 
 #[test]
+fn reservation_quarantines_lists_failed_cleanups_only() {
+    // The read names each operation whose cleanup failed, with the pane it
+    // reserved or else created, in admission order. A released operation
+    // and a running one are not in it, and reading changes nothing.
+    let now = Instant::now();
+    let mut state = State::default();
+    assert_eq!(state.quarantines(), Vec::new());
+    let run = |state: &mut State, agent: &str, pane: Option<&str>, kind| {
+        let id = state.admit(request(agent, pane, kind, now), now).unwrap();
+        let fence = state.ready(now).pop().unwrap().1.unwrap();
+        (id, fence)
+    };
+    let (bad, _) = run(&mut state, "p/bad", Some("%100"), ReservationKind::Clear);
+    state.finish(bad, false);
+    let (made, fence) = run(&mut state, "p/made", None, ReservationKind::Up);
+    state.claim(&fence, PaneId::parse("%7").unwrap()).unwrap();
+    state.finish(made, false);
+    let (gone, _) = run(&mut state, "p/gone", None, ReservationKind::Down);
+    state.finish(gone, false);
+    let (ok, _) = run(&mut state, "p/ok", Some("%2"), ReservationKind::Observe);
+    state.finish(ok, true);
+    run(&mut state, "p/live", Some("%3"), ReservationKind::Delivery);
+    let quarantine = |agent: &str, pane: Option<&str>, kind| Quarantine {
+        agent: agent.parse().unwrap(),
+        pane: pane.map(|pane| PaneId::parse(pane).unwrap()),
+        kind,
+    };
+    let expected = vec![
+        quarantine("p/bad", Some("%100"), ReservationKind::Clear),
+        quarantine("p/made", Some("%7"), ReservationKind::Up),
+        quarantine("p/gone", None, ReservationKind::Down),
+    ];
+    assert_eq!(state.quarantines(), expected);
+    assert_eq!(state.quarantines(), expected);
+    assert!(matches!(
+        state.admit(request("p/bad", None, ReservationKind::Down, now), now),
+        Err(ReservationError::Quarantined { .. })
+    ));
+}
+
+#[test]
 fn reservation_quarantine_does_not_take_live_pool_capacity() {
     let now = Instant::now();
     let mut state = State::default();

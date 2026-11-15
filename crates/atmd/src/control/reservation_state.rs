@@ -2,7 +2,9 @@
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 
-use super::{PaneId, ReservationError, ReservationKind, ReservationRequest, WaitPolicy};
+use super::{
+    PaneId, Quarantine, ReservationError, ReservationKind, ReservationRequest, WaitPolicy,
+};
 
 pub(super) const CAPACITY: usize = 32;
 pub(super) const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -308,6 +310,19 @@ impl State {
             operation: fence.operation,
             phase: Phase::Cleanup,
         })
+    }
+
+    /// The quarantined operations, in the order they were admitted.
+    pub(super) fn quarantines(&self) -> Vec<Quarantine> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.phase == Phase::Quarantined)
+            .map(|entry| Quarantine {
+                agent: entry.request.agent.clone(),
+                pane: entry.request.pane.clone().or_else(|| entry.created.clone()),
+                kind: entry.request.kind,
+            })
+            .collect()
     }
 
     /// Called only when the owned supervisor has joined work and cleanup.

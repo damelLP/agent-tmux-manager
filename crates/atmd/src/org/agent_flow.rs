@@ -8,11 +8,12 @@
 
 use super::agent_screen::{AgentScreen, Foreground, PaneBaseline};
 use crate::control::reservation::{CaptureFormat, PaneCapture, PaneKey};
+use crate::registry::PaneSession;
 use atm_core::harness_control::{
-    ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
+    ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
 };
 use atm_core::styled_screen::StyledScreen;
-use atm_core::{DialogState, InputState, SessionId, TurnState};
+use atm_core::{DialogState, FreshEditorEvidence, InputState, SessionId, TurnState};
 use std::path::PathBuf;
 
 /// What a flow does after one capture.
@@ -43,6 +44,10 @@ pub(super) enum KeyAction {
     TrustAccept,
     /// Dismiss a prompt the launch may skip (an update offer).
     SkipLaunchPrompt,
+    /// Submit the command staged in the editor.
+    Submit,
+    /// Keep the current worktree when a clear asks which one to use.
+    KeepWorktree,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +73,8 @@ impl StartProgress {
     pub(super) fn sent(&mut self, action: KeyAction, expect: &ControlDialog) {
         match action {
             KeyAction::SkipLaunchPrompt => self.launch_skipped = true,
+            // Keys of a clear; a start sends neither.
+            KeyAction::Submit | KeyAction::KeepWorktree => {}
             KeyAction::TrustSelect | KeyAction::TrustAccept => {
                 if let ControlDialog::FolderTrust { folder, .. } = expect {
                     self.folder.get_or_insert_with(|| folder.clone());
@@ -473,5 +480,254 @@ pub(super) fn adopt_baseline(
         PaneShape::JobInFront if command != facts.name => Some(PaneBaseline::adopted(root_pid)),
         PaneShape::RootProgram => Some(PaneBaseline::adopted(root_pid)),
         _ => None,
+    }
+}
+
+/// Why a capture does not allow input to the agent's harness, whatever its
+/// screen shows; `None` allows. Every paste and key of a flow requires this of
+/// the control actor's own capture: the agent's tag, a live pane out of copy
+/// mode, the pinned harness in the foreground, and no client focused on the
+/// pane (a person may be typing there). Unknown focus is not permission.
+#[must_use]
+pub(super) fn input_refusal(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+) -> Option<&'static str> {
+    let pane = &capture.inspection;
+    if pane.local_agent_tag.as_deref() != Some(tag) {
+        Some("the pane no longer carries the agent's tag")
+    } else if pane.dead {
+        Some("the program in the pane has exited")
+    } else if pane.in_mode {
+        Some("the pane is in copy mode")
+    } else if screen.foreground(capture, baseline) != Some(Foreground::Harness) {
+        Some("the harness is not known to be the pane's foreground program")
+    } else {
+        match capture.focused {
+            Some(false) => None,
+            Some(true) => Some("the pane is focused"),
+            None => Some("whether the pane is focused could not be read"),
+        }
+    }
+}
+
+/// An editor a command may be typed into: no dialog, empty, no turn running.
+fn safe_editor(control: &ControlScreen) -> bool {
+    control.dialog == ControlDialog::None
+        && control.facts.input == InputState::Empty
+        && control.facts.turn == TurnState::NotRunning
+        && control.facts.dialog == DialogState::None
+}
+
+/// Why a screen can't be cleared; `None` allows. A harness whose clear is
+/// proven by its screen alone must show a conversation first: without one
+/// there is no change a later fresh editor could prove.
+#[must_use]
+pub(super) fn clear_refusal(
+    policy: &ControlPolicy,
+    control: &ControlScreen,
+) -> Option<&'static str> {
+    if !safe_editor(control) {
+        Some("the editor is not empty and idle")
+    } else if matches!(policy.clear_proof, ClearProof::ConversationToFresh { .. })
+        && !control.conversation
+    {
+        Some("no conversation is on screen, so a clear could not be confirmed")
+    } else {
+        None
+    }
+}
+
+/// A clear with nothing to do: the harness says a ready agent without a
+/// session needs none, the agent has no session, no session on its pane could
+/// be its own, and the screen is a fresh, safe editor. All of it, or the
+/// command is sent.
+#[must_use]
+pub(super) fn clear_noop(
+    policy: &ControlPolicy,
+    bound: bool,
+    eligible_rows: usize,
+    control: &ControlScreen,
+) -> bool {
+    matches!(
+        policy.clear_proof,
+        ClearProof::ConversationToFresh {
+            ready_unbound_noop: true
+        }
+    ) && !bound
+        && eligible_rows == 0
+        && safe_editor(control)
+        && control.facts.fresh_editor == FreshEditorEvidence::Present
+        && !control.conversation
+}
+
+/// The paste guard of a clear, on the control actor's own capture.
+#[must_use]
+pub(super) fn safe_to_paste(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+) -> bool {
+    input_refusal(screen, capture, baseline, tag).is_none()
+        && clear_refusal(screen.policy(), &screen.control(capture, baseline)).is_none()
+}
+
+/// Rule for the Enter that submits a pasted command, over what one capture
+/// read: why the pane allows no input (if anything), whether the editor holds
+/// exactly the command, and the dialog. Enter needs all three in its favour.
+/// A completion popup counts as no dialog only where the adapter recognises
+/// its exact layout; an unrecognised one is Unknown and is looked at again. A
+/// paste is never repeated and nothing is cleaned up, so a draft that is not
+/// the command waits for its owner.
+#[must_use]
+pub(super) fn decide_submit(
+    refusal: Option<&'static str>,
+    staged: Option<bool>,
+    dialog: &ControlDialog,
+) -> Step {
+    if let Some(reason) = refusal {
+        return Step::Wait(reason);
+    }
+    match (dialog, staged) {
+        (ControlDialog::None, Some(true)) => Step::Key {
+            key: PaneKey::Enter,
+            expect: ControlDialog::None,
+            action: KeyAction::Submit,
+        },
+        (ControlDialog::None, _) => Step::Wait("the command is not staged in the editor"),
+        (ControlDialog::Unknown, _) => Step::Wait("the screen was not recognised"),
+        _ => Step::Stuck("a dialog opened before the command was submitted".into()),
+    }
+}
+
+/// [`decide_submit`] on one capture: `expected` must be staged exactly,
+/// leading whitespace included.
+#[must_use]
+pub(super) fn submit_step(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+    expected: &str,
+) -> Step {
+    decide_submit(
+        input_refusal(screen, capture, baseline, tag),
+        screen.staged(capture, baseline, expected),
+        &screen.control(capture, baseline).dialog,
+    )
+}
+
+/// The guard of the submitting Enter, on the control actor's own capture.
+#[must_use]
+pub(super) fn submit_allowed(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+    expected: &str,
+) -> bool {
+    matches!(
+        submit_step(screen, capture, baseline, tag, expected),
+        Step::Key { .. }
+    )
+}
+
+/// The session a clear produced, among the rows now on the agent's pane: the
+/// one top-level session of the agent's harness that was not on the pane
+/// before the command (`before` holds those, and the agent's own), once the
+/// registry has accepted its start with the source the harness names.
+///
+/// `Ok(None)` waits: no such row yet, a row a status line created, a start
+/// with another source, or a harness whose clear announces no session. More
+/// than one new session is an error; nothing says which is the agent's.
+pub(super) fn cleared_session(
+    policy: &ControlPolicy,
+    harness: &str,
+    rows: &[PaneSession],
+    before: &[SessionId],
+) -> Result<Option<SessionId>, String> {
+    let ClearProof::ChangedSession { start_source } = policy.clear_proof else {
+        return Ok(None);
+    };
+    let mut new = rows.iter().filter(|row| {
+        row.view.parent_session_id.is_none()
+            && !row.view.id.is_pending()
+            && row.view.harness == harness
+            && !before.contains(&row.view.id)
+    });
+    let Some(row) = new.next() else {
+        return Ok(None);
+    };
+    if new.next().is_some() {
+        return Err("more than one new session appeared on the pane".into());
+    }
+    Ok(row
+        .start
+        .as_ref()
+        .filter(|start| start_source.is_none() || start.source.as_deref() == start_source)
+        .map(|_| row.view.id.clone()))
+}
+
+/// The keys one clear has sent after its command.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ClearProgress {
+    pub worktree_kept: bool,
+}
+
+/// Decide a clear's next step once its command was submitted, from the
+/// harness's control screen and the session [`cleared_session`] found.
+///
+/// A harness that announces a new session is done when that session has
+/// arrived and, after it, the editor is safe: neither alone is enough. A
+/// harness that announces none is done on a fresh, safe editor without the
+/// conversation. A recognised dialog other than the worktree choice stops the
+/// clear at once; an unrecognised screen is looked at again.
+#[must_use]
+pub(super) fn decide_clear(
+    policy: &ControlPolicy,
+    control: &ControlScreen,
+    progress: &ClearProgress,
+    session: Option<&SessionId>,
+) -> Step {
+    match &control.dialog {
+        ControlDialog::Unknown => Step::Wait("the screen was not recognised"),
+        ControlDialog::CurrentWorktree { .. } if progress.worktree_kept => {
+            Step::Wait("the worktree choice is still shown after it was answered")
+        }
+        ControlDialog::CurrentWorktree {
+            selected: false, ..
+        } => Step::Stuck(
+            "the harness asks which worktree to use and the current one is not selected".into(),
+        ),
+        ControlDialog::CurrentWorktree { accept, .. } => match pane_key(*accept) {
+            Some(key) => Step::Key {
+                key,
+                expect: control.dialog.clone(),
+                action: KeyAction::KeepWorktree,
+            },
+            None => Step::Stuck("the worktree choice needs a key atm cannot send".into()),
+        },
+        ControlDialog::None => match policy.clear_proof {
+            ClearProof::ChangedSession { .. } => match session {
+                None => Step::Wait("the harness has not announced a new session"),
+                Some(_) if !safe_editor(control) => Step::Wait("the editor is not empty and idle"),
+                Some(session) => Step::Ready(Ready::Session(session.clone())),
+            },
+            ClearProof::ConversationToFresh { .. } if control.conversation => {
+                Step::Wait("the conversation is still on screen")
+            }
+            ClearProof::ConversationToFresh { .. }
+                if safe_editor(control)
+                    && control.facts.fresh_editor == FreshEditorEvidence::Present =>
+            {
+                Step::Ready(Ready::Editor)
+            }
+            ClearProof::ConversationToFresh { .. } => Step::Wait("no fresh editor is shown"),
+            _ => Step::Stuck("the harness proves a clear in a way atm does not know".into()),
+        },
+        _ => Step::Stuck("a dialog opened during the clear".into()),
     }
 }

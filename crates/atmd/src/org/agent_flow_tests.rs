@@ -1855,3 +1855,621 @@ fn proc_facts_parse_or_refuse() {
         );
     }
 }
+
+// ---- agent.clear ----
+
+use crate::control::reservation::PaneCapture;
+use crate::registry::{AcceptedStart, PaneSession};
+
+/// The tag `capture` puts on its pane.
+const TAG: &str = "p/lead";
+
+const CLAUDE_CONVERSATION: &str = claude!("B-baseline-conversation-120x40");
+/// `/clear` pasted into that conversation's editor; its completion menu is open.
+const CLAUDE_STAGED: &str = claude!("B-clear-001-120x40");
+const CLAUDE_CLEARED: &str = claude!("B-clear-007-120x40");
+const CLAUDE_OTHER_DRAFT: &str = include_str!(
+    "../../../atm-claude-adapter/tests/fixtures/screen_styled_p1_B-auto-pasted-120x40_2.1.325.txt"
+);
+/// A permission dialog the adapter does not read.
+const CLAUDE_MODAL: &str = claude!("C3-dialog-120x40");
+const CLAUDE_TRUST: &str = claude!("A120-default-120x40");
+const CODEX_CONVERSATION: &str = codex!("screen_control_p1_b12-completed-before-new-100x32");
+/// `/new` pasted, with Codex's one-row completion popup.
+const CODEX_POPUP: &str = codex!("screen_styled_p1_b09-valid-new-draft-100x32");
+const CODEX_WORKTREE: &str = codex!("screen_control_p1_b31-nodaemon-clear-dialog-100x32");
+const CODEX_FRESH: &str = codex!("screen_styled_p1_b14-fresh-baseline-32-100x32");
+const CODEX_DRAFT: &str = codex!("screen_styled_p1_b23-early-paste-landed-100x24");
+const CODEX_DRAFT_OVER_CONVERSATION: &str = codex!("screen_styled_p1_c03-draft-before-100x24");
+const CODEX_WORKING: &str = codex!("screen_styled_p1_c07-working-held-100x24");
+const CODEX_HOOK_REVIEW: &str = codex!("screen_control_p1_a02-startup-100x32");
+const PI_CONVERSATION: &str = pi!("screen_control_p1_B-conversation-120x40");
+const PI_FRESH: &str = pi!("screen_styled_p1_A-ready-120x40");
+const PI_DRAFT: &str = pi!("screen_styled_p1_B-0-event-pasted-120x40");
+const PI_RETRY: &str = pi!("screen_styled_p1_R-retry-held-120x40");
+const PI_SELECTOR: &str = pi!("screen_styled_p1_C3-one-selector-120x40");
+
+/// Synthetic: pi's real draft frame with its draft replaced by `/new`, the
+/// cursor cell and the row's width kept. pi's own staged `/new` capture is
+/// not a fixture yet; a pasted `/new` draws no completion list (probe P5).
+pub(super) fn pi_staged() -> String {
+    let draft = "B_SENTINEL_0_event\x1b[7m \x1b[0m";
+    assert!(PI_DRAFT.contains(draft));
+    PI_DRAFT.replace(draft, "/new\x1b[7m \x1b[0m              ")
+}
+
+/// A real frame as a guard captures it when the pane itself allows input:
+/// the agent's tag, the pinned harness in front, no client focused on it.
+fn unfocused(harness: Harness, fixture: &str) -> PaneCapture {
+    capture(
+        fixture,
+        CaptureFormat::Ansi,
+        Some(ROOT),
+        Some(name(harness)),
+    )
+    .with_focus(Some(false))
+}
+
+fn submit(harness: Harness, fixture: &str, expected: &str) -> Step {
+    submit_step(
+        agent_screen(harness).unwrap(),
+        &unfocused(harness, fixture),
+        &pinned(name(harness)),
+        TAG,
+        expected,
+    )
+}
+
+fn enter() -> Step {
+    Step::Key {
+        key: PaneKey::Enter,
+        expect: ControlDialog::None,
+        action: KeyAction::Submit,
+    }
+}
+
+const NOT_STAGED: Step = Step::Wait("the command is not staged in the editor");
+const NOT_RECOGNISED: Step = Step::Wait("the screen was not recognised");
+
+#[test]
+fn input_refusal_table() {
+    // One real frame per harness; only the pane's own facts change.
+    for (harness, fixture) in [
+        (Harness::ClaudeCode, CLAUDE_CONVERSATION),
+        (Harness::Codex, CODEX_CONVERSATION),
+        (Harness::Pi, PI_CONVERSATION),
+    ] {
+        let screen = agent_screen(harness).unwrap();
+        let baseline = pinned(name(harness));
+        let allowed = unfocused(harness, fixture);
+        // The positive twin of every row below.
+        assert_eq!(input_refusal(screen, &allowed, &baseline, TAG), None);
+        assert!(safe_to_paste(screen, &allowed, &baseline, TAG));
+        let with = |change: &dyn Fn(&mut PaneCapture)| {
+            let mut frame = allowed.clone();
+            change(&mut frame);
+            frame
+        };
+        let foreground = "the harness is not known to be the pane's foreground program";
+        let rows: [(PaneCapture, &str); 10] = [
+            (
+                with(&|c| c.inspection.local_agent_tag = Some("p/other".into())),
+                "the pane no longer carries the agent's tag",
+            ),
+            (
+                with(&|c| c.inspection.local_agent_tag = None),
+                "the pane no longer carries the agent's tag",
+            ),
+            (
+                with(&|c| c.inspection.dead = true),
+                "the program in the pane has exited",
+            ),
+            (
+                with(&|c| c.inspection.in_mode = true),
+                "the pane is in copy mode",
+            ),
+            // The harness exited to its shell and the frame is stale.
+            (
+                with(&|c| c.inspection.foreground_command = Some("zsh".into())),
+                foreground,
+            ),
+            (
+                with(&|c| c.inspection.foreground_command = Some("node".into())),
+                foreground,
+            ),
+            (
+                with(&|c| c.inspection.foreground_command = None),
+                foreground,
+            ),
+            (with(&|c| c.inspection.pane.pane_pid = ROOT + 1), foreground),
+            (with(&|c| c.focused = Some(true)), "the pane is focused"),
+            (
+                with(&|c| c.focused = None),
+                "whether the pane is focused could not be read",
+            ),
+        ];
+        for (frame, reason) in rows {
+            assert_eq!(
+                input_refusal(screen, &frame, &baseline, TAG),
+                Some(reason),
+                "{harness:?}"
+            );
+            assert!(!safe_to_paste(screen, &frame, &baseline, TAG), "{reason}");
+        }
+        // A pane nothing was recorded about refuses, and so does another agent's tag.
+        assert_eq!(
+            input_refusal(screen, &allowed, &PaneBaseline::unproven(), TAG),
+            Some(foreground)
+        );
+        assert!(input_refusal(screen, &allowed, &baseline, "p/other").is_some());
+    }
+}
+
+#[test]
+fn clear_needs_a_safe_editor_and_a_conversation_where_the_screen_is_the_proof() {
+    let idle = "the editor is not empty and idle";
+    let unproven = "no conversation is on screen, so a clear could not be confirmed";
+    for (harness, fixture, refusal) in [
+        (Harness::ClaudeCode, CLAUDE_CONVERSATION, None),
+        // Claude and pi prove a clear by a new session: no conversation needed.
+        (Harness::ClaudeCode, CLAUDE_CLEARED, None),
+        (Harness::ClaudeCode, CLAUDE_STAGED, Some(idle)),
+        (Harness::ClaudeCode, CLAUDE_OTHER_DRAFT, Some(idle)),
+        (Harness::ClaudeCode, CLAUDE_MODAL, Some(idle)),
+        (Harness::ClaudeCode, CLAUDE_TRUST, Some(idle)),
+        (Harness::Pi, PI_CONVERSATION, None),
+        (Harness::Pi, PI_FRESH, None),
+        (Harness::Pi, PI_DRAFT, Some(idle)),
+        (Harness::Pi, PI_RETRY, Some(idle)),
+        (Harness::Pi, PI_SELECTOR, Some(idle)),
+        (Harness::Codex, CODEX_CONVERSATION, None),
+        // Codex proves a clear by its screen: fresh before means no proof after.
+        (Harness::Codex, CODEX_FRESH, Some(unproven)),
+        (Harness::Codex, CODEX_DRAFT, Some(idle)),
+        (Harness::Codex, CODEX_DRAFT_OVER_CONVERSATION, Some(idle)),
+        (Harness::Codex, CODEX_WORKING, Some(idle)),
+        (Harness::Codex, CODEX_WORKTREE, Some(idle)),
+        (Harness::Codex, CODEX_POPUP, Some(idle)),
+    ] {
+        let screen = agent_screen(harness).unwrap();
+        let baseline = pinned(name(harness));
+        let frame = unfocused(harness, fixture);
+        let control = screen.control(&frame, &baseline);
+        assert_eq!(
+            clear_refusal(policy(harness), &control),
+            refusal,
+            "{harness:?} {control:?}"
+        );
+        // The paste guard is the same rule on the guard's own capture.
+        assert_eq!(
+            safe_to_paste(screen, &frame, &baseline, TAG),
+            refusal.is_none(),
+            "{harness:?} {control:?}"
+        );
+    }
+    // The same pi draft frame with `/new` staged is no safe editor either:
+    // a second paste would append to it.
+    let screen = agent_screen(Harness::Pi).unwrap();
+    assert!(!safe_to_paste(
+        screen,
+        &unfocused(Harness::Pi, &pi_staged()),
+        &pinned("pi"),
+        TAG
+    ));
+}
+
+#[test]
+fn submit_requires_staged_true_and_dialog_none() {
+    // Real frames. Claude's completion menu with exactly `/clear` selected and
+    // staged is no dialog; pi draws none for a pasted command.
+    assert_eq!(
+        submit(Harness::ClaudeCode, CLAUDE_STAGED, "/clear"),
+        enter()
+    );
+    assert_eq!(submit(Harness::Pi, &pi_staged(), "/new"), enter());
+    // Their twins: the same frames and another expected text, leading
+    // whitespace included, and the same harness with something else staged.
+    for expected in [" /clear", "/clea", "/clear x", "/new", ""] {
+        assert_eq!(
+            submit(Harness::ClaudeCode, CLAUDE_STAGED, expected),
+            NOT_STAGED,
+            "{expected:?}"
+        );
+    }
+    assert_eq!(submit(Harness::Pi, &pi_staged(), " /new"), NOT_STAGED);
+    for (harness, fixture, command) in [
+        (Harness::ClaudeCode, CLAUDE_CONVERSATION, "/clear"),
+        (Harness::ClaudeCode, CLAUDE_CLEARED, "/clear"),
+        (Harness::ClaudeCode, CLAUDE_OTHER_DRAFT, "/clear"),
+        (Harness::Pi, PI_DRAFT, "/new"),
+        (Harness::Pi, PI_CONVERSATION, "/new"),
+        (Harness::Codex, CODEX_DRAFT, "/new"),
+        (Harness::Codex, CODEX_CONVERSATION, "/new"),
+    ] {
+        assert_eq!(submit(harness, fixture, command), NOT_STAGED, "{harness:?}");
+    }
+    // A screen the adapter does not recognise is looked at again, even with
+    // the command staged: Codex's `/new` popup is not recognised as "no
+    // dialog" by its adapter yet, so today no Enter follows a Codex paste.
+    let codex = agent_screen(Harness::Codex).unwrap();
+    let popup = unfocused(Harness::Codex, CODEX_POPUP);
+    assert_eq!(codex.staged(&popup, &pinned("codex"), "/new"), Some(true));
+    assert_eq!(submit(Harness::Codex, CODEX_POPUP, "/new"), NOT_RECOGNISED);
+    assert_eq!(
+        submit(Harness::ClaudeCode, CLAUDE_MODAL, "/clear"),
+        NOT_RECOGNISED
+    );
+    assert!(!submit_allowed(
+        codex,
+        &popup,
+        &pinned("codex"),
+        TAG,
+        "/new"
+    ));
+    // A recognised dialog stops the flow.
+    for (harness, fixture, command) in [
+        (Harness::ClaudeCode, CLAUDE_TRUST, "/clear"),
+        (Harness::Codex, CODEX_WORKTREE, "/new"),
+        (Harness::Codex, CODEX_HOOK_REVIEW, "/new"),
+    ] {
+        assert!(
+            matches!(submit(harness, fixture, command), Step::Stuck(_)),
+            "{harness:?}"
+        );
+    }
+
+    // Synthetic: the rule over plain reads, for what no frame above shows.
+    // Enter needs the exact draft and a positive "no dialog", both.
+    assert_eq!(
+        decide_submit(None, Some(true), &ControlDialog::None),
+        enter()
+    );
+    // A whitespace-only draft with the command pasted after it is not the
+    // command (whitespace_draft_plus_clear_never_gets_enter), and neither is
+    // a draft the adapter can't read.
+    for staged in [Some(false), None] {
+        assert_eq!(
+            decide_submit(None, staged, &ControlDialog::None),
+            NOT_STAGED
+        );
+        assert_eq!(
+            decide_submit(None, staged, &ControlDialog::Unknown),
+            NOT_RECOGNISED
+        );
+    }
+    // A popup with another row selected, a candidate above the selected row or
+    // a selected row without its style stays Unknown in the adapter: no Enter,
+    // whatever the editor row holds.
+    assert_eq!(
+        decide_submit(None, Some(true), &ControlDialog::Unknown),
+        NOT_RECOGNISED
+    );
+    for dialog in [
+        ControlDialog::Blocked,
+        ControlDialog::LaunchSkip {
+            key: ControlKey::Escape,
+        },
+        ControlDialog::CurrentWorktree {
+            selected: true,
+            accept: ControlKey::Enter,
+        },
+    ] {
+        assert!(
+            matches!(decide_submit(None, Some(true), &dialog), Step::Stuck(_)),
+            "{dialog:?}"
+        );
+    }
+    // What the pane itself refuses comes first, and waits.
+    assert_eq!(
+        decide_submit(
+            Some("the pane is focused"),
+            Some(true),
+            &ControlDialog::None
+        ),
+        Step::Wait("the pane is focused")
+    );
+}
+
+#[test]
+fn submit_refuses_focused_or_unknown_focus() {
+    for (harness, fixture, command) in [
+        (Harness::ClaudeCode, CLAUDE_STAGED.to_owned(), "/clear"),
+        (Harness::Pi, pi_staged(), "/new"),
+    ] {
+        let screen = agent_screen(harness).unwrap();
+        let baseline = pinned(name(harness));
+        let staged = unfocused(harness, &fixture);
+        // The twin: nobody is looking at the pane.
+        assert!(submit_allowed(screen, &staged, &baseline, TAG, command));
+        for (focused, reason) in [
+            (Some(true), "the pane is focused"),
+            (None, "whether the pane is focused could not be read"),
+        ] {
+            let frame = staged.clone().with_focus(focused);
+            assert!(!submit_allowed(screen, &frame, &baseline, TAG, command));
+            assert_eq!(
+                submit_step(screen, &frame, &baseline, TAG, command),
+                Step::Wait(reason)
+            );
+        }
+        // And every other reason the pane gives, on the same staged frame.
+        let mut stale = staged.clone();
+        stale.inspection.foreground_command = Some("zsh".into());
+        assert!(!submit_allowed(screen, &stale, &baseline, TAG, command));
+        assert!(!submit_allowed(
+            screen, &staged, &baseline, "p/other", command
+        ));
+        assert!(!submit_allowed(
+            screen,
+            &staged,
+            &PaneBaseline::unproven(),
+            TAG,
+            command
+        ));
+    }
+}
+
+#[test]
+fn codex_noop_needs_all_three() {
+    let read = |harness, fixture| screen(harness, fixture);
+    let codex = policy(Harness::Codex);
+    let fresh = read(Harness::Codex, CODEX_FRESH);
+    // Ready without a session, no session on the pane that could be the
+    // agent's, a fresh safe editor.
+    assert!(clear_noop(codex, false, 0, &fresh));
+    // Each one missing sends the command instead (or refuses, by `clear_refusal`).
+    assert!(!clear_noop(codex, true, 0, &fresh));
+    assert!(!clear_noop(codex, false, 1, &fresh));
+    for fixture in [
+        // A conversation whose hook was missed is not nothing to clear.
+        CODEX_CONVERSATION,
+        CODEX_DRAFT,
+        CODEX_WORKING,
+        CODEX_POPUP,
+        CODEX_WORKTREE,
+    ] {
+        let control = read(Harness::Codex, fixture);
+        assert!(!clear_noop(codex, false, 0, &control), "{control:?}");
+    }
+    assert!(!clear_noop(codex, false, 0, &ControlScreen::default()));
+    // A harness that announces its session at the start has no such case.
+    for (harness, fixture) in [
+        (Harness::ClaudeCode, CLAUDE_CLEARED),
+        (Harness::Pi, PI_FRESH),
+    ] {
+        assert!(!clear_noop(
+            policy(harness),
+            false,
+            0,
+            &read(harness, fixture)
+        ));
+    }
+}
+
+/// A session row on the agent's pane. `start`: `None` for a row no
+/// SessionStart was accepted for, else that start's source.
+fn pane_row(id: &str, harness: Harness, start: Option<Option<&str>>) -> PaneSession {
+    let mut row = atm_core::SessionDomain::new(
+        SessionId::new(id),
+        atm_core::AgentType::GeneralPurpose,
+        atm_core::Model::default(),
+    );
+    row.harness = harness;
+    row.tmux_pane = Some("%1".into());
+    PaneSession {
+        view: atm_core::SessionView::from_domain(&row),
+        pid: Some(4242),
+        start: start.map(|source| AcceptedStart {
+            source: source.map(Into::into),
+        }),
+    }
+}
+
+#[test]
+fn clear_table_changed_session() {
+    let claude = policy(Harness::ClaudeCode);
+    let pi = policy(Harness::Pi);
+    let before = [SessionId::new("old")];
+    let new = SessionId::new("new");
+    let found = |policy, harness: Harness, rows: &[PaneSession]| {
+        cleared_session(policy, harness.short_tag(), rows, &before)
+    };
+    let old = |harness| pane_row("old", harness, Some(Some("startup")));
+    let cleared = |harness| pane_row("new", harness, Some(Some("clear")));
+
+    // Which session a clear produced.
+    let c = Harness::ClaudeCode;
+    assert_eq!(found(claude, c, &[]), Ok(None));
+    assert_eq!(found(claude, c, &[old(c)]), Ok(None));
+    assert_eq!(
+        found(claude, c, &[old(c), cleared(c)]),
+        Ok(Some(new.clone()))
+    );
+    // The old row may leave before or after the new one arrives.
+    assert_eq!(found(claude, c, &[cleared(c)]), Ok(Some(new.clone())));
+    // A row a status line created has had no start; another source is not
+    // this clear's (wrong_Claude_source_rejected).
+    assert_eq!(
+        found(claude, c, &[old(c), pane_row("new", c, None)]),
+        Ok(None)
+    );
+    for source in [Some("startup"), Some("resume"), None] {
+        let row = pane_row("new", c, Some(source));
+        assert_eq!(found(claude, c, &[old(c), row]), Ok(None), "{source:?}");
+    }
+    // The session on the pane before the command is never the result, whatever
+    // it reports later (old_row_never_rebound).
+    assert_eq!(
+        found(claude, c, &[pane_row("old", c, Some(Some("clear")))]),
+        Ok(None)
+    );
+    // Not the agent's: a subagent's row, a pending row, another harness's.
+    let mut child = cleared(c);
+    child.view.parent_session_id = Some(SessionId::new("old"));
+    let pending = pane_row("pending-4242", c, Some(Some("clear")));
+    assert!(pending.view.id.is_pending());
+    let foreign = pane_row("new", Harness::Pi, Some(Some("clear")));
+    assert_eq!(
+        found(claude, c, &[old(c), child, pending, foreign]),
+        Ok(None)
+    );
+    // Two new sessions: nothing says which is the agent's.
+    let other = pane_row("newer", c, Some(Some("clear")));
+    assert!(found(claude, c, &[cleared(c), other]).is_err());
+
+    // pi names no source: any accepted start of a new id, but still a start.
+    let p = Harness::Pi;
+    for source in [Some("new"), Some("startup"), None] {
+        let row = pane_row("new", p, Some(source));
+        assert_eq!(
+            found(pi, p, &[old(p), row]),
+            Ok(Some(new.clone())),
+            "{source:?}"
+        );
+    }
+    assert_eq!(found(pi, p, &[old(p), pane_row("new", p, None)]), Ok(None));
+    // A harness whose clear announces no session never has one to wait for.
+    let x = Harness::Codex;
+    assert_eq!(found(policy(x), x, &[old(x), cleared(x)]), Ok(None));
+
+    // When the clear is done: the session and, with it, a safe editor.
+    let none = ClearProgress::default();
+    for (harness, fresh, conversation, staged) in [
+        (
+            c,
+            CLAUDE_CLEARED,
+            CLAUDE_CONVERSATION,
+            CLAUDE_STAGED.to_owned(),
+        ),
+        (p, PI_FRESH, PI_CONVERSATION, pi_staged()),
+    ] {
+        let policy = policy(harness);
+        let waiting = Step::Wait("the harness has not announced a new session");
+        // editor_before_event_stays_clearing: an empty editor proves nothing.
+        for fixture in [fresh, conversation] {
+            assert_eq!(
+                decide_clear(policy, &screen(harness, fixture), &none, None),
+                waiting,
+                "{harness:?}"
+            );
+        }
+        // event_before_editor_stays_clearing: the command is still in the editor.
+        assert_eq!(
+            decide_clear(policy, &screen(harness, &staged), &none, Some(&new)),
+            Step::Wait("the editor is not empty and idle"),
+            "{harness:?}"
+        );
+        assert_eq!(
+            decide_clear(policy, &screen(harness, fresh), &none, Some(&new)),
+            Step::Ready(Ready::Session(new.clone())),
+            "{harness:?}"
+        );
+    }
+    // pi_retry_empty_idle_not_ready: an empty editor under pi's retry notice.
+    assert_eq!(
+        decide_clear(pi, &screen(p, PI_RETRY), &none, Some(&new)),
+        Step::Wait("the editor is not empty and idle")
+    );
+    // An unread screen is looked at again; a recognised dialog stops the clear.
+    assert_eq!(
+        decide_clear(claude, &screen(c, CLAUDE_MODAL), &none, Some(&new)),
+        NOT_RECOGNISED
+    );
+    assert_eq!(
+        decide_clear(claude, &ControlScreen::default(), &none, Some(&new)),
+        NOT_RECOGNISED
+    );
+    assert_eq!(
+        stuck(Some(&decide_clear(
+            claude,
+            &screen(c, CLAUDE_TRUST),
+            &none,
+            Some(&new)
+        ))),
+        "a dialog opened during the clear"
+    );
+}
+
+#[test]
+fn clear_table_fresh() {
+    let x = Harness::Codex;
+    let codex = policy(x);
+    let none = ClearProgress::default();
+    let step = |fixture, progress: &ClearProgress, session: Option<&SessionId>| {
+        decide_clear(codex, &screen(x, fixture), progress, session)
+    };
+    // Before: the conversation. After: a fresh, safe editor without it.
+    assert_eq!(
+        step(CODEX_CONVERSATION, &none, None),
+        Step::Wait("the conversation is still on screen")
+    );
+    assert_eq!(
+        step(CODEX_WORKING, &none, None),
+        Step::Wait("the conversation is still on screen")
+    );
+    assert_eq!(step(CODEX_FRESH, &none, None), Step::Ready(Ready::Editor));
+    // Never a session: Codex announces the new one with its next prompt, and
+    // a row that is on the pane now is the old conversation's.
+    let row = SessionId::new("old-or-new");
+    assert_eq!(
+        step(CODEX_FRESH, &none, Some(&row)),
+        Step::Ready(Ready::Editor)
+    );
+    // The command still staged, a draft, an unread screen: look again.
+    assert_eq!(step(CODEX_POPUP, &none, None), NOT_RECOGNISED);
+    assert_eq!(
+        step(CODEX_DRAFT, &none, None),
+        Step::Wait("no fresh editor is shown")
+    );
+
+    // exact_worktree_default_only: the worktree choice is answered once, on
+    // the dialog that has the current worktree selected.
+    let worktree = screen(x, CODEX_WORKTREE);
+    assert_eq!(
+        worktree.dialog,
+        ControlDialog::CurrentWorktree {
+            selected: true,
+            accept: ControlKey::Enter
+        }
+    );
+    assert_eq!(
+        step(CODEX_WORKTREE, &none, None),
+        Step::Key {
+            key: PaneKey::Enter,
+            expect: worktree.dialog.clone(),
+            action: KeyAction::KeepWorktree,
+        }
+    );
+    let kept = ClearProgress {
+        worktree_kept: true,
+    };
+    assert_eq!(
+        step(CODEX_WORKTREE, &kept, None),
+        Step::Wait("the worktree choice is still shown after it was answered")
+    );
+    assert_eq!(step(CODEX_FRESH, &kept, None), Step::Ready(Ready::Editor));
+    // Synthetic: the same dialog with another option selected, and with a key
+    // the control actor has no route for.
+    let mut other = worktree.clone();
+    other.dialog = ControlDialog::CurrentWorktree {
+        selected: false,
+        accept: ControlKey::Enter,
+    };
+    assert_eq!(
+        stuck(Some(&decide_clear(codex, &other, &none, None))),
+        "the harness asks which worktree to use and the current one is not selected"
+    );
+    other.dialog = ControlDialog::CurrentWorktree {
+        selected: true,
+        accept: ControlKey::Character('y'),
+    };
+    assert!(matches!(
+        decide_clear(codex, &other, &none, None),
+        Step::Stuck(_)
+    ));
+    // Any other recognised dialog stops the clear.
+    assert_eq!(
+        stuck(Some(&step(CODEX_HOOK_REVIEW, &none, None))),
+        "a dialog opened during the clear"
+    );
+}

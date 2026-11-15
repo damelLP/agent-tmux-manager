@@ -444,7 +444,9 @@ impl MessageHistory {
     ) -> RecipientLiveView {
         let mut live = RecipientLiveView::new(message, agent, std::iter::empty());
         if let Some(history) = history {
-            live.agent_not_ready_since = history.not_ready_since;
+            live.agent_not_ready_since = history
+                .not_ready_since
+                .map(|since| since.max(self.recovery_time));
             live.running_turn_since = history.running_turn_since;
             live.pane = history.pane;
             live.input_line = history.input;

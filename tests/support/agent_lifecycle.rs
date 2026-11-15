@@ -256,6 +256,9 @@ impl AgentRig {
         row
     }
 
+    /// Best-effort input-effect check, paired with a before/after styled screen
+    /// comparison. The event-socket barrier does not order queued pty input,
+    /// and the journal cannot detect keys the stand-in ignores.
     pub fn assert_no_input_since(&self, pane: &StandInPane, after: u64) {
         self.rig.control(pane, json!({"command": "barrier"}));
         for event in self

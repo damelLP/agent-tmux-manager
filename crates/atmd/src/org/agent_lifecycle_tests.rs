@@ -1094,6 +1094,199 @@ async fn adopt_tag_refused_before_any_effect_does_not_quarantine() {
     assert!(!quarantined(&adoption.rig, "q/lead").await);
 }
 
+#[test]
+fn only_a_before_effect_error_clears_the_effect_flag() {
+    use crate::org::agent_lifecycle::{changed, Effect};
+    use crate::control::reservation::{ExpectedTag, ReservationError as E};
+    use crate::control::ControlError as C;
+    use std::sync::atomic::Ordering;
+    // What `ReservationError` documents for a general pane operation. No
+    // wildcard arm on the outer match: a new variant needs a row here.
+    fn before_effect(error: &E) -> bool {
+        match error {
+            E::NotImplemented { .. }
+            | E::Busy { .. }
+            | E::StaleReservation
+            | E::ScreenChanged { .. }
+            | E::PacingRefused { .. }
+            | E::PaneInputRefused { .. }
+            | E::UnsafePaste { .. }
+            | E::TagMismatch { .. }
+            | E::PaneGone { .. }
+            | E::InvalidObservation { .. }
+            | E::Quarantined { .. } => true,
+            E::InvalidRequest { .. } | E::Unavailable | E::Timeout => false,
+            E::Control(C::SendRefused { .. }) => true,
+            E::Control(
+                C::NoSession { .. }
+                | C::NoPane { .. }
+                | C::AmbiguousTarget { .. }
+                | C::AgentClearing { .. }
+                | C::PaneQuarantined { .. }
+                | C::OrganisationUnavailable { .. }
+                | C::Tmux { .. },
+            ) => false,
+        }
+    }
+    let p = || pane("%1");
+    let s = || "%1".to_owned();
+    let errors = || {
+        vec![
+            E::NotImplemented { operation: "x" },
+            E::InvalidRequest { reason: "x".into() },
+            E::Busy {
+                agent: lead(),
+                pane: Some(p()),
+            },
+            E::StaleReservation,
+            E::ScreenChanged { pane: p() },
+            E::PacingRefused { pane: p() },
+            E::PaneInputRefused {
+                pane: p(),
+                reason: "x",
+            },
+            E::UnsafePaste { pane: p() },
+            E::TagMismatch {
+                pane: p(),
+                expected: ExpectedTag::Absent,
+                actual: None,
+            },
+            E::PaneGone { pane: p() },
+            E::InvalidObservation {
+                pane: p(),
+                reason: "x".into(),
+            },
+            E::Quarantined {
+                agent: lead(),
+                pane: None,
+            },
+            E::Unavailable,
+            E::Timeout,
+            E::Control(C::SendRefused {
+                pane: s(),
+                reason: "x",
+            }),
+            E::Control(C::NoSession { target: s() }),
+            E::Control(C::NoPane { session: s() }),
+            E::Control(C::AmbiguousTarget {
+                target: s(),
+                count: 2,
+                ids: s(),
+            }),
+            E::Control(C::AgentClearing {
+                pane: s(),
+                agent: lead(),
+            }),
+            E::Control(C::PaneQuarantined {
+                pane: s(),
+                agent: lead(),
+            }),
+            E::Control(C::OrganisationUnavailable { pane: s() }),
+            E::Control(C::Tmux {
+                context: "x".into(),
+                source: atm_tmux::TmuxError::ParseError("x".into()),
+            }),
+        ]
+    };
+    assert_eq!(errors().len(), 22, "one of each variant");
+    for error in errors() {
+        let (label, expected) = (format!("{error:?}"), !before_effect(&error));
+        // The flow sets the flag before its call.
+        let effect = Effect::default();
+        effect.store(true, Ordering::SeqCst);
+        assert!(changed(&effect, Err(error)).is_err());
+        assert_eq!(effect.load(Ordering::SeqCst), expected, "{label}");
+    }
+    // A call that succeeded changed the pane.
+    let effect = Effect::default();
+    effect.store(true, Ordering::SeqCst);
+    assert!(changed(&effect, Ok(())).is_ok());
+    assert!(effect.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn pane_effect_whose_call_outlives_the_deadline_quarantines() {
+    // Review 22, probe v06. tmux performs the kill (or removes the tag) and
+    // its call does not return before the down's deadline: the work is
+    // stopped with the effect made and no Down recorded, so the reservation
+    // must not be released. Twins (refused before any effect, released):
+    // down_refused_before_any_effect_does_not_quarantine.
+    use crate::control::reservation::ReservationError;
+    for (kill, effect) in [
+        (true, "kill %1"),
+        (false, "set-option -p -u -t %1 @atm-agent"),
+    ] {
+        let (rig, agents) = ready_agent().await;
+        rig.inspect_only("%1", "p/lead");
+        rig.client
+            .script_tag_check(&tagged("%1", Some("p/lead")))
+            .unwrap();
+        rig.client.stall_pane_effects(true);
+        let result = down(&agents, kill).await;
+        assert!(
+            matches!(
+                result,
+                Err(AgentError::Reservation(ReservationError::Timeout))
+            ),
+            "{kill}: {result:?}"
+        );
+        assert_eq!(mutations(&rig), [effect]);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert!(quarantined(&rig, "p/lead").await, "{kill}");
+    }
+}
+
+#[tokio::test]
+async fn adopt_tag_whose_call_outlives_the_deadline_quarantines() {
+    // The same for an adopt: tmux sets the tag and its call does not return.
+    // The pane carries a tag with no adoption recorded. Twin:
+    // adopt_tag_refused_before_any_effect_does_not_quarantine.
+    //
+    // An adopt reads its project from the filesystem, which a paused clock
+    // would time out. So the clock is paused once tmux has the tag write:
+    // from there only the deadline is left, and virtual time reaches it.
+    use crate::control::reservation::ReservationError;
+    let adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    let untagged = Adoption::inspection(None, "pi", "");
+    adoption
+        .rig
+        .client
+        .script_inspect(&pane("%1"), Some(&untagged))
+        .unwrap();
+    adoption.rig.client.script_tag_check(&untagged).unwrap();
+    adoption.rig.client.stall_pane_effects(true);
+    let (agents, project_root) = (adoption.agents.clone(), adoption.project.path().join("q"));
+    let call = tokio::spawn(async move {
+        agents
+            .adopt(AdoptParams {
+                project_root,
+                name: "lead".into(),
+                pane: "%1".into(),
+                caller_server: None,
+            })
+            .await
+    });
+    while mutations(&adoption.rig).is_empty() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    let result = call.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(ReservationError::Timeout))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        mutations(&adoption.rig),
+        ["set-option -p -t %1 @atm-agent q/lead"]
+    );
+    assert!(adoption.agent().await.is_none());
+    assert!(quarantined(&adoption.rig, "q/lead").await);
+}
+
 /// `q/lead` with a pi role, recorded on %1 before the service starts: Up and
 /// PaneCreated, then `more`. Its project is registered at the directory an
 /// adopt names, so the adopt finds this agent.

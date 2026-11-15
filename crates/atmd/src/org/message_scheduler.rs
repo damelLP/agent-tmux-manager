@@ -16,10 +16,26 @@
 //! permit and no reservation. The owner's decisions wait per recipient, at
 //! most as many as the service admits requests.
 //!
+//! Known limit of that bound: a job lives while its recipient has an open
+//! message, and a held message (blocked, waiting for the owner, or for a
+//! recipient that cannot be observed) keeps it. With 32 recipients each
+//! holding one, a 33rd recipient is not observed, its messages show no
+//! reason, and the owner's give-up or retry for it answers `Timeout` although
+//! nothing was started.
+//!
 //! Every step is evaluated on evidence copied immediately before it. An
 //! error is never permission: no step, no input, and the round is tried again
 //! later. After an attempt whose outcome cannot be accounted for, the job
 //! decides nothing for its recipient until it can.
+//!
+//! A recipient that cannot be observed (the observer failed or timed out, or
+//! history refused what it returned) is not a focused pane. While that lasts,
+//! the inbox shows "recipient cannot be observed" where the policy answers
+//! its unbounded focus wait, and once it has lasted the policy's readiness
+//! timeout the owner gets one notice per loss, for the oldest open message.
+//! Nothing is held: the message stays queued and is delivered when an
+//! observation returns. An observation that succeeded with an unknown focus
+//! is no loss; it waits as the next paragraph says.
 //!
 //! Notices go to the owner's inbox once per message and reason while the
 //! message is open, after the state that caused them is applied. A focus
@@ -42,7 +58,9 @@ use super::OrgServiceError;
 use crate::{control::reservation::PaneId, eventlog::Envelope};
 use atm_core::ScreenFacts;
 use atm_org::{
-    delivery::{busy_notice_due, next_delivery, DeliveryStep, FailureReason, WaitReason},
+    delivery::{
+        busy_notice_due, next_delivery, DeliveryStep, FailureReason, WaitReason, BUSY_NOTICE_AFTER,
+    },
     Agent, AgentId, DeliveryReceipt, OrgCommand,
 };
 use std::{
@@ -64,6 +82,9 @@ pub(super) const MAX_JOBS: usize = 32;
 const ERROR_BACKOFF: Duration = Duration::from_secs(30);
 /// One observation of a recipient; a slower one counts as lost.
 const OBSERVE_BUDGET: Duration = Duration::from_secs(5);
+/// What the inbox shows, in place of the policy's unbounded focus wait, while
+/// a recipient cannot be observed: nobody knows where the owner is.
+const UNOBSERVED: &str = "recipient cannot be observed";
 /// One write of the job's own and its fold: 6 s organisation execute and the
 /// 4 s fold margin of the resolution budget (see `message_delivery`).
 const COMMIT_BUDGET: Duration = Duration::from_secs(10);
@@ -382,6 +403,18 @@ fn blocked_notice(id: MessageId, reason: &str, behind: &[MessageId], latched: bo
     format!("{id} blocked: {reason}; waiting behind it: {behind}. {advice}")
 }
 
+/// The owner's notice for a recipient that could not be observed for the
+/// policy's readiness timeout, in the blocked notice's form. Nothing is held:
+/// the message stays queued.
+fn unobserved_notice(id: MessageId, recipient: &AgentId, lasted: Duration) -> String {
+    format!(
+        "{id} waiting: recipient {recipient} could not be observed for {} s. \
+         It stays queued and is delivered when the pane can be read again; \
+         atm msg give-up {id} cancels it",
+        lasted.as_secs()
+    )
+}
+
 fn note(body: String) -> MessageContent {
     MessageContent {
         from: Address::System,
@@ -404,6 +437,13 @@ struct Unaccounted {
     error: Option<(String, bool)>,
 }
 
+/// A span in which no observation of the recipient was usable.
+struct Lost {
+    since: Instant,
+    /// The message whose notice tells the owner about this loss.
+    told: Option<MessageId>,
+}
+
 struct Job {
     service: Arc<Service>,
     effects: Effects,
@@ -411,6 +451,8 @@ struct Job {
     observed: Option<Instant>,
     /// The last recorded observation's focus sample; None when it was lost.
     focused: Option<bool>,
+    /// Set while the last observation failed or was refused.
+    lost: Option<Lost>,
     unaccounted: Option<Unaccounted>,
     /// No attempt before this instant: the last one could not start.
     not_before: Option<Instant>,
@@ -426,6 +468,7 @@ impl Job {
             recipient,
             observed: None,
             focused: None,
+            lost: None,
             unaccounted: None,
             not_before: None,
             shown: BTreeSet::new(),
@@ -565,6 +608,7 @@ impl Job {
             // Said positively, so that the agent's applied status decides,
             // not the unknown focus of a pane that does not exist.
             self.focused = Some(false);
+            self.lost = None;
             let observation = RecipientObservation {
                 pane: None,
                 session: None,
@@ -597,7 +641,10 @@ impl Job {
             rt.history.record(update, now).map(|()| focused)
         });
         match recorded {
-            Ok(focused) => self.focused = focused,
+            Ok(focused) => {
+                self.focused = focused;
+                self.lost = None;
+            }
             Err(error) => {
                 // A failed or mismatched observation proves nothing: it is a
                 // loss of continuity, never a dead pane. A recipient history
@@ -605,6 +652,8 @@ impl Job {
                 // cannot take the loss fails the step that follows.
                 tracing::debug!(%recipient, %error, "Recipient observation lost");
                 self.focused = None;
+                let since = Instant::now();
+                (self.lost).get_or_insert(Lost { since, told: None });
                 let _ = (rt.history).record(HistoryUpdate::ObservationLost { recipient }, now);
             }
         }
@@ -654,20 +703,27 @@ impl Job {
                 Err(error) => return Err(error),
             }
         }
-        service
-            .board
-            .track_busy_turn(id, snapshot.live.running_turn_since);
         let poll = Instant::now() + rt.policy.settings().guard_poll_interval;
         match step {
             // Delivered while this round ran. Its fold, which this job has
             // yet to see, removes it from the open messages.
             DeliveryStep::Complete => Ok(Next::Change),
+            // Without an observation the policy's unbounded focus wait says
+            // nothing about the owner.
+            DeliveryStep::Wait {
+                until,
+                reason: WaitReason::OwnerFocused,
+            } if self.lost.is_some() => self.unobserved(&snapshot, until).await,
             DeliveryStep::Wait { until, reason } => {
+                service
+                    .board
+                    .track_busy_turn(id, snapshot.live.running_turn_since);
                 self.show(id, DeliveryPhase::Waiting, Some(reason.to_string()), None);
                 if busy_notice_due(&snapshot.message, &snapshot.live, now) {
                     let body = format!(
-                        "{} busy for 30 min; message still queued ({id})",
-                        snapshot.recipient.id
+                        "{} busy for {} min; message still queued ({id})",
+                        snapshot.recipient.id,
+                        BUSY_NOTICE_AFTER.as_secs() / 60
                     );
                     self.publish(id, BUSY_NOTICE_REASON, note(body)).await;
                 }
@@ -719,6 +775,9 @@ impl Job {
                     })
                     .await?;
                 if !failed.is_empty() {
+                    // On the board from here on, so that its notice key is
+                    // forgotten with it.
+                    self.shown.insert(id);
                     let body =
                         format!("{id} failed: {reason}. Send it again if it is still needed");
                     self.publish(id, &format!("failed: {reason}"), note(body))
@@ -759,8 +818,13 @@ impl Job {
     ) -> Result<Next, MessageError> {
         let service = self.service.clone();
         let snapshot = service.rt.history.snapshot(id, now)?;
-        if snapshot.message.status == DeliveryStatus::Delivered {
-            // Delivered and acknowledged while this round ran.
+        if matches!(
+            snapshot.message.status,
+            DeliveryStatus::Delivered | DeliveryStatus::Failed
+        ) {
+            // Settled while this round ran: delivered and acknowledged, or
+            // failed for good and forgotten. Expecting it again would hold
+            // its reference for ever.
             return Ok(Next::Change);
         }
         let Err(error) = service.rt.evidence.register(id, inbox_reference(id)) else {
@@ -772,6 +836,36 @@ impl Job {
             self.blocked_notice(id, &text, false).await;
         }
         Ok(Next::At(Instant::now() + ERROR_BACKOFF))
+    }
+
+    /// The policy waits for a focus nobody could sample: the recipient cannot
+    /// be observed. The inbox says that, and once the loss has lasted the
+    /// policy's readiness timeout the owner is told, once per loss and for
+    /// the oldest open message only. Nothing is held and nothing is pasted:
+    /// the message stays queued until an observation returns.
+    async fn unobserved(
+        &mut self,
+        snapshot: &DeliverySnapshot,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Next, MessageError> {
+        let id = snapshot.message.id;
+        self.show(id, DeliveryPhase::Waiting, Some(UNOBSERVED.into()), None);
+        let service = self.service.clone();
+        let wake = service.rt.clock.deadline(until)?;
+        let timeout = service.rt.policy.settings().readiness_timeout;
+        let Some(lost) = &mut self.lost else {
+            return Ok(Next::At(wake));
+        };
+        let lasted = lost.since.elapsed();
+        if lasted < timeout {
+            // No observation arrives to wake the job for this.
+            return Ok(Next::At(wake.min(Instant::now() + (timeout - lasted))));
+        }
+        if snapshot.blocked_by.is_none() && *lost.told.get_or_insert(id) == id {
+            let body = unobserved_notice(id, &self.recipient, timeout);
+            self.publish(id, UNOBSERVED, note(body)).await;
+        }
+        Ok(Next::At(wake))
     }
 
     /// Persist a receipt as Delivered and wait for its fold; the caller then

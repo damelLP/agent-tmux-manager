@@ -308,14 +308,26 @@ pub(super) fn launch_text_is_safe(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| matches!(c, ' '..='~'))
 }
 
+/// The terminal cells one character takes, when that is certain: one or two.
+/// `None` for a control character and for a character without a cell of its
+/// own (a combining mark, a joiner, a variation selector): terminals lay
+/// those out differently, and nothing here guesses.
+fn cells(c: char) -> Option<usize> {
+    unicode_width::UnicodeWidthChar::width(c).filter(|cells| (1..=2).contains(cells))
+}
+
 /// The cells before the cursor on the cursor's logical line: the cursor's row
 /// up to the cursor, joined upward with every row that fills the pane's width
-/// (a wrapped line). Cells at or after the cursor are ignored: a shell leaves
-/// stale cells and suggestions there.
+/// (a wrapped line, or a row its shell filled: the join is not a proof of a
+/// wrap, only the same reading before and after a paste). Cells at or after
+/// the cursor are ignored: a shell leaves stale cells, suggestions and a
+/// right-hand prompt there.
 ///
-/// `None` when the line can't be read exactly: an undecodable capture, a
-/// cursor outside it, or a character before the cursor whose cell width is
-/// not certainly one (anything but printable ASCII).
+/// A capture holds one character per glyph, so the cut is made by cell widths
+/// and must agree with the cursor column tmux reports. `None` when the line
+/// can't be read exactly: an undecodable capture, a cursor outside it, a
+/// character before the cursor without a certain width, a cursor column that
+/// falls inside a character, or a row with more cells than the pane is wide.
 #[must_use]
 pub(super) fn launch_line(capture: &PaneCapture) -> Option<String> {
     let decoded;
@@ -335,21 +347,33 @@ pub(super) fn launch_line(capture: &PaneCapture) -> Option<String> {
     }
     // A cursor column equal to the width is the end of that row (dash leaves
     // it there after an exact fit; bash and zsh move to the next row).
-    let mut line: String = rows.get(row)?.chars().take(column).collect();
-    if !launch_text_is_safe(&line) && !line.is_empty() {
+    let cursor_row = rows.get(row)?;
+    let mut line = String::new();
+    let mut before = 0;
+    for c in cursor_row.chars() {
+        if before >= column {
+            break;
+        }
+        before += cells(c)?;
+        line.push(c);
+    }
+    let all: Option<usize> = cursor_row.chars().map(cells).sum();
+    if before > column || all.is_some_and(|all| all > width) {
         return None;
     }
     // Cells never written before the cursor are blank.
-    while line.len() < column {
-        line.push(' ');
-    }
+    line.extend(std::iter::repeat_n(' ', column - before));
     for above in rows.get(..row)?.iter().rev() {
-        let ascii = above.chars().filter(|c| matches!(c, ' '..='~')).count();
-        let other = above.chars().count() - ascii;
-        if other == 0 && ascii == width {
+        // The row's cells, at least and at most: a character without a
+        // certain width may take none or two.
+        let (mut least, mut most) = (0, 0);
+        for c in above.chars() {
+            least += cells(c).unwrap_or(0);
+            most += cells(c).unwrap_or(2);
+        }
+        if least == width && most == width {
             line.insert_str(0, above);
-        } else if ascii + 2 * other < width {
-            // Too short to fill the row whatever its characters' widths are.
+        } else if most < width {
             break;
         } else {
             return None;

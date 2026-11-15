@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::super::{
-    message_evidence::AttemptScope,
+    message_evidence::{AttemptScope, MAX_MESSAGES},
     message_history::{EffectCertainty, PanePresence, SessionObservation},
     message_service_tests::{
         code, empty_editor, guarded, other, owner, page, pane, until, utc, worker, Rig,
@@ -556,6 +556,27 @@ impl Drop for ManualJob {
 }
 
 #[tokio::test(start_paused = true)]
+async fn first_terminal_evaluation_does_not_retain_busy_turn_bookkeeping() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    guarded(rig.job.observe()).await.unwrap();
+    // Model a terminal commit racing the first evaluation after observation.
+    rig.command(OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: "owner cancelled".into(),
+        final_failure: true,
+    })
+    .await;
+    let mut queued = rig.job.service.board.queued.subscribe();
+    let next = guarded(rig.job.step(id, &mut queued)).await.unwrap();
+    assert!(matches!(next, Next::Change));
+    assert!(!rig.job.shown.contains(&id));
+    let shared = rig.job.service.board.shared.lock().unwrap();
+    assert!(!shared.busy_turn.contains_key(&id));
+}
+
+#[tokio::test(start_paused = true)]
 async fn running_turn_notice_at_30_minutes_once() {
     let mut rig = ManualJob::new().await;
     rig.turn(atm_core::TurnState::Running);
@@ -949,30 +970,179 @@ async fn owner_message_starts_no_job() {
     assert!(bench.screens.observed().is_empty());
 }
 
-#[tokio::test(start_paused = true)]
-async fn lost_observation_waits_without_a_notice_and_never_pastes() {
-    let mut bench = Bench::blind().await;
-    let id = bench.send(worker(), "brief").await;
-    bench.pass(600).await;
-    assert!(bench.entries().is_empty());
-    assert!(bench.screens.calls(&worker()) > 0);
+const UNOBSERVED_REASON: &str = "recipient cannot be observed";
+
+/// The pinned text of the one notice for a recipient nobody could observe.
+fn unobserved(id: MessageId) -> String {
+    format!(
+        "{id} waiting: recipient demo/worker could not be observed for 120 s. \
+         It stays queued and is delivered when the pane can be read again; \
+         atm msg give-up {id} cancels it"
+    )
+}
+
+async fn waits_unobserved(bench: &Bench, id: MessageId) {
     let view = bench.entry(worker(), id).await;
     assert_eq!(view.status, DeliveryStatus::Queued);
     assert_eq!(view.delivery.phase, DeliveryPhase::Waiting);
-    // The policy treats an unknown focus as focused; the owner is not told
-    // they are on a pane nobody could look at.
-    assert_eq!(
-        view.delivery.reason.as_deref(),
-        Some("owner is focused on this pane")
-    );
+    assert_eq!(view.delivery.reason.as_deref(), Some(UNOBSERVED_REASON));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unobservable_recipient_says_so_tells_the_owner_once_and_never_pastes() {
+    let mut bench = Bench::blind().await;
+    let id = bench.send(worker(), "brief").await;
+    // At once: nobody knows where the owner is, and the inbox does not
+    // claim it.
+    bench.pass(1).await;
+    assert!(bench.screens.calls(&worker()) > 0);
+    waits_unobserved(&bench, id).await;
+    // Nothing is told before the loss has lasted the readiness timeout,
+    bench.pass(118).await;
     assert!(bench.notes().await.is_empty());
-    // The same for a pane that was read, with a focus that could not be.
+    // one notice at it, by the job's own wake,
+    bench.pass(2).await;
+    assert_eq!(bench.notes().await, [unobserved(id)]);
+    // and none after that. The message only waits: nothing is held.
+    bench.pass(3600).await;
+    assert_eq!(bench.notes().await.len(), 1);
+    waits_unobserved(&bench, id).await;
+    assert_eq!(code(bench.retry(id).await.unwrap_err()), "conflict");
+    assert!(bench.committed().iter().all(|e| failed(e).is_none()));
+    // A pane that was read, with a focus that could not be, is no loss: the
+    // policy waits as for a focused pane, and the owner is not told they are
+    // on it.
     bench
         .screens
         .set(worker(), with(ready("%1", "s1"), |o| o.focused = None));
     bench.pass(600).await;
+    assert_eq!(
+        bench.entry(worker(), id).await.delivery.reason.as_deref(),
+        Some("owner is focused on this pane")
+    );
+    assert_eq!(bench.notes().await.len(), 1);
     assert!(bench.entries().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_unobserved_notice_for_the_oldest_open_message() {
+    let bench = Bench::blind().await;
+    let first = bench.send(worker(), "first").await;
+    let second = bench.send(worker(), "second").await;
+    bench.pass(3600).await;
+    assert_eq!(bench.notes().await, [unobserved(first)]);
+    for id in [first, second] {
+        waits_unobserved(&bench, id).await;
+    }
+    // The owner gives up on it. The loss is the same one: the next message
+    // waits on, and the owner is not told again.
+    assert_eq!(bench.give_up(first).await.unwrap(), DeliveryStatus::Failed);
+    bench.pass(3600).await;
+    assert_eq!(bench.notes().await.len(), 1);
+    waits_unobserved(&bench, second).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn unobserved_notice_is_not_for_a_message_behind_a_held_one() {
+    let mut bench = Bench::new().await;
+    let held = bench.probably_delivered().await;
+    // A guard poll later the pane can no longer be read, and a message
+    // arrives: the job looks again and finds nothing.
+    bench.screens.lose(&worker());
+    bench.pass(1).await;
+    let behind = bench.send(worker(), "behind it").await;
+    bench.pass(3600).await;
+    // The owner has the held message's notice; the loss adds none for the
+    // message that waits behind it.
+    assert_eq!(
+        bench.notes().await,
+        [blocked_notice(held, PROBABLY, &[], true)]
+    );
+    waits_unobserved(&bench, behind).await;
+    assert_eq!(bench.entries(), []);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agent_without_a_pane_ends_the_loss() {
+    let bench = Bench::blind().await;
+    let id = bench.send(worker(), "brief").await;
+    bench.pass(100).await;
+    // Down, so without a pane: that is known about the recipient, not lost.
+    bench
+        .rig
+        .run(OrgCommand::Down {
+            agent_id: worker(),
+            reason: "stopped".into(),
+        })
+        .await;
+    bench.pass(100).await;
+    let down = blocked_notice(id, "recipient agent is stuck or down", &[], false);
+    assert_eq!(bench.notes().await, std::slice::from_ref(&down));
+    // Back on a pane nobody can read: a new loss, counted from here.
+    bench
+        .rig
+        .run(OrgCommand::Adopt {
+            agent_id: worker(),
+            pane: "%5".into(),
+            session_id: Some("s5".into()),
+        })
+        .await;
+    bench.pass(119).await;
+    assert_eq!(bench.notes().await.len(), 1);
+    bench.pass(2).await;
+    assert_eq!(bench.notes().await, [down, unobserved(id)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn observation_back_before_the_timeout_tells_nothing_and_delivers() {
+    let mut bench = Bench::blind().await;
+    bench.script(Act::Deliver);
+    let id = bench.send(worker(), "brief").await;
+    bench.pass(60).await;
+    waits_unobserved(&bench, id).await;
+    // The pane can be read again, and the policy has a reason of its own.
+    let scrolling = with(ready("%1", "s1"), |o| o.copy_mode = Some(true));
+    bench.screens.set(worker(), scrolling);
+    bench.pass(70).await;
+    assert_eq!(
+        bench.entry(worker(), id).await.delivery.reason.as_deref(),
+        Some("pane is in copy mode")
+    );
     assert!(bench.notes().await.is_empty());
+    bench.screens.set(worker(), ready("%1", "s1"));
+    assert_eq!(bench.entered().await, id);
+    bench.event("delivered", |e| delivered(e) == Some(id)).await;
+    assert!(bench.notes().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn observation_back_after_the_notice_delivers() {
+    let mut bench = Bench::blind().await;
+    bench.script(Act::Deliver);
+    let id = bench.send(worker(), "brief").await;
+    bench.pass(121).await;
+    assert_eq!(bench.notes().await, [unobserved(id)]);
+    bench.screens.set(worker(), ready("%1", "s1"));
+    assert_eq!(bench.entered().await, id);
+    bench.event("delivered", |e| delivered(e) == Some(id)).await;
+    assert_eq!(bench.notes().await.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn observation_of_another_pane_or_session_is_a_loss() {
+    for elsewhere in [ready("%9", "s1"), ready("%1", "someone-else")] {
+        let mut bench = Bench::blind().await;
+        // History refuses it: it says nothing about this recipient.
+        bench.screens.set(worker(), elsewhere);
+        let id = bench.send(worker(), "brief").await;
+        bench.pass(1).await;
+        waits_unobserved(&bench, id).await;
+        bench.pass(118).await;
+        assert!(bench.notes().await.is_empty());
+        bench.pass(3600).await;
+        assert_eq!(bench.notes().await, [unobserved(id)]);
+        assert!(bench.entries().is_empty());
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -1090,6 +1260,29 @@ async fn final_failure_outside_an_attempt_tells_the_owner() {
         bench.entry(worker(), id).await.status,
         DeliveryStatus::Failed
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_on_the_first_evaluation_leaves_no_notice_key() {
+    let bench = Bench::blind().await;
+    let gone = with(ready("%1", "s1"), |o| o.presence = PanePresence::Gone);
+    bench.screens.set(worker(), gone);
+    bench.send(worker(), "brief").await;
+    bench.pass(120).await;
+    // The pane has been gone for longer than the grace: the next message
+    // fails on its first evaluation, before anything was shown for it.
+    let next = bench.send(worker(), "next").await;
+    bench.pass(120).await;
+    assert_eq!(
+        bench.entry(worker(), next).await.status,
+        DeliveryStatus::Failed
+    );
+    assert_eq!(bench.notes().await.len(), 2);
+    // Both are told and gone: the board keeps nothing about either.
+    let service = bench.rig.messages.service().unwrap();
+    let shared = service.board.shared.lock().unwrap();
+    assert!(shared.noticed.is_empty(), "{:?}", shared.noticed);
+    assert!(shared.progress.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1716,6 +1909,30 @@ async fn message_without_evidence_is_blocked_until_evidence_has_room() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn given_up_unattempted_messages_hold_no_evidence_reference() {
+    let mut bench = Bench::blind().await;
+    // One more message than evidence has references, each given up before
+    // any attempt: nothing could ever confirm one of them.
+    let mut failed = Vec::new();
+    for _ in 0..=MAX_MESSAGES {
+        let id = bench.send(worker(), "never attempted").await;
+        assert_eq!(bench.give_up(id).await.unwrap(), DeliveryStatus::Failed);
+        failed.push(id);
+    }
+    let evidence = bench.rig.rt.evidence.clone();
+    assert!(failed.iter().all(|id| evidence.snapshot(*id).is_err()));
+    // The fill outran the bench's event buffer; read from here on.
+    bench.events = bench.events.resubscribe();
+    // So a new message to a ready agent is expected, attempted and delivered.
+    bench.script(Act::Deliver);
+    bench.screens.set(other(), ready("%2", "s2"));
+    let id = bench.send(other(), "brief").await;
+    assert_eq!(bench.entered().await, id);
+    bench.event("delivered", |e| delivered(e) == Some(id)).await;
+    assert!(bench.notes().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn step_on_a_message_delivered_meanwhile_evaluates_again() {
     let mut bench = Bench::blind().await;
     let service = bench.rig.messages.service().unwrap();
@@ -1750,6 +1967,31 @@ async fn step_on_a_message_delivered_meanwhile_evaluates_again() {
     let step = job.step(acknowledged, &mut queued).await;
     assert!(matches!(step, Ok(Next::Change)));
     assert!(bench.rig.rt.evidence.snapshot(acknowledged).is_err());
+    assert!(bench.notes().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn step_on_a_message_failed_meanwhile_registers_nothing() {
+    let bench = Bench::blind().await;
+    let service = bench.rig.messages.service().unwrap();
+    let effects = Effects {
+        deliver: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+        observe: bench.screens.effect(),
+    };
+    let mut queued = service.board.queued.subscribe();
+    let mut job = Job::new(service.clone(), effects, worker());
+    // A wake raced the final failure's fold: the job still holds the ID as
+    // open, while history has it failed and evidence has dropped it.
+    let id = bench.send(worker(), "given up").await;
+    assert_eq!(bench.give_up(id).await.unwrap(), DeliveryStatus::Failed);
+    assert!(bench.rig.rt.evidence.snapshot(id).is_err());
+    let step = job.step(id, &mut queued).await;
+    assert!(
+        matches!(step, Ok(Next::Change)),
+        "a failed message is no error"
+    );
+    // The step must not expect it again: nothing would ever forget it.
+    assert!(bench.rig.rt.evidence.snapshot(id).is_err());
     assert!(bench.notes().await.is_empty());
 }
 

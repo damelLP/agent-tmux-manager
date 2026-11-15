@@ -32,9 +32,14 @@
 //! (a poisoned lock, a clock outside its range, an Activity that history could
 //! not retain) disables evidence for everyone, which blocks input and retries.
 //!
-//! Known limit: nothing evicts the scopes of a finally failed message, since a
-//! late receipt may still confirm it. A daemon that retains 16384 scopes
-//! refuses new arms until it restarts; retained receipts keep working.
+//! Known limit: nothing evicts a finally failed message that was attempted,
+//! since a late receipt may still confirm it. Such a message keeps its
+//! reference and its scopes; one that failed without a scope keeps nothing.
+//! After 4096 attempted-and-failed messages in one log, new messages to agents
+//! are refused ("message evidence reference capacity exhausted") until the log
+//! is replaced. A restart does not clear it: each start expects the last
+//! attempt of every such message again, where its scope can be rebuilt.
+//! Retained receipts keep working.
 //!
 //! Lock order: evidence, then history. The tap stamps an event's receive time
 //! and forwards its Activity to history under one evidence lock acquisition, so
@@ -79,7 +84,12 @@ pub struct AttemptEvidence {
     pub probably_landed: bool,
 }
 
-const MAX_MESSAGES: usize = 4096;
+/// References: one for each open message, and one for each finally failed
+/// message that still has a scope. The second kind is never evicted, so it
+/// bounds the attempted-and-failed messages of one log (see the module docs).
+pub(super) const MAX_MESSAGES: usize = 4096;
+/// Scopes over all references. A full store refuses the next arm, and with it
+/// the attempt; it empties only as receipts are acknowledged.
 const MAX_SCOPES: usize = 16384;
 /// Bounds one scope's excluded baseline, not the sessions the daemon sees.
 const MAX_SESSIONS: usize = 4096;
@@ -332,6 +342,17 @@ impl MessageEvidence {
             state.messages.remove(&id);
         }
         Ok(())
+    }
+
+    /// A message that failed for good and has no scope can never be confirmed,
+    /// so its reference buys nothing: forget it. With a scope it stays, for a
+    /// late receipt.
+    pub(crate) fn forget_unscoped(&self, id: MessageId) {
+        if let Ok(mut state) = self.state() {
+            if (state.messages.get(&id)).is_some_and(|entry| entry.scopes.is_empty()) {
+                state.messages.remove(&id);
+            }
+        }
     }
 
     /// Only the tap's accepted original parent identity may enter here.

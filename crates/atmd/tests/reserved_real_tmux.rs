@@ -685,7 +685,8 @@ s.recv(1)
         atmd::org::OrgHandle::disabled("literal smoke"),
         cancel.clone(),
     );
-    // Use the real daemon's shared control service, without adding a wire endpoint.
+    // Exercise the real control actor and RealTmuxClient on private tmux;
+    // calls use ControlHandle directly, so nothing travels over the daemon socket.
     let mut services = atmd::server::methods::MethodServices::new(registry);
     services.control = Some(control.clone());
     let daemon =

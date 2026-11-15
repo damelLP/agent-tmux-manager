@@ -70,6 +70,9 @@ impl AgentRuntime {
                     )));
                 }
                 Some(_) => {
+                    // Set before the call: work that is stopped while the
+                    // call is outstanding may have changed the pane.
+                    effect.store(true, Ordering::SeqCst);
                     let done = if kill {
                         let action = serde_json::json!({
                             "method": "agent.down",
@@ -146,27 +149,38 @@ impl AgentRuntime {
     }
 }
 
-/// Record that a pane operation may have changed its pane, unless it failed in
-/// one of the ways [`ReservationError`] documents as "before effect" for a
-/// pane operation: then nothing was changed and nothing needs accounting for.
-/// Every other outcome, success included, may have: an error can follow the
-/// effect. (`InvalidRequest` is left out: for a general operation it is not
-/// documented as before effect.)
-fn changed(effect: &Effect, result: Result<(), ReservationError>) -> Result<(), ReservationError> {
+/// Account for the one pane operation of a flow, whose `effect` flag the flow
+/// set before the call (so that work stopped during the call counts as a
+/// change). The flag is cleared when the call failed in one of the ways
+/// [`ReservationError`] documents as "before effect" for a pane operation:
+/// then nothing was changed and nothing needs accounting for. Every other
+/// outcome, success included, leaves it set: an error can follow the effect.
+/// (`InvalidRequest` is left out: for a general operation it is not documented
+/// as before effect.)
+///
+/// Only for a flow with a single pane effect: clearing the flag would forget
+/// an earlier one.
+pub(super) fn changed(
+    effect: &Effect,
+    result: Result<(), ReservationError>,
+) -> Result<(), ReservationError> {
     let before_effect = matches!(
         &result,
         Err(ReservationError::NotImplemented { .. }
             | ReservationError::Busy { .. }
             | ReservationError::StaleReservation
             | ReservationError::ScreenChanged { .. }
+            | ReservationError::PacingRefused { .. }
+            | ReservationError::PaneInputRefused { .. }
+            | ReservationError::UnsafePaste { .. }
             | ReservationError::TagMismatch { .. }
             | ReservationError::PaneGone { .. }
             | ReservationError::InvalidObservation { .. }
             | ReservationError::Quarantined { .. }
             | ReservationError::Control(crate::control::ControlError::SendRefused { .. }))
     );
-    if !before_effect {
-        effect.store(true, Ordering::SeqCst);
+    if before_effect {
+        effect.store(false, Ordering::SeqCst);
     }
     result
 }
@@ -263,6 +277,7 @@ impl AgentRuntime {
         // Before the tag: an ambiguous pane is refused with nothing changed.
         candidates(&self.pane_sessions(pane).await?)?;
         if !tagged {
+            effect.store(true, Ordering::SeqCst);
             changed(effect, r.tag(pane, ExpectedTag::Absent).await)?;
         }
         // Read everything again now that the pane is ours.

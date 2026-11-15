@@ -349,16 +349,16 @@ fn summary(session: &str, agent: &AgentId) -> OrgCommand {
 }
 
 impl Process {
-    /// The message's exact reference, submitted in this session on %1, as
+    /// The message's exact reference, submitted in this session and pane, as
     /// the connection tap hands a proven parent event to evidence.
-    fn reference(&self, id: MessageId, session: &str) {
+    fn reference(&self, id: MessageId, session: &str, pane: &str) {
         let event = atm_core::LifecycleEvent::PromptSubmit {
             prompt: Some(super::message_delivery::inbox_reference(id)),
         };
         (self.rt.evidence)
             .tap(
                 &session.into(),
-                Some("%1"),
+                Some(pane),
                 Some(atm_core::Harness::Pi),
                 Some(&event),
                 true,
@@ -438,11 +438,11 @@ async fn startup_reconstructs_bound_attempt_not_current_occupant() {
     );
     // The occupant submits the reference: not the attempted session, so it
     // confirms nothing.
-    second.reference(id, "s2");
+    second.reference(id, "s2", "%1");
     assert!(second.rt.evidence.receipt(id).unwrap().is_none());
     // The attempted session's own receipt arrives late: it confirms, and the
     // scheduler persists it without any retry.
-    second.reference(id, "s1");
+    second.reference(id, "s1", "%1");
     second.delivered(id).await;
     let entry = second.inbox(Some("%1")).await.messages.remove(0);
     assert_eq!(entry.status, DeliveryStatus::Delivered);
@@ -481,22 +481,37 @@ async fn ambiguous_lazy_replay_stays_restarted() {
         })
         .await;
     first.run(summary("s1", &worker)).await;
+    // And one attempted on a pane the agent did not hold at that attempt:
+    // its bound session says nothing about what was pasted there.
+    let elsewhere = first
+        .send(None, Address::Agent(worker.clone()), "elsewhere")
+        .await;
+    first
+        .run(OrgCommand::DeliveryAttempted {
+            message_id: elsewhere,
+            attempt: 1,
+            pane: "%9".into(),
+        })
+        .await;
 
     let after = tempfile::tempdir().unwrap();
     copy_log(before.path(), after.path());
     let second = Process::start(after.path()).await;
     second.notice().await;
-    // No scope was rebuilt, so no row can confirm it, whatever it submits.
-    second.reference(id, "s1");
-    let facts = second.rt.evidence.snapshot(id).unwrap();
-    assert!(facts.receipt.is_none());
-    assert!(!facts.probably_landed);
-    assert_eq!(
-        second.step(id),
-        DeliveryStep::Blocked {
-            reason: FailureReason::Restarted
-        }
-    );
+    // No scope was rebuilt, so no row can confirm either, whatever it submits.
+    second.reference(id, "s1", "%1");
+    second.reference(elsewhere, "s1", "%9");
+    for id in [id, elsewhere] {
+        let facts = second.rt.evidence.snapshot(id).unwrap();
+        assert!(facts.receipt.is_none());
+        assert!(!facts.probably_landed);
+        assert_eq!(
+            second.step(id),
+            DeliveryStep::Blocked {
+                reason: FailureReason::Restarted
+            }
+        );
+    }
     assert_eq!(
         second.inbox(Some("%1")).await.messages[0].status,
         DeliveryStatus::Delivering

@@ -865,7 +865,20 @@ impl Rig {
                 registry.clone(),
                 control.clone(),
                 cancel.child_token(),
-                Arc::new(|_| Box::pin(async { None })),
+                // The pane's processes: a shell with job control (the pane's
+                // root) running pi as its foreground job. The agent service
+                // pins pi from that when it starts.
+                Arc::new(|_| {
+                    Box::pin(async {
+                        Some(crate::org::agent_flow::ProcFacts {
+                            process_group: 100,
+                            foreground_group: 150,
+                            system_shell: true,
+                            children: 1,
+                            name: "zsh".into(),
+                        })
+                    })
+                }),
                 Arc::new(|_| None),
             );
             guarded(agents.reconciled()).await.unwrap();

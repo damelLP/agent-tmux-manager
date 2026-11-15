@@ -44,6 +44,15 @@ fn idle_shell() -> ProcFacts {
     }
 }
 
+/// The same shell once the launch runs: the harness is its foreground job.
+fn harness_in_front() -> ProcFacts {
+    ProcFacts {
+        foreground_group: 150,
+        children: 1,
+        ..idle_shell()
+    }
+}
+
 /// (harness, its ready editor, the command tmux shows for it)
 const HARNESSES: [(Harness, &str, &str); 3] = [
     (Harness::ClaudeCode, CLAUDE_READY, "claude"),
@@ -92,6 +101,9 @@ impl Starting {
         .map(|command| command.text)
         .unwrap_or_default();
         *rig.proc.lock().unwrap() = Some(idle_shell());
+        // The launch's Enter runs the harness: from then on the pane's shell
+        // is not idle, it holds the harness as its foreground job.
+        *rig.proc_after_enter.lock().unwrap() = Some(harness_in_front());
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
         let events = agents.observation_events();

@@ -52,6 +52,12 @@ mod reconciliation {
         /// one job in the foreground: the shape under which a harness named
         /// by a capture can be pinned.
         proc: std::sync::Arc<std::sync::Mutex<Option<super::super::agent_flow::ProcFacts>>>,
+        /// What the reader answers, in place of `proc`, once an Enter has been
+        /// sent to a pane; unset by default. A test of a start sets it: the
+        /// Enter runs the launch, and from then on the pane's shell holds the
+        /// harness as its foreground job.
+        proc_after_enter:
+            std::sync::Arc<std::sync::Mutex<Option<super::super::agent_flow::ProcFacts>>>,
         /// Answers the reader gives first, one per read, before `proc`.
         proc_script: std::sync::Arc<
             std::sync::Mutex<
@@ -155,6 +161,7 @@ mod reconciliation {
                         name: "zsh".into(),
                     },
                 ))),
+                proc_after_enter: Default::default(),
                 proc_script: Default::default(),
             }
         }
@@ -276,9 +283,16 @@ mod reconciliation {
         /// pid 100 must never be looked up on the machine the tests run on.
         fn reader(&self) -> super::super::agent_proc::ProcReader {
             let (proc, script) = (self.proc.clone(), self.proc_script.clone());
+            let (after_enter, mock) = (self.proc_after_enter.clone(), self.client.mock());
             std::sync::Arc::new(move |_| {
                 let scripted = script.lock().unwrap().pop_front();
-                let facts = scripted.unwrap_or_else(|| proc.lock().unwrap().clone());
+                let facts = scripted.unwrap_or_else(|| {
+                    let entered = mock.calls().iter().any(|call| {
+                        matches!(call, atm_tmux::mock::MockCall::SendKeys { keys, .. } if keys == "Enter")
+                    });
+                    let launched = after_enter.lock().unwrap().clone().filter(|_| entered);
+                    launched.or_else(|| proc.lock().unwrap().clone())
+                });
                 Box::pin(async move { facts })
             })
         }
@@ -522,6 +536,7 @@ mod reconciliation {
             rig.control.clone(),
             rig.cancel.child_token(),
             rig.reader(),
+            std::sync::Arc::new(|_| None),
         );
         agents.reconciled().await.unwrap();
         assert!(matches!(
@@ -557,6 +572,7 @@ mod reconciliation {
             rig.control.clone(),
             rig.cancel.child_token(),
             rig.reader(),
+            std::sync::Arc::new(|_| None),
         );
         agents.reconciled().await.unwrap();
         assert!(matches!(
@@ -2080,6 +2096,7 @@ mod reconciliation {
                     rig.control.clone(),
                     cancel.clone(),
                     rig.reader(),
+                    std::sync::Arc::new(|_| None),
                 );
                 agents.reconciled().await.unwrap();
                 let state = rig.org.snapshot().await.unwrap();
@@ -2113,6 +2130,7 @@ mod reconciliation {
                     rig.control.clone(),
                     cancel.clone(),
                     rig.reader(),
+                    std::sync::Arc::new(|_| None),
                 );
                 agents.reconciled().await.unwrap();
                 assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
@@ -2427,6 +2445,7 @@ mod reconciliation {
             rig.control.clone(),
             cancel.clone(),
             rig.reader(),
+            std::sync::Arc::new(|_| None),
         );
         agents.reconciled().await.unwrap();
         let (entered, entry) = tokio::sync::oneshot::channel();
@@ -2672,6 +2691,7 @@ mod reconciliation {
             rig.control.clone(),
             cancel.clone(),
             rig.reader(),
+            std::sync::Arc::new(|_| None),
         );
         agents.reconciled().await.unwrap();
         cancel.cancel();
@@ -2737,6 +2757,7 @@ mod reconciliation {
             rig.control.clone(),
             rig.cancel.child_token(),
             rig.reader(),
+            std::sync::Arc::new(|_| None),
         );
         agents.reconciled().await.unwrap();
         assert!(matches!(

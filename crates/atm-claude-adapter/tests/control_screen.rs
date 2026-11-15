@@ -534,6 +534,31 @@ fn captured_above_completion_without_header() {
 }
 
 #[test]
+fn synthetic_top_cut_completion_continuations_refuse_staging() {
+    let text = plain(ABOVE_COMPLETIONS.first().unwrap());
+    let rule = text.lines().find(|row| row.starts_with('─')).unwrap();
+    let (_, editor) = text.split_once(rule).unwrap();
+    // Synthetic: the pane top cuts off every command, leaving only a real
+    // description continuation above the editor, with optional blank padding.
+    let continuations: Vec<_> = text
+        .lines()
+        .filter(|row| row.contains("on disk") || row.contains("consistent wording"))
+        .collect();
+    assert_eq!(continuations.len(), 2);
+    for continuation in continuations {
+        for padding in ["", "\n\n"] {
+            let cut = format!("{padding}{continuation}\n{rule}{editor}");
+            assert_eq!(
+                screen::staged_draft_matches(ScreenInput::Styled(&cut), "/clear"),
+                None,
+                "{cut}"
+            );
+            assert_eq!(observe(&cut).dialog, ControlDialog::Unknown);
+        }
+    }
+}
+
+#[test]
 fn above_completion_checks_selection_before_fallback() {
     // Ignoring the selected name, or falling back after a bad menu, must fail.
     let text = plain(ABOVE_COMPLETIONS.first().unwrap());

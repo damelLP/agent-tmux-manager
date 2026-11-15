@@ -195,6 +195,13 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
         }
         end = start;
     }
+    if above.is_empty()
+        && end < history.len()
+        && history.get(..end).ok_or(())?.iter().all(|s| s.is_empty())
+    {
+        // Continuations reached the pane top without a command/selector row.
+        return Err(());
+    }
     let ordinary = editor(&lines, Some(screen));
     let (menu, above_editor) = if !above.is_empty() {
         (above, true)

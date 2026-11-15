@@ -890,6 +890,50 @@ async fn deadline_during_the_enter_says_the_command_may_have_been_submitted() {
         .await;
 }
 
+/// A clear that its deadline ends while tmux holds its Enter, as
+/// deadline_during_the_enter_says_the_command_may_have_been_submitted, on an
+/// organisation whose first write of an event of `kind` fails. Returns the
+/// rig and the caller's answer.
+async fn clear_ended_at_its_deadline_with_one_failed_write(
+    kind: &'static str,
+) -> (Clearing, Result<ClearResult, AgentError>) {
+    let rig = Rig::gated_with_failure(None, Some(kind)).await;
+    let mut clearing = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+    clearing.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+    let call = clearing.start();
+    progress(&mut clearing.events, "clear_submitting", Some("p/lead")).await;
+    clearing.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    (clearing, result)
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_stuck_write_at_the_deadline_keeps_the_timeout() {
+    // The cleanup's Stuck write fails: nothing says why the clear ended, so
+    // the caller is not told a reason either. The answer stays the timeout,
+    // the agent is still Clearing with no reason and no note, and the
+    // reservation is quarantined. Twin:
+    // failed_note_at_the_deadline_still_answers_with_the_recorded_reason
+    // (the Stuck write succeeds).
+    let (clearing, result) =
+        clear_ended_at_its_deadline_with_one_failed_write("agent.stuck").await;
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    let agent = clearing.agent().await;
+    assert_eq!(agent.status, AgentStatus::Clearing, "{agent:?}");
+    assert_eq!(agent.reason, None);
+    let state = clearing.rig.org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 0, "nobody is told by a note");
+    assert!(quarantined(&clearing.rig, "p/lead").await);
+}
+
 #[tokio::test(start_paused = true)]
 async fn timeout_waiting_for_the_reservation_is_not_answered_with_an_earlier_stuck_reason() {
     // The agent is Stuck since an earlier call, and another job holds its

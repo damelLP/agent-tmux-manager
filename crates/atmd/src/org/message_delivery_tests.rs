@@ -2843,7 +2843,8 @@ async fn session_changed_before_paste_no_input() {
 /// recipient with an eligible row is reachable and must spend no attempt.
 #[tokio::test(start_paused = true)]
 async fn unbound_codex_with_an_eligible_row_is_refused_before_commit() {
-    let (rig, id) = ready_unbound_codex().await;
+    let (mut rig, id) = ready_unbound_codex().await;
+    rig.fold_rest();
     let parked = rig.park().await;
     let attempt = rig.spawn_deliver(id);
     rig.admission_requested(id).await;
@@ -2857,6 +2858,17 @@ async fn unbound_codex_with_an_eligible_row_is_refused_before_commit() {
         recipient.session.as_ref().map(|row| row.id.clone()),
         Some(SessionId::new("new"))
     );
+    // The scheduler's observer may already know this row and see a stable
+    // empty editor without binding it. Keep policy ready so that skipping
+    // the executor's gate really spends an attempt, rather than just
+    // returning a policy wait for a newly observed source.
+    let observed = HistoryUpdate::Observed {
+        recipient: worker(),
+        observation: observation(&recipient, &codex_frame(CODEX_EMPTY)).unwrap(),
+    };
+    rig.rt.history.record(observed, rig.now()).unwrap();
+    tokio::time::advance(rig.rt.policy.settings().stable_idle).await;
+    assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 1 });
     rig.script(&[codex_frame(CODEX_EMPTY)]);
     parked.send(()).unwrap();
 

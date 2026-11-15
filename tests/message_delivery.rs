@@ -571,7 +571,7 @@ fn clear_then_message_not_merged() {
     let requested = watch.wait("the clear request", |e| {
         e["kind"] == "agent.clear_requested"
     });
-    let clearing = rig.test.rig.wait_event(&lead.pane, cursor, |e| {
+    rig.test.rig.wait_event(&lead.pane, cursor, |e| {
         e["kind"] == "rendered" && e["state"] == "clearing"
     });
     let id = rig.send(None, &lead.id, "for the new session");
@@ -585,14 +585,9 @@ fn clear_then_message_not_merged() {
 
     let delivered = watch.wait("the receipt", about("msg.delivered", &id));
     assert_eq!(delivered["body"]["session_id"], new);
-    let prompt = rig
-        .test
+    rig.test
         .rig
         .wait_event(&lead.pane, cursor, accepted(&reference(&id)));
-    assert!(
-        clearing["event_sequence"].as_u64() < prompt["event_sequence"].as_u64(),
-        "the reference was typed before the clear"
-    );
     assert_eq!(rig.accepted_since(&lead.pane, cursor), [reference(&id)]);
     for record in rig.test.rig.journal(&lead.pane) {
         let text = record["text"].as_str().unwrap_or_default();

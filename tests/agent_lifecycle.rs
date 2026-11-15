@@ -943,6 +943,107 @@ fn msg_send_during_clear_delivers_once_to_new_generation() {
     test.rig.close();
 }
 
+/// The `atm` binary itself, against the same daemon: `atm agent up`, `list`,
+/// `clear` and `down` take the caller's pane and server from the environment
+/// tmux gives a pane (`TMUX_PANE`, `TMUX`), and print the daemon's answer.
+#[test]
+fn atm_cli_starts_clears_and_takes_down_an_agent() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    test.role("lead", mode, "");
+    let log = test.next_stand_in("lead", &config);
+    let placement = test.placement(&config);
+    let atm = |args: &[&str]| {
+        let mut command = test
+            .rig
+            .command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
+        command
+            .args(args)
+            .env("TMUX", test.rig.tmux_env())
+            .env("TMUX_PANE", &placement);
+        command
+    };
+    let json_of = |output: std::process::Output| -> serde_json::Value {
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let project = test.project.to_str().unwrap().to_owned();
+
+    let up = json_of(test.rig.run(&mut atm(&[
+        "agent",
+        "up",
+        "lead",
+        "--project-root",
+        &project,
+        "--format",
+        "json",
+    ])));
+    assert_eq!(up["agent_id"], "project/lead", "{up}");
+    assert_eq!(up["state"], "ready", "{up}");
+    let pane = test
+        .rig
+        .observe_pane(up["pane"].as_str().unwrap().to_owned(), mode, log);
+    assert_eq!(test.tag(&pane.pane_id), "project/lead");
+    let listed = json_of(test.rig.run(&mut atm(&[
+        "agent",
+        "list",
+        "--project-root",
+        &project,
+        "--format",
+        "json",
+    ])));
+    assert_eq!(listed[0]["agent_id"], "project/lead", "{listed}");
+    assert_eq!(listed[0]["state"], "ready", "{listed}");
+    assert_eq!(listed[0]["pane"], pane.pane_id);
+
+    // The clear waits for the stand-in's clock, so the command runs while
+    // the test moves it.
+    let old = test.complete_fixture_turn(&pane);
+    let after = test.rig.event_cursor(&pane);
+    let clear = atm(&["agent", "clear", "project/lead", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    test.rig.wait_event(&pane, after, |e| {
+        e["kind"] == "rendered" && e["state"] == "clearing"
+    });
+    let now = test.rig.control(&pane, json!({"command":"barrier"}))["now_ms"]
+        .as_u64()
+        .unwrap();
+    let reply = test.rig.control(
+        &pane,
+        json!({"command":"advance_to", "now_ms": now + config.clear_gap_ms}),
+    );
+    assert!(reply["error"].is_null(), "{reply}");
+    let cleared = json_of(clear.wait_with_output().unwrap());
+    let row = test.rig.wait_for_row(&pane, |r| {
+        !r.id.is_pending() && r.id != old.id && r.status == SessionStatus::Idle
+    });
+    assert_eq!(
+        cleared,
+        json!({"agent_id": "project/lead", "session_id": row.id.as_str()})
+    );
+
+    let down = json_of(test.rig.run(&mut atm(&[
+        "agent",
+        "down",
+        "project/lead",
+        "--kill",
+        "--format",
+        "json",
+    ])));
+    assert_eq!(down, json!({"agent_id": "project/lead"}));
+    stand_in::process::wait_exit(pane.pid, std::time::Duration::from_secs(30)).unwrap();
+    let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
+    assert!(!panes.lines().any(|p| p == pane.pane_id), "{panes}");
+    let agent = test.agent("project/lead");
+    assert_eq!(agent["state"], "down", "{agent}");
+    test.rig.close();
+}
+
 /// A delivery policy whose waits are as short as the policy allows: the
 /// tests wait on events, and the defaults (ten seconds of idle) would only
 /// make them long.

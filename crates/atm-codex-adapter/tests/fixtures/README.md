@@ -135,6 +135,28 @@ and extra-candidate mutations cover both boundary kinds. This is control-only;
 production clear integration, running popups and arbitrary versions/layouts
 remain unverified.
 
+### Clear-flow sequence (P6)
+
+Captured: codex-cli 0.167.0, 2026-11-15, P6 sealed loopback-only Responses
+stub and private tmux 3.8 `capture-pane -p -e -N`. Additional Styled fixtures
+use the same naming and equal-width run-root substitution as above:
+
+- `A-80x24-plain-finished-P6_END_PLAIN` from `a-full`: a safe editor whose
+  initial prompt has scrolled away; neither conversation nor freshness is
+  positively established.
+- `B-120x40-finished-P6_OLD_ANSWER_B-120x40` and
+  `B-120x40-after-enter-poll-000` through `004` from `b-enter`: one session's
+  conversation, followed by the existing `B-120x40-before-enter` popup and
+  the ordered post-Enter captures. Poll 000 is transitional Unknown; 001
+  through 004 show the fresh editor.
+- `B-80x24-finished-P6_OLD_ANSWER_B-80x24` and
+  `B-80x24-after-enter-poll-000` through `001` from `b-enter`: the matching
+  narrow-pane sequence. Its existing `B-80x24-before-enter` popup is accepted
+  by the finished-turn boundary. Removing only that popup row's inverse
+  selection is a hand-changed refusal twin, not a real capture.
+
+The daemon clear tests replay these without running a harness.
+
 ## Finished-turn clocks (U8g)
 
 Captured: codex-cli 0.167.0, 2026-11-14, U5 and sealed P1 private-tmux

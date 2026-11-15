@@ -424,16 +424,6 @@ pub(super) fn shell_refusal(
     }
 }
 
-/// Whether `line` may be taken as the shell's line before the paste, when a
-/// paste guard refused the line taken before it (`refused`). A prompt may be
-/// drawn again and read differently; a line that is the refused one with more
-/// after it is that prompt with something typed at it, and typing the launch
-/// after it would run both.
-#[must_use]
-pub(super) fn prompt_line_allowed(refused: Option<&str>, line: &str) -> bool {
-    refused.is_none_or(|refused| line == refused || !line.starts_with(refused))
-}
-
 /// The paste guard of a launch: the shell's line still reads exactly `before`.
 #[must_use]
 pub(super) fn launch_paste_allowed(

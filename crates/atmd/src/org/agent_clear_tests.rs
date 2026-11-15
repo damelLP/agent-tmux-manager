@@ -48,6 +48,23 @@ const CODEX_POPUP: &str = fixture!("codex", "p5_100x40-popup_0.167.0.styled");
 const CODEX_WORKTREE: &str =
     fixture!("codex", "control_p1_b31-nodaemon-clear-dialog-100x32_0.167.0");
 const CODEX_FRESH: &str = fixture!("codex", "styled_p1_b14-fresh-baseline-32-100x32_0.167.0");
+const CODEX_P6_CONVERSATION: &str =
+    fixture!("codex", "p6_B-120x40-finished-P6_OLD_ANSWER_B-120x40_0.167.0.styled");
+const CODEX_P6_POPUP: &str = fixture!("codex", "p6_B-120x40-before-enter_0.167.0.styled");
+const CODEX_P6_80_CONVERSATION: &str =
+    fixture!("codex", "p6_B-80x24-finished-P6_OLD_ANSWER_B-80x24_0.167.0.styled");
+const CODEX_P6_80_POPUP: &str = fixture!("codex", "p6_B-80x24-before-enter_0.167.0.styled");
+const CODEX_P6_80_AFTER_ENTER: [&str; 2] = [
+    fixture!("codex", "p6_B-80x24-after-enter-poll-000_0.167.0.styled"),
+    fixture!("codex", "p6_B-80x24-after-enter-poll-001_0.167.0.styled"),
+];
+const CODEX_P6_AFTER_ENTER: [&str; 5] = [
+    fixture!("codex", "p6_B-120x40-after-enter-poll-000_0.167.0.styled"),
+    fixture!("codex", "p6_B-120x40-after-enter-poll-001_0.167.0.styled"),
+    fixture!("codex", "p6_B-120x40-after-enter-poll-002_0.167.0.styled"),
+    fixture!("codex", "p6_B-120x40-after-enter-poll-003_0.167.0.styled"),
+    fixture!("codex", "p6_B-120x40-after-enter-poll-004_0.167.0.styled"),
+];
 
 const NOTHING_SENT: &str = "nothing was sent to %1";
 const NOT_SUBMITTED: &str = "the clear command was typed and not submitted";
@@ -902,12 +919,18 @@ async fn session_that_starts_before_the_enter_is_not_the_clears_proof() {
         clearing.frame(cleared);
         let call = clearing.start();
         // The Clear is committed after the precheck's capture, and the
-        // paste's guard is paced after that capture.
-        loop {
-            if committed.recv().await.unwrap().kind == "agent.clear_requested" {
-                break;
+        // paste's guard is paced after that capture. Bounded: the rig keeps
+        // the sender alive, so a Clear that is never recorded would
+        // otherwise be waited for without end.
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                if committed.recv().await.unwrap().kind == "agent.clear_requested" {
+                    break;
+                }
             }
-        }
+        })
+        .await
+        .expect("the clear was never recorded");
         clearing.session_start("early", Some("clear")).await;
         clearing.awaiting_session().await;
         assert_eq!(
@@ -936,83 +959,91 @@ async fn session_that_starts_before_the_enter_is_not_the_clears_proof() {
 
 #[tokio::test(start_paused = true)]
 async fn clear_paste_outcome_unknown_never_repeats_paste() {
-    let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
-    let mut committed = clearing.rig.org.committed.subscribe();
-    clearing.frame(CLAUDE_CONVERSATION);
-    clearing.frame(CLAUDE_CONVERSATION);
-    // A safe editor again: a second paste would pass its guard.
-    clearing.frame(CLAUDE_CONVERSATION);
-    let call = clearing.start();
-    // The Clear is committed after the precheck's capture; the paste's guard
-    // is paced after that capture (see the test above).
-    loop {
-        if committed.recv().await.unwrap().kind == "agent.clear_requested" {
-            break;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+        let mut committed = clearing.rig.org.committed.subscribe();
+        clearing.frame(CLAUDE_CONVERSATION);
+        clearing.frame(CLAUDE_CONVERSATION);
+        // A safe editor again: a second paste would pass its guard.
+        clearing.frame(CLAUDE_CONVERSATION);
+        let call = clearing.start();
+        // The Clear is committed after the precheck's capture; the paste's guard
+        // is paced after that capture (see the test above).
+        loop {
+            if committed.recv().await.unwrap().kind == "agent.clear_requested" {
+                break;
+            }
         }
-    }
-    fail_next_tmux_call(&clearing);
-    let result = call.await.unwrap();
-    assert!(
-        matches!(result, Err(AgentError::Reservation(_))),
-        "{result:?}"
-    );
-    assert!(clearing.sent().is_empty(), "no second attempt");
-    assert!(clearing.unread() >= 3, "the flow did not look again");
-    clearing
-        .assert_stuck_with(
-            "typing the clear command failed, and whether it reached the pane is unknown",
-        )
-        .await;
+        fail_next_tmux_call(&clearing);
+        let result = call.await.unwrap();
+        assert!(
+            matches!(result, Err(AgentError::Reservation(_))),
+            "{result:?}"
+        );
+        assert!(clearing.sent().is_empty(), "no second attempt");
+        assert!(clearing.unread() >= 3, "the flow did not look again");
+        clearing
+            .assert_stuck_with(
+                "typing the clear command failed, and whether it reached the pane is unknown",
+            )
+            .await;
+    })
+    .await
+    .expect("clear must finish even if its intent is never committed");
 }
 
 #[tokio::test(start_paused = true)]
 async fn clear_reply_lost_goes_stuck_from_fresh_snapshot() {
-    // The Clear hangs in the organisation's append, and the flow gives up on
-    // its reply. `released`: the append then completes while the cleanup's
-    // snapshot waits behind it; the snapshot sees the agent Clearing and the
-    // cleanup marks it Stuck. Otherwise the cleanup can't learn the outcome
-    // and the agent's reservation is quarantined. Nothing was typed either way.
-    for released in [true, false] {
-        let (gate, mut entered) = mpsc::channel(1);
-        let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
-        let clearing = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
-        clearing.frame(CLAUDE_CONVERSATION);
-        let call = clearing.start();
-        let release = entered.recv().await.unwrap();
-        // Virtual time: past the wait for the command's reply (6 s), and
-        // either inside or past the cleanup's wait for its snapshot (5 s more).
-        tokio::time::sleep(std::time::Duration::from_secs(if released { 8 } else { 20 })).await;
-        assert_eq!(call.is_finished(), !released);
-        release.send(()).unwrap();
-        let result = call.await.unwrap();
-        assert!(result.is_err(), "{result:?}");
-        assert!(clearing.sent().is_empty());
-        let again = clearing
-            .rig
-            .control
-            .run_reserved(
-                request("p/lead", Some("%1"), ReservationKind::Observe),
-                |_| async { Ok::<_, AgentError>(()) },
-                cleanup,
-            )
-            .await;
-        if released {
-            clearing
-                .assert_stuck("the clear command was not typed")
+    tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        // The Clear hangs in the organisation's append, and the flow gives up on
+        // its reply. `released`: the append then completes while the cleanup's
+        // snapshot waits behind it; the snapshot sees the agent Clearing and the
+        // cleanup marks it Stuck. Otherwise the cleanup can't learn the outcome
+        // and the agent's reservation is quarantined. Nothing was typed either way.
+        for released in [true, false] {
+            let (gate, mut entered) = mpsc::channel(1);
+            let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
+            let clearing = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+            clearing.frame(CLAUDE_CONVERSATION);
+            let call = clearing.start();
+            let release = entered.recv().await.unwrap();
+            // Virtual time: past the wait for the command's reply (6 s), and
+            // either inside or past the cleanup's wait for its snapshot (5 s more).
+            tokio::time::sleep(std::time::Duration::from_secs(if released { 8 } else { 20 })).await;
+            assert_eq!(call.is_finished(), !released);
+            release.send(()).unwrap();
+            let result = call.await.unwrap();
+            assert!(result.is_err(), "{result:?}");
+            assert!(clearing.sent().is_empty());
+            let again = clearing
+                .rig
+                .control
+                .run_reserved(
+                    request("p/lead", Some("%1"), ReservationKind::Observe),
+                    |_| async { Ok::<_, AgentError>(()) },
+                    cleanup,
+                )
                 .await;
-            again.unwrap();
-        } else {
-            assert!(
-                matches!(
-                    again,
-                    Err(AgentError::Reservation(
-                        crate::control::reservation::ReservationError::Quarantined { .. }
-                    ))
-                ),
-                "{again:?}"
-            );
+            if released {
+                clearing
+                    .assert_stuck("the clear command was not typed")
+                    .await;
+                again.unwrap();
+            } else {
+                assert!(
+                    matches!(
+                        again,
+                        Err(AgentError::Reservation(
+                            crate::control::reservation::ReservationError::Quarantined { .. }
+                        ))
+                    ),
+                    "{again:?}"
+                );
+            }
         }
-    }
+    })
+    .await
+    .expect("clear must finish even if its append gate is never entered");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1091,30 +1122,55 @@ async fn duplicate_clear_conflicts_while_first_waits_for_delivery() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn codex_clear_goes_from_conversation_to_fresh_editor() {
-    // Codex announces no session when it clears: the proof is the screen, a
-    // conversation before and a fresh safe editor after. Also
-    // exact_worktree_default_only (the worktree choice is answered once, with
-    // the current worktree selected), old_row_never_rebound and
-    // next_prompt_binds_new.
-    let mut clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+async fn clear_never_binds_a_pending_row_before_clearing() {
+    let rig = Rig::new().await;
+    rig.row_of("pending-4242", "%1", false, Harness::ClaudeCode)
+        .await;
+    let mut clearing = Clearing::on(rig, Harness::ClaudeCode, Old::Unbound).await;
     let mut committed = clearing.rig.org.committed.subscribe();
-    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
-    // After the Enter: the popup is still drawn, then the worktree choice
-    // (the flow's capture and the guard's), still shown once more, then fresh.
-    clearing.frame(CODEX_POPUP);
-    clearing.frame(CODEX_WORKTREE);
-    clearing.frame(CODEX_WORKTREE);
-    clearing.frame(CODEX_WORKTREE);
-    clearing.frame(CODEX_FRESH);
+    clearing.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+    clearing.frame(CLAUDE_CLEARED);
+    let call = clearing.start();
+    clearing.awaiting_session().await;
+    let agent = clearing.agent().await;
+    assert_eq!(agent.status, AgentStatus::Clearing);
+    assert_eq!(agent.session_id, None);
+    assert_eq!(
+        agent.excluded_session_id, None,
+        "a pending id was never bound first"
+    );
+    clearing.session_start("new", Some("clear")).await;
+    assert_eq!(
+        call.await.unwrap().unwrap().session_id,
+        Some(SessionId::new("new"))
+    );
+    assert_eq!(
+        committed_kinds(&mut committed),
+        ["agent.clear_requested", "agent.session_bound"]
+    );
+    assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_clear_goes_from_conversation_to_fresh_editor() {
+    // Codex announces no session when it clears: the proof is the screen.
+    // Replay one real P6 session in order, including its transitional Unknown
+    // frame. The first fresh poll completes the clear; later polls stay unread.
+    // A neighboring test checks exclusion until the next prompt binds.
+    let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    let mut committed = clearing.rig.org.committed.subscribe();
+    clearing.frames_through_enter(CODEX_P6_CONVERSATION, CODEX_P6_POPUP);
+    for frame in CODEX_P6_AFTER_ENTER {
+        clearing.frame(frame);
+    }
     let result = clearing.clear().await.unwrap();
     assert_eq!(result.session_id, None, "the next prompt announces it");
     assert_eq!(
         clearing.sent(),
-        ["paste %1 /new", "keys %1 Enter", "keys %1 Enter"],
-        "the command, its Enter, and one Enter for the worktree choice"
+        ["paste %1 /new", "keys %1 Enter"],
+        "one submit, no worktree choice in this real sequence"
     );
-    assert_eq!(clearing.unread(), 0);
+    assert_eq!(clearing.unread(), 9, "polls 002 through 004 were not needed");
     assert_eq!(
         committed_kinds(&mut committed),
         ["agent.clear_requested", "agent.editor_ready"]
@@ -1123,7 +1179,95 @@ async fn codex_clear_goes_from_conversation_to_fresh_editor() {
     assert_eq!(agent.status, AgentStatus::Ready);
     assert_eq!(agent.session_id, None);
     assert_eq!(agent.excluded_session_id, Some(SessionId::new("old")));
+}
 
+#[tokio::test(start_paused = true)]
+async fn codex_p6_80x24_finished_popup_gets_one_enter() {
+    let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    let reader = crate::org::agent_screen::agent_screen(Harness::Codex).unwrap();
+    let baseline = clearing.agents.baseline_of(&lead(), "%1");
+    let mut popup = clearing.capture(CODEX_P6_80_POPUP);
+    popup.inspection.pane.width = 80;
+    assert_eq!(
+        reader.control(&popup, &baseline).dialog,
+        atm_core::harness_control::ControlDialog::None
+    );
+    // One real P6 session: finished conversation, selected popup, transitional
+    // Unknown, then fresh editor. The finished-turn boundary permits Enter.
+    for frame in [
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_POPUP,
+        CODEX_P6_80_POPUP,
+    ]
+    .into_iter()
+    .chain(CODEX_P6_80_AFTER_ENTER)
+    {
+        clearing.frame_with(frame, |capture| capture.inspection.pane.width = 80);
+    }
+    let result = clearing.clear().await;
+    assert_eq!(clearing.sent(), ["paste %1 /new", "keys %1 Enter"]);
+    assert_eq!(result.unwrap().session_id, None);
+    assert_eq!(clearing.unread(), 0);
+    let agent = clearing.agent().await;
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, None);
+    assert_eq!(agent.excluded_session_id, Some(SessionId::new("old")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_p6_80x24_popup_without_inverse_gets_no_enter() {
+    let popup = body(CODEX_P6_80_POPUP);
+    let selected = popup
+        .lines()
+        .find(|line| line.contains("start a new chat during a conversation"))
+        .unwrap();
+    // Synthetic, hand-changed: remove only inverse selection from the real
+    // popup row. Without positive selection evidence the guard must refuse
+    // Enter, even though the composer still holds exactly /new.
+    let unselected = selected
+        .replace("\x1b[0;1;7m", "\x1b[0;1m")
+        .replace("\x1b[0;7m", "\x1b[0m");
+    assert_ne!(unselected, selected);
+    let changed = popup.replacen(selected, &unselected, 1);
+    let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    let reader = crate::org::agent_screen::agent_screen(Harness::Codex).unwrap();
+    let baseline = clearing.agents.baseline_of(&lead(), "%1");
+    let mut capture = clearing.capture(&changed);
+    capture.inspection.pane.width = 80;
+    assert_eq!(
+        reader.control(&capture, &baseline).dialog,
+        atm_core::harness_control::ControlDialog::Unknown
+    );
+    for frame in [
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_POPUP,
+        &changed,
+        &changed,
+    ] {
+        clearing.frame_with(frame, |capture| capture.inspection.pane.width = 80);
+    }
+    // The staged read is recognized, but selection disappears on the guard's
+    // own capture and stays absent until the scripted frames run out.
+    let result = clearing.clear().await;
+    assert_eq!(clearing.sent(), ["paste %1 /new"]);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(clearing.unread(), 0);
+    clearing
+        .assert_stuck(&format!("{NOT_SUBMITTED}: the screen was not recognised"))
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_old_row_stays_excluded_until_the_next_prompt_binds() {
+    let mut clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    clearing.frames_through_enter(CODEX_P6_CONVERSATION, CODEX_P6_POPUP);
+    for frame in CODEX_P6_AFTER_ENTER.into_iter().take(2) {
+        clearing.frame(frame);
+    }
+    clearing.clear().await.unwrap();
+    assert_eq!(clearing.unread(), 0);
     // The old conversation's row is still there and reports again: never bound.
     clearing.session_start("old", Some("startup")).await;
     clearing.settled().await;
@@ -1140,10 +1284,27 @@ async fn codex_clear_goes_from_conversation_to_fresh_editor() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn worktree_default_is_answered_only_once() {
+    let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+    clearing.frame(CODEX_WORKTREE);
+    clearing.frame(CODEX_WORKTREE);
+    clearing.frame(CODEX_WORKTREE);
+    clearing.frame(CODEX_FRESH);
+    assert_eq!(clearing.clear().await.unwrap().session_id, None);
+    assert_eq!(
+        clearing.sent(),
+        ["paste %1 /new", "keys %1 Enter", "keys %1 Enter"]
+    );
+    assert_eq!(clearing.unread(), 0);
+    assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
+}
+
+#[tokio::test(start_paused = true)]
 async fn worktree_default_changes_before_guard_refused() {
     // The worktree choice is on the flow's capture; on the guard's own
     // capture the screen is another one. No key. Twin (the key is sent):
-    // codex_clear_goes_from_conversation_to_fresh_editor.
+    // worktree_default_is_answered_only_once.
     let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
     clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
     clearing.frame(CODEX_WORKTREE);
@@ -1161,12 +1322,72 @@ async fn worktree_default_changes_before_guard_refused() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn worktree_focused_at_guard_sends_no_key() {
+    for focused in [Some(true), None] {
+        let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+        clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+        clearing.frame(CODEX_WORKTREE);
+        clearing.frame_with(CODEX_WORKTREE, |capture| capture.focused = focused);
+        // The choice disappears before the next pass. A mutant that ignores
+        // focus would send a key into the focused dialog, then also finish.
+        clearing.frame(CODEX_FRESH);
+        assert_eq!(clearing.clear().await.unwrap().session_id, None);
+        assert_eq!(
+            clearing.sent(),
+            ["paste %1 /new", "keys %1 Enter"],
+            "{focused:?}"
+        );
+        assert_eq!(clearing.unread(), 0);
+        assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn worktree_uncertain_key_is_not_retried() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+        clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+        clearing.frame(CODEX_WORKTREE);
+        clearing.frame(CODEX_WORKTREE);
+        clearing.frame(CODEX_WORKTREE);
+        clearing.frame(CODEX_WORKTREE);
+        clearing.frame(CODEX_FRESH);
+        let call = clearing.start();
+        progress(&mut clearing.events, "clear_submitting", Some("p/lead")).await;
+        // Advance only virtual capture pacing until the flow has read the
+        // worktree dialog. The next operation is its paced guarded key.
+        while clearing.unread() > 12 && !call.is_finished() {
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        }
+        assert_eq!(clearing.unread(), 12, "worktree guard is next");
+        assert_eq!(clearing.sent(), ["paste %1 /new", "keys %1 Enter"]);
+        fail_next_tmux_call(&clearing);
+        let result = call.await.unwrap();
+        assert_eq!(
+            clearing.sent(),
+            ["paste %1 /new", "keys %1 Enter"],
+            "no second worktree key"
+        );
+        assert!(matches!(result, Err(AgentError::Reservation(_))), "{result:?}");
+        clearing
+            .assert_stuck_with(
+                "answering the worktree choice failed, and whether it reached the pane is unknown",
+            )
+            .await;
+        assert_eq!(clearing.unread(), 12, "no further observation after uncertainty");
+    })
+    .await
+    .expect("clear must finish even if the worktree key fails");
+}
+
+#[tokio::test(start_paused = true)]
 async fn codex_popup_other_selection_sends_no_enter() {
     // Also codex_popup_candidate_above_selected_sends_no_enter and
     // codex_popup_selected_row_without_inverse_sends_no_enter. Synthetic: the
     // real popup frame with its one row changed. Codex's adapter reads none
-    // of them as "no dialog", so the staged command gets no Enter. Twin (the
-    // unchanged frame): codex_clear_goes_from_conversation_to_fresh_editor.
+    // of them as "no dialog", so the staged command gets no Enter. Twins
+    // (the unchanged frame gets its Enter): worktree_default_is_answered_only_once,
+    // codex_second_clear_ignores_the_excluded_old_row.
     let popup = body(CODEX_POPUP);
     let row = popup
         .lines()
@@ -1211,6 +1432,37 @@ async fn codex_ready_unbound_noop_sends_zero_keys() {
     assert_eq!(clearing.unread(), 0);
     assert_eq!(clearing.rig.org.status().unwrap(), before);
     assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_second_clear_ignores_the_excluded_old_row() {
+    let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+    clearing.frame(CODEX_FRESH);
+    clearing.clear().await.unwrap();
+    assert!(clearing
+        .rig
+        .registry
+        .get_session(SessionId::new("old"))
+        .await
+        .is_some());
+    let agent = clearing.agent().await;
+    assert_eq!((agent.status, agent.session_id), (AgentStatus::Ready, None));
+    assert_eq!(agent.excluded_session_id, Some(SessionId::new("old")));
+    let before = clearing.rig.org.status().unwrap();
+    let sent = clearing.sent();
+    clearing.frame(CODEX_FRESH);
+    assert_eq!(clearing.clear().await.unwrap().session_id, None);
+    assert_eq!(clearing.sent(), sent, "a second clear sends nothing");
+    assert_eq!(
+        clearing.rig.org.status().unwrap(), before,
+        "no rebind or clear intent"
+    );
+    assert_eq!(clearing.unread(), 0);
+    assert_eq!(
+        clearing.agent().await.excluded_session_id,
+        Some(SessionId::new("old"))
+    );
 }
 
 #[tokio::test(start_paused = true)]

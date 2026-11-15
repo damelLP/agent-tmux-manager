@@ -3560,9 +3560,10 @@ mod reconciliation {
     mod lifecycle {
         include!("agent_lifecycle_tests.rs");
         include!("agent_clear_tests.rs");
-        include!("stop_tests.rs");
         include!("agent_up_tests.rs");
         include!("agent_start_dialog_tests.rs");
+        include!("agent_respawn_tests.rs");
+        include!("stop_tests.rs");
     }
 
     #[tokio::test]

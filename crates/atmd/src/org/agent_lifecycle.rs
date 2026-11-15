@@ -8,9 +8,9 @@
 use super::agent_flow::{
     adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, decide_start,
     input_refusal, launch_enter_allowed, launch_line, launch_line_is_staged, launch_paste_allowed,
-    placement, prompt_line_allowed, safe_editor, safe_to_paste, shell_baseline, shell_refusal,
-    start_view, started_session, submit_allowed, submit_step, ClearProgress, KeyAction, ProcFacts,
-    Ready, StartProgress, StartView, Step,
+    placement, safe_editor, safe_to_paste, shell_baseline, shell_refusal, start_view,
+    started_session, submit_allowed, submit_step, ClearProgress, KeyAction, ProcFacts, Ready,
+    StartProgress, StartView, Step,
 };
 use super::agent_launch::{launch_command, LaunchCommand};
 use super::agent_project::PreparedAgent;
@@ -45,6 +45,7 @@ impl AgentRuntime {
     /// A pane that is positively gone already satisfies either. A pane that
     /// carries another tag is not this agent's any more: nothing is changed
     /// and the call refuses. No keys are sent and no end event is awaited.
+    /// `operation` is the method the kill is audited under.
     pub(super) async fn down(
         &self,
         r: &Reservation,
@@ -52,6 +53,7 @@ impl AgentRuntime {
         reserved: Option<&PaneId>,
         kill: bool,
         effect: &Effect,
+        operation: &str,
     ) -> Result<DownResult, AgentError> {
         let state = self.org.snapshot().await?;
         let agent = state
@@ -85,7 +87,7 @@ impl AgentRuntime {
                     effect.store(true, Ordering::SeqCst);
                     let done = if kill {
                         let action = serde_json::json!({
-                            "method": "agent.down",
+                            "method": operation,
                             "agent": id.to_string(),
                         });
                         r.kill(pane, id.clone(), action, chrono::Utc::now()).await
@@ -497,11 +499,43 @@ pub(super) fn pin(
 /// Why a clear has not completed. `None` until the flow commits to clearing;
 /// from then on the flow keeps it current, so that the cleanup can say why
 /// when the reservation's deadline, or an error, stops the flow.
-pub(super) type Waiting = Arc<std::sync::Mutex<Option<String>>>;
+pub(super) type Waiting = Arc<std::sync::Mutex<Unfinished>>;
+
+#[derive(Debug, Default)]
+pub(super) struct Unfinished {
+    reason: Option<String>,
+    /// The keys the flow has sent to its harness's dialogs. The cleanup adds
+    /// it to the reason, whatever the flow waited for last.
+    unanswered: Option<String>,
+    /// The audit of an accept whose dialog has not been seen to go. The
+    /// cleanup writes it when the flow ends before that was seen.
+    unaudited: Option<atm_org::ControlAudit>,
+}
 
 fn waiting_for(waiting: &Waiting, reason: impl Into<String>) {
     if let Ok(mut waiting) = waiting.lock() {
-        *waiting = Some(reason.into());
+        waiting.reason = Some(reason.into());
+    }
+}
+
+fn unanswered(waiting: &Waiting, sent: Option<String>) {
+    if let Ok(mut waiting) = waiting.lock() {
+        waiting.unanswered = sent;
+    }
+}
+
+fn unaudited(waiting: &Waiting, audit: Option<atm_org::ControlAudit>) {
+    if let Ok(mut waiting) = waiting.lock() {
+        waiting.unaudited = audit;
+    }
+}
+
+/// How a reason names the dialog a start's key went to.
+fn dialog_name(dialog: &ControlDialog) -> String {
+    match dialog {
+        ControlDialog::FolderTrust { folder, .. } => format!("the trust dialog for {folder}"),
+        ControlDialog::LaunchSkip { .. } => "the update prompt".into(),
+        _ => "the harness's start dialog".into(),
     }
 }
 
@@ -825,6 +859,30 @@ impl AgentRuntime {
             .await
     }
 
+    /// The cleanup of a respawn: that of the Down it began with (a killed
+    /// pane the agent is still recorded on can't be accounted for), then that
+    /// of the start that followed.
+    pub(super) async fn settle_respawn(
+        &self,
+        id: &AgentId,
+        old: Option<&PaneId>,
+        effect: &Effect,
+        waiting: &Waiting,
+    ) -> Result<(), AgentError> {
+        let state = self.org.snapshot().await?;
+        if effect.load(Ordering::SeqCst)
+            && state.agent(id).is_some_and(|agent| {
+                agent.status != AgentStatus::Down
+                    && agent.pane.as_deref() == old.map(PaneId::as_str)
+            })
+        {
+            return Err(AgentError::Internal(format!(
+                "agent {id}'s pane was changed but its Down is not recorded"
+            )));
+        }
+        self.settle_up(id, waiting).await
+    }
+
     async fn settle(
         &self,
         id: &AgentId,
@@ -833,9 +891,26 @@ impl AgentRuntime {
         what: &str,
     ) -> Result<(), AgentError> {
         let state = self.org.snapshot().await?;
-        let committed = waiting
-            .lock()
-            .map_or_else(|_| Some("its progress was lost".into()), |w| w.clone());
+        let (committed, unaudited) = waiting.lock().map_or_else(
+            |_| (Some("its progress was lost".into()), None),
+            |mut w| {
+                let sent = w.unanswered.iter().map(|sent| format!("; {sent}"));
+                let reason = w
+                    .reason
+                    .clone()
+                    .map(|reason| reason + &sent.collect::<String>());
+                (reason, w.unaudited.take())
+            },
+        );
+        if let Some(audit) = unaudited {
+            // An accept went out and the flow ended before its dialog was
+            // seen to go. A failure to write this must not cost the Stuck
+            // record below, which names the key too.
+            let _ = self
+                .org
+                .execute(OrgCommand::ControlSent(audit), chrono::Utc::now())
+                .await;
+        }
         let (Some(waiting), Some(agent)) = (
             committed,
             state.agent(id).filter(|agent| agent.status == unfinished),
@@ -880,6 +955,14 @@ pub(super) struct Launch {
     direction: atm_tmux::PaneDirection,
     /// The agent whose pane the role's `pane` hint names, if it has one.
     beside: Option<AgentId>,
+}
+
+/// What a respawn replaces before it starts the agent again: the pane the
+/// agent was reserved with, if it had one, and the flag its kill sets.
+#[derive(Debug)]
+pub(super) struct Replace {
+    pub reserved: Option<PaneId>,
+    pub effect: Effect,
 }
 
 impl AgentRuntime {
@@ -957,20 +1040,36 @@ impl AgentRuntime {
     /// safe editor for a harness that announces its session later.
     ///
     /// Nothing is typed until the new pane's root is proven an idle shell
-    /// whose line can be read exactly, and the command is run only when the
-    /// line reads that prompt followed by the command and nothing else. The
+    /// whose line can be read exactly, on a pane nobody has selected; that
+    /// line is read once. The command is typed only after exactly that line,
+    /// and run only when the line reads it followed by the command and
+    /// nothing else. A line that reads otherwise before the paste ends the
+    /// start. After the paste the text can't be taken back, so the start
+    /// waits: the Enter goes out only once the line reads exactly that again,
+    /// and at the deadline the command is left typed and not run. The
     /// command is pasted once and run once, each under a guard on the control
     /// actor's own capture; an input whose outcome is unknown is never
     /// repeated. A dialog the harness opens at its start is answered only
     /// where the harness's policy and the role allow it (a trust dialog for
     /// one of the role's trust directories, a prompt the launch may skip),
-    /// each key under a guard on that same dialog, and audited. From the Up it
-    /// records onwards the flow never gives up quietly: every failure, and the deadline, leaves the agent Starting for
-    /// [`Self::settle_up`] to mark Stuck.
+    /// each key under a guard on that same dialog, and audited.
+    ///
+    /// Once the flow knows its Up is recorded it never gives up quietly: every
+    /// failure, and the deadline, leaves the agent Starting for
+    /// [`Self::settle_up`] to mark Stuck. Two cases end otherwise. If the Up's
+    /// reply is lost, the flow has set no reason, the cleanup marks nothing,
+    /// and the next observation records the agent Down for having no pane.
+    /// And if the cleanup can't write, the reservation is quarantined with
+    /// the agent still Starting.
+    ///
+    /// With `replace` this is a respawn: once the pane to split is proven, and
+    /// is not the agent's own, the agent is taken down as [`Self::down`] does
+    /// with a kill, and then started as above, all in this one reservation.
     pub(super) async fn up(
         &self,
         r: &Reservation,
         launch: Launch,
+        replace: Option<Replace>,
         waiting: &Waiting,
     ) -> Result<UpResult, AgentError> {
         let Launch {
@@ -991,35 +1090,77 @@ impl AgentRuntime {
         let (policy, format, tag) = (screen.policy(), screen.capture_format(), id.to_string());
         // The pane to split: read only, it grants no input.
         let target = PaneId::parse(context.target_pane.clone())?;
+        let verb = if replace.is_some() {
+            "respawned"
+        } else {
+            "started"
+        };
         let refused = |reason: String| {
             AgentError::Refused(format!(
-                "agent {id} was not started: {reason}; nothing was changed"
+                "agent {id} was not {verb}: {reason}; nothing was changed"
             ))
         };
-        let found = r
-            .inspect(&target)
-            .await?
-            .filter(|found| !found.dead)
-            .ok_or_else(|| refused(format!("the pane to split, {target}, is gone")))?;
-        if let Some(beside) = &beside {
-            if found.local_agent_tag.as_deref() != Some(&beside.to_string()) {
-                return Err(refused(format!(
-                    "{target} is no longer agent {beside}'s pane"
-                )));
-            }
+        // Why the pane to split can't be used; `None` when it can.
+        let placement = || async {
+            let found = r.inspect(&target).await?.filter(|found| !found.dead);
+            Ok::<_, AgentError>(match (found, &beside) {
+                (None, _) => Some(format!("the pane to split, {target}, is gone")),
+                (Some(found), Some(beside))
+                    if found.local_agent_tag.as_deref() != Some(&beside.to_string()) =>
+                {
+                    Some(format!("{target} is no longer agent {beside}'s pane"))
+                }
+                _ => None,
+            })
+        };
+        if let Some(reason) = placement().await? {
+            return Err(refused(reason));
         }
-        // The organisation refuses an agent that is already up.
-        self.org
-            .execute(
-                OrgCommand::Up {
+        let begin = match replace {
+            // The organisation refuses an agent that is already up.
+            None => OrgCommand::Up {
+                agent_id: id.clone(),
+                role: prepared.role.clone(),
+            },
+            Some(Replace { reserved, effect }) => {
+                // Checked before the kill: afterwards there would be no pane
+                // to split.
+                if reserved.as_ref() == Some(&target) {
+                    return Err(refused(format!(
+                        "the pane to split, {target}, is the agent's own pane, which a respawn kills; run it from another pane"
+                    )));
+                }
+                self.down(r, &id, reserved.as_ref(), true, &effect, "agent.respawn")
+                    .await?;
+                // Again, now that time has passed in the kill.
+                if let Some(reason) = placement().await? {
+                    return Err(AgentError::Refused(format!(
+                        "agent {id} was taken down and not started again: {reason}"
+                    )));
+                }
+                OrgCommand::Respawn {
                     agent_id: id.clone(),
                     role: prepared.role.clone(),
-                },
-                chrono::Utc::now(),
-            )
-            .await?;
-        waiting_for(waiting, "its pane was not created");
-        let pane = r.split(context, direction, "50%".into()).await?;
+                    reason: "respawned".into(),
+                }
+            }
+        };
+        self.org.execute(begin, chrono::Utc::now()).await?;
+        // Said for the call in flight: a split that is stopped, or whose
+        // answer is lost, may have made a pane that no record names.
+        waiting_for(
+            waiting,
+            "its pane may have been created and is not recorded",
+        );
+        let pane = match r.split(context, direction, "50%".into()).await {
+            Ok(pane) => pane,
+            Err(error) => {
+                if before_effect(&error) {
+                    waiting_for(waiting, "its pane was not created");
+                }
+                return Err(error.into());
+            }
+        };
         waiting_for(waiting, format!("{pane} was created and not recorded"));
         r.tag(&pane, ExpectedTag::Absent).await?;
         self.org
@@ -1034,11 +1175,11 @@ impl AgentRuntime {
 
         waiting_for(waiting, "the shell in the new pane is not at its prompt");
         let text = command.text;
-        let mut refused_line = None;
-        let (mut baseline, before) = loop {
-            let (baseline, before) = self
-                .idle_shell(r, &id, &pane, screen, refused_line.as_deref(), waiting)
-                .await?;
+        // The prompt is read once, here, and never again: a line that reads
+        // otherwise later has something typed at it, and a launch typed
+        // after it would run that too.
+        let (mut baseline, before) = self.idle_shell(r, &id, &pane, screen, waiting).await?;
+        loop {
             let guard = {
                 let (baseline, tag, before) = (baseline.clone(), tag.clone(), before.clone());
                 move |capture: &_| launch_paste_allowed(screen, capture, &baseline, &tag, &before)
@@ -1049,19 +1190,32 @@ impl AgentRuntime {
                 .paste_guarded(&pane, id.clone(), text.clone(), format, guard)
                 .await
             {
-                Ok(()) => break (baseline, before),
-                // Nothing was sent: read the shell's line again.
-                Err(error) => {
-                    input_error(
+                Ok(()) => break,
+                Err(error) => input_error(
+                    waiting,
+                    "typing the launch command",
+                    "the shell's line changed before the launch command was typed",
+                    error,
+                )?,
+            }
+            // Nothing was sent. A pane that takes no input for now (somebody
+            // is focused on it) is waited on; a line that is not the prompt
+            // any more ends the start.
+            let capture = r.capture(&pane, format).await?;
+            match shell_refusal(screen, &capture, &baseline, &tag) {
+                Some(reason) => waiting_for(waiting, reason),
+                None if launch_line(&capture).as_deref() == Some(before.as_str()) => {}
+                None => {
+                    return Err(stopped(
                         waiting,
-                        "typing the launch command",
-                        "the shell's line changed before the launch command was typed",
-                        error,
-                    )?;
-                    refused_line = Some(before);
+                        &id,
+                        "start",
+                        "the shell's line changed after its prompt was read, so nothing was typed"
+                            .into(),
+                    ))
                 }
             }
-        };
+        }
         // Subscribed before the command runs: a session that arrives from
         // here on is an event.
         let mut events = self.registry.subscribe();
@@ -1127,25 +1281,35 @@ impl AgentRuntime {
 
         let announces = policy.session_arrival == SessionArrival::AtStart;
         let mut progress = StartProgress::default();
-        // The key that last accepted a trust dialog, for its audit.
+        // The key that last accepted a trust dialog, for its audit, and every
+        // key this start has sent to a dialog, as (the dialog, its keys).
         let mut accepted_with = None;
-        let audit = |dialog: &str, key: PaneKey, folder: Option<String>| {
+        let mut sent_keys: Vec<(String, Vec<String>)> = Vec::new();
+        // `gone` is said only by the audit of an accept whose dialog was not
+        // seen to go; the audit of one that was has no such field.
+        let audit_of = |dialog: &str, key: PaneKey, folder: Option<&str>, gone: Option<bool>| {
             let mut action = serde_json::json!({
                 "method": "agent.up",
                 "agent": tag,
                 "dialog": dialog,
                 "key": format!("{key:?}"),
             });
-            if let Some((action, folder)) = action.as_object_mut().zip(folder) {
-                action.insert("folder".into(), folder.into());
+            if let Some(action) = action.as_object_mut() {
+                if let Some(folder) = folder {
+                    action.insert("folder".into(), folder.into());
+                }
+                if let Some(gone) = gone {
+                    action.insert("dialog_gone".into(), gone.into());
+                }
             }
-            self.org.execute(
-                OrgCommand::ControlSent(atm_org::ControlAudit {
-                    pane: pane.to_string(),
-                    action,
-                }),
-                chrono::Utc::now(),
-            )
+            atm_org::ControlAudit {
+                pane: pane.to_string(),
+                action,
+            }
+        };
+        let audit = |audit: atm_org::ControlAudit| {
+            self.org
+                .execute(OrgCommand::ControlSent(audit), chrono::Utc::now())
         };
         loop {
             let mut session = None;
@@ -1174,7 +1338,10 @@ impl AgentRuntime {
             // The first screen after an accept that is not the trust dialog:
             // the harness took the answer.
             if let Some((folder, key)) = progress.trust_accepted(&control).zip(accepted_with) {
-                audit("folder_trust", key, Some(folder)).await?;
+                // Never two audits for one accept: this one replaces the one
+                // the cleanup would write.
+                unaudited(waiting, None);
+                audit(audit_of("folder_trust", key, Some(&folder), None)).await?;
             }
             match decide_start(
                 policy,
@@ -1233,26 +1400,58 @@ impl AgentRuntime {
                         }
                     };
                     // Said before the key, as for the launch's Enter.
+                    let dialog = dialog_name(&expect);
                     waiting_for(
                         waiting,
-                        "the harness's start dialog was being answered and the key may have reached it",
+                        format!(
+                            "{key:?} was being sent to {dialog} and may have reached the harness"
+                        ),
                     );
                     #[cfg(test)]
                     self.progress("up_answering", Some(id.clone()));
                     match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
                         Ok(()) => {
                             progress.sent(action, &expect);
-                            match action {
-                                KeyAction::TrustAccept => accepted_with = Some(key),
-                                KeyAction::SkipLaunchPrompt => {
-                                    audit("launch_skip", key, None).await?;
+                            // Every reason from here on names the keys sent.
+                            match sent_keys.last_mut() {
+                                Some((to, keys)) if *to == dialog => keys.push(format!("{key:?}")),
+                                _ => sent_keys.push((dialog, vec![format!("{key:?}")])),
+                            }
+                            let sent: Vec<String> = sent_keys
+                                .iter()
+                                .map(|(to, keys)| format!("{} to {to}", keys.join(", ")))
+                                .collect();
+                            unanswered(
+                                waiting,
+                                Some(format!("atm had sent {}", sent.join(" and "))),
+                            );
+                            match (action, &expect) {
+                                (
+                                    KeyAction::TrustAccept,
+                                    ControlDialog::FolderTrust { folder, .. },
+                                ) => {
+                                    accepted_with = Some(key);
+                                    // Written by the cleanup if the start
+                                    // ends before the dialog is seen to go.
+                                    unaudited(
+                                        waiting,
+                                        Some(audit_of(
+                                            "folder_trust",
+                                            key,
+                                            Some(folder),
+                                            Some(false),
+                                        )),
+                                    );
+                                }
+                                (KeyAction::SkipLaunchPrompt, _) => {
+                                    audit(audit_of("launch_skip", key, None, None)).await?;
                                 }
                                 _ => {}
                             }
                         }
                         Err(error) => input_error(
                             waiting,
-                            "answering the harness's start dialog",
+                            &format!("sending {key:?} to {dialog}"),
                             "the harness's start dialog changed before it was answered",
                             error,
                         )?,
@@ -1268,15 +1467,18 @@ impl AgentRuntime {
     /// before the cursor, which the paste and its Enter are checked against.
     ///
     /// The process facts are read between two captures and used only when both
-    /// show the same root process, shell and line, and that line is not blank. A line that is
-    /// `refused_line` with more typed after it is never taken.
+    /// show the same root process, shell and line, and that line is not blank.
+    ///
+    /// Text reaches that line only from a client that selected the pane, so a
+    /// capture that shows the pane focused before the line is read, or whose
+    /// focus could not be read, ends the start: the line could hold what was
+    /// typed, and waiting for the focus to leave would not show it.
     async fn idle_shell(
         &self,
         r: &Reservation,
         id: &AgentId,
         pane: &PaneId,
         screen: &'static AgentScreen,
-        refused_line: Option<&str>,
         waiting: &Waiting,
     ) -> Result<(PaneBaseline, String), AgentError> {
         let (format, tag) = (screen.capture_format(), id.to_string());
@@ -1286,8 +1488,28 @@ impl AgentRuntime {
                 .pane_root_pid()
                 .zip(capture.inspection.foreground_command.clone())
         };
+        // Unknown focus is not permission: it ends the start as a shown
+        // focus does.
+        let selected = |capture: &PaneCapture| {
+            let what = match capture.focused {
+                Some(false) => return Ok(()),
+                Some(true) => "the new pane was selected before its prompt could be read",
+                None => {
+                    "whether the new pane was selected could not be read before its prompt was read"
+                }
+            };
+            Err(stopped(
+                waiting,
+                id,
+                "start",
+                format!(
+                    "{what}, so nothing was typed; start the harness there by hand and adopt it, or take the agent down and up again"
+                ),
+            ))
+        };
         loop {
             let first = r.capture(pane, format).await?;
+            selected(&first)?;
             let Some((root, command)) = seen(&first) else {
                 continue;
             };
@@ -1299,6 +1521,7 @@ impl AgentRuntime {
             };
             // The second capture must show that root and shell again.
             let second = r.capture(pane, format).await?;
+            selected(&second)?;
             if let Some(reason) = shell_refusal(screen, &second, &baseline, &tag) {
                 waiting_for(waiting, reason);
                 continue;
@@ -1307,9 +1530,7 @@ impl AgentRuntime {
                 // A blank line is a shell that has drawn no prompt yet (an idle
                 // shell can still be reading its startup files).
                 Some(line)
-                    if !line.trim().is_empty()
-                        && launch_line(&first).as_ref() == Some(&line)
-                        && prompt_line_allowed(refused_line, &line) =>
+                    if !line.trim().is_empty() && launch_line(&first).as_ref() == Some(&line) =>
                 {
                     self.record_baseline(id.clone(), pane.as_str(), baseline.clone());
                     return Ok((baseline, line));

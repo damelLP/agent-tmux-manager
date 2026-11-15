@@ -83,6 +83,8 @@ pub enum ExecutorHold {
     StagedMismatch,
     InputOutcomeUnknown,
     TokenVisible,
+    /// The reference is on the screen and the attempt sent no Enter.
+    EnterNotSent,
 }
 
 /// Raw inspection fact, before A1 attaches continuous GoneSince history.

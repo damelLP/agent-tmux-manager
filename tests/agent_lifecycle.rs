@@ -83,17 +83,16 @@ fn down_kill_removes_pane_and_records_audit() {
     let result = test.rpc("agent.down", json!({"agent": id, "kill": true}), None);
     assert_eq!(result, json!({"agent_id": id}));
     stand_in::process::wait_exit(pane.pid, std::time::Duration::from_secs(30)).unwrap();
-    // Down needs no ending hook or editor input. EOF before SIGHUP can still
-    // make the dying stand-in record its own SessionEnd attempt, and only that.
+    // Down needs no ending hook or editor input. EOF before SIGHUP can make
+    // the stand-in record SessionEnd; if its hook returns first, it records exit.
     for event in test
         .rig
         .journal(&pane)
         .iter()
         .filter(|e| e["event_sequence"].as_u64().unwrap() > before_kill)
     {
-        assert_eq!(
-            (event["kind"].as_str(), event["event"].as_str()),
-            (Some("event"), Some("SessionEnd")),
+        assert!(
+            event["kind"] == "exit" || (event["kind"] == "event" && event["event"] == "SessionEnd"),
             "unexpected record after kill: {event}"
         );
     }
@@ -114,6 +113,16 @@ fn down_kill_removes_pane_and_records_audit() {
         .filter(|e| e["kind"] == "control.killed")
         .collect();
     assert_eq!(kills.len(), 1, "{events:?}");
+    // A submitted /exit in one input chunk can leave only the allowed journal
+    // records, so the kill must also be the only audited control action.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["kind"].as_str().unwrap().starts_with("control."))
+            .count(),
+        1,
+        "{events:?}"
+    );
     assert_eq!(
         kills[0]["body"],
         json!({"pane": pane.pane_id, "action": {"method":"agent.down", "agent":id}})
@@ -221,7 +230,7 @@ fn adopt_noninteractive_launcher_stays_starting() {
 }
 
 /// Verify private selectors/env and reject harness executables on daemon PATH.
-/// The outer seal already removes TMUX/TMUX_PANE; this is not a leak injection.
+/// The rig's command() clears every child's environment, including TMUX/TMUX_PANE.
 #[test]
 fn lifecycle_rig_is_private_and_daemon_override_is_set() {
     let mut first = AgentRig::start(StandInMode::Claude);
@@ -467,7 +476,7 @@ fn unknown_modal_zero_keys() {}
 /// Empty idle input with pi retry chrome is not Ready. No current U11b retry
 /// scene exists; capture-backed tests elsewhere do not implement this case.
 #[test]
-#[ignore = "waits for Tasks 6/8 and the missing U11b pi-retry fixture"]
+#[ignore = "waits for Task 6 and the missing U11b pi-retry fixture; agent.clear is in the base, acceptance not yet written"]
 fn retry_chrome_empty_idle_blocks_ready() {}
 
 /// Hold after clear consumption; watch clear_requested before raw session.send

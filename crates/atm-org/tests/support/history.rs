@@ -41,7 +41,7 @@ pub struct Seed {
 }
 pub fn arb_seed() -> impl Strategy<Value = Seed> {
     (
-        0usize..21,
+        0usize..23,
         0usize..3,
         0usize..4,
         0usize..6,
@@ -177,7 +177,15 @@ impl Seed {
             17 => OrgCommand::ControlSpawned(audit),
             18 => OrgCommand::ControlKilled(audit),
             19 => OrgCommand::EditorReady { agent_id },
-            _ => OrgCommand::Revalidate { agent_id },
+            20 => OrgCommand::Revalidate { agent_id },
+            21 => OrgCommand::SaveRequested {
+                agent_id,
+                message_id,
+            },
+            _ => OrgCommand::Saved {
+                agent_id,
+                message_id,
+            },
         }
     }
 }

@@ -339,7 +339,10 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::SessionSummary(_)
         | OrgEvent::ControlSent(_)
         | OrgEvent::ControlSpawned(_)
-        | OrgEvent::ControlKilled(_) => None,
+        | OrgEvent::ControlKilled(_)
+        // Audits of a handover: they name an agent and change nothing in it.
+        | OrgEvent::AgentSaveRequested { .. }
+        | OrgEvent::AgentSaved { .. } => None,
     }
 }
 

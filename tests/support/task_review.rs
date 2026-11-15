@@ -237,3 +237,11 @@ async fn daemon_read_timeout_does_not_claim_accepted_work() {
         );
     }
 }
+
+// Break caught: an unfamiliar fixture setup is silently replayed as "assigned".
+#[tokio::test]
+#[should_panic(expected = "unknown task CLI fixture setup")]
+async fn unknown_fixture_setup_is_refused_not_guessed() {
+    let fixture = json!({"setup":"not-a-setup","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"probe","method":"task.list","params":{}}});
+    super::support::method_answer(&fixture, None).await;
+}

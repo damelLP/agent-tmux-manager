@@ -42,7 +42,7 @@ async fn all_nine_task_commands_have_help() {
 #[tokio::test]
 async fn method_answers_match_the_recorded_contract() {
     let fixtures = support::contracts();
-    assert_eq!(fixtures.len(), 18);
+    assert_eq!(fixtures.len(), cases().len() * 2);
     for fixture in fixtures {
         let answer = support::method_answer(&fixture, None).await;
         let name = fixture["name"].as_str().unwrap();

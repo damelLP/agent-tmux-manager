@@ -158,23 +158,15 @@ pub async fn exchange(
 }
 
 pub fn contracts() -> Vec<Value> {
-    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/atmd/tests/fixtures/tasks");
-    let mut paths: Vec<_> = std::fs::read_dir(folder)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    paths.sort();
-    paths
-        .into_iter()
-        .map(|path| {
-            let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            value["name"] = json!(path.file_stem().unwrap().to_str().unwrap());
-            value
-        })
-        .collect()
+    serde_json::from_str(include_str!("../fixtures/atm_task/requests.json")).unwrap()
 }
 
 pub async fn method_answer(fixture: &Value, cli_args: Option<&[&str]>) -> Value {
+    let setup = fixture["setup"].as_str().unwrap_or("");
+    assert!(
+        matches!(setup, "" | "assigned" | "submitted" | "review"),
+        "unknown task CLI fixture setup: {setup:?}"
+    );
     use atm_org::{OrgCommand, TaskActor, TaskCommand, TaskCreated, TaskKind, TaskSubmission};
     use atmd::{
         org::{agents::AgentHandle, messages::MessageHandle, OrgHandle},
@@ -221,7 +213,6 @@ pub async fn method_answer(fixture: &Value, cli_args: Option<&[&str]>) -> Value 
         who: who.parse().unwrap(),
         lead: who == "project/lead",
     };
-    let setup = fixture["setup"].as_str().unwrap_or("");
     if !setup.is_empty() {
         org.execute(
             OrgCommand::Task(TaskCommand::Assign {

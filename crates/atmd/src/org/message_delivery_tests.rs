@@ -3086,3 +3086,170 @@ async fn narrow_reference_and_trailing_padding_ambiguity_no_enter() {
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);
 }
+
+// ---------------------------------------------------------------------------
+// Settlement against the policy: holds block, a proven no-effect retries
+// ---------------------------------------------------------------------------
+
+/// One whole attempt whose Enter is sent and never confirmed, optionally
+/// with other activity in the session while it waits (a prompt event that
+/// is not the reference: the hook for ours was dropped). Returns the rig
+/// after the attempt ended at the confirmation window.
+async fn unconfirmed_enter(activity: bool) -> (Rig, MessageId) {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let attempt = rig.spawn_deliver(id);
+    rig.audited().await;
+    if activity {
+        rig.prompt("s1", "something else the session was told".into());
+    }
+    guarded(attempt).await.unwrap().unwrap();
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    (rig, id)
+}
+
+/// After an unconfirmed Enter the policy blocks the message for as long as
+/// nobody resolves it, and an executor run for it types nothing and writes
+/// nothing: no failure, no retry, no second paste.
+async fn stays_blocked(rig: &mut Rig, id: MessageId) {
+    let blocked = DeliveryStep::Blocked {
+        reason: FailureReason::ProbablyDelivered,
+    };
+    let before = rig.org.status().unwrap();
+    for _ in 0..2 {
+        assert_eq!(rig.step(id), blocked);
+        // The executor's one capture; it must not ask for a paste guard.
+        rig.script(&[pi(IDLE)]);
+        rig.deliver(id).await.unwrap();
+        assert!(rig.typed(id), "{:?}", rig.effects());
+        assert_eq!(rig.reads(), 0);
+        assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivering);
+        tokio::time::advance(Duration::from_secs(600)).await;
+    }
+    rig.rt.control.flush_audits().await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before);
+}
+
+/// The Enter was applied; no receipt and no activity followed. Held with
+/// the token as the reason, and blocked: never an automatic retry.
+#[tokio::test(start_paused = true)]
+async fn token_visible_after_enter_blocks_retry() {
+    let (mut rig, id) = unconfirmed_enter(false).await;
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::TokenVisible));
+    assert!(!rig.rt.evidence.snapshot(id).unwrap().probably_landed);
+    stays_blocked(&mut rig, id).await;
+}
+
+/// The same with the session active while the attempt waited: the hook for
+/// our prompt was dropped, the turn is visibly running. No second paste.
+#[tokio::test(start_paused = true)]
+async fn dropped_prompt_with_activity_blocks_second_paste() {
+    let (mut rig, id) = unconfirmed_enter(true).await;
+    assert!(rig.rt.evidence.snapshot(id).unwrap().probably_landed);
+    stays_blocked(&mut rig, id).await;
+}
+
+/// The audit of the Enter cannot be written for a while (the organisation
+/// writer is held). The attempt does not wait for it and types nothing
+/// again; the record that lands later carries the time of the Enter, not
+/// the time it was written.
+#[tokio::test(start_paused = true)]
+async fn audit_stall_or_overflow_never_repeats_input_and_preserves_time() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.script(&[showing(&inbox_reference(id))]);
+    let attempt = rig.spawn_deliver(id);
+    rig.pasted().await;
+    rig.hold();
+    // The next append is the audit: the Enter's call has just returned.
+    let seq = rig.entered().await;
+    let sent = rig.now();
+    assert!(rig.typed(id), "{:?}", rig.effects());
+
+    guarded(attempt).await.unwrap().unwrap();
+
+    let ended = rig.now();
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::TokenVisible));
+    rig.release();
+    let audit = rig.audited().await;
+    assert_eq!(audit.seq, seq);
+    assert_eq!(audit.ts, sent);
+    assert!(audit.ts < ended);
+    assert_eq!(audit.body["action"]["outcome"], "ok");
+}
+
+/// Four attempts that each type nothing (the owner's client is on the pane
+/// when the paste is guarded). The executor fails the first three for
+/// their retries, which the policy times 1, 2 and 4 seconds later, and
+/// leaves the fourth, the final one by the policy's count, to the policy.
+/// Nothing is ever pasted.
+#[tokio::test(start_paused = true)]
+async fn proven_no_effect_retries_1_2_4_then_final() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    let before = rig.org.status().unwrap();
+    for (attempt, delay) in [(1, Some(1)), (2, Some(2)), (3, Some(4)), (4, None)] {
+        assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt });
+        rig.script(&[pi(IDLE), focused()]);
+        rig.deliver(id).await.unwrap();
+        assert_eq!((rig.pastes(), rig.reads()), (0, 0), "attempt {attempt}");
+        let snapshot = rig.snapshot(id);
+        assert_eq!(snapshot.hold, None, "attempt {attempt}");
+        let Some(delay) = delay else {
+            // The final attempt: no failure from the executor.
+            assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+            break;
+        };
+        assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+        let step = rig.step(id);
+        assert!(matches!(step, DeliveryStep::RetryAt { .. }), "{step:?}");
+        // Not a moment before its delay has passed.
+        tokio::time::advance(Duration::from_secs(delay) - Duration::from_millis(1)).await;
+        let step = rig.step(id);
+        assert!(matches!(step, DeliveryStep::RetryAt { .. }), "{step:?}");
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    // Four attempts and three failures were written, and no fourth failure.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 7);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let failed = DeliveryStep::Fail {
+        reason: FailureReason::ConfirmationTimeout,
+    };
+    assert_eq!(rig.step(id), failed);
+}
+
+/// Attempt 1 was armed, typed nothing and was failed for its retry. Before
+/// the retry the session reports the exact reference for attempt 1's scope
+/// (the owner pasted and submitted it himself, say). The next run of the
+/// executor finds the receipt: no attempt 2, no paste, delivered.
+#[tokio::test(start_paused = true)]
+async fn receipt_between_failure_and_retry_cancels() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), focused()]);
+    rig.deliver(id).await.unwrap();
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+    let before = rig.org.status().unwrap();
+    rig.prompt("s1", inbox_reference(id));
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    // The executor's one capture: a paste guard would find no frame.
+    rig.script(&[pi(IDLE)]);
+    rig.deliver(id).await.unwrap();
+
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert_eq!(rig.reads(), 0);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+    assert_eq!(snapshot.message.last_attempt.map(|a| a.attempt), Some(1));
+    // Only `Delivered` was written.
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+}

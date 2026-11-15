@@ -21,9 +21,10 @@
 //! request was queued, or that did not exist then. Its content is not read.
 //!
 //! The turn's end is taken from events only. The task subscribes to the
-//! registry and to committed events before it queues the request, and reads
-//! registry events first, so the end of an earlier turn is never taken for
-//! the end of the save turn. It refuses early only for a turn it saw start
+//! registry and to committed events before it queues the request. It reads
+//! registry events first, and reads that channel empty every time it looks
+//! at committed state, so neither the end of an earlier turn nor a status
+//! from before the delivery is taken for the end of the save turn. It refuses early only for a turn it saw start
 //! and end after the delivery; otherwise an idle session with an unchanged
 //! file waits for the deadline. A harness that shows idle while it works can
 //! at worst lead to a clear on a busy screen, which the clear refuses.
@@ -290,6 +291,10 @@ pub(super) struct Handovers {
     files: Arc<Semaphore>,
 }
 
+fn registry_stopped() -> MethodError {
+    AgentError::Unavailable("session registry stopped".into()).into()
+}
+
 fn refused(message: String) -> MethodError {
     MethodError::new(error_code::REFUSED, message)
 }
@@ -536,24 +541,9 @@ impl Job {
                 // must be read before it.
                 biased;
                 row = self.rows.recv() => match row {
-                    Ok(SessionEvent::Updated { session }) if session.id == self.session => {
-                        self.observe(session.status);
-                    }
-                    Ok(SessionEvent::Removed { session_id, .. }) if session_id == self.session => {
-                        return Err(refused(format!(
-                            "{}'s session ended before it had saved; nothing was cleared",
-                            self.agent
-                        )));
-                    }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Some(row) = self.service.registry.get_session(self.session.clone()).await {
-                            self.observe(row.status);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(AgentError::Unavailable("session registry stopped".into()).into());
-                    }
+                    Ok(event) => self.row(event)?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => self.reread_row().await,
+                    Err(broadcast::error::RecvError::Closed) => return Err(registry_stopped()),
                 },
                 event = self.committed.recv() => match event {
                     Ok(event) if !self.concerns(&event) => {}
@@ -581,7 +571,39 @@ impl Job {
             || named("message_id", self.message_id.to_string())
     }
 
-    /// Read the request's delivery and the agent's state from committed state.
+    /// One registry event: this session's status, or its end.
+    fn row(&mut self, event: SessionEvent) -> Result<(), MethodError> {
+        match event {
+            SessionEvent::Updated { session } if session.id == self.session => {
+                self.observe(session.status);
+            }
+            SessionEvent::Removed { session_id, .. } if session_id == self.session => {
+                return Err(refused(format!(
+                    "{}'s session ended before it had saved; nothing was cleared",
+                    self.agent
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// After missed registry events: the session's row as it is now.
+    async fn reread_row(&mut self) {
+        let row = self.service.registry.get_session(self.session.clone());
+        if let Some(row) = row.await {
+            self.observe(row.status);
+        }
+    }
+
+    /// Read the request's delivery and the agent's state from committed
+    /// state, and before that every registry event that is already there.
+    ///
+    /// The harness's prompt event sets the session working in the registry
+    /// before the delivery it confirms is committed. So once the snapshot
+    /// shows the delivery, the save turn's first status is in the registry
+    /// channel, read or not. Reading the channel empty here means a delivery
+    /// is never judged against a status from before the save turn.
     async fn refresh(&mut self) -> Result<(), MethodError> {
         let state = self
             .service
@@ -589,6 +611,14 @@ impl Job {
             .snapshot()
             .await
             .map_err(AgentError::from)?;
+        loop {
+            match self.rows.try_recv() {
+                Ok(event) => self.row(event)?,
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => self.reread_row().await,
+                Err(broadcast::error::TryRecvError::Closed) => return Err(registry_stopped()),
+            }
+        }
         let message = state.message(&self.message_id).ok_or_else(|| {
             AgentError::Internal(format!("save request {} was not found", self.message_id))
         })?;

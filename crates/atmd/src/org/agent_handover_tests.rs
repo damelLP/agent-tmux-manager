@@ -593,6 +593,43 @@ async fn an_idle_seen_before_the_save_turn_is_not_its_end() {
     assert_eq!(answer(call).await.unwrap().state, HandoverState::Cleared);
 }
 
+/// The ordering a busy daemon can produce: the agent wrote its memory file
+/// before the request reached it (it asked for its own handover and wrote in
+/// the same turn), and the job reads the delivery from committed state while
+/// the save turn's first status is still unread in its registry channel. The
+/// file has changed and the last status the job knows is idle, yet the save
+/// turn has only begun. The deadline is already due, so a job that waits for
+/// the turn answers "did not end", and one that takes the stale idle for the
+/// turn's end answers `cleared`.
+#[tokio::test]
+async fn a_delivery_read_before_the_save_turns_status_does_not_end_the_save() {
+    let mut rig = Rig::new().await;
+    std::fs::write(rig.memory("worker"), "old state").unwrap();
+    let p = HandoverParams {
+        agent: id("worker"),
+        timeout_ms: 600_000,
+    };
+    let due = Box::pin(std::future::ready(()));
+    let admitted = rig.service.admit(p, owner(), due).await.ok().unwrap();
+    let request = rig.requested().await;
+    std::fs::write(rig.memory("worker"), "written before the request arrived").unwrap();
+    // The prompt: the registry shows the save turn, then the delivery is
+    // committed. The job has not run yet and has read neither.
+    rig.deliver(request, "s1", "%1").await;
+
+    let (code, message) = refusal(answer(tokio::spawn(admitted.job.run())).await);
+    assert_eq!(code, error_code::TIMEOUT);
+    assert_eq!(
+        message,
+        "p/worker's save turn did not end in 600 s; nothing was cleared"
+    );
+    assert!(
+        rig.cleared.try_recv().is_err(),
+        "cleared before the save turn"
+    );
+    assert!(!rig.kinds().contains(&"agent.saved".to_string()));
+}
+
 #[tokio::test]
 async fn an_agent_that_asks_for_its_own_handover_is_answered_at_once() {
     let mut rig = Rig::new().await;

@@ -731,12 +731,13 @@ pub fn spawn_messages(
     runtime: MessageRuntime,
     startup_high_water: u64,
 ) -> (MessageHandle, JoinHandle<()>) {
+    let effects = Effects::production(&runtime);
     match runtime.org.watch(Vec::new(), 0) {
         Ok(events) => spawn_service(
             runtime,
             Events::Watch(Box::new(events)),
             startup_high_water,
-            Some(Effects::production()),
+            Some(effects),
         ),
         Err(error) => (
             MessageHandle::disabled(error.to_string()),

@@ -1025,6 +1025,47 @@ async fn unobservable_recipient_says_so_tells_the_owner_once_and_never_pastes() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_observation_slower_than_five_seconds_is_a_loss() {
+    let mut bench = Bench::blind().await;
+    // It would be a ready pane, if the read ever returned.
+    bench.screens.set(worker(), ready("%1", "s1"));
+    close(&bench.screens.gate);
+    let id = bench.send(worker(), "brief").await;
+    bench.pass(4).await;
+    // Still reading: nothing is decided, and nothing is claimed.
+    assert_eq!(bench.screens.calls(&worker()), 1);
+    assert_eq!(bench.entry(worker(), id).await.delivery.reason, None);
+    bench.pass(2).await;
+    waits_unobserved(&bench, id).await;
+    // The slow read was given up, and the next began with the next guard
+    // poll: one read at a time, each with its own five seconds.
+    assert_eq!(bench.screens.calls(&worker()), 2);
+    assert!(bench.entries().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_observation_per_guard_poll_however_often_the_job_wakes() {
+    let bench = Bench::blind().await;
+    bench.send(worker(), "first").await;
+    until("the first observation", || {
+        bench.screens.calls(&worker()) == 1
+    })
+    .await;
+    // Every committed event wakes the job, here three times in one instant.
+    for body in ["second", "third", "fourth"] {
+        bench.send(worker(), body).await;
+    }
+    for _ in 0..1000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(bench.screens.calls(&worker()), 1);
+    // After that, one per poll: each will be a tmux capture.
+    bench.pass(10).await;
+    let calls = bench.screens.calls(&worker());
+    assert!((40..=42).contains(&calls), "{calls} observations in 10 s");
+}
+
+#[tokio::test(start_paused = true)]
 async fn one_unobserved_notice_for_the_oldest_open_message() {
     let bench = Bench::blind().await;
     let first = bench.send(worker(), "first").await;

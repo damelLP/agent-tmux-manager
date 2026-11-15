@@ -133,10 +133,26 @@ class Model:
         self.state, self.deadline = "idle", None
         self.announced = False
         self.drop_next = None
+        self.hold_next = None
+        self.held_hooks = []
         self.active_prompt = ""
         self.queue = []
         self.last_ctrl_c = None
         self.selection = 1
+
+    def arm_hook_hold(self, event=None):
+        known = {f["data"].get("event", f["data"].get("hook_event_name")) for f in self.frames}
+        if event is not None and (not isinstance(event, str) or event not in known):
+            raise ValueError("unknown lifecycle event for this mode")
+        if self.hold_next is not None or self.held_hooks:
+            raise ValueError("a hook hold is already armed or holding")
+        self.hold_next = "*" if event is None else event
+
+    def release_hooks(self):
+        if not self.held_hooks:
+            raise ValueError("no held hook to release")
+        effects, self.held_hooks = self.held_hooks, []
+        return effects
 
     def emit(self, name, variant=None, **updates):
         if not self.hooks_enabled:
@@ -160,7 +176,12 @@ class Model:
             kind = "event"
             if self.drop_next in ("*", name):
                 kind, self.drop_next = "dropped", None
-            return [{"kind": kind, "event": name, "data": data}]
+            effect = {"kind": kind, "event": name, "data": data}
+            if kind == "event" and (self.held_hooks or self.hold_next in ("*", name)):
+                self.hold_next = None
+                self.held_hooks.append(effect)
+                return [dict(effect, kind="held")]
+            return [effect]
         raise ValueError(f"no captured template for {name}/{variant}")
 
     def render(self, detail=""):
@@ -268,6 +289,9 @@ class Model:
                 for session_id in ids:
                     self.session_id = session_id
                     effects += self.emit("SessionEnd", "other" if self.mode == "codex" else "prompt_input_exit")
+            if self.held_hooks:
+                self.held_hooks.append({"kind": "exit"})  # Keep the control stream alive until release.
+                return effects
             return effects + [{"kind": "exit"}]
         if kind in ("up", "down"):
             return []

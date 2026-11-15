@@ -111,6 +111,75 @@ class ControlTests(unittest.TestCase):
             r.control({"id": 3, "command": "refuse_next_paste"})
             self.assertIn("error", journal(r)[-1])
 
+    # Break caught: an acknowledgment-only hold arm forwards completion early.
+    def test_held_completion_is_not_forwarded_until_release(self):
+        for mode, expected in [("claude", ["Stop"]), ("codex", ["Stop"]),
+                               ("pi", ["turn_end", "agent_end"])]:
+            with self.subTest(mode=mode):
+                r = runtime()
+                r.mode, r.model = mode, make(mode)
+                sent = []
+                r.forward = sent.append
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.start())
+                    r.action(("submit", "turn"))
+                    sent.clear()
+                    r.control({"id": 1, "command": "hold_next_hook"})
+                    r.control({"id": 2, "command": "advance_to", "now_ms": 500})
+                    lifecycle = lambda: [d for d in sent if "event" in d or "hook_event_name" in d]
+                    self.assertEqual(lifecycle(), [], "held completion must not be forwarded")
+                    self.assertEqual(r.model.state, "idle")
+                    held = [e for e in journal(r) if e["kind"] == "held"]
+                    self.assertEqual([e["event"] for e in held], expected)
+                    r.control({"id": 3, "command": "barrier"})
+                    self.assertEqual(lifecycle(), [])
+                    r.control({"id": 4, "command": "release_hook"})
+                self.assertEqual(lifecycle(), [e["data"] for e in held])
+                self.assertEqual(journal(r)[-1]["id"], 4, "release acknowledges after forwarding")
+                released = [e for e in journal(r) if e["kind"] == "event"
+                            and e["event"] in expected]
+                self.assertEqual([e["event"] for e in released], expected)
+                r.control({"id": 5, "command": "release_hook"})
+                self.assertIn("error", journal(r)[-1])
+                self.assertEqual(len(lifecycle()), len(expected))
+
+    def test_invalid_hook_controls_do_not_erase_named_hold_or_draft(self):
+        r = runtime()
+        sent = []
+        r.forward = sent.append
+        r.parser.draft.extend(b"keep me")
+        for name in ["stop", "input", "", [], {}, True, 1]:
+            r.control({"id": 1, "command": "hold_next_hook", "event": name})
+            self.assertIn("error", journal(r)[-1])
+        r.control({"id": 2, "command": "hold_next_hook", "event": "Stop"})
+        self.assertNotIn("error", journal(r)[-1])
+        for command in ["hold_next_hook", "release_hook"]:
+            r.control({"id": 3, "command": command})
+            self.assertIn("error", journal(r)[-1])
+        self.assertEqual(r.parser.draft, b"keep me")
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.start())
+            r.action(("submit", "turn"))
+            r.control({"id": 4, "command": "advance_to", "now_ms": 500})
+            self.assertFalse(any(d.get("hook_event_name") == "Stop" for d in sent))
+            r.control({"id": 5, "command": "release_hook"})
+        self.assertEqual(sum(d.get("hook_event_name") == "Stop" for d in sent), 1)
+
+    def test_held_shutdown_can_be_released_before_process_exit(self):
+        r = runtime()
+        sent = []
+        r.forward = sent.append
+        with redirect_stdout(io.StringIO()):
+            r.control({"id": 1, "command": "hold_next_hook"})
+            r.action(("exit", ""))
+            self.assertTrue(r.running)
+            self.assertEqual(sent, [])
+            r.control({"id": 2, "command": "release_hook"})
+        self.assertFalse(r.running)
+        self.assertEqual([d["hook_event_name"] for d in sent], ["SessionEnd"])
+        self.assertEqual(journal(r)[-2]["kind"], "exit")
+        self.assertEqual(journal(r)[-1]["id"], 2)
+
     def test_status_record_follows_forwarding_not_the_draft_redraw(self):
         r = runtime()
         sent = []

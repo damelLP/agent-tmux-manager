@@ -294,6 +294,51 @@ This is **harness non-acceptance after tmux pasted bytes**, not proof that the
 sender sent nothing. It cannot justify a known-zero-effect automatic retry or
 unignore `message_delivery::safe_retry_after_known_zero_effect`.
 
+### Releasable hook hold (synthetic)
+
+The same channel holds hooks without holding model time, terminal rendering or
+control processing. Arm only one gate per process:
+
+- `{"command":"hold_next_hook"}` holds the next emitted lifecycle hook.
+- `{"command":"hold_next_hook","event":"Stop"}` holds the next matching hook.
+  Names are case-sensitive and must exist in this mode's captured templates;
+  omission/JSON null means literally next. For pi's actual end use `agent_end`,
+  or omit `event` to hold both completion hooks in order.
+- A `kind=held` runtime event, with `event` and the exact `data`, is the fence that
+  the hook was withheld, **not** sent. It keeps its original session ID. Every
+  later lifecycle hook is also held in emission order, including across clear.
+  Thus pi's `agent_end` cannot overtake a held `turn_end`. Status payloads are
+  independent: neither held nor a consumer of the arm.
+- `{"command":"release_hook"}` forwards the buffered hooks exactly once, in
+  order, through the normal hook/replay path, then acknowledges the control.
+  It disarms the gate; later hooks flow normally. An acknowledgment is still only
+  completed forwarding attempts, not daemon receipt: await the daemon row/event
+  when receipt matters. A held shutdown also defers process exit until release,
+  keeping this control stream usable; exit otherwise behaves as before.
+- A duplicate arm (armed or holding), unknown/malformed name, or release with no
+  captured hook returns a control error without overwriting the gate/draft.
+  Release while only armed does not cancel that arm. Existing `/atm/drop-next`
+  takes precedence: a dropped hook neither consumes the hold nor reappears on
+  release, including when another hook is already held.
+
+For a late end, start a turn on manual time and await its Working row, then:
+
+```rust,ignore
+// Claude/Codex: optionally add "event": "Stop"; pi: omit it to hold both ends.
+rig.control(&pane, serde_json::json!({"command": "hold_next_hook"}));
+let after = rig.event_cursor(&pane);
+rig.control(&pane, serde_json::json!({"command": "advance_to", "now_ms": 500}));
+rig.wait_event(&pane, after, |e| e["kind"] == "held");
+rig.wait_event(&pane, after, |e| e["kind"] == "rendered" && e["state"] == "idle");
+// The editor looks idle but the completion hook has not been forwarded.
+rig.control(&pane, serde_json::json!({"command": "release_hook"}));
+rig.wait_for_row(&pane, |r| r.status == atm_core::SessionStatus::Idle);
+```
+
+Here `500` is the default `work_ms` from an initial manual clock of zero; use the
+turn's actual deadline if the test has advanced it. This is synthetic fault
+injection, not a claim about vendor hook scheduling. No sleeps are needed.
+
 ### Lifecycle fidelity
 
 | Mode | Startup | Prompt / completion | Clear | Interrupt |

@@ -128,6 +128,97 @@ class InputTests(unittest.TestCase):
                          [("submit", "a\x1bb")])
 
 
+class HookHoldTests(unittest.TestCase):
+    # Synthetic: ordered lifecycle delay; forwarding agent_end early is a bug.
+    def test_literal_next_hold_keeps_pi_completion_order_and_exact_payloads(self):
+        from copy import deepcopy
+        m = make("pi")
+        m.start()
+        m.handle(("submit", "turn"), 0)
+        m.arm_hook_hold()
+        held = m.tick(500)
+        self.assertEqual(events(held), [])
+        payloads = deepcopy([e["data"] for e in held if e["kind"] == "held"])
+        self.assertEqual([e["event"] for e in held if e["kind"] == "held"],
+                         ["turn_end", "agent_end"])
+        self.assertEqual(m.state, "idle")
+        released = m.release_hooks()
+        self.assertEqual(events(released), ["turn_end", "agent_end"])
+        self.assertEqual(data(released), payloads)
+        self.assertEqual([d["session_id"] for d in data(released)], ["test-1", "test-1"])
+        self.assertEqual(events(m.handle(("submit", "normal now"), 501)), ["input", "agent_start"])
+        self.assertEqual(events(m.tick(1001)), ["turn_end", "agent_end"])
+        with self.assertRaises(ValueError):
+            m.release_hooks()
+
+    def test_named_hold_preserves_status_and_ids_across_clear(self):
+        m = make()
+        m.start()
+        m.arm_hook_hold("Stop")
+        self.assertEqual(events(m.handle(("submit", "turn"), 0)), ["UserPromptSubmit"])
+        held = m.tick(500)
+        self.assertEqual(events(held), [])
+        self.assertEqual([e["kind"] for e in held], ["held", "status", "render"])
+        m.handle(("submit", "/clear"), 501, "test-2")
+        self.assertEqual(events(m.tick(601)), [])
+        released = m.release_hooks()
+        self.assertEqual(events(released), ["Stop", "SessionEnd", "SessionStart"])
+        self.assertEqual([d["session_id"] for d in data(released)],
+                         ["test-1", "test-1", "test-2"])
+        self.assertEqual(data(released)[1]["reason"], "clear")
+        self.assertEqual(data(released)[2]["source"], "clear")
+
+    def test_drop_takes_precedence_without_consuming_or_resurrecting_hold(self):
+        m = make()
+        m.start()
+        m.arm_hook_hold()
+        m.handle(("submit", "/atm/drop-next UserPromptSubmit"), 0)
+        dropped = m.handle(("submit", "lost input"), 1)
+        self.assertEqual([e["event"] for e in dropped if e["kind"] == "dropped"],
+                         ["UserPromptSubmit"])
+        with self.assertRaises(ValueError):
+            m.release_hooks()
+        held = m.tick(501)
+        self.assertEqual([e["event"] for e in held if e["kind"] == "held"], ["Stop"])
+        m.handle(("submit", "/atm/drop-next UserPromptSubmit"), 502)
+        dropped = m.handle(("submit", "also lost while holding"), 503)
+        self.assertEqual([e["event"] for e in dropped if e["kind"] == "dropped"],
+                         ["UserPromptSubmit"])
+        self.assertEqual(events(m.release_hooks()), ["Stop"])
+
+    def test_invalid_and_duplicate_gate_commands_leave_original_hold_intact(self):
+        for name in ["stop", "input", "*", "", 1, True, {}, []]:
+            with self.subTest(name=name):
+                m = make()
+                with self.assertRaises(ValueError):
+                    m.arm_hook_hold(name)
+                self.assertEqual(events(m.start()), ["SessionStart"])
+        m = make()
+        m.arm_hook_hold("Stop")
+        for action in [lambda: m.arm_hook_hold(), m.release_hooks]:
+            with self.assertRaises(ValueError):
+                action()
+        self.assertEqual(events(m.start()), ["SessionStart"])
+        m.handle(("submit", "turn"), 0)
+        self.assertEqual(events(m.tick(500)), [])
+        with self.assertRaises(ValueError):
+            m.arm_hook_hold("UserPromptSubmit")
+        self.assertEqual(events(m.release_hooks()), ["Stop"])
+
+    def test_held_shutdown_keeps_exit_releasable(self):
+        for mode, hook in [("claude", "SessionEnd"), ("codex", "SessionEnd"),
+                           ("pi", "session_shutdown")]:
+            with self.subTest(mode=mode):
+                m = make(mode)
+                m.start()
+                m.arm_hook_hold()
+                effects = m.handle(("exit", ""), 0)
+                self.assertEqual([e["kind"] for e in effects], ["held"])
+                released = m.release_hooks()
+                self.assertEqual(events(released), [hook])
+                self.assertEqual(released[-1], {"kind": "exit"})
+
+
 class LifecycleTests(unittest.TestCase):
     def test_claude_start_prompt_end_and_exact_payload(self):
         m = make(work_ms=500)

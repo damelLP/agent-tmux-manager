@@ -174,6 +174,14 @@ class Runtime:
                 self.parser.arm_paste_refusal()
             except ValueError as error:
                 reply["error"] = str(error)
+        elif message.get("command") in ("hold_next_hook", "release_hook"):
+            try:
+                if message["command"] == "hold_next_hook":
+                    self.model.arm_hook_hold(message.get("event"))
+                else:
+                    self.effects(self.model.release_hooks())
+            except ValueError as error:
+                reply["error"] = str(error)
         elif message.get("command") == "render_source":
             spec = next((s for s in self.screen_catalog if s["key"] == message.get("key")
                          and s["mode"] == self.mode), None)

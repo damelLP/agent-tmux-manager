@@ -382,6 +382,25 @@ mod tests {
     }
 
     #[test]
+    fn reservation_state_checks_fence_deadline_boundary() {
+        let now = Instant::now();
+        let mut state = State::default();
+        let req = request(now);
+        let deadline = req.deadline;
+        let pane = req.pane.clone().unwrap();
+        let fence = grant(&mut state, req, now);
+        state
+            .check(&fence, Some(&pane), deadline - Duration::from_nanos(1))
+            .unwrap();
+        for at in [deadline, deadline + Duration::from_nanos(1)] {
+            assert!(matches!(
+                state.check(&fence, Some(&pane), at),
+                Err(ReservationError::Timeout)
+            ));
+        }
+    }
+
+    #[test]
     fn reservation_state_new_pane_jobs_fence_the_previous_agent_generation() {
         let now = Instant::now();
         let mut state = State::default();

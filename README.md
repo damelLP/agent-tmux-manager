@@ -160,6 +160,7 @@ idle_minutes  = 48            # optional: default four fifths of cache_minutes, 
 - **Limits.** All of it is in memory: after a restart of `atmd` nothing is done until a turn ends, and a handover the restart cut off is lost with its note. A request that was never delivered when the handover gave up stays queued, as for the command: once what held it is gone it is typed, the agent saves, and nothing clears the session. For an idle seat that late turn runs on a cold cache; `atm msg give-up mN` cancels the request. An older `atmd` refuses a role file that has these keys (`agent up` fails and `atm me` reports an invalid role), so remove them before going back to one.
   - Admission does not re-check the session the watcher judged: a clear/rebind in that tiny window can target the new session (reasoned, unverified).
   - After a daemon restart, a session with a recorded start line has its first turn end counted as "not worked"; at the line this excludes it from automatic handover for that session.
+  - Even with all automatic rules off, every registry session's turn end copies the full organisation state; a Ready seat also reads its role file, and its line note waits for background work to end.
 
 ### Finding your instructions and handover
 

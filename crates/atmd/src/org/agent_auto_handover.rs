@@ -60,10 +60,10 @@
 //!   cache, which is what the idle rule is there to avoid. The owner's
 //!   give-up cancels the request. This needs `cache_minutes` in a role file
 //!   to happen to an idle seat.
-//! - The organisation's state is copied once per look, and the role file is
-//!   read on the watcher's own task with a five-second budget. A filesystem
-//!   that hangs delays every look by that long; registry events missed
-//!   meanwhile make the watcher forget what it saw.
+//! - Even with all automatic rules off, every registry session's turn end copies the full organisation state; a Ready seat also reads its role file, and its line note waits for background work to end.
+//! - The role file is read on the watcher's own task with a five-second
+//!   budget. A filesystem that hangs delays every look by that long;
+//!   registry events missed meanwhile make the watcher forget what it saw.
 //! - Whether the owner is away is not known yet: he is taken to be present.
 
 use super::{

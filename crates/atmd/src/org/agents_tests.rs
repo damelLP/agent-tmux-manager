@@ -4624,7 +4624,8 @@ mod reconciliation {
                 .await
                 .expect("clear write must reach the append gate")
                 .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let start = Instant::now();
+            let deadline = start + Duration::from_secs(5);
             let mut list = Box::pin(agents.list(ListParams::default()));
             poll_fn(|cx| {
                 assert!(list.as_mut().poll(cx).is_pending());
@@ -4669,6 +4670,9 @@ mod reconciliation {
                 _ = tokio::time::sleep_until(deadline) => panic!("list exhausted its budget"),
                 result = &mut list => result.expect("quarantine timeout must not fail the list"),
             };
+            if earlier_work.is_zero() {
+                assert_eq!(Instant::now(), start + Duration::from_secs(1));
+            }
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].agent_id.to_string(), "p/lead");
             assert_eq!(entries[0].state, AgentStatus::Clearing);

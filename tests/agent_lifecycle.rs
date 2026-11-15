@@ -215,8 +215,8 @@ fn adopt_noninteractive_launcher_stays_starting() {
     let cursor = test.cursor();
     let result = test.adopt("lead", &pane);
     assert_eq!(result["state"], "starting", "{result}");
-    // Inspect the adoption's own committed event. The old observer has not yet
-    // acquired Task 10's foreground verdict; its later state is not this call.
+    // Inspect the adoption's own committed event for its null session binding,
+    // not a later state produced by foreground reconciliation.
     let events = test.tail(cursor);
     let adopted = events
         .iter()
@@ -770,7 +770,7 @@ fn busy_restart_starting_until_event() {}
 /// A Ready/null process exits without End; a later positive idle-shell
 /// observation records Down instead of trusting the retained harness frame.
 #[test]
-#[ignore = "covered by unit exit_to_shell_records_down_without_end; stand-in acceptance needs a full Ready/null exit-without-End fixture"]
+#[ignore = "covered by units exit_to_shell_records_down_without_end and restart_idle_shell_records_down (Ready/null at restart); stand-in acceptance needs a full Ready/null exit-without-End fixture"]
 fn ready_null_exit_without_end() {}
 
 /// Exact canonical allowlist path permits No→Down→Yes→Enter once; confirm the
@@ -1054,7 +1054,7 @@ const DELIVERY: &str = "[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\
 /// delivery waits for readiness. The in-process coalesced-reservation callback
 /// barrier belongs to U8c/B's separate reservation tests, not a new test RPC.
 #[test]
-#[ignore = "waits for Task 12: Task 8 plus U9b slice B integration"]
+#[ignore = "covered by unit duplicate_clear_conflicts_while_first_waits_for_delivery; admitted-delivery stand-in acceptance not yet written"]
 fn clear_waits_behind_admitted_delivery() {}
 
 /// A daemon stopped during a start must not wait out the control stage's

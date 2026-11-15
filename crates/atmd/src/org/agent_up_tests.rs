@@ -989,6 +989,38 @@ async fn a_launch_guard_refusal_that_sent_nothing_is_not_an_unknown_outcome() {
 }
 
 #[tokio::test]
+async fn launch_enter_that_never_answers_is_reported_as_unknown() {
+    // tmux takes the Enter and its call never returns. The call's own limit
+    // answers before the start's deadline: the Enter is not repeated, and the
+    // reason says that it may have reached the pane. (With less than that
+    // limit left the deadline comes first; the flow names the Enter before it
+    // sends it, as the clear's test of this shows.)
+    let mut starting = Starting::new(Harness::Codex).await;
+    starting.script_launch();
+    let call = starting.start().await;
+    progress(&mut starting.events, "up_running", Some("q/lead")).await;
+    starting.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(starting.effects(), starting.launched());
+    let reason = starting.agent().await.unwrap().reason.unwrap_or_default();
+    assert!(
+        reason.starts_with(&format!(
+            "{START}: running the launch command failed, and whether it reached the pane is unknown"
+        )),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
 async fn shell_named_harness_is_stuck_not_ready() {
     // After the Enter the pane shows the harness's editor while tmux still
     // names the shell as its foreground program (a wrapper under the shell's

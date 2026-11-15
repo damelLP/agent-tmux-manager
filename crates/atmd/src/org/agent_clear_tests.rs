@@ -864,6 +864,32 @@ async fn a_guard_refusal_that_sent_nothing_is_not_an_unknown_outcome() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn deadline_during_the_enter_says_the_command_may_have_been_submitted() {
+    // Review 23, follow-up 1. tmux takes the Enter and its call does not
+    // return before the clear's deadline: the agent is Stuck, and the reason
+    // must not say that the command never appeared in the editor.
+    let mut clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+    clearing.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+    let call = clearing.start();
+    progress(&mut clearing.events, "clear_submitting", Some("p/lead")).await;
+    clearing.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+    clearing
+        .assert_stuck("the clear command was being submitted and may have reached the harness")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn clear_paste_outcome_unknown_never_repeats_paste() {
     let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
     let mut committed = clearing.rig.org.committed.subscribe();

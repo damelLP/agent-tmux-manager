@@ -643,6 +643,12 @@ impl AgentRuntime {
                     let guard = move |capture: &_| {
                         submit_allowed(screen, capture, &baseline, &tag, command)
                     };
+                    // Said before the key: a deadline while the key is out
+                    // must not report the step before it.
+                    waiting_for(
+                        waiting,
+                        "the clear command was being submitted and may have reached the harness",
+                    );
                     #[cfg(test)]
                     self.progress("clear_submitting", Some(id.clone()));
                     match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
@@ -1012,6 +1018,10 @@ impl AgentRuntime {
                             launch_enter_allowed(screen, capture, &baseline, &tag, (&before, &text))
                         }
                     };
+                    waiting_for(
+                        waiting,
+                        "the launch command was being run and may have started the harness",
+                    );
                     #[cfg(test)]
                     self.progress("up_running", Some(id.clone()));
                     match r

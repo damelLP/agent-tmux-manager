@@ -270,17 +270,27 @@ impl AgentRuntime {
         }
         let session = session.filter(|_| safe);
         let bound = session.is_some();
-        self.org
-            .execute(
-                OrgCommand::Adopt {
-                    agent_id: id.clone(),
-                    pane: pane.to_string(),
-                    session_id: session,
-                },
-                chrono::Utc::now(),
-            )
-            .await?;
-        if safe && !bound {
+        // A Ready or Starting agent that is adopted again on its own pane, with
+        // no session to bind, keeps its record: an Adopt without a session
+        // would drop a binding whose row is not announced yet (after a daemon
+        // restart every row is a discovery row until the harness's next event).
+        let kept = existing
+            .filter(|agent| agent.pane.is_some() && !bound)
+            .map(|agent| agent.status)
+            .filter(|status| matches!(status, AgentStatus::Ready | AgentStatus::Starting));
+        if kept.is_none() {
+            self.org
+                .execute(
+                    OrgCommand::Adopt {
+                        agent_id: id.clone(),
+                        pane: pane.to_string(),
+                        session_id: session,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await?;
+        }
+        if safe && !bound && kept != Some(AgentStatus::Ready) {
             // A harness that announces its session with the first prompt.
             self.org
                 .execute(

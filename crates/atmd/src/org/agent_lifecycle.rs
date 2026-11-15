@@ -1065,6 +1065,9 @@ impl AgentRuntime {
     /// With `replace` this is a respawn: once the pane to split is proven, and
     /// is not the agent's own, the agent is taken down as [`Self::down`] does
     /// with a kill, and then started as above, all in this one reservation.
+    /// With a role's `pane` hint, `agent.respawn` called from the agent's own
+    /// pane intentionally kills the caller's pane and loses its reply while
+    /// the daemon finishes the job; use `atm agent list` to check the outcome.
     pub(super) async fn up(
         &self,
         r: &Reservation,

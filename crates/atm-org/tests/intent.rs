@@ -195,6 +195,45 @@ fn html_comments_cannot_authorize_measures_or_duplicate_sections() {
     }
 }
 
+// Break caught: skipping an annotated heading before applying the section boundary.
+#[test]
+fn annotated_peer_and_ancestor_headings_end_the_measures_section() {
+    for heading in [
+        "## Retired measures <!-- replaced -->",
+        "# Retired measures <!-- replaced -->",
+        "## Retired measures <!--\nreplaced\n-->",
+        "# Retired measures <!--\nreplaced\n-->",
+    ] {
+        let text = format!(
+            "## How we will know\n- mechanical: cargo test\n\n{heading}\n- mechanical: cargo bench\n"
+        );
+        assert_eq!(
+            parse_intent_measures(&text).unwrap(),
+            vec![TaskMeasure::Mechanical {
+                command: "cargo test".into(),
+            }],
+            "{heading}"
+        );
+    }
+}
+
+// Break caught: ending the section on an annotated nested heading too.
+#[test]
+fn annotated_nested_headings_keep_the_measures_section_open() {
+    assert_eq!(
+        parse_intent_measures(
+            "## How we will know\n- owner\n### Checks <!-- current -->\n- mechanical: cargo test\n"
+        )
+        .unwrap(),
+        vec![
+            TaskMeasure::Owner,
+            TaskMeasure::Mechanical {
+                command: "cargo test".into(),
+            },
+        ]
+    );
+}
+
 // Break caught: trim_start turning an indented code example into approved measures.
 #[test]
 fn indented_code_cannot_authorize_measures() {

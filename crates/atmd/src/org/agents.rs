@@ -1813,6 +1813,12 @@ async fn observer(
 /// The pane that a successful `session.kill` closed, from its audit event.
 /// A lifecycle flow's own kill (`agent.down`, a respawn) is logged under its
 /// own method and records its agent itself.
+///
+/// The event is best effort: the control audit queue holds 32 and drops what
+/// does not fit. A dropped one leaves the old wake, the registry removing the
+/// session's row. An agent whose session has no row then stays recorded as it
+/// was, on a dead pane, until another wake of it (a later event, a lagged
+/// rebuild or a daemon restart): no worse than before this wake existed.
 fn killed_pane(event: &crate::eventlog::Envelope) -> Option<&str> {
     let field = |pointer| {
         event

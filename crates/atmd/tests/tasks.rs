@@ -159,6 +159,17 @@ async fn all_nine_methods_success_and_refusal_wire_fixtures() {
         match f["setup"].as_str().unwrap_or("") {
             "assigned" => rig.assign().await,
             "submitted" => rig.submitted().await,
+            "accepted" => {
+                rig.submitted().await;
+                rig.run(TaskCommand::Verdict {
+                    task_id: "t6".parse().unwrap(),
+                    verdict: atm_org::TaskVerdict::Accepted,
+                    review_task: None,
+                    note: None,
+                    by: actor("owner"),
+                })
+                .await;
+            }
             "review" => {
                 rig.submitted().await;
                 let mut review = created("Review");

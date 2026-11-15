@@ -1,4 +1,5 @@
 //! Accounting across real daemon boundaries; no model, tmux, sleeps or polling.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test fixture helpers only
 use atm_core::Money;
 use atm_org::*;
 use atmd::{
@@ -319,6 +320,58 @@ async fn unsupported_historical_cost_does_not_poison_startup() {
     )
     .await
     .unwrap();
+    cancel.cancel();
+}
+
+// Break caught: task.get omits live usage, substitutes session totals, loses the
+// exact money codec, or keeps accruing time after the accepted record is frozen.
+#[tokio::test]
+async fn task_get_exposes_live_and_frozen_usage_and_preserves_not_found() {
+    use atmd::server::methods::{CallContext, CallerId};
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let id = seed(&org).await;
+    sample(&org, 100_000, true).await;
+    sample(&org, 125_000, false).await;
+    let mut services = MethodServices::new(spawn_registry());
+    services.org = org.clone();
+    let router = router(services).unwrap();
+    let caller = CallContext {
+        client_id: CallerId("usage-test".into()),
+        from_pane: None,
+    };
+    let live = router
+        .call(caller.clone(), "task.get", json!({"task_id":id}))
+        .await
+        .unwrap();
+    assert_eq!(live["usage"]["turns"], 1);
+    assert_eq!(live["usage"]["cost"], json!({"microdollars":25_000}));
+    assert_eq!(live["usage"]["peak_context_percent"], 40);
+    assert_eq!(live["usage"]["review_rounds"], 0);
+    assert_eq!(live["usage"]["changes_requested"], 0);
+    assert!(live["usage"]["seconds_in_state"]["assigned"].is_u64());
+    assert_eq!(live["task"]["cost"], Value::Null);
+    submit(&org, &id, TaskSubmission::Result).await;
+    accept(&org, &id).await;
+    let accepted = router
+        .call(caller.clone(), "task.get", json!({"task_id":id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted["usage"],
+        json!({"turns":1,"review_rounds":0,"changes_requested":0,"cost":{"microdollars":25_000},"peak_context_percent":40,"seconds_in_state":{"open":0,"assigned":4,"submitted":1}})
+    );
+    assert_eq!(accepted["task"]["cost"], accepted["usage"]);
+    assert_eq!(
+        router
+            .call(caller, "task.get", json!({"task_id":"t999999"}))
+            .await
+            .unwrap_err()
+            .0
+            .code,
+        "not_found"
+    );
     cancel.cancel();
 }
 

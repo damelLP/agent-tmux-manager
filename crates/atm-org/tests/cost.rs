@@ -1,6 +1,7 @@
 //! Synthetic: plain task commands and reported measurements, no harness or I/O.
 //! Breaks caught: summing cumulative prices, arbitrary attribution, status-edge
 //! turn counts, truncating each state visit, and accepting a plan as final work.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test fixture helpers only
 use atm_core::{LifecycleEvent, Money, SessionId};
 use atm_org::*;
 use chrono::{DateTime, Duration, Utc};

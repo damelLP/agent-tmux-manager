@@ -1348,18 +1348,17 @@ pub fn parse_status_line(
     parse_status_line_with_pane(data).map(|(pid, _, status, _)| (pid, status))
 }
 
+type ParsedStatusLine = (
+    Option<u32>,
+    Option<String>,
+    StatusLineData,
+    Option<atm_core::LifecycleEvent>,
+);
+
 /// [`parse_status_line`], with the tmux pane `atm-hook` adds inside tmux.
 fn parse_status_line_with_pane(
     data: serde_json::Value,
-) -> Result<
-    (
-        Option<u32>,
-        Option<String>,
-        StatusLineData,
-        Option<atm_core::LifecycleEvent>,
-    ),
-    ConnectionError,
-> {
+) -> Result<ParsedStatusLine, ConnectionError> {
     let raw: RawStatusLine =
         serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
     // Always Some today; the Option predates the empty-model rules

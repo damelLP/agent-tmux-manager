@@ -257,8 +257,10 @@ pub struct RecipientLiveView {
     pub pane: PaneLiveness,
     pub agent_status: AgentStatus,
     /// Start of the current not-ready window, independent of message holds.
-    /// Reconstruct from applied transitions in log order: set when leaving Ready
-    /// or first creating a non-ready agent; clear on Ready. Preserve across
+    /// Track applied transitions and observations: set when leaving Ready
+    /// or first creating a non-ready agent; clear on Ready or observed Running.
+    /// The first loss of Running starts a fresh window. Observations are not
+    /// logged, so replay starts this clock no earlier than recovery. Preserve across
     /// Starting/Clearing transitions and metadata events. Entering Starting or
     /// Clearing from Stuck/Down starts a new window: the outage already notified
     /// the owner, and a restart gets its own readiness budget. Agent.updated_at

@@ -225,6 +225,17 @@ Claude Code / pi / Codex  ──hook/extension──▶  atmd (daemon)  ◀─�
 
 `atm setup` registers supported harness integrations (Claude Code hooks, the pi extension, and Codex CLI hooks). Harness events are forwarded to the `atmd` daemon over a Unix socket, and `atm` connects for real-time display. Codex context usage is read on a best-effort basis from the rollout transcript supplied with hook events; a missing or changed transcript never blocks lifecycle updates. Codex requires a one-time trust approval of the installed hooks: run `/hooks` inside codex after `atm setup`.
 
+For Claude Code, `atm setup` adds its `statusLine` only when none exists. It keeps a user's existing statusLine unchanged and writes no backup. ATM reads Claude Code context, model and cost only through `atm-hook`, so your status script should pass its stdin JSON to that hook. Keep the forwarding inside a script file, because a statusLine whose `command` itself runs `atm-hook` counts as ATM's own. Setup prints an example using the installed hook's path; inside your wrapper, buffer stdin and forward it, then reuse `$input` for your own rendering:
+
+```sh
+input=$(cat)
+hook="$HOME/.local/bin/atm-hook"
+if [ -x "$hook" ]; then printf '%s' "$input" | "$hook"; fi
+# Render your status line from "$input" here.
+```
+
+To use ATM's statusLine instead, remove your `statusLine` entry from `~/.claude/settings.json` and run `atm setup` again. `atm uninstall` leaves a statusLine alone unless its `command` itself runs `atm-hook`; that one counts as ATM's own and is removed, or replaced by a backup an older version saved.
+
 ## Daemon socket
 
 `atmd` listens on a Unix socket at `/tmp/atm.sock` by default. Set `ATM_SOCKET` to move it. The daemon, the `atm` TUI and CLI, the Claude Code and Codex hooks, and the pi extension all read the same variable, and `atm` forwards it to the daemon it auto-starts, so one exported value keeps every component on the same socket:

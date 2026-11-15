@@ -5,9 +5,10 @@
 //!
 //! - **Claude Code**: writes the `atm-hook` bash script to
 //!   `~/.local/bin/`, then registers it in `~/.claude/settings.json`'s
-//!   `hooks` and `statusLine` blocks. A statusLine of the user's own is
-//!   saved first to `claude-statusline-backup.json` in ATM's config dir
-//!   (`~/.config/atm/` on Linux), and `atm uninstall` restores it.
+//!   `hooks` block and adds a `statusLine` only when absent. A user's own
+//!   statusLine is preserved without a backup; its command should forward
+//!   stdin to `atm-hook` for context, model and cost updates. `atm uninstall`
+//!   still restores `claude-statusline-backup.json` from older setups.
 //! - **pi** (<https://pi.dev/>): writes the `pi-atm` TypeScript
 //!   extension to `~/.pi/agent/packages/pi-atm/`, then adds
 //!   `"packages/pi-atm"` to `~/.pi/agent/settings.json`'s `packages`
@@ -201,7 +202,7 @@ pub fn uninstall() -> Result<()> {
     }
 
     // Step 2: Remove statusLine if it uses atm-hook, restoring the user's
-    // own from setup's backup. ATM's backup never stops uninstall: one it
+    // own from an older setup's backup. ATM's backup never stops uninstall: one it
     // can't read or delete is left for the user, with a warning.
     let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
     let (backup, readable) = match read_json_file_or_empty(&backup_path) {

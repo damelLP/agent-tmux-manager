@@ -6,7 +6,7 @@ use super::{
 };
 use crate::server::methods::{parse_params, MethodError, MethodRouter};
 use atm_org::{
-    Address, AgentId, ApplyError, DecisionId, Refusal, TaskActor, TaskBudget, TaskCommand,
+    Address, AgentId, ApplyError, DecisionId, ProjectId, Refusal, TaskBudget, TaskCommand,
     TaskCreated, TaskFile, TaskFileKind, TaskId, TaskKind, TaskMeasure, TaskRefusal, TaskState,
     TaskSubmission, TaskVerdict,
 };
@@ -32,6 +32,7 @@ fn limit() -> u16 {
 }
 params!(CreateParams {
     pub title: String,
+    pub project_id: Option<ProjectId>,
     #[serde(default = "work")] pub kind: TaskKind,
     pub parent: Option<TaskId>,
     pub judges: Option<TaskId>,
@@ -181,7 +182,7 @@ fn encode(value: impl Serialize) -> Result<serde_json::Value, MethodError> {
 
 /// Always advertised; unavailable persistence cannot yield a successful mutation.
 pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Result<(), MethodError> {
-    let tasks = TaskHandle::new(org);
+    let tasks = TaskHandle::new(org.clone());
     macro_rules! mutation {
         ($name:literal, $ty:ty, $validate:expr, $make:expr) => {{
             let tasks = tasks.clone();
@@ -195,22 +196,41 @@ pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Resul
             })?;
         }};
     }
-    mutation!(
+    let creating = tasks.clone();
+    let intent = super::intent::IntentFiles::default();
+    router.register(
         "task.create",
-        CreateParams,
-        create,
-        |p: CreateParams, by: TaskActor| TaskCommand::Create(TaskCreated {
-            title: p.title,
-            kind: p.kind,
-            creator: by.who,
-            parent: p.parent,
-            judges: p.judges,
-            measure: p.measure,
-            budget: p.budget,
-            files: p.files,
-            rests_on: p.rests_on
-        })
-    );
+        Duration::from_secs(30),
+        move |caller, params| {
+            let tasks = creating.clone();
+            let org = org.clone();
+            let intent = intent.clone();
+            async move {
+                let p: CreateParams = parse_params(params)?;
+                create(&p)?;
+                let creator = intent
+                    .check(&org, &caller, p.project_id.as_ref(), p.measure.clone())
+                    .await?;
+                encode(
+                    tasks
+                        .mutate(caller, move |_| {
+                            TaskCommand::Create(TaskCreated {
+                                title: p.title,
+                                kind: p.kind,
+                                creator,
+                                parent: p.parent,
+                                judges: p.judges,
+                                measure: p.measure,
+                                budget: p.budget,
+                                files: p.files,
+                                rests_on: p.rests_on,
+                            })
+                        })
+                        .await?,
+                )
+            }
+        },
+    )?;
     mutation!(
         "task.assign",
         AssignParams,

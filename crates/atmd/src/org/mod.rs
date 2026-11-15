@@ -37,6 +37,7 @@ pub mod agents;
 mod agents_tests;
 mod decision_methods;
 pub mod decisions;
+mod intent;
 pub mod message_delivery;
 #[cfg(test)]
 mod message_delivery_gate;

@@ -159,6 +159,45 @@ async fn context_adopted_agent_reads_fresh_role_and_manager() {
     assert_eq!(rig.context().await, missing);
 }
 
+// Break caught: only adopted (role-less) agents preserve missing-role semantics;
+// a started agent incorrectly falls back to its persisted role when the file vanishes.
+#[tokio::test]
+async fn context_started_agent_uses_live_file_not_stored_role_fallback() {
+    let rig = Rig::new().await;
+    for command in [
+        OrgCommand::Down {
+            agent_id: "project/worker".parse().unwrap(),
+            reason: "start fixture".into(),
+        },
+        OrgCommand::Up {
+            agent_id: "project/worker".parse().unwrap(),
+            role: atm_org::parse_role(
+                "worker",
+                "+++\nharness='pi'\nmanager='stored-manager'\n+++\nStored body\n",
+            )
+            .unwrap(),
+        },
+        OrgCommand::PaneCreated {
+            agent_id: "project/worker".parse().unwrap(),
+            pane: "%7".into(),
+        },
+    ] {
+        rig.org.execute(command, chrono::Utc::now()).await.unwrap();
+    }
+    let missing = rig.context().await;
+    assert_eq!(missing["instructions"], Value::Null);
+    assert_eq!(missing["manager"], "owner");
+    assert_eq!(missing["role_file"], json!(rig.role_path()));
+    assert_eq!(
+        missing["report_command"],
+        "atm msg send --to owner --kind report --body 'DONE: <result>'"
+    );
+    rig.role("+++\nharness='pi'\nmanager='fresh-manager'\n+++\nFresh body\n");
+    let present = rig.context().await;
+    assert_eq!(present["instructions"], "Fresh body\n");
+    assert_eq!(present["manager"], "project/fresh-manager");
+}
+
 // Break caught: treating blank role instructions as a missing role, or misresolving managers.
 #[tokio::test]
 async fn context_manager_resolution_and_invalid_manager_refusal() {
@@ -391,6 +430,30 @@ async fn context_role_and_result_limits_refuse_without_truncation() {
     let error = rig.call(Some("%7"), json!({})).await.unwrap_err();
     assert_eq!(error.0.code, "refused");
     assert!(error.0.message.contains("atm inbox --unread"));
+}
+
+// Break caught: rejecting the inclusive result-size boundary, or accepting one
+// extra byte. Calibrate only the input padding for the variable temporary paths.
+#[tokio::test]
+async fn context_exact_result_byte_limit_is_inclusive() {
+    let rig = Rig::new().await;
+    let header = "+++\nharness='pi'\n+++\n";
+    rig.role(header);
+    let padding = 524_288 - serde_json::to_vec(&rig.context().await).unwrap().len();
+    // JSON encodes U+0001 as six ASCII bytes; the role stays below its own limit.
+    let body = format!(
+        "{}{}",
+        "\u{0001}".repeat(padding / 6),
+        "x".repeat(padding % 6)
+    );
+    assert!(header.len() + body.len() < 262_144);
+    rig.role(&format!("{header}{body}"));
+    let exact = rig.context().await;
+    assert_eq!(serde_json::to_vec(&exact).unwrap().len(), 524_288);
+    rig.role(&format!("{header}{body}x"));
+    let error = rig.call(Some("%7"), json!({})).await.unwrap_err();
+    assert_eq!(error.0.code, "refused");
+    assert!(error.0.message.contains("exceeds 524288 bytes"));
 }
 
 // Break caught: invalid UTF-8 treated as an internal failure rather than an invalid role,

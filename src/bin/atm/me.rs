@@ -134,7 +134,9 @@ mod tests {
         value.instructions = Some("é🙂\tcode\\path\n\u{1b}[31m\r\u{7f}\u{85}".into());
         value.unread_messages.first_mut().unwrap().first_line = "line\nspoof\u{1b}".into();
         value.memory.path = "/project/\u{1b}memory".into();
+        value.role_file = "/project/\u{1b}role.md".into();
         let text = rendered(&value);
+        assert!(text.contains("Instructions (/project/\\u{1b}role.md):\n"));
         assert!(text.contains("  é🙂\tcode\\path\n"));
         assert!(text.contains("line\\nspoof\\u{1b}; read: atm inbox --id m7"));
         assert!(!text

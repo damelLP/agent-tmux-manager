@@ -77,7 +77,7 @@ fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) ->
             let hook_path = hook_script_path();
             let command = hook_path.to_string_lossy().replace('\'', "'\\''");
             println!(
-                "    statusLine - kept yours; atm reads Claude Code context, model and cost only through atm-hook; pass your command's stdin to atm-hook (e.g. input=$(cat); printf '%s' \"$input\" | '{command}'), or remove your statusLine and run atm setup again."
+                "    statusLine - kept yours; atm reads Claude Code context, model and cost only through atm-hook; in your status script, pass its stdin to atm-hook (e.g. input=$(cat); printf '%s' \"$input\" | '{command}'), or remove your statusLine and run atm setup again."
             );
             return Ok(false);
         }
@@ -92,7 +92,7 @@ fn install_status_line(settings: &mut Map<String, Value>, backup_path: &Path) ->
 }
 
 /// Uninstall's statusLine step: replaces ATM's statusLine in `settings`
-/// with `backup` (the user's own, saved by setup), or removes it when
+/// with `backup` (the user's own, saved by an older setup), or removes it when
 /// there is none. Any other statusLine replaced ATM's after setup, so it
 /// stays. Returns whether `settings` changed.
 #[must_use]

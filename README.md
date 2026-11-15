@@ -225,15 +225,16 @@ Claude Code / pi / Codex  ──hook/extension──▶  atmd (daemon)  ◀─�
 
 `atm setup` registers supported harness integrations (Claude Code hooks, the pi extension, and Codex CLI hooks). Harness events are forwarded to the `atmd` daemon over a Unix socket, and `atm` connects for real-time display. Codex context usage is read on a best-effort basis from the rollout transcript supplied with hook events; a missing or changed transcript never blocks lifecycle updates. Codex requires a one-time trust approval of the installed hooks: run `/hooks` inside codex after `atm setup`.
 
-For Claude Code, `atm setup` adds its `statusLine` only when none exists. It keeps a user's existing statusLine unchanged and writes no backup. ATM reads Claude Code context, model and cost only through `atm-hook`, so a custom status command should pass its stdin JSON to that hook. Setup prints an example using the installed hook's path; inside your wrapper, buffer stdin and forward it, then reuse `$input` for your own rendering:
+For Claude Code, `atm setup` adds its `statusLine` only when none exists. It keeps a user's existing statusLine unchanged and writes no backup. ATM reads Claude Code context, model and cost only through `atm-hook`, so your status script should pass its stdin JSON to that hook. Keep the forwarding inside a script file, because a statusLine whose `command` itself runs `atm-hook` counts as ATM's own. Setup prints an example using the installed hook's path; inside your wrapper, buffer stdin and forward it, then reuse `$input` for your own rendering:
 
 ```sh
 input=$(cat)
-printf '%s' "$input" | "$HOME/.local/bin/atm-hook"
+hook="$HOME/.local/bin/atm-hook"
+if [ -x "$hook" ]; then printf '%s' "$input" | "$hook"; fi
 # Render your status line from "$input" here.
 ```
 
-To use ATM's statusLine instead, remove your `statusLine` entry from `~/.claude/settings.json` and run `atm setup` again. `atm uninstall` still restores statusLine backups saved by older versions, but only over ATM's own statusLine; it leaves a user's current statusLine alone.
+To use ATM's statusLine instead, remove your `statusLine` entry from `~/.claude/settings.json` and run `atm setup` again. `atm uninstall` leaves a statusLine alone unless its `command` itself runs `atm-hook`; that one counts as ATM's own and is removed, or replaced by a backup an older version saved.
 
 ## Daemon socket
 

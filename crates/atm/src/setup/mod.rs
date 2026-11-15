@@ -202,7 +202,7 @@ pub fn uninstall() -> Result<()> {
     }
 
     // Step 2: Remove statusLine if it uses atm-hook, restoring the user's
-    // own from setup's backup. ATM's backup never stops uninstall: one it
+    // own from an older setup's backup. ATM's backup never stops uninstall: one it
     // can't read or delete is left for the user, with a warning.
     let backup_path = status_line_backup_path().ok_or(SetupError::ConfigDirUnknown)?;
     let (backup, readable) = match read_json_file_or_empty(&backup_path) {

@@ -101,7 +101,7 @@ fn setup_preserves_the_users_status_line_without_a_backup() {
             "{line}"
         );
         assert!(
-            line.contains("pass your command's stdin to atm-hook"),
+            line.contains("in your status script, pass its stdin to atm-hook"),
             "{line}"
         );
         assert!(

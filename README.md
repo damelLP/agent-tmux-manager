@@ -84,6 +84,7 @@ atm send <id> "fix the tests"     # send text to agent
 atm reply <id> --yes               # accept a permission prompt
 atm peek <id> --prompt             # extract the active prompt
 atm list -f json --status working  # list working agents as JSON
+atm task list --open                # unfinished tasks; get t41 shows every field
 atm decisions                      # pending/provisional decisions for you
 atm decide d41 yes 'Approved'      # owner answer; --rule records a rule mark
 atm status                         # one-line summary for tmux status bar
@@ -150,7 +151,7 @@ atm me                         # identity, manager, instructions and what is wai
 atm me --format json           # the same context as structured data
 ```
 
-`atm me` reads the current `.atm/roles/<name>.md` in the project's main checkout on every call. It shows your full agent id and manager, the role's instructions, unread messages (id, kind, sender and first line; the start line that pointed you here is left out), the absolute `.atm/memory/<name>.md` path and whether it exists, and open tasks (an empty array until task tracking is available). Read an existing memory file for handover. The caller's pane binding determines identity, not the working directory or `ATM_AGENT`; an unbound caller gets a clear refusal.
+`atm me` reads the current `.atm/roles/<name>.md` in the project's main checkout on every call. It shows your full agent id and manager, the role's instructions, unread messages (id, kind, sender and first line; the start line that pointed you here is left out), the absolute `.atm/memory/<name>.md` path and whether it exists, and unfinished tasks assigned to you (id, title, kind, state, agent and reason). Read an existing memory file for handover. The caller's pane binding determines identity, not the working directory or `ATM_AGENT`; an unbound caller gets a clear refusal.
 
 Every unread message includes `atm inbox --id mN` to retrieve its full body and attachments. Text adds `After handling a delivered message: atm msg ack <id>` after a nonempty unread list (replace `<id>` with the message id). Fetching context does **not** mark messages read: use `atm msg ack mN` explicitly after reading a Delivered message. Unread summaries include queued and failed messages too, in message sequence order.
 
@@ -223,6 +224,92 @@ pane_gone_grace = { secs = 2, nanos = 0 }
 ```
 
 Durations must be positive and fit the policy's checked timestamp arithmetic; retry delays must be nondecreasing. Maximum attempts are the number of retry delays plus one (four by default); an empty retry list permits one attempt. Timing defaults do not prove a harness editor is safe: observations and safety guards still control delivery.
+
+## Tasks
+
+`atm task` calls the daemon's nine `task.*` methods, with one request per command and no direct-tmux fallback or automatic retry. Tasks persist in the organisation event log across daemon restarts. A task id is `t` plus its creation event sequence (`t41`, not `t041`); use the id printed by `create` in the examples below.
+
+From the creator's shell:
+
+```sh
+atm task create 'Build the change' --measure '{"kind":"mechanical","command":"cargo test --workspace"}' \
+  --file '{"path":"brief.md","kind":"brief","note":null}'
+atm task assign t41 project/worker
+atm task get t41
+atm task list --open --agent project/worker
+```
+
+From the assigned named agent's pane:
+
+```sh
+atm task set-state t41 working
+atm task set-state t41 waiting --reason 'Waiting for the owner'
+atm task set-state t41 blocked --reason 'Required input is missing'
+atm task set-state t41 working
+atm task submit t41 --what plan --file '{"path":"plan.md","kind":"plan","note":"Review before building"}'
+# After the creator/lead/owner accepts the plan, the task is working again.
+atm task submit t41 --file '{"path":"report.md","kind":"report","note":null}'
+```
+
+The default submission is `result`. Creator, lead or owner can request changes or accept, subject to the measure; nobody can give a verdict on their own assigned task:
+
+```sh
+atm task verdict t41 changes_requested --note 'Add the missing case'
+atm task verdict t41 accepted --note 'Checked against the measure'
+# A separate review is created with the task it judges, then assigned to a fresh reviewer.
+atm task create 'Review the change' --kind review --judges t41 --measure '{"kind":"owner"}'
+atm task assign t52 project/reviewer
+atm task review t41 t52
+# After the reviewer submits t52 as a result:
+atm task verdict t41 accepted --review-task t52 --note 'Review passed'
+atm task attach t41 evidence.log --kind evidence --note 'Verification output'
+```
+
+These are examples of separate paths, not commands to execute unconditionally in order: a task must be submitted to start review or receive its first verdict, and an accepted result is final. An accepted **plan** resumes work instead of finishing the task. A verdict with a submitted review task also accepts that review task. Reviewed measures require such a review for result acceptance unless the owner accepts; owner-judgement results require the owner.
+
+### Task commands and data
+
+Every subcommand accepts `--format text|json` (default text); the option also works before the subcommand, e.g. `atm task --format json get t41`. JSON preserves the complete original daemon result, including additive fields and newer enum strings. Text escapes terminal controls; `get` shows every task field, including the measure, budget, decision reference, files, timestamps and cost record when present. Newer enum values read as `unknown` in summaries rather than making reads fail; full raw get fields and JSON remain visible. This daemon refuses unknown enum inputs.
+
+| Command | Operands and optional flags |
+|---|---|
+| `create <title>` | Required `--measure <JSON>`; `--kind <kind>` (default `work`), `--parent <id>`, `--judges <id>`, `--budget <JSON>`, repeatable `--file <JSON>`, `--rests-on <decision-id>` |
+| `assign <id> <project/name>` | Queues the task's brief to its assigned agent |
+| `set-state <id> <state>` | `--reason <text>`; directly settable states are `open`, `working`, `waiting`, `blocked`, `cancelled` |
+| `submit <id>` | `--what plan\|result` (default `result`), repeatable `--file <JSON>` |
+| `attach <id> <path>` | Required `--kind <file-kind>`; `--note <text>` |
+| `review <id> <review-task-id>` | Starts an existing review of the submitted task |
+| `verdict <id> <accepted\|changes_requested>` | `--review-task <id>`, `--note <text>` |
+| `list` | `--agent <project/name>`, `--creator <owner\|system\|project/name>`, `--state <state>`, `--kind <kind>`, `--parent <id>`, `--after <id>`, `--open`, `--limit <1..1000>` (default 100) |
+| `get <id>` | Complete task, not just its list summary |
+
+Agent ids must be full `project/name` addresses for these commands: there is no bare-name lookup, implicit project filter or `--project-root`. `list` includes closed tasks unless `--open` excludes accepted/cancelled tasks. All filters intersect. A `next_after` JSON cursor or `next: --after tN` text line means another matching page exists; repeat the command with that cursor and the same filters. Pages/get are bounded to 512 KiB and are never silently truncated.
+
+Kinds are `work`, `review`, `plan`, `errand`, `drift_check`. The ten states are `open`, `assigned`, `working`, `waiting`, `blocked`, `submitted`, `in_review`, `accepted`, `changes_requested`, `cancelled`. Assign/submit/review/verdict have dedicated commands rather than direct state changes. Waiting and blocked require a reason. Creator/lead/owner can reopen eligible tasks with `set-state ... open` or cancel them with `set-state ... cancelled`; accepted/cancelled tasks are final.
+
+Structured flags use the method's JSON objects, not filenames containing JSON:
+
+```sh
+# Choose one measure; no command or rubric is executed/read by this CLI.
+--measure '{"kind":"mechanical","command":"check"}'
+--measure '{"kind":"reviewed","rubric":"rubric.md"}'
+--measure '{"kind":"owner"}'
+# Each file has its own kind and optional note; repeat --file for different files.
+--file '{"path":"brief.md","kind":"brief","note":null}'
+--budget '{"cost":{"microdollars":1000000},"turns":10,"deadline":"2026-12-01T00:00:00Z"}'
+```
+
+File kinds are `brief`, `report`, `evidence`, `plan`, `contract`. Budget fields are optional; cost is an integer **microdollar object**, not floating USD, and deadlines use RFC3339. Budget data does not make this CLI stop work. File paths are literal: neither client nor daemon reads/uploads attached files or checks they exist; prefer absolute paths across worktrees. Optional notes default to null. Quote multiline arguments to retain exact text; no stdin is read automatically.
+
+### Task identity and notification outcomes
+
+The daemon derives the caller from its pane, not its working directory or `ATM_AGENT`. A named member may work/wait/block/submit only its assigned task. The task's creator, the named lead and owner can assign/manage/review/give verdicts; a task's assigned agent cannot approve itself, and the measure can further restrict acceptance. An unbound caller counts as owner, just as for messages. There is no `--from`, `--by` or authority bypass; pane attribution is not authentication against hostile local clients. Anyone may create a task or attach a file, subject to daemon validation.
+
+Assignment queues a task-correlated **brief** to the assigned agent, with only brief-kind files attached. Submission queues a **report** to the creator with the submission's files. These use the normal guarded, confirmed-message runtime; `queued mN` is **not delivery confirmation**. Read and acknowledge the resulting inbox message normally. An unchanged repeated operation is shown as `unchanged` and does not enqueue another message.
+
+A task mutation and its automatic message enqueue are separate durable operations. If the task committed but enqueue was not confirmed, the successful response includes `notification: unconfirmed` with the daemon's diagnostic; text displays it prominently and JSON retains it. Inspect the task and inbox before resending. A daemon death between those writes can leave the task without its message, and replay does not re-emit old notifications. The CLI does not repair that gap by retrying.
+
+Mutations allow 35 seconds including startup/transport; list/get allow 15. A timeout does not prove rollback: accepted work may finish, so inspect `atm task get` and the inbox before retrying. Service/refusal/output errors exit 1 (also with `--format json`, with diagnostics on stderr); malformed command syntax exits 2 before contacting the daemon. A successful committed task with an unconfirmed notification still exits 0 and includes that warning.
 
 ## Decisions
 

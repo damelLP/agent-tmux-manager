@@ -220,7 +220,7 @@ async fn respawn_waiter_after_kill_sees_ready_on_new_pane() {
     // kill and the new start and see an agent that is temporarily Down.
     let (gate, mut entered) = mpsc::channel(1);
     let rig = Rig::gated(Some(("agent.down", gate))).await;
-    let mut starting = Starting::ready_with(rig, CODEX).await;
+    let mut starting = Starting::ready_on(rig, CODEX).await;
     starting.script_replace();
     starting.script_launch_on_new();
     starting.frame(Starting::moved(Starting::screen(CODEX_FRESH, "codex"), "%2"));

@@ -823,13 +823,16 @@ where
         let mut stopping = false;
         let mut input_closed = false;
         loop {
-            if stopping && jobs.idle() {
-                requests.close();
-            }
             // Reserved work can stop before the service does.
             let work_stopped = work.is_cancelled();
             jobs.ready(Instant::now());
             jobs.capture_ready(&*client, work_stopped).await;
+            // Read after the pass has drained what it can: a paced capture of
+            // stopped work can be the last thing here, and nothing wakes the
+            // actor after it.
+            if stopping && jobs.idle() {
+                requests.close();
+            }
             // One pass per wake, not a busy retry loop. Re-resolve original targets
             // against current registry, org projection and reservation ownership.
             for _ in 0..parked.len() {

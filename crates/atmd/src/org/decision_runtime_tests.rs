@@ -315,6 +315,144 @@ async fn answer_bridge_restart_after_enqueue_does_not_duplicate() {
     new_cancel.cancel();
 }
 
+// Break caught: a snapshot or accepted enqueue timing out permanently disables
+// the bridge. Hold only the response boundary; the real actor still processes
+// the accepted request before any retry, including a late SendMessage commit.
+async fn retry_timeout(execute_timeout: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (org, cancel) = seed(dir.path(), false).await;
+    let (requests, mut receive) = tokio::sync::mpsc::channel(64);
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (timed_out, timeout) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let real_requests = org.requests.clone();
+    let proxy = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut timed_out = Some(timed_out);
+        let mut released = Some(released);
+        while let Some(mut request) = receive.recv().await {
+            let target = match &request {
+                crate::org::Request::Snapshot(_) => !execute_timeout,
+                crate::org::Request::Execute { command, .. } => {
+                    execute_timeout && matches!(**command, OrgCommand::SendMessage(_))
+                }
+            };
+            if target && entered.is_some() {
+                entered.take().unwrap().send(()).unwrap();
+                match &mut request {
+                    crate::org::Request::Snapshot(reply) => reply.closed().await,
+                    crate::org::Request::Execute { reply, .. } => reply.closed().await,
+                }
+                timed_out.take().unwrap().send(()).unwrap();
+                released.take().unwrap().await.unwrap();
+            }
+            real_requests.send(request).await.unwrap();
+        }
+    });
+    let mut bridged_org = org.clone();
+    bridged_org.requests = requests;
+    let bridge_cancel = cancel.child_token();
+    // No disk/socket I/O occurs while time is paused: only the held
+    // in-memory response and OrgHandle's actual 5/6-second deadline.
+    tokio::time::pause();
+    let (handle, task) = spawn_decisions(
+        bridged_org,
+        MessageClock::new(tokio::time::Instant::now(), now()),
+        bridge_cancel.clone(),
+    );
+    entry.await.unwrap();
+    tokio::time::advance(Duration::from_secs(7)).await;
+    timeout.await.unwrap();
+    tokio::time::resume();
+    release.send(()).unwrap();
+    guarded(handle.initialized()).await.unwrap();
+    let state = org.snapshot().await.unwrap();
+    assert_eq!(
+        state.messages().count(),
+        1,
+        "execute timeout: {execute_timeout}"
+    );
+    assert_eq!(state.messages().next().unwrap().content, content());
+
+    let agent = CallContext {
+        from_pane: Some(crate::server::methods::CallerPane("%7".into())),
+        ..caller()
+    };
+    let params = RequestParams {
+        kind: DecisionKind::Plan,
+        title: "Choose again".into(),
+        context: String::new(),
+        files: vec![],
+        options: vec!["yes".into(), "no".into()],
+        recommended: None,
+        may_be_undone: true,
+        changes_intent: true,
+        deadline: None,
+    };
+    let withdrawn = handle.request(params.clone(), agent.clone()).await.unwrap();
+    assert!(
+        handle
+            .withdraw(
+                WithdrawParams {
+                    id: withdrawn.decision_id,
+                    reason: None
+                },
+                agent.clone(),
+            )
+            .await
+            .unwrap()
+            .changed
+    );
+    let next = handle.request(params, agent).await.unwrap();
+    let mut messages = org
+        .watch(vec!["msg.sent".into()], org.status().unwrap())
+        .unwrap();
+    assert!(
+        handle
+            .resolve(
+                ResolveParams {
+                    id: next.decision_id,
+                    option: "no".into(),
+                    note: None,
+                    standing_rule: false,
+                },
+                caller(),
+            )
+            .await
+            .unwrap()
+            .changed
+    );
+    let sent = guarded(messages.next()).await.unwrap().unwrap();
+    assert_eq!(
+        sent.body["body"],
+        format!(
+            "Decision {} resolved: no\nStanding rule: no",
+            next.decision_id
+        )
+    );
+    let state = org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 2);
+    assert_eq!(
+        state.messages().filter(|m| m.content == content()).count(),
+        1
+    );
+    bridge_cancel.cancel();
+    guarded(task).await.unwrap();
+    drop(handle);
+    guarded(proxy).await.unwrap();
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn decision_bridge_retries_snapshot_timeout_without_duplicates() {
+    retry_timeout(false).await;
+}
+
+#[tokio::test]
+async fn decision_bridge_retries_execute_timeout_without_duplicates() {
+    retry_timeout(true).await;
+}
+
 #[tokio::test]
 async fn decision_bridge_failure_refuses_mutations_but_retains_reads() {
     let dir = tempfile::tempdir().unwrap();

@@ -435,11 +435,25 @@ impl DecisionHandle {
 }
 
 async fn reconcile(org: &OrgHandle, clock: &MessageClock) -> Result<(), DecisionError> {
-    for message in missing_resolution_messages(&org.snapshot().await?) {
-        org.execute(OrgCommand::SendMessage(message), clock.now()?)
-            .await?;
+    loop {
+        let result = async {
+            for message in missing_resolution_messages(&org.snapshot().await?) {
+                org.execute(OrgCommand::SendMessage(message), clock.now()?)
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Err(DecisionError::Organisation(OrgServiceError::Timeout)) => {
+                // The actor is FIFO: the next snapshot includes any late enqueue.
+                // Exact-content dedupe makes retry safe; a stopped actor still fails.
+                tracing::warn!("Decision answer reconcile timed out; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            result => return result,
+        }
     }
-    Ok(())
 }
 
 /// One bridge per server; watching before the snapshot makes overlap harmless

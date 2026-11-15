@@ -323,27 +323,27 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
     second.rig.close();
 }
 
-// Acceptance inventory, NOT implemented assertions. Remove an ignore only
-// together with its real test body; running these empty bodies proves nothing.
+// Ignored cases below are acceptance inventory, NOT implemented assertions.
+// Remove an ignore only with its real test body; empty bodies prove nothing.
 // Task numbers below are the lifecycle slice's task numbers.
 
-/// Claude up: daemon ATM_SPAWN_BIN, role argv/model, ATM_AGENT, tag before first
-/// start, real session plus safe editor, no implicit prompt, all in its own window.
-/// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
+/// Claude up: daemon ATM_SPAWN_BIN, ATM_AGENT, resulting pane tag and bound
+/// Idle session, no implicit prompt, all in its own detached placement window.
+/// Uses the stand-in's styled fresh-editor Claude frame at 100x30.
 #[test]
 fn agent_up_ready_tagged_env_claude() {
     up_is_ready_tagged_and_announced(StandInMode::Claude, true);
 }
 
-/// Codex up: daemon override, role/required args and ATM_AGENT, pre-start tag,
-/// fresh safe Ready/null without submitting a prompt to manufacture a session.
+/// Codex up: daemon override, ATM_AGENT and resulting pane tag; Ready/null
+/// without submitting a prompt to manufacture a session (100x30 stand-in).
 #[test]
 fn agent_up_ready_tagged_env_codex() {
     up_is_ready_tagged_and_announced(StandInMode::Codex, false);
 }
 
-/// Pi up: daemon override, role args/model and ATM_AGENT, pre-start tag,
-/// session_start plus safe editor before Ready, no implicit initial prompt.
+/// Pi up: daemon override, ATM_AGENT, resulting pane tag and bound Idle
+/// session on Ready, no implicit initial prompt (200x50 stand-in).
 #[test]
 fn agent_up_ready_tagged_env_pi() {
     up_is_ready_tagged_and_announced(StandInMode::Pi, true);
@@ -513,16 +513,16 @@ fn up_is_ready_tagged_and_announced(mode: StandInMode, bound: bool) {
 #[ignore = "covered by unit linked_root_uses_main_role; stand-in acceptance needs a scrubbed linked-checkout Git fixture"]
 fn agent_up_reads_main_checkout_role() {}
 
-/// Held Claude clear stays Clearing until a new real ID with source=clear and
-/// a safe editor; return that ID on the same process, never rebind the old row.
-/// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
+/// Held Claude clear stays Clearing until the stand-in's clock is released;
+/// return a new Idle session ID on the same process, with the old row removed.
+/// Uses the stand-in's styled fresh-editor Claude frame at 100x30.
 #[test]
 fn clear_returns_new_ready_session_claude() {
     clear_returns_a_new_ready_session(StandInMode::Claude);
 }
 
-/// Held pi clear stays Clearing until changed ID plus safe editor on the same
-/// process/connection; repeated notices alone are not acknowledgment.
+/// Held pi clear stays Clearing until the stand-in's clock is released;
+/// return a changed Idle session ID on the same process, without a prompt.
 #[test]
 fn clear_returns_new_ready_session_pi() {
     clear_returns_a_new_ready_session(StandInMode::Pi);
@@ -627,8 +627,9 @@ fn codex_ready_unbound_clear_is_noop() {}
 #[ignore = "agent.clear is in the base; worktree clear stand-in acceptance not yet written"]
 fn clear_worktree_default() {}
 
-/// Respawn replaces pane/process/session under the same agent; stale old events
-/// cannot bind. Use another pre-sized placement window, never split a stand-in.
+/// Respawn replaces pane/process/session under the same agent, then down kills
+/// the replacement. Use another pre-sized placement window, never split a stand-in.
+/// Stale completion is covered by unit stale_completion_after_respawn_cannot_bind.
 #[test]
 fn respawn_uses_new_process_and_session() {
     let mode = StandInMode::Pi;
@@ -943,9 +944,9 @@ fn msg_send_during_clear_delivers_once_to_new_generation() {
     test.rig.close();
 }
 
-/// The `atm` binary itself, against the same daemon: `atm agent up`, `list`,
-/// `clear` and `down` take the caller's pane and server from the environment
-/// tmux gives a pane (`TMUX_PANE`, `TMUX`), and print the daemon's answer.
+/// The `atm` binary itself, against the same private daemon: `atm agent up`,
+/// `list`, `clear` and `down` print the daemon's answers. Up uses TMUX_PANE and
+/// the rig's ATM_TMUX_SOCKET override; that override takes precedence over TMUX.
 #[test]
 fn atm_cli_starts_clears_and_takes_down_an_agent() {
     let mode = StandInMode::Pi;

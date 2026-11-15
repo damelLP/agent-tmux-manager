@@ -101,9 +101,9 @@ impl RawHandle {
         let unavailable = || OrgServiceError::Unavailable("raw logging disabled".into());
         let queue = self.queue.as_ref().ok_or_else(unavailable)?;
         let (send, receive) = oneshot::channel();
-        // Runs alongside summary flush after connection/control/audit drains;
-        // both flushes share the final 2 s of the nominal 64 s shutdown budget.
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // Runs alongside summary flush after the server's stages have stopped;
+        // both flushes share the last part of the stop budget.
+        tokio::time::timeout(crate::server::stop::FLUSHES, async {
             queue
                 .send(Request::Flush(send))
                 .await

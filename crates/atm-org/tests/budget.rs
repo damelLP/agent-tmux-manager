@@ -389,6 +389,36 @@ fn note_survives_state_and_delivery_changes_and_replay() {
 
 proptest! {
     #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
+    // Break caught: simultaneous tasks share a latch, or later metrics rearm it.
+    #[test]
+    fn simultaneous_crossings_keep_independent_task_latches(
+        cost in 0_i64..i64::MAX,
+        turns in any::<u32>(),
+        later in 20_u64..86_400,
+    ) {
+        let mut rig = Rig::new();
+        let mut body = new_task(TaskKind::Work, mechanical(), LEAD);
+        body.budget = Some(TaskBudget {
+            deadline: Some(ts(20)),
+            ..limits(Some(0), Some(0))
+        });
+        let first = rig.create(body.clone());
+        let second = rig.create(body);
+        let due = budget_step(&rig.state, ts(20), |_| Some(usage(Some(1), Some(1))));
+        prop_assert_eq!(
+            due.notes.iter().filter_map(|note| note.task.clone()).collect::<Vec<_>>(),
+            vec![first, second.clone()]
+        );
+        rig.org(OrgCommand::SendMessage(due.notes.first().unwrap().clone())).unwrap();
+        let next = budget_step(&rig.state, ts(later), |_| Some(usage(Some(cost), Some(turns))));
+        prop_assert_eq!(next.notes.len(), 1);
+        prop_assert_eq!(&next.notes.first().unwrap().task, &Some(second));
+        rig.org(OrgCommand::SendMessage(next.notes.first().unwrap().clone())).unwrap();
+        let done = budget_step(&rig.state, ts(later), |_| None);
+        prop_assert!(done.notes.is_empty());
+        prop_assert_eq!(done.wake_at, None);
+    }
+
     // Break caught: increasing usage/time makes a previous crossing disappear.
     #[test]
     fn increasing_usage_and_time_preserves_crossings(

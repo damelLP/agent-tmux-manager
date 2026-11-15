@@ -141,6 +141,23 @@ atm agent handover worker --format json        # {"agent_id":…,"message_id":"m
 
 **A note at the context line.** When a named agent's turn ends and its context is at 60% or more, `atmd` sends one note to the agent's manager (to you for an agent whose role names none, and for an adopted agent): `agent <id> is at <n>% of its context (line 60%). Hand it over: atm agent handover <id>`. It is sent once per session and nothing is cleared. After a restart of `atmd` a session that was already noted can be noted once more. The line is 60% for every harness and model: a chosen number, not a measured one, until measurements give better ones.
 
+**Handover without a command.** A role file can let `atmd` hand its seat over by itself. It is off unless the role says so:
+
+```toml
+auto_handover = ["context"]   # or ["context", "idle"]; leave it out for off
+context_line  = 60            # optional: this seat's line in percent, 1 to 100 (default 60)
+cache_minutes = 60            # optional, required for "idle": how long you assume the prompt cache lives
+idle_minutes  = 48            # optional: default four fifths of cache_minutes, and always below it
+```
+
+- **`"context"`:** when a turn of the seat ends at or above its line, `atmd` runs the handover above itself: the same save request, the same wait for the memory file, the same clear. The seat's manager gets one note when it is over, `automatic handover of <id> done (context 63%, line 60%): it saved to <file> (mN) and has a new session.` or `automatic handover of <id> (…) did not complete: <reason>. Nothing more is tried in this session. By hand: atm agent handover <id>`, in place of the note at the line. `context_line` also moves that note for a seat that is off.
+- **`"idle"`:** when the seat has been idle for `idle_minutes` and nothing it waits for will come before `cache_minutes` are over, it is asked to save while its cache is still warm, and the handover gives up when they are over. `atmd` has no cache life of its own, because none has been measured: without `cache_minutes` there is no idle rule. What a seat waits for is read from tasks and decisions only: a task it holds or has given to another agent, or a pending decision it asked for (your answer counts as coming in time). A seat that works by messages alone waits for nothing as far as `atmd` can see, so use `"idle"` only where tasks carry the work.
+- **The file is read at every turn end,** in the project's main checkout, as `atm me` reads it. An edit takes effect at the seat's next turn end with no restart and no respawn, and removing `auto_handover` stops it. A missing or invalid role file is off.
+- **It never does more than the command would.** Nothing is typed while a turn runs, over a draft, at a dialog or into the pane you are focused on: the request waits there as any message does, and after ten minutes the manager is told. Nothing is cleared unless the agent saved. A session that shows background work is left alone, and so is one that has done nothing but start.
+- **One try per session.** Whatever becomes of it, `atmd` asks no second time in that session; the next session has a try of its own. A handover that could not start (the agent is not ready, another handover of it runs) sends nothing and does not count.
+- **A session whose cache has run out is not cleared.** With `"idle"` on, a seat idle for longer than `cache_minutes` is left as it is, and gets the note at its line. Clear it with a command.
+- **Limits.** All of it is in memory: after a restart of `atmd` nothing is done until a turn ends, and a handover the restart cut off is lost with its note. A request that was never delivered stays queued, as for the command. An older `atmd` refuses a role file that has these keys (`agent up` fails and `atm me` reports an invalid role), so remove them before going back to one.
+
 ### Finding your instructions and handover
 
 From a named agent's pane, start with one command:

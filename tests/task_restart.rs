@@ -203,6 +203,15 @@ fn real_daemon_restart_preserves_tasks_reviews_messages_and_pending_decision() {
     let list = call(&rig, None, "task.list", json!({}));
     assert_eq!(list["tasks"].as_array().unwrap().len(), 5);
     let context = rig.atm_json(Some(&worker.pane), &["me", "--format", "json"]);
+    assert_eq!(
+        context["open_tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["task_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [working.as_str(), waiting.as_str()]
+    );
     let inboxes = [
         inbox_facts(&rig, None),
         inbox_facts(&rig, Some(&lead.pane)),

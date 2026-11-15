@@ -111,7 +111,8 @@ pub struct GetResult {
     pub task: Task,
 }
 
-pub(super) fn sequence(id: &TaskId) -> Result<u64, TaskError> {
+/// Canonical task sequence; legacy free-text message references are not task IDs.
+pub fn sequence(id: &TaskId) -> Result<u64, TaskError> {
     let text = id.to_string();
     text.strip_prefix('t')
         .and_then(|s| s.parse::<u64>().ok())

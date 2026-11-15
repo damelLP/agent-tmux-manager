@@ -56,6 +56,10 @@ fn assigned_brief_and_submitted_report_travel_through_guarded_pi_references() {
     assert_eq!(inbox["read_at"], Value::Null);
     let context = rig.atm_json(Some(&worker.pane), &["me", "--format", "json"]);
     assert_eq!(context["agent_id"], worker.id);
+    assert_eq!(
+        context["open_tasks"],
+        json!([{"task_id":id,"title":"Tasks é🙂","kind":"work","state":"assigned","agent_id":worker.id,"reason":null}])
+    );
     rig.call(
         "task.set_state",
         json!({"task_id":id,"state":"working"}),
@@ -97,6 +101,10 @@ fn assigned_brief_and_submitted_report_travel_through_guarded_pi_references() {
         rig.call("task.get", json!({"task_id":id}), Some(&worker.pane))
             .unwrap()["task"]["state"],
         "accepted"
+    );
+    assert_eq!(
+        rig.atm_json(Some(&worker.pane), &["me", "--format", "json"])["open_tasks"],
+        json!([])
     );
     watch.catch_up(&rig);
     assert_eq!(

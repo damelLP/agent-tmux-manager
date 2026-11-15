@@ -880,10 +880,11 @@ impl Rig {
             };
             tmux.script_inspect(&pane(), Some(&idle.inspection))
                 .unwrap();
-            // Even a Ready unbound pane is captured while the restart pass
-            // tries to pin its baseline. Give it its own frame so a failed
-            // read cannot queue a retry ahead of the delivery reservation.
-            tmux.script_capture(&idle).unwrap();
+            // The restart pass captures only with a live harness row: Pi
+            // has one; the unbound Codex editor does not yet.
+            if !codex {
+                tmux.script_capture(&idle).unwrap();
+            }
             let (agents, _task) = spawn_agents_with(
                 org.clone(),
                 registry.clone(),

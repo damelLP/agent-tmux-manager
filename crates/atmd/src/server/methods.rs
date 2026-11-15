@@ -179,6 +179,7 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         || "named-agent operations are not configured".into(),
         |error| error.to_string(),
     );
+    crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();

@@ -1,0 +1,18 @@
+{
+  "request": {
+    "protocol_version": {"major": 1, "minor": 1},
+    "type": "request", "id": "context", "method": "agent.context", "params": {}, "from_pane": "%7"
+  },
+  "response": {
+    "type": "response", "id": "context",
+    "result": {
+      "agent_id": "project/worker", "manager": "project/lead",
+      "role_file": "substituted temporary root/.atm/roles/worker.md",
+      "instructions": "Follow the brief.\n",
+      "unread_messages": [{"message_id": "m3", "kind": "brief", "from": "owner", "first_line": "Read the attached brief"}],
+      "memory": {"path": "substituted temporary root/.atm/memory/worker.md", "exists": false},
+      "open_tasks": [],
+      "report_command": "atm msg send --to project/lead --kind report --body 'DONE: <result>'"
+    }
+  }
+}

@@ -1,8 +1,12 @@
 //! Captured: pi 1.5.0, 2026-11-14, sealed P1 private-tmux capture.
 //! No startup dialogs appeared: only existing editor facts can give None.
-//! Conversation requires visible content after recognized startup chrome, not
-//! merely nonzero usage or lack of freshness. Scrolled captures additionally
-//! prove separated, indented transcript blocks with a nonzero-usage footer.
+//! Conversation after recognized startup requires at least two blank-separated
+//! transcript blocks, all singly indented and free of warnings/notices/queued
+//! output. Captured: pi 1.5.0, 2026-11-14, sealed P3/P5 private-tmux captures:
+//! download status alone is not history. A single block or unsupported startup
+//! before real history can remain false; false is not freshness. Arbitrary custom
+//! UI imitating transcript blocks is unverified. Scrolled captures additionally
+//! require a nonzero-usage footer; usage alone never proves conversation.
 use super::*;
 use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlPolicy, ControlScreen, SessionArrival,
@@ -56,9 +60,13 @@ pub fn observe_control_screen(
         .rev()
         .find(|end| history.get(..*end).is_some_and(startup_only));
     result.conversation = if let Some(end) = startup_end {
-        history
-            .get(end..)
-            .is_some_and(|tail| tail.iter().any(|s| !s.trim().is_empty()))
+        history.get(end..).is_some_and(|tail| {
+            let blocks: Vec<_> = tail
+                .split(|s| s.trim().is_empty())
+                .filter(|block| !block.is_empty())
+                .collect();
+            blocks.len() >= 2 && blocks.iter().all(|block| transcript_block(block))
+        })
     } else {
         // P1's working/draft captures have scrolled past the banner. Do not
         // mistake damaged startup chrome for this observed transcript layout.

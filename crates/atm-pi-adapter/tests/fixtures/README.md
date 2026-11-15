@@ -12,7 +12,8 @@ load. Other control tests reuse the existing styled P1 fixtures below.
 
 No startup dialogs appeared: the control observer emits None only for existing
 recognized editors, Unknown otherwise. Conversation is independent of draft/
-turn facts: content beyond recognized startup blocks proves visible history.
+turn facts: validated transcript blocks beyond recognized startup prove visible
+history (see the stricter startup-suffix contract below).
 P1's scrolled working/draft screens have separate indented transcript blocks
 and nonzero usage; neither usage nor an old new-session notice alone proves
 conversation or freshness. A draft alone is not conversation. Unknown custom
@@ -190,3 +191,35 @@ plain text cannot reliably distinguish those rules from pasted editor borders.
 
 No RPC method is added. Captured success and synthetic refusal tests cover
 parser conformance; static clear/launch policy has exact-value tests.
+
+## Startup conversation evidence (U8i)
+
+Captured: pi 1.5.0, 2026-11-14, P3/P5 sealed loopback-only private tmux 3.8
+`capture-pane -p -e -N` (Styled) and `capture-pane -p -N` (Plain).
+`control_startup/manifest.json` maps all 260 original relative capture paths to
+50 deduplicated, version-labelled fixture bodies. Each row records original and
+sanitized SHA-256, geometry, format, provenance and pre-fix independent facts,
+control dialog and conversation value. Bodies have no added provenance header.
+Only private run roots become equal-width `/tmp/xxx…` paths, including clipped
+cwd rows; rows, ANSI, spaces and editor text are otherwise byte-preserved.
+
+Coverage includes P5 `a-initial`, `a-pi-typed`, `a-pi-cleanup` at 80/100/120
+columns and P3 `b-wide`, `b-narrow`, `b-narrow-corrected` at 28/80/120 columns
+(no P3 100-column capture). Drafts, first-after-input, stale popups and cleanup
+are retained, not just empty editors. All are pre-first-turn frames. Before the
+fix 104 wide frames falsely reported conversation from fd download status; all
+260 must now report false, without changing any independent fact or dialog.
+Retained Plain padding can report Draft; styled empty editors remain Empty.
+Wrapped startup still does not prove freshness, and popup Unknown stays Unknown.
+
+After recognized startup, positive evidence requires at least two nonempty,
+blank-separated transcript blocks, **every** block singly indented and free of
+warning/notice/queued-output rows. Scrolled-history evidence is unchanged.
+Nonzero counters alone are not history. Deliberately, a single visible block or
+real history following unsupported startup output may remain false: absence of
+positive evidence is not freshness and must not replace session-identity proof.
+Arbitrary custom UI imitating two transcript-shaped prose blocks is unverified.
+The existing P1 conversation/scrolled positives and zero-usage prompt/reply
+regression remain unchanged. `control_startup.rs` labels Synthetic mutations of
+values, spacing, suffix blocks, anchors, footer, borders and ANSI; these are not
+additional captures. Live post-build harness/daemon orchestration is unverified.

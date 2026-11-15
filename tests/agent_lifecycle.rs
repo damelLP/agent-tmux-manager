@@ -270,3 +270,184 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
     assert!(!second.rig.pane_rows(&b).is_empty());
     second.rig.close();
 }
+
+// Acceptance inventory, NOT implemented assertions. Remove an ignore only
+// together with its real test body; running these empty bodies proves nothing.
+// Task numbers below are the lifecycle slice's task numbers.
+
+/// Claude up: daemon ATM_SPAWN_BIN, role argv/model, ATM_AGENT, tag before first
+/// start, real session plus safe editor, no implicit prompt, all in its own window.
+#[test]
+#[ignore = "waits for Task 6: agent.up acceptance"]
+fn agent_up_ready_tagged_env_claude() {}
+
+/// Codex up: daemon override, role/required args and ATM_AGENT, pre-start tag,
+/// fresh safe Ready/null without submitting a prompt to manufacture a session.
+#[test]
+#[ignore = "waits for Task 6: agent.up acceptance"]
+fn agent_up_ready_tagged_env_codex() {}
+
+/// Pi up: daemon override, role args/model and ATM_AGENT, pre-start tag,
+/// session_start plus safe editor before Ready, no implicit initial prompt.
+#[test]
+#[ignore = "waits for Task 6: agent.up acceptance"]
+fn agent_up_ready_tagged_env_pi() {}
+
+/// A linked checkout uses the main role, not a conflicting linked role. Scrub
+/// all GIT_* for fixture git commands; prove the temp gitdir before any write.
+#[test]
+#[ignore = "waits for Task 6 and a scrubbed linked-checkout Git fixture"]
+fn agent_up_reads_main_checkout_role() {}
+
+/// Held Claude clear stays Clearing until a new real ID with source=clear and
+/// a safe editor; return that ID on the same process, never rebind the old row.
+#[test]
+#[ignore = "waits for Task 8: Claude clear stand-in acceptance"]
+fn clear_returns_new_ready_session_claude() {}
+
+/// Held pi clear stays Clearing until changed ID plus safe editor on the same
+/// process/connection; repeated notices alone are not acknowledgment.
+#[test]
+#[ignore = "waits for Task 8: pi clear stand-in acceptance"]
+fn clear_returns_new_ready_session_pi() {}
+
+/// Codex conversation-to-fresh clear returns Ready/null, excludes the old ID,
+/// then binds the next real prompt's ID once without any slash concatenation.
+#[test]
+#[ignore = "waits for Task 8: Codex lazy-session clear acceptance"]
+fn codex_clear_ready_without_id_then_binds_next_prompt() {}
+
+/// Ready/null with no eligible row AND fresh safe facts sends no clear input
+/// and emits no clear_requested; an unreported conversation must not pass.
+#[test]
+#[ignore = "waits for Task 8: Codex clear no-op acceptance"]
+fn codex_ready_unbound_clear_is_noop() {}
+
+/// Accept only the exact default current-worktree choice, create no checkout,
+/// confirm a fresh safe editor and the specified control audit.
+#[test]
+#[ignore = "waits for Task 8: worktree clear acceptance"]
+fn clear_worktree_default() {}
+
+/// Respawn replaces pane/process/session under the same agent; stale old events
+/// cannot bind. Use another pre-sized placement window, never split a stand-in.
+#[test]
+#[ignore = "waits for Tasks 6 and 10: respawn acceptance"]
+fn respawn_uses_new_process_and_session() {}
+
+/// A daemon restart retains durable identity/binding and converges after live
+/// row and foreground-baseline revalidation, without lifecycle input.
+#[test]
+#[ignore = "waits for Task 10: restart foreground revalidation"]
+fn restart_preserves_agent_list() {}
+
+/// Restart only the owned private tmux server; a reused pane ID with a foreign
+/// tag must never be claimed, receive input, or be killed by the old agent.
+#[test]
+#[ignore = "waits for Task 10: reused-pane restart acceptance"]
+fn tmux_restart_does_not_claim_reused_pane() {}
+
+/// Pending discovery is liveness, not a replacement session ID. A safe idle
+/// restarted agent preserves its recorded binding and revalidates Ready.
+#[test]
+#[ignore = "waits for Task 10: pending-row restart acceptance"]
+fn idle_pending_restart_ready_preserves_binding() {}
+
+/// A busy/unknown restart remains Starting until a later real event and safe
+/// editor jointly permit Ready; stale idle history cannot satisfy it.
+#[test]
+#[ignore = "waits for Task 10: busy restart acceptance"]
+fn busy_restart_starting_until_event() {}
+
+/// A Ready/null process exits without End; a later positive idle-shell
+/// observation records Down instead of trusting the retained harness frame.
+#[test]
+#[ignore = "waits for Task 10 and a full Ready/null exit-without-End fixture"]
+fn ready_null_exit_without_end() {}
+
+/// Exact canonical allowlist path permits No→Down→Yes→Enter once; confirm the
+/// accepted editor/start and control.sent audit, never Enter on unselected No.
+#[test]
+#[ignore = "waits for Tasks 6 and 7: Claude folder-trust acceptance"]
+fn claude_folder_trust_allowlist_audited() {}
+
+/// An unallowlisted, prefix-only or changed folder goes Stuck with zero input;
+/// compare with the allowlisted positive case, not merely a timeout.
+#[test]
+#[ignore = "waits for Task 7: unauthorized-folder refusal acceptance"]
+fn unallowlisted_folder_trust_zero_keys() {}
+
+/// One trust-selection reset permits one recovery; a second reset is Stuck.
+/// U11b currently models stable selection, so it cannot prove this sequence.
+#[test]
+#[ignore = "waits for Task 7 and the missing U11b trust-reset fixture"]
+fn first_trust_reset_recovers_second_reset_stuck() {}
+
+/// Codex update is skipped with exactly one guarded Escape; verify the
+/// subsequent accepted state and control.sent, not merely key dispatch.
+#[test]
+#[ignore = "waits for Task 7: update-dialog acceptance"]
+fn update_skip_audited() {}
+
+/// Default-selected Codex folder trust accepts once only for the exact allowed
+/// path; verify readiness/audit and refusal of a changed selection or path.
+#[test]
+#[ignore = "waits for Task 7: Codex folder-trust acceptance"]
+fn codex_folder_trust_allowlist_audited() {}
+
+/// While hook review is parked, the review modal is Stuck with an owner note
+/// and no trust key. Deliberately replace this expectation when Task 9 lands.
+#[test]
+#[ignore = "waits for Task 7: parked hook-review refusal acceptance"]
+fn codex_hooks_review_is_stuck_without_literal_key() {}
+
+/// Walk all hook-list pages, require the exact ATM event/count set, send the
+/// approved literal trust key once, confirm accepted rows and audit evidence.
+#[test]
+#[ignore = "waits for Task 9: hook-review flow is parked"]
+fn codex_exact_atm_hooks_only_audited() {}
+
+/// Foreign, extra, changed, or hidden hook rows authorize no trust key; pair
+/// with the exact-list success case, using controlled foreign-list evidence.
+#[test]
+#[ignore = "waits for Task 9 and a controlled foreign-hook-list fixture"]
+fn codex_other_hooks_stuck() {}
+
+/// Unknown/permission modal yields the specific refusal/Stuck and no input or
+/// approval. Source replay can diagnose parsing, never prove a lifecycle turn.
+#[test]
+#[ignore = "waits for Task 7: unknown-modal refusal acceptance"]
+fn unknown_modal_zero_keys() {}
+
+/// Empty idle input with pi retry chrome is not Ready. No current U11b retry
+/// scene exists; capture-backed tests elsewhere do not implement this case.
+#[test]
+#[ignore = "waits for Tasks 6/8 and the missing U11b pi-retry fixture"]
+fn retry_chrome_empty_idle_blocks_ready() {}
+
+/// Hold after clear consumption; watch clear_requested before raw session.send
+/// and spawn_type (canonical, alias, %0N). Assert exact U8c refusal, then release
+/// and await Ready. This does not prove message-delivery serialization.
+#[test]
+#[ignore = "waits for Task 8: clear-versus-raw-send acceptance"]
+fn clear_vs_raw_send_refuses_until_ready() {}
+
+/// With durable Clearing, restart the daemon and assert the same raw-send
+/// refusals; do not assume the pre-restart clear RPC is still alive.
+#[test]
+#[ignore = "waits for Tasks 8 and 10: durable-clearing restart acceptance"]
+fn durable_clearing_after_restart_refuses_raw_send() {}
+
+/// Real msg.send stays queued behind held clear. Watch sent/clear_requested/
+/// ready/delivered and the stand-in gates; exactly one new-generation prompt
+/// contains the token, never concatenated /clear or /new. No substitute executor.
+#[test]
+#[ignore = "waits for Task 12: Task 8 plus U9b slice B integration"]
+fn msg_send_during_clear_delivers_once_to_new_generation() {}
+
+/// An already-admitted real delivery finishes before clear starts; later
+/// delivery waits for readiness. The in-process coalesced-reservation callback
+/// barrier belongs to U8c/B's separate reservation tests, not a new test RPC.
+#[test]
+#[ignore = "waits for Task 12: Task 8 plus U9b slice B integration"]
+fn clear_waits_behind_admitted_delivery() {}

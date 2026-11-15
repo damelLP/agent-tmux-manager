@@ -730,6 +730,31 @@ async fn all_agent_targets_accept_bare_and_full_ids() {
 }
 
 #[tokio::test]
+async fn daemon_lookup_error_keeps_its_text() {
+    for args in [
+        target_args("clear", "worker"),
+        target_args("respawn", "worker"),
+        target_args("down-kill", "worker"),
+        target_args("inbox", "worker"),
+        vec!["msg", "send", "--to", "worker", "--body", "hi"],
+    ] {
+        let out = run(
+            &args,
+            None,
+            vec![Step {
+                method: "agent.list",
+                params: json!({"project_root":"$cwd"}),
+                payload: json!({"error":{"code":"unavailable","message":"agent.list is unavailable: test"}}),
+            }],
+            false,
+        ).await;
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        assert_eq!(out.stderr, b"Error: agent.list is unavailable: test\n");
+    }
+}
+
+#[tokio::test]
 async fn malformed_lookup_answers_say_nothing_was_sent() {
     for action in TARGET_ACTIONS {
         let out = run(

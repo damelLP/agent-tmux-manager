@@ -33,5 +33,7 @@ crates/atmd/src/org/task_methods.rs
 crates/atmd/src/org/decisions.rs
 crates/atmd/tests/intent.rs
 crates/atmd/tests/standing_rules.rs
+crates/atmd/tests/fixtures/intent/*
+crates/atmd/tests/fixtures/standing_rules/*
 crates/atmd/tests/decision_conformance.rs
 tests/atm_decide.rs

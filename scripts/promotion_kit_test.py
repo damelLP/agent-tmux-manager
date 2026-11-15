@@ -175,6 +175,8 @@ class ProtectedFiles(Sealed):
                  'crates/atmd/src/org/tasks.rs', 'crates/atmd/src/org/task_methods.rs',
                  'crates/atmd/src/org/decisions.rs', 'crates/atmd/tests/intent.rs',
                  'crates/atmd/tests/standing_rules.rs',
+                 'crates/atmd/tests/fixtures/intent/methods.json',
+                 'crates/atmd/tests/fixtures/standing_rules/methods.json',
                  'crates/atmd/tests/decision_conformance.rs', 'tests/atm_decide.rs')
         before = self.before
         for status, content in (('A', 'initial'), ('M', 'changed'), ('D', None)):
@@ -190,6 +192,27 @@ class ProtectedFiles(Sealed):
                 after = self.commit(self.repo)
                 self.assertEqual(self.report(before, after)[0], {path: status for path in paths})
             before = after
+
+    # Policy fixture judges stay explicit even if the generic fixture glob is narrowed.
+    def test_policy_fixtures_do_not_depend_on_the_generic_fixture_glob(self):
+        script = self.root / 'policy-report/atm-protected-files.py'
+        script.parent.mkdir()
+        script.write_bytes((SCRIPTS / script.name).read_bytes())
+        manifest = (SCRIPTS / 'protected-files.txt').read_text()
+        script.with_name('protected-files.txt').write_text('\n'.join(
+            line for line in manifest.splitlines() if line != 'crates/*/tests/fixtures/*'))
+        paths = ('crates/atmd/tests/fixtures/intent/methods.json',
+                 'crates/atmd/tests/fixtures/standing_rules/methods.json')
+        for path in paths:
+            file = self.repo / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('before')
+        before = self.commit(self.repo)
+        for path in paths:
+            (self.repo / path).write_text('after')
+        after = self.commit(self.repo)
+        self.assertEqual(self.report(before, after, script=script)[0],
+                         {path: 'M' for path in paths})
 
     # Current shipped rules must not mask a regression in the historical-list union.
     def test_historical_intent_measures_survive_current_list_narrowing_and_deletion(self):

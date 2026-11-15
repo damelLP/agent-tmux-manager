@@ -697,7 +697,8 @@ async fn failed_observations_clear_busy_notice_evidence_without_restarting_readi
     rig.screens.lose(&worker());
     rig.round(10_000).await;
     let lost = rig.job.service.rt.clock.now().unwrap();
-    for elapsed in [0, 120_000, 1_800_000] {
+    let loss_notice = unobserved(id);
+    for (elapsed, loss_noted) in [(0, false), (120_000, true), (1_800_000, true)] {
         rig.round(elapsed).await;
         let now = rig.job.service.rt.clock.now().unwrap();
         let live = rig.job.service.rt.history.snapshot(id, now).unwrap().live;
@@ -705,16 +706,37 @@ async fn failed_observations_clear_busy_notice_evidence_without_restarting_readi
         assert_eq!(live.agent_not_ready_since, Some(lost));
         assert_eq!(
             rig.job.service.board.progress(id).reason.as_deref(),
-            Some("owner is focused on this pane")
+            Some("recipient cannot be observed")
         );
-        assert!(rig.notes().await.is_empty());
+        if loss_noted {
+            assert_eq!(rig.notes().await, std::slice::from_ref(&loss_notice));
+        } else {
+            assert!(rig.notes().await.is_empty());
+        }
     }
     rig.turn(atm_core::TurnState::Running);
     rig.round(0).await;
+    let resumed = rig.job.service.rt.clock.now().unwrap();
+    let live = rig
+        .job
+        .service
+        .rt
+        .history
+        .snapshot(id, resumed)
+        .unwrap()
+        .live;
+    assert_eq!(live.running_turn_since, Some(resumed));
+    assert_eq!(live.agent_not_ready_since, None);
     rig.round(1_799_999).await;
-    assert!(rig.notes().await.is_empty());
+    assert_eq!(rig.notes().await, std::slice::from_ref(&loss_notice));
     rig.round(1).await;
-    assert_eq!(rig.notes().await.len(), 1);
+    assert_eq!(
+        rig.notes().await,
+        [
+            loss_notice,
+            format!("demo/worker busy for 30 min; message still queued ({id})")
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]

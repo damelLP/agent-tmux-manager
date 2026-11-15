@@ -50,11 +50,13 @@ pub(super) fn parse_address(text: &str) -> Result<String, String> {
     parse_agent(text)
 }
 
-fn unique_name(rows: &[AgentListEntry], name: &str) -> Result<AgentId> {
+fn unique_name(rows: &[AgentListEntry], name: &str, searched: &str) -> Result<AgentId> {
     let mut matches = rows.iter().filter(|row| row.agent_id.name == name);
-    let first = matches
-        .next()
-        .with_context(|| format!("agent {name} was not found in the selected project; use project/name or --project-root <path>"))?;
+    let first = matches.next().with_context(|| {
+        format!(
+            "agent {name} was not found in {searched}; use project/name or --project-root <path>"
+        )
+    })?;
     if matches.next().is_some() {
         bail!("agent name {name} is ambiguous; use project/name");
     }
@@ -92,16 +94,29 @@ pub(super) async fn agent(to: &str, root: Option<PathBuf>) -> Result<AgentId> {
                     .into_iter()
                     .filter(|row| row.agent_id.project == project)
                     .collect();
-                return unique_name(&selected, to);
+                return unique_name(&selected, to, &format!("project {project} (caller's pane)"));
             }
         }
     }
+    let source = if root.is_some() {
+        "--project-root"
+    } else {
+        "current directory"
+    };
     let root = match root {
         Some(root) if root.is_absolute() => root,
         Some(root) => std::env::current_dir()?.join(root),
         None => std::env::current_dir()?,
     };
-    unique_name(&list(Some(root)).await?, to)
+    let rows = list(Some(root.clone())).await?;
+    let searched = match rows.first() {
+        Some(row) => format!("project {} ({source})", row.agent_id.project),
+        None => format!(
+            "project at {} ({source})",
+            super::msg::escaped(&root.to_string_lossy(), false)
+        ),
+    };
+    unique_name(&rows, to, &searched)
 }
 
 #[cfg(test)]

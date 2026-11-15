@@ -100,7 +100,7 @@ pub(super) async fn inbox_request(params: InboxParams) -> Result<InboxResult> {
         .map(|(result, _)| result)
 }
 
-fn escaped(text: &str, multiline: bool) -> String {
+pub(super) fn escaped(text: &str, multiline: bool) -> String {
     text.chars()
         .flat_map(|c| {
             if c == '\\' && !multiline {

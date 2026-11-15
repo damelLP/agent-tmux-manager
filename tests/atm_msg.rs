@@ -27,8 +27,17 @@ fn ok(method: &'static str, params: Value, result: Value) -> Step {
         payload: json!({"result":result}),
     }
 }
-async fn run(args: &[&str], pane: Option<&str>, mut steps: Vec<Step>, success: bool) -> Output {
+async fn run(args: &[&str], pane: Option<&str>, steps: Vec<Step>, success: bool) -> Output {
     let dir = tempfile::tempdir().unwrap();
+    run_in(&dir, args, pane, steps, success).await
+}
+async fn run_in(
+    dir: &tempfile::TempDir,
+    args: &[&str],
+    pane: Option<&str>,
+    mut steps: Vec<Step>,
+    success: bool,
+) -> Output {
     let socket = dir.path().join("rpc.sock");
     let listener = Arc::new(UnixListener::bind(&socket).unwrap());
     for step in &mut steps {
@@ -709,6 +718,70 @@ async fn malformed_lookup_answers_say_nothing_was_sent() {
     assert!(String::from_utf8(out.stderr).unwrap().starts_with(
         "Error: agent lookup failed: malformed answer from daemon; nothing was sent\n"
     ));
+}
+
+#[tokio::test]
+async fn missing_agent_names_the_searched_project_and_source() {
+    for action in TARGET_ACTIONS {
+        let out = run(
+            &target_args(action, "worker"),
+            Some("%7"),
+            vec![ok(
+                "agent.list",
+                json!({"project_root":null}),
+                json!([
+                    agent("p/caller", Some("%7"), "ready"),
+                    agent("q/worker", None, "ready")
+                ]),
+            )],
+            false,
+        )
+        .await;
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "Error: agent worker was not found in project p (caller's pane); use project/name or --project-root <path>\n");
+        for (root, source) in [
+            (None, "current directory"),
+            (Some("/q"), "--project-root"),
+            (Some("sub"), "--project-root"),
+        ] {
+            for known_project in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut args = target_args(action, "worker");
+                let searched_root = match root {
+                    Some("/q") => std::path::PathBuf::from("/q"),
+                    Some(relative) => dir.path().join(relative),
+                    None => dir.path().to_owned(),
+                };
+                if let Some(root) = root {
+                    args.extend(["--project-root", root]);
+                }
+                let rows = if known_project {
+                    json!([agent("q/other", None, "ready")])
+                } else {
+                    json!([])
+                };
+                let out = run_in(
+                    &dir,
+                    &args,
+                    None,
+                    vec![ok(
+                        "agent.list",
+                        json!({"project_root":searched_root}),
+                        rows,
+                    )],
+                    false,
+                )
+                .await;
+                let project = if known_project {
+                    "project q".to_owned()
+                } else {
+                    format!("project at {}", searched_root.display())
+                };
+                assert_eq!(String::from_utf8(out.stderr).unwrap(), format!("Error: agent worker was not found in {project} ({source}); use project/name or --project-root <path>\n"));
+                assert_eq!(out.status.code(), Some(1));
+                assert!(out.stdout.is_empty());
+            }
+        }
+    }
 }
 
 #[tokio::test]

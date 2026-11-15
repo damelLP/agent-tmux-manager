@@ -105,6 +105,8 @@
 //! A queued, unattempted message gets one informational owner Note after
 //! [`BUSY_NOTICE_AFTER`] behind the same observed turn (measured no earlier than
 //! its sent_at). This is independent of delivery status, never a block/drop.
+//! Any lost or Unknown sample restarts the thirty-minute interval and re-arms
+//! the note, even within the same physical turn.
 //! Positive running-turn evidence clears that clock. Its first loss starts a
 //! fresh window; repeated unknown observations never restart it. Unknown focus
 //! still waits ahead of agent status, even if that window has expired.
@@ -136,6 +138,8 @@ use thiserror::Error;
 
 /// One informational owner notice after a message waits behind a continuously
 /// observed running turn. Never a readiness timeout or permission to drop it.
+/// Any lost or Unknown sample restarts the interval and re-arms the note,
+/// even within the same physical turn.
 pub const BUSY_NOTICE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// Config-file settings. Durations serialize as `{secs, nanos}`; omitted fields
@@ -257,8 +261,10 @@ pub struct RecipientLiveView {
     pub pane: PaneLiveness,
     pub agent_status: AgentStatus,
     /// Start of the current not-ready window, independent of message holds.
-    /// Reconstruct from applied transitions in log order: set when leaving Ready
-    /// or first creating a non-ready agent; clear on Ready. Preserve across
+    /// Track applied transitions and observations: set when leaving Ready
+    /// or first creating a non-ready agent; clear on Ready or observed Running.
+    /// The first loss of Running starts a fresh window. Observations are not
+    /// logged, so replay starts this clock no earlier than recovery. Preserve across
     /// Starting/Clearing transitions and metadata events. Entering Starting or
     /// Clearing from Stuck/Down starts a new window: the outage already notified
     /// the owner, and a restart gets its own readiness budget. Agent.updated_at
@@ -1265,6 +1271,20 @@ mod tests {
             &live,
             time(1800)
         ));
+    }
+
+    #[test]
+    fn queued_retry_waits_behind_a_running_turn_without_a_busy_notice() {
+        let mut h = History::new(false);
+        h.attempt(1, 0);
+        h.failure(false, 2);
+        assert_eq!(h.message().status, DeliveryStatus::Queued);
+        let mut live = ready();
+        live.running_turn_since = Some(time(0));
+        for now in [1800, 7200] {
+            wait(h.step(&live, now), WaitReason::SessionBusy);
+            assert!(!busy_notice_due(h.message(), &live, time(now)));
+        }
     }
 
     #[test]

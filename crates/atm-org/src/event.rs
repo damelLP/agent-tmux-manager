@@ -18,7 +18,7 @@
 //! this is another reason downgrading a newer log is not a safety guarantee.
 
 use crate::{
-    Address, AgentId, DecisionId, DecisionRequest, DecisionResolution, DecisionWithdrawal,
+    Address, AgentId, DecisionId, DecisionRequest, DecisionResolutionEvent, DecisionWithdrawal,
     MessageId, ProjectId, ProvisionalChoice, RoleSpec, TaskId,
 };
 use atm_core::{Harness, Money, SessionId};
@@ -196,9 +196,9 @@ pub enum OrgEvent {
     #[serde(rename = "decision.taken_provisionally")]
     DecisionTakenProvisionally(ProvisionalChoice),
     #[serde(rename = "decision.resolved")]
-    DecisionResolved(DecisionResolution),
+    DecisionResolved(DecisionResolutionEvent),
     #[serde(rename = "decision.overruled")]
-    DecisionOverruled(DecisionResolution),
+    DecisionOverruled(DecisionResolutionEvent),
     #[serde(rename = "decision.expired")]
     DecisionExpired { decision_id: DecisionId },
     #[serde(rename = "decision.withdrawn")]

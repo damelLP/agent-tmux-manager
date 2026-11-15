@@ -147,7 +147,7 @@ pub struct ProvisionalChoice {
     pub by: Address,
 }
 
-/// Body of `decision.resolved` and `decision.overruled`.
+/// The owner's answer, independent of the pane that submitted it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionResolution {
     pub decision_id: DecisionId,
@@ -155,6 +155,29 @@ pub struct DecisionResolution {
     pub by: Address,
     pub note: Option<String>,
     pub standing_rule: bool,
+}
+
+/// Body of `decision.resolved` and `decision.overruled`. Caller metadata is
+/// audit only: equality compares the answer, and the fold does not retain it.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct DecisionResolutionEvent {
+    #[serde(flatten)]
+    pub resolution: DecisionResolution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane: Option<String>,
+}
+impl PartialEq for DecisionResolutionEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.resolution == other.resolution
+    }
+}
+impl From<DecisionResolution> for DecisionResolutionEvent {
+    fn from(resolution: DecisionResolution) -> Self {
+        Self {
+            resolution,
+            caller_pane: None,
+        }
+    }
 }
 
 /// Body of `decision.withdrawn`.
@@ -265,7 +288,7 @@ impl DecisionCommand {
         match self.clone() {
             Self::Request(request) => OrgEvent::DecisionRequested(request),
             Self::TakeProvisionally(choice) => OrgEvent::DecisionTakenProvisionally(choice),
-            Self::Resolve(resolution) => OrgEvent::DecisionResolved(resolution),
+            Self::Resolve(resolution) => OrgEvent::DecisionResolved(resolution.into()),
             Self::Expire { decision_id } => OrgEvent::DecisionExpired { decision_id },
             Self::Withdraw(withdrawal) => OrgEvent::DecisionWithdrawn(withdrawal),
         }
@@ -334,7 +357,9 @@ impl OrgState {
                                 .as_ref()
                                 .is_some_and(|taken| taken.option != resolution.option);
                         if overrules {
-                            return Ok(vec![OrgEvent::DecisionOverruled(resolution.clone())]);
+                            return Ok(vec![OrgEvent::DecisionOverruled(
+                                resolution.clone().into(),
+                            )]);
                         }
                         true
                     }

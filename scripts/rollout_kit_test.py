@@ -33,12 +33,20 @@ NAMES = ('atm', 'atmd')
 LABEL = 'rollout-test'
 # A wrapper `atm`: every command goes to the real binary except those the test names in
 # modes.json, which exit with the given code (a pair adds the error text), or print the
-# given text and exit 0.
+# given text and exit 0. {"each": [...]} gives one such action per call, the last one for
+# every later call; null there means the real binary.
 WRAPPER = '''#!/usr/bin/python3
 import json, os, sys
 modes = json.load(open(MODES))
 for words, action in modes.items():
     if sys.argv[1:1 + len(words.split())] == words.split():
+        if isinstance(action, dict) and 'each' in action:
+            counter = MODES + '.calls.' + words.replace(' ', '-')
+            calls = int(open(counter).read()) if os.path.exists(counter) else 0
+            open(counter, 'w').write(str(calls + 1))
+            action = action['each'][min(calls, len(action['each']) - 1)]
+            if action is None:
+                break
         if isinstance(action, int):
             action = [action, 'injected failure: ' + words]
         if isinstance(action, list) and action and isinstance(action[0], int):
@@ -852,6 +860,37 @@ class FailedChecks(Rig):
         seat = self.agent()
         self.wrap({'agent list --format json': [dict(self.agents()[0], pane=None)]})
         self.assertIn('project/seat was on pane %s and is now on -' % seat['pane'], self.rolled_back('agents', old))
+
+    def test_an_agent_list_that_is_still_starting_is_asked_again(self):
+        self.start_tmux()
+        self.start_daemon()
+        seat = self.agent()
+        # The two answers of a daemon whose start has not finished reconciling its agents.
+        self.wrap({'agent list': {'each': [
+            [1, 'Error: agent service unavailable: agent reconciliation is in progress'],
+            [1, 'Error: agent operation timed out; admitted effects may have completed; inspect agent list'],
+            None]}})
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('Checks passed: identity, list, status, agent-list, agents, send.', out)
+        self.assert_running(self.pair(self.candidate / 'bin'))
+        self.assertEqual([(a['agent_id'], a['pane']) for a in self.agents()], [(seat['agent_id'], seat['pane'])])
+
+    def test_an_agent_list_that_fails_after_the_rollback_is_reported_as_itself(self):
+        self.wrap({'status': 1})  # the new build fails a check
+        # The previous build answers the snapshot, then fails its list for a reason of its own.
+        self.wrap({'agent list': {'each': [None, [1, 'Error: agent operation failed: disk full']]}},
+                  installed=True)
+        self.start_tmux()
+        old = self.pair()
+        self.start_daemon()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 4, out + err)
+        self.assertIn('check status failed: atm status exit 1: injected failure: status; rolled back, and then '
+                      'check agent-list failed: atm agent list exit 1: Error: agent operation failed: disk full',
+                      err)
+        self.assertNotIn('organisation log', err)
+        self.assert_running(old)
 
 
 class DownAcrossTheRestart(Rig):

@@ -38,6 +38,12 @@ WAIT_POLL = 2.0  # seconds between two looks at work in flight (--wait)
 LOCK_WAIT = QUIT_WAIT = SEND_WAIT = 15
 COMMAND_WAIT = 5  # for a one-shot atm call (a loop's `atm list`) to end by itself
 SWAP_WAIT = 300  # for atm-promote or atm-rollback; its own atm setup gives up after 60
+# What `atm agent list` answers while a daemon that has just started still reconciles its
+# agents (the list waits five seconds for that pass, then times out), and how long to keep asking.
+STARTING = ('agent reconciliation is in progress', 'agent operation timed out', 'daemon request timed out')
+AGENT_LIST_WAIT = 60
+# What it answers when the organisation service is off because the log could not be replayed.
+UNREADABLE_LOG = 'organisation service unavailable: events replay'
 # The smoke's daemon delivers as soon as its stand-in is idle; the default policy waits ten seconds.
 SMOKE_CONFIG = ('[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\n'
                 'stable_empty_input = { secs = 0, nanos = 1000000 }\n')
@@ -431,9 +437,16 @@ class Rollout:
         except (OSError, ValueError, AttributeError):
             return None
 
-    def named_agents(self):
-        """The installed build's agent list; None for a build from before named agents."""
-        listed = self.call([self.atm, 'agent', 'list', '--format', 'json'])
+    def named_agents(self, patience=0):
+        """The installed build's agent list; None for a build from before named agents.
+        For `patience` seconds it asks again while the daemon answers that it is still starting."""
+        deadline = time.monotonic() + patience
+        while True:
+            listed = self.call([self.atm, 'agent', 'list', '--format', 'json'])
+            starting = listed.returncode != 0 and any(text in listed.stderr for text in STARTING)
+            if not starting or time.monotonic() >= deadline:
+                break
+            time.sleep(.2)  # bounded poll on "it answers", not a settling delay
         if listed.returncode == 2 and 'unrecognized subcommand' in listed.stderr:
             return None
         if listed.returncode != 0:
@@ -613,7 +626,7 @@ class Rollout:
             json.loads(answers('list', 'list', '--format', 'json'))
             answers('status', 'status')
             try:
-                listed = self.named_agents()
+                listed = self.named_agents(AGENT_LIST_WAIT)
             except (OSError, ValueError) as error:
                 raise CheckFailed('agent-list', str(error)) from error
             if listed is None:  # the build now installed is from before named agents
@@ -831,7 +844,7 @@ class Rollout:
             self.start_daemon()
             self.checks(before, self.old)
         except CheckFailed as second:
-            if second.name == 'agent-list':
+            if second.name == 'agent-list' and UNREADABLE_LOG in second.detail:
                 raise NeedsYou(f'{failure}; the previous build runs but cannot read the organisation log the '
                                'newer build wrote; named agents and messages are unavailable until the newer '
                                'build is back; the state directory was not touched') from second

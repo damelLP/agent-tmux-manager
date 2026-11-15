@@ -6,9 +6,9 @@
 //! Delivery must independently check the screen before input.
 //! A Stuck agent recovers only when one observation finds its session row and
 //! captures a safe editor; a binding alone never clears Stuck.
-//! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: down,
-//! adopt and clear act on panes; up and respawn are not built yet and answer
-//! "not implemented" after admission.
+//! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: up, down,
+//! adopt and clear act on panes; respawn is not built yet and answers "not
+//! implemented" after admission.
 
 pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
@@ -122,6 +122,9 @@ pub enum AgentError {
     Organisation(#[from] OrgServiceError),
 }
 
+/// Reads one variable of the environment a launch takes its overrides from.
+pub(super) type SpawnEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 #[derive(Clone)]
 pub(super) struct AgentRuntime {
     pub org: OrgHandle,
@@ -132,6 +135,8 @@ pub(super) struct AgentRuntime {
     baselines: Arc<std::sync::Mutex<HashMap<AgentId, (String, PaneBaseline)>>>,
     /// Reads a pane's root process from procfs; scripted in tests.
     pub proc: super::agent_proc::ProcReader,
+    /// The `ATM_SPAWN_*` overrides of the daemon's start environment.
+    pub spawn_env: SpawnEnv,
     #[cfg(test)]
     progress: broadcast::Sender<ObservationProgress>,
 }
@@ -386,21 +391,39 @@ impl AgentHandle {
             .map_err(|_| AgentError::Unavailable("lifecycle dispatcher stopped".into()))?
     }
 
-    pub async fn up(&self, p: UpParams, _caller: CallContext) -> Result<UpResult, AgentError> {
+    pub async fn up(&self, p: UpParams, caller: CallContext) -> Result<UpResult, AgentError> {
+        const OPERATION: &str = "agent.up";
         let deadline = Instant::now() + Duration::from_secs(60);
         let prepared = self
-            .projects("agent.up")?
+            .projects(OPERATION)?
             .prepare(p.project_root, p.name)
             .await?;
-        self.unimplemented(
-            ReservationRequest::new(
-                prepared.agent_id,
-                None,
-                ReservationKind::Up,
-                WaitPolicy::Wait,
-                deadline,
-            ),
-            "agent.up",
+        let rt = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or_else(|| self.unavailable(OPERATION))?;
+        let id = prepared.agent_id.clone();
+        let launch = rt
+            .prepare_launch(prepared, caller, p.caller_server.clone())
+            .await?;
+        #[cfg(test)]
+        rt.progress("up_prepared", Some(id.clone()));
+        let request = ReservationRequest::new(
+            id.clone(),
+            None,
+            ReservationKind::Up,
+            WaitPolicy::Wait,
+            deadline,
+        );
+        let waiting = super::agent_lifecycle::Waiting::default();
+        let (work, cleanup) = (rt.clone(), rt.clone());
+        let why = waiting.clone();
+        self.lifecycle_for(
+            p.caller_server,
+            request,
+            move |r| async move { work.up(&r, launch, &waiting).await },
+            move |_, _| async move { cleanup.settle_up(&id, &why).await },
         )
         .await
     }
@@ -1049,7 +1072,13 @@ pub fn spawn_agents(
     cancel: CancellationToken,
 ) -> (AgentHandle, JoinHandle<()>) {
     let proc = super::agent_proc::procfs_reader();
-    spawn_agents_with(org, registry, control, cancel, proc)
+    // Read once: a launch takes its overrides from the daemon's start.
+    let env: HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| key.starts_with("ATM_SPAWN_"))
+        .collect();
+    let spawn_env: SpawnEnv = Arc::new(move |key| env.get(key).cloned());
+    spawn_agents_with(org, registry, control, cancel, proc, spawn_env)
 }
 
 /// [`spawn_agents`] with the procfs reader given, so tests can script it.
@@ -1059,6 +1088,7 @@ pub(super) fn spawn_agents_with(
     control: ControlHandle,
     cancel: CancellationToken,
     proc: super::agent_proc::ProcReader,
+    spawn_env: SpawnEnv,
 ) -> (AgentHandle, JoinHandle<()>) {
     let rt = AgentRuntime {
         org,
@@ -1066,6 +1096,7 @@ pub(super) fn spawn_agents_with(
         control,
         baselines: Arc::default(),
         proc,
+        spawn_env,
         #[cfg(test)]
         progress: broadcast::channel(4096).0,
     };

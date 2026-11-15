@@ -76,7 +76,7 @@ fn rig_send_inbox_ack_round_trip() {
     assert_eq!(entry["content"]["body"], BODY);
     assert_eq!(entry["content"]["from"], "owner");
     assert_eq!(entry["read_at"], json!(null), "fetching is not reading");
-    // Another caller's view is refused, the owner's is not.
+    // The owner can also fetch the agent's message with --for.
     assert_eq!(
         rig.inbox_entry(None, Some(&lead.id), &id)["content"]["body"],
         BODY
@@ -174,7 +174,7 @@ mod delivered_reference_and_exact_inbox_body {
     }
 
     #[test]
-    #[ignore = "the Codex stand-in at 200x50 is adopted Starting, never Ready: adoption finds no safe editor on its screen, after a finished turn too (a stand-in or U8 gap, no gate of this unit)"]
+    #[ignore = "the Codex stand-in at 200x50 is adopted Starting, never Ready: adoption finds no safe editor on its screen, after a finished turn too"]
     fn codex() {
         run(StandInMode::Codex);
     }
@@ -186,7 +186,7 @@ mod delivered_reference_and_exact_inbox_body {
 /// The proof stays the scripted `proven_no_effect_retries_1_2_4_then_final`
 /// family in atmd's delivery tests until the stand-in can refuse a paste.
 #[test]
-#[ignore = "missing stand-in control: refuse the next paste before it is sent (a proven no-effect between the attempt's commit and its paste guard); no gate on cp/chunk-f opens this"]
+#[ignore = "missing stand-in control: refuse the next paste before it is sent (a proven no-effect between the attempt's commit and its paste guard)"]
 fn safe_retry_after_known_zero_effect() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Claude);
@@ -507,7 +507,7 @@ fn restart_queued_and_delivering_hold() {
 /// daemon attempts it as its first attempt once the recipient is free.
 ///
 #[test]
-#[ignore = "waits for U8n item 2: the baseline is re-derived after a daemon restart"]
+#[ignore = "the daemon does not yet re-derive an adopted agent's baseline after restart"]
 fn unattempted_restart_recovers() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Claude);
@@ -665,7 +665,7 @@ fn delivery_then_clear_fifo() {
 /// A Codex agent that has no session yet is bound by the prompt that the
 /// delivery itself submits, and the receipt names that session.
 #[test]
-#[ignore = "a fresh Codex stand-in at 200x50 is adopted Starting, never Ready and unbound: adoption finds no safe editor on its screen (a stand-in or U8 gap, no gate of this unit)"]
+#[ignore = "a fresh Codex stand-in at 200x50 is adopted Starting, never Ready and unbound: adoption finds no safe editor on its screen"]
 fn lazy_codex_id_binds_only_after_prompt() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let pane = rig

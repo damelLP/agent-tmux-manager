@@ -7,6 +7,8 @@ mod stand_in;
 #[path = "support/agent_lifecycle.rs"]
 mod support;
 
+use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
 use atm_core::SessionStatus;
 use serde_json::json;
 use stand_in::StandInMode;
@@ -81,12 +83,20 @@ fn down_kill_removes_pane_and_records_audit() {
     let result = test.rpc("agent.down", json!({"agent": id, "kill": true}), None);
     assert_eq!(result, json!({"agent_id": id}));
     stand_in::process::wait_exit(pane.pid, std::time::Duration::from_secs(30)).unwrap();
-    // A killed process needs no ending hook or editor input to complete Down.
-    assert!(test
+    // Down needs no ending hook or editor input. EOF before SIGHUP can still
+    // make the dying stand-in record its own SessionEnd attempt, and only that.
+    for event in test
         .rig
         .journal(&pane)
         .iter()
-        .all(|e| e["event_sequence"].as_u64().unwrap() <= before_kill));
+        .filter(|e| e["event_sequence"].as_u64().unwrap() > before_kill)
+    {
+        assert_eq!(
+            (event["kind"].as_str(), event["event"].as_str()),
+            (Some("event"), Some("SessionEnd")),
+            "unexpected record after kill: {event}"
+        );
+    }
     let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
     assert!(!panes.lines().any(|p| p == pane.pane_id));
     assert!(panes.lines().any(|p| p == other.pane_id));
@@ -124,6 +134,12 @@ fn down_kill_removes_pane_and_records_audit() {
     assert_eq!(test.rig.capture_styled(&other), other_screen);
     assert_eq!(test.rig.pane_rows(&other)[0].id, other_row.id);
     test.assert_no_input_since(&other, other_cursor);
+    // Re-read after exit and the intervening checks, without waiting for an
+    // optional End hook: a recorded send attempt does not prove its delivery.
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "down", "{agent}");
+    assert_eq!(agent["pane"], json!(null), "{agent}");
+    assert_eq!(agent["session_id"], json!(null), "{agent}");
     test.rig.close();
 }
 
@@ -185,6 +201,7 @@ fn adopt_noninteractive_launcher_stays_starting() {
     let pane = test.rig.launch(&support::config(StandInMode::Claude));
     test.complete_fixture_turn(&pane);
     let identity = process_identity(pane.pid);
+    let screen = test.rig.capture_styled(&pane);
     let after = test.rig.event_cursor(&pane);
     let cursor = test.cursor();
     let result = test.adopt("lead", &pane);
@@ -199,10 +216,12 @@ fn adopt_noninteractive_launcher_stays_starting() {
     assert_eq!(adopted["body"]["session_id"], json!(null));
     assert_eq!(process_identity(pane.pid), identity);
     test.assert_no_input_since(&pane, after);
+    assert_eq!(test.rig.capture_styled(&pane), screen);
     test.rig.close();
 }
 
-/// Private selectors/env must not reach the live server or installed harnesses.
+/// Verify private selectors/env and reject harness executables on daemon PATH.
+/// The outer seal already removes TMUX/TMUX_PANE; this is not a leak injection.
 #[test]
 fn lifecycle_rig_is_private_and_daemon_override_is_set() {
     let mut first = AgentRig::start(StandInMode::Claude);
@@ -231,6 +250,30 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
         assert!(!entries
             .iter()
             .any(|e| e.starts_with(b"TMUX=") || e.starts_with(b"TMUX_PANE=")));
+        let path = entries
+            .iter()
+            .find_map(|entry| entry.strip_prefix(b"PATH="))
+            .expect("daemon PATH must be explicit");
+        for directory in std::env::split_paths(std::ffi::OsStr::from_bytes(path)) {
+            assert!(
+                directory.is_absolute(),
+                "nonabsolute PATH entry: {directory:?}"
+            );
+            for harness in ["claude", "codex", "pi"] {
+                let executable = directory.join(harness);
+                match std::fs::metadata(&executable) {
+                    Ok(metadata) => assert!(
+                        !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0,
+                        "harness executable on daemon PATH: {executable:?}"
+                    ),
+                    Err(error) => assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound,
+                        "cannot inspect daemon PATH candidate {executable:?}: {error}"
+                    ),
+                }
+            }
+        }
         assert_eq!(
             checked(
                 test.rig
@@ -277,8 +320,9 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
 
 /// Claude up: daemon ATM_SPAWN_BIN, role argv/model, ATM_AGENT, tag before first
 /// start, real session plus safe editor, no implicit prompt, all in its own window.
+/// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance"]
+#[ignore = "waits for Task 6: agent.up acceptance and a styled fresh-editor Claude stand-in frame at 200 columns"]
 fn agent_up_ready_tagged_env_claude() {}
 
 /// Codex up: daemon override, role/required args and ATM_AGENT, pre-start tag,
@@ -301,32 +345,33 @@ fn agent_up_reads_main_checkout_role() {}
 
 /// Held Claude clear stays Clearing until a new real ID with source=clear and
 /// a safe editor; return that ID on the same process, never rebind the old row.
+/// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "waits for Task 8: Claude clear stand-in acceptance"]
+#[ignore = "agent.clear is in the base; acceptance not yet written; needs a styled fresh-editor Claude stand-in frame at 200 columns"]
 fn clear_returns_new_ready_session_claude() {}
 
 /// Held pi clear stays Clearing until changed ID plus safe editor on the same
 /// process/connection; repeated notices alone are not acknowledgment.
 #[test]
-#[ignore = "waits for Task 8: pi clear stand-in acceptance"]
+#[ignore = "agent.clear is in the base; pi clear stand-in acceptance not yet written"]
 fn clear_returns_new_ready_session_pi() {}
 
 /// Codex conversation-to-fresh clear returns Ready/null, excludes the old ID,
 /// then binds the next real prompt's ID once without any slash concatenation.
 #[test]
-#[ignore = "waits for Task 8: Codex lazy-session clear acceptance"]
+#[ignore = "agent.clear is in the base; Codex lazy-session clear stand-in acceptance not yet written"]
 fn codex_clear_ready_without_id_then_binds_next_prompt() {}
 
 /// Ready/null with no eligible row AND fresh safe facts sends no clear input
 /// and emits no clear_requested; an unreported conversation must not pass.
 #[test]
-#[ignore = "waits for Task 8: Codex clear no-op acceptance"]
+#[ignore = "agent.clear is in the base; Codex clear no-op stand-in acceptance not yet written"]
 fn codex_ready_unbound_clear_is_noop() {}
 
 /// Accept only the exact default current-worktree choice, create no checkout,
 /// confirm a fresh safe editor and the specified control audit.
 #[test]
-#[ignore = "waits for Task 8: worktree clear acceptance"]
+#[ignore = "agent.clear is in the base; worktree clear stand-in acceptance not yet written"]
 fn clear_worktree_default() {}
 
 /// Respawn replaces pane/process/session under the same agent; stale old events
@@ -429,13 +474,13 @@ fn retry_chrome_empty_idle_blocks_ready() {}
 /// and spawn_type (canonical, alias, %0N). Assert exact U8c refusal, then release
 /// and await Ready. This does not prove message-delivery serialization.
 #[test]
-#[ignore = "waits for Task 8: clear-versus-raw-send acceptance"]
+#[ignore = "agent.clear is in the base; clear-versus-raw-send stand-in acceptance not yet written"]
 fn clear_vs_raw_send_refuses_until_ready() {}
 
 /// With durable Clearing, restart the daemon and assert the same raw-send
 /// refusals; do not assume the pre-restart clear RPC is still alive.
 #[test]
-#[ignore = "waits for Tasks 8 and 10: durable-clearing restart acceptance"]
+#[ignore = "waits for Task 10: durable-clearing restart acceptance; agent.clear is in the base"]
 fn durable_clearing_after_restart_refuses_raw_send() {}
 
 /// Real msg.send stays queued behind held clear. Watch sent/clear_requested/

@@ -337,6 +337,12 @@ fn blocked_queue_notice_lists_followers() {
         let entry = rig.inbox_entry(None, Some(&lead.id), follower);
         assert_eq!(entry["status"], "queued", "{entry}");
         assert_eq!(entry["delivery"]["attempt"], 0, "{entry}");
+        // History's predecessor is not the scheduler's veto. Check its own
+        // decision so passing cannot depend on outrunning stable idle.
+        assert_eq!(
+            entry["delivery"]["reason"], "another delivery is in flight on this pane",
+            "{entry}"
+        );
         assert_ne!(entry["delivery"]["blocked_by"], json!(null), "{entry}");
     }
     let second = rig.inbox_entry(None, Some(&lead.id), &ids[1]);

@@ -95,7 +95,8 @@ fn future_value_histories_fold_deterministically_and_compose_at_every_prefix() {
                 prop_assert_eq!(task.state, TaskState::Unknown);
                 prop_assert_eq!(task.files.first().unwrap().kind, TaskFileKind::Unknown);
                 let seconds = &task.cost.as_ref().unwrap().seconds_in_state;
-                prop_assert_eq!(seconds.get(&TaskState::Unknown), Some(&a.saturating_add(b)));
+                let total = a.saturating_add(b);
+                prop_assert_eq!(seconds.get(&TaskState::Unknown), Some(&total));
                 prop_assert_eq!(seconds.get(&TaskState::Working), Some(&3));
                 for cut in 0..=log.len() {
                     let mut partial = OrgState::default();

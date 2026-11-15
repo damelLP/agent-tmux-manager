@@ -47,6 +47,8 @@
 //!
 //! # Limits
 //!
+//! - Admission does not re-check the session the watcher judged: a clear/rebind in that tiny window can target the new session (reasoned, unverified).
+//! - After a daemon restart, a session with a recorded start line has its first turn end counted as "not worked"; at the line this excludes it from automatic handover for that session.
 //! - Everything here is in memory. After a restart of `atmd` no turn end is
 //!   on record, so nothing is done until a turn ends; a handover the restart
 //!   cut off is lost with its note, and its session can be asked to save once

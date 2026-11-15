@@ -158,6 +158,8 @@ idle_minutes  = 48            # optional: default four fifths of cache_minutes, 
 - **One try per session.** Whatever becomes of it, `atmd` asks no second time in that session; the next session has a try of its own. If the start-line turn already ends at or above its line, the note says that this session will not be handed over automatically: neither the context nor the idle rule runs in it, even after later work. A handover that could not start (the agent is not ready, another handover of it runs) sends nothing and does not count.
 - **A session whose cache has run out is not cleared.** With `"idle"` on, a seat idle for longer than `cache_minutes` is left as it is, and gets the note at its line. Clear it with a command.
 - **Limits.** All of it is in memory: after a restart of `atmd` nothing is done until a turn ends, and a handover the restart cut off is lost with its note. A request that was never delivered when the handover gave up stays queued, as for the command: once what held it is gone it is typed, the agent saves, and nothing clears the session. For an idle seat that late turn runs on a cold cache; `atm msg give-up mN` cancels the request. An older `atmd` refuses a role file that has these keys (`agent up` fails and `atm me` reports an invalid role), so remove them before going back to one.
+  - Admission does not re-check the session the watcher judged: a clear/rebind in that tiny window can target the new session (reasoned, unverified).
+  - After a daemon restart, a session with a recorded start line has its first turn end counted as "not worked"; at the line this excludes it from automatic handover for that session.
 
 ### Finding your instructions and handover
 

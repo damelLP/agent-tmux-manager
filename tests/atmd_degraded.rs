@@ -7,6 +7,9 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
+#[path = "support/control.rs"]
+mod control_support;
+
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -92,7 +95,10 @@ fn test_accept_errors_back_off() {
         });
     }
     let mut daemon = Daemon(cmd.spawn().expect("spawn atmd"));
-    assert!(wait_until(|| socket.exists()), "atmd never bound");
+    assert!(
+        wait_until(|| control_support::socket_is_ready(&socket)),
+        "atmd never accepted a connection"
+    );
 
     // Silent clients hold their descriptors until the 10s handshake
     // deadline, so the daemon runs out and the rest wait in the backlog.

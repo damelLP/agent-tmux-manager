@@ -601,17 +601,16 @@ fn clear_then_message_not_merged() {
     rig.test.rig.close();
 }
 
-/// A clear requested while a delivery attempt holds the recipient starts
-/// only after that attempt: the reference is typed before the clear command
-/// and never joined to it.
+/// A delivery with a lost prompt hook and a subsequent clear stay separate:
+/// one accepted reference, no delivery failure, and the owner's hold notice.
 ///
-/// On pi, for the reason given at `clear_then_message_not_merged`. The
-/// attempt is kept in flight by a lost hook, so it ends held, not delivered:
-/// the stand-in can drop a hook but cannot hold one and release it later.
-/// When the clear arrives after the attempt has ended the order still holds,
-/// but the two did not overlap.
+/// On pi, for the reason given at `clear_then_message_not_merged`. The clear
+/// is requested only after the reference was accepted. This does not prove
+/// that the clear waits for an in-flight delivery reservation: the attempt
+/// may already have ended. The stand-in can drop a hook but cannot hold one
+/// and release it later to prove that overlap.
 #[test]
-fn delivery_then_clear_fifo() {
+fn held_delivery_then_clear_not_joined() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let lead = rig.ready_agent("lead", StandInMode::Pi);
     rig.stand_in_control(&lead.pane, "/atm/drop-next input", "drop armed");
@@ -620,28 +619,22 @@ fn delivery_then_clear_fifo() {
     let cursor = rig.test.rig.event_cursor(&lead.pane);
 
     let id = rig.send(None, &lead.id, "before the clear");
-    let attempted = watch.wait("the attempt", about("msg.delivery_attempted", &id));
-    let prompt = rig
-        .test
+    watch.wait("the attempt", about("msg.delivery_attempted", &id));
+    rig.test
         .rig
         .wait_event(&lead.pane, cursor, accepted(&reference(&id)));
-    // The attempt waits for a receipt that cannot come; the clear is asked now.
+    // The prompt was already accepted; no receipt can confirm it.
     let socket = rig.test.rig.socket();
     let params = json!({"agent": lead.id, "timeout_ms": 120_000});
     let clear = std::thread::spawn(move || support::call_on(&socket, "agent.clear", params, None));
     // The reference's turn ends; the clear may then type its command.
     rig.finish_turn(&lead.pane);
-    let requested = watch.wait("the clear request", |e| {
+    watch.wait("the clear request", |e| {
         e["kind"] == "agent.clear_requested"
     });
-    assert!(seq(&attempted) < seq(&requested));
-    let clearing = rig.test.rig.wait_event(&lead.pane, cursor, |e| {
+    rig.test.rig.wait_event(&lead.pane, cursor, |e| {
         e["kind"] == "rendered" && e["state"] == "clearing"
     });
-    assert!(
-        prompt["event_sequence"].as_u64() < clearing["event_sequence"].as_u64(),
-        "the clear was typed before the reference"
-    );
     rig.advance(&lead.pane, 100, "idle");
     clear.join().unwrap().expect("agent.clear");
 

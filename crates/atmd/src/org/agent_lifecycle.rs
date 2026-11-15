@@ -992,7 +992,10 @@ impl AgentRuntime {
     /// whose line can be read exactly, on a pane nobody has selected; that
     /// line is read once. The command is typed only after exactly that line,
     /// and run only when the line reads it followed by the command and
-    /// nothing else. The
+    /// nothing else. A line that reads otherwise before the paste ends the
+    /// start. After the paste the text can't be taken back, so the start
+    /// waits: the Enter goes out only once the line reads exactly that again,
+    /// and at the deadline the command is left typed and not run. The
     /// command is pasted once and run once, each under a guard on the control
     /// actor's own capture; an input whose outcome is unknown is never
     /// repeated. A dialog the harness opens at its start is answered only

@@ -51,7 +51,18 @@ fn render_context(context: &AgentContext, out: &mut impl Write) -> Result<()> {
     } else {
         writeln!(out, "Open tasks:")?;
         for task in &context.open_tasks {
-            writeln!(out, "  {}", escaped(&serde_json::to_string(task)?, false))?;
+            let inspect = task
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| id.parse::<atm_org::TaskId>().ok())
+                .filter(|id| atmd::org::tasks::sequence(id).is_ok())
+                .map(|id| format!("; inspect: atm task get {id}"))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "  {}{inspect}",
+                escaped(&serde_json::to_string(task)?, false)
+            )?;
         }
     }
     if context.unread_messages.is_empty() {

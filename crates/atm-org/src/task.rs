@@ -1,7 +1,8 @@
 //! Tasks: who works on what, in which state, judged by what.
 //!
-//! A task is created by `task.created` and is from then on in one of ten
-//! states. Its id is `t` plus the sequence number of that event, as message
+//! A task is created by `task.created` and is from then on in one of ten known
+//! states, or a read-only `Unknown` state after replaying a later value.
+//! Its id is `t` plus the sequence number of that event, as message
 //! ids are `m<seq>`; the free-text task reference of a message is not checked
 //! against tasks. Everything follows the crate's decide → append → apply rule:
 //! [`TaskCommand`] is decided against the table below, and the events it
@@ -26,6 +27,7 @@
 //! | changes requested | assigned ¹ | working | waiting | blocked | submitted | — | — | same | open | cancelled |
 //! | accepted | — | — | — | — | — | — | same | — | — | — |
 //! | cancelled | — | — | — | — | — | — | — | — | — | same |
+//! | unknown (read-only) | — | — | — | — | — | — | — | — | — | — |
 //!
 //! 1. To another agent the task starts over at `assigned`; to the agent it
 //!    already has is `same`.
@@ -38,7 +40,10 @@
 //!    verdict lands on whatever is submitted when it is decided.
 //! 6. The same review task again is `same`; a second one is refused.
 //!
-//! Attaching a file is allowed in every state and changes no state.
+//! Attaching a file is allowed in every known state and changes no state.
+//! Unknown state freezes all commands, including attachments and reports, even
+//! for the owner; an unknown-state review cannot be used either. Replay still
+//! applies understood committed facts without this command-policy freeze.
 //!
 //! # Who may ask
 //!
@@ -70,8 +75,12 @@
 //!
 //! Accepting a *result* depends on the task's measure. Mechanical: authority.
 //! Reviewed: the verdict names a submitted review task, unless the owner
-//! accepts. The owner's judgement: only the owner. Approving a plan and
-//! asking for changes need authority only.
+//! accepts. The owner's judgement: only the owner. An unknown measure refuses
+//! new direct result acceptance by anyone. Approving a known plan and asking
+//! for changes need authority only. An unknown submission cannot be reviewed
+//! or given a verdict by this build; it can still be taken back or cancelled
+//! under the table. A committed unknown verdict, or acceptance of an unknown
+//! submission, enters Unknown state instead of assuming result acceptance.
 //!
 //! # Reports
 //!
@@ -85,10 +94,14 @@
 //!
 //! The ten `task.*` kinds are additive: an older daemon skips them, and no
 //! other kind refers to a task. `tests/task_golden.rs` states every body.
-//! Known limit: an older build rejects a new task kind, measure kind, file kind,
-//! state, verdict, submission, or `seconds_in_state` key inside a known body as a
-//! body error, as with stage 0's enums; whether additive values must be tolerated
-//! is decided before T2a writes task events.
+//! Later task kind, measure kind, file kind, state, verdict and submission words
+//! decode as read-only Unknown values; commands carrying them are refused before
+//! any no-op shortcut. Unknown cost-state keys share an Unknown bucket, summing
+//! distinct words with u64 saturation. The original words, unknown measure
+//! payload and per-unknown-state time split are lost in memory only: the raw log
+//! keeps the original bodies. Different unknown file kinds can deduplicate when
+//! their path/note match. Malformed known values and missing references still
+//! error; this is not a fallback for corrupt bodies.
 //! Every task stays in memory, in creation order; none is ever removed.
 
 use crate::command::nonempty;
@@ -109,6 +122,8 @@ pub enum TaskKind {
     Plan,
     Errand,
     DriftCheck,
+    #[serde(other)]
+    Unknown,
 }
 
 /// The ten states. Reasons and what was submitted are fields of [`Task`].
@@ -125,6 +140,8 @@ pub enum TaskState {
     Accepted,
     ChangesRequested,
     Cancelled,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +152,8 @@ pub enum TaskFileKind {
     Evidence,
     Plan,
     Contract,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +173,8 @@ pub enum TaskMeasure {
     Reviewed { rubric: String },
     /// The owner's judgement.
     Owner,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Fields only: nothing in this crate reads a budget.
@@ -170,6 +191,8 @@ pub struct TaskBudget {
 pub enum TaskSubmission {
     Plan,
     Result,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +200,8 @@ pub enum TaskSubmission {
 pub enum TaskVerdict {
     Accepted,
     ChangesRequested,
+    #[serde(other)]
+    Unknown,
 }
 
 /// The cost-of-change record of an accepted task, as its caller measured it.
@@ -188,7 +213,37 @@ pub struct TaskCost {
     #[serde(default, with = "crate::event::optional_money")]
     pub cost: Option<Money>,
     pub peak_context_percent: Option<u8>,
+    #[serde(deserialize_with = "seconds_in_state")]
     pub seconds_in_state: BTreeMap<TaskState, u64>,
+}
+
+// The tagged event buffers its body; that path accepts numeric fallback tags.
+// Materializing this field restores strict JSON-value identifier decoding.
+fn task_measure<'de, D>(deserializer: D) -> Result<TaskMeasure, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::from_value(serde_json::Value::deserialize(deserializer)?)
+        .map_err(serde::de::Error::custom)
+}
+
+fn seconds_in_state<'de, D>(deserializer: D) -> Result<BTreeMap<TaskState, u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, u64>::deserialize(deserializer)?;
+    let mut seconds = BTreeMap::new();
+    for (word, value) in raw {
+        let state: TaskState = serde_json::from_value(serde_json::Value::String(word))
+            .map_err(serde::de::Error::custom)?;
+        let slot = seconds.entry(state).or_insert(0_u64);
+        *slot = if state == TaskState::Unknown {
+            slot.saturating_add(value)
+        } else {
+            value
+        };
+    }
+    Ok(seconds)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +254,7 @@ pub struct TaskCreated {
     pub parent: Option<TaskId>,
     /// The task a review judges; no other kind has one.
     pub judges: Option<TaskId>,
+    #[serde(deserialize_with = "task_measure")]
     pub measure: TaskMeasure,
     pub budget: Option<TaskBudget>,
     pub files: Vec<TaskFile>,
@@ -261,8 +317,9 @@ pub struct TaskCostRecorded {
     pub record: TaskCost,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
+    #[serde(rename = "task_id")]
     pub id: TaskId,
     pub title: String,
     pub kind: TaskKind,
@@ -398,6 +455,53 @@ pub enum TaskRefusal {
 }
 
 impl TaskCommand {
+    /// Read-only values must be refused before any duplicate/no-op shortcut.
+    fn known_values(&self) -> Result<Option<&TaskId>, Refusal> {
+        match self {
+            Self::Create(body) => {
+                require_known("kind", body.kind != TaskKind::Unknown)?;
+                require_known("measure.kind", body.measure != TaskMeasure::Unknown)?;
+                files_known(&body.files)?;
+                Ok(None)
+            }
+            Self::SetState { task_id, state, .. } => {
+                require_known("state", *state != TaskState::Unknown)?;
+                Ok(Some(task_id))
+            }
+            Self::Submit {
+                task_id,
+                what,
+                files,
+                ..
+            } => {
+                require_known("what", *what != TaskSubmission::Unknown)?;
+                files_known(files)?;
+                Ok(Some(task_id))
+            }
+            Self::Verdict {
+                task_id, verdict, ..
+            } => {
+                require_known("verdict", *verdict != TaskVerdict::Unknown)?;
+                Ok(Some(task_id))
+            }
+            Self::Attach { task_id, file, .. } => {
+                files_known(std::slice::from_ref(file))?;
+                Ok(Some(task_id))
+            }
+            Self::RecordCost { task_id, record } => {
+                require_known(
+                    "seconds_in_state",
+                    !record.seconds_in_state.contains_key(&TaskState::Unknown),
+                )?;
+                Ok(Some(task_id))
+            }
+            Self::Assign { task_id, .. }
+            | Self::StartReview { task_id, .. }
+            | Self::Reminded { task_id, .. }
+            | Self::Flagged { task_id, .. } => Ok(Some(task_id)),
+        }
+    }
+
     /// The fact this command asks for, from the command alone. Decide checks
     /// its references before any policy.
     pub(crate) fn event(&self) -> OrgEvent {
@@ -567,6 +671,9 @@ impl OrgState {
     /// `review_task`, which must be a review task that judges `task`.
     fn review_of(&self, task: &Task, review_task: &TaskId) -> Result<&Task, Refusal> {
         let review = self.require_task(review_task)?;
+        if review.state == TaskState::Unknown {
+            return Err(review.refuse("use as a review").into());
+        }
         if review.kind != TaskKind::Review || review.judges.as_ref() != Some(&task.id) {
             return Err(TaskRefusal::NotReviewOf {
                 task_id: task.id.clone(),
@@ -585,6 +692,21 @@ impl OrgState {
         event: OrgEvent,
     ) -> Result<Vec<OrgEvent>, Refusal> {
         use TaskState as S;
+        if let Some(id) = command.known_values()? {
+            let task = self.require_task(id)?;
+            if task.state == S::Unknown {
+                return Err(task.refuse("change").into());
+            }
+            if matches!(
+                command,
+                TaskCommand::StartReview { .. } | TaskCommand::Verdict { .. }
+            ) {
+                require_known(
+                    "submission",
+                    task.submission != Some(TaskSubmission::Unknown),
+                )?;
+            }
+        }
         let changed = match command {
             TaskCommand::Create(body) => {
                 nonempty("title", &body.title)?;
@@ -592,7 +714,8 @@ impl OrgState {
                 match &body.measure {
                     TaskMeasure::Mechanical { command } => nonempty("measure command", command)?,
                     TaskMeasure::Reviewed { rubric } => nonempty("measure rubric", rubric)?,
-                    TaskMeasure::Owner => {}
+                    // Unknown was refused by known_values, before this policy.
+                    TaskMeasure::Owner | TaskMeasure::Unknown => {}
                 }
                 if (body.kind == TaskKind::Review) != body.judges.is_some() {
                     return Err(TaskRefusal::Judges { kind: body.kind }.into());
@@ -635,9 +758,8 @@ impl OrgState {
                     | S::Submitted
                     | S::InReview
                     | S::Accepted
-                    | S::ChangesRequested => {
-                        return Err(TaskRefusal::NotSettable { state: *state }.into())
-                    }
+                    | S::ChangesRequested
+                    | S::Unknown => return Err(TaskRefusal::NotSettable { state: *state }.into()),
                 };
                 match reason {
                     Some(reason) => nonempty("reason", reason)?,
@@ -751,6 +873,7 @@ impl OrgState {
                     && task.submission != Some(TaskSubmission::Plan)
                 {
                     let needs = match task.measure {
+                        TaskMeasure::Unknown => Some("a known measure"),
                         TaskMeasure::Owner if !owner => Some("the owner's verdict"),
                         TaskMeasure::Reviewed { .. } if !owner && review.is_none() => {
                             Some("a submitted review task, or the owner's verdict")
@@ -819,6 +942,24 @@ impl OrgState {
         };
         Ok(if changed { vec![event] } else { vec![] })
     }
+}
+
+fn require_known(field: &'static str, known: bool) -> Result<(), Refusal> {
+    if known {
+        Ok(())
+    } else {
+        Err(Refusal::InvalidValue {
+            field,
+            reason: "must be known".into(),
+        })
+    }
+}
+
+fn files_known(files: &[TaskFile]) -> Result<(), Refusal> {
+    require_known(
+        "file.kind",
+        files.iter().all(|file| file.kind != TaskFileKind::Unknown),
+    )
 }
 
 fn files_named(files: &[TaskFile]) -> Result<(), Refusal> {
@@ -934,6 +1075,9 @@ impl TaskVerdictGiven {
     }
     pub(crate) fn fold(&self, task: &mut Task, ts: DateTime<Utc>) {
         let state = match (self.verdict, task.submission) {
+            (TaskVerdict::Unknown, _) | (TaskVerdict::Accepted, Some(TaskSubmission::Unknown)) => {
+                TaskState::Unknown
+            }
             // The plan stop is over: build it.
             (TaskVerdict::Accepted, Some(TaskSubmission::Plan)) => TaskState::Working,
             (TaskVerdict::Accepted, _) => TaskState::Accepted,

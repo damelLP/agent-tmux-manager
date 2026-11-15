@@ -87,7 +87,7 @@ pub fn assign(task: &TaskId, to: &str, who: TaskActor) -> TaskCommand {
 pub fn submit(task: &TaskId, what: TaskSubmission, path: &str, who: TaskActor) -> TaskCommand {
     let kind = match what {
         TaskSubmission::Plan => TaskFileKind::Plan,
-        TaskSubmission::Result => TaskFileKind::Report,
+        TaskSubmission::Result | TaskSubmission::Unknown => TaskFileKind::Report,
     };
     TaskCommand::Submit {
         task_id: task.clone(),

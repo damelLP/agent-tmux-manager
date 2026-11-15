@@ -1,0 +1,1 @@
+{"setup":"assigned","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"state","method":"task.set_state","params":{"task_id":"t6","state":"working"}},"response":{"error":{"code":"refused"}}}

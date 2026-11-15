@@ -28,6 +28,14 @@
 //! later. After an attempt whose outcome cannot be accounted for, the job
 //! decides nothing for its recipient until it can.
 //!
+//! The observation is the executor's: one answer of the agent service and one
+//! new capture through control, read by the executor's own function, so the
+//! two never describe one screen differently. A Ready agent also passes the
+//! executor's session gate before it counts as observed. Without that the
+//! policy could ask for an attempt the gate refuses under the reservation,
+//! at every poll. An agent that is starting or clearing takes no attempt and
+//! passes no gate, so the busy wait sees its turn.
+//!
 //! A recipient that cannot be observed (the observer failed or timed out, or
 //! history refused what it returned) is not a focused pane. While that lasts,
 //! the inbox shows "recipient cannot be observed" where the policy answers
@@ -45,7 +53,10 @@
 //! unattempted message after thirty minutes; a new observed interval may notify
 //! again. Lost observations break that interval, including across restart.
 
-use super::message_delivery::{deliver, inbox_reference, ATTEMPT_WORK_BUDGET};
+use super::agents::{AgentHandle, Recipient};
+use super::message_delivery::{
+    attempt_session, deliver, inbox_reference, observation, ATTEMPT_WORK_BUDGET,
+};
 use super::message_history::{
     DeliverySnapshot, ExecutorHold, HistoryUpdate, PanePresence, RecipientObservation,
 };
@@ -55,13 +66,19 @@ use super::messages::{
     MessageKind, MessageRuntime, Service,
 };
 use super::OrgServiceError;
-use crate::{control::reservation::PaneId, eventlog::Envelope};
+use crate::{
+    control::{
+        reservation::{PaneCapture, PaneId},
+        service::ControlHandle,
+    },
+    eventlog::Envelope,
+};
 use atm_core::ScreenFacts;
 use atm_org::{
     delivery::{
         busy_notice_due, next_delivery, DeliveryStep, FailureReason, WaitReason, BUSY_NOTICE_AFTER,
     },
-    Agent, AgentId, DeliveryReceipt, OrgCommand,
+    Agent, AgentId, AgentStatus, DeliveryReceipt, OrgCommand,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
@@ -110,20 +127,66 @@ pub(super) struct Effects {
 }
 
 impl Effects {
-    /// The executor seam, and no observer yet: the shared screen dispatch it
-    /// needs is not wired here. Without an observation the policy only waits.
-    pub(super) fn production() -> Self {
+    /// The executor, and the observer over the runtime's own control and
+    /// agent handles: both read a recipient through the same two services.
+    pub(super) fn production(rt: &MessageRuntime) -> Self {
+        let (control, agents) = (rt.control.clone(), rt.agents.clone());
         Self {
             deliver: Arc::new(|rt, id, deadline| Box::pin(deliver(rt, id, deadline))),
-            observe: Arc::new(|_| {
-                Box::pin(async {
-                    Err(MessageError::Unavailable(
-                        "recipient observation is not configured".into(),
-                    ))
-                })
+            observe: Arc::new(move |agent| {
+                Box::pin(observe(control.clone(), agents.clone(), agent))
             }),
         }
     }
+}
+
+/// One fresh look at a recipient, as the executor will look at it under its
+/// reservation: the agent service's answer for the agent and one new capture
+/// of its pane, both taken for this call. Nothing is kept between calls, and
+/// every failure is an error, which the job records as a lost observation:
+/// the agent service or the registry cannot answer, the pane has more than
+/// one eligible session, or tmux fails.
+async fn observe(
+    control: ControlHandle,
+    agents: AgentHandle,
+    agent: Agent,
+) -> Result<RecipientObservation, MessageError> {
+    let recipient = (agents.recipient(&agent.id).await)
+        .map_err(|error| MessageError::Unavailable(error.to_string()))?;
+    let format = recipient.screen.capture_format();
+    let capture = control.observe(&recipient.pane, format).await?;
+    observed(&agent.id, &recipient, &capture)
+}
+
+/// What one recipient answer and one capture of its pane say, through the
+/// executor's own function; an error where they say nothing usable: the pane
+/// is tagged for someone else, or its harness is not established yet.
+///
+/// A Ready agent passes the executor's session gate here too. History takes
+/// an observation whose session row is missing or not yet bound, and the
+/// policy could then ask for an attempt that the gate refuses under the
+/// reservation, again at every poll. An agent in any other status never
+/// takes an attempt, so it passes no gate: its turn is observed while it
+/// starts or clears, which the busy wait reads.
+pub(super) fn observed(
+    agent: &AgentId,
+    recipient: &Recipient,
+    capture: &PaneCapture,
+) -> Result<RecipientObservation, MessageError> {
+    if capture.inspection.local_agent_tag.as_deref() != Some(agent.to_string().as_str()) {
+        return Err(MessageError::Conflict(format!(
+            "{} is not tagged for agent {agent}",
+            recipient.pane
+        )));
+    }
+    if recipient.status == AgentStatus::Ready {
+        attempt_session(
+            recipient.status,
+            recipient.session_id.as_ref(),
+            recipient.session.as_ref().map(|row| &row.id),
+        )?;
+    }
+    observation(recipient, capture)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

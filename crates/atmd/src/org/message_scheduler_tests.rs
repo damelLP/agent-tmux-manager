@@ -129,6 +129,9 @@ enum Act {
     NoEffect,
     /// As Paste, then the receipt arrives inside the attempt.
     Deliver,
+    /// Submit the attempt and report a timeout without its reply: whether
+    /// it was committed is for the scheduler's accounting to find out.
+    LostReply,
 }
 
 async fn perform(rt: MessageRuntime, id: MessageId, act: Act) -> Result<(), MessageError> {
@@ -152,6 +155,13 @@ async fn perform(rt: MessageRuntime, id: MessageId, act: Act) -> Result<(), Mess
         attempt,
         pane: pane.clone(),
     };
+    if act == Act::LostReply {
+        let org = rt.org.clone();
+        tokio::spawn(async move { org.execute(attempted, now).await });
+        // The writer has the command before the executor returns.
+        tokio::task::yield_now().await;
+        return Err(MessageError::Timeout);
+    }
     let seq = rt.org.execute(attempted, now).await?.last().unwrap().seq;
     rt.history.folded(seq).await?;
     let session = snapshot.recipient.session_id.clone();
@@ -1025,6 +1035,47 @@ async fn unobservable_recipient_says_so_tells_the_owner_once_and_never_pastes() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_observation_slower_than_five_seconds_is_a_loss() {
+    let mut bench = Bench::blind().await;
+    // It would be a ready pane, if the read ever returned.
+    bench.screens.set(worker(), ready("%1", "s1"));
+    close(&bench.screens.gate);
+    let id = bench.send(worker(), "brief").await;
+    bench.pass(4).await;
+    // Still reading: nothing is decided, and nothing is claimed.
+    assert_eq!(bench.screens.calls(&worker()), 1);
+    assert_eq!(bench.entry(worker(), id).await.delivery.reason, None);
+    bench.pass(2).await;
+    waits_unobserved(&bench, id).await;
+    // The slow read was given up, and the next began with the next guard
+    // poll: one read at a time, each with its own five seconds.
+    assert_eq!(bench.screens.calls(&worker()), 2);
+    assert!(bench.entries().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_observation_per_guard_poll_however_often_the_job_wakes() {
+    let bench = Bench::blind().await;
+    bench.send(worker(), "first").await;
+    until("the first observation", || {
+        bench.screens.calls(&worker()) == 1
+    })
+    .await;
+    // Every committed event wakes the job, here three times in one instant.
+    for body in ["second", "third", "fourth"] {
+        bench.send(worker(), body).await;
+    }
+    for _ in 0..1000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(bench.screens.calls(&worker()), 1);
+    // After that, one per poll: each will be a tmux capture.
+    bench.pass(10).await;
+    let calls = bench.screens.calls(&worker());
+    assert!((40..=42).contains(&calls), "{calls} observations in 10 s");
+}
+
+#[tokio::test(start_paused = true)]
 async fn one_unobserved_notice_for_the_oldest_open_message() {
     let bench = Bench::blind().await;
     let first = bench.send(worker(), "first").await;
@@ -1803,6 +1854,69 @@ async fn attempt_reply_lost_then_fifo_snapshot_accounts_commit() {
         .event("the second attempt", |e| attempted(e).is_some())
         .await;
     assert_eq!(attempted(&event), Some((id, 2, "%1")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unaccounted_attempt_stops_every_round_until_it_is_accounted_for() {
+    let mut bench = Bench::new().await;
+    bench.script(Act::LostReply);
+    close(&bench.work);
+    close(&bench.cleanup);
+    let id = bench.send(worker(), "brief").await;
+    assert_eq!(bench.entered().await, id);
+    // The attempt's append enters the writer and is held there; the
+    // executor returns a timeout, knowing nothing about its commit.
+    bench.rig.hold();
+    bench.work.add_permits(OPEN);
+    assert_eq!(bench.worked().await, id);
+    bench.rig.entered().await;
+    bench.cleanup.add_permits(OPEN);
+    // Accounting cannot finish behind the held append. History still shows
+    // a message with no attempt and a ready pane, and the job must not
+    // decide on that: no second attempt, however long it lasts,
+    bench.pass(120).await;
+    assert!(bench.entries().is_empty());
+    let view = bench.entry(worker(), id).await.delivery;
+    assert_eq!(view.phase, DeliveryPhase::Blocked);
+    assert!(
+        (view.reason.as_deref()).is_some_and(|r| r.starts_with("input outcome is not accounted")),
+        "{view:?}"
+    );
+    // and the owner's give-up waits behind it instead of deciding.
+    assert_eq!(code(bench.give_up(id).await.unwrap_err()), "timeout");
+    assert!(bench.entries().is_empty());
+    // The writer answers again: the attempt was committed. It is held as
+    // an input of unknown outcome, told once, and never pasted again.
+    bench.rig.release();
+    bench.event("the blocked notice", system_note).await;
+    bench.pass(600).await;
+    assert!(bench.entries().is_empty());
+    assert_eq!(
+        bench.notes().await,
+        [blocked_notice(id, "input outcome is unknown", &[], true)]
+    );
+    let view = bench.entry(worker(), id).await;
+    assert_eq!(view.status, DeliveryStatus::Delivering);
+    assert_eq!(view.delivery.attempt, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_while_waiting_for_admission_starts_no_attempt() {
+    let mut bench = Bench::new().await;
+    // Every admission is taken, so the worker's attempt has to wait.
+    let admissions = bench.rig.rt.admissions.clone();
+    let taken = (admissions.acquire_many_owned(MESSAGE_ADMISSION_LIMIT as u32))
+        .await
+        .unwrap();
+    bench.send(worker(), "brief").await;
+    bench.pass(30).await;
+    assert!(bench.entries().is_empty());
+    // The daemon stops, and only then is there room: the job must leave
+    // without starting what nothing would wait for.
+    bench.rig.rt.cancel.cancel();
+    drop(taken);
+    guarded(&mut bench.rig.task).await.unwrap();
+    assert!(bench.entries().is_empty());
 }
 
 #[tokio::test(start_paused = true)]

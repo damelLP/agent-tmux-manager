@@ -8,6 +8,10 @@
 //! Time is paused and only in-memory I/O runs under it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// The scheduler's production observer, tested on this file's rig.
+#[path = "message_observer_tests.rs"]
+mod observer;
+
 use super::*;
 use crate::{
     control::{

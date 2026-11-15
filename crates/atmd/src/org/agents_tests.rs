@@ -631,6 +631,94 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn recipient_reports_status_and_recorded_binding() {
+        // Review 19, probe r10: an agent that must get no input still has a
+        // recipient. What tells them apart is in the same answer.
+        for (state, status, bound, excluded) in [
+            ("ready", AgentStatus::Ready, Some("s1"), None),
+            ("stuck", AgentStatus::Stuck, Some("s1"), None),
+            ("starting", AgentStatus::Starting, Some("s1"), None),
+            // An interrupted clear: the restart check marks it Stuck.
+            ("clearing", AgentStatus::Stuck, None, Some("s1")),
+        ] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("s1")).await;
+            rig.row("s1", "%1", false).await;
+            let id: AgentId = "p/lead".parse().unwrap();
+            match state {
+                "stuck" => {
+                    rig.command(OrgCommand::Stuck {
+                        agent_id: id.clone(),
+                        reason: "trust dialog reset".into(),
+                    })
+                    .await
+                }
+                "clearing" => {
+                    rig.command(OrgCommand::Clear {
+                        agent_id: id.clone(),
+                    })
+                    .await
+                }
+                "starting" => {
+                    rig.command(OrgCommand::Revalidate {
+                        agent_id: id.clone(),
+                    })
+                    .await
+                }
+                _ => {}
+            }
+            rig.frame("%1", "p/lead", "unknown\n");
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            let recipient = agents.recipient(&id).await.unwrap();
+            assert_eq!(recipient.status, rig.state("lead").await.status, "{state}");
+            if state != "ready" {
+                assert_eq!(recipient.status, status, "{state}");
+            }
+            assert_eq!(recipient.session_id, bound.map(SessionId::new), "{state}");
+            assert_eq!(recipient.excluded, excluded.map(SessionId::new), "{state}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recipient_reports_the_panes_row_and_the_binding_when_they_differ() {
+        // The agent is recorded as bound to s1; the pane's one eligible row is
+        // s2 (the pane is in copy mode, so the observer has not bound it).
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s2", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let mut in_mode = Rig::inspection("%1", "p/lead", false);
+        in_mode.in_mode = true;
+        rig.client
+            .script_inspect(&PaneId::parse("%1").unwrap(), Some(&in_mode))
+            .unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        rig.events
+            .send(crate::registry::SessionEvent::Removed {
+                session_id: SessionId::new("unrelated"),
+                reason: crate::registry::RemovalReason::Explicit,
+            })
+            .unwrap();
+        progress(&mut events, "idle", None).await;
+        assert_eq!(
+            rig.client
+                .pending_reads(&PaneId::parse("%1").unwrap())
+                .unwrap(),
+            0
+        );
+        let recipient = recipient_of(&agents, "lead").await.unwrap();
+        assert_eq!(recipient.status, AgentStatus::Ready);
+        assert_eq!(recipient.session_id, Some(SessionId::new("s1")));
+        assert_eq!(
+            recipient.session.map(|row| row.id),
+            Some(SessionId::new("s2"))
+        );
+    }
+
+    #[tokio::test]
     async fn recipient_refuses_what_it_cannot_name() {
         let rig = Rig::new().await;
         rig.agent("lead", None, None).await;

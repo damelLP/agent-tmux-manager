@@ -167,6 +167,12 @@ impl AgentRuntime {
 /// What a delivery needs to know about its recipient, read in one call.
 #[derive(Debug, Clone)]
 pub struct Recipient {
+    /// The agent's recorded status, from the same snapshot as everything
+    /// else here. An answer is not permission: only a Ready agent takes input.
+    pub status: AgentStatus,
+    /// The session the agent is recorded as bound to, if any. A delivery is
+    /// confirmed against this, never against `session`.
+    pub session_id: Option<SessionId>,
     pub pane: PaneId,
     pub harness: Harness,
     /// The harness's screen dispatch, for use with `baseline`.
@@ -653,6 +659,8 @@ impl AgentHandle {
             )));
         }
         Ok(Recipient {
+            status: found.status,
+            session_id: found.session_id.clone(),
             pane: PaneId::parse(pane)?,
             harness,
             screen,

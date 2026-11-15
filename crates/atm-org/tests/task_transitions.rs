@@ -265,7 +265,7 @@ fn a_new_task_is_open_and_keeps_what_it_was_created_with() {
         turns: Some(40),
         deadline: Some(ts(1000)),
     });
-    body.rests_on = Some(7);
+    body.rests_on = Some(DecisionId::new(7));
     let parent = rig.work_task();
     body.parent = Some(parent.clone());
     let task = rig.create(body.clone());
@@ -281,7 +281,7 @@ fn a_new_task_is_open_and_keeps_what_it_was_created_with() {
     assert_eq!(created.measure, body.measure);
     assert_eq!(created.budget, body.budget);
     assert_eq!(created.files, body.files);
-    assert_eq!(created.rests_on, Some(7));
+    assert_eq!(created.rests_on, Some(DecisionId::new(7)));
     assert_eq!(created.created_at, ts(rig.seq));
     assert_eq!(created.changed_at, ts(rig.seq));
     // Tasks are listed in the order they were created, not in text order.

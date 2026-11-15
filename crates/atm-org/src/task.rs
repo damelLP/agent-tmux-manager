@@ -92,7 +92,9 @@
 //! Every task stays in memory, in creation order; none is ever removed.
 
 use crate::command::nonempty;
-use crate::{Address, AgentId, ApplyError, IdError, OrgEvent, OrgState, Refusal, TaskId};
+use crate::{
+    Address, AgentId, ApplyError, DecisionId, IdError, OrgEvent, OrgState, Refusal, TaskId,
+};
 use atm_core::Money;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -200,8 +202,8 @@ pub struct TaskCreated {
     pub measure: TaskMeasure,
     pub budget: Option<TaskBudget>,
     pub files: Vec<TaskFile>,
-    /// The sequence number of the provisional decision this task is built on.
-    pub rests_on: Option<u64>,
+    /// The provisional decision this task is built on; existence is not checked.
+    pub rests_on: Option<DecisionId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskAssigned {
@@ -280,7 +282,8 @@ pub struct Task {
     pub files: Vec<TaskFile>,
     pub measure: TaskMeasure,
     pub budget: Option<TaskBudget>,
-    pub rests_on: Option<u64>,
+    /// The provisional decision reference; existence is not checked.
+    pub rests_on: Option<DecisionId>,
     /// Set by the reports; cleared by the next change of state.
     pub reminded_at: Option<DateTime<Utc>>,
     pub flagged_at: Option<DateTime<Utc>>,

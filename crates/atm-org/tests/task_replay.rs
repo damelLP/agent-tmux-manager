@@ -130,7 +130,7 @@ impl Step {
                 body.rests_on = self
                     .variant
                     .is_multiple_of(7)
-                    .then_some(self.variant as u64);
+                    .then_some(DecisionId::new(self.variant as u64));
                 TaskCommand::Create(body)
             }
             2 => TaskCommand::Assign {

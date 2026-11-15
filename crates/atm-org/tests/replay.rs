@@ -278,7 +278,7 @@ fn task_event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> 
                 deadline: Some(time()),
             }),
             files: vec![file],
-            rests_on: flag.then_some(n),
+            rests_on: flag.then_some(DecisionId::new(n)),
         }),
         27 => OrgEvent::TaskAssigned(TaskAssigned {
             task_id,

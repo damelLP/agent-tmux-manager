@@ -103,7 +103,7 @@ fn task_rows() -> Vec<(u64, &'static str, Value)> {
                 "measure": {"kind": "owner"},
                 "budget": null,
                 "files": [],
-                "rests_on": 7
+                "rests_on": "d7"
             }),
         ),
         (
@@ -230,6 +230,95 @@ fn until(seq: u64) -> OrgState {
 }
 
 #[test]
+fn task_decision_references_round_trip_without_requiring_a_decision() {
+    for (text, seq) in [("d0", 0), ("d7", 7), ("d18446744073709551615", u64::MAX)] {
+        let mut body = serde_json::to_value(tasks::new_task(
+            TaskKind::Work,
+            tasks::mechanical(),
+            "owner",
+        ))
+        .unwrap();
+        body["rests_on"] = json!(text);
+        let event = OrgEvent::from_parts("task.created", &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.to_body(), body);
+        let OrgEvent::TaskCreated(created) = event.clone() else {
+            panic!("expected task.created");
+        };
+        let mut state = OrgState::default();
+        let decision_id = DecisionId::new(seq);
+        assert!(state.decision(&decision_id).is_none());
+        assert_eq!(
+            state
+                .decide(&OrgCommand::Task(TaskCommand::Create(created)), ts(1))
+                .unwrap(),
+            vec![event.clone()]
+        );
+        state.apply(1, ts(1), &event).unwrap();
+        assert_eq!(
+            serde_json::to_value(state.task(&tid(1)).unwrap().rests_on).unwrap(),
+            json!(text)
+        );
+        assert!(state.decision(&decision_id).is_none());
+    }
+}
+
+#[test]
+fn task_decision_references_reject_noncanonical_values() {
+    let mut body = serde_json::to_value(tasks::new_task(
+        TaskKind::Work,
+        tasks::mechanical(),
+        "owner",
+    ))
+    .unwrap();
+    for value in [
+        json!(7),
+        json!("7"),
+        json!("d07"),
+        json!("d+7"),
+        json!("d-7"),
+        json!("D7"),
+        json!("t7"),
+        json!("d"),
+        json!("d18446744073709551616"),
+        json!("d7 "),
+        json!(" d7"),
+        json!(true),
+        json!([]),
+        json!({}),
+    ] {
+        body["rests_on"] = value.clone();
+        assert!(
+            matches!(
+                OrgEvent::from_parts("task.created", &body),
+                Err(OrgError::Body { .. })
+            ),
+            "accepted invalid decision reference {value}"
+        );
+    }
+}
+
+#[test]
+fn task_decision_references_remain_optional() {
+    for missing in [false, true] {
+        let mut body = serde_json::to_value(tasks::new_task(
+            TaskKind::Work,
+            tasks::mechanical(),
+            "owner",
+        ))
+        .unwrap();
+        if missing {
+            body.as_object_mut().unwrap().remove("rests_on");
+        }
+        let event = OrgEvent::from_parts("task.created", &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.to_body()["rests_on"], Value::Null);
+    }
+}
+
+#[test]
 fn every_task_kind_has_a_golden_body_that_round_trips() {
     let rows = task_rows();
     let mut seen: Vec<&str> = rows.iter().map(|row| row.1).collect();
@@ -320,7 +409,7 @@ fn the_golden_log_folds_to_the_expected_state() {
         files: vec![file("reviews/t12.md", TaskFileKind::Report)],
         measure: TaskMeasure::Owner,
         budget: None,
-        rests_on: Some(7),
+        rests_on: Some(DecisionId::new(7)),
         reminded_at: None,
         flagged_at: None,
         cost: None,

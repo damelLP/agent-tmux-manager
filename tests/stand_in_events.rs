@@ -189,6 +189,53 @@ fn held_shutdown_keeps_private_control_stream_alive_until_release() {
     rig.close();
 }
 
+/// Synthetic context usage travels through each real adapter, not a registry shortcut.
+#[test]
+fn next_context_share_reaches_the_daemon_in_every_mode() {
+    use atm_core::SessionStatus;
+    let mut rig = StandInRig::start();
+    for mode in [StandInMode::Claude, StandInMode::Codex, StandInMode::Pi] {
+        let mut config = StandInConfig::new(mode);
+        config.manual_clock = true;
+        let pane = rig.launch(&config);
+        rig.paste(&pane, "context line");
+        rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
+        rig.control(
+            &pane,
+            json!({"command": "set_context_share", "percent": 40}),
+        );
+        rig.control(&pane, json!({"command": "advance_to", "now_ms": 500}));
+        let reported = rig.wait_for_row(&pane, |r| {
+            r.status == SessionStatus::Idle && (r.context_percentage - 40.0).abs() < 0.0001
+        });
+        assert_eq!(reported.context_percentage, 40.0);
+
+        // An unconfigured next payload is unchanged. Codex has no baseline usage
+        // payload, so an unavailable transcript leaves the last known share alone.
+        rig.paste(&pane, "unconfigured usage");
+        rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
+        rig.control(&pane, json!({"command": "advance_to", "now_ms": 1000}));
+        rig.wait_for_row(&pane, |r| {
+            r.status == SessionStatus::Idle
+                && if mode == StandInMode::Codex {
+                    r.context_percentage == 40.0
+                } else {
+                    r.context_percentage < 1.0
+                }
+        });
+        rig.control(&pane, json!({"command": "set_context_share", "percent": 0}));
+        rig.paste(&pane, "explicit zero usage");
+        rig.wait_for_row(&pane, |r| r.status == SessionStatus::Working);
+        rig.control(&pane, json!({"command": "advance_to", "now_ms": 1500}));
+        rig.wait_for_row(&pane, |r| {
+            r.status == SessionStatus::Idle && r.context_percentage == 0.0
+        });
+        rig.paste(&pane, "/atm/exit");
+        rig.wait_for_shell(&pane);
+    }
+    rig.close();
+}
+
 #[test]
 fn event_replay_is_scoped_to_restarted_process_not_reused_pane_or_log() {
     let mut rig = StandInRig::start();

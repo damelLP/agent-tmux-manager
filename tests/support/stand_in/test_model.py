@@ -219,6 +219,90 @@ class HookHoldTests(unittest.TestCase):
                 self.assertEqual(released[-1], {"kind": "exit"})
 
 
+class ContextShareTests(unittest.TestCase):
+    # Synthetic: context-line injection, not measured token/cost evolution.
+    # Break caught: an ignored setting leaves the captured null/tiny usage.
+    def test_next_context_share_uses_real_mode_fields_without_mutating_templates(self):
+        from copy import deepcopy
+        for mode in ["claude", "codex", "pi"]:
+            with self.subTest(mode=mode):
+                m = make(mode)
+                templates = deepcopy(m.frames)
+                m.set_context_share(40)
+                if mode == "claude":
+                    window = m.status()[0]["data"]["context_window"]
+                    self.assertEqual(window["used_percentage"], 40)
+                    self.assertEqual(window["remaining_percentage"], 60)
+                    self.assertEqual(window["current_usage"], {
+                        "input_tokens": 400000, "output_tokens": 0,
+                        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+                    self.assertEqual(window["total_input_tokens"], 400000)
+                    self.assertIsNone(m.status()[0]["data"]["context_window"]["current_usage"])
+                elif mode == "pi":
+                    usage = data(m.emit("turn_end"))[0]["usage"]
+                    self.assertEqual(usage, {"cost": 0.0001171, "tokens": 1151,
+                                             "contextTokens": 108800})
+                    self.assertEqual(data(m.emit("turn_end"))[0]["usage"]["contextTokens"], 1151)
+                else:
+                    effects = m.emit("Stop")
+                    self.assertEqual(effects[0]["kind"], "usage")
+                    self.assertEqual(effects[0]["data"], {"type": "event_msg", "payload": {
+                        "type": "token_count", "info": {
+                            "total_token_usage": {"total_tokens": 103360},
+                            "last_token_usage": {"total_tokens": 103360},
+                            "model_context_window": 258400}}})
+                    self.assertEqual(data(effects)[0]["transcript_path"], effects[0]["path"])
+                    self.assertEqual([e["kind"] for e in m.emit("Stop")], ["event"])
+                    self.assertEqual(data(m.emit("Stop"))[0]["transcript_path"], "/fixture/session.jsonl")
+                self.assertEqual(m.frames, templates)
+
+    def test_context_share_validates_boundaries_and_preserves_pending_on_error(self):
+        for percent, tokens in [(0, 0), (100, 1000000), (39.5, 395000), (0.00015, 2)]:
+            m = make()
+            m.set_context_share(percent)
+            self.assertEqual(m.status()[0]["data"]["context_window"]["current_usage"]["input_tokens"], tokens)
+        m = make()
+        m.set_context_share(40)
+        for invalid in [None, True, False, "40", {}, [], -1, 100.01, float("nan"),
+                        float("inf"), -float("inf"), 10 ** 1000]:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    m.set_context_share(invalid)
+        self.assertEqual(m.status()[0]["data"]["context_window"]["used_percentage"], 40)
+        m.set_context_share(40)
+        m.set_context_share(65)  # Last valid unused setting wins.
+        self.assertEqual(m.status()[0]["data"]["context_window"]["used_percentage"], 65)
+
+    def test_context_share_waits_for_usage_not_other_pi_or_ending_codex_hooks(self):
+        for mode, name in [("pi", "agent_start"), ("codex", "SessionEnd")]:
+            m = make(mode)
+            m.set_context_share(40)
+            self.assertEqual([e["kind"] for e in m.emit(name)], ["event"])
+            effects = m.emit("turn_end" if mode == "pi" else "Stop")
+            if mode == "pi":
+                self.assertEqual(data(effects)[0]["usage"]["contextTokens"], 108800)
+            else:
+                self.assertEqual(effects[0]["data"]["payload"]["info"]["last_token_usage"]["total_tokens"], 103360)
+
+    def test_new_setting_cannot_rewrite_already_held_context_payload(self):
+        for mode, name in [("pi", "turn_end"), ("codex", "Stop")]:
+            m = make(mode)
+            m.arm_hook_hold(name)
+            m.set_context_share(40)
+            first = m.emit(name)
+            m.set_context_share(65)
+            released = m.release_hooks()
+            second = m.emit(name)
+            if mode == "pi":
+                self.assertEqual(data(released)[0]["usage"]["contextTokens"], 108800)
+                self.assertEqual(data(second)[0]["usage"]["contextTokens"], 176800)
+            else:
+                self.assertEqual(first[0]["data"]["payload"]["info"]["last_token_usage"]["total_tokens"], 103360)
+                self.assertEqual(second[0]["data"]["payload"]["info"]["last_token_usage"]["total_tokens"], 167960)
+                self.assertEqual(data(released)[0]["transcript_path"], first[0]["path"])
+                self.assertNotEqual(first[0]["path"], second[0]["path"])
+
+
 class LifecycleTests(unittest.TestCase):
     def test_claude_start_prompt_end_and_exact_payload(self):
         m = make(work_ms=500)

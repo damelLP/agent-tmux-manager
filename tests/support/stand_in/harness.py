@@ -174,6 +174,11 @@ class Runtime:
                 self.parser.arm_paste_refusal()
             except ValueError as error:
                 reply["error"] = str(error)
+        elif message.get("command") == "set_context_share":
+            try:
+                self.model.set_context_share(message.get("percent"))
+            except ValueError as error:
+                reply["error"] = str(error)
         elif message.get("command") in ("hold_next_hook", "release_hook"):
             try:
                 if message["command"] == "hold_next_hook":
@@ -296,6 +301,12 @@ class Runtime:
         for effect in effects:
             if not self.running:
                 break
+            if effect["kind"] == "usage":
+                path = Path(patch_paths(effect["path"], self.root))
+                if not path.resolve().is_relative_to(self.root):
+                    raise ValueError("usage transcript must stay inside the private root")
+                with path.open("x") as transcript:
+                    transcript.write(json.dumps(effect["data"]) + "\n")
             if effect["kind"] == "render":
                 if self.parser.pasting or self.parser.pending:
                     self.last_render = effect

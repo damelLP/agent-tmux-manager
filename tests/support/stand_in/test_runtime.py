@@ -180,6 +180,67 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(journal(r)[-2]["kind"], "exit")
         self.assertEqual(journal(r)[-1]["id"], 2)
 
+    # Synthetic: ignoring the control must leave baseline usage, not 40%.
+    def test_context_share_control_changes_next_real_status_or_usage(self):
+        import json
+        import tempfile
+        for mode, wanted in [("claude", 400000), ("pi", 108800), ("codex", 103360)]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                r = runtime()
+                r.mode, r.model, r.root = mode, make(mode), harness.Path(directory)
+                reported = []
+                def forward(data):
+                    if mode == "claude" and "context_window" in data:
+                        usage = data["context_window"]["current_usage"]
+                        reported.append(usage["input_tokens"] if usage else 0)
+                    elif mode == "pi" and "usage" in data:
+                        reported.append(data["usage"]["contextTokens"])
+                    elif mode == "codex":
+                        path = harness.Path(harness.patch_paths(data["transcript_path"], r.root))
+                        if path.is_file():
+                            record = json.loads(path.read_text())
+                            reported.append(record["payload"]["info"]["last_token_usage"]["total_tokens"])
+                r.forward = forward
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.start())
+                    r.action(("submit", "turn"))
+                    reported.clear()
+                    sequence = r.render_sequence
+                    r.control({"id": 1, "command": "set_context_share", "percent": 40})
+                    self.assertEqual(reported, [], "setting usage must not send it immediately")
+                    self.assertEqual(r.render_sequence, sequence, "control must not redraw")
+                    r.control({"id": 2, "command": "advance_to", "now_ms": 500})
+                self.assertEqual(reported, [wanted], "next payload must carry the requested context share")
+                self.assertEqual(journal(r)[-1]["id"], 2)
+
+    def test_invalid_context_control_keeps_pending_share_and_draft(self):
+        r = runtime()
+        r.parser.draft.extend(b"keep me")
+        r.control({"id": 1, "command": "set_context_share", "percent": 40})
+        self.assertNotIn("error", journal(r)[-1])
+        for value in [None, True, "40", -1, 101, float("nan")]:
+            r.control({"id": 2, "command": "set_context_share", "percent": value})
+            self.assertIn("error", journal(r)[-1])
+        r.control({"id": 3, "command": "set_context_share"})
+        self.assertIn("error", journal(r)[-1])
+        sent = []
+        r.forward = sent.append
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.status())
+        self.assertEqual(sent[0]["context_window"]["used_percentage"], 40)
+        self.assertEqual(r.parser.draft, b"keep me")
+
+    def test_codex_usage_write_refuses_a_path_outside_its_private_root(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            r = runtime()
+            r.root = harness.Path(directory) / "private"
+            r.root.mkdir()
+            outside = harness.Path(directory) / "outside.jsonl"
+            with self.assertRaises(ValueError):
+                r.effects([{"kind": "usage", "path": str(outside), "data": {}}])
+            self.assertFalse(outside.exists())
+
     def test_status_record_follows_forwarding_not_the_draft_redraw(self):
         r = runtime()
         sent = []

@@ -135,10 +135,53 @@ class Model:
         self.drop_next = None
         self.hold_next = None
         self.held_hooks = []
+        self.next_context_share = None
+        self.context_sequence = 0
         self.active_prompt = ""
         self.queue = []
         self.last_ctrl_c = None
         self.selection = 1
+
+    def set_context_share(self, percent):
+        if type(percent) not in (int, float) or not 0 <= percent <= 100:
+            raise ValueError("context share requires a finite number from 0 through 100")
+        self.next_context_share = float(percent)
+
+    def context_override(self, data):
+        if self.next_context_share is None:
+            return []
+        if self.mode == "claude":
+            if "context_window" not in data:
+                return []
+            window = data["context_window"]
+            capacity = window["context_window_size"]
+        elif self.mode == "pi":
+            if "usage" not in data:
+                return []
+            capacity = data["model"]["contextWindow"]
+        else:
+            if data.get("hook_event_name") == "SessionEnd":
+                return []  # The daemon deliberately does not read usage on end.
+            capacity = 258400  # Captured Codex 0.163.0 rollout capacity; Synthetic here.
+        percent, self.next_context_share = self.next_context_share, None
+        tokens = round(capacity * percent / 100)
+        # Synthetic: deterministic context-line injection, not measured usage.
+        if self.mode == "claude":
+            window.update(used_percentage=percent, remaining_percentage=100 - percent,
+                          total_input_tokens=tokens, total_output_tokens=0,
+                          current_usage={"input_tokens": tokens, "output_tokens": 0,
+                                         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        elif self.mode == "pi":
+            data["usage"]["contextTokens"] = tokens
+        else:
+            self.context_sequence += 1
+            path = f"/fixture/usage-{self.session_id}-{self.context_sequence}.jsonl"
+            data["transcript_path"] = path
+            return [{"kind": "usage", "path": path, "data": {"type": "event_msg", "payload": {
+                "type": "token_count", "info": {"model_context_window": capacity,
+                    "total_token_usage": {"total_tokens": tokens},
+                    "last_token_usage": {"total_tokens": tokens}}}}}]
+        return []
 
     def arm_hook_hold(self, event=None):
         known = {f["data"].get("event", f["data"].get("hook_event_name")) for f in self.frames}
@@ -173,6 +216,7 @@ class Model:
             data.pop("tmux_pane", None)
             data["session_id"] = self.session_id
             data.get("payload", data).update(updates)
+            usage = self.context_override(data)
             kind = "event"
             if self.drop_next in ("*", name):
                 kind, self.drop_next = "dropped", None
@@ -180,8 +224,8 @@ class Model:
             if kind == "event" and (self.held_hooks or self.hold_next in ("*", name)):
                 self.hold_next = None
                 self.held_hooks.append(effect)
-                return [dict(effect, kind="held")]
-            return [effect]
+                return usage + [dict(effect, kind="held")]
+            return usage + [effect]
         raise ValueError(f"no captured template for {name}/{variant}")
 
     def render(self, detail=""):
@@ -201,6 +245,7 @@ class Model:
         # Captured shape; Synthetic: deterministic timing and replay of an old ID.
         data = deepcopy(next(f["data"] for f in self.frames if f["type"] == "status_update"))
         data["session_id"] = session_id or self.session_id
+        self.context_override(data)
         return [{"kind": "status", "data": data}]
 
     def start(self):

@@ -339,6 +339,55 @@ Here `500` is the default `work_ms` from an initial manual clock of zero; use th
 turn's actual deadline if the test has advanced it. This is synthetic fault
 injection, not a claim about vendor hook scheduling. No sleeps are needed.
 
+### Next context share (synthetic)
+
+`{"command":"set_context_share","percent":40}` on the same duplex channel
+acknowledges a **one-shot** setting for the next generated context-bearing
+payload. It does not send a payload, advance time, end a turn or redraw. `percent`
+is a finite JSON number from 0 through 100 inclusive; booleans, null, missing,
+strings and out-of-range values return a control error without changing a pending
+setting/draft. Another valid setting replaces an unused setting. Tokens round to
+the nearest integer (ties to even); fractional shares can differ by half a token
+from the requested value. Unconfigured payloads and captured templates are unchanged.
+
+| Mode | Next eligible report | Fields changed / window |
+|---|---|---|
+| Claude | Next automatic status or `/atm/status [ID]` | `context_window.used_percentage`, `remaining_percentage`, `current_usage.input_tokens` with other current/cache fields zero, and matching one-request totals; captured `context_window_size` is 1000000 |
+| pi | Next usage-bearing `turn_end` envelope, including abort | `usage.contextTokens` over captured `model.contextWindow` 272000; cost/session-token snapshot stays unchanged |
+| Codex | Next non-ending lifecycle hook | Its `transcript_path` points to a new private JSONL `event_msg`/`token_count` record: `info.last_token_usage.total_tokens` and matching `total_token_usage.total_tokens`, over `model_context_window` 258400 |
+
+Claude's daemon adapter **calculates** context from current input/cache tokens;
+changing `used_percentage` alone would not move its line. Codex has no usage/status
+hook field, and the daemon skips transcript usage at `SessionEnd`, so that event
+does not consume the setting. Each synthetic Codex record is written before its
+referencing hook is forwarded, at a unique process/session/sequence path inside
+the rig root. Later settings never overwrite that file, including for held hooks.
+A subsequent unconfigured Codex hook reports no new usage, so the daemon keeps
+its last known share; use another setting (including zero) and a non-ending hook
+to reset it. Claude/pi return to their captured payload values after consumption.
+
+Consumption is at **generation**, not receipt: a dropped report consumes the
+setting; a held report keeps its generated value even if a new setting is armed
+before release. Ordinary non-usage pi events do not consume it. A pending setting
+is not a lifecycle end or a readiness signal. Await the real daemon row for the
+reported share; its control acknowledgment alone is not proof of receipt:
+
+```rust,ignore
+// After starting a manual-clock turn and awaiting its Working row:
+rig.control(&pane, serde_json::json!({"command":"set_context_share", "percent":40}));
+rig.control(&pane, serde_json::json!({"command":"advance_to", "now_ms":500}));
+rig.wait_for_row(&pane, |r| r.status == atm_core::SessionStatus::Idle
+    && r.context_percentage == 40.0);
+```
+
+As above, use the actual work deadline rather than 500 if time already advanced.
+**Synthetic:** context counts/percentages and the Codex rollout composition are
+fault-injection values, not captured usage measurements. Codex's record shape and
+258400 capacity reuse the captured `codex_rollout_tokens_0.163.0.jsonl` documented
+by `atm-codex-adapter`, composed here with the stand-in's 0.167.0 hook templates;
+this is not a claim of a new Codex capture. No cost, terminal capture or production
+parser is changed.
+
 ### Lifecycle fidelity
 
 | Mode | Startup | Prompt / completion | Clear | Interrupt |

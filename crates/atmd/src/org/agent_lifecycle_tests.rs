@@ -1580,3 +1580,53 @@ async fn second_adopt_of_a_clearing_agent_changes_nothing() {
     }
 }
 
+#[tokio::test]
+async fn second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready() {
+    // Decision A, Stuck (the owner's choice, 2026-11-15): an explicit adopt is
+    // the owner's way out of Stuck. On a safe idle screen it makes the agent
+    // Ready and clears the reason; it binds the pane's one session, if any.
+    for bound in [false, true] {
+        let mut adoption = ready_with_role().await;
+        if bound {
+            row_arrives(&adoption, "s1").await;
+            assert_eq!(
+                adoption.agent().await.unwrap().session_id,
+                Some(SessionId::new("s1"))
+            );
+        }
+        adoption
+            .rig
+            .command(OrgCommand::Stuck {
+                agent_id: adoptee(),
+                reason: "the trust dialog reset again".into(),
+            })
+            .await;
+        // The twin: a busy screen establishes nothing, and Stuck stays.
+        let recorded = adoption.agent().await.unwrap();
+        assert_eq!(recorded.status, AgentStatus::Stuck);
+        let mut committed = adoption.rig.org.committed.subscribe();
+        script_readopt(&adoption, PI_RUNNING, "pi");
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Stuck);
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{bound}");
+
+        script_readopt(&adoption, PI_PADDED, "pi");
+        adoption.script_follow_up(None);
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+        assert_eq!(
+            committed_kinds(&mut committed),
+            if bound {
+                vec!["agent.adopted"]
+            } else {
+                vec!["agent.adopted", "agent.editor_ready"]
+            }
+        );
+        let agent = adoption.agent().await.unwrap();
+        assert_eq!(agent.status, AgentStatus::Ready, "{bound}");
+        assert_eq!(agent.reason, None, "{bound}");
+        assert_eq!(agent.session_id, bound.then(|| SessionId::new("s1")));
+        assert!(mutations(&adoption.rig).is_empty(), "{bound}");
+        adoption.followed().await;
+    }
+}

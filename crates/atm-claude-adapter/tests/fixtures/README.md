@@ -1,5 +1,45 @@
 # Claude screen fixtures
 
+## Staged message references (P3)
+
+Captured: Claude Code 2.1.325, 2026-11-14, sealed loopback-only private tmux
+`capture-pane -p -e -N` (styled) and `capture-pane -p -N` (plain).
+Each row maps `b-claude-confirm/B-claude-<stem>.{styled-N,plain-N}.txt`
+to `screen_p3_<stem>_2.1.325.{styled,plain}.txt`. Each file also carries its
+individual capture method and state in its provenance line.
+
+| Stem (one styled/plain pair per row) | Evidence |
+|---|---|
+| 80x40-r0-C-u-empty | Same-run empty editor |
+| 80x40-r0-C-u-staged | Short reference, single row |
+| 80x40-r0-C-u-after-C-u | First clear observation |
+| 80x40-r0-C-u-cleared | Settled clear observation |
+| 120x40-r1-C-u-empty | Same-run empty editor |
+| 120x40-r1-C-u-staged | Long reference, single row |
+| 120x40-r1-C-u-after-C-u | First clear observation |
+| 120x40-r1-C-u-cleared | Settled clear observation |
+| 28x40-r1-C-u-empty | Same-run narrow empty editor |
+| 28x40-r1-C-u-staged | Long reference, real two-row wrap |
+| 28x40-r1-C-u-timeout | One Ctrl-U leaves the first visual row |
+| 28x40-r1-C-u-second-C-u-cleared | Second Ctrl-U clears the remainder |
+| 120x40-r1-Escape-empty | Independent Escape-run baseline |
+| 120x40-r1-Escape-staged | Independent Escape-run staged draft |
+| 120x40-r1-Escape-after-Escape | Draft remains; Esc again to clear |
+| 120x40-r1-Escape-second-Escape-cleared | Second Escape clears the draft |
+
+Only private paths, including clipped path fragments, become equal-length
+`/tmp/xxx…` placeholders. Rows, spaces, ANSI sequences and editor text stay
+unchanged; tests remove only the added provenance line. Sequential plain and
+styled observations are not an atomic pair. No Enter was sent in this probe.
+
+`tests/staged_reference.rs` checks both reference lengths at wide widths,
+wrong references, plain-input refusal, cleared negatives and explicitly
+Synthetic changed-token/outside-editor mutations. All 28-column exact reads
+currently return None, including the partial Ctrl-U draft. One Escape does
+not clear the reference: its wide frame still matches and must not be called
+a cleared negative. Wide control facts read Draft / NotRunning / None, with
+control dialog None. Matching alone is not authorization to submit.
+
 ## Staged clear command (P5)
 
 Captured: Claude Code 2.1.325, 2026-11-14, P5 sealed loopback-only private

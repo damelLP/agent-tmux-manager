@@ -1,5 +1,44 @@
 # Pi screen fixtures
 
+## Staged message references (P3)
+
+Captured: pi 1.5.0, 2026-11-14, sealed loopback-only private tmux
+`capture-pane -p -e -N` (styled) and `capture-pane -p -N` (plain).
+Each row maps `<source>/B-pi-<stem>.{styled-N,plain-N}.txt`
+to `screen_p3_<stem>_1.5.0.{styled,plain}.txt`. Each file also carries its
+individual capture method and state in its provenance line.
+
+| Source | Stem (one styled/plain pair per row) | Evidence |
+|---|---|---|
+| b-wide | 80x40-r0-C-u-empty | Same-run empty editor |
+| b-wide | 80x40-r0-C-u-staged | Short reference, single row |
+| b-wide | 80x40-r0-C-u-after-C-u | First clear observation |
+| b-wide | 80x40-r0-C-u-cleared | Settled clear observation |
+| b-wide | 120x40-r1-C-u-empty | Same-run empty editor |
+| b-wide | 120x40-r1-C-u-staged | Long reference, single row |
+| b-wide | 120x40-r1-C-u-after-C-u | First clear observation |
+| b-wide | 120x40-r1-C-u-cleared | Settled clear observation |
+| b-narrow-corrected | 28x40-r1-C-u-empty | Same-run narrow empty editor |
+| b-narrow-corrected | 28x40-r1-C-u-staged | Long reference, real two-row wrap |
+| b-narrow-corrected | 28x40-r1-C-u-after-C-u | First narrow clear observation |
+| b-narrow-corrected | 28x40-r1-C-u-cleared | Settled narrow clear observation |
+| b-wide | 120x40-r1-Escape-empty | Independent Escape-run baseline |
+| b-wide | 120x40-r1-Escape-staged | Independent Escape-run staged draft |
+| b-wide | 120x40-r1-Escape-after-Escape | Escape leaves the draft intact |
+
+Only private paths, including clipped path fragments, become equal-length
+`/tmp/xxx…` placeholders. Rows, spaces, ANSI sequences and editor text stay
+unchanged; tests remove only the added provenance line. Sequential plain and
+styled observations are not an atomic pair. No Enter was sent in this probe.
+
+`tests/staged_reference.rs` checks both reference lengths at wide widths,
+wrong references, plain-input refusal, cleared negatives and explicitly
+Synthetic changed-token/outside-editor mutations. The wrapped exact match
+currently returns None even though its control facts read Draft / NotRunning
+/ None, with control dialog None. One Escape does not clear the reference:
+its wide frame still matches and must not be called a cleared negative.
+Matching alone is not authorization to submit.
+
 ## Staged clear command and typed popup (P5)
 
 Captured: pi 1.5.0, 2026-11-14, P5 sealed loopback-only private tmux 3.8

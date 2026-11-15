@@ -326,6 +326,138 @@ async fn automatic_messages_name_task_and_preserve_actor_files_and_noops() {
     assert_eq!(rig.snapshot().await, state);
 }
 
+// Break caught: a seat containing "lead" gains authority over a task it did not create.
+#[tokio::test]
+async fn near_lead_names_cannot_manage_another_creators_task() {
+    for name in ["leader", "lead-b"] {
+        for (method, mut params, submitted) in [
+            (
+                "task.assign",
+                json!({"task_id":"t6","agent_id":"project/reviewer"}),
+                false,
+            ),
+            ("task.review", json!({"task_id":"t6"}), true),
+            (
+                "task.set_state",
+                json!({"task_id":"t6","state":"open"}),
+                false,
+            ),
+            (
+                "task.set_state",
+                json!({"task_id":"t6","state":"cancelled"}),
+                false,
+            ),
+            (
+                "task.verdict",
+                json!({"task_id":"t6","verdict":"accepted"}),
+                true,
+            ),
+        ] {
+            let rig = Rig::new().await;
+            rig.org
+                .execute(
+                    OrgCommand::Adopt {
+                        agent_id: format!("project/{name}").parse().unwrap(),
+                        pane: "%5".into(),
+                        session_id: None,
+                    },
+                    now(),
+                )
+                .await
+                .unwrap();
+            if submitted {
+                rig.submitted().await;
+            } else {
+                rig.assign().await;
+            }
+            if method == "task.review" {
+                let review = rig
+                    .ok(
+                        None,
+                        "task.create",
+                        json!({"title":"Review","kind":"review","judges":"t6","measure":{"kind":"owner"}}),
+                    )
+                    .await;
+                params["review_task"] = review["task_id"].clone();
+            }
+            let before = rig.snapshot().await;
+            let cursor = rig.org.status().unwrap();
+            let result = rig.call(Some("%5"), method, params.clone()).await;
+            assert!(
+                matches!(&result, Err(error) if error.0.code == "refused"),
+                "project/{name} {method} {params}: {result:?}"
+            );
+            assert_eq!(rig.snapshot().await, before);
+            assert_eq!(rig.org.status().unwrap(), cursor);
+            // The same request is valid for authority; refusal was not a bad fixture.
+            assert_eq!(rig.ok(None, method, params).await["changed"], true);
+        }
+    }
+}
+
+// Break caught: reports on agent-created tasks are always routed to the owner.
+#[tokio::test]
+async fn submitted_report_goes_to_agent_creator_not_assigning_owner() {
+    let rig = Rig::new().await;
+    let task = rig
+        .ok(
+            Some("%1"),
+            "task.create",
+            json!({"title":"Agent task","measure":{"kind":"owner"}}),
+        )
+        .await;
+    let id = &task["task_id"];
+    rig.ok(
+        None,
+        "task.assign",
+        json!({"task_id":id,"agent_id":"project/worker"}),
+    )
+    .await;
+    let submitted = rig
+        .ok(Some("%2"), "task.submit", json!({"task_id":id}))
+        .await;
+    let message_id = submitted["notification"]["message_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let state = rig.snapshot().await;
+    let report = state.message(&message_id).unwrap();
+    assert_eq!(
+        serde_json::to_value(&report.content).unwrap(),
+        json!({"from":"project/worker","to":"project/lead","kind":"report","body":"Task t7 submitted (result): Agent task\nSubmitted by project/worker; inspect the task: atm task get t7\nNo submission file is attached.","attachments":[],"task":"t7"})
+    );
+}
+
+// Break caught: assignment briefs attach report/evidence/plan/contract files too.
+#[tokio::test]
+async fn automatic_brief_attaches_only_brief_files() {
+    let rig = Rig::new().await;
+    for kind in ["report", "evidence", "plan", "contract"] {
+        rig.ok(
+            None,
+            "task.attach",
+            json!({"task_id":"t6","file":{"path":format!("{kind}.md"),"kind":kind}}),
+        )
+        .await;
+    }
+    let assigned = rig
+        .ok(
+            None,
+            "task.assign",
+            json!({"task_id":"t6","agent_id":"project/worker"}),
+        )
+        .await;
+    let message_id = assigned["notification"]["message_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let state = rig.snapshot().await;
+    let brief = state.message(&message_id).unwrap();
+    assert_eq!(brief.content.attachments, ["briefs/task.md"]);
+}
+
 // Break caught: authority inferred from client name/manager, owner allowed to submit, or own verdict allowed.
 #[tokio::test]
 async fn caller_attribution_authority_and_direct_states_are_enforced() {

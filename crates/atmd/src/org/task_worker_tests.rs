@@ -57,6 +57,28 @@ fn assign(_: TaskActor) -> TaskCommand {
     }
 }
 
+// Break caught: an internally created task addresses its report to system, which has no inbox.
+#[test]
+fn system_created_task_report_falls_back_to_owner() {
+    let mut state = OrgState::default();
+    let mut task = created("Work".into());
+    task.creator = Address::System;
+    state
+        .apply(1, chrono::Utc::now(), &OrgEvent::TaskCreated(task))
+        .unwrap();
+    let event = OrgEvent::TaskSubmitted(atm_org::TaskSubmitted {
+        task_id: "t1".parse().unwrap(),
+        what: TaskSubmission::Result,
+        files: vec![],
+        by: "p/worker".parse().unwrap(),
+    });
+    let report = notification(&event, &state).unwrap().unwrap();
+    assert_eq!(report.to, Address::Owner);
+    assert!(report
+        .body
+        .ends_with("\nCreator is system; report routed to owner."));
+}
+
 // Break caught: waiter cancellation drops a post-commit enqueue or releases its permit early.
 #[tokio::test]
 async fn cancelled_waiter_leaves_worker_to_finish_enqueue_exactly_once() {

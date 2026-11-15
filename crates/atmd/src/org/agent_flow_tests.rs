@@ -1889,14 +1889,41 @@ const PI_DRAFT: &str = pi!("screen_styled_p1_B-0-event-pasted-120x40");
 const PI_RETRY: &str = pi!("screen_styled_p1_R-retry-held-120x40");
 const PI_SELECTOR: &str = pi!("screen_styled_p1_C3-one-selector-120x40");
 
-/// Synthetic: pi's real draft frame with its draft replaced by `/new`, the
-/// cursor cell and the row's width kept. pi's own staged `/new` capture is
-/// not a fixture yet; a pasted `/new` draws no completion list (probe P5).
-pub(super) fn pi_staged() -> String {
-    let draft = "B_SENTINEL_0_event\x1b[7m \x1b[0m";
-    assert!(PI_DRAFT.contains(draft));
-    PI_DRAFT.replace(draft, "/new\x1b[7m \x1b[0m              ")
-}
+/// `/new` pasted into pi's editor; a pasted command draws no completion list.
+const PI_STAGED: &str =
+    include_str!("../../../atm-pi-adapter/tests/fixtures/screen_p5_120x40-staged_1.5.0.styled.txt");
+
+/// The clear command staged in each harness's editor at 80, 100 and 120
+/// columns (Codex's with its one-row completion popup).
+const STAGED_COMMANDS: [(Harness, &str, [&str; 3]); 3] = [
+    (
+        Harness::ClaudeCode,
+        "/clear",
+        [
+            include_str!("../../../atm-claude-adapter/tests/fixtures/screen_p5_80x40-staged_2.1.325.styled.txt"),
+            include_str!("../../../atm-claude-adapter/tests/fixtures/screen_p5_100x40-staged_2.1.325.styled.txt"),
+            include_str!("../../../atm-claude-adapter/tests/fixtures/screen_p5_120x40-staged_2.1.325.styled.txt"),
+        ],
+    ),
+    (
+        Harness::Codex,
+        "/new",
+        [
+            include_str!("../../../atm-codex-adapter/tests/fixtures/screen_p5_80x40-popup_0.167.0.styled.txt"),
+            include_str!("../../../atm-codex-adapter/tests/fixtures/screen_p5_100x40-popup_0.167.0.styled.txt"),
+            include_str!("../../../atm-codex-adapter/tests/fixtures/screen_p5_120x40-popup_0.167.0.styled.txt"),
+        ],
+    ),
+    (
+        Harness::Pi,
+        "/new",
+        [
+            include_str!("../../../atm-pi-adapter/tests/fixtures/screen_p5_80x40-staged_1.5.0.styled.txt"),
+            include_str!("../../../atm-pi-adapter/tests/fixtures/screen_p5_100x40-staged_1.5.0.styled.txt"),
+            PI_STAGED,
+        ],
+    ),
+];
 
 /// A real frame as a guard captures it when the pane itself allows input:
 /// the agent's tag, the pinned harness in front, no client focused on it.
@@ -2052,7 +2079,7 @@ fn clear_needs_a_safe_editor_and_a_conversation_where_the_screen_is_the_proof() 
     let screen = agent_screen(Harness::Pi).unwrap();
     assert!(!safe_to_paste(
         screen,
-        &unfocused(Harness::Pi, &pi_staged()),
+        &unfocused(Harness::Pi, PI_STAGED),
         &pinned("pi"),
         TAG
     ));
@@ -2066,7 +2093,14 @@ fn submit_requires_staged_true_and_dialog_none() {
         submit(Harness::ClaudeCode, CLAUDE_STAGED, "/clear"),
         enter()
     );
-    assert_eq!(submit(Harness::Pi, &pi_staged(), "/new"), enter());
+    assert_eq!(submit(Harness::Pi, PI_STAGED, "/new"), enter());
+    for (harness, command, widths) in STAGED_COMMANDS {
+        for staged in widths {
+            assert_eq!(submit(harness, staged, command), enter(), "{harness:?}");
+            let wrong = format!(" {command}");
+            assert_eq!(submit(harness, staged, &wrong), NOT_STAGED, "{harness:?}");
+        }
+    }
     // Their twins: the same frames and another expected text, leading
     // whitespace included, and the same harness with something else staged.
     for expected in [" /clear", "/clea", "/clear x", "/new", ""] {
@@ -2076,7 +2110,7 @@ fn submit_requires_staged_true_and_dialog_none() {
             "{expected:?}"
         );
     }
-    assert_eq!(submit(Harness::Pi, &pi_staged(), " /new"), NOT_STAGED);
+    assert_eq!(submit(Harness::Pi, PI_STAGED, " /new"), NOT_STAGED);
     for (harness, fixture, command) in [
         (Harness::ClaudeCode, CLAUDE_CONVERSATION, "/clear"),
         (Harness::ClaudeCode, CLAUDE_CLEARED, "/clear"),
@@ -2170,7 +2204,7 @@ fn submit_requires_staged_true_and_dialog_none() {
 fn submit_refuses_focused_or_unknown_focus() {
     for (harness, fixture, command) in [
         (Harness::ClaudeCode, CLAUDE_STAGED.to_owned(), "/clear"),
-        (Harness::Pi, pi_staged(), "/new"),
+        (Harness::Pi, PI_STAGED.to_owned(), "/new"),
     ] {
         let screen = agent_screen(harness).unwrap();
         let baseline = pinned(name(harness));
@@ -2337,7 +2371,7 @@ fn clear_table_changed_session() {
             CLAUDE_CONVERSATION,
             CLAUDE_STAGED.to_owned(),
         ),
-        (p, PI_FRESH, PI_CONVERSATION, pi_staged()),
+        (p, PI_FRESH, PI_CONVERSATION, PI_STAGED.to_owned()),
     ] {
         let policy = policy(harness);
         let waiting = Step::Wait("the harness has not announced a new session");

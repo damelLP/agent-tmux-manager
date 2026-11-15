@@ -249,3 +249,43 @@ async fn registry_reply_dropped_is_an_error() {
     // The legacy read answers the same failure with an empty list.
     assert!(registry.get_all_sessions().await.is_empty());
 }
+
+#[test]
+fn row_renamed_by_a_status_line_loses_the_old_sessions_start() {
+    // A session starts with a source; a status line of the same process then
+    // names another session. No SessionStart was accepted for that one, so
+    // the row must not carry the first session's start over to it.
+    for first in ["clear", "startup"] {
+        let mut actor = actor();
+        let pid = std::process::id();
+        apply(&mut actor, "s1", pid, "%7", start(Some(first)));
+        assert_eq!(
+            sources(&read(&mut actor, "%7")),
+            [("s1", Some(Some(first)))]
+        );
+        let (status_pid, data) = parse_status_line(serde_json::json!({
+            "session_id": "s2",
+            "pid": pid,
+            "model": {"id": "claude-sonnet-4-20250514"},
+            "cost": {"total_cost_usd": 0.10, "total_duration_ms": 5000},
+            "context_window": {"total_input_tokens": 1000, "context_window_size": 200000}
+        }))
+        .unwrap();
+        let (respond_to, mut rx) = oneshot::channel();
+        actor.handle_command(RegistryCommand::UpdateFromStatusLine {
+            session_id: SessionId::new("s2"),
+            pid: status_pid,
+            data,
+            harness: atm_core::Harness::ClaudeCode,
+            respond_to,
+        });
+        rx.try_recv().unwrap().unwrap();
+        assert_eq!(sources(&read(&mut actor, "%7")), [("s2", None)], "{first}");
+        // The twin: the new session's own start then sets its source.
+        apply(&mut actor, "s2", pid, "%7", start(Some("clear")));
+        assert_eq!(
+            sources(&read(&mut actor, "%7")),
+            [("s2", Some(Some("clear")))]
+        );
+    }
+}

@@ -316,7 +316,12 @@ async fn untag_ok_then_down_append_unknown_quarantines() {
         let agents = agents.clone();
         async move { down(&agents, false).await }
     });
-    let release = entered.recv().await.unwrap();
+    // Bounded: the rig keeps the gate's sender alive, so a Down that is
+    // never written would otherwise be waited for without end.
+    let release = tokio::time::timeout(std::time::Duration::from_secs(60), entered.recv())
+        .await
+        .expect("the Down was never written")
+        .unwrap();
     let result = call.await.unwrap();
     assert!(result.is_err(), "{result:?}");
     assert_quarantined(&rig).await;

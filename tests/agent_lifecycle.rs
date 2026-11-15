@@ -12,7 +12,7 @@ use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 use atm_core::SessionStatus;
 use serde_json::json;
 use stand_in::StandInMode;
-use support::{checked, process_identity, AgentRig};
+use support::{checked, process_identity, AgentRig, Started};
 
 /// Adoption must bind the existing process/session, not launch or type into it.
 #[test]
@@ -331,20 +331,181 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
 /// start, real session plus safe editor, no implicit prompt, all in its own window.
 /// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance and a styled fresh-editor Claude stand-in frame at 200 columns"]
-fn agent_up_ready_tagged_env_claude() {}
+fn agent_up_ready_tagged_env_claude() {
+    up_is_ready_tagged_and_announced(StandInMode::Claude, true);
+}
 
 /// Codex up: daemon override, role/required args and ATM_AGENT, pre-start tag,
 /// fresh safe Ready/null without submitting a prompt to manufacture a session.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance"]
-fn agent_up_ready_tagged_env_codex() {}
+fn agent_up_ready_tagged_env_codex() {
+    up_is_ready_tagged_and_announced(StandInMode::Codex, false);
+}
 
 /// Pi up: daemon override, role args/model and ATM_AGENT, pre-start tag,
 /// session_start plus safe editor before Ready, no implicit initial prompt.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance"]
-fn agent_up_ready_tagged_env_pi() {}
+fn agent_up_ready_tagged_env_pi() {
+    up_is_ready_tagged_and_announced(StandInMode::Pi, true);
+}
+
+/// `agent.up` from a pane of the private server: the daemon splits it, tags
+/// the new pane, types the launch command into its shell and waits for the
+/// harness. `bound`: the harness announces a session at its start, and Ready
+/// is that session with a safe editor; otherwise Ready has no session yet.
+fn up_is_ready_tagged_and_announced(mode: StandInMode, bound: bool) {
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, pane) = (started.id.as_str(), &started.pane);
+    assert_eq!(started.result["state"], "ready", "{}", started.result);
+    assert_eq!(id, "project/lead");
+
+    // The pane is the lower half of the caller's window: never attached,
+    // the size the stand-in draws at, tagged for the agent.
+    assert_ne!(pane.pane_id, started.placement);
+    let window = |pane_id: &str| {
+        checked(test.rig.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{window_id} #{window_panes} #{session_attached}",
+        ]))
+    };
+    assert_eq!(window(&pane.pane_id), window(&started.placement));
+    assert!(
+        window(&pane.pane_id).ends_with(" 2 0"),
+        "{}",
+        window(&pane.pane_id)
+    );
+    let size = checked(test.rig.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &pane.pane_id,
+        "#{pane_width} #{pane_height}",
+    ]));
+    assert_eq!(size, format!("{} {}", config.columns, config.rows));
+    assert_eq!(test.tag(&pane.pane_id), id);
+
+    // The harness is a job of the pane's interactive shell, started through
+    // the daemon's ATM_SPAWN_BIN in the role's directory, with ATM_AGENT set.
+    let shell: u32 =
+        checked(
+            test.rig
+                .tmux(&["display-message", "-p", "-t", &pane.pane_id, "#{pane_pid}"]),
+        )
+        .parse()
+        .unwrap();
+    assert_ne!(shell, pane.pid);
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pane.pid)).unwrap();
+    let parent: u32 = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(parent, shell);
+    let environ = std::fs::read(format!("/proc/{}/environ", pane.pid)).unwrap();
+    assert!(
+        environ
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == format!("ATM_AGENT={id}").as_bytes()),
+        "ATM_AGENT is not in the harness's environment"
+    );
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{}/cwd", pane.pid)).unwrap(),
+        test.project.canonicalize().unwrap()
+    );
+    let journal = test.rig.journal(pane);
+    let identity = journal.iter().find(|e| e["kind"] == "identity").unwrap();
+    assert_eq!(
+        identity["argv"][0],
+        test.rig.launcher(mode).to_str().unwrap(),
+        "{identity}"
+    );
+
+    // Ready is the harness's own row and nothing typed into its editor.
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "ready", "{agent}");
+    assert_eq!(agent["pane"], pane.pane_id);
+    if bound {
+        let row = test.rig.wait_for_row(pane, |r| {
+            !r.id.is_pending() && r.status == SessionStatus::Idle
+        });
+        assert_eq!(test.rig.pane_rows(pane).len(), 1);
+        assert_eq!(agent["session_id"], row.id.as_str(), "{agent}");
+    } else {
+        // No session is announced before a first prompt: the only row a
+        // discovery pass can give the pane is its own placeholder.
+        test.rig.discover();
+        let rows = test.rig.pane_rows(pane);
+        assert!(rows.iter().all(|row| row.id.is_pending()), "{rows:?}");
+        assert_eq!(agent["session_id"], json!(null), "{agent}");
+        assert_eq!(test.agent(id)["state"], "ready");
+    }
+    test.assert_no_prompt(pane);
+    // Nothing was typed into the caller's pane. (The split resized it, and
+    // the rig's shell redraws its prompt as an empty line then.)
+    let caller = checked(
+        test.rig
+            .tmux(&["capture-pane", "-p", "-t", &started.placement]),
+    );
+    assert!(
+        caller.is_empty() || caller == started.placement_screen,
+        "{caller}"
+    );
+    assert_eq!(test.tag(&started.placement), "");
+
+    // The record: requested, the pane, the launch's audit, then readiness;
+    // the launch is the only control action.
+    let events = test.tail(started.cursor);
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .filter(|kind| kind.starts_with("agent.") || kind.starts_with("control."))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "agent.up_requested",
+            "agent.pane_created",
+            "control.spawned",
+            if bound {
+                "agent.session_bound"
+            } else {
+                "agent.editor_ready"
+            },
+        ],
+        "{events:?}"
+    );
+    let spawned = events
+        .iter()
+        .find(|e| e["kind"] == "control.spawned")
+        .unwrap();
+    assert_eq!(
+        spawned["body"],
+        json!({
+            "pane": pane.pane_id,
+            "action": {
+                "method": "agent.up",
+                "agent": id,
+                "binary": test.rig.launcher(mode),
+            },
+        })
+    );
+    // A second up of an agent that is up is refused, with nothing done.
+    let cursor = test.cursor();
+    let again = test.up_from("lead", &started.placement);
+    assert!(again.is_err(), "{again:?}");
+    assert!(test.tail(cursor).is_empty());
+    assert!(window(&pane.pane_id).ends_with(" 2 0"));
+    test.rig.close();
+}
 
 /// A linked checkout uses the main role, not a conflicting linked role. Scrub
 /// all GIT_* for fixture git commands; prove the temp gitdir before any write.
@@ -356,14 +517,97 @@ fn agent_up_reads_main_checkout_role() {}
 /// a safe editor; return that ID on the same process, never rebind the old row.
 /// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "agent.clear is in the base; acceptance not yet written; needs a styled fresh-editor Claude stand-in frame at 200 columns"]
-fn clear_returns_new_ready_session_claude() {}
+fn clear_returns_new_ready_session_claude() {
+    clear_returns_a_new_ready_session(StandInMode::Claude);
+}
 
 /// Held pi clear stays Clearing until changed ID plus safe editor on the same
 /// process/connection; repeated notices alone are not acknowledgment.
 #[test]
-#[ignore = "agent.clear is in the base; pi clear stand-in acceptance not yet written"]
-fn clear_returns_new_ready_session_pi() {}
+fn clear_returns_new_ready_session_pi() {
+    clear_returns_a_new_ready_session(StandInMode::Pi);
+}
+
+/// `agent.clear` of an agent that `agent.up` started and that has had a
+/// turn: the clear command goes into the same process, the agent is Clearing
+/// for as long as the harness has not announced another session, and the
+/// call answers with that session once its editor is safe.
+fn clear_returns_a_new_ready_session(mode: StandInMode) {
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, pane) = (started.id.as_str(), &started.pane);
+    let old = test.complete_fixture_turn(pane);
+    assert_eq!(test.agent(id)["session_id"], old.id.as_str());
+    let identity = process_identity(pane.pid);
+    let cursor = test.cursor();
+    let after = test.rig.event_cursor(pane);
+    let call = test.call_in_background("agent.clear", json!({"agent": id, "timeout_ms": 30000}));
+    // The stand-in took the command and holds the clear on its manual clock:
+    // the call has not answered, and the agent is Clearing, not Ready.
+    test.rig.wait_event(pane, after, |e| {
+        e["kind"] == "rendered" && e["state"] == "clearing"
+    });
+    assert!(!call.is_finished());
+    let held = test.agent(id);
+    assert_eq!(held["state"], "clearing", "{held}");
+    let now = test.rig.control(pane, json!({"command":"barrier"}))["now_ms"]
+        .as_u64()
+        .unwrap();
+    let reply = test.rig.control(
+        pane,
+        json!({"command":"advance_to", "now_ms": now + config.clear_gap_ms}),
+    );
+    assert!(reply["error"].is_null(), "{reply}");
+    let result = call.join().unwrap().unwrap();
+    let row = test.rig.wait_for_row(pane, |r| {
+        !r.id.is_pending() && r.id != old.id && r.status == SessionStatus::Idle
+    });
+    assert_eq!(
+        result,
+        json!({"agent_id": id, "session_id": row.id.as_str()})
+    );
+    // The same process in the same pane, one row, and the agent Ready on it.
+    assert_eq!(process_identity(pane.pid), identity);
+    test.rig.wait_for_absent(&old.id);
+    assert_eq!(test.rig.pane_rows(pane).len(), 1);
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "ready", "{agent}");
+    assert_eq!(agent["pane"], pane.pane_id);
+    assert_eq!(agent["session_id"], row.id.as_str());
+    // The clear command was the only thing typed, and it was not a prompt.
+    test.rig.control(pane, json!({"command": "barrier"}));
+    for event in test
+        .rig
+        .journal(pane)
+        .iter()
+        .filter(|e| e["event_sequence"].as_u64().unwrap() > after)
+    {
+        assert!(
+            !matches!(
+                event["kind"].as_str(),
+                Some("identity" | "accepted" | "rejected" | "queued")
+            ),
+            "{event}"
+        );
+        assert!(
+            !matches!(event["event"].as_str(), Some("UserPromptSubmit" | "input")),
+            "{event}"
+        );
+    }
+    let events = test.tail(cursor);
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .filter(|kind| kind.starts_with("agent.") || kind.starts_with("control."))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["agent.clear_requested", "agent.session_bound"],
+        "{events:?}"
+    );
+    test.rig.close();
+}
 
 /// Codex conversation-to-fresh clear returns Ready/null, excludes the old ID,
 /// then binds the next real prompt's ID once without any slash concatenation.
@@ -386,8 +630,117 @@ fn clear_worktree_default() {}
 /// Respawn replaces pane/process/session under the same agent; stale old events
 /// cannot bind. Use another pre-sized placement window, never split a stand-in.
 #[test]
-#[ignore = "waits for Tasks 6 and 10: respawn acceptance"]
-fn respawn_uses_new_process_and_session() {}
+fn respawn_uses_new_process_and_session() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, old) = (started.id.as_str(), &started.pane);
+    let old_row = test.complete_fixture_turn(old);
+    let old_identity = process_identity(old.pid);
+
+    // Called from another window: the old pane is killed, never split.
+    let log = test.next_stand_in("lead-again", &config);
+    let placement = test.placement(&config);
+    let cursor = test.cursor();
+    let result = test.rpc(
+        "agent.respawn",
+        json!({"agent": id, "caller_server": test.server()}),
+        Some(placement.clone()),
+    );
+    assert_eq!(result["agent_id"], id);
+    let pane_id = result["pane"].as_str().unwrap().to_owned();
+    assert_ne!(pane_id, old.pane_id);
+    let new = test.rig.observe_pane(pane_id, mode, log);
+
+    // The old pane and its process are gone; the new pane is in the
+    // caller's window, tagged, with another process and another session.
+    stand_in::process::wait_exit(old.pid, std::time::Duration::from_secs(30)).unwrap();
+    let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
+    assert!(!panes.lines().any(|p| p == old.pane_id), "{panes}");
+    assert!(panes.lines().any(|p| p == started.placement), "{panes}");
+    let window = |pane_id: &str| {
+        checked(test.rig.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{window_id} #{window_panes} #{session_attached}",
+        ]))
+    };
+    assert_eq!(window(&new.pane_id), window(&placement));
+    assert!(window(&new.pane_id).ends_with(" 2 0"));
+    assert_eq!(test.tag(&new.pane_id), id);
+    assert_ne!(process_identity(new.pid), old_identity);
+    let row = test.rig.wait_for_row(&new, |r| {
+        !r.id.is_pending() && r.status == SessionStatus::Idle
+    });
+    assert_ne!(row.id, old_row.id);
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "ready", "{agent}");
+    assert_eq!(agent["pane"], new.pane_id);
+    assert_eq!(agent["session_id"], row.id.as_str());
+    test.assert_no_prompt(&new);
+
+    // One record: the kill under agent.respawn, the Down, then a start.
+    let events = test.tail(cursor);
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .filter(|kind| kind.starts_with("agent.") || kind.starts_with("control."))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "control.killed",
+            "agent.down",
+            "agent.up_requested",
+            "agent.pane_created",
+            "control.spawned",
+            "agent.session_bound",
+        ],
+        "{events:?}"
+    );
+    let killed = events
+        .iter()
+        .find(|e| e["kind"] == "control.killed")
+        .unwrap();
+    assert_eq!(
+        killed["body"],
+        json!({"pane": old.pane_id, "action": {"method": "agent.respawn", "agent": id}})
+    );
+    let bound = events
+        .iter()
+        .find(|e| e["kind"] == "agent.session_bound")
+        .unwrap();
+    assert_eq!(bound["body"]["session_id"], row.id.as_str());
+
+    // The agent that was started twice is taken down like any other.
+    let cursor = test.cursor();
+    let result = test.rpc("agent.down", json!({"agent": id, "kill": true}), None);
+    assert_eq!(result, json!({"agent_id": id}));
+    stand_in::process::wait_exit(new.pid, std::time::Duration::from_secs(30)).unwrap();
+    let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
+    assert!(!panes.lines().any(|p| p == new.pane_id), "{panes}");
+    let agent = test.agent(id);
+    assert_eq!(agent["state"], "down", "{agent}");
+    assert_eq!(agent["pane"], json!(null));
+    assert_eq!(
+        agent["reason"],
+        format!("taken down; {} killed", new.pane_id)
+    );
+    let events = test.tail(cursor);
+    let killed: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "control.killed")
+        .collect();
+    assert_eq!(killed.len(), 1, "{events:?}");
+    assert_eq!(
+        killed[0]["body"],
+        json!({"pane": new.pane_id, "action": {"method": "agent.down", "agent": id}})
+    );
+    test.rig.close();
+}
 
 /// A daemon restart retains durable identity/binding and converges after live
 /// row and foreground-baseline revalidation, without lifecycle input.
@@ -496,8 +849,205 @@ fn durable_clearing_after_restart_refuses_raw_send() {}
 /// ready/delivered and the stand-in gates; exactly one new-generation prompt
 /// contains the token, never concatenated /clear or /new. No substitute executor.
 #[test]
-#[ignore = "waits for Task 12: Task 8 plus U9b slice B integration"]
-fn msg_send_during_clear_delivers_once_to_new_generation() {}
+fn msg_send_during_clear_delivers_once_to_new_generation() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start_with_config(mode, DELIVERY);
+    let config = support::started_config(mode);
+    let started = Started::up(&test, "lead", &config);
+    let (id, pane) = (started.id.as_str(), &started.pane);
+    let old = test.complete_fixture_turn(pane);
+    let cursor = test.cursor();
+    let after = test.rig.event_cursor(pane);
+    let call = test.call_in_background("agent.clear", json!({"agent": id, "timeout_ms": 30000}));
+    test.rig.wait_event(pane, after, |e| {
+        e["kind"] == "rendered" && e["state"] == "clearing"
+    });
+    // Sent while the stand-in holds the clear: recorded, and not typed.
+    let sent = test.rpc(
+        "msg.send",
+        json!({"to": id, "body": "after the clear"}),
+        None,
+    );
+    let message = sent["message_id"].as_str().unwrap().to_owned();
+    let reference = format!("[{message}] Read: atm inbox --id {message}");
+    assert!(!call.is_finished());
+    assert_eq!(test.agent(id)["state"], "clearing");
+    let held = test.rig.event_cursor(pane);
+    let now = test.rig.control(pane, json!({"command":"barrier"}))["now_ms"]
+        .as_u64()
+        .unwrap();
+    let reply = test.rig.control(
+        pane,
+        json!({"command":"advance_to", "now_ms": now + config.clear_gap_ms}),
+    );
+    assert!(reply["error"].is_null(), "{reply}");
+    let cleared = call.join().unwrap().unwrap();
+    let new = cleared["session_id"].as_str().unwrap().to_owned();
+    assert_ne!(new, old.id.as_str());
+
+    // The new session takes the reference as a prompt, exactly as sent.
+    let accepted = test.rig.wait_event(pane, held, |e| e["kind"] == "accepted");
+    assert_eq!(accepted["text"], reference.as_str(), "{accepted}");
+    test.rig.wait("the delivery's record", || {
+        test.tail(cursor)
+            .iter()
+            .any(|e| e["kind"] == "msg.delivered")
+    });
+    // One prompt since the clear began, in the new session: the clear
+    // command was not a prompt, and the reference was not joined to it.
+    let journal = test.rig.journal(pane);
+    let since: Vec<_> = journal
+        .iter()
+        .filter(|e| e["event_sequence"].as_u64().unwrap() > after)
+        .collect();
+    let prompts: Vec<_> = since
+        .iter()
+        .filter(|e| matches!(e["kind"].as_str(), Some("accepted" | "rejected" | "queued")))
+        .collect();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let inputs: Vec<_> = since.iter().filter(|e| e["event"] == "input").collect();
+    assert_eq!(inputs.len(), 1, "{inputs:?}");
+    assert_eq!(inputs[0]["data"]["session_id"], new.as_str());
+    assert_eq!(inputs[0]["data"]["payload"]["text"], reference.as_str());
+
+    // The record: the message was sent during the clear and attempted only
+    // after the agent was bound to its new session; one attempt, delivered.
+    let events = test.tail(cursor);
+    let seq = |kind: &str| {
+        let found: Vec<_> = events.iter().filter(|e| e["kind"] == kind).collect();
+        assert_eq!(found.len(), 1, "{kind}: {events:?}");
+        found[0]["seq"].as_u64().unwrap()
+    };
+    let order = [
+        seq("agent.clear_requested"),
+        seq("msg.sent"),
+        seq("agent.session_bound"),
+        seq("msg.delivery_attempted"),
+        seq("msg.delivered"),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{events:?}");
+    let delivered = events
+        .iter()
+        .find(|e| e["kind"] == "msg.delivered")
+        .unwrap();
+    assert_eq!(
+        delivered["body"],
+        json!({
+            "message_id": message,
+            "session_id": new,
+            "confirmation": "prompt_submit_exact_reference",
+        })
+    );
+    let agent = test.agent(id);
+    assert_eq!(agent["session_id"], new.as_str(), "{agent}");
+    test.rig.close();
+}
+
+/// The `atm` binary itself, against the same daemon: `atm agent up`, `list`,
+/// `clear` and `down` take the caller's pane and server from the environment
+/// tmux gives a pane (`TMUX_PANE`, `TMUX`), and print the daemon's answer.
+#[test]
+fn atm_cli_starts_clears_and_takes_down_an_agent() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start(mode);
+    let config = support::started_config(mode);
+    test.role("lead", mode, "");
+    let log = test.next_stand_in("lead", &config);
+    let placement = test.placement(&config);
+    let atm = |args: &[&str]| {
+        let mut command = test
+            .rig
+            .command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
+        command
+            .args(args)
+            .env("TMUX", test.rig.tmux_env())
+            .env("TMUX_PANE", &placement);
+        command
+    };
+    let json_of = |output: std::process::Output| -> serde_json::Value {
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let project = test.project.to_str().unwrap().to_owned();
+
+    let up = json_of(test.rig.run(&mut atm(&[
+        "agent",
+        "up",
+        "lead",
+        "--project-root",
+        &project,
+        "--format",
+        "json",
+    ])));
+    assert_eq!(up["agent_id"], "project/lead", "{up}");
+    assert_eq!(up["state"], "ready", "{up}");
+    let pane = test
+        .rig
+        .observe_pane(up["pane"].as_str().unwrap().to_owned(), mode, log);
+    assert_eq!(test.tag(&pane.pane_id), "project/lead");
+    let listed = json_of(test.rig.run(&mut atm(&[
+        "agent",
+        "list",
+        "--project-root",
+        &project,
+        "--format",
+        "json",
+    ])));
+    assert_eq!(listed[0]["agent_id"], "project/lead", "{listed}");
+    assert_eq!(listed[0]["state"], "ready", "{listed}");
+    assert_eq!(listed[0]["pane"], pane.pane_id);
+
+    // The clear waits for the stand-in's clock, so the command runs while
+    // the test moves it.
+    let old = test.complete_fixture_turn(&pane);
+    let after = test.rig.event_cursor(&pane);
+    let clear = atm(&["agent", "clear", "project/lead", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    test.rig.wait_event(&pane, after, |e| {
+        e["kind"] == "rendered" && e["state"] == "clearing"
+    });
+    let now = test.rig.control(&pane, json!({"command":"barrier"}))["now_ms"]
+        .as_u64()
+        .unwrap();
+    let reply = test.rig.control(
+        &pane,
+        json!({"command":"advance_to", "now_ms": now + config.clear_gap_ms}),
+    );
+    assert!(reply["error"].is_null(), "{reply}");
+    let cleared = json_of(clear.wait_with_output().unwrap());
+    let row = test.rig.wait_for_row(&pane, |r| {
+        !r.id.is_pending() && r.id != old.id && r.status == SessionStatus::Idle
+    });
+    assert_eq!(
+        cleared,
+        json!({"agent_id": "project/lead", "session_id": row.id.as_str()})
+    );
+
+    let down = json_of(test.rig.run(&mut atm(&[
+        "agent",
+        "down",
+        "project/lead",
+        "--kill",
+        "--format",
+        "json",
+    ])));
+    assert_eq!(down, json!({"agent_id": "project/lead"}));
+    stand_in::process::wait_exit(pane.pid, std::time::Duration::from_secs(30)).unwrap();
+    let panes = checked(test.rig.tmux(&["list-panes", "-a", "-F", "#{pane_id}"]));
+    assert!(!panes.lines().any(|p| p == pane.pane_id), "{panes}");
+    let agent = test.agent("project/lead");
+    assert_eq!(agent["state"], "down", "{agent}");
+    test.rig.close();
+}
+
+/// A delivery policy whose waits are as short as the policy allows: the
+/// tests wait on events, and the defaults (ten seconds of idle) would only
+/// make them long.
+const DELIVERY: &str = "[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\nstable_empty_input = { secs = 0, nanos = 1000000 }\n";
 
 /// An already-admitted real delivery finishes before clear starts; later
 /// delivery waits for readiness. The in-process coalesced-reservation callback

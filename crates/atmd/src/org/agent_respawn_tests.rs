@@ -15,8 +15,13 @@ impl Starting {
 
     /// The agent started and Ready on `%1`, every observation of it done.
     /// (harness, its ready editor, the command tmux shows for it)
-    async fn ready((harness, ready, command): (Harness, &str, &str)) -> Self {
-        let mut starting = Self::new(harness).await;
+    async fn ready(harness: (Harness, &str, &str)) -> Self {
+        Self::ready_on(Rig::new().await, harness).await
+    }
+
+    /// As [`Self::ready`], on `rig`.
+    async fn ready_on(rig: Rig, (harness, ready, command): (Harness, &str, &str)) -> Self {
+        let mut starting = Self::with_role(rig, harness, "").await;
         starting.script_launch();
         starting.frame(Self::screen(ready, command));
         if harness == Harness::Codex {
@@ -320,6 +325,46 @@ async fn respawn_of_a_pane_that_is_not_the_agents_any_more_refuses() {
     );
     assert_eq!(starting.effects(), Vec::<String>::new());
     assert_eq!(starting.rig.org.status().unwrap(), before);
+    assert_eq!(starting.unread_all(), 0);
+    assert!(!quarantined(&starting.rig, "q/lead").await);
+}
+
+#[tokio::test]
+async fn respawn_kill_done_and_down_not_recorded_quarantines() {
+    // The old pane is killed, and the Down that says so can't be written.
+    // The agent is still recorded Ready on a pane that is gone: the record
+    // and the pane disagree, so the cleanup fails and the reservation is
+    // quarantined, not released. Nothing is split or typed, and the agent is
+    // not marked Stuck: the start's own cleanup is not reached, and its
+    // owner gets no note. Twins: respawn_kills_then_ups_in_one_reservation
+    // (the Down is recorded), and
+    // respawn_of_a_pane_that_is_not_the_agents_any_more_refuses (the same
+    // reads with another tag: nothing killed, nothing quarantined).
+    let rig = Rig::gated_with_failure(None, Some("agent.down")).await;
+    let mut starting = Starting::ready_on(rig, CODEX).await;
+    let mut committed = starting.rig.org.committed.subscribe();
+    starting.inspect("%0", None);
+    starting.inspect("%1", Some("q/lead"));
+    starting
+        .rig
+        .client
+        .script_tag_check(&Starting::inspection("%1", Some("q/lead"), "zsh"))
+        .unwrap();
+    starting.rig.client.script_inspect(&pane("%1"), None).unwrap();
+    let result = starting.respawn().await;
+    assert!(
+        matches!(result, Err(AgentError::Organisation(_))),
+        "{result:?}"
+    );
+    assert_eq!(starting.effects(), ["kill %1"]);
+    assert_eq!(committed_kinds(&mut committed), ["control.killed"]);
+    let agent = starting.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.pane.as_deref(), Some("%1"));
+    assert_eq!(agent.reason, None);
+    let state = starting.rig.org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 0, "nobody is told by a note");
+    assert!(quarantined(&starting.rig, "q/lead").await);
     assert_eq!(starting.unread_all(), 0);
 }
 

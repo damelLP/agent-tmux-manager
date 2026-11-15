@@ -1,12 +1,6 @@
 //! One-shot confirmed-message commands. Bodies stay in the durable inbox.
 use anyhow::{bail, Context, Result};
-use atmd::{
-    control::reservation::PaneId,
-    org::{
-        agents::{AgentListEntry, AgentStatus, ListParams, ListResult},
-        messages::*,
-    },
-};
+use atmd::org::messages::*;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
@@ -19,8 +13,6 @@ use std::{
 const MESSAGE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 // 60 s router + 10 s startup/transport margin = 70 s (retry/give-up).
 const MESSAGE_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(70);
-// 10 s agent.list router + 10 s startup/transport margin = 20 s.
-const AGENT_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum MessageFormat {
@@ -84,7 +76,7 @@ pub struct InboxArgs {
     format: MessageFormat,
 }
 
-async fn request<P: Serialize, R: DeserializeOwned>(
+pub(super) async fn request<P: Serialize, R: DeserializeOwned>(
     method: &str,
     params: P,
     budget: Duration,
@@ -104,65 +96,6 @@ pub(super) async fn inbox_request(params: InboxParams) -> Result<InboxResult> {
     request("msg.inbox", params, MESSAGE_RPC_TIMEOUT)
         .await
         .map(|(result, _)| result)
-}
-
-async fn list(root: Option<PathBuf>) -> Result<ListResult> {
-    request(
-        "agent.list",
-        ListParams { project_root: root },
-        AGENT_LIST_TIMEOUT,
-    )
-    .await
-    .map(|(result, _)| result)
-}
-fn unique_name(rows: &[AgentListEntry], name: &str) -> Result<Address> {
-    let mut matches = rows.iter().filter(|row| row.agent_id.name == name);
-    let first = matches
-        .next()
-        .with_context(|| format!("agent {name} was not found in the selected project"))?;
-    if matches.next().is_some() {
-        bail!("agent name {name} is ambiguous; use project/name");
-    }
-    Ok(Address::Agent(first.agent_id.clone()))
-}
-async fn recipient(to: &str, root: Option<PathBuf>) -> Result<Address> {
-    if to == "owner" || to == "system" || to.contains('/') {
-        let address: Address = to.parse()?;
-        if address == Address::System {
-            bail!("system is not a message recipient");
-        }
-        return Ok(address);
-    }
-    // Reuse the domain's name validation rather than maintaining a second grammar.
-    AgentId::new("validation".parse()?, to)?;
-    let pane = super::spawn::non_empty_env("TMUX_PANE")
-        .map(PaneId::parse)
-        .transpose()?;
-    if root.is_none() {
-        if let Some(pane) = pane {
-            let rows = list(None).await?;
-            let mut bindings = rows.iter().filter(|row| {
-                row.state != AgentStatus::Down && row.pane.as_deref() == Some(pane.as_str())
-            });
-            if let Some(caller) = bindings.next() {
-                if bindings.next().is_some() {
-                    bail!("caller pane has ambiguous agent bindings");
-                }
-                let project = caller.agent_id.project.clone();
-                let selected: Vec<_> = rows
-                    .into_iter()
-                    .filter(|row| row.agent_id.project == project)
-                    .collect();
-                return unique_name(&selected, to);
-            }
-        }
-    }
-    let root = match root {
-        Some(root) if root.is_absolute() => root,
-        Some(root) => std::env::current_dir()?.join(root),
-        None => std::env::current_dir()?,
-    };
-    unique_name(&list(Some(root)).await?, to)
 }
 
 fn escaped(text: &str, multiline: bool) -> String {
@@ -220,7 +153,10 @@ pub async fn cmd_msg(action: MsgAction) -> Result<()> {
         } => {
             let kind = serde_json::from_value(serde_json::Value::String(kind))
                 .context("invalid message kind")?;
-            let to = recipient(&to, project_root).await?;
+            let to = super::agent_target::address(&to, project_root).await?;
+            if to == Address::System {
+                bail!("system is not a message recipient");
+            }
             let owner = to == Address::Owner;
             let (result, raw): (SendResult, _) = request(
                 "msg.send",
@@ -417,6 +353,6 @@ mod tests {
     fn cli_budgets_exceed_method_router_budgets() {
         assert!(MESSAGE_RPC_TIMEOUT > Duration::from_secs(10));
         assert!(MESSAGE_RESOLUTION_TIMEOUT > Duration::from_secs(60));
-        assert!(AGENT_LIST_TIMEOUT > Duration::from_secs(10));
+        assert!(super::super::agent_target::AGENT_LIST_TIMEOUT > Duration::from_secs(10));
     }
 }

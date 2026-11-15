@@ -41,6 +41,7 @@ use atm_tui::setup;
 use atm_tui::tmux;
 
 mod agent;
+mod agent_target;
 mod cli;
 mod msg;
 pub mod rpc;

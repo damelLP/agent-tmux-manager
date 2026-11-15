@@ -341,6 +341,39 @@ fn facts_read_real_idle_claude_editors_as_the_control_read_does() {
     }
 }
 
+/// Claude Code with its native cursor: a suggestion row is faint throughout.
+const CLAUDE_NATIVE_SUGGESTIONS: [&str; 2] = [
+    include_str!(
+        "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_native-fresh-placeholder_2.1.325.txt"
+    ),
+    include_str!(
+        "../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_native-suggestion-after-turn_2.1.325.txt"
+    ),
+];
+
+#[test]
+fn facts_read_real_claude_suggestion_rows_as_an_empty_idle_editor() {
+    let screen = agent_screen(Harness::ClaudeCode).unwrap();
+    let baseline = pinned("claude");
+    for fixture in CLAUDE_NATIVE_SUGGESTIONS {
+        let frame = capture(fixture, CaptureFormat::Ansi, Some(ROOT), Some("claude"));
+        let facts = screen.facts(&frame, &baseline);
+        assert_eq!(facts, screen.control(&frame, &baseline).facts);
+        assert_eq!(facts.input, InputState::Empty);
+        assert_eq!(facts.turn, TurnState::NotRunning);
+        assert_eq!(facts.dialog, DialogState::None);
+        assert_eq!(
+            screen.control(&frame, &baseline).dialog,
+            ControlDialog::None
+        );
+        // A suggestion is not a staged line, whatever it says.
+        assert_eq!(
+            screen.staged(&frame, &baseline, "read the attached note.txt"),
+            None
+        );
+    }
+}
+
 #[test]
 fn staged_is_none_unless_harness_is_foreground() {
     for (harness, name, _, draft, text, _) in CASES {

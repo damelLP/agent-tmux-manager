@@ -123,6 +123,42 @@ in the control observer. The manual queued staged check remains None. The queued
 frame's captured editor row is also transplanted into supported auto chrome in
 a labelled Synthetic test. A match alone never proves what Enter will do.
 
+## Native-cursor fixtures (stage 1)
+
+`screen_styled_s1_native-<state>_2.1.325.txt`. Bytes are unchanged; the first
+line is provenance, removed only at test load. The folder in them was a
+temporary directory.
+
+Captured: Claude Code 2.1.325, 2026-11-15, rehearsal on a candidate, tmux
+capture-pane -p -e -N (tmux 3.8, 149x35, fullscreen renderer, real session):
+
+| State | Input row | Input | Turn | Fresh |
+|---|---|---|---|---|
+| `fresh-placeholder` | faint `Try "…"`, no inverse cell | Empty | NotRunning | Present |
+| `suggestion-after-turn` | faint free-text suggestion after a finished turn | Empty | NotRunning | Unknown |
+
+Captured: Claude Code 2.1.325, 2026-11-15, sealed private tmux with nothing
+submitted, tmux capture-pane -p -e -N (tmux 3.8, 120x40, fullscreen renderer,
+status line silenced for the launch):
+
+| State | Input row | Input | Turn | Fresh |
+|---|---|---|---|---|
+| `typed-first-letter` | `T`, the placeholder's first letter, typed; the rest of the placeholder is gone | Draft | NotRunning | Unknown |
+| `typed-abc` | `abc` typed | Draft | NotRunning | Unknown |
+| `same-text-draft-home` | the placeholder's own text typed, cursor moved to its start | Draft | NotRunning | Unknown |
+
+In all five tmux reported a visible cursor (`cursor_flag=1`): Claude shows the
+terminal's cursor and draws no inverse cell. The same sealed check found the
+placeholder row unchanged with no tmux client, with a focused one, after a
+terminal focus-out and focus-in, with the classic renderer, and without the
+launching shell's `CLAUDE*` variables. The U5b and P1 captures above came from
+offline clean configurations, where Claude draws its own inverse cursor.
+
+Not captured, and so not read as Empty: a suggestion after a turn under the
+drawn cursor (Unknown), and a suggestion that wraps to a second row (Draft).
+A status-line row between the editor and the footer also remains Unknown.
+Synthetic mutations are labelled in `tests/styled_screen.rs`.
+
 The original text fixtures are the 15 distinct frames among 48 raw U5 Claude
 screens (40 rows, 120 columns). The additional coordinator and U5b frames are
 described below; there are 65 Claude screen fixture files in total. Existing JSON/JSONL hook fixtures retain the

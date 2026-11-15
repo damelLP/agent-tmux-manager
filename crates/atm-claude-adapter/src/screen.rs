@@ -29,6 +29,21 @@
 //! a sealed 2.1.325 probe confirmed `/clear   ` executes clear, not a prompt.
 //! The queued-message placeholder uses the same inverse-first-cell/faint-rest
 //! evidence as suggestions; other faint text is not a typed draft.
+//!
+//! Captured: Claude Code 2.1.325, 2026-11-15, rehearsal on a candidate and a sealed
+//! private tmux with nothing submitted, tmux 3.8 `capture-pane -p -e -N`.
+//! With its native cursor Claude shows the terminal's own cursor and draws no
+//! inverse cell, with or without a focused tmux client. The 2.1.325 binary turns
+//! it on for `CLAUDE_CODE_NATIVE_CURSOR`, `CLAUDE_CODE_ACCESSIBILITY` or the
+//! account's `tengu_native_cursor` flag (read, not captured both ways); the
+//! offline captures above had it off. A suggestion row is then faint in every
+//! non-space cell: the startup `Try "…"`, and the free-text suggestion Claude
+//! shows after a turn. Such a single row is Empty whatever its text. Typed text
+//! was never faint, including the placeholder's own text and its first letter,
+//! and typing removed the suggestion, so a row with a plain or inverse cell
+//! beside faint ones stays Unknown. Not captured: a suggestion after a turn under
+//! the drawn cursor (stays Unknown), and one that wraps to a second row (Draft).
+//!
 //! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
 //! Legacy facts stay Unknown; the staged matcher accepts only the complete
 //! captured completion layout with both editor and selected command exact.
@@ -257,7 +272,21 @@ fn editor_facts(
     // trailing spaces and cannot distinguish a spaces-only draft from empty.
     let input = if !continuation.is_empty() {
         InputState::Draft
-    } else if input.is_empty() {
+    } else if input.is_empty()
+        || styled.zip(offset).is_some_and(|(screen, offset)| {
+            // Native cursor: nothing is drawn inverse, and a suggestion, whatever
+            // its text, is faint in every cell. Typed text is never faint.
+            let mut cells = input
+                .char_indices()
+                .filter(|(_, c)| !c.is_whitespace())
+                .peekable();
+            cells.peek().is_some()
+                && cells.all(|(i, _)| {
+                    screen.faint_at(offset + i) == Some(true)
+                        && screen.inverse_at(offset + i) == Some(false)
+                })
+        })
+    {
         InputState::Empty
     } else if (input.starts_with("Try \"") && input.ends_with('"'))
         || (styled.is_some() && input == "Press up to edit queued messages")

@@ -363,3 +363,24 @@ fn synthetic_headers_and_footer_damage_do_not_manufacture_freshness() {
         ControlDialog::Unknown
     );
 }
+
+#[test]
+fn captured_native_cursor_suggestion_after_a_turn_allows_a_clear() {
+    // What `agent clear` needs: no dialog, an empty idle editor, a conversation.
+    let after_turn =
+        include_str!("fixtures/screen_styled_s1_native-suggestion-after-turn_2.1.325.txt");
+    let screen = observe(after_turn);
+    assert_eq!(screen.dialog, ControlDialog::None);
+    assert!(screen.conversation);
+    assert_eq!(screen.facts.input, InputState::Empty);
+    assert_eq!(screen.facts.turn, TurnState::NotRunning);
+    assert_eq!(screen.facts.fresh_editor, FreshEditorEvidence::Unknown);
+    // A never-used editor with the startup placeholder is fresh, with no conversation.
+    let fresh = include_str!("fixtures/screen_styled_s1_native-fresh-placeholder_2.1.325.txt");
+    let screen = observe(fresh);
+    assert_eq!(screen.dialog, ControlDialog::None);
+    assert!(!screen.conversation);
+    assert_eq!(screen.facts.input, InputState::Empty);
+    assert_eq!(screen.facts.turn, TurnState::NotRunning);
+    assert_eq!(screen.facts.fresh_editor, FreshEditorEvidence::Present);
+}

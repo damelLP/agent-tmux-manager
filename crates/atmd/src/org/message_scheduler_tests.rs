@@ -1276,6 +1276,48 @@ async fn unobserved_notice_is_not_for_a_message_behind_a_held_one() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn non_focus_wait_preserves_observation_loss_for_the_next_message() {
+    let mut rig = ManualJob::new().await;
+    rig.screens.set(worker(), ready("%1", "s1"));
+    rig.job.effects.deliver = Arc::new(|rt, id, _| Box::pin(perform(rt, id, Act::Paste)));
+    let first = rig.send().await;
+    rig.round(0).await;
+    rig.round(10_000).await;
+    let rt = &rig.job.service.rt;
+    let snapshot = rt.history.snapshot(first, rt.clock.now().unwrap()).unwrap();
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+    assert_eq!(snapshot.message.last_attempt.unwrap().attempt, 1);
+
+    rig.screens.lose(&worker());
+    let second = rig.send().await;
+    // The pasted head waits on unknown pane guards, not focus. That wait
+    // must keep the loss for its follower, even just before the hold deadline.
+    for advance_ms in [0, 1, 119_998] {
+        rig.round(advance_ms).await;
+        let head = rig.job.service.board.progress(first);
+        assert_eq!(head.phase, Some(DeliveryPhase::Waiting));
+        assert_eq!(head.reason.as_deref(), Some("pane guards are unknown"));
+        let inbox = guarded(rig.messages.inbox(
+            InboxParams {
+                recipient: Some(Address::Agent(worker())),
+                id: Some(second),
+                ..page()
+            },
+            owner(),
+        ))
+        .await
+        .unwrap();
+        let entry = inbox.messages.first().unwrap();
+        assert_eq!(entry.status, DeliveryStatus::Queued);
+        assert_eq!(entry.delivery.phase, DeliveryPhase::Waiting);
+        assert_eq!(entry.delivery.reason.as_deref(), Some(UNOBSERVED_REASON));
+        assert_eq!(entry.delivery.blocked_by, Some(first));
+        assert_eq!(entry.delivery.attempt, 0);
+        assert!(rig.notes().await.is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_agent_without_a_pane_ends_the_loss() {
     let bench = Bench::blind().await;
     let id = bench.send(worker(), "brief").await;
@@ -1397,6 +1439,40 @@ async fn pane_observations_are_throttled_across_frequent_job_wakes() {
         assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
         assert!(snapshot.message.last_attempt.is_none());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_pane_observations_are_throttled_across_frequent_job_wakes() {
+    let mut rig = ManualJob::new().await;
+    rig.screens.lose(&worker());
+    let id = rig.send().await;
+    for (advance_ms, captures) in [
+        (0, 1),
+        (0, 1),
+        (1, 1),
+        (248, 1),
+        (0, 1),
+        (1, 2),
+        (0, 2),
+        (249, 2),
+        (1, 3),
+    ] {
+        tokio::time::advance(Duration::from_millis(advance_ms)).await;
+        // Failed captures are paced too: keep observed across rounds so an
+        // unrelated wake cannot retry the observer inside the guard poll.
+        let mut queued = rig.job.service.board.queued.subscribe();
+        guarded(rig.job.round(&mut queued)).await.unwrap();
+        assert_eq!(rig.screens.calls(&worker()), captures);
+        let rt = &rig.job.service.rt;
+        let snapshot = rt.history.snapshot(id, rt.clock.now().unwrap()).unwrap();
+        assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+        assert!(snapshot.message.last_attempt.is_none());
+        assert_eq!(
+            rig.job.service.board.progress(id).reason.as_deref(),
+            Some(UNOBSERVED_REASON)
+        );
+    }
+    assert!(rig.notes().await.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

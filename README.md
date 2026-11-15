@@ -240,7 +240,7 @@ enabled = true    # false turns reminders off
 delay_secs = 60   # idle time after the turn's end before the note
 ```
 
-`atmd` reads `[reminder]` when it starts. An unknown key or `delay_secs = 0` turns reminders off and logs the reason.
+`atmd` reads `[reminder]` when it starts. An unknown key or `delay_secs = 0` turns reminders off and logs the reason. They are also off while `[delivery]` is invalid: nothing could type the note.
 
 Limits:
 

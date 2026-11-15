@@ -860,3 +860,139 @@ async fn adopt_without_any_session_row_tags_and_stays_starting() {
     assert_eq!(agent.session_id, None);
     adoption.followed().await;
 }
+
+// Captured: codex-cli 0.167.0 (P1): a turn running.
+const CODEX_WORKING: &str = include_str!(
+    "../../../atm-codex-adapter/tests/fixtures/screen_styled_p1_c07-working-held-100x24_0.167.0.txt"
+);
+
+/// Script the reads of an adopt of the pane the agent is already tagged on.
+fn script_readopt(adoption: &Adoption, text: &str, command: &str) {
+    adoption
+        .rig
+        .client
+        .script_inspect(
+            &pane("%1"),
+            Some(&Adoption::inspection(Some("q/lead"), command, "")),
+        )
+        .unwrap();
+    adoption.script_capture(text, command);
+    adoption.script_capture(text, command);
+}
+
+#[tokio::test]
+async fn readopt_keeps_a_binding_whose_row_is_only_a_discovery_row() {
+    // Review 19, probe r02. A Ready agent bound to s1; its registry row is
+    // only the discovery row, as every row is after a daemon restart until
+    // the harness's next event. Adopting it again on its idle pane must not
+    // drop the binding, and writes nothing.
+    let mut adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    adoption.followed().await;
+    let tagged = Adoption::inspection(Some("q/lead"), "pi", "");
+    // The real row goes, the discovery row comes; each wakes one observation.
+    adoption.rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
+    adoption.rig.registry.remove(SessionId::new("s1")).await.unwrap();
+    progress(&mut adoption.events, "finished", Some("q/lead")).await;
+    adoption.rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
+    adoption
+        .rig
+        .row_of("pending-100", "%1", false, Harness::Pi)
+        .await;
+    progress(&mut adoption.events, "finished", Some("q/lead")).await;
+    let recorded = adoption.agent().await.unwrap();
+    assert_eq!(recorded.status, AgentStatus::Ready);
+    assert_eq!(recorded.session_id, Some(SessionId::new("s1")));
+
+    let mut committed = adoption.rig.org.committed.subscribe();
+    let before = adoption.rig.org.status().unwrap();
+    script_readopt(&adoption, PI_PADDED, "pi");
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
+
+    // The same agent suspended with its binding (Starting, as a restart check
+    // leaves it on a busy screen): the adopt reports the editor and keeps s1.
+    adoption
+        .rig
+        .command(OrgCommand::Revalidate {
+            agent_id: adoptee(),
+        })
+        .await;
+    assert_eq!(adoption.agent().await.unwrap().status, AgentStatus::Starting);
+    committed_kinds(&mut committed);
+    script_readopt(&adoption, PI_PADDED, "pi");
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(committed_kinds(&mut committed), ["agent.editor_ready"]);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+}
+
+#[tokio::test]
+async fn readopt_of_a_ready_agent_without_a_session_writes_nothing() {
+    // Review 19, probe r03. A Codex agent is Ready without a session until
+    // its first prompt. Adopting it again on the same fresh editor is no
+    // change at all.
+    let mut adoption = Adoption::new().await;
+    adoption
+        .rig
+        .row_of("pending-100", "%1", false, Harness::Codex)
+        .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture(CODEX_PADDED, "codex");
+    adoption.script_capture(CODEX_PADDED, "codex");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    adoption.followed().await;
+    let recorded = adoption.agent().await.unwrap();
+    assert_eq!(recorded.status, AgentStatus::Ready);
+    assert_eq!(recorded.session_id, None);
+
+    let mut committed = adoption.rig.org.committed.subscribe();
+    let before = adoption.rig.org.status().unwrap();
+    script_readopt(&adoption, CODEX_PADDED, "codex");
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
+}
+
+#[tokio::test]
+async fn readopt_of_a_starting_agent_on_a_safe_screen_only_reports_the_editor() {
+    // Adopted on a busy screen: Starting. Adopted again on its idle pane with
+    // no session to bind: Ready through EditorReady alone, the observer's
+    // revalidation rule. No second Adopt is recorded.
+    let mut adoption = Adoption::new().await;
+    adoption
+        .rig
+        .row_of("pending-100", "%1", false, Harness::Codex)
+        .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption.script_tagging();
+    adoption.script_capture(CODEX_WORKING, "codex");
+    adoption.script_capture(CODEX_WORKING, "codex");
+    adoption.script_follow_up(Some((CODEX_WORKING, "codex")));
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Starting);
+    adoption.followed().await;
+    assert_eq!(adoption.agent().await.unwrap().status, AgentStatus::Starting);
+
+    let mut committed = adoption.rig.org.committed.subscribe();
+    script_readopt(&adoption, CODEX_PADDED, "codex");
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(committed_kinds(&mut committed), ["agent.editor_ready"]);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, None);
+}

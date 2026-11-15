@@ -188,6 +188,21 @@ mod tests {
         let agent = || "project/lead".parse().unwrap();
         for (error, code, message) in [
             (
+                R::PaneInputRefused { pane: pane(), reason: "copy mode" },
+                "refused",
+                "pane %7 refuses input: copy mode; nothing was sent",
+            ),
+            (
+                R::UnsafePaste { pane: pane() },
+                "refused",
+                "paste text for pane %7 contains unsafe control bytes; nothing was sent",
+            ),
+            (
+                R::PacingRefused { pane: pane() },
+                "unavailable",
+                "capture pacing refused pane %7; nothing was sent",
+            ),
+            (
                 R::ScreenChanged { pane: pane() },
                 "refused",
                 "Refusing input to %7: screen changed or is no longer safe; nothing was sent by this action",

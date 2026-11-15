@@ -233,6 +233,16 @@ impl AgentScreen {
         Some((command.clone(), (self.control)(input, None)))
     }
 
+    /// Whether this harness's adapter recognises the capture as one of its
+    /// screens, whatever is recorded as the pane's foreground program. A flow
+    /// about to type into a shell requires that it does not.
+    #[must_use]
+    pub fn recognises(&self, capture: &PaneCapture) -> bool {
+        self.input(capture).is_some_and(|input| {
+            (self.control)(input, None).dialog != atm_core::harness_control::ControlDialog::Unknown
+        })
+    }
+
     /// Whether a complete hook review list is exactly atm's own. False for a
     /// harness without such a list.
     #[must_use]

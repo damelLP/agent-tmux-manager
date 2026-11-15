@@ -4,8 +4,13 @@
 //! transcript blocks, all singly indented and free of warnings/notices/queued
 //! output. Captured: pi 1.5.0, 2026-11-14, sealed P3/P5 private-tmux captures:
 //! download status alone is not history. A single block or unsupported startup
-//! before real history can remain false; false is not freshness. Arbitrary custom
-//! UI imitating transcript blocks is unverified. Scrolled captures additionally
+//! before real history can remain false; false is not freshness. While the startup
+//! banner is visible, any block with a deeper-indented line (list item or code),
+//! notice (`✓ ...`) or queued input (`↳ ...`) also makes real history read false:
+//! every block must be valid. Once the banner scrolls off, invalid blocks are
+//! ignored, so the same history can read true if at least two valid blocks remain
+//! and the usage footer is nonzero. A false-to-true change is not a new turn.
+//! Arbitrary custom UI imitating transcript blocks is unverified. Scrolled captures
 //! require a nonzero-usage footer; usage alone never proves conversation.
 use super::*;
 use atm_core::harness_control::{

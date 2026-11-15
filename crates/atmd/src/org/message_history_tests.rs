@@ -60,8 +60,11 @@ struct Fixture {
 }
 impl Fixture {
     fn new(high_water: u64) -> Self {
+        Self::recovered(high_water, 0)
+    }
+    fn recovered(high_water: u64, recovery_ms: i64) -> Self {
         let mut f = Self {
-            history: MessageHistory::new(high_water, at(0), DeliveryPolicy::default()),
+            history: MessageHistory::new(high_water, at(recovery_ms), DeliveryPolicy::default()),
             seq: 0,
             id: MessageId::new(3),
         };
@@ -227,6 +230,62 @@ fn running_revalidation_does_not_spend_not_ready_budget() {
 }
 
 #[test]
+fn replayed_starting_unknown_gets_one_not_ready_window_from_recovery() {
+    assert_replayed_not_ready_window(TurnState::Unknown, InputState::Unknown);
+}
+
+#[test]
+fn replayed_starting_turn_ended_with_draft_gets_not_ready_window_from_recovery() {
+    assert_replayed_not_ready_window(TurnState::NotRunning, InputState::Draft);
+}
+
+fn assert_replayed_not_ready_window(turn: TurnState, input: InputState) {
+    // Replay holds only transitions: Running since 00:06 was not logged.
+    // Starting began at 00:05; recovery is 19:59, first sample 20:00.
+    let mut f = Fixture::recovered(4, 1_199_000);
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        5_000,
+    );
+    let mut obs = observation(SessionStatus::Working);
+    obs.facts.turn = turn;
+    obs.facts.input = input;
+    f.observe(obs.clone(), 1_200_000);
+    wait(f.consume(1_200_000), WaitReason::AgentNotReady);
+    assert_eq!(
+        f.snapshot(1_200_000).live.agent_not_ready_since,
+        Some(at(1_199_000))
+    );
+    f.observe(obs.clone(), 1_250_000);
+    wait(f.consume(1_318_999), WaitReason::AgentNotReady);
+    blocked(f.consume(1_319_000), FailureReason::AgentNotReadyTimeout);
+    f.observe(obs, 1_400_000);
+    assert_eq!(
+        f.snapshot(1_400_000).live.agent_not_ready_since,
+        Some(at(1_199_000))
+    );
+    blocked(f.step(1_400_000), FailureReason::AgentNotReadyTimeout);
+}
+
+#[test]
+fn not_ready_transition_after_recovery_keeps_its_later_start() {
+    let mut f = Fixture::recovered(3, 1_199_000);
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        1_250_000,
+    );
+    let mut obs = observation(SessionStatus::Working);
+    obs.facts.turn = TurnState::Unknown;
+    f.observe(obs, 1_260_000);
+    assert_eq!(
+        f.snapshot(1_260_000).live.agent_not_ready_since,
+        Some(at(1_250_000))
+    );
+    wait(f.step(1_369_999), WaitReason::AgentNotReady);
+    blocked(f.step(1_370_000), FailureReason::AgentNotReadyTimeout);
+}
+
+#[test]
 fn non_running_observation_starts_one_fresh_not_ready_window() {
     for turn in [TurnState::NotRunning, TurnState::Unknown] {
         let mut f = Fixture::new(0);
@@ -273,6 +332,39 @@ fn lost_running_evidence_starts_clock_once_but_keeps_focus_precedence() {
     assert_eq!(live.running_turn_since, Some(at(2_100_000)));
     assert_eq!(live.agent_not_ready_since, None);
     wait(f.step(2_200_000), WaitReason::SessionBusy);
+}
+
+#[test]
+fn session_lost_while_starting_and_running_starts_not_ready_clock_at_event() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Working);
+    obs.facts.turn = TurnState::Running;
+    f.observe(obs.clone(), 0);
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        5_000,
+    );
+    assert_eq!(
+        f.snapshot(5_000).live.agent_status,
+        atm_org::AgentStatus::Starting
+    );
+    assert_eq!(f.snapshot(5_000).live.agent_not_ready_since, None);
+    f.apply(OrgEvent::AgentSessionLost { agent_id: agent() }, 600_000);
+    let live = f.snapshot(600_000).live;
+    assert_eq!(live.agent_status, atm_org::AgentStatus::Starting);
+    assert_eq!(live.running_turn_since, None);
+    assert_eq!(live.agent_not_ready_since, Some(at(600_000)));
+    // Recover known-unfocused observations without resurrecting the old turn.
+    obs.session = None;
+    obs.facts.turn = TurnState::Unknown;
+    f.observe(obs.clone(), 600_001);
+    f.observe(obs, 700_000);
+    assert_eq!(
+        f.snapshot(700_000).live.agent_not_ready_since,
+        Some(at(600_000))
+    );
+    wait(f.step(719_999), WaitReason::AgentNotReady);
+    blocked(f.step(720_000), FailureReason::AgentNotReadyTimeout);
 }
 
 #[test]

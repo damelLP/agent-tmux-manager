@@ -8,6 +8,10 @@
 //! Time is paused and only in-memory I/O runs under it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// The scheduler's production observer, tested on this file's rig.
+#[path = "message_observer_tests.rs"]
+mod observer;
+
 use super::*;
 use crate::{
     control::{
@@ -804,6 +808,7 @@ impl Rig {
                 control.clone(),
                 cancel.child_token(),
                 Arc::new(|_| Box::pin(async { None })),
+                Arc::new(|_| None),
             );
             guarded(agents.reconciled()).await.unwrap();
             assert_eq!(tmux.pending_reads(&pane()).unwrap(), 0);

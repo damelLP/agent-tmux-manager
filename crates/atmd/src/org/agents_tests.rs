@@ -49,6 +49,12 @@ mod reconciliation {
         cancel: CancellationToken,
         /// What the scripted procfs reader answers for any process; none by default.
         proc: std::sync::Arc<std::sync::Mutex<Option<super::super::agent_flow::ProcFacts>>>,
+        /// Answers the reader gives first, one per read, before `proc`.
+        proc_script: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<Option<super::super::agent_flow::ProcFacts>>,
+            >,
+        >,
     }
     impl Rig {
         async fn new() -> Self {
@@ -138,6 +144,7 @@ mod reconciliation {
                 control,
                 cancel,
                 proc: Default::default(),
+                proc_script: Default::default(),
             }
         }
         async fn command(&self, command: OrgCommand) {
@@ -244,16 +251,18 @@ mod reconciliation {
                 .unwrap();
         }
         fn start(&self) -> (AgentHandle, tokio::task::JoinHandle<()>) {
-            let proc = self.proc.clone();
+            let (proc, script) = (self.proc.clone(), self.proc_script.clone());
             spawn_agents_with(
                 self.org.clone(),
                 self.registry.clone(),
                 self.control.clone(),
                 self.cancel.child_token(),
                 std::sync::Arc::new(move |_| {
-                    let facts = proc.lock().unwrap().clone();
+                    let scripted = script.lock().unwrap().pop_front();
+                    let facts = scripted.unwrap_or_else(|| proc.lock().unwrap().clone());
                     Box::pin(async move { facts })
                 }),
+                std::sync::Arc::new(|_| None),
             )
         }
         async fn state(&self, name: &str) -> atm_org::Agent {
@@ -1501,6 +1510,11 @@ mod reconciliation {
             "+++\nharness='pi'\n+++\n",
         )
         .unwrap();
+        // The role is read, and the start then finds no pane to split: refused
+        // with nothing recorded.
+        rig.client
+            .script_inspect(&PaneId::parse("%0").unwrap(), None)
+            .unwrap();
         assert!(matches!(
             agents
                 .up(
@@ -1512,9 +1526,7 @@ mod reconciliation {
                     caller(),
                 )
                 .await,
-            Err(AgentError::NotImplemented {
-                operation: "agent.up"
-            })
+            Err(AgentError::Refused(_))
         ));
         assert!(dir.path().join(".atm/project.toml").is_file());
         assert!(agents
@@ -2729,39 +2741,6 @@ mod reconciliation {
         assert_eq!(rig.org.status().unwrap(), cursor);
     }
 
-    #[tokio::test]
-    async fn up_prepares_config_but_no_lifecycle_effects_until_flow_exists() {
-        let rig = Rig::new().await;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".atm/roles")).unwrap();
-        std::fs::write(
-            dir.path().join(".atm/roles/lead.md"),
-            "+++\nharness='pi'\n+++\n",
-        )
-        .unwrap();
-        let (agents, _) = rig.start();
-        agents.reconciled().await.unwrap();
-        let result = agents
-            .up(
-                UpParams {
-                    project_root: dir.path().into(),
-                    name: "lead".into(),
-                    caller_server: None,
-                },
-                caller(),
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(AgentError::NotImplemented {
-                operation: "agent.up"
-            })
-        ));
-        assert!(dir.path().join(".atm/project.toml").is_file());
-        assert!(rig.org.snapshot().await.unwrap().agents().next().is_none());
-        assert!(rig.client.mock().calls().is_empty());
-    }
-
     fn request(
         id: &str,
         pane: Option<&str>,
@@ -3065,6 +3044,7 @@ mod reconciliation {
     mod lifecycle {
         include!("agent_lifecycle_tests.rs");
         include!("agent_clear_tests.rs");
+        include!("agent_up_tests.rs");
     }
 
     #[tokio::test]

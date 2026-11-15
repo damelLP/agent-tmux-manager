@@ -1167,6 +1167,22 @@ fn launch_line_with_typed_prefix_refuses() {
 }
 
 #[test]
+fn launch_line_is_staged_when_the_text_ends_in_a_space() {
+    // A launch text can end in a space (a whitespace-only `ARGS` override).
+    // Synthetic: a capture shows that space only as the cursor's column, with
+    // or without the cell written.
+    let text = "cd '/proj' && ATM_AGENT='p/lead' claude ' ' ";
+    for row in [format!("pb> {text}"), format!("pb> {}", text.trim_end())] {
+        let end = 4 + text.len() as u32;
+        let capture = shell_capture(&[&row, ""], 80, (end, 0), CaptureFormat::Plain);
+        assert!(launch_line_is_staged(&capture, "pb> ", text), "{row:?}");
+        // The twin: the cursor one cell short of the text's end.
+        let capture = shell_capture(&[&row, ""], 80, (end - 1, 0), CaptureFormat::Plain);
+        assert!(!launch_line_is_staged(&capture, "pb> ", text), "{row:?}");
+    }
+}
+
+#[test]
 fn launch_line_with_changed_prompt_refuses() {
     // Synthetic: an asynchronous prompt redraw between the paste and the Enter.
     let text = "cd '/proj' && ATM_AGENT='p/lead' claude";
@@ -1196,25 +1212,88 @@ fn launch_line_with_changed_prompt_refuses() {
 }
 
 #[test]
-fn launch_line_refuses_what_it_cannot_measure() {
-    // Synthetic. A character before the cursor that is not printable ASCII may
-    // be wider than one cell: the cut at the cursor is then unknown.
-    for prompt in ["\u{276f} ", "\u{1f680} ", "caf\u{e9}> "] {
-        let capture = shell_capture(
-            &[prompt, ""],
-            80,
-            (prompt.chars().count() as u32, 0),
-            CaptureFormat::Plain,
-        );
-        assert_eq!(launch_line(&capture), None, "{prompt:?}");
+fn launch_line_measures_prompt_glyphs_by_cells() {
+    // Probe P-B2 (tmux 3.8 and 3.6; bash, zsh, dash): the column tmux reports
+    // for the cursor after each of these prompts. The last is the left prompt
+    // of an installed powerlevel10k. A capture holds one character per glyph,
+    // however many cells it takes.
+    let text = "cd '/proj' && ATM_AGENT='p/lead' claude";
+    for (prompt, column) in [
+        ("\u{276f} ", 2),
+        ("\u{754c} ", 3),
+        ("\u{1f600} ", 3),
+        ("\u{e0b0} ", 2),
+        ("\u{f303} \u{f015} ~ \u{276f} ", 8),
+    ] {
+        let before = shell_capture(&[prompt, ""], 80, (column, 0), CaptureFormat::Plain);
+        assert_eq!(launch_line(&before).as_deref(), Some(prompt), "{prompt:?}");
+        let row = format!("{prompt}{text}");
+        let end = column + text.len() as u32;
+        let after = shell_capture(&[&row, ""], 80, (end, 0), CaptureFormat::Plain);
+        assert!(launch_line_is_staged(&after, prompt, text), "{prompt:?}");
+        // The twin: the same prompt with text typed ahead of the paste.
+        let row = format!("{prompt}x{text}");
+        let after = shell_capture(&[&row, ""], 80, (end + 1, 0), CaptureFormat::Plain);
+        assert!(!launch_line_is_staged(&after, prompt, text), "{prompt:?}");
     }
-    // A row above that may or may not fill the width: unknown, so refuse.
+    // Cells, not characters: three cells are the wide glyph and its space,
+    // and the character after them is at the cursor, not before it.
+    let capture = shell_capture(&["\u{754c} x", ""], 80, (3, 0), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture).as_deref(), Some("\u{754c} "));
+    // Synthetic: a right-hand prompt fills the row. It is after the cursor.
+    let prompt = "\u{f303} \u{f015} ~ \u{276f} ";
+    let row = format!("{prompt}{:>72}", "user@host ");
+    let capture = shell_capture(&[&row, ""], 80, (8, 0), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture).as_deref(), Some(prompt));
+    // A full row of wide glyphs above the cursor's row is a wrapped line.
     let wide = "\u{1f680}".repeat(40);
     let capture = shell_capture(&[&wide, "pb> "], 80, (4, 1), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture), Some(format!("{wide}pb> ")));
+}
+
+#[test]
+fn launch_line_refuses_what_it_cannot_measure() {
+    // Synthetic. tmux's cursor column falls inside a wide character: its
+    // widths and ours disagree about this row, so nothing is read from it.
+    let capture = shell_capture(&["\u{754c} ", ""], 80, (1, 0), CaptureFormat::Plain);
     assert_eq!(launch_line(&capture), None);
-    // The twin: a row above too short to fill the width under any widths.
-    let capture = shell_capture(&["\u{276f} done", "pb> "], 80, (4, 1), CaptureFormat::Plain);
+    // The twin: the column after the character.
+    let capture = shell_capture(&["\u{754c} ", ""], 80, (2, 0), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture).as_deref(), Some("\u{754c}"));
+    // The row holds more cells than the pane is wide: the same disagreement.
+    let wide = "\u{754c}".repeat(41);
+    let capture = shell_capture(&[&wide, ""], 80, (4, 0), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture), None);
+    let wide = "\u{754c}".repeat(40);
+    let capture = shell_capture(&[&wide, ""], 80, (4, 0), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture).as_deref(), Some("\u{754c}\u{754c}"));
+    // A character without a certain width before the cursor: a combining
+    // mark, a joiner, a variation selector, a control character.
+    for prompt in [
+        "cafe\u{301}> ",
+        "a\u{200d}b> ",
+        "\u{2764}\u{fe0f} ",
+        "pb\t> ",
+    ] {
+        let capture = shell_capture(&[prompt, ""], 80, (6, 0), CaptureFormat::Plain);
+        assert_eq!(launch_line(&capture), None, "{prompt:?}");
+        // After the cursor it is not read.
+        let row = format!("pb> {prompt}");
+        let capture = shell_capture(&[&row, ""], 80, (4, 0), CaptureFormat::Plain);
+        assert_eq!(launch_line(&capture).as_deref(), Some("pb> "), "{prompt:?}");
+    }
+    // A row above that may or may not fill the width: unknown, so refuse.
+    // (78 cells for certain, 80 if the mark takes two.)
+    let unsure = format!("{}e\u{301}", "x".repeat(77));
+    let capture = shell_capture(&[&unsure, "pb> "], 80, (4, 1), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture), None);
+    // The twins: a row above too short to fill the width under any widths,
+    // and one that is wider than the pane.
+    let capture = shell_capture(&["e\u{301} done", "pb> "], 80, (4, 1), CaptureFormat::Plain);
     assert_eq!(launch_line(&capture).as_deref(), Some("pb> "));
+    let wide = "\u{754c}".repeat(41);
+    let capture = shell_capture(&[&wide, "pb> "], 80, (4, 1), CaptureFormat::Plain);
+    assert_eq!(launch_line(&capture), None);
     // An undecodable styled capture and a cursor below the capture.
     let capture = shell_capture(&["pb> \u{1b}[5n", ""], 80, (4, 0), CaptureFormat::Ansi);
     assert_eq!(launch_line(&capture), None);
@@ -2554,4 +2633,156 @@ fn clear_table_fresh() {
         stuck(Some(&step(CODEX_HOOK_REVIEW, &none, None))),
         "a dialog opened during the clear"
     );
+}
+
+#[test]
+fn placement_reads_a_side_and_an_agent_name() {
+    use atm_tmux::PaneDirection::{Above, Below, Left, Right};
+    for (hint, expected) in [
+        ("below:lead", Some((Below, "lead"))),
+        ("above:lead", Some((Above, "lead"))),
+        ("left:a-b", Some((Left, "a-b"))),
+        ("right:lead", Some((Right, "lead"))),
+        // Only the first colon divides; the name is checked as an agent's later.
+        ("right:a:b", Some((Right, "a:b"))),
+        ("below:", None),
+        ("under:lead", None),
+        ("Below:lead", None),
+        ("lead", None),
+        ("", None),
+    ] {
+        assert_eq!(placement(hint), expected, "{hint:?}");
+    }
+}
+
+#[test]
+fn started_session_is_the_one_accepted_start_on_the_pane() {
+    let found = |rows: &[PaneSession]| started_session("claude", rows);
+    let started = |id| pane_row(id, Harness::ClaudeCode, Some(Some("startup")));
+    assert_eq!(found(&[]), Ok(None));
+    assert_eq!(found(&[started("s1")]), Ok(Some(SessionId::new("s1"))));
+    // Any accepted start counts, whatever its source.
+    let resumed = pane_row("s1", Harness::ClaudeCode, Some(None));
+    assert_eq!(found(&[resumed]), Ok(Some(SessionId::new("s1"))));
+    // A row no start created waits.
+    let status_only = pane_row("s1", Harness::ClaudeCode, None);
+    assert_eq!(found(&[status_only]), Ok(None));
+    // Another harness's row, a child row and a pending row are not the agent's.
+    let other = pane_row("p1", Harness::Pi, Some(Some("startup")));
+    let mut child = started("c1");
+    child.view.parent_session_id = Some(SessionId::new("s1"));
+    let pending = started("pending-100");
+    assert!(pending.view.id.is_pending());
+    assert_eq!(
+        found(&[other.clone(), child.clone(), pending.clone()]),
+        Ok(None)
+    );
+    assert_eq!(
+        found(&[other, child, pending, started("s1")]),
+        Ok(Some(SessionId::new("s1")))
+    );
+    // Two of the agent's harness: nothing says which is the agent's.
+    assert!(found(&[started("s1"), started("s2")]).is_err());
+    assert!(found(&[started("s1"), pane_row("s2", Harness::ClaudeCode, None)]).is_err());
+}
+
+#[test]
+fn a_refused_prompt_line_with_more_typed_after_it_is_never_the_prompt() {
+    // No paste guard has refused yet: any settled line is the prompt.
+    assert!(prompt_line_allowed(None, "pb> "));
+    assert!(prompt_line_allowed(None, ""));
+    // The refused line itself (the guard refused for another reason), and a
+    // prompt that was drawn again.
+    assert!(prompt_line_allowed(Some("pb> "), "pb> "));
+    assert!(prompt_line_allowed(Some("pb> "), "pb (main)> "));
+    assert!(prompt_line_allowed(Some("pb> "), ""));
+    // The refused line with something typed after it.
+    assert!(!prompt_line_allowed(Some("pb> "), "pb> rm -rf ~; "));
+    assert!(!prompt_line_allowed(Some("pb> "), "pb>  "));
+    // An empty refused line says nothing about a later one: fail closed.
+    assert!(!prompt_line_allowed(Some(""), "x"));
+}
+
+#[test]
+fn launch_guards_need_the_recorded_shell_unfocused_and_the_exact_line() {
+    let screen = agent_screen(Harness::Codex).unwrap();
+    let baseline = PaneBaseline::shell(ROOT, "zsh".into());
+    let text = "cd '/proj' && ATM_AGENT='p/lead' codex";
+    let shell = |line: &str| {
+        shell_capture(&[line, ""], 80, (line.len() as u32, 0), CaptureFormat::Ansi)
+            .with_focus(Some(false))
+    };
+    let staged = format!("pb> {text}");
+    let allowed = |before: &PaneCapture, after: &PaneCapture| {
+        (
+            shell_refusal(screen, before, &baseline, "p/lead"),
+            launch_paste_allowed(screen, before, &baseline, "p/lead", "pb> "),
+            launch_enter_allowed(screen, after, &baseline, "p/lead", ("pb> ", text)),
+        )
+    };
+    assert_eq!(allowed(&shell("pb> "), &shell(&staged)), (None, true, true));
+    // Each change to the pane refuses both guards, with its reason.
+    type Change = fn(&mut PaneCapture);
+    let changes: [(Change, &str); 8] = [
+        (
+            |c| c.inspection.local_agent_tag = Some("p/other".into()),
+            "the pane no longer carries the agent's tag",
+        ),
+        (
+            |c| c.inspection.dead = true,
+            "the shell in the pane has exited",
+        ),
+        (|c| c.inspection.in_mode = true, "the pane is in copy mode"),
+        (
+            |c| c.inspection.pane.pane_pid += 1,
+            "the pane's shell is not known to be its foreground program",
+        ),
+        (
+            |c| c.inspection.foreground_command = Some("vim".into()),
+            "the pane's shell is not known to be its foreground program",
+        ),
+        (
+            |c| c.inspection.foreground_command = None,
+            "the pane's shell is not known to be its foreground program",
+        ),
+        (|c| c.focused = Some(true), "the pane is focused"),
+        (
+            |c| c.focused = None,
+            "whether the pane is focused could not be read",
+        ),
+    ];
+    for (change, reason) in changes {
+        let (mut before, mut after) = (shell("pb> "), shell(&staged));
+        change(&mut before);
+        change(&mut after);
+        assert_eq!(
+            allowed(&before, &after),
+            (Some(reason), false, false),
+            "{reason}"
+        );
+    }
+    // The line: the paste needs it to read the prompt, the Enter the prompt
+    // followed by the command.
+    assert_eq!(
+        allowed(&shell("pb> x"), &shell(&format!("pb> x{text}"))),
+        (None, false, false)
+    );
+    assert_eq!(
+        allowed(&shell(&staged), &shell("pb> ")),
+        (None, false, false)
+    );
+    // A harness's screen in a pane whose shell is in front (a stale frame):
+    // nothing is typed under it. Real capture: Codex's fresh editor.
+    let fresh = include_str!(
+        "../../../atm-codex-adapter/tests/fixtures/screen_styled_p1_b14-fresh-baseline-32-100x32_0.167.0.txt"
+    );
+    let mut stale =
+        capture(fresh, CaptureFormat::Ansi, Some(ROOT), Some("zsh")).with_focus(Some(false));
+    stale.inspection.local_agent_tag = Some("p/lead".into());
+    assert_eq!(
+        shell_refusal(screen, &stale, &baseline, "p/lead"),
+        Some("the pane shows a harness's screen before anything was launched")
+    );
+    assert!(screen.recognises(&stale));
+    assert!(!screen.recognises(&shell("pb> ")));
 }

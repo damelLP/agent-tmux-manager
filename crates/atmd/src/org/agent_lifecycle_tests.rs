@@ -1094,6 +1094,203 @@ async fn adopt_tag_refused_before_any_effect_does_not_quarantine() {
     assert!(!quarantined(&adoption.rig, "q/lead").await);
 }
 
+#[test]
+fn only_a_before_effect_error_clears_the_effect_flag() {
+    use crate::org::agent_lifecycle::{changed, Effect};
+    use crate::control::reservation::{ExpectedTag, ReservationError as E};
+    use crate::control::ControlError as C;
+    use std::sync::atomic::Ordering;
+    // What `ReservationError` documents for a general pane operation. No
+    // wildcard arm on the outer match: a new variant needs a row here.
+    fn before_effect(error: &E) -> bool {
+        match error {
+            E::NotImplemented { .. }
+            | E::Busy { .. }
+            | E::StaleReservation
+            | E::ScreenChanged { .. }
+            | E::PacingRefused { .. }
+            | E::PaneInputRefused { .. }
+            | E::UnsafePaste { .. }
+            | E::TagMismatch { .. }
+            | E::PaneGone { .. }
+            | E::InvalidObservation { .. }
+            | E::Quarantined { .. } => true,
+            E::InvalidRequest { .. } | E::Unavailable | E::Timeout => false,
+            E::Control(C::SendRefused { .. }) => true,
+            E::Control(
+                C::NoSession { .. }
+                | C::NoPane { .. }
+                | C::AmbiguousTarget { .. }
+                | C::AgentClearing { .. }
+                | C::PaneQuarantined { .. }
+                | C::OrganisationUnavailable { .. }
+                | C::Tmux { .. },
+            ) => false,
+        }
+    }
+    let p = || pane("%1");
+    let s = || "%1".to_owned();
+    let errors = || {
+        vec![
+            E::NotImplemented { operation: "x" },
+            E::InvalidRequest { reason: "x".into() },
+            E::Busy {
+                agent: lead(),
+                pane: Some(p()),
+            },
+            E::StaleReservation,
+            E::ScreenChanged { pane: p() },
+            E::PacingRefused { pane: p() },
+            E::PaneInputRefused {
+                pane: p(),
+                reason: "x",
+            },
+            E::UnsafePaste { pane: p() },
+            E::TagMismatch {
+                pane: p(),
+                expected: ExpectedTag::Absent,
+                actual: None,
+            },
+            E::PaneGone { pane: p() },
+            E::InvalidObservation {
+                pane: p(),
+                reason: "x".into(),
+            },
+            E::Quarantined {
+                agent: lead(),
+                pane: None,
+            },
+            E::Unavailable,
+            E::Timeout,
+            E::Control(C::SendRefused {
+                pane: s(),
+                reason: "x",
+            }),
+            E::Control(C::NoSession { target: s() }),
+            E::Control(C::NoPane { session: s() }),
+            E::Control(C::AmbiguousTarget {
+                target: s(),
+                count: 2,
+                ids: s(),
+            }),
+            E::Control(C::AgentClearing {
+                pane: s(),
+                agent: lead(),
+            }),
+            E::Control(C::PaneQuarantined {
+                pane: s(),
+                agent: lead(),
+            }),
+            E::Control(C::OrganisationUnavailable { pane: s() }),
+            E::Control(C::Tmux {
+                context: "x".into(),
+                source: atm_tmux::TmuxError::ParseError("x".into()),
+            }),
+        ]
+    };
+    assert_eq!(errors().len(), 22, "one of each variant");
+    for error in errors() {
+        let (label, expected) = (format!("{error:?}"), !before_effect(&error));
+        // The flow sets the flag before its call.
+        let effect = Effect::default();
+        effect.store(true, Ordering::SeqCst);
+        assert!(changed(&effect, Err(error)).is_err());
+        assert_eq!(effect.load(Ordering::SeqCst), expected, "{label}");
+    }
+    // A call that succeeded changed the pane.
+    let effect = Effect::default();
+    effect.store(true, Ordering::SeqCst);
+    assert!(changed(&effect, Ok(())).is_ok());
+    assert!(effect.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn pane_effect_whose_call_outlives_the_deadline_quarantines() {
+    // Review 22, probe v06. tmux performs the kill (or removes the tag) and
+    // its call does not return before the down's deadline: the work is
+    // stopped with the effect made and no Down recorded, so the reservation
+    // must not be released. Twins (refused before any effect, released):
+    // down_refused_before_any_effect_does_not_quarantine.
+    use crate::control::reservation::ReservationError;
+    for (kill, effect) in [
+        (true, "kill %1"),
+        (false, "set-option -p -u -t %1 @atm-agent"),
+    ] {
+        let (rig, agents) = ready_agent().await;
+        rig.inspect_only("%1", "p/lead");
+        rig.client
+            .script_tag_check(&tagged("%1", Some("p/lead")))
+            .unwrap();
+        rig.client.stall_pane_effects(true);
+        let result = down(&agents, kill).await;
+        assert!(
+            matches!(
+                result,
+                Err(AgentError::Reservation(ReservationError::Timeout))
+            ),
+            "{kill}: {result:?}"
+        );
+        assert_eq!(mutations(&rig), [effect]);
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert!(quarantined(&rig, "p/lead").await, "{kill}");
+    }
+}
+
+#[tokio::test]
+async fn adopt_tag_whose_call_outlives_the_deadline_quarantines() {
+    // The same for an adopt: tmux sets the tag and its call does not return.
+    // The pane carries a tag with no adoption recorded. Twin:
+    // adopt_tag_refused_before_any_effect_does_not_quarantine.
+    //
+    // An adopt reads its project from the filesystem, which a paused clock
+    // would time out. So the clock is paused once tmux has the tag write:
+    // from there only the deadline is left, and virtual time reaches it.
+    use crate::control::reservation::ReservationError;
+    let adoption = Adoption::new().await;
+    adoption.rig.row("s1", "%1", false).await;
+    let untagged = Adoption::inspection(None, "pi", "");
+    adoption
+        .rig
+        .client
+        .script_inspect(&pane("%1"), Some(&untagged))
+        .unwrap();
+    adoption.rig.client.script_tag_check(&untagged).unwrap();
+    adoption.rig.client.stall_pane_effects(true);
+    let (agents, project_root) = (adoption.agents.clone(), adoption.project.path().join("q"));
+    let call = tokio::spawn(async move {
+        agents
+            .adopt(AdoptParams {
+                project_root,
+                name: "lead".into(),
+                pane: "%1".into(),
+                caller_server: None,
+            })
+            .await
+    });
+    while mutations(&adoption.rig).is_empty() {
+        // An adopt that ends before its tag never writes one: fail, don't spin.
+        if call.is_finished() {
+            panic!("the adopt ended before its tag: {:?}", call.await);
+        }
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    let result = call.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(ReservationError::Timeout))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        mutations(&adoption.rig),
+        ["set-option -p -t %1 @atm-agent q/lead"]
+    );
+    assert!(adoption.agent().await.is_none());
+    assert!(quarantined(&adoption.rig, "q/lead").await);
+}
+
 /// `q/lead` with a pi role, recorded on %1 before the service starts: Up and
 /// PaneCreated, then `more`. Its project is registered at the directory an
 /// adopt names, so the adopt finds this agent.
@@ -1231,9 +1428,10 @@ async fn settle(adoption: &Adoption) {
 #[tokio::test]
 async fn adopt_of_an_agent_with_a_role_reads_the_screen_only_of_its_live_harness() {
     // A Starting agent with a pi role. With no row of pi on the pane its
-    // screen is not read at all (a row of another harness is no evidence that
-    // pi runs there): nothing is pinned and it stays Starting.
-    let adoption = recorded_with_role(Vec::new(), &[("other", false, Harness::Codex)]).await;
+    // screen is not read at all: nothing is pinned and it stays Starting.
+    // (With only a row of another harness the adopt is refused:
+    // adopt_refuses_a_role_whose_harness_is_not_the_panes.)
+    let adoption = recorded_with_role(Vec::new(), &[]).await;
     let before = adoption.rig.org.status().unwrap();
     script_readopt(&adoption, PI_PADDED, "pi");
     *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
@@ -1294,4 +1492,283 @@ async fn adopt_of_an_agent_with_a_role_reads_the_screen_only_of_its_live_harness
             );
         }
     }
+}
+
+// --- cp-u8-21: a second adopt of a Clearing or Stuck agent ---
+
+/// `q/lead` with a pi role, Ready without a session on %1, its harness's
+/// discovery row on the pane, and the service started.
+async fn ready_with_role() -> Adoption {
+    let adoption = recorded_with_role(
+        vec![OrgCommand::EditorReady {
+            agent_id: adoptee(),
+        }],
+        &[("pending-100", false, Harness::Pi)],
+    )
+    .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption
+}
+
+/// A session row arrives on %1. It wakes one observation, which inspects.
+async fn row_arrives(adoption: &Adoption, session: &str) {
+    adoption
+        .rig
+        .client
+        .script_inspect(
+            &pane("%1"),
+            Some(&Adoption::inspection(Some("q/lead"), "pi", "")),
+        )
+        .unwrap();
+    adoption.rig.row(session, "%1", false).await;
+    settle(adoption).await;
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn second_adopt_of_a_clearing_agent_changes_nothing() {
+    // Decision A, Clearing. A clear that did not finish keeps waiting for its
+    // own proof: an adopt answers Clearing and reads, tags and writes nothing,
+    // on a safe idle screen, with only a discovery row and with a new session
+    // on the pane. Twin: second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready.
+    for session in [None, Some("s2")] {
+        let adoption = ready_with_role().await;
+        adoption
+            .rig
+            .command(OrgCommand::Clear {
+                agent_id: adoptee(),
+            })
+            .await;
+        if let Some(session) = session {
+            row_arrives(&adoption, session).await;
+        }
+        let recorded = adoption.agent().await.unwrap();
+        assert_eq!(recorded.status, AgentStatus::Clearing);
+        let mut committed = adoption.rig.org.committed.subscribe();
+        let before = adoption.rig.org.status().unwrap();
+        script_readopt(&adoption, PI_PADDED, "pi");
+        let result = adoption.adopt().await.unwrap();
+        assert_eq!(result.state, AgentStatus::Clearing, "{session:?}");
+        assert_eq!(
+            adoption.rig.client.pending_reads(&pane("%1")).unwrap(),
+            6,
+            "nothing was read after the inspection"
+        );
+        assert!(mutations(&adoption.rig).is_empty(), "{session:?}");
+        assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+        assert_eq!(adoption.rig.org.status().unwrap(), before);
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{session:?}");
+
+        // Named on another pane, it is refused before that pane is looked at:
+        // the agent is not moved and the other pane gets no tag.
+        let elsewhere = adoption
+            .agents
+            .adopt(AdoptParams {
+                project_root: adoption.project.path().join("q"),
+                name: "lead".into(),
+                pane: "%2".into(),
+                caller_server: None,
+            })
+            .await;
+        match elsewhere {
+            Err(AgentError::Refused(reason)) => {
+                assert!(reason.contains("already runs in %1"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(mutations(&adoption.rig).is_empty());
+        assert_eq!(adoption.agent().await.unwrap(), recorded);
+    }
+}
+
+#[tokio::test]
+async fn second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready() {
+    // Decision A, Stuck (the owner's choice, 2026-11-15): an explicit adopt is
+    // the owner's way out of Stuck. On a safe idle screen it makes the agent
+    // Ready and clears the reason; it binds the pane's one session, if any.
+    for bound in [false, true] {
+        let mut adoption = ready_with_role().await;
+        if bound {
+            row_arrives(&adoption, "s1").await;
+            assert_eq!(
+                adoption.agent().await.unwrap().session_id,
+                Some(SessionId::new("s1"))
+            );
+        }
+        adoption
+            .rig
+            .command(OrgCommand::Stuck {
+                agent_id: adoptee(),
+                reason: "the trust dialog reset again".into(),
+            })
+            .await;
+        // The twin: a busy screen establishes nothing, and Stuck stays.
+        let recorded = adoption.agent().await.unwrap();
+        assert_eq!(recorded.status, AgentStatus::Stuck);
+        let mut committed = adoption.rig.org.committed.subscribe();
+        script_readopt(&adoption, PI_RUNNING, "pi");
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Stuck);
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{bound}");
+
+        script_readopt(&adoption, PI_PADDED, "pi");
+        adoption.script_follow_up(None);
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+        assert_eq!(
+            committed_kinds(&mut committed),
+            if bound {
+                vec!["agent.adopted"]
+            } else {
+                vec!["agent.adopted", "agent.editor_ready"]
+            }
+        );
+        let agent = adoption.agent().await.unwrap();
+        assert_eq!(agent.status, AgentStatus::Ready, "{bound}");
+        assert_eq!(agent.reason, None, "{bound}");
+        assert_eq!(agent.session_id, bound.then(|| SessionId::new("s1")));
+        assert!(mutations(&adoption.rig).is_empty(), "{bound}");
+        adoption.followed().await;
+    }
+}
+
+// --- cp-u8-21 D: a role whose harness is not the pane's ---
+
+/// `q/lead` was started with a pi role and taken down: it has a role and no
+/// pane. `rows` are the top-level session rows on %1.
+async fn taken_down_with_role(rows: &[(&str, Harness)]) -> Adoption {
+    let rig = Rig::new().await;
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("q")).unwrap();
+    let root = project.path().join("q").canonicalize().unwrap();
+    rig.command(OrgCommand::RegisterProject {
+        project_id: "q".parse().unwrap(),
+        root: root.to_str().unwrap().into(),
+        move_root: false,
+    })
+    .await;
+    rig.command(OrgCommand::Up {
+        agent_id: adoptee(),
+        role: atm_org::parse_role("lead", "+++\nharness='pi'\n+++\n").unwrap(),
+    })
+    .await;
+    rig.command(OrgCommand::Down {
+        agent_id: adoptee(),
+        reason: "taken down".into(),
+    })
+    .await;
+    for (id, harness) in rows {
+        rig.row_of(id, "%1", false, *harness).await;
+    }
+    *rig.proc.lock().unwrap() = Some(job_in_front());
+    let (agents, _) = rig.start();
+    agents.reconciled().await.unwrap();
+    let events = agents.observation_events();
+    Adoption {
+        rig,
+        agents,
+        project,
+        events,
+    }
+}
+
+#[tokio::test]
+async fn adopt_refuses_a_role_whose_harness_is_not_the_panes() {
+    // Decision D. The agent's role names pi and the only session on the pane
+    // is a Codex one: nothing could ever bind, and the agent would be
+    // Starting for good. Refused before the tag, with nothing recorded.
+    let refused = |result: Result<AdoptResult, AgentError>| match result {
+        Err(AgentError::Refused(reason)) => {
+            assert!(reason.contains("%1 runs codex"), "{reason}");
+            assert!(reason.contains("role names pi"), "{reason}");
+            assert!(reason.contains("nothing was changed"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    };
+    // A real session row, and a discovery row: both show which harness runs.
+    for row in ["other", "pending-100"] {
+        let adoption = taken_down_with_role(&[(row, Harness::Codex)]).await;
+        let recorded = adoption.agent().await.unwrap();
+        let before = adoption.rig.org.status().unwrap();
+        adoption
+            .rig
+            .client
+            .script_inspect(&pane("%1"), Some(&Adoption::inspection(None, "codex", "")))
+            .unwrap();
+        refused(adoption.adopt().await);
+        assert!(mutations(&adoption.rig).is_empty(), "refused before the tag");
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(adoption.rig.org.status().unwrap(), before, "{row}");
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{row}");
+        assert!(!quarantined(&adoption.rig, "q/lead").await);
+    }
+
+    // The same for an agent that is already recorded on the pane and tagged.
+    let adoption = recorded_with_role(Vec::new(), &[("other", false, Harness::Codex)]).await;
+    let recorded = adoption.agent().await.unwrap();
+    let before = adoption.rig.org.status().unwrap();
+    adoption
+        .rig
+        .client
+        .script_inspect(
+            &pane("%1"),
+            Some(&Adoption::inspection(Some("q/lead"), "codex", "")),
+        )
+        .unwrap();
+    refused(adoption.adopt().await);
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+    assert_eq!(adoption.rig.org.status().unwrap(), before);
+    assert_eq!(adoption.agent().await.unwrap(), recorded);
+
+    // The twin: the pane's session is a pi one, and the agent is adopted.
+    let mut adoption = taken_down_with_role(&[("s1", Harness::Pi)]).await;
+    adoption.script_tagging();
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_capture(PI_PADDED, "pi");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(adoption.tags_set(), 1);
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.pane.as_deref(), Some("%1"));
+    assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+    adoption.followed().await;
+}
+
+#[tokio::test]
+async fn adopt_of_an_agent_stuck_by_an_interrupted_clear_makes_it_ready() {
+    // Decision A, as answered for the reason a daemon restart gives a clear
+    // it interrupted: the agent is Stuck like any other, and the adopt of
+    // its pane, on a safe idle screen, is the answer to "inspect %1".
+    let mut adoption = recorded_with_role(
+        vec![
+            OrgCommand::EditorReady {
+                agent_id: adoptee(),
+            },
+            OrgCommand::Clear {
+                agent_id: adoptee(),
+            },
+        ],
+        &[("pending-100", false, Harness::Pi)],
+    )
+    .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    let recorded = adoption.agent().await.unwrap();
+    assert_eq!(recorded.status, AgentStatus::Stuck);
+    assert_eq!(
+        recorded.reason.as_deref(),
+        Some("clear interrupted by daemon restart; inspect %1")
+    );
+    let mut committed = adoption.rig.org.committed.subscribe();
+    script_readopt(&adoption, PI_PADDED, "pi");
+    adoption.script_follow_up(None);
+    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+    assert_eq!(
+        committed_kinds(&mut committed),
+        ["agent.adopted", "agent.editor_ready"]
+    );
+    let agent = adoption.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.reason, None);
+    assert!(mutations(&adoption.rig).is_empty());
+    adoption.followed().await;
 }

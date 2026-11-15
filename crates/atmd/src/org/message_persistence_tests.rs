@@ -517,3 +517,145 @@ async fn ambiguous_lazy_replay_stays_restarted() {
         DeliveryStatus::Delivering
     );
 }
+
+impl Process {
+    async fn adopt(&self, worker: &AgentId) {
+        self.run(OrgCommand::Adopt {
+            agent_id: worker.clone(),
+            pane: "%1".into(),
+            session_id: Some("s1".into()),
+        })
+        .await;
+        self.run(summary("s1", worker)).await;
+    }
+
+    async fn give_up(&self, id: MessageId) {
+        let gave_up = guarded(self.messages.give_up(ResolveParams { id }, caller(None)));
+        assert_eq!(gave_up.await.unwrap().status, DeliveryStatus::Failed);
+    }
+
+    /// The recipient's view of one message once its job has judged it: the
+    /// job runs on this runtime, so yielding to it is the whole wait.
+    async fn judged(&self, worker: &AgentId, id: MessageId) -> InboxEntry {
+        let params = || InboxParams {
+            recipient: Some(Address::Agent(worker.clone())),
+            unread_only: false,
+            count_only: false,
+            id: Some(id),
+            after: None,
+            limit: 1,
+        };
+        guarded(async {
+            loop {
+                let inbox = self.messages.inbox(params(), caller(None)).await.unwrap();
+                match inbox.messages.into_iter().next() {
+                    Some(entry) if entry.delivery.reason.is_some() => return entry,
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+    }
+}
+
+#[tokio::test]
+async fn restart_expects_no_reference_for_messages_that_failed_unattempted() {
+    use super::message_evidence::MAX_MESSAGES;
+    let before = tempfile::tempdir().unwrap();
+    let first = Process::start(before.path()).await;
+    let worker = first.project().await;
+    first.adopt(&worker).await;
+    // One more message than evidence has references, each given up before
+    // any attempt.
+    let mut failed = Vec::new();
+    for _ in 0..=MAX_MESSAGES {
+        let id = first
+            .send(None, Address::Agent(worker.clone()), "never attempted")
+            .await;
+        first.give_up(id).await;
+        failed.push(id);
+    }
+
+    let after = tempfile::tempdir().unwrap();
+    copy_log(before.path(), after.path());
+    let second = Process::start(after.path()).await;
+    // Nothing could confirm them, so the new process expects none of them,
+    assert!(failed
+        .iter()
+        .all(|id| second.rt.evidence.snapshot(*id).is_err()));
+    // and has a reference for the next message: it waits for its recipient
+    // like any other, and the owner is told nothing.
+    let id = second
+        .send(None, Address::Agent(worker.clone()), "brief")
+        .await;
+    assert!(second.rt.evidence.snapshot(id).is_ok());
+    let entry = second.judged(&worker, id).await;
+    assert_eq!(entry.delivery.phase, DeliveryPhase::Waiting);
+    assert!(second.inbox(None).await.messages.is_empty());
+}
+
+#[tokio::test]
+async fn restart_still_expects_a_failed_message_whose_attempt_can_be_confirmed() {
+    let before = tempfile::tempdir().unwrap();
+    let first = Process::start(before.path()).await;
+    let worker = first.project().await;
+    first.adopt(&worker).await;
+    let id = first
+        .send(None, Address::Agent(worker.clone()), "brief")
+        .await;
+    first
+        .run(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: "%1".into(),
+        })
+        .await;
+    first.give_up(id).await;
+
+    let after = tempfile::tempdir().unwrap();
+    copy_log(before.path(), after.path());
+    let second = Process::start(after.path()).await;
+    // Failed for good, but its attempt went to a bound session on the
+    // agent's pane: evidence expects that session's receipt again.
+    assert!(second.rt.evidence.receipt(id).unwrap().is_none());
+    second.reference(id, "s1", "%1");
+    second.delivered(id).await;
+    let entry = second.inbox(Some("%1")).await.messages.remove(0);
+    assert_eq!(entry.status, DeliveryStatus::Delivered);
+    assert_eq!(entry.delivery.session_id, Some("s1".into()));
+}
+
+#[tokio::test]
+async fn restart_forgets_a_failed_message_whose_scope_evidence_refuses() {
+    let before = tempfile::tempdir().unwrap();
+    let first = Process::start(before.path()).await;
+    let worker = first.project().await;
+    // Attempted while the agent was bound to a placeholder row: a scope
+    // evidence never accepts.
+    let pending = "pending-7";
+    first
+        .run(OrgCommand::Adopt {
+            agent_id: worker.clone(),
+            pane: "%1".into(),
+            session_id: Some(pending.into()),
+        })
+        .await;
+    first.run(summary(pending, &worker)).await;
+    let id = first
+        .send(None, Address::Agent(worker.clone()), "brief")
+        .await;
+    first
+        .run(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: "%1".into(),
+        })
+        .await;
+    first.give_up(id).await;
+
+    let after = tempfile::tempdir().unwrap();
+    copy_log(before.path(), after.path());
+    let second = Process::start(after.path()).await;
+    // Failed for good and nothing can confirm it: no reference is held.
+    assert!(second.rt.evidence.snapshot(id).is_err());
+}

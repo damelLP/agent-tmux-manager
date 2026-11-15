@@ -308,14 +308,26 @@ pub(super) fn launch_text_is_safe(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| matches!(c, ' '..='~'))
 }
 
+/// The terminal cells one character takes, when that is certain: one or two.
+/// `None` for a control character and for a character without a cell of its
+/// own (a combining mark, a joiner, a variation selector): terminals lay
+/// those out differently, and nothing here guesses.
+fn cells(c: char) -> Option<usize> {
+    unicode_width::UnicodeWidthChar::width(c).filter(|cells| (1..=2).contains(cells))
+}
+
 /// The cells before the cursor on the cursor's logical line: the cursor's row
 /// up to the cursor, joined upward with every row that fills the pane's width
-/// (a wrapped line). Cells at or after the cursor are ignored: a shell leaves
-/// stale cells and suggestions there.
+/// (a wrapped line, or a row its shell filled: the join is not a proof of a
+/// wrap, only the same reading before and after a paste). Cells at or after
+/// the cursor are ignored: a shell leaves stale cells, suggestions and a
+/// right-hand prompt there.
 ///
-/// `None` when the line can't be read exactly: an undecodable capture, a
-/// cursor outside it, or a character before the cursor whose cell width is
-/// not certainly one (anything but printable ASCII).
+/// A capture holds one character per glyph, so the cut is made by cell widths
+/// and must agree with the cursor column tmux reports. `None` when the line
+/// can't be read exactly: an undecodable capture, a cursor outside it, a
+/// character before the cursor without a certain width, a cursor column that
+/// falls inside a character, or a row with more cells than the pane is wide.
 #[must_use]
 pub(super) fn launch_line(capture: &PaneCapture) -> Option<String> {
     let decoded;
@@ -335,21 +347,33 @@ pub(super) fn launch_line(capture: &PaneCapture) -> Option<String> {
     }
     // A cursor column equal to the width is the end of that row (dash leaves
     // it there after an exact fit; bash and zsh move to the next row).
-    let mut line: String = rows.get(row)?.chars().take(column).collect();
-    if !launch_text_is_safe(&line) && !line.is_empty() {
+    let cursor_row = rows.get(row)?;
+    let mut line = String::new();
+    let mut before = 0;
+    for c in cursor_row.chars() {
+        if before >= column {
+            break;
+        }
+        before += cells(c)?;
+        line.push(c);
+    }
+    let all: Option<usize> = cursor_row.chars().map(cells).sum();
+    if before > column || all.is_some_and(|all| all > width) {
         return None;
     }
     // Cells never written before the cursor are blank.
-    while line.len() < column {
-        line.push(' ');
-    }
+    line.extend(std::iter::repeat_n(' ', column - before));
     for above in rows.get(..row)?.iter().rev() {
-        let ascii = above.chars().filter(|c| matches!(c, ' '..='~')).count();
-        let other = above.chars().count() - ascii;
-        if other == 0 && ascii == width {
+        // The row's cells, at least and at most: a character without a
+        // certain width may take none or two.
+        let (mut least, mut most) = (0, 0);
+        for c in above.chars() {
+            least += cells(c).unwrap_or(0);
+            most += cells(c).unwrap_or(2);
+        }
+        if least == width && most == width {
             line.insert_str(0, above);
-        } else if ascii + 2 * other < width {
-            // Too short to fill the row whatever its characters' widths are.
+        } else if most < width {
             break;
         } else {
             return None;
@@ -366,6 +390,113 @@ pub(super) fn launch_line_is_staged(capture: &PaneCapture, before: &str, text: &
     launch_line(capture).is_some_and(|line| {
         line.len() == before.len() + text.len() && line.starts_with(before) && line.ends_with(text)
     })
+}
+
+/// Why a capture does not allow typing a launch into the pane's shell; `None`
+/// allows. Both guards of a launch require this of the control actor's own
+/// capture: the agent's tag, a live pane out of copy mode, the recorded shell
+/// in the foreground of the recorded root process, no client focused on the
+/// pane (a person may be typing there), and no harness screen on it.
+#[must_use]
+pub(super) fn shell_refusal(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+) -> Option<&'static str> {
+    let pane = &capture.inspection;
+    if pane.local_agent_tag.as_deref() != Some(tag) {
+        Some("the pane no longer carries the agent's tag")
+    } else if pane.dead {
+        Some("the shell in the pane has exited")
+    } else if pane.in_mode {
+        Some("the pane is in copy mode")
+    } else if screen.foreground(capture, baseline) != Some(Foreground::Shell) {
+        Some("the pane's shell is not known to be its foreground program")
+    } else if screen.recognises(capture) {
+        Some("the pane shows a harness's screen before anything was launched")
+    } else {
+        match capture.focused {
+            Some(false) => None,
+            Some(true) => Some("the pane is focused"),
+            None => Some("whether the pane is focused could not be read"),
+        }
+    }
+}
+
+/// Whether `line` may be taken as the shell's line before the paste, when a
+/// paste guard refused the line taken before it (`refused`). A prompt may be
+/// drawn again and read differently; a line that is the refused one with more
+/// after it is that prompt with something typed at it, and typing the launch
+/// after it would run both.
+#[must_use]
+pub(super) fn prompt_line_allowed(refused: Option<&str>, line: &str) -> bool {
+    refused.is_none_or(|refused| line == refused || !line.starts_with(refused))
+}
+
+/// The paste guard of a launch: the shell's line still reads exactly `before`.
+#[must_use]
+pub(super) fn launch_paste_allowed(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+    before: &str,
+) -> bool {
+    shell_refusal(screen, capture, baseline, tag).is_none()
+        && launch_line(capture).as_deref() == Some(before)
+}
+
+/// The Enter guard of a launch, on the control actor's own capture.
+#[must_use]
+pub(super) fn launch_enter_allowed(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+    (before, text): (&str, &str),
+) -> bool {
+    shell_refusal(screen, capture, baseline, tag).is_none()
+        && launch_line_is_staged(capture, before, text)
+}
+
+/// Where a role's `pane` hint puts the agent's new pane: `<side>:<agent>`,
+/// the side of that agent's pane to split off (`below:lead`).
+#[must_use]
+pub(super) fn placement(hint: &str) -> Option<(atm_tmux::PaneDirection, &str)> {
+    use atm_tmux::PaneDirection::{Above, Below, Left, Right};
+    let (side, agent) = hint.split_once(':')?;
+    let direction = match side {
+        "left" => Left,
+        "right" => Right,
+        "above" => Above,
+        "below" => Below,
+        _ => return None,
+    };
+    (!agent.is_empty()).then_some((direction, agent))
+}
+
+/// The session a start produced, among the rows on the agent's new pane: its
+/// one top-level session of the agent's harness, once the registry has
+/// accepted its start. `Ok(None)` waits: no such row yet, or a row something
+/// other than a start created. More than one is an error; nothing says which
+/// is the agent's.
+pub(super) fn started_session(
+    harness: &str,
+    rows: &[PaneSession],
+) -> Result<Option<SessionId>, String> {
+    let mut own = rows.iter().filter(|row| {
+        row.view.parent_session_id.is_none()
+            && !row.view.id.is_pending()
+            && row.view.harness == harness
+    });
+    let Some(row) = own.next() else {
+        return Ok(None);
+    };
+    if own.next().is_some() {
+        return Err("more than one session appeared on the new pane".into());
+    }
+    Ok(row.start.as_ref().map(|_| row.view.id.clone()))
 }
 
 /// What procfs says about a pane's root process. A flow reads it once, when it

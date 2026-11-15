@@ -1,0 +1,36 @@
+Captured: Claude Code 2.1.325, 2026-11-15, rehearsal on a candidate, tmux capture-pane -p -e -N.
+  111                                
+  112                                
+  113                                
+  114                                                                     
+  115                                
+  116                                
+  117                                                                                                                                                
+  118                                
+  119                                
+  120                                
+
+[38;5;246m✻[39m [38;5;246mCogitated for 1s · done 12:45[39m      
+
+[38;5;246m[48;5;237m❯ [38;5;231m[m45] Read: atm inbox --id m45[39m                                                                                                                     
+[49m                                     
+  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m               
+
+[38;5;231m●[39m Message m45 is a brief from [38;5;153mowner[39m to [38;5;153mrehearsal/cc[39m, status delivered, not yet read:                                                                 
+                                                                                                                                                     
+  [2m▎[0m [3mRehearsal brief. Read the attached file. Then run: (1) [38;5;153matm msg send --to owner --kind report --body "<the second line of the file>"[39m (2) [38;5;153matm msg [0m 
+  [2m▎[0m [3m[38;5;153msend --to pb --body "hello from cc, no reply needed"[39m (3) [38;5;153matm msg ack <this message id>[39m. Nothing else.[0m                                            
+                                                                                                                                                     
+  It has an attachment at [38;5;153m/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxx/note.txt[39m.     
+                                                                                                                                                     
+  I haven't done any of those steps. You asked me to read the message, and the brief asks for outbound messages to [38;5;153mowner[39m and [38;5;153mpb[39m plus an ack. Those   
+  would send content to other parties, so I'll wait for your go-ahead. Tell me if you want me to read the attached file, send the two messages, and  
+  ack m45.                                                                                                                                           
+
+[38;5;246m✻[39m [38;5;246mWorked for 5s · done 12:48[39m                                                                                                                         
+                                                                                                                                                     
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2mread the attached note.txt[0m                                              
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[39m  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m                                    

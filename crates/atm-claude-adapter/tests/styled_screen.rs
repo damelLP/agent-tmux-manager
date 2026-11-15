@@ -215,8 +215,12 @@ fn real_slash_menu_and_manual_queued_frame_remain_unknown() {
 
 #[test]
 fn faint_text_is_not_a_typed_draft() {
-    // Synthetic: faint or partly faint command text is not typed input.
-    for command in ["\x1b[2m/clear", "/cl\x1b[2mear"] {
+    // Synthetic: faint or partly faint command text is not typed input. A row
+    // that is faint throughout is a suggestion; a partly faint one is unknown.
+    for (command, input) in [
+        ("\x1b[2m/clear", InputState::Empty),
+        ("/cl\x1b[2mear", InputState::Unknown),
+    ] {
         let text = BLANK.replace("\x1b[7m \x1b[0m", &format!("{command}\x1b[0m"));
         assert_eq!(
             staged_draft_matches(ScreenInput::Styled(&text), "/clear"),
@@ -224,7 +228,7 @@ fn faint_text_is_not_a_typed_draft() {
         );
         assert_eq!(
             observe_screen(ScreenInput::Styled(&text), None).input,
-            InputState::Unknown
+            input
         );
     }
 }
@@ -371,4 +375,144 @@ fn synthetic_style_and_frame_mutations_never_create_empty() {
         None
     );
     check("\x1b[7m \x1b[0m", ScreenFacts::default());
+}
+
+// Native-cursor rendering: Claude shows the terminal's own cursor and draws no
+// inverse cell, so a suggestion row is faint from its first cell on.
+const NATIVE_FRESH: &str = capture!("s1_native-fresh-placeholder");
+const NATIVE_SUGGESTION: &str = capture!("s1_native-suggestion-after-turn");
+const SUGGESTION_ROW: &str = "\x1b[2mread the attached note.txt\x1b[0m";
+
+#[test]
+fn captured_native_cursor_suggestions_are_empty() {
+    check(
+        NATIVE_FRESH,
+        facts(
+            InputState::Empty,
+            TurnState::NotRunning,
+            FreshEditorEvidence::Present,
+        ),
+    );
+    // A suggestion after a turn has free text, not the `Try "…"` shape.
+    assert!(NATIVE_SUGGESTION.contains(SUGGESTION_ROW));
+    check(
+        NATIVE_SUGGESTION,
+        facts(
+            InputState::Empty,
+            TurnState::NotRunning,
+            FreshEditorEvidence::Unknown,
+        ),
+    );
+    for text in [NATIVE_FRESH, NATIVE_SUGGESTION] {
+        // A suggestion is never a staged draft, whatever text it shows.
+        for expected in [
+            "/clear",
+            "read the attached note.txt",
+            "Try \"how do I log an error?\"",
+        ] {
+            assert_eq!(
+                staged_draft_matches(ScreenInput::Styled(text), expected),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn captured_native_cursor_typed_text_is_a_draft() {
+    for (text, typed) in [
+        (capture!("s1_native-typed-first-letter"), "T"),
+        (capture!("s1_native-typed-abc"), "abc"),
+        // The placeholder's own text, typed, with the cursor moved to its start.
+        (
+            capture!("s1_native-same-text-draft-home"),
+            "Try \"edit <filepath> to...\"",
+        ),
+    ] {
+        check(
+            text,
+            facts(
+                InputState::Draft,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(text), typed),
+            Some(true)
+        );
+    }
+}
+
+#[test]
+fn synthetic_mutations_of_a_native_cursor_suggestion_are_never_empty() {
+    let rule = format!("{}\n", "─".repeat(149));
+    assert!(NATIVE_SUGGESTION.contains(&rule));
+    // Synthetic: each row below differs from the captured suggestion in one way.
+    for (name, text) in [
+        (
+            "typed text after the suggestion",
+            NATIVE_SUGGESTION.replace(SUGGESTION_ROW, &format!("{SUGGESTION_ROW} ok")),
+        ),
+        (
+            "a faint word inside typed text",
+            NATIVE_SUGGESTION.replace(SUGGESTION_ROW, "read \x1b[2mthe\x1b[0m attached note.txt"),
+        ),
+        (
+            "a plain first cell before a faint rest",
+            NATIVE_SUGGESTION.replace(SUGGESTION_ROW, "r\x1b[2mead the attached note.txt\x1b[0m"),
+        ),
+        (
+            "a faint cell that is also inverse",
+            NATIVE_SUGGESTION.replace(
+                SUGGESTION_ROW,
+                "\x1b[2;7mr\x1b[0;2mead the attached note.txt\x1b[0m",
+            ),
+        ),
+        (
+            "an inverse cell inside the faint text",
+            NATIVE_SUGGESTION.replace(
+                SUGGESTION_ROW,
+                "\x1b[2mread the \x1b[2;7ma\x1b[0;2mttached note.txt\x1b[0m",
+            ),
+        ),
+        (
+            "a second row in the editor box",
+            NATIVE_SUGGESTION.replace(
+                SUGGESTION_ROW,
+                &format!("{SUGGESTION_ROW}\n  \x1b[2mand more\x1b[0m"),
+            ),
+        ),
+        (
+            "a changed footer",
+            NATIVE_SUGGESTION.replace("cycle)", "changed)"),
+        ),
+        ("a missing rule", NATIVE_SUGGESTION.replacen(&rule, "\n", 1)),
+        ("a hidden attribute", format!("{NATIVE_SUGGESTION}\x1b[8m")),
+    ] {
+        assert_ne!(text, NATIVE_SUGGESTION, "{name}");
+        assert_ne!(
+            observe_screen(ScreenInput::Styled(&text), None).input,
+            InputState::Empty,
+            "{name}"
+        );
+        for expected in ["/clear", "read the attached note.txt"] {
+            assert_ne!(
+                staged_draft_matches(ScreenInput::Styled(&text), expected),
+                Some(true),
+                "{name}"
+            );
+        }
+    }
+    // Synthetic: the same text without the faint attribute is a typed draft.
+    let typed = NATIVE_SUGGESTION.replace(SUGGESTION_ROW, "read the attached note.txt");
+    assert_ne!(typed, NATIVE_SUGGESTION);
+    assert_eq!(
+        observe_screen(ScreenInput::Styled(&typed), None).input,
+        InputState::Draft
+    );
+    assert_eq!(
+        staged_draft_matches(ScreenInput::Styled(&typed), "read the attached note.txt"),
+        Some(true)
+    );
 }

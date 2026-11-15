@@ -198,6 +198,74 @@ async fn committed_decision_reaches_existing_runner_as_one_literal_argument() {
     task.await.unwrap();
 }
 
+// Break caught: watching from sequence zero on startup re-notifies historical
+// pending decisions and unread owner messages before the new decision notice.
+#[tokio::test]
+async fn notifier_starts_at_current_cursor_without_repeating_pending_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().join("state"), cancel.clone()).await;
+    for command in [
+        OrgCommand::RegisterProject {
+            project_id: "p".parse().unwrap(),
+            root: "/project".into(),
+            move_root: false,
+        },
+        OrgCommand::Adopt {
+            agent_id: "p/worker".parse().unwrap(),
+            pane: "%7".into(),
+            session_id: None,
+        },
+    ] {
+        org.execute(command, now()).await.unwrap();
+    }
+    let request: atm_org::DecisionRequest =
+        serde_json::from_value(decision_record(3).body).unwrap();
+    org.execute(
+        OrgCommand::Decision(atm_org::DecisionCommand::Request(request.clone())),
+        now(),
+    )
+    .await
+    .unwrap();
+    org.execute(OrgCommand::SendMessage(content()), now())
+        .await
+        .unwrap();
+    assert_eq!(org.status().unwrap(), 4);
+    let socket = dir.path().join("notify.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let config = NotifyConfig {
+        command: vec!["python3".into(), "-c".into(),
+            "import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(json.dumps(sys.argv[2:]).encode()); s.close()".into(),
+            socket.to_string_lossy().into_owned()],
+        delay_secs: 0,
+    };
+    let task = spawn_message_notifier(org.clone(), config, cancel.clone()).unwrap();
+    org.execute(
+        OrgCommand::Decision(atm_org::DecisionCommand::Request(request)),
+        now(),
+    )
+    .await
+    .unwrap();
+    use tokio::io::AsyncReadExt;
+    let first: serde_json::Value = tokio::time::timeout(Duration::from_secs(60), async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        first,
+        serde_json::json!(["d5 from p/worker: atm decisions"])
+    );
+    let state = org.snapshot().await.unwrap();
+    assert!(still_open(&state, Subject::Decision(DecisionId::new(3))));
+    assert!(still_open(&state, Subject::Message(MessageId::new(4))));
+    cancel.cancel();
+    task.await.unwrap();
+}
+
 fn now() -> DateTime<Utc> {
     DateTime::from_timestamp(1_700_000_000, 0).unwrap()
 }

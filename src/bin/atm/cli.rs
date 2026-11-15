@@ -8,9 +8,9 @@ use tokio::net::UnixStream;
 
 use atm_core::SessionView;
 use atm_protocol::{ClientMessage, DaemonMessage};
-use atm_tmux::{RealTmuxClient, TmuxClient};
+use atm_tmux::RealTmuxClient;
 use atm_tui::{daemon, role};
-use atmd::control::resolve_pane_id;
+use atmd::control::{self, resolve_pane_id, ReplyOutcome};
 
 use super::{spawn::non_empty_env, ListFormat};
 
@@ -125,24 +125,15 @@ pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
 }
 
 pub(super) async fn cmd_kill(target: String) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-    client
-        .kill_pane(&pane_id)
-        .await
-        .context(format!("Failed to kill pane {pane_id}"))?;
+    let sessions = daemon_sessions().await?;
+    let pane_id = control::kill(&RealTmuxClient::new(), &sessions, &target).await?;
     println!("Killed {pane_id}");
     Ok(())
 }
 
 pub(super) async fn cmd_interrupt(target: String) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-    // C-c sends SIGINT to the foreground process in the pane
-    client
-        .send_keys(&pane_id, "C-c")
-        .await
-        .context(format!("Failed to interrupt pane {pane_id}"))?;
+    let sessions = daemon_sessions().await?;
+    let pane_id = control::interrupt(&RealTmuxClient::new(), &sessions, &target).await?;
     println!("Interrupted {pane_id}");
     Ok(())
 }
@@ -270,250 +261,22 @@ pub(super) async fn cmd_reply(
     yes: bool,
     no: bool,
 ) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-
-    if no {
-        // Escape dismisses/cancels the prompt
-        client
-            .send_keys(&pane_id, "Escape")
-            .await
-            .context("Failed to send Escape")?;
-        println!("Sent Escape to {pane_id}");
-        return Ok(());
+    let sessions = daemon_sessions().await?;
+    match control::reply(&RealTmuxClient::new(), &sessions, &target, option, yes, no).await? {
+        ReplyOutcome::Escape { pane } => println!("Sent Escape to {pane}"),
+        ReplyOutcome::Enter { pane } => println!("Sent Enter to {pane}"),
+        ReplyOutcome::Selected { pane, option } => println!("Selected option {option} on {pane}"),
     }
-
-    if yes || option.is_none() {
-        // Just press Enter to accept current selection
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-        println!("Sent Enter to {pane_id}");
-        return Ok(());
-    }
-
-    // Navigate to the desired option number
-    let desired = option.unwrap_or(1);
-
-    // Capture the pane to find which option the cursor is on
-    let lines = client
-        .capture_pane(&pane_id)
-        .await
-        .context("Failed to capture pane")?;
-
-    let current = find_selected_option(&lines).unwrap_or(1);
-
-    if desired == current {
-        // Already on the right option, just press Enter
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-    } else if desired > current {
-        // Navigate down
-        for _ in 0..(desired - current) {
-            client
-                .send_keys(&pane_id, "Down")
-                .await
-                .context("Failed to send Down")?;
-        }
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-    } else {
-        // Navigate up
-        for _ in 0..(current - desired) {
-            client
-                .send_keys(&pane_id, "Up")
-                .await
-                .context("Failed to send Up")?;
-        }
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-    }
-
-    println!("Selected option {desired} on {pane_id}");
     Ok(())
 }
 
-/// Finds which numbered option currently has the ❯ cursor.
-/// Returns 1-based option number, or None if no cursor found.
-fn find_selected_option(lines: &[String]) -> Option<usize> {
-    for line in lines {
-        let trimmed = line.trim();
-        // Pattern: "❯ N. ..." where N is the option number
-        if let Some(rest) = trimmed.strip_prefix("❯ ") {
-            // Try to parse "N." at the start
-            if let Some(dot_pos) = rest.find('.') {
-                if let Ok(n) = rest[..dot_pos].trim().parse::<usize>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    // No cursor found — assume option 1 (default selection)
-    None
-}
-
 pub(super) async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-    let lines = client
-        .capture_pane(&pane_id)
-        .await
-        .context(format!("Failed to capture pane {pane_id}"))?;
-
-    let output: &[String] = if prompt {
-        extract_prompt(&lines)
-    } else if let Some(n) = tail {
-        let start = lines.len().saturating_sub(n);
-        &lines[start..]
-    } else {
-        &lines
-    };
-
+    let sessions = daemon_sessions().await?;
+    let output = control::peek(&RealTmuxClient::new(), &sessions, &target, tail, prompt).await?;
     for line in output {
         println!("{line}");
     }
     Ok(())
-}
-
-/// Extracts the active prompt from captured pane content.
-///
-/// Scans backwards from the bottom looking for Claude Code prompt patterns:
-/// - Footer line: "Enter to select" / "Esc to cancel" / "(Y)es/(N)o"
-/// - Numbered options: "1. ...", "2. ..."
-/// - Separator lines (box drawing: ─── or ═══)
-/// - Question/title lines
-/// - Title blocks (☐/□/■)
-///
-/// Falls back to the last 15 lines if no prompt pattern is detected.
-fn extract_prompt(lines: &[String]) -> &[String] {
-    if lines.is_empty() {
-        return lines;
-    }
-
-    // Find the footer line (bottom of prompt)
-    let footer_idx = lines.iter().rposition(|l| {
-        let trimmed = l.trim();
-        trimmed.contains("Enter to select")
-            || trimmed.contains("Esc to cancel")
-            || trimmed.contains("(Y)es")
-            || trimmed.contains("(y/n)")
-            || trimmed.contains("to navigate")
-    });
-
-    let end = footer_idx.map_or(lines.len(), |i| i + 1);
-
-    // Scan backwards from footer to find the top of the prompt block.
-    // Strategy: keep going as long as lines look like prompt content.
-    // Stop when we hit a line that's clearly not part of the prompt
-    // (e.g., regular output, the ● response marker, the ❯ input line).
-    let mut start = end.saturating_sub(1);
-
-    for i in (0..end.saturating_sub(1)).rev() {
-        let trimmed = lines[i].trim();
-
-        // Part of prompt: numbered options, indented descriptions, cursor
-        if trimmed.starts_with("1.")
-            || trimmed.starts_with("2.")
-            || trimmed.starts_with("3.")
-            || trimmed.starts_with("4.")
-            || trimmed.starts_with("5.")
-            || trimmed.starts_with("6.")
-            || trimmed.starts_with("7.")
-            || trimmed.starts_with("8.")
-            || trimmed.starts_with("9.")
-        {
-            start = i;
-            continue;
-        }
-
-        // Cursor indicator on option
-        if trimmed.starts_with("❯ ") && trimmed.len() > 2 {
-            // "❯ 1. Yes" is a prompt option; bare "❯ " is the input line
-            let after_cursor = trimmed.get(4..).unwrap_or(""); // skip "❯ "
-            if after_cursor.starts_with("1.")
-                || after_cursor.starts_with("2.")
-                || after_cursor.starts_with("3.")
-                || after_cursor.starts_with("4.")
-                || after_cursor.starts_with("5.")
-            {
-                start = i;
-                continue;
-            }
-        }
-
-        // Indented description line (part of an option)
-        if lines[i].starts_with("    ") && !trimmed.is_empty() {
-            start = i;
-            continue;
-        }
-
-        // Separator line (─── or ═══ etc.)
-        if is_separator_line(trimmed) {
-            start = i;
-            continue;
-        }
-
-        // Empty line (spacing within prompt)
-        if trimmed.is_empty() {
-            start = i;
-            continue;
-        }
-
-        // Question line (contains ?)
-        if trimmed.contains('?') {
-            start = i;
-            continue;
-        }
-
-        // Title block (☐/□/■)
-        if trimmed.starts_with('☐') || trimmed.starts_with('□') || trimmed.starts_with('■') {
-            start = i;
-            break; // Title is the top of the prompt
-        }
-
-        // If we've already found prompt content (start < end-1),
-        // a non-matching line means we've gone past the prompt
-        if start < end.saturating_sub(1) {
-            break;
-        }
-    }
-
-    // If we didn't find any prompt markers, fall back to last 15 lines
-    if start == end.saturating_sub(1) && footer_idx.is_none() {
-        let fallback_start = lines.len().saturating_sub(15);
-        return &lines[fallback_start..];
-    }
-
-    // Trim leading blank/separator lines from the extracted prompt
-    while start < end {
-        let trimmed = lines.get(start).map(|l| l.trim()).unwrap_or("");
-        if trimmed.is_empty() || is_separator_line(trimmed) {
-            start += 1;
-        } else {
-            break;
-        }
-    }
-
-    &lines[start..end]
-}
-
-/// Returns true if a line is a box-drawing separator (────, ════, etc.)
-fn is_separator_line(trimmed: &str) -> bool {
-    if trimmed.len() < 3 {
-        return false;
-    }
-    let first_char = trimmed.chars().next().unwrap_or(' ');
-    matches!(first_char, '─' | '━' | '═' | '┄' | '┈')
-        && trimmed
-            .chars()
-            .all(|c| matches!(c, '─' | '━' | '═' | '┄' | '┈' | ' '))
 }
 
 pub(super) async fn cmd_status() -> Result<()> {
@@ -601,81 +364,5 @@ mod list_tests {
                 );
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod prompt_tests {
-    use super::extract_prompt;
-
-    #[test]
-    fn test_extract_numbered_prompt() {
-        let lines: Vec<String> = vec![
-            "Some previous output",
-            "",
-            "Do you like pineapple on pizza?",
-            "",
-            "❯ 1. Yes",
-            "    Pineapple belongs on pizza",
-            "  2. No",
-            "    Pineapple does not belong on pizza",
-            "  3. Type something.",
-            "",
-            "  4. Chat about this",
-            "",
-            "Enter to select · ↑/↓ to navigate · Esc to cancel",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
-        let prompt = extract_prompt(&lines);
-        let text = prompt
-            .iter()
-            .map(|l| l.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            text.contains("pineapple on pizza"),
-            "should contain the question"
-        );
-        assert!(text.contains("1. Yes"), "should contain option 1");
-        assert!(text.contains("4. Chat"), "should contain option 4");
-        assert!(text.contains("Enter to select"), "should contain footer");
-        assert!(
-            !text.contains("previous output"),
-            "should not contain earlier output"
-        );
-    }
-
-    #[test]
-    fn test_extract_yn_prompt() {
-        let lines: Vec<String> = vec![
-            "lots of code output here",
-            "more code",
-            "",
-            "Allow Bash: git status? (Y)es/(N)o",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
-        let prompt = extract_prompt(&lines);
-        assert!(prompt.iter().any(|l| l.contains("(Y)es")));
-    }
-
-    #[test]
-    fn test_fallback_when_no_prompt() {
-        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
-
-        let prompt = extract_prompt(&lines);
-        assert_eq!(prompt.len(), 15);
-    }
-
-    #[test]
-    fn test_empty_input() {
-        let lines: Vec<String> = vec![];
-        let prompt = extract_prompt(&lines);
-        assert!(prompt.is_empty());
     }
 }

@@ -48,10 +48,13 @@ impl From<AgentError> for MethodError {
                 ReservationError::TagMismatch { .. }
                 | ReservationError::StaleReservation
                 | ReservationError::ScreenChanged { .. }
+                | ReservationError::PaneInputRefused { .. }
+                | ReservationError::UnsafePaste { .. }
                 | ReservationError::InvalidObservation { .. } => error_code::REFUSED,
                 ReservationError::PaneGone { .. } => error_code::NOT_FOUND,
                 ReservationError::InvalidRequest { .. } => error_code::INVALID_PARAMS,
                 ReservationError::Unavailable
+                | ReservationError::PacingRefused { .. }
                 | ReservationError::NotImplemented { .. }
                 | ReservationError::Quarantined { .. } => error_code::UNAVAILABLE,
                 ReservationError::Timeout => error_code::TIMEOUT,

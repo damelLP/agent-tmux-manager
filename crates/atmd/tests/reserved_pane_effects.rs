@@ -70,11 +70,13 @@ async fn reserved_input_refuses_unsafe_state_before_any_guard_or_effect() {
         .run_reserved(
             request(ReservationKind::Delivery),
             move |r| async move {
-                for dead in [false, true] {
+                for state in 0..4 {
                     for operation in 0..4 {
                         let mut fresh = frame(Some("project/lead"), CaptureFormat::Plain);
-                        fresh.inspection.dead = dead;
-                        fresh.inspection.in_mode = !dead;
+                        fresh.inspection.dead = state == 0;
+                        fresh.inspection.in_mode = state == 1;
+                        fresh.inspection.synchronized = state == 2;
+                        fresh.inspection.input_off = state == 3;
                         if operation >= 2 {
                             scripts.script_capture(&fresh).unwrap();
                         } else {
@@ -111,12 +113,7 @@ async fn reserved_input_refuses_unsafe_state_before_any_guard_or_effect() {
                             }
                         };
                         assert!(
-                            matches!(
-                                result,
-                                Err(ReservationError::Control(
-                                    atmd::control::ControlError::SendRefused { .. }
-                                ))
-                            ),
+                            matches!(result, Err(ReservationError::PaneInputRefused { .. })),
                             "{result:?}"
                         );
                         assert!(!called.load(Ordering::SeqCst));
@@ -183,6 +180,20 @@ async fn reserved_paste_preserves_unknown_flag_policy_but_refuses_control_bytes(
                             let refuse = (bracketed == Some(false) && text.contains(['\n', '\r']))
                                 || text.contains(['\x1b', '\x03', '\0', '\x7f']);
                             assert_eq!(result.is_err(), refuse, "{guarded} {bracketed:?} {text:?}");
+                            if text.contains(['\x1b', '\x03', '\0', '\x7f']) {
+                                assert!(
+                                    matches!(result, Err(ReservationError::UnsafePaste { .. })),
+                                    "{result:?}"
+                                );
+                            } else if refuse {
+                                assert!(
+                                    matches!(
+                                        result,
+                                        Err(ReservationError::PaneInputRefused { .. })
+                                    ),
+                                    "{result:?}"
+                                );
+                            }
                             assert_eq!(
                                 effects(&scripts.mock()).len(),
                                 before + usize::from(!refuse)
@@ -385,9 +396,11 @@ async fn reserved_missing_is_positive_and_transport_errors_are_not_absence() {
                     r.capture(&pane(), CaptureFormat::Plain).await,
                     Err(ReservationError::PaneGone { .. })
                 ));
-                let error = r.inspect(&pane()).await.unwrap_err().to_string();
+                let error = r.inspect(&pane()).await.unwrap_err();
+                assert!(matches!(error, ReservationError::Control(_)), "{error:?}");
+                let message = error.to_string();
                 assert!(
-                    error.contains("%0") && error.contains("read pane metadata"),
+                    message.contains("%0") && message.contains("read pane metadata"),
                     "{error}"
                 );
                 Ok(())

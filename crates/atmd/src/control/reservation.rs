@@ -84,15 +84,17 @@
 //!
 //! **An unguarded Enter after a paste is never safe for U8/U9b.** A prior capture
 //! is not authorization: a dialog or shell may replace the editor while a key
-//! waits in the actor queue. Both guarded forms re-capture and invoke the caller's
+//! waits in the actor queue. All guarded forms re-capture and invoke the caller's
 //! pure, quick predicate in the same actor turn as the effect. Use predicates,
 //! not whole-frame equality: harmless counters/spinners may change. This closes
 //! the actor-queue gap, not races with external harness redraws or tmux clients.
 //! Before either predicate or input, fresh metadata refuses dead panes, any mode,
-//! and multiline paste when bracketed paste is explicitly off (U7's rule).
+//! synchronize-panes, input-off, and multiline paste when bracketed paste is
+//! explicitly off (U7's rule). These are PaneInputRefused: nothing was sent.
 //! tmux before 3.7 reports no flag: unknown remains allowed, not a guarantee
 //! against line submission. Reserved paste rejects ASCII control bytes except
-//! tab, LF and CR, including injected bracketed-paste terminators on older tmux.
+//! tab, LF and CR, including injected bracketed-paste terminators: both tmux 3.6
+//! and 3.8 pass those bytes through unchanged.
 //!
 //! Do not call legacy `send` or `type_spawn_command` inside a reservation: those
 //! paths wait behind its ownership. Use reserved guarded paste/keys instead.
@@ -105,9 +107,10 @@
 //! unavailable. Org projection catch-up also parks outside tmux turns, within the
 //! same deadline. Parked legacy input yields to reservation waiters on its pane,
 //! even later arrivals; a steady stream of them can starve it until Timeout.
-//! A dropped caller does not cancel admitted parked input: it can still start
-//! within its original deadline. After the first effect, Enter is completed under
-//! the tmux client's timeout, even if the caller's response budget has expired.
+//! A legacy send whose caller is gone before its first effect is discarded,
+//! including after pre-effect reads. Spawn typing retains daemon-owned admission.
+//! After the first effect, Enter is completed under the tmux client's timeout,
+//! even if the caller disconnects or its response budget expires.
 //! An excluded old session
 //! prefix becomes NoSession after clear, never input redirected to the new editor.
 //! Quarantine and unavailable org state on tagged/unknown-ownership panes fail
@@ -257,7 +260,8 @@ fn optional_pane(pane: &Option<PaneId>) -> &str {
     pane.as_ref().map_or("no pane", PaneId::as_str)
 }
 
-/// The entire nonliteral-key surface. Text belongs in [`Reservation::paste`].
+/// The entire nonliteral-key surface. Single literal characters use
+/// [`Reservation::literal_key_guarded`]; text belongs in [`Reservation::paste`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneKey {
     Enter,
@@ -283,6 +287,10 @@ pub struct PaneInspection {
     pub local_agent_tag: Option<String>,
     pub dead: bool,
     pub in_mode: bool,
+    /// Window synchronization would fan keys out to sibling panes.
+    pub synchronized: bool,
+    /// tmux would silently drop input to this pane.
+    pub input_off: bool,
     /// None means unknown (for example, a tmux version without this format).
     pub bracketed_paste: Option<bool>,
     /// Zero-based terminal-cell coordinates, not UTF-8 offsets.
@@ -291,8 +299,13 @@ pub struct PaneInspection {
     /// Foreground PID, not a process group. tmux 3.6/3.8 do not expose it:
     /// None must not be replaced by pane_pid or inferred from a command name.
     pub foreground_pid: Option<u32>,
-    /// Raw pane_current_command, not proof of shell/editor identity. With job
-    /// control disabled tmux can report the root command while a child runs.
+    /// Neutral pane_current_command, never proof that the shell is back. A
+    /// same-named wrapper can report the shell while its child runs, even with
+    /// job control enabled. A dead pane can report its start command; immediately
+    /// after creation the name can transiently be tmux or a wrapper shell.
+    /// U8 reads procfs once for its baseline, outside any guard; these facts alone
+    /// cannot establish positive shell/editor identity. Empty or control-bearing
+    /// names are None; mutation prechecks do not read this process-controlled field.
     pub foreground_command: Option<String>,
 }
 
@@ -313,6 +326,8 @@ impl PaneInspection {
             local_agent_tag,
             dead,
             in_mode,
+            synchronized: false,
+            input_off: false,
             bracketed_paste,
             cursor_column,
             cursor_row,
@@ -322,6 +337,7 @@ impl PaneInspection {
     }
 
     /// The tmux pane's root process, not necessarily its interactive shell.
+    /// None when unavailable; tmux 3.8 reports no PID for a dead pane.
     #[must_use]
     pub fn pane_root_pid(&self) -> Option<u32> {
         (self.pane.pane_pid != 0).then_some(self.pane.pane_pid)
@@ -355,7 +371,7 @@ impl PaneInspection {
 /// no bytes if the pane disappears after metadata; no external-client CAS is
 /// promised. Mutations of that missing canonical pane fail, never retarget.
 /// Grouped/linked metadata accepts agreeing pane fields, retaining the first
-/// line's session/window. Versions 3.6a and 3.4 remain unverified.
+/// line's session/window. tmux 3.4 remains unverified.
 ///
 /// Preserve meaningful whitespace and rows. A consumer may construct its
 /// shared ScreenCursor from the inspection's coordinates when its adapter
@@ -376,7 +392,11 @@ pub struct PaneCapture {
     pub text: String,
     pub inspection: PaneInspection,
     pub format: CaptureFormat,
-    /// Any client with the exact focused flag showing this canonical pane.
+    /// Any client with the exact focused flag selecting this canonical pane:
+    /// the active pane of its current window, not every visible pane. A visible
+    /// inactive pane can therefore be Some(false). Control-mode clients are always
+    /// focused. With focus-events off (tmux's default), tty clients stay focused;
+    /// focus-out is observed only when enabled and the terminal sends ESC[O.
     /// Some(false) is observed absence; None is unknown, never permission.
     /// Sampled in the frame's command list. A client may move before an effect.
     pub focused: Option<bool>,
@@ -420,8 +440,10 @@ impl ControlHandle {
     /// Includes metadata, local tag, viewport (-N, optionally styled), focus and
     /// neutral process facts. Captures of one pane are paced at least 250ms apart,
     /// including guarded input, without blocking other panes. No cached frame is
-    /// returned. The scheduler bounds pending captures and recent pane keys to
-    /// 32 each; overflow is Unavailable. The original 30-second deadline includes
+    /// returned. At most 32 captures wait per pane, across at most 32 recent pane
+    /// keys. Overflow is PacingRefused (nothing was sent); a burst on one pane
+    /// cannot fill another pane's wait list. Await each observation rather than
+    /// repeatedly dropping/reissuing it. The original 30-second deadline includes
     /// pacing/queue time.
     /// U8 owns any spawn/adopt shell identity baseline and its interpretation;
     /// a command-name match alone is not positive process identity evidence.
@@ -658,6 +680,43 @@ impl Reservation {
         .await
     }
 
+    /// Send one printable ASCII character (space through `~`), never an Enter
+    /// or a paste. Other characters return InvalidRequest before dispatch.
+    ///
+    /// Same fresh capture, pacing, fence, tag, input-safety and pure predicate
+    /// contract as [`Self::keys_guarded`]. The consumer must authorize the
+    /// foreground process, focus and screen on that capture; this effect does
+    /// not infer dialog permission. There is deliberately no unguarded form.
+    ///
+    /// Uses one `send-keys -l -t <pane> -- <character>` command (tmux's command
+    /// parser requires escaping a semicolon). Success acknowledges tmux, not
+    /// the application. Errors may leave the outcome unknown; never retry
+    /// blindly. No automatic retry or additional key is sent.
+    pub async fn literal_key_guarded<P>(
+        &self,
+        pane: &PaneId,
+        expected: AgentId,
+        key: char,
+        format: CaptureFormat,
+        check: P,
+    ) -> Result<(), ReservationError>
+    where
+        P: FnOnce(&PaneCapture) -> bool + Send + 'static,
+    {
+        if !(key.is_ascii_graphic() || key == ' ') {
+            return Err(ReservationError::InvalidRequest {
+                reason: "literal key must be one printable ASCII character".into(),
+            });
+        }
+        self.effect(pane_ops::Action::Input {
+            pane: pane.clone(),
+            expected,
+            input: pane_ops::Input::LiteralKey(key),
+            guard: Some((format, Box::new(check))),
+        })
+        .await
+    }
+
     /// Re-capture, run a caller-supplied pure screen check, then paste literal
     /// text without a separate Enter key (see [`Self::paste`] for the pre-3.7
     /// multiline limit). Same actor-turn, predicate and failure contract as
@@ -776,6 +835,9 @@ impl Reservation {
 /// | Busy | Before effect (admission) | Before effect (admission) |
 /// | StaleReservation | Before effect | Before effect |
 /// | ScreenChanged | Before effect | Before effect |
+/// | PacingRefused | Before effect | Before effect |
+/// | PaneInputRefused | Before effect (state can change) | Before effect |
+/// | UnsafePaste | Before effect (permanent for this text) | Before effect |
 /// | TagMismatch | Before effect | Before effect |
 /// | PaneGone | Before effect | Before effect |
 /// | InvalidObservation | Before effect | Before effect |
@@ -813,6 +875,18 @@ pub enum ReservationError {
     /// Before effect: the fresh predicate rejected (or panicked); no input sent.
     #[error("pane {pane} no longer passes the approved screen check; nothing was sent")]
     ScreenChanged { pane: PaneId },
+    /// Before effect: capture pacing capacity refused this call. Nothing was sent
+    /// or mutated; retry after pending observations drain, not by flooding the queue.
+    #[error("capture pacing refused pane {pane}; nothing was sent")]
+    PacingRefused { pane: PaneId },
+    /// Before effect: pane state refuses input. Nothing was sent; retry only
+    /// after the state changes (for example, copy mode exits).
+    #[error("pane {pane} refuses input: {reason}; nothing was sent")]
+    PaneInputRefused { pane: PaneId, reason: &'static str },
+    /// Before effect: text contains unsupported control bytes. Nothing was sent;
+    /// retrying the same text cannot succeed, regardless of pane state.
+    #[error("paste text for pane {pane} contains unsafe control bytes; nothing was sent")]
+    UnsafePaste { pane: PaneId },
     /// Before effect: mutation-time local tag did not match the expectation.
     #[error("pane {pane} tag mismatch: expected {expected}, found {}", actual.as_deref().unwrap_or("absent"))]
     TagMismatch {
@@ -841,10 +915,10 @@ pub enum ReservationError {
     #[error("reserved control operation timed out; admitted effects may have completed")]
     Timeout,
     /// Uncertain in general: tmux failure may follow a partial or complete effect.
-    /// Exception: SendRefused is before effect. Mode/dead-pane, explicit-off
-    /// multiline and unsafe-control-byte refusals all run before the predicate
-    /// and before any input; they send nothing. Other Control variants must not
-    /// be assumed pre-effect without a more specific caller contract.
+    /// Exception: SendRefused is before effect, but reserved input uses the
+    /// explicit PaneInputRefused and UnsafePaste variants instead. They run before
+    /// the predicate and any input. Other Control variants must not be assumed
+    /// pre-effect without a more specific caller contract.
     #[error(transparent)]
     Control(#[from] ControlError),
 }
@@ -856,3 +930,58 @@ mod tests;
 #[cfg(test)]
 #[path = "reservation_tests.rs"]
 mod ownership_tests;
+
+#[cfg(test)]
+mod literal_fence_tests {
+    use super::*;
+    use atm_tmux::MockTmuxClient;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn literal_key_guarded_cannot_use_another_actors_fence() {
+        let cancel = CancellationToken::new();
+        let mock = MockTmuxClient::new();
+        let spawn = || {
+            super::super::service::spawn_control(
+                Box::new(mock.clone()),
+                crate::registry::spawn_registry(),
+                crate::org::OrgHandle::disabled("literal fence test"),
+                cancel.clone(),
+            )
+        };
+        let (control, actor) = spawn();
+        let (foreign, other_actor) = spawn();
+        control
+            .run_reserved(
+                ReservationRequest::new(
+                    "project/lead".parse().unwrap(),
+                    Some(PaneId::parse("%0").unwrap()),
+                    ReservationKind::Up,
+                    WaitPolicy::Wait,
+                    Instant::now() + std::time::Duration::from_secs(60),
+                ),
+                move |mut r| async move {
+                    // Only unit tests can forge this cross-actor capability.
+                    r.control = foreign;
+                    let result = r
+                        .literal_key_guarded(
+                            &PaneId::parse("%0")?,
+                            r.agent().clone(),
+                            't',
+                            CaptureFormat::Plain,
+                            |_| panic!("foreign fence reached predicate"),
+                        )
+                        .await;
+                    assert!(matches!(result, Err(ReservationError::StaleReservation)));
+                    Ok::<_, ReservationError>(())
+                },
+                |_, _| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        assert!(mock.calls().is_empty());
+        cancel.cancel();
+        actor.await.unwrap();
+        other_actor.await.unwrap();
+    }
+}

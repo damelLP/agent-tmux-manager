@@ -146,10 +146,14 @@ pub enum HistoryUpdate {
         pane: Option<PaneId>,
     },
     /// After this attempted sequence is applied and before input dispatch.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     Armed { scope: AttemptScope },
     /// Retained facts; absence/false is not permission to clear a prior latch.
     /// Only a new arm or explicit matching owner retry can release that latch.
     /// probably_landed for a message with no attempt is a `Conflict`.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     Evidence {
         id: MessageId,
         receipt: Option<DeliveryReceipt>,
@@ -175,6 +179,8 @@ pub enum HistoryUpdate {
     /// Latch probably_landed and this diagnostic for the matching attempted log
     /// sequence. Only an Armed for another attempt or a matching OwnerRetry
     /// releases it; the first Armed of this same attempt does not.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     Held {
         id: MessageId,
         attempt_seq: u64,
@@ -182,6 +188,8 @@ pub enum HistoryUpdate {
     },
     /// Release only this matching attempt's transient hold, never its durable
     /// attempt count or late-receipt scopes. A stale attempt sequence refuses.
+    /// For a delivered message this is a `Conflict`: evaluate again; its
+    /// snapshot then answers `Complete`.
     OwnerRetry { id: MessageId, attempt_seq: u64 },
 }
 
@@ -277,15 +285,17 @@ impl Queue {
             .find(|other| *other != id)
     }
 
-    /// The reservation first, else the FIFO head while it is older than `id`.
+    /// The reservation first, else the older FIFO head if `id` is not itself
+    /// in flight: its retry must not wait on an unattempted head.
     /// Either one is the policy's veto (`other_delivery_in_flight`), so a
     /// follower is answered `Wait(OtherDelivery)` and `Consumed` refuses its
     /// paste: FIFO holds before any first attempt too. That wait is no hold:
     /// a follower's readiness budget and stale-blocker bound start when it
     /// becomes the head, not while it waits its turn.
     fn blocked_by(&self, id: MessageId) -> Option<MessageId> {
-        self.other_in_flight(id)
-            .or(self.head.filter(|head| *head < id))
+        self.other_in_flight(id).or(self
+            .head
+            .filter(|head| *head < id && !self.in_flight.contains(&Some(id))))
     }
 }
 
@@ -667,6 +677,7 @@ impl MessageHistory {
             return Ok(());
         };
         let open = self.open.entry(recipient.clone()).or_default();
+        let previous_head = open.first().copied();
         if matches!(
             message.status,
             DeliveryStatus::Queued | DeliveryStatus::Delivering
@@ -674,6 +685,14 @@ impl MessageHistory {
             open.insert(id);
         } else {
             open.remove(&id);
+        }
+        if seq > self.startup_high_water && open.first().copied() != previous_head {
+            // A live promotion starts a fresh readiness budget even if nobody
+            // consumed the replayed follower's wait. During replay the head
+            // keeps its recovery-time budget instead.
+            if let Some(track) = open.first().and_then(|head| self.messages.get_mut(head)) {
+                track.hold_since = None;
+            }
         }
         if message.status == DeliveryStatus::Delivered {
             // Terminal. A failed message keeps its continuity instead: a late
@@ -901,9 +920,16 @@ impl MessageHistory {
                 if probably_landed {
                     // Nothing can have landed before an attempt, and the policy
                     // would refuse that state for ever with nothing to release it.
-                    let attempt = track.last_attempt_seq.ok_or_else(|| {
-                        MessageError::Conflict("message has no attempt that could land".into())
-                    })?;
+                    // A copy before the new arm still belongs to the old scope,
+                    // even if the next attempt has already been folded.
+                    let attempt = track
+                        .scope
+                        .as_ref()
+                        .map(|scope| scope.attempt_seq)
+                        .or(track.last_attempt_seq)
+                        .ok_or_else(|| {
+                            MessageError::Conflict("message has no attempt that could land".into())
+                        })?;
                     track.latch.get_or_insert(attempt);
                 }
                 if receipt.is_some() {

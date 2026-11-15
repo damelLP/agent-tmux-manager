@@ -1,0 +1,5 @@
+{
+  "capture": "Captured: tmux 3.6, 2026-11-14, private control-client attach and refresh-client -f pause-after=5; pane id sanitized.",
+  "attached": "attached,focused,control-mode,UTF-8\t%0\n",
+  "paused": "attached,focused,control-mode,pause-after=5,UTF-8\t%0\n"
+}

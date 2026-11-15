@@ -156,7 +156,8 @@ class ProtectedFiles(Sealed):
                                   'crates/future/tests/fixtures/golden.jsonl': 'A'})
 
     def test_hooks_and_clippy_config_changes_are_protected(self):
-        paths = ('.githooks/pre-commit', '.githooks/pre-push', 'clippy.toml')
+        paths = ('.githooks/pre-commit', '.githooks/pre-push',
+                 '.githooks/commit-msg', 'clippy.toml')
         (self.repo / '.githooks').mkdir()
         for path in paths:
             (self.repo / path).write_text('before')
@@ -269,17 +270,19 @@ if mode == 'failure':
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 return atm_promotion.main(operation)
 
-    # Missing either rename or setup's exact destination invocation breaks this.
+    # Missing either rename or setup's destination/socket override breaks this.
     def test_promote_and_idempotent_rollback_keep_regular_pairs_and_setup_routing(self):
-        self.call(env=dict(self.env, TMUX='foreign', TMUX_PANE='%99'))
+        inherited = dict(self.env, ATM_SOCKET=str(self.root / 'inherited.sock'),
+                         TMUX='foreign', TMUX_PANE='%99')
+        self.call(env=inherited)
         self.assertEqual(self.pair_bytes(self.bin), self.new)
         self.assertEqual(self.pair_bytes(self.previous()), self.old)
         self.assertFalse((self.bin / 'atm').is_symlink())
         self.assertFalse((self.bin / 'atmd').is_symlink())
-        self.call('rollback')
+        self.call('rollback', env=inherited)
         archives = list((self.bin / '.atm-promotion/pairs').iterdir())
         self.assertIn(self.new, [self.pair_bytes(path) for path in archives])
-        self.call('rollback')
+        self.call('rollback', env=inherited)
         self.assertEqual(list((self.bin / '.atm-promotion/pairs').iterdir()), archives)
         self.assertEqual(self.pair_bytes(self.bin), self.old)
         records = self.records()
@@ -540,22 +543,34 @@ if mode == 'failure':
         self.assertEqual(self.pair_bytes(self.bin), self.old)
         self.assertEqual(self.records(), [])
 
-    def child(self, executable, env):
-        # cat blocks on a pipe, not a timing guess. /proc/exe identifies our copy.
-        process = subprocess.Popen([str(executable)], env=env, stdin=subprocess.PIPE,
+    def child(self, executable, env, *args):
+        # Both holders echo pipe input to signal readiness and exit on stdin EOF.
+        process = subprocess.Popen([str(executable), *args], env=env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         def cleanup():
             process.stdin.close()
-            process.wait(timeout=30)
+            self.assertEqual(process.wait(timeout=30), 0)
             process.stdout.close(); process.stderr.close()
         self.addCleanup(cleanup)
         process.stdin.write(b'ready\n'); process.stdin.flush()
         self.assertEqual(process.stdout.readline(), b'ready\n')
         return process
 
+    def installed_child(self, env):
+        # A renamed multi-call cat can refuse to start; the running Python is portable.
+        executable = self.bin / 'atmd'
+        shutil.copy2(sys.executable, executable)
+        process = self.child(executable, env, '-I', '-S', '-c',
+                             'import sys\nfor line in sys.stdin.buffer:\n'
+                             '    sys.stdout.buffer.write(line); sys.stdout.buffer.flush()')
+        proc = Path('/proc') / str(process.pid)
+        self.assertEqual(os.readlink(proc / 'exe'), str(executable))
+        self.assertEqual((proc / 'comm').read_text().strip(), 'atmd')
+        self.assertEqual((proc / 'cmdline').read_bytes().split(b'\0')[0], os.fsencode(executable))
+        return process
+
     def test_running_installed_binary_refuses_but_foreign_process_does_not(self):
-        shutil.copy2('/bin/cat', self.bin / 'atmd')
-        process = self.child(self.bin / 'atmd', dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
+        process = self.installed_child(dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
         self.call(ok=False)
         self.assertIsNone(process.poll())
         process.stdin.close(); process.wait(timeout=30)
@@ -575,8 +590,7 @@ if mode == 'failure':
             return real_readlink(path, *args, **kwargs)
         with patch.object(atm_promotion.os, 'readlink', side_effect=readlink):
             self.assertEqual(self.in_process(), 0)
-        shutil.copy2('/bin/cat', self.bin / 'atmd')
-        relevant = self.child(self.bin / 'atmd', dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
+        relevant = self.installed_child(dict(self.env, ATM_SOCKET=str(self.root / 'other.sock')))
         denied = Path(f'/proc/{relevant.pid}/exe')
         with patch.object(atm_promotion.os, 'readlink', side_effect=readlink):
             self.assertNotEqual(self.in_process(), 0)

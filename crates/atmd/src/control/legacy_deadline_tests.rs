@@ -8,9 +8,24 @@ enum DelayAt {
     Command,
     State,
 }
+type Pause = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Semaphore>,
+);
 struct DelayedClient {
     mock: MockTmuxClient,
     at: DelayAt,
+    pause: Option<Pause>,
+}
+impl DelayedClient {
+    async fn delay(&self) {
+        if let Some((entered, release)) = &self.pause {
+            entered.notify_one();
+            release.acquire().await.unwrap().forget();
+        } else {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }
 
 type Call<'a, T> = std::pin::Pin<Box<dyn Future<Output = Result<T, TmuxError>> + Send + 'a>>;
@@ -23,6 +38,9 @@ macro_rules! forward {
         }
     };
 }
+#[path = "legacy_disconnect_tests.rs"]
+mod disconnect_tests;
+
 impl TmuxClient for DelayedClient {
     fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
         &'s self,
@@ -39,9 +57,9 @@ impl TmuxClient for DelayedClient {
         Box::pin(async move {
             let result = self.mock.raw_command(command, args).await;
             if matches!(self.at, DelayAt::State)
-                && args.contains(&"#{pane_in_mode} #{bracket_paste_flag}")
+                && args.contains(&crate::control::send::STATE_FORMAT)
             {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.delay().await;
             }
             result
         })
@@ -60,7 +78,7 @@ impl TmuxClient for DelayedClient {
         Box::pin(async move {
             let result = self.mock.paste_text(pane, text).await;
             if matches!(self.at, DelayAt::Paste) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.delay().await;
             }
             result
         })
@@ -79,12 +97,12 @@ impl TmuxClient for DelayedClient {
         Box::pin(async move {
             let result = self.mock.send_keys(pane, keys).await;
             if matches!(self.at, DelayAt::Command) && keys != "Enter" {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.delay().await;
             }
             result
         })
     }
-    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>) -> String);
+    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
     forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
     forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
     forward!(kill_pane<'a>(pane: &'a str) -> ());
@@ -96,6 +114,64 @@ impl TmuxClient for DelayedClient {
     forward!(new_session<'a>(name: &'a str) -> String);
 }
 
+async fn drop_caller_at(at: DelayAt) {
+    let mock = MockTmuxClient::new();
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(DelayedClient {
+            mock: mock.clone(),
+            at,
+            pause: Some((entered.clone(), release.clone())),
+        }),
+        crate::registry::spawn_registry(),
+        OrgHandle::disabled("drop caller"),
+        cancel.clone(),
+    );
+    untagged(&mock, "%1");
+    mock.set_next_raw_output("0 1");
+    let c = control.clone();
+    let send = tokio::spawn(async move { c.send("%1".into(), "once".into()).await });
+    entered.notified().await;
+    send.abort();
+    let _ = send.await;
+    release.add_permits(1);
+    control.flush_audits().await;
+    if matches!(at, DelayAt::State) {
+        assert!(input_calls(&mock).is_empty());
+    } else {
+        assert_eq!(
+            input_calls(&mock),
+            vec![
+                MockCall::PasteText {
+                    pane: "%1".into(),
+                    text: "once".into()
+                },
+                MockCall::SendKeys {
+                    pane: "%1".into(),
+                    keys: "Enter".into()
+                }
+            ]
+        );
+    }
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn dropped_send_caller_during_state_read_never_pastes() {
+    tokio::time::timeout(Duration::from_secs(30), drop_caller_at(DelayAt::State))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn dropped_send_caller_after_paste_still_finishes_enter() {
+    tokio::time::timeout(Duration::from_secs(30), drop_caller_at(DelayAt::Paste))
+        .await
+        .unwrap();
+}
+
 async fn near_deadline(at: DelayAt) {
     let mock = MockTmuxClient::new();
     let cancel = CancellationToken::new();
@@ -103,6 +179,7 @@ async fn near_deadline(at: DelayAt) {
         Box::new(DelayedClient {
             mock: mock.clone(),
             at,
+            pause: None,
         }),
         crate::registry::spawn_registry(),
         OrgHandle::disabled("test"),

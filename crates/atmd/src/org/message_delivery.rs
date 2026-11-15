@@ -6,9 +6,11 @@
 
 use super::message_history::{EffectCertainty, ExecutorHold};
 use super::messages::{MessageError, MessageRuntime};
-use crate::control::reservation::ReservationError;
-use atm_core::{DialogState, InputState, ScreenFacts, TurnState};
-use atm_org::MessageId;
+use crate::control::reservation::{CaptureFormat, PaneCapture, ReservationError};
+use atm_core::{
+    styled_screen::StyledScreen, DialogState, InputState, ScreenFacts, SessionId, TurnState,
+};
+use atm_org::{AgentStatus, MessageId};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -209,6 +211,49 @@ pub fn cleanup_succeeds(disposition: AttemptDisposition, settled: Settled) -> bo
         AttemptDisposition::Hold(_) => settled == Settled::Held,
         AttemptDisposition::Unaccountable => false,
     }
+}
+
+/// Whether the message's `[mN]` token is on the screen. For a hold's reason
+/// only: an absent token never proves that nothing was typed.
+///
+/// Neutral: the shared style decoder and no adapter. The token is searched in
+/// the decoded text with the rows joined, so neither a style change nor a row
+/// break inside it hides it. `None`: a styled capture that does not decode.
+#[must_use]
+pub fn token_visible(capture: &PaneCapture, id: MessageId) -> Option<bool> {
+    let decoded;
+    let text = match capture.format {
+        CaptureFormat::Plain => capture.text.as_str(),
+        CaptureFormat::Ansi => {
+            decoded = StyledScreen::parse(&capture.text).ok()?;
+            decoded.text()
+        }
+    };
+    Some(text.replace('\n', "").contains(&format!("[{id}]")))
+}
+
+/// The session an attempt may be confirmed against: `Some` for a bound agent,
+/// `None` for a lazy first prompt. From the agent's recorded status and
+/// binding and the pane's one eligible row, all read in one snapshot.
+///
+/// Only a Ready agent takes a delivery. A recorded binding must be the pane's
+/// eligible row: no row, or another one, means the binding is stale. Without
+/// a binding only a pane with no eligible row is attempted: a row the agent
+/// is not bound to proves nothing yet.
+pub fn attempt_session(
+    status: AgentStatus,
+    recorded: Option<&SessionId>,
+    eligible: Option<&SessionId>,
+) -> Result<Option<SessionId>, MessageError> {
+    if status != AgentStatus::Ready {
+        return Err(MessageError::Refused("recipient is not ready".into()));
+    }
+    if recorded != eligible {
+        return Err(MessageError::Refused(
+            "recipient's recorded session is not the pane's eligible session".into(),
+        ));
+    }
+    Ok(recorded.cloned())
 }
 
 /// Execute at most one attempt; B supplies the implementation after seam review.

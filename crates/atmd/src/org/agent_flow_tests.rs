@@ -2240,6 +2240,52 @@ fn submit_refuses_focused_or_unknown_focus() {
 }
 
 #[test]
+fn a_safe_editor_is_empty_idle_and_has_no_dialog_of_either_kind() {
+    // Real frames: an idle editor of each harness, with and without a
+    // conversation.
+    for (harness, fixture) in [
+        (Harness::ClaudeCode, CLAUDE_CONVERSATION),
+        (Harness::ClaudeCode, CLAUDE_CLEARED),
+        (Harness::Codex, CODEX_CONVERSATION),
+        (Harness::Codex, CODEX_FRESH),
+        (Harness::Pi, PI_CONVERSATION),
+        (Harness::Pi, PI_FRESH),
+    ] {
+        assert!(safe_editor(&screen(harness, fixture)), "{harness:?}");
+    }
+    for (harness, fixture) in [
+        (Harness::ClaudeCode, CLAUDE_OTHER_DRAFT),
+        (Harness::ClaudeCode, CLAUDE_MODAL),
+        (Harness::ClaudeCode, CLAUDE_TRUST),
+        (Harness::Codex, CODEX_WORKING),
+        (Harness::Codex, CODEX_WORKTREE),
+        (Harness::Pi, PI_RETRY),
+        (Harness::Pi, PI_SELECTOR),
+    ] {
+        assert!(!safe_editor(&screen(harness, fixture)), "{harness:?}");
+    }
+    assert!(!safe_editor(&ControlScreen::default()));
+    // Synthetic: no adapter reports an idle editor together with a control
+    // dialog today, so each of the four conditions is changed alone on a real
+    // idle read.
+    let idle = screen(Harness::Pi, PI_FRESH);
+    let changed = |change: &dyn Fn(&mut ControlScreen)| {
+        let mut control = idle.clone();
+        change(&mut control);
+        control
+    };
+    for control in [
+        changed(&|c| c.dialog = ControlDialog::Blocked),
+        changed(&|c| c.dialog = ControlDialog::Unknown),
+        changed(&|c| c.facts.input = atm_core::InputState::Draft),
+        changed(&|c| c.facts.turn = atm_core::TurnState::Running),
+        changed(&|c| c.facts.dialog = atm_core::DialogState::Other),
+    ] {
+        assert!(!safe_editor(&control), "{control:?}");
+    }
+}
+
+#[test]
 fn codex_noop_needs_all_three() {
     let read = |harness, fixture| screen(harness, fixture);
     let codex = policy(Harness::Codex);

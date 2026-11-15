@@ -927,6 +927,100 @@ async fn launch_enter_outcome_unknown_never_repeats_enter() {
 }
 
 #[tokio::test]
+async fn a_launch_guard_refusal_that_sent_nothing_is_not_an_unknown_outcome() {
+    // As for a clear: copy mode on the capture of the paste's guard, or of
+    // the Enter's, sent nothing and is looked at again; a pane that carries
+    // another tag by then stops the start, saying that nothing was sent.
+    // Twin with an uncertain error: launch_enter_outcome_unknown_never_repeats_enter.
+    let copy_mode = |mut capture: PaneCapture| {
+        capture.inspection.in_mode = true;
+        capture
+    };
+    let mut starting = Starting::new(Harness::Codex).await;
+    starting.script_pane();
+    starting.frame(Starting::shell(PROMPT));
+    starting.frame(Starting::shell(PROMPT));
+    starting.frame(copy_mode(Starting::shell(PROMPT)));
+    starting.script_paste();
+    starting.frame(starting.staged());
+    starting.frame(copy_mode(starting.staged()));
+    starting.frame(starting.staged());
+    starting.frame(starting.staged());
+    starting.frame(Starting::screen(CODEX_FRESH, "codex"));
+    let result = starting.up().await.unwrap();
+    assert_eq!(result.state, AgentStatus::Ready);
+    assert_eq!(starting.effects(), starting.launched());
+    assert_eq!(starting.unread(), 0);
+
+    for (at_paste, what, sent) in [
+        (true, "typing the launch command", 2),
+        (false, "running the launch command", 3),
+    ] {
+        let other_tag = |mut capture: PaneCapture| {
+            capture.inspection.local_agent_tag = Some("q/other".into());
+            capture
+        };
+        let mut starting = Starting::new(Harness::Codex).await;
+        starting.script_pane();
+        starting.frame(Starting::shell(PROMPT));
+        starting.frame(Starting::shell(PROMPT));
+        if at_paste {
+            starting.frame(other_tag(Starting::shell(PROMPT)));
+        } else {
+            starting.frame(Starting::shell(PROMPT));
+            starting.frame(starting.staged());
+            starting.frame(other_tag(starting.staged()));
+        }
+        let result = starting.up().await;
+        assert!(
+            matches!(result, Err(AgentError::Reservation(_))),
+            "{result:?}"
+        );
+        assert_eq!(starting.effects().len(), sent, "{:?}", starting.effects());
+        let reason = starting.agent().await.unwrap().reason.unwrap_or_default();
+        assert!(
+            reason.starts_with(&format!(
+                "{START}: {what} was refused, and nothing was sent by it (pane %1 tag mismatch"
+            )),
+            "{reason}"
+        );
+        assert_eq!(starting.unread(), 0);
+    }
+}
+
+#[tokio::test]
+async fn launch_enter_that_never_answers_is_reported_as_unknown() {
+    // tmux takes the Enter and its call never returns. The call's own limit
+    // answers before the start's deadline: the Enter is not repeated, and the
+    // reason says that it may have reached the pane. (With less than that
+    // limit left the deadline comes first; the flow names the Enter before it
+    // sends it, as the clear's test of this shows.)
+    let mut starting = Starting::new(Harness::Codex).await;
+    starting.script_launch();
+    let call = starting.start().await;
+    progress(&mut starting.events, "up_running", Some("q/lead")).await;
+    starting.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(starting.effects(), starting.launched());
+    let reason = starting.agent().await.unwrap().reason.unwrap_or_default();
+    assert!(
+        reason.starts_with(&format!(
+            "{START}: running the launch command failed, and whether it reached the pane is unknown"
+        )),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
 async fn shell_named_harness_is_stuck_not_ready() {
     // After the Enter the pane shows the harness's editor while tmux still
     // names the shell as its foreground program (a wrapper under the shell's

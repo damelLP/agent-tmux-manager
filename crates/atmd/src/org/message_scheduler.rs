@@ -728,6 +728,9 @@ impl Job {
                     })
                     .await?;
                 if !failed.is_empty() {
+                    // On the board from here on, so that its notice key is
+                    // forgotten with it.
+                    self.shown.insert(id);
                     let body =
                         format!("{id} failed: {reason}. Send it again if it is still needed");
                     self.publish(id, &format!("failed: {reason}"), note(body))

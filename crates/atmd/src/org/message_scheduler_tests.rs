@@ -932,6 +932,29 @@ async fn final_failure_outside_an_attempt_tells_the_owner() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn failure_on_the_first_evaluation_leaves_no_notice_key() {
+    let bench = Bench::blind().await;
+    let gone = with(ready("%1", "s1"), |o| o.presence = PanePresence::Gone);
+    bench.screens.set(worker(), gone);
+    bench.send(worker(), "brief").await;
+    bench.pass(120).await;
+    // The pane has been gone for longer than the grace: the next message
+    // fails on its first evaluation, before anything was shown for it.
+    let next = bench.send(worker(), "next").await;
+    bench.pass(120).await;
+    assert_eq!(
+        bench.entry(worker(), next).await.status,
+        DeliveryStatus::Failed
+    );
+    assert_eq!(bench.notes().await.len(), 2);
+    // Both are told and gone: the board keeps nothing about either.
+    let service = bench.rig.messages.service().unwrap();
+    let shared = service.board.shared.lock().unwrap();
+    assert!(shared.noticed.is_empty(), "{:?}", shared.noticed);
+    assert!(shared.progress.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn unconfirmed_attempts_retry_with_the_same_id_up_to_the_limit() {
     let mut bench = Bench::new().await;
     let id = bench.send(worker(), "brief").await;

@@ -6,7 +6,9 @@
 //! Delivery must independently check the screen before input.
 //! A Stuck agent recovers only when one observation finds its session row and
 //! captures a safe editor; a binding alone never clears Stuck.
-//! Lifecycle effects remain unavailable until the flow slice is installed.
+//! The lifecycle flows (`agent_lifecycle`) run as jobs admitted here: down,
+//! adopt and clear act on panes; up and respawn are not built yet and answer
+//! "not implemented" after admission.
 
 pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
@@ -175,7 +177,10 @@ pub struct Recipient {
     /// The agent's excluded (old) session: a session that appears later must
     /// not be this one.
     pub excluded: Option<SessionId>,
-    /// The single eligible parent session on the pane; `None` when there is none.
+    /// The pane's one eligible parent session row; `None` when there is none.
+    /// It is what the registry shows on the pane now and may differ from the
+    /// session the agent is recorded as bound to: a new session the observer
+    /// has not bound yet, or a binding whose row is not announced yet.
     pub session: Option<SessionView>,
 }
 

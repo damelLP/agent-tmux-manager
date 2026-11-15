@@ -621,7 +621,13 @@ async fn up_failure_at_each_step_stops_later_effects() {
         starting.effects(),
         ["split %0 Below detached=true command=None"]
     );
-    assert_down_without_pane(&mut starting, "its pane was not created").await;
+    // tmux answered the split with something that names no pane: whether it
+    // made one is not known, and the reason does not say that there is none.
+    assert_down_without_pane(
+        &mut starting,
+        "its pane may have been created and is not recorded",
+    )
+    .await;
 
     // The new pane already carries a tag: it is not tagged, recorded or typed into.
     let mut starting = Starting::new(Harness::Pi).await;
@@ -847,6 +853,22 @@ async fn launch_line_with_typed_prefix_sends_no_enter() {
         cases.push((
             "the prompt was drawn again",
             Starting::shell(&format!("pb (main)> {}", starting.text)),
+            not_staged.clone(),
+        ));
+        // The right length, and only one of the two parts right: the line
+        // is compared whole, not by its length and one end.
+        cases.push((
+            "another prompt of the same length",
+            Starting::shell(&format!("pc> {}", starting.text)),
+            not_staged.clone(),
+        ));
+        let mut other_text = starting.text.clone();
+        other_text.replace_range(..1, "x");
+        assert_eq!(other_text.len(), starting.text.len());
+        assert_ne!(other_text, starting.text);
+        cases.push((
+            "another command of the same length",
+            Starting::shell(&format!("{PROMPT}{other_text}")),
             not_staged,
         ));
         let mut other_root = starting.staged();
@@ -1084,6 +1106,47 @@ async fn launch_enter_that_never_answers_is_reported_as_unknown() {
         )),
         "{reason}"
     );
+}
+
+#[tokio::test]
+async fn deadline_during_the_launch_enter_says_the_command_may_have_run() {
+    // Somebody is focused on the new pane for forty of the start's sixty
+    // seconds, after the prompt was read (a refused paste guard and the
+    // flow's look at the pane, a paced capture each quarter second on the
+    // paused clock), then leaves. The command is typed, and its Enter goes
+    // out with less time left than the call's own limit; tmux never answers
+    // it. The start's deadline ends the flow while the Enter is out, and the
+    // reason names the Enter, not the step before it. (With more time left
+    // the call's limit answers first:
+    // launch_enter_that_never_answers_is_reported_as_unknown.)
+    let mut starting = Starting::new(Harness::Codex).await;
+    starting.script_pane();
+    starting.frame(Starting::shell(PROMPT));
+    starting.frame(Starting::shell(PROMPT));
+    for _ in 0..160 {
+        starting.frame(Starting::shell(PROMPT).with_focus(Some(true)));
+    }
+    starting.frame(Starting::shell(PROMPT));
+    starting.frame(starting.staged());
+    starting.frame(starting.staged());
+    let call = starting.start().await;
+    progress_within(&mut starting.events, "up_running", Some("q/lead"), 59).await;
+    starting.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(starting.effects(), starting.launched());
+    starting
+        .assert_stuck("the launch command was being run and may have started the harness")
+        .await;
+    assert_eq!(starting.unread(), 0);
 }
 
 #[tokio::test]

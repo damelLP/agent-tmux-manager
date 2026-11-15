@@ -38,8 +38,9 @@
 //! that waits gets the refusal as its answer and no note. A caller that goes
 //! away does not stop the handover; if its call has ended by the time the
 //! handover fails, the manager gets that same note. The daemon ends a call
-//! at the method's deadline. A client that closes its socket is not such an
-//! end: the connection keeps the call and discards its answer.
+//! when the caller's socket closes (the connection drops this method's wait
+//! then) and at the method's deadline. A client that only half-closes keeps
+//! its call, and gets the answer.
 //!
 //! The handover policy in `atm_org::idle` is not asked: a command may hand
 //! over at any context share.

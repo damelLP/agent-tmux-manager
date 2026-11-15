@@ -5,7 +5,9 @@
 //! dropped on timeout or daemon shutdown (already performed effects are not undone).
 //! Client EOF/protocol Disconnect drains accepted calls. A full socket closure
 //! drops only session.send's wait: the control actor discards pre-effect input
-//! but still finishes Enter after an already-started paste.
+//! but still finishes Enter after an already-started paste. It also drops
+//! agent.handover's wait: the handover is a task of its own and carries on,
+//! and tells the agent's manager if it then fails.
 
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::future::Future;

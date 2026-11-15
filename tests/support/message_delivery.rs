@@ -2,11 +2,12 @@
 //! a private daemon with a `[delivery]` config, stand-ins adopted as agents,
 //! the real `atm msg`/`atm inbox` CLI, and committed events through `watch`.
 //!
-//! Nothing here is a second stand-in or daemon fixture. Every wait is on a
-//! committed event (`Watch`), on a stand-in event after a cursor taken before
-//! the action, or on an RPC answer. "Nothing was typed" is claimed only after
-//! a committed event that shows the daemon decided (the fence), by the
-//! lifecycle rig's journal predicate together with a styled screen comparison.
+//! Nothing here is a second stand-in or daemon fixture. Waits use committed
+//! events (`Watch`), stand-in events after a cursor taken before the action,
+//! RPC answers, or bounded polls on tmux state and daemon log lines.
+//! "Nothing was typed" needs a fence showing the daemon decided: a committed
+//! event, or the scheduler's return after a refused attempt. The lifecycle
+//! rig checks the journal together with a styled screen comparison.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -326,9 +327,9 @@ impl MessageRig {
     }
 
     /// Nothing was typed into the pane since the cursor, and its screen is
-    /// the one captured then. Call it only after a committed fence event: the
-    /// journal's silence alone says nothing about a daemon that has not yet
-    /// decided.
+    /// the one captured then. Call it only after a fence showing the daemon's
+    /// decision or the failed scheduling round's return: the journal's silence
+    /// alone says nothing about a daemon that has not yet decided.
     pub fn assert_untouched(&self, pane: &StandInPane, after: u64, screen: &str) {
         self.test.assert_no_input_since(pane, after);
         assert_eq!(

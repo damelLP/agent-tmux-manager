@@ -740,9 +740,14 @@ fn unavailable_org_causes_no_paste() {
     );
     client.focus(&rig, false);
 
-    // The fence: the daemon tried to commit, and its log refused.
     rig.test.rig.wait("the log's refusal of the attempt", || {
         rig.daemon_log().contains(refused)
+    });
+    // The actor logs its refusal before the executor handles the error. Fence
+    // on the scheduler's return, after the executor and its cleanup are done.
+    rig.test.rig.wait("the attempt's return", || {
+        rig.daemon_log()
+            .contains("Message scheduling round failed; no input")
     });
     let (code, message) = rig
         .call("msg.inbox", json!({"for": lead.id}), None)

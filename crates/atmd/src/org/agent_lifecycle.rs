@@ -446,11 +446,25 @@ impl AgentRuntime {
 /// Why a clear has not completed. `None` until the flow commits to clearing;
 /// from then on the flow keeps it current, so that the cleanup can say why
 /// when the reservation's deadline, or an error, stops the flow.
-pub(super) type Waiting = Arc<std::sync::Mutex<Option<String>>>;
+pub(super) type Waiting = Arc<std::sync::Mutex<Unfinished>>;
+
+#[derive(Debug, Default)]
+pub(super) struct Unfinished {
+    reason: Option<String>,
+    /// Keys the flow sent that nothing has shown the harness to have taken.
+    /// The cleanup adds it to the reason, whatever the flow waited for last.
+    unanswered: Option<String>,
+}
 
 fn waiting_for(waiting: &Waiting, reason: impl Into<String>) {
     if let Ok(mut waiting) = waiting.lock() {
-        *waiting = Some(reason.into());
+        waiting.reason = Some(reason.into());
+    }
+}
+
+fn unanswered(waiting: &Waiting, sent: Option<String>) {
+    if let Ok(mut waiting) = waiting.lock() {
+        waiting.unanswered = sent;
     }
 }
 
@@ -782,9 +796,15 @@ impl AgentRuntime {
         what: &str,
     ) -> Result<(), AgentError> {
         let state = self.org.snapshot().await?;
-        let committed = waiting
-            .lock()
-            .map_or_else(|_| Some("its progress was lost".into()), |w| w.clone());
+        let committed = waiting.lock().map_or_else(
+            |_| Some("its progress was lost".into()),
+            |w| {
+                let sent = w.unanswered.iter().map(|sent| format!("; {sent}"));
+                w.reason
+                    .clone()
+                    .map(|reason| reason + &sent.collect::<String>())
+            },
+        );
         let (Some(waiting), Some(agent)) = (
             committed,
             state.agent(id).filter(|agent| agent.status == unfinished),
@@ -1076,8 +1096,10 @@ impl AgentRuntime {
 
         let announces = policy.session_arrival == SessionArrival::AtStart;
         let mut progress = StartProgress::default();
-        // The key that last accepted a trust dialog, for its audit.
+        // The key that last accepted a trust dialog, for its audit, and every
+        // key sent to that dialog since it was last seen accepted.
         let mut accepted_with = None;
+        let mut trust_keys: Vec<String> = Vec::new();
         let audit = |dialog: &str, key: PaneKey, folder: Option<String>| {
             let mut action = serde_json::json!({
                 "method": "agent.up",
@@ -1124,6 +1146,8 @@ impl AgentRuntime {
             // the harness took the answer.
             if let Some((folder, key)) = progress.trust_accepted(&control).zip(accepted_with) {
                 audit("folder_trust", key, Some(folder)).await?;
+                trust_keys.clear();
+                unanswered(waiting, None);
             }
             match decide_start(
                 policy,
@@ -1191,6 +1215,18 @@ impl AgentRuntime {
                     match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
                         Ok(()) => {
                             progress.sent(action, &expect);
+                            if let ControlDialog::FolderTrust { folder, .. } = &expect {
+                                trust_keys.push(format!("{key:?}"));
+                                // A round that is never accepted is not
+                                // audited: its Stuck reason says what was sent.
+                                unanswered(
+                                    waiting,
+                                    Some(format!(
+                                        "atm sent {} to the trust dialog for {folder} and has not seen it accepted",
+                                        trust_keys.join(", ")
+                                    )),
+                                );
+                            }
                             match action {
                                 KeyAction::TrustAccept => accepted_with = Some(key),
                                 KeyAction::SkipLaunchPrompt => {

@@ -960,16 +960,24 @@ impl AgentRuntime {
     /// safe editor for a harness that announces its session later.
     ///
     /// Nothing is typed until the new pane's root is proven an idle shell
-    /// whose line can be read exactly, and the command is run only when the
-    /// line reads that prompt followed by the command and nothing else. The
+    /// whose line can be read exactly, on a pane nobody has selected; that
+    /// line is read once. The command is typed only after exactly that line,
+    /// and run only when the line reads it followed by the command and
+    /// nothing else. The
     /// command is pasted once and run once, each under a guard on the control
     /// actor's own capture; an input whose outcome is unknown is never
     /// repeated. A dialog the harness opens at its start is answered only
     /// where the harness's policy and the role allow it (a trust dialog for
     /// one of the role's trust directories, a prompt the launch may skip),
-    /// each key under a guard on that same dialog, and audited. From the Up it
-    /// records onwards the flow never gives up quietly: every failure, and the deadline, leaves the agent Starting for
-    /// [`Self::settle_up`] to mark Stuck.
+    /// each key under a guard on that same dialog, and audited.
+    ///
+    /// Once the flow knows its Up is recorded it never gives up quietly: every
+    /// failure, and the deadline, leaves the agent Starting for
+    /// [`Self::settle_up`] to mark Stuck. Two cases end otherwise. If the Up's
+    /// reply is lost, the flow has set no reason, the cleanup marks nothing,
+    /// and the next observation records the agent Down for having no pane.
+    /// And if the cleanup can't write, the reservation is quarantined with
+    /// the agent still Starting.
     ///
     /// With `replace` this is a respawn: once the pane to split is proven, and
     /// is not the agent's own, the agent is taken down as [`Self::down`] does

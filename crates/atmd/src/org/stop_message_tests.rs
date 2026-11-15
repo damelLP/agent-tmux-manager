@@ -131,7 +131,7 @@ async fn stop_while_the_paste_has_not_answered_settles_inside_the_message_budget
     assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 0));
     let snapshot = rig.snapshot(id);
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
-    assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    assert_eq!(snapshot.hold, Some(ExecutorHold::EnterNotSent));
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);
 }

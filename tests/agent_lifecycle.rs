@@ -291,8 +291,9 @@ fn lifecycle_rig_is_private_and_daemon_override_is_set() {
 
 /// Claude up: daemon ATM_SPAWN_BIN, role argv/model, ATM_AGENT, tag before first
 /// start, real session plus safe editor, no implicit prompt, all in its own window.
+/// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "waits for Task 6: agent.up acceptance"]
+#[ignore = "waits for Task 6: agent.up acceptance and a styled fresh-editor Claude stand-in frame at 200 columns"]
 fn agent_up_ready_tagged_env_claude() {}
 
 /// Codex up: daemon override, role/required args and ATM_AGENT, pre-start tag,
@@ -315,32 +316,33 @@ fn agent_up_reads_main_checkout_role() {}
 
 /// Held Claude clear stays Clearing until a new real ID with source=clear and
 /// a safe editor; return that ID on the same process, never rebind the old row.
+/// Requires a styled fresh-editor Claude frame at 200 columns in the stand-in.
 #[test]
-#[ignore = "waits for Task 8: Claude clear stand-in acceptance"]
+#[ignore = "agent.clear is in the base; acceptance not yet written; needs a styled fresh-editor Claude stand-in frame at 200 columns"]
 fn clear_returns_new_ready_session_claude() {}
 
 /// Held pi clear stays Clearing until changed ID plus safe editor on the same
 /// process/connection; repeated notices alone are not acknowledgment.
 #[test]
-#[ignore = "waits for Task 8: pi clear stand-in acceptance"]
+#[ignore = "agent.clear is in the base; pi clear stand-in acceptance not yet written"]
 fn clear_returns_new_ready_session_pi() {}
 
 /// Codex conversation-to-fresh clear returns Ready/null, excludes the old ID,
 /// then binds the next real prompt's ID once without any slash concatenation.
 #[test]
-#[ignore = "waits for Task 8: Codex lazy-session clear acceptance"]
+#[ignore = "agent.clear is in the base; Codex lazy-session clear stand-in acceptance not yet written"]
 fn codex_clear_ready_without_id_then_binds_next_prompt() {}
 
 /// Ready/null with no eligible row AND fresh safe facts sends no clear input
 /// and emits no clear_requested; an unreported conversation must not pass.
 #[test]
-#[ignore = "waits for Task 8: Codex clear no-op acceptance"]
+#[ignore = "agent.clear is in the base; Codex clear no-op stand-in acceptance not yet written"]
 fn codex_ready_unbound_clear_is_noop() {}
 
 /// Accept only the exact default current-worktree choice, create no checkout,
 /// confirm a fresh safe editor and the specified control audit.
 #[test]
-#[ignore = "waits for Task 8: worktree clear acceptance"]
+#[ignore = "agent.clear is in the base; worktree clear stand-in acceptance not yet written"]
 fn clear_worktree_default() {}
 
 /// Respawn replaces pane/process/session under the same agent; stale old events
@@ -443,13 +445,13 @@ fn retry_chrome_empty_idle_blocks_ready() {}
 /// and spawn_type (canonical, alias, %0N). Assert exact U8c refusal, then release
 /// and await Ready. This does not prove message-delivery serialization.
 #[test]
-#[ignore = "waits for Task 8: clear-versus-raw-send acceptance"]
+#[ignore = "agent.clear is in the base; clear-versus-raw-send stand-in acceptance not yet written"]
 fn clear_vs_raw_send_refuses_until_ready() {}
 
 /// With durable Clearing, restart the daemon and assert the same raw-send
 /// refusals; do not assume the pre-restart clear RPC is still alive.
 #[test]
-#[ignore = "waits for Tasks 8 and 10: durable-clearing restart acceptance"]
+#[ignore = "waits for Task 10: durable-clearing restart acceptance; agent.clear is in the base"]
 fn durable_clearing_after_restart_refuses_raw_send() {}
 
 /// Real msg.send stays queued behind held clear. Watch sent/clear_requested/

@@ -15,8 +15,12 @@ impl Starting {
 
     /// The agent started and Ready on `%1`, every observation of it done.
     /// (harness, its ready editor, the command tmux shows for it)
-    async fn ready((harness, ready, command): (Harness, &str, &str)) -> Self {
-        let mut starting = Self::new(harness).await;
+    async fn ready(harness: (Harness, &str, &str)) -> Self {
+        Self::ready_with(Rig::new().await, harness).await
+    }
+
+    async fn ready_with(rig: Rig, (harness, ready, command): (Harness, &str, &str)) -> Self {
+        let mut starting = Self::with_role(rig, harness, "").await;
         starting.script_launch();
         starting.frame(Self::screen(ready, command));
         if harness == Harness::Codex {
@@ -126,8 +130,15 @@ const CLAUDE: (Harness, &str, &str) = (Harness::ClaudeCode, CLAUDE_READY, "claud
 async fn respawn_kills_then_ups_in_one_reservation() {
     // The old pane is killed (audited under agent.respawn), the agent is
     // recorded down and requested up again, and the new pane is split,
-    // tagged, launched into and waited on exactly as agent.up does.
-    let mut starting = Starting::ready(CODEX).await;
+    // tagged, launched into and waited on exactly as agent.up does. Hold
+    // the launch's audit append: both the agent and its old pane must still
+    // be reserved while the new start is in progress.
+    let (gate, mut entered) = mpsc::channel(1);
+    let rig = Rig::gated(Some(("control.spawned", gate))).await;
+    let ready = tokio::spawn(Starting::ready_with(rig, CODEX));
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
+        .await.unwrap().unwrap().send(()).unwrap();
+    let mut starting = ready.await.unwrap();
     let mut committed = starting.rig.org.committed.subscribe();
     starting.script_replace();
     starting.script_launch_on_new();
@@ -135,7 +146,28 @@ async fn respawn_kills_then_ups_in_one_reservation() {
     for _ in 0..2 {
         starting.inspect("%2", Some("q/lead"));
     }
-    let result = starting.respawn().await.unwrap();
+    let call = starting.respawning(None).await;
+    let release = tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
+        .await.unwrap().unwrap();
+    for (agent, held_pane) in [("q/lead", None), ("q/other", Some("%1"))] {
+        let request = crate::control::reservation::ReservationRequest::new(
+            agent.parse().unwrap(),
+            held_pane.map(pane),
+            ReservationKind::Observe,
+            crate::control::reservation::WaitPolicy::Refuse,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        let observed = starting.rig.control.run_reserved(
+            request,
+            |_| async { Ok::<_, AgentError>(()) },
+            cleanup,
+        ).await;
+        assert!(matches!(observed, Err(AgentError::Reservation(
+            crate::control::reservation::ReservationError::Busy { .. }
+        ))), "{agent} {held_pane:?}: {observed:?}");
+    }
+    release.send(()).unwrap();
+    let result = call.await.unwrap().unwrap();
     assert_eq!(result.agent_id, started());
     assert_eq!(result.pane, "%2");
     assert_eq!(starting.effects(), starting.respawned());

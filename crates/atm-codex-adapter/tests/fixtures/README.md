@@ -26,12 +26,73 @@ Styled frames match `/new` exactly and retain delivery Draft / NotRunning /
 Other; Plain retained-space frames are Unknown and cannot prove a staged
 draft. The sole selected candidate is inverse across both command and
 description, not just its arrow. Only this exact Styled single-row popup,
-with blank boundaries and a matching non-faint active draft, reads control
+with a blank upper boundary (or the P6 finished-status boundary below), a
+blank lower boundary and a matching non-faint active draft, reads control
 None. Delivery stays Other; Plain input, changed/extra candidates, missing
 or partial inverse selection, changed description columns and argument hints
 stay control Unknown. No general completion-menu recognition is implied.
 `tests/staged_clear.rs` pins these facts and labels editor/text, geometry and
 style mutations Synthetic. A match alone never authorizes Enter.
+
+## Full-transcript staged clear command (P6)
+
+Captured: codex-cli 0.167.0, 2026-11-15, P6 sealed loopback-only Responses
+stub and private tmux 3.8 `capture-pane -p -e -N` (styled) and `-p -N`
+(plain). Launched through the pinned npm entrypoint with `--no-daemon`.
+Each source stem below maps to
+`screen_p6_<stem>_0.167.0.{styled,plain}.txt`. Sources retain the suffixes
+`.styled-N.txt` and `.plain-N.txt`. Only the private 23-byte run root becomes
+`/tmp/xxxxxxxxxxxxxxxxxx` (23 bytes); all SGR, spaces and rows remain intact.
+Each fixture has its own provenance line; tests remove only that line.
+
+| Source stem | Source directory | Status row (1-based) | Previous row blank? |
+|---|---|---:|---|
+| A-80x24-plain-popup | a-full | 18 | yes, row 17 |
+| A-80x24-wrap-popup | a-full | 18 | yes, row 17 |
+| A-80x24-list-popup | a-full | 18 | yes, row 17 |
+| A-80x24-code-popup | a-full | 18 | yes, row 17 |
+| A-100x32-plain-popup | a-full | 26 | yes, row 25 |
+| A-100x32-wrap-popup | a-full | 26 | yes, row 25 |
+| A-100x32-list-popup | a-full | 26 | yes, row 25 |
+| A-100x32-code-popup | a-full | 26 | yes, row 25 |
+| A-120x40-plain-popup | a-full | 34 | yes, row 33 |
+| A-120x40-wrap-popup | a-full | 34 | yes, row 33 |
+| A-120x40-list-popup | a-full | 34 | yes, row 33 |
+| A-120x40-code-popup | a-full | 34 | yes, row 33 |
+| B-80x24-before-enter | b-enter | 18 | yes, row 17 |
+| B-120x40-before-enter | b-enter | 19 | yes, row 18 |
+
+The twelve A transcripts fill the viewport, ending with short text, a wrapped
+line, a list or fenced code. Their Down/Up popup frames are byte-identical to
+the copied popup frames, so are not duplicated. A and B-80x24 put the finished
+status directly above the menu; B-120x40 leaves 15 blank rows between them.
+One blank remains below the menu, before the composer, in every capture.
+P6 pressed Enter only in B: both screens became fresh, subsequent main requests
+excluded the earlier exchange, and new rollout IDs appeared at the next prompt.
+No harness or provider is run by these tests.
+
+The old blank-only upper anchor refused all touching-status frames. Control
+now also accepts exactly two spaces plus a whole-line `Worked for <duration>
+• <clock>`, using the existing finished-duration/clock grammar, with every
+character faint and non-inverse and a blank immediately before the status.
+Running status, malformed chrome/values, wrong attributes, missing separators
+and arbitrary transcript text touching the menu remain Unknown. Blank-boundary
+frames remain supported; no historical status styling is inferred from them.
+In either case the nearest nonblank row before the upper separator must not
+look like an extra slash-command candidate (command, two-space gap, description).
+This closes M3's formerly accepted candidate across a blank, as well as keeping
+M2b's adjacent extra candidate and M7's displaced menu Unknown. Startup help's
+one-space ` - ` separator is not completion chrome. Candidate-looking historical
+text may conservatively refuse; exact text/style imitation is not distinguishable
+from real chrome by a stateless screen observer.
+
+`tests/staged_clear.rs` pins all 14 real frame pairs with actual cursor metadata,
+the pre-status blanks, unchanged delivery Draft / NotRunning / Other, exact
+staged match and control None. Plain reads remain Unknown with or without a
+cursor, and cannot prove a draft. Synthetic value, UTF-8 offset, style, layout
+and extra-candidate mutations cover both boundary kinds. This is control-only;
+production clear integration, running popups and arbitrary versions/layouts
+remain unverified.
 
 ## Finished-turn clocks (U8g)
 

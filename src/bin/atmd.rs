@@ -22,9 +22,10 @@
 //!
 //! `stop` observes process exit, including unreaped zombies, not PID/socket-file
 //! removal. It reports progress once after 5 seconds and gives up after 75 seconds
-//! from signaling, without killing the daemon or removing its state. Nominal
-//! shutdown allows 2 s for connections, 30 s for admitted control deadlines,
-//! 30 s for audits, then 2 s for concurrent summary/raw flushes (64 s total).
+//! from signaling, without killing the daemon or removing its state. The stages
+//! of a shutdown and their bounds are defined once, in `atmd::server::stop`
+//! (66 s nominal: 2 s for connections, 62 s from the stop of reserved work to
+//! the end of control and its audits, 2 s for concurrent summary/raw flushes).
 //! Blocking I/O, including Tokio blocking-pool work at runtime drop, can outlast
 //! that allowance. A stop timeout leaves the daemon potentially still shutting
 //! down; successful exit does not promise every pending write was persisted.
@@ -219,10 +220,10 @@ fn exit_already_running(pid: Option<u32>) -> ! {
 }
 
 // Keep the candidate kit's process-exit policy aligned (scripts/atm_candidate.py).
-// Keep in sync with STOP_WAIT_TIMEOUT in scripts/atm_candidate.py: 64 s of nominal
-// drains (2 connections + 30 control + 30 audits + 2 concurrent flushes) plus margin.
+// The daemon's own stop budget plus margin (atmd::server::stop). The kit's
+// STOP_WAIT_TIMEOUT and the README state the same number; a test compares them.
 // NOT a hard bound on daemon blocking I/O.
-const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
+const STOP_WAIT_TIMEOUT: Duration = atmd::server::stop::STOP_WAIT;
 const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -552,8 +553,8 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     // Subscribed before discovery, so the notifier sees every session.
     let message_notify_cancel = cancel_token.child_token();
     let config = read_startup_config(atm_tui::setup::atm_config_path()).await;
-    // A2 consumes this policy when assembling the active message runtime.
-    // Until then the seam remains unavailable, including for valid policies.
+    // The server starts the message service on this policy. An invalid one
+    // leaves the message methods unavailable with this reason.
     if let Err(reason) = &config.delivery {
         warn!(%reason, "Invalid delivery configuration; message delivery is unavailable");
     }
@@ -606,6 +607,7 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     services.state_dir = state_dir;
     services.org = org;
     services.raw = raw.clone();
+    services.delivery_policy = Some(config.delivery);
     let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
@@ -989,6 +991,29 @@ mod tests {
             config.delivery.unwrap().settings().stable_idle,
             std::time::Duration::from_secs(1)
         );
+    }
+
+    /// One number for how long a stop is waited for, and one for how long a
+    /// shutdown nominally takes: the kit and the documents follow the daemon.
+    #[test]
+    fn stop_wait_is_stated_once() {
+        let wait = STOP_WAIT_TIMEOUT.as_secs();
+        let nominal = atmd::server::stop::NOMINAL.as_secs();
+        let kit = include_str!("../../scripts/atm_candidate.py");
+        assert!(
+            kit.contains(&format!("\nSTOP_WAIT_TIMEOUT = {wait}\n")),
+            "scripts/atm_candidate.py waits another time than {wait} s"
+        );
+        for (name, text) in [
+            ("README.md", include_str!("../../README.md")),
+            (
+                "scripts/atm-candidate.md",
+                include_str!("../../scripts/atm-candidate.md"),
+            ),
+        ] {
+            assert!(text.contains(&format!("up to {wait} seconds")), "{name}");
+            assert!(text.contains(&format!("{nominal} seconds")), "{name}");
+        }
     }
 
     #[test]

@@ -3047,6 +3047,7 @@ mod reconciliation {
         include!("agent_up_tests.rs");
         include!("agent_start_dialog_tests.rs");
         include!("agent_respawn_tests.rs");
+        include!("stop_tests.rs");
     }
 
     #[tokio::test]

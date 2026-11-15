@@ -59,10 +59,10 @@
 //! | Delivering without receipt/evidence, pane alive | AwaitConfirmation until deadline; then RetryAt or final Fail |
 //! | Queued retry with landing evidence | Blocked(ProbablyDelivered) |
 //! | Queued retry before logged failed_at + retry delay | RetryAt; no new failure event |
+//! | Queued, agent stuck/down, whatever the focus | Blocked(AgentUnavailable); ready resumes |
 //! | Queued, owner focused (unknown focus is focused) | Wait(OwnerFocused), notice, no timeout |
 //! | Queued, agent starting/clearing, positively running turn | Wait(SessionBusy); no readiness clock |
 //! | Queued, agent starting/clearing, no running evidence | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after the current not-ready window + readiness_timeout |
-//! | Queued, agent stuck/down | Blocked(AgentUnavailable); ready resumes |
 //! | Queued, another message delivering or retry-pending for recipient | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
 //! | Queued, positively running turn on a Ready agent | Wait(SessionBusy), regardless of row age or send_now |
@@ -104,7 +104,7 @@
 //! follows Stuck or Down; see [`RecipientLiveView::agent_not_ready_since`].
 //! Positive running-turn evidence clears that clock. Its first loss starts a
 //! fresh window; repeated unknown observations never restart it. Unknown focus
-//! still waits ahead of agent status, even if that window has expired.
+//! still waits ahead of Starting/Clearing, even if that window has expired.
 //! A queued, unattempted message gets one informational owner Note after
 //! [`BUSY_NOTICE_AFTER`] behind the same observed turn (measured no earlier than
 //! its sent_at). This is independent of delivery status, never a block/drop.
@@ -726,6 +726,11 @@ pub fn next_delivery(
             });
         }
     }
+    if matches!(live.agent_status, AgentStatus::Stuck | AgentStatus::Down) {
+        return Ok(DeliveryStep::Blocked {
+            reason: FailureReason::AgentUnavailable,
+        });
+    }
     if live.owner_focused {
         return poll(WaitReason::OwnerFocused);
     }
@@ -742,12 +747,7 @@ pub fn next_delivery(
                 None,
             );
         }
-        AgentStatus::Stuck | AgentStatus::Down => {
-            return Ok(DeliveryStep::Blocked {
-                reason: FailureReason::AgentUnavailable,
-            })
-        }
-        AgentStatus::Ready => {}
+        AgentStatus::Ready | AgentStatus::Stuck | AgentStatus::Down => {}
     }
     if live.other_delivery_in_flight {
         return poll(WaitReason::OtherDelivery);
@@ -1716,6 +1716,40 @@ mod tests {
         live.session = None;
         wait(h.step(&live, 4), WaitReason::InputStabilizing);
         assert_eq!(h.step(&live, 5), DeliveryStep::PasteNow { attempt: 1 });
+    }
+
+    #[test]
+    fn stuck_recipient_blocks_whatever_the_focus() {
+        let h = History::new(false);
+        let mut live = ready();
+        live.agent_status = AgentStatus::Stuck;
+        for focused in [false, true] {
+            live.owner_focused = focused;
+            assert_eq!(
+                h.step(&live, 1000),
+                DeliveryStep::Blocked {
+                    reason: FailureReason::AgentUnavailable
+                },
+                "Stuck with owner_focused={focused}"
+            );
+        }
+    }
+
+    #[test]
+    fn down_recipient_blocks_whatever_the_focus() {
+        let h = History::new(false);
+        let mut live = ready();
+        live.agent_status = AgentStatus::Down;
+        for focused in [false, true] {
+            live.owner_focused = focused;
+            assert_eq!(
+                h.step(&live, 1000),
+                DeliveryStep::Blocked {
+                    reason: FailureReason::AgentUnavailable
+                },
+                "Down with owner_focused={focused}"
+            );
+        }
     }
 
     #[test]
@@ -2802,6 +2836,38 @@ mod tests {
         );
         h.failure(true, 19);
         assert_eq!(h.step(&ready(), 100), DeliveryStep::Complete);
+    }
+
+    #[test]
+    fn confirmation_and_retry_accounting_precede_agent_unavailability() {
+        for status in [AgentStatus::Stuck, AgentStatus::Down] {
+            let mut h = History::new(false);
+            let mut live = ready();
+            live.agent_status = status;
+            h.attempt(1, 0);
+            assert_eq!(
+                h.step(&live, 2),
+                DeliveryStep::AwaitConfirmation { until: time(3) },
+                "inside confirmation window: {status:?}"
+            );
+            assert_eq!(
+                h.step(&live, 4),
+                DeliveryStep::RetryAt {
+                    at: time(5),
+                    reason: FailureReason::ConfirmationTimeout
+                },
+                "past confirmation deadline: {status:?}"
+            );
+            h.failure(false, 4);
+            assert_eq!(
+                h.step(&live, 4),
+                DeliveryStep::RetryAt {
+                    at: time(5),
+                    reason: FailureReason::ConfirmationTimeout
+                },
+                "queued before retry delay: {status:?}"
+            );
+        }
     }
 
     #[test]

@@ -40,9 +40,9 @@ impl SummaryObserver {
 
     pub async fn finish(mut self) {
         self.stop.cancel();
-        // Runs alongside raw flush after connection/control/audit drains;
-        // both flushes share the final 2 s of the nominal 64 s shutdown budget.
-        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
+        // Runs alongside raw flush after the server's stages have stopped;
+        // both flushes share the last part of the stop budget.
+        match tokio::time::timeout(crate::server::stop::FLUSHES, &mut self.task).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(%error, "Session summary observer failed"),
             Err(_) => {

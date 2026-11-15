@@ -38,6 +38,7 @@
 //! displaced/unindented row or unknown footer still refuses. Multiline status
 //! output and teammate lists below the footer are not established by these
 //! captures.
+//!
 //! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
 //! Legacy facts stay Unknown; the staged matcher accepts only the complete
 //! captured completion layout with both editor and selected command exact.

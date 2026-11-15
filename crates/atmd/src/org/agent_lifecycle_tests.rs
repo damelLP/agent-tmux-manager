@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::control::reservation::ReservationKind;
+use crate::org::agent_screen_tests::CLAUDE_STATUS_116_FRESH;
 use atm_tmux::mock::MockCall;
 
 fn pane(id: &str) -> PaneId {
@@ -675,7 +676,7 @@ async fn adopt_tags_absent_pane_and_binds_one_eligible_row() {
 
 #[tokio::test]
 async fn adopt_claude_custom_status_binds_ready() {
-    let fixture = body(include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_s1_status-116-fresh_2.1.325.txt"));
+    let fixture = body(CLAUDE_STATUS_116_FRESH);
     // Synthetic: a second nonblank status-region row is not the captured layout.
     let malformed = fixture.replace("[sample] ctx", "second row\n  [sample] ctx");
     for (text, ready) in [(fixture, true), (malformed.as_str(), false)] {

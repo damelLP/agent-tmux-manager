@@ -180,6 +180,7 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         |error| error.to_string(),
     );
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
+    let handover_org = services.org.clone();
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();
@@ -203,11 +204,15 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     })?;
 
     register_control(&mut router, services.control)?;
-    crate::org::agents::register_agent_methods(
+    let agents = services
+        .agents
+        .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable));
+    crate::org::agents::register_agent_methods(&mut router, agents.clone())?;
+    crate::org::agent_handover::register_agent_handover_method(
         &mut router,
-        services
-            .agents
-            .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable)),
+        agents,
+        handover_org,
+        services.registry.clone(),
     )?;
 
     crate::org::messages::register_message_methods(

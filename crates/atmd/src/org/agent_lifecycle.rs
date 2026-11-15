@@ -1467,9 +1467,9 @@ impl AgentRuntime {
     /// show the same root process, shell and line, and that line is not blank.
     ///
     /// Text reaches that line only from a client that selected the pane, so a
-    /// capture that shows the pane focused before the line is read ends the
-    /// start: the line could hold what was typed, and waiting for the focus to
-    /// leave would not show it.
+    /// capture that shows the pane focused before the line is read, or whose
+    /// focus could not be read, ends the start: the line could hold what was
+    /// typed, and waiting for the focus to leave would not show it.
     async fn idle_shell(
         &self,
         r: &Reservation,
@@ -1485,17 +1485,24 @@ impl AgentRuntime {
                 .pane_root_pid()
                 .zip(capture.inspection.foreground_command.clone())
         };
+        // Unknown focus is not permission: it ends the start as a shown
+        // focus does.
         let selected = |capture: &PaneCapture| {
-            match capture.focused {
-            Some(true) => Err(stopped(
+            let what = match capture.focused {
+                Some(false) => return Ok(()),
+                Some(true) => "the new pane was selected before its prompt could be read",
+                None => {
+                    "whether the new pane was selected could not be read before its prompt was read"
+                }
+            };
+            Err(stopped(
                 waiting,
                 id,
                 "start",
-                "the new pane was selected before its prompt could be read, so nothing was typed; start the harness there by hand and adopt it, or take the agent down and up again"
-                    .into(),
-            )),
-            _ => Ok(()),
-        }
+                format!(
+                    "{what}, so nothing was typed; start the harness there by hand and adopt it, or take the agent down and up again"
+                ),
+            ))
         };
         loop {
             let first = r.capture(pane, format).await?;

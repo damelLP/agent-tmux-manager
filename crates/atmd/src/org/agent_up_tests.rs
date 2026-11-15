@@ -180,6 +180,25 @@ impl Starting {
         }
     }
 
+    /// The frames a start would need to read the shell's line a second time
+    /// as its prompt and launch after it: `line` five times (a refused paste
+    /// guard, the start's own look, two captures of a new proof, a paste
+    /// guard), then `line` with the launch text after it, twice (the staged
+    /// capture and the Enter's guard), and the harness.
+    fn script_second_reading(&self, line: &str) {
+        for _ in 0..5 {
+            self.frame(Self::shell(line));
+        }
+        let staged = Self::shell(&format!("{line}{}", self.text));
+        self.frame(staged.clone());
+        self.frame(staged);
+        self.frame(Self::screen(CODEX_FRESH, "codex"));
+    }
+
+    /// What is left of [`Self::script_second_reading`] when the start ends
+    /// at its own look: six frames, three reads each.
+    const SECOND_READING_UNREAD: usize = 6 * 3;
+
     /// Everything a start reads up to and including its Enter.
     fn script_launch(&self) {
         self.script_pane();
@@ -751,6 +770,7 @@ async fn up_waits_for_idle_shell_before_paste() {
 }
 
 const SELECTED: &str = "the new pane was selected before its prompt could be read, so nothing was typed; start the harness there by hand and adopt it, or take the agent down and up again";
+const UNREAD_FOCUS: &str = "whether the new pane was selected could not be read before its prompt was read, so nothing was typed; start the harness there by hand and adopt it, or take the agent down and up again";
 const CHANGED: &str = "the shell's line changed after its prompt was read, so nothing was typed";
 
 #[tokio::test]
@@ -789,32 +809,53 @@ async fn focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed() {
 }
 
 #[tokio::test]
-async fn launch_refuses_focused_pane() {
-    // Focus that can't be read before the prompt is read: nothing is typed,
-    // and the start waits. (A focus that is seen there ends the start:
-    // focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed.)
-    let mut starting = Starting::new(Harness::Codex).await;
-    starting.script_pane();
-    starting.frame(Starting::shell(PROMPT));
-    starting.frame(Starting::shell(PROMPT).with_focus(None));
-    let result = starting.up().await;
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(starting.effects().len(), 2, "{:?}", starting.effects());
-    starting
-        .assert_stuck("whether the pane is focused could not be read")
-        .await;
-    assert_eq!(starting.unread(), 0);
+async fn unknown_focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed() {
+    // Unknown focus is not permission. While the client list could not be
+    // read the owner may be in the pane, typing; when focus reads "nobody"
+    // again, the line with his text would be proven as the prompt. So a
+    // capture of the proof whose focus could not be read ends the start, as
+    // a shown focus does. The frames are the second review's two sequences
+    // (unknown on the first capture; on the second), with the typed line and
+    // the launch after it, which are scripted and not asserted read or
+    // unread. Twin: up_order_is_split_tag_pane_created_paste_enter_ready.
+    for (first, second) in [(None, Some(false)), (Some(false), None)] {
+        let mut starting = Starting::new(Harness::Codex).await;
+        starting.script_pane();
+        starting.frame(Starting::shell(PROMPT).with_focus(first));
+        starting.frame(Starting::shell(PROMPT).with_focus(second));
+        let typed = format!("{PROMPT}rm -rf ");
+        for _ in 0..3 {
+            starting.frame(Starting::shell(&typed));
+        }
+        let staged = Starting::shell(&format!("{typed}{}", starting.text));
+        starting.frame(staged.clone());
+        starting.frame(staged);
+        starting.frame(Starting::screen(CODEX_FRESH, "codex"));
+        let result = starting.up().await;
+        assert!(
+            matches!(&result, Err(AgentError::Refused(reason)) if reason.contains(UNREAD_FOCUS)),
+            "{result:?}"
+        );
+        assert_eq!(starting.effects().len(), 2, "{:?}", starting.effects());
+        starting.assert_stuck(UNREAD_FOCUS).await;
+    }
+}
 
+#[tokio::test]
+async fn launch_refuses_focused_pane() {
     // Focused after the prompt was read, at the paste's own guard: refused
-    // there and waited on while it lasts. The line still reads the prompt
-    // when the focus has gone, so the launch goes on.
-    let focused = || Starting::shell(PROMPT).with_focus(Some(true));
+    // there and waited on while it lasts, and so is a focus that can't be
+    // read. The line still reads the prompt when the focus has gone, so the
+    // launch goes on. (Before the prompt is read either ends the start:
+    // focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed and
+    // unknown_focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed.)
     let mut starting = Starting::new(Harness::Codex).await;
     starting.script_pane();
     starting.frame(Starting::shell(PROMPT));
     starting.frame(Starting::shell(PROMPT));
-    for _ in 0..3 {
-        starting.frame(focused());
+    // (guard, the flow's look, guard, look, guard)
+    for focus in [Some(true), None, None, Some(true), None] {
+        starting.frame(Starting::shell(PROMPT).with_focus(focus));
     }
     starting.frame(Starting::shell(PROMPT));
     starting.frame(Starting::shell(PROMPT));
@@ -931,17 +972,26 @@ async fn prompt_that_reads_differently_after_it_was_read_ends_the_start() {
     // paste's guard, the line is not read as a new prompt: nothing was sent,
     // and the start ends. (Before the Task 6 review the new line was taken;
     // a line with typed text was taken the same way.)
+    //
+    // The frames go on as a second reading of the prompt would need them:
+    // the new line five times in all, then that line with the launch after
+    // it. The start reads two of them (the refused guard, and its own look)
+    // and none of the rest.
     let mut starting = Starting::new(Harness::Codex).await;
     starting.script_pane();
     starting.frame(Starting::shell(PROMPT));
     starting.frame(Starting::shell(PROMPT));
-    starting.frame(Starting::shell("pb (main)> "));
-    starting.frame(Starting::shell("pb (main)> "));
+    starting.script_second_reading("pb (main)> ");
     let result = starting.up().await;
     assert!(result.is_err(), "{result:?}");
+    // (An observation of the stuck agent may have inspected the pane once.)
+    assert!(
+        starting.unread() + 1 >= Starting::SECOND_READING_UNREAD,
+        "{}",
+        starting.unread()
+    );
     assert_eq!(starting.effects().len(), 2, "{:?}", starting.effects());
     starting.assert_stuck(CHANGED).await;
-    assert_eq!(starting.unread(), 0);
 }
 
 #[tokio::test]
@@ -952,18 +1002,24 @@ async fn draft_at_the_prompt_before_the_launch_paste_sends_nothing() {
     // guard refuses, the flow's next capture reads another line than the
     // prompt, and the start ends with no paste and no Enter.
     // Twin: up_order_is_split_tag_pane_created_paste_enter_ready.
+    // The frames go on as a second reading of the prompt would need them
+    // (prompt_that_reads_differently_after_it_was_read_ends_the_start).
     let draft = format!("{PROMPT}rm -rf ~; ");
     let mut starting = Starting::new(Harness::Codex).await;
     starting.script_pane();
     starting.frame(Starting::shell(PROMPT));
     starting.frame(Starting::shell(PROMPT));
-    starting.frame(Starting::shell(&draft));
-    starting.frame(Starting::shell(&draft));
+    starting.script_second_reading(&draft);
     let result = starting.up().await;
     assert!(result.is_err(), "{result:?}");
+    // (An observation of the stuck agent may have inspected the pane once.)
+    assert!(
+        starting.unread() + 1 >= Starting::SECOND_READING_UNREAD,
+        "{}",
+        starting.unread()
+    );
     assert_eq!(starting.effects().len(), 2, "{:?}", starting.effects());
     starting.assert_stuck(CHANGED).await;
-    assert_eq!(starting.unread(), 0);
 
     // Typed while somebody is focused on the pane: that only waits. When
     // the focus has gone the line is not the prompt, and the start ends.

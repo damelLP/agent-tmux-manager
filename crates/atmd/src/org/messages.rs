@@ -57,6 +57,7 @@ pub use super::message_methods::register_message_methods;
 use super::message_scheduler::{self, Board, Effects, Resolution, Resolve};
 pub use super::message_types::*;
 use super::{
+    agents::AgentHandle,
     message_delivery::{inbox_reference, MESSAGE_RESOLUTION_BUDGET},
     message_evidence::{AttemptScope, MessageEvidence},
     message_history::MessageHistoryHandle,
@@ -169,6 +170,9 @@ pub struct MessageRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
+    /// What is recorded about a recipient's pane lives in the agent service's
+    /// memory: the executor and the observer read a recipient through it.
+    pub agents: AgentHandle,
     pub evidence: MessageEvidence,
     pub history: MessageHistoryHandle,
     pub policy: DeliveryPolicy,
@@ -186,6 +190,7 @@ impl MessageRuntime {
         org: OrgHandle,
         registry: RegistryHandle,
         control: ControlHandle,
+        agents: AgentHandle,
         evidence: MessageEvidence,
         history: MessageHistoryHandle,
         policy: DeliveryPolicy,
@@ -196,6 +201,7 @@ impl MessageRuntime {
             org,
             registry,
             control,
+            agents,
             evidence,
             history,
             policy,

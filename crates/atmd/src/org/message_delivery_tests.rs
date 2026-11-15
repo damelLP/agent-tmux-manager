@@ -567,6 +567,7 @@ impl Rig {
             org.clone(),
             registry,
             control,
+            crate::org::agents::AgentHandle::disabled("no agent service in this rig yet"),
             evidence,
             history,
             policy,

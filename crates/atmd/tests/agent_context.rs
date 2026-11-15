@@ -330,6 +330,36 @@ async fn context_uses_main_project_paths_and_live_memory_metadata() {
     assert!(error.0.message.contains("worker.md"));
 }
 
+// Break caught: opening a role FIFO before inspecting its type stalls the shared
+// reader instead of refusing it, preventing every other context read too.
+#[tokio::test]
+async fn context_fifo_role_is_refused_without_timing_out() {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let rig = Rig::new().await;
+    rig.role("");
+    std::fs::remove_file(rig.role_path()).unwrap();
+    let fifo = std::ffi::CString::new(rig.role_path().to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let metadata = std::fs::metadata(rig.role_path()).unwrap();
+    assert!(metadata.file_type().is_fifo());
+    eprintln!("role metadata: is_fifo={}", metadata.file_type().is_fifo());
+    let result = tokio::time::timeout(Duration::from_secs(60), rig.call(Some("%7"), json!({})))
+        .await
+        .unwrap();
+    // Release a pre-fix reader blocked in open even on the expected red run.
+    // O_NONBLOCK fails harmlessly if the fixed code already refused the FIFO.
+    let _writer = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(rig.role_path());
+    let error = result.unwrap_err();
+    assert_eq!(error.0.code, "refused");
+    assert!(error.0.message.contains("role is not a regular file"));
+    std::fs::remove_file(rig.role_path()).unwrap();
+    rig.role("+++\nharness='pi'\n+++\nAfter FIFO\n");
+    assert_eq!(rig.context().await["instructions"], "After FIFO\n");
+}
+
 // Break caught: unbounded role/result allocation and silently successful truncation.
 #[tokio::test]
 async fn context_role_and_result_limits_refuse_without_truncation() {

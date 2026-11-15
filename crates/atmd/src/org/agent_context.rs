@@ -141,6 +141,19 @@ fn read_files(
     memory_file: &Path,
     name: &str,
 ) -> Result<(Option<RoleSpec>, bool), AgentError> {
+    let nonregular = || {
+        AgentError::Refused(format!(
+            "{}: role is not a regular file",
+            role_file.display()
+        ))
+    };
+    match fs::metadata(role_file) {
+        Ok(metadata) if !metadata.is_file() => return Err(nonregular()),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(file_error(role_file, error));
+        }
+        _ => {}
+    }
     let role = match fs::File::open(role_file) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(file_error(role_file, error)),
@@ -150,10 +163,7 @@ fn read_files(
                 .map_err(|e| file_error(role_file, e))?
                 .is_file()
             {
-                return Err(AgentError::Refused(format!(
-                    "{}: role is not a regular file",
-                    role_file.display()
-                )));
+                return Err(nonregular());
             }
             let mut bytes = Vec::new();
             file.take(ROLE_BYTES as u64 + 1)

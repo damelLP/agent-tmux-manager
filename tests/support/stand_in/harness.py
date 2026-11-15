@@ -43,6 +43,26 @@ def patch_paths(value, root):
     return value
 
 
+def take_title(name):
+    """Take the /proc cmdline of a harness that sets its process title.
+
+    pi sets process.title = "pi", which overwrites its argv in place: the
+    cmdline becomes the bare name and NUL padding (pi 1.5.0). sys.argv is a
+    copy and keeps the launch arguments.
+    """
+    import ctypes
+    fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+    arg_start, arg_end = int(fields[45]), int(fields[46])
+    title = name.encode()
+    if arg_end - arg_start <= len(title):
+        raise RuntimeError("argv area too small for the process title")
+    ctypes.memset(arg_start, 0, arg_end - arg_start)
+    ctypes.memmove(arg_start, title, len(title))
+    cmdline = Path("/proc/self/cmdline").read_bytes()
+    if cmdline.rstrip(b"\0") != title or len(cmdline) <= len(title):
+        raise RuntimeError("failed to take the process title's cmdline")
+
+
 class Runtime:
     def __init__(self):
         self.mode = Path(sys.argv[0]).name
@@ -105,6 +125,8 @@ class Runtime:
         Path("/proc/self/comm").write_text(self.mode)
         if Path("/proc/self/comm").read_text().strip() != self.mode:
             raise RuntimeError("failed to set process comm")
+        if self.mode == "pi":
+            take_title(self.mode)
         self.start_time = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
         self.pane = os.environ["TMUX_PANE"]
         (self.root / ("shell-" + self.pane + ".json")).write_text(json.dumps({

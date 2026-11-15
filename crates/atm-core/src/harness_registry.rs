@@ -112,9 +112,10 @@ pub struct HarnessDefinition {
     pub discovery_enabled: bool,
     /// Whether bare argv0 matches are allowed during cmdline scanning.
     ///
-    /// This is safe for distinctive command names like `claude`, but unsafe for
-    /// short ambiguous names like `pi` (a random program can take `pi` as data).
-    /// Bare matches are never accepted from arbitrary positional arguments.
+    /// Bare matches are never accepted from arbitrary positional arguments,
+    /// so a program that takes a short name like `pi` as data is not matched.
+    /// A harness whose process shows only its bare name needs this: nothing
+    /// else in `/proc` identifies it.
     pub allow_bare_cmdline_match: bool,
 }
 
@@ -124,7 +125,11 @@ const CLAUDE_MATCHERS: &[ProcessMatcher] = &[
     ProcessMatcher::Contains("claude/versions/"),
 ];
 
+/// `Exact("pi")` is pi's real shape: pi sets `process.title = "pi"`, so
+/// `/proc` shows the cmdline `pi` (and NUL padding) and the exe `node`.
+/// Verified 2026-11-15 against pi 1.5.0.
 const PI_MATCHERS: &[ProcessMatcher] = &[
+    ProcessMatcher::Exact("pi"),
     ProcessMatcher::Suffix("/bin/pi"),
     ProcessMatcher::Suffix("/pi"),
     ProcessMatcher::Contains("pi-coding-agent"),
@@ -208,7 +213,7 @@ pub const BUILTIN_HARNESSES: &[HarnessDefinition] = &[
         version_args: &["--version"],
         process_matchers: PI_MATCHERS,
         discovery_enabled: true,
-        allow_bare_cmdline_match: false,
+        allow_bare_cmdline_match: true,
         process_excludes: &[],
     },
     HarnessDefinition {
@@ -376,7 +381,9 @@ mod tests {
         let pi = find_harness_definition("pi").unwrap_or(default_harness_definition());
         assert!(pi.process_matchers.iter().any(|m| m.matches("/usr/bin/pi")));
         assert!(pi.discovery_enabled);
-        assert!(!pi.allow_bare_cmdline_match);
+        // A real pi's cmdline is the bare name (see the pi entry).
+        assert!(pi.process_matchers.iter().any(|m| m.matches("pi")));
+        assert!(pi.allow_bare_cmdline_match);
     }
 
     #[test]

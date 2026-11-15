@@ -175,6 +175,8 @@ impl StandInRig {
         for mode in [StandInMode::Claude, StandInMode::Codex, StandInMode::Pi] {
             // A script path ending in the vendor name is visible to discovery;
             // the Python process itself sets comm before starting the forwarder.
+            // The pi stand-in then overwrites its cmdline with the bare name,
+            // as a real pi does: discovery has only that name to go by.
             std::os::unix::fs::symlink(Path::new(SOURCE).join("harness.py"), rig.launcher(mode))
                 .unwrap();
         }

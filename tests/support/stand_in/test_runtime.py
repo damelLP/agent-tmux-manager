@@ -423,5 +423,17 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(r.pending_renders, [])
 
 
+class TitleTests(unittest.TestCase):
+    def test_take_title_leaves_the_bare_name_and_nul_padding(self):
+        # In a child: the title replaces the calling process's own cmdline.
+        import subprocess, sys
+        code = ("import harness, sys; harness.take_title('pi'); "
+                "sys.stdout.buffer.write(open('/proc/self/cmdline', 'rb').read())")
+        out = subprocess.run([sys.executable, "-B", "-c", code, "an-argument"],
+                             cwd=harness.HERE, capture_output=True, timeout=30, check=True).stdout
+        self.assertEqual(out.rstrip(b"\0"), b"pi")
+        self.assertGreater(len(out), len(b"pi\0"))
+
+
 if __name__ == "__main__":
     unittest.main()

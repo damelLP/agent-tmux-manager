@@ -69,6 +69,9 @@ fn render_context(context: &AgentContext, out: &mut impl Write) -> Result<()> {
             message.message_id
         )?;
     }
+    if !context.unread_messages.is_empty() {
+        writeln!(out, "After handling a delivered message: atm msg ack <id>")?;
+    }
     writeln!(out, "Report: {}", escaped(&context.report_command, false))?;
     Ok(())
 }
@@ -109,6 +112,17 @@ mod tests {
     fn me_renders_empty_body_missing_role_and_empty_lists_distinctly() {
         let mut value = context();
         value.instructions = Some(String::new());
+        let mut second = value.unread_messages.first().unwrap().clone();
+        second.message_id = atm_org::MessageId::new(8);
+        value.unread_messages.push(second);
+        let unread = rendered(&value);
+        assert!(unread.contains("read: atm inbox --id m8\nAfter handling a delivered message: atm msg ack <id>\nReport: "));
+        assert_eq!(
+            unread
+                .matches("After handling a delivered message:")
+                .count(),
+            1
+        );
         value.unread_messages.clear();
         value.memory.exists = true;
         let text = rendered(&value);
@@ -117,6 +131,7 @@ mod tests {
             text.contains("Memory: /project/.atm/memory/worker.md (exists; read for handover)\n")
         );
         assert!(text.contains("Unread: none\n"));
+        assert!(!text.contains("atm msg ack"));
         value.instructions = None;
         value.manager = atm_org::Address::Owner;
         assert!(rendered(&value).contains("Instructions: none (no role file at /project/.atm/roles/worker.md); reports go to owner\n"));

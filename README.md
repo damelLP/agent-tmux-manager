@@ -128,7 +128,7 @@ atm me --format json           # the same context as structured data
 
 `atm me` reads the current `.atm/roles/<name>.md` in the project's main checkout on every call. It shows your full agent id and manager, the role's instructions, unread messages (id, kind, sender and first line), the absolute `.atm/memory/<name>.md` path and whether it exists, and open tasks (an empty array until task tracking is available). Read an existing memory file for handover. The caller's pane binding determines identity, not the working directory or `ATM_AGENT`; an unbound caller gets a clear refusal.
 
-Every unread message includes `atm inbox --id mN` to retrieve its full body and attachments. Fetching context does **not** mark messages read: use `atm msg ack mN` explicitly after reading a Delivered message. Unread summaries include queued and failed messages too, in message sequence order.
+Every unread message includes `atm inbox --id mN` to retrieve its full body and attachments. Text adds `After handling a delivered message: atm msg ack <id>` after a nonempty unread list (replace `<id>` with the message id). Fetching context does **not** mark messages read: use `atm msg ack mN` explicitly after reading a Delivered message. Unread summaries include queued and failed messages too, in message sequence order.
 
 The last line is the exact reporting template for your manager, for example:
 

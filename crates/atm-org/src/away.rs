@@ -21,6 +21,15 @@
 //! it is taken provisionally, by the requester when the agent decides. The
 //! owner can overrule either.
 //!
+//! ## Kinds that always wait
+//!
+//! The class follows from two fields the requester fills in itself, so a
+//! request can call a push something that can be undone. [`Decision::away_step`]
+//! therefore reads the kind first: an `action`, a `hire` and a `budget` are
+//! put through the table as [`DecisionClass::Irreversible`] whatever the two
+//! fields say, and so is a kind this build does not know. `policy`, `plan`
+//! and `dialog` keep the class their fields give them.
+//!
 //! # The stacking cap
 //!
 //! A provisional decision may carry the task in progress to its end; nothing
@@ -63,8 +72,8 @@
 //! are refused.
 
 use crate::{
-    Address, Decision, DecisionClass, DecisionCommand, DecisionId, DecisionStatus, OrgEvent,
-    OrgState, ProjectId, ProvisionalChoice, Refusal, Task, TaskId, TaskState,
+    Address, Decision, DecisionClass, DecisionCommand, DecisionId, DecisionKind, DecisionStatus,
+    OrgEvent, OrgState, ProjectId, ProvisionalChoice, Refusal, Task, TaskId, TaskState,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -269,7 +278,15 @@ impl Decision {
     /// Only meaningful while the decision is pending.
     #[must_use]
     pub fn away_step(&self, away: bool) -> AwayStep {
-        away_step(self.class(), self.request.recommended.is_some(), away)
+        // Kinds that reach outside wait, whatever class the requester claims.
+        let class = match self.request.kind {
+            DecisionKind::Action
+            | DecisionKind::Hire
+            | DecisionKind::Budget
+            | DecisionKind::Unknown => DecisionClass::Irreversible,
+            DecisionKind::Policy | DecisionKind::Plan | DecisionKind::Dialog => self.class(),
+        };
+        away_step(class, self.request.recommended.is_some(), away)
     }
 }
 

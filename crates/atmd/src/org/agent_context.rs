@@ -146,7 +146,7 @@ fn file_error(path: &Path, error: impl std::fmt::Display) -> AgentError {
     AgentError::Internal(format!("{}: {error}", path.display()))
 }
 
-fn read_files(
+pub(super) fn read_files(
     role_file: &Path,
     memory_file: &Path,
     name: &str,

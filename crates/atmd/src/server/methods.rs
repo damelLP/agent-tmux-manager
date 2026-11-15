@@ -30,6 +30,9 @@ pub struct MethodServices {
     pub control: Option<crate::control::service::ControlHandle>,
     /// Named-agent service; None advertises explicitly unavailable operations.
     pub agents: Option<crate::org::agents::AgentHandle>,
+    /// The handover service the server shares with its watcher; None builds
+    /// one for the method alone.
+    pub handovers: Option<crate::org::agent_handover::Handovers>,
     /// Confirmed-message service; None advertises explicitly unavailable operations.
     pub messages: Option<crate::org::messages::MessageHandle>,
     /// Decision API and its sole restart-recoverable answer bridge.
@@ -63,6 +66,7 @@ impl MethodServices {
             registry,
             control: None,
             agents: None,
+            handovers: None,
             messages: None,
             decisions: None,
             delivery_policy: None,
@@ -223,12 +227,14 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         .agents
         .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable));
     crate::org::agents::register_agent_methods(&mut router, agents.clone())?;
-    crate::org::agent_handover::register_agent_handover_method(
-        &mut router,
-        agents,
-        handover_org,
-        services.registry.clone(),
-    )?;
+    let handovers = services.handovers.unwrap_or_else(|| {
+        crate::org::agent_handover::Handovers::for_agents(
+            agents,
+            handover_org,
+            services.registry.clone(),
+        )
+    });
+    crate::org::agent_handover::register_agent_handover_method(&mut router, handovers)?;
 
     crate::org::messages::register_message_methods(
         &mut router,

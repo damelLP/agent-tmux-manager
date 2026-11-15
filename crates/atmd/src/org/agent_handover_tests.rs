@@ -5,6 +5,7 @@
 //! is exercised with the stand-in harness in `tests/agent_handover.rs`.
 //! Every wait is on a committed event, a channel or the call's own answer.
 
+use super::agent_auto_handover::spawn_handover_watch;
 use super::agent_handover::*;
 use super::agents::{AgentError, ClearResult};
 use super::OrgHandle;
@@ -866,8 +867,8 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
     let now = Utc::now();
     let limits = HandoverLimits::default();
     let s1 = SessionId::new("s1");
-    assert_eq!(context_note(&state, &s1, 39.99, &limits, now), None);
-    let (agent, note) = context_note(&state, &s1, 40.0, &limits, now).unwrap();
+    assert_eq!(context_note(&state, &s1, 59.99, &limits, now), None);
+    let (agent, note) = context_note(&state, &s1, 60.0, &limits, now).unwrap();
     assert_eq!(agent, id("worker"));
     assert_eq!(
         note,
@@ -875,14 +876,14 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
             from: Address::System,
             to: Address::Agent(id("lead")),
             kind: MessageKind::Note,
-            body: "agent p/worker is at 40% of its context (line 40%). \
+            body: "agent p/worker is at 60% of its context (line 60%). \
                    Hand it over: atm agent handover p/worker"
                 .into(),
             attachments: Vec::new(),
             task: None,
         }
     );
-    // The line is the policy's, passed in: nothing here knows 40.
+    // The line is the policy's, passed in: nothing here knows 60.
     let seventy = HandoverLimits {
         context_line_percent: 70,
         ..limits
@@ -892,7 +893,7 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
     assert!(note.body.contains("is at 70% of its context (line 70%)"));
     // The lead has no manager: its note goes to the owner.
     let lead = SessionId::new("lead-1");
-    let (agent, note) = context_note(&state, &lead, 55.0, &limits, now).unwrap();
+    let (agent, note) = context_note(&state, &lead, 65.0, &limits, now).unwrap();
     assert_eq!((agent, note.to), (id("lead"), Address::Owner));
     // A session no ready agent is bound to gets no note.
     let unbound = SessionId::new("other");
@@ -912,15 +913,15 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
 #[tokio::test]
 async fn one_note_per_session_when_a_turn_ends_at_the_line() {
     let mut rig = Rig::new().await;
-    spawn_context_notes(rig.org.clone(), rig.registry.clone(), rig.cancel.clone());
+    spawn_handover_watch(rig.service.clone(), rig.cancel.clone());
     // Below the line: no note.
-    rig.share("s1", 399).await;
+    rig.share("s1", 599).await;
     rig.turn("s1").await;
     // At the line: the first note.
-    rig.share("s1", 400).await;
+    rig.share("s1", 600).await;
     rig.turn("s1").await;
     // The same session again, higher: no second note.
-    rig.share("s1", 500).await;
+    rig.share("s1", 700).await;
     rig.turn("s1").await;
     // A session no agent is bound to: no note.
     let mut other = SessionDomain::new(
@@ -932,9 +933,12 @@ async fn one_note_per_session_when_a_turn_ends_at_the_line() {
     rig.registry.register(other).await.unwrap();
     rig.share("other", 900).await;
     rig.turn("other").await;
+    // The note is for the agent bound to the session when the watcher looks,
+    // so the worker's first note is awaited before the worker moves on.
+    let first = rig.next("msg.sent").await;
     // The worker in a new session (after a clear): a new note.
     rig.bind("worker", "s2", "%1").await;
-    rig.share("s2", 450).await;
+    rig.share("s2", 650).await;
     rig.turn("s2").await;
     // A share that is reported after the turn's end still counts, and the
     // lead's note goes to the owner.
@@ -944,8 +948,11 @@ async fn one_note_per_session_when_a_turn_ends_at_the_line() {
     // The watcher reads these in order, so the three notes below, with no
     // other between them, are all that the sequence above produced.
     let mut notes = Vec::new();
-    for _ in 0..3 {
-        let note = rig.next("msg.sent").await;
+    for note in [
+        first,
+        rig.next("msg.sent").await,
+        rig.next("msg.sent").await,
+    ] {
         notes.push((
             note.body["to"].as_str().unwrap().to_owned(),
             note.body["body"].as_str().unwrap().to_owned(),
@@ -953,15 +960,15 @@ async fn one_note_per_session_when_a_turn_ends_at_the_line() {
     }
     let text = |agent: &str, share: u32| {
         format!(
-            "agent p/{agent} is at {share}% of its context (line 40%). \
+            "agent p/{agent} is at {share}% of its context (line 60%). \
              Hand it over: atm agent handover p/{agent}"
         )
     };
     assert_eq!(
         notes,
         [
-            ("p/lead".to_owned(), text("worker", 40)),
-            ("p/lead".to_owned(), text("worker", 45)),
+            ("p/lead".to_owned(), text("worker", 60)),
+            ("p/lead".to_owned(), text("worker", 65)),
             ("owner".to_owned(), text("lead", 60)),
         ]
     );
@@ -969,7 +976,7 @@ async fn one_note_per_session_when_a_turn_ends_at_the_line() {
 
 fn line_note(agent: &str, share: u32) -> String {
     format!(
-        "agent p/{agent} is at {share}% of its context (line 40%). \
+        "agent p/{agent} is at {share}% of its context (line 60%). \
          Hand it over: atm agent handover p/{agent}"
     )
 }
@@ -991,12 +998,12 @@ async fn notes(rig: &mut Rig, count: usize) -> Vec<(String, String)> {
 #[tokio::test]
 async fn a_share_at_the_line_is_not_noted_while_the_turn_runs() {
     let mut rig = Rig::new().await;
-    spawn_context_notes(rig.org.clone(), rig.registry.clone(), rig.cancel.clone());
+    spawn_handover_watch(rig.service.clone(), rig.cancel.clone());
     // The worker has ended a turn, then works again and crosses the line
     // inside that turn.
     rig.turn("s1").await;
     rig.report("s1", LifecycleEvent::WorkingStart).await;
-    rig.share("s1", 500).await;
+    rig.share("s1", 700).await;
     // Meanwhile the lead's turn ends above the line: its note comes first,
     // which shows that the worker's share was seen and not noted.
     rig.turn("lead-1").await;
@@ -1007,7 +1014,7 @@ async fn a_share_at_the_line_is_not_noted_while_the_turn_runs() {
         notes(&mut rig, 2).await,
         [
             ("owner".to_owned(), line_note("lead", 60)),
-            ("p/lead".to_owned(), line_note("worker", 50)),
+            ("p/lead".to_owned(), line_note("worker", 70)),
         ]
     );
 }
@@ -1015,11 +1022,11 @@ async fn a_share_at_the_line_is_not_noted_while_the_turn_runs() {
 #[tokio::test]
 async fn an_idle_session_is_not_noted_before_a_turn_has_ended_in_it() {
     let mut rig = Rig::new().await;
-    spawn_context_notes(rig.org.clone(), rig.registry.clone(), rig.cancel.clone());
+    spawn_handover_watch(rig.service.clone(), rig.cancel.clone());
     // The worker's session is first seen idle and above the line, as after
     // a daemon restart: updates arrive, and no turn has ended.
-    rig.share("s1", 500).await;
-    rig.share("s1", 510).await;
+    rig.share("s1", 700).await;
+    rig.share("s1", 710).await;
     // The lead's note comes first, which shows that those updates were seen
     // and not noted.
     rig.turn("lead-1").await;
@@ -1030,7 +1037,11 @@ async fn an_idle_session_is_not_noted_before_a_turn_has_ended_in_it() {
         notes(&mut rig, 2).await,
         [
             ("owner".to_owned(), line_note("lead", 60)),
-            ("p/lead".to_owned(), line_note("worker", 51)),
+            ("p/lead".to_owned(), line_note("worker", 71)),
         ]
     );
 }
+
+// The handover watcher's tests use this file's rig.
+#[path = "agent_auto_handover_tests.rs"]
+mod auto;

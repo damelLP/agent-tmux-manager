@@ -12,6 +12,7 @@
 //! its filesystem worker may still hold the stream lock. Restart to recover.
 
 mod actor;
+pub mod agent_auto_handover;
 pub mod agent_context;
 pub mod agent_handover;
 #[cfg(test)]

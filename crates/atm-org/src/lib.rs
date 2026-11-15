@@ -188,6 +188,7 @@
 //! once per session (None if no cost was reported), using Money's saturation.
 //! Delivery timestamps and first read time come from apply's supplied timestamp.
 
+pub mod auto_handover;
 mod away;
 mod command;
 mod config;

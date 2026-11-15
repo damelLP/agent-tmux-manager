@@ -40,8 +40,8 @@ impl SummaryObserver {
 
     pub async fn finish(mut self) {
         self.stop.cancel();
-        // Connection drain takes at most 2 s; leave 1 s of margin inside
-        // `atmd stop`'s 5 s wait for the remaining shutdown work.
+        // Runs alongside raw flush after connection/control/audit drains;
+        // both flushes share the final 2 s of the nominal 64 s shutdown budget.
         match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(%error, "Session summary observer failed"),

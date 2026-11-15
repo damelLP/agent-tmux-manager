@@ -77,9 +77,16 @@ rig.close();
   waiters after the cached committed state changes; no list-sessions polling.
   Restart creates a fresh subscription. `pane_rows` and `rows` make explicit
   snapshot queries to the real daemon.
-  SessionView has no PID: use owned panes/IDs, never total host row counts.
-  `discover()` can see unrelated procfs processes. A pending row becoming one
-  real-ID row proves discovery and the hook agree on PID.
+  SessionView has no PID: identify rows by owned panes/IDs. The rig sets a
+  private `ATM_TMUX_SOCKET` label: startup discovery and `discover()` admit only
+  processes mapped to that server's panes, and admit none if pane listing fails.
+  This supersedes the initial M1 allowance for foreign pending rows documented
+  in `scripts/atm-candidate.md` under "Lifecycle and limits": U11b's concurrent
+  runs proved host processes fill the 100-row registry and leak host sessions
+  into failure logs. Default-label daemons remain host-wide; private tests that
+  need discovery isolation must set a label in their own helpers. Direct hooks
+  are not filtered. A pending row becoming one real-ID row proves discovery
+  and the hook agree on PID.
 - `capture(pane)` joins wrapped screen lines; `capture_plain(pane)` preserves
   viewport line structure and trailing newlines (`capture-pane -p`, no `-J`).
   `capture_styled(pane)` uses `capture-pane -e -N -p`, retaining SGR and trailing
@@ -92,10 +99,30 @@ rig.close();
   Commands and `wait_for_shell` wait on Linux pidfd exit notification with a
   30-second hang guard, not repeated `try_wait`/procfs polling. Command output
   goes through temporary files so large output cannot fill a pipe.
+  `wait_for_shell` additionally awaits the retained bash prompt's event, keyed by
+  the exited harness PID/start time so a prior prompt cannot satisfy a relaunch.
+  The rig's `PROMPT_COMMAND` prints synthetic `stand-in-shell$` chrome and waits
+  for tmux's cursor-position reply before publishing that event; `PS1` is cleared
+  in the hook itself (bash resets an inherited empty PS1). New shells without an
+  exited harness do not read a cursor reply, leaving queued spawn input to bash.
+  Send nothing to a retained shell until `wait_for_shell` returns.
+  Verified with tmux 3.8 and bash 5.3.20; no model CLI is involved.
   `command(path)` supplies the same sealed environment to custom invocations;
   execute with `rig.run(&mut command)`. `tmux` supplies the private `-L` label.
   If also using role support, import `stand_in::bounded` rather than including
   `support/role.rs` twice.
+- `stand_in_forwarder_identity` names its failed step and dumps its journal,
+  fresh rows and daemon diagnostics. It enables `ATM_STANDIN_TRACE_HOOKS=1` on
+  its private server: real hook bash xtrace goes to the pane's `.hook-trace.log`,
+  including previous command exit status, without enabling `/tmp/atm-hook.log`.
+  This observes send attempts, not delivery guarantees, and adds tracing overhead.
+  Failure diagnostics can include discovered host sessions; keep them local.
+  Concurrent loaded runs reproduced a Codex pending-row timeout before any hook:
+  daemon logs rejected that exact PID at the registry's 100-session cap. Private
+  sockets do not isolate `/proc` discovery from other rigs or host harnesses.
+  Run a failing binary alone and report both results; do not extend waits or
+  infer hook loss from a row timeout. A socat timeout status alone also does not
+  prove a dropped hook (the daemon may already have accepted its messages).
 - `journal(pane)` is diagnostic JSONL: identity, accepted/rejected/queued input,
   event/dropped, status, draft, render, ready, selection, connected/disconnected,
   transport_dropped.
@@ -349,13 +376,16 @@ P1 trust has 80/120/200x40, and Codex dialogs 100x24/32 sources.
 Uncaptured combinations are explicitly synthetic: redundant blank padding is
 removed before old transcript, preserving editor blanks and history separators.
 Pi rules reflow to equal widths and aligned usage/model and Codex shortcut/warning
-footers retain complete tokens. Codex fresh panes below 25 rows use P1's compact
+footers retain complete tokens. Claude's standalone effort and `Ctrl+Y to paste
+deleted text` lines are dropped whole if they would be clipped. Codex fresh panes below 25 rows use P1's compact
 100x24 header/editor/footer capture (a18), not the tall logo, which needs 25 rows.
 This is a source splice from P1's gpt-5.4 session into the U5 lifecycle; resizing
 that capture to other compact sizes is Synthetic. The adapter contract pins
 all lifecycle facts at 100x30, 80x24 (Codex), 100x24, 120x19 and the supported minima: **Codex 80x19,
-pi 86x19**. A 60x40 split is too narrow for their captured interrupt/startup chrome:
-scene rendering explicitly refuses it. Only `launch`, `wait_ready` and `wait_event`
+pi 86x19**. Claude requires **53 columns** (its existing two-row floor is unchanged,
+not a claim of lifecycle fidelity at that height); fresh facts are pinned at
+53x19/24/30/40. A 52-column Claude pane or 60-column Codex/pi split is too narrow
+for captured chrome: scene rendering explicitly refuses it. Only `launch`, `wait_ready` and `wait_event`
 surface the scene error immediately rather than waiting for a misleading ready
 frame; `observe_pane` and `wait_for_row` do not surface scene errors. Use a wider pane for these modes.
 Source-only replay remains native-size evidence. This is not real-harness resize
@@ -392,14 +422,15 @@ No frame/ready event is emitted after exit. Codex hook-review Esc and permission
 Pure source/scene/key tests run through the Cargo Python contract; private tmux
 integration tests cover native fresh replay, modal keys and retained shells.
 `stand_in_screens` calls all three real adapters, not copied parsers. It compares
-all 76 sources through private tmux with independent source text and pinned U8a
-facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
+all 76 sources through private tmux with independent source text and pinned legacy
+`observe_screen` facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
 allowing tmux to normalize SGR encodings. Separate key-driven tests cover drafts,
 working/idle, each clear phase, repeated identical clear snapshots, interruptions,
 actual retained shells, trust, update, hook review/list, worktree and permission.
-P1 Codex dialogs and selected Claude trust remain Unknown under unchanged U8a.
+P1 Codex dialogs and selected Claude trust remain Unknown to legacy `observe_screen`.
+In chunk A, B0's `observe_control_screen` recognises these modals; the stand-in tests do not pin it.
 Claude's rich identical-draft source has a separate warning footer and is wholly
-Unknown, not merely unknown input. No parser special cases are added.
+Unknown to legacy `observe_screen`, not merely unknown input. No parser special cases are added.
 
 For supplementary source-only conformance, `control(pane, json!({"command":
 "render_source", "key": "claude.permission.u5"}))` replays a catalog entry for
@@ -411,8 +442,12 @@ This diagnostic control never proves a lifecycle
 transition; the key-driven tests are the independent transition evidence.
 
 A real-looking placeholder, selected trust option or Codex draft may still be
-Unknown to the current parsers. Neither the journal nor a rendered frame is
+Unknown to legacy `observe_screen`. Neither the journal nor a rendered frame is
 permission to deliver a prompt.
+A rig daemon discovers every harness process on the host (private sockets do not
+isolate `/proc`), so concurrent runs can fill its registry (`Registry is full`,
+max 100) and failure output can name the host's real sessions; a separate unit
+addresses discovery scope.
 
 ## Captured templates
 

@@ -107,6 +107,9 @@ class Runtime:
             raise RuntimeError("failed to set process comm")
         self.start_time = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
         self.pane = os.environ["TMUX_PANE"]
+        (self.root / ("shell-" + self.pane + ".json")).write_text(json.dumps({
+            "pane": self.pane, "shell_for_pid": os.getpid(),
+            "shell_for_start_time": self.start_time}))
         self.record({"kind": "identity", "mode": self.mode, "argv": sys.argv,
                      "session_id": self.model.session_id})
 
@@ -191,8 +194,18 @@ class Runtime:
             hook = "atm-hook" if self.mode == "claude" else "atm-codex-hook"
             script = HERE.parents[2] / "crates" / "atm" / "scripts" / hook
             # No injected pid/pane: the real forwarder must enrich these.
-            subprocess.run(["/bin/bash", str(script)], input=json.dumps(data),
-                           text=True, timeout=30, check=True, env=dict(os.environ, ATM_DEBUG="0"))
+            env = dict(os.environ, ATM_DEBUG="0")
+            if os.environ.get("ATM_STANDIN_TRACE_HOOKS") == "1":
+                # Keep xtrace off the pane and out of the production debug log.
+                # PS4 includes the preceding command's status (notably timeout 124).
+                with self.log_path.with_suffix(".hook-trace.log").open("a") as trace:
+                    env.update(BASH_XTRACEFD=str(trace.fileno()), PS4='+hook:${LINENO}:status=$? ')
+                    subprocess.run(["/bin/bash", "-x", str(script)], input=json.dumps(data),
+                                   text=True, timeout=30, check=True, env=env,
+                                   pass_fds=(trace.fileno(),))
+            else:
+                subprocess.run(["/bin/bash", str(script)], input=json.dumps(data),
+                               text=True, timeout=30, check=True, env=env)
             return
         self.observe_pi()
         data.update(pid=os.getpid(), tmux_pane=self.pane)

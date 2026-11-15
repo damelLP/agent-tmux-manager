@@ -37,6 +37,10 @@ Sessions appear as you use supported coding-agent harnesses. Press `Enter` to ju
 
 An open TUI restarts the daemon within a few seconds if it goes away, including after `atmd stop`. Quit every TUI before you stop the daemon for good, or before you restart it by hand: a TUI may start it first, with the TUI's environment. The daemon log defaults to `~/.local/state/atm/atm.log` (or `$XDG_STATE_HOME/atm/atm.log` when `XDG_STATE_HOME` is absolute); each background start keeps the previous run's log as `atm.log.1`. Set `ATM_STATE_DIR` to a nonempty directory path to keep the daemon's PID file (`atmd.pid`), logs (`atm.log`, `atm.log.1`) and event log (`log/`), and the TUI's `tui.log`, there instead. Use a directory that survives a reboot: atmd replays the event log at start.
 
+`atmd stop` waits for the daemon's real process exit, not just removal of its socket or PID file. After 5 seconds it prints one progress line and continues waiting, up to 75 seconds from signaling. Nominal shutdown drains can take 64 seconds: connections (2), admitted control work (30 total under its original deadlines), audits (30), then concurrent summary/raw flushes (2). Blocking I/O, including work that Tokio waits for at runtime shutdown, can take longer without a finite bound. On timeout, stop exits non-zero and names the PID that may still be shutting down; it neither force-kills the daemon nor removes its state. Successful stop confirms exit, not that every pending write was persisted.
+
+Known limit (unverified in a seccomp-filtered runtime): if a filter rejects Linux `pidfd_open` with `EPERM`, `atmd stop` fails before signaling the daemon. Only `ENOSYS` enables the old-kernel numeric-PID fallback; a seccomp denial does not.
+
 ## CLI at a glance
 
 ```bash

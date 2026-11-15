@@ -101,8 +101,8 @@ impl RawHandle {
         let unavailable = || OrgServiceError::Unavailable("raw logging disabled".into());
         let queue = self.queue.as_ref().ok_or_else(unavailable)?;
         let (send, receive) = oneshot::channel();
-        // Runs alongside summary flush after the 2 s connection drain; keep
-        // both flushes within 2 s, leaving margin in `atmd stop`'s 5 s wait.
+        // Runs alongside summary flush after connection/control/audit drains;
+        // both flushes share the final 2 s of the nominal 64 s shutdown budget.
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             queue
                 .send(Request::Flush(send))

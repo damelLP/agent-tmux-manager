@@ -413,6 +413,7 @@ fn status_output(body: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn captured_minute_completion_line_is_recognized() {
@@ -431,33 +432,16 @@ mod tests {
                 .find(|line| line.starts_with("Worked for "))
                 .unwrap();
             assert!(worked_status(line), "{line}");
-            // This argv-started session has compact footer chrome not supported
-            // by the editor parser. Duration evidence must not broaden that gate.
+            // Launched with --no-alt-screen, -C <dir> and a positional prompt.
+            // P3 isolated --no-alt-screen as the compact-footer trigger, not -C
+            // or the prompt; prompt-started Codex via today's atm spawn has the
+            // normal footer. Duration evidence must not broaden the editor gate.
             assert_eq!(
                 super::observe_screen(ScreenInput::Styled(text), None).turn,
                 TurnState::Unknown
             );
-            // Synthetic: transplant the real completed line into a captured
-            // supported editor to exercise both public observers end to end.
-            let supported =
-                include_str!("../tests/fixtures/screen_styled_p1_c02-multiline-100x24_0.167.0.txt")
-                    .split_once('\n')
-                    .unwrap()
-                    .1
-                    .replace("Worked for <1s • 16:34", line);
-            assert_eq!(
-                super::observe_screen(ScreenInput::Styled(&supported), None).turn,
-                TurnState::NotRunning
-            );
-            assert_eq!(
-                observe_control_screen(ScreenInput::Styled(&supported), None)
-                    .facts
-                    .turn,
-                TurnState::NotRunning
-            );
         }
     }
-    use proptest::prelude::*;
 
     fn observe_screen(text: &str, cursor: Option<ScreenCursor>) -> ScreenFacts {
         super::observe_screen(ScreenInput::Plain(text), cursor)

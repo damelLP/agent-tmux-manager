@@ -360,6 +360,13 @@ impl StandInRig {
             .env("ATM_STANDIN_ROOT", self.root())
             .env("ATM_STANDIN_EVENTS", self.events.path())
             .env("ATM_DEBUG", "0")
+            .env(
+                "PROMPT_COMMAND",
+                format!(
+                    "PS1=; python3 {}",
+                    quote(&format!("{SOURCE}/shell_prompt.py"))
+                ),
+            )
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .current_dir(self.root());
         cmd
@@ -530,17 +537,12 @@ impl StandInRig {
     pub fn wait_for_shell(&self, pane: &StandInPane) {
         self.owns(pane);
         process::wait_exit(pane.pid, Duration::from_secs(30)).expect("stand-in process exit");
-        assert_eq!(
-            checked(self.tmux(&[
-                "display-message",
-                "-p",
-                "-t",
-                &pane.pane_id,
-                "#{pane_current_command}",
-            ])),
-            "bash",
-            "retained shell after stand-in exit"
-        );
+        self.events.wait(|e| {
+            e["kind"] == "shell_prompt"
+                && e["pane"] == pane.pane_id
+                && e["shell_for_pid"] == pane.pid
+                && e["shell_for_start_time"] == pane.start_time
+        });
     }
     pub fn key(&self, pane: &StandInPane, key: &str) {
         self.owns(pane);

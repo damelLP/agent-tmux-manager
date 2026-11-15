@@ -17,6 +17,69 @@ from atm_candidate import git_env
 SCRIPT = Path(__file__).with_name('atm-candidate')
 
 
+class StopPolicy(unittest.TestCase):
+    def run_wait(self, exit_at):
+        # Virtual time at the syscall boundary; no real I/O or settling delays.
+        import contextlib
+        import io
+        from unittest.mock import patch
+        import atm_candidate
+        clock = [0.0]
+        def poll(read, write, error, timeout):
+            self.assertEqual((read, write, error), ([7], [], []))
+            clock[0] += timeout
+            if exit_at is not None and clock[0] >= exit_at:
+                clock[0] = exit_at
+                return ([7], [], [])
+            return ([], [], [])
+        class Output(io.StringIO):
+            def write(stream, text):
+                if 'is still stopping' in text:
+                    self.assertEqual(clock[0], 5, 'progress deadline drifted from atmd stop')
+                return super().write(text)
+        output = Output()
+        failure = None
+        with (patch.object(atm_candidate.time, 'monotonic', lambda: clock[0]),
+              patch.object(atm_candidate.select, 'select', poll),
+              contextlib.redirect_stderr(output)):
+            try:
+                atm_candidate.wait_for_exit(7, 123, 0)
+            except atm_candidate.Refused as error:
+                failure = str(error)
+        return clock[0], output.getvalue(), failure
+
+    def test_exit_before_progress_is_silent(self):
+        self.assertEqual(self.run_wait(0), (0, '', None))
+
+    def test_exit_after_five_seconds_gets_one_progress_line(self):
+        elapsed, output, failure = self.run_wait(6)
+        self.assertEqual(elapsed, 6)
+        self.assertEqual(output.count('Process 123 is still stopping'), 1)
+        self.assertIsNone(failure)
+
+    def test_live_process_timeout_is_seventy_five_seconds_not_thirty(self):
+        elapsed, output, failure = self.run_wait(None)
+        self.assertEqual(elapsed, 75)
+        self.assertEqual(output.count('Process 123 is still stopping'), 1)
+        self.assertIn('process 123', failure)
+        self.assertIn('75 seconds', failure)
+        self.assertIn('still be shutting down', failure)
+        self.assertIn('retained runtime', failure)
+
+    def test_exit_observed_at_deadline_wins(self):
+        elapsed, output, failure = self.run_wait(75)
+        self.assertEqual(elapsed, 75)
+        self.assertEqual(output.count('Process 123 is still stopping'), 1)
+        self.assertIsNone(failure)
+
+    def test_failed_exit_probe_is_not_success(self):
+        from unittest.mock import patch
+        import atm_candidate
+        with patch.object(atm_candidate.select, 'select', side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                atm_candidate.wait_for_exit(7, 123, 0)
+
+
 class CandidateKit(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='kit-')
@@ -67,8 +130,10 @@ class CandidateKit(unittest.TestCase):
             self.assertEqual(out.returncode, 0, out.stderr)
 
     def call(self, *args, ok=True, env=None):
+        # Allow the 30 s kit lock plus one 75 s stop budget and cleanup margin.
+        # This is a hang guard, not a settling delay or a load-dependent retry.
         out = subprocess.run(['bash', str(self.script), *map(str, args)],
-                             env=env or self.env, capture_output=True, text=True, timeout=45)
+                             env=env or self.env, capture_output=True, text=True, timeout=120)
         if ok is not None:
             self.assertEqual(out.returncode == 0, ok, out.stdout + out.stderr)
         return out
@@ -897,6 +962,67 @@ class CandidateKit(unittest.TestCase):
             if child.poll() is None:
                 child.stdin.close()
                 child.wait(timeout=30)
+
+    # Removing progress or treating TERM/file cleanup as exit breaks this gate.
+    def test_stop_reports_progress_before_removing_runtime(self):
+        import select
+        import time
+        import atm_candidate
+        self.call('start', self.install())
+        status = self.status()
+        env = dict(self.env, ATM_SOCKET=status['socket'],
+                   TMUX_TMPDIR=str(Path(status['run']) / 't'),
+                   ATM_CANDIDATE_RUN=status['token'])
+        child = subprocess.Popen(['/bin/cat'], env=env, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, start_new_session=True)
+        fd = os.pidfd_open(child.pid)
+        stopper = None
+        try:
+            self.cat_ready(child)
+            kit = object.__new__(atm_candidate.Kit)
+            self.assertTrue(kit.owns(status, child.pid))
+            signal.pidfd_send_signal(fd, signal.SIGSTOP)
+            self.assertEqual(os.waitid(os.P_PID, child.pid, os.WSTOPPED).si_status,
+                             signal.SIGSTOP)
+            stopper = subprocess.Popen(['bash', str(self.script), 'stop'], env=self.env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       bufsize=0)
+            progress = f'Process {child.pid} is still stopping'.encode()
+            deadline = time.monotonic() + 120  # outer hang guard, not an exit-duration assertion
+            while True:
+                # Other owned processes may report progress before their exit events.
+                # Unbuffered bytes keep readline from hiding lines from select.
+                remaining = max(0, deadline - time.monotonic())
+                self.assertTrue(select.select([stopper.stderr], [], [], remaining)[0],
+                                'stop never reported held-child progress')
+                line = stopper.stderr.readline()
+                self.assertTrue(line, 'stop exited before held-child progress')
+                if progress in line:
+                    break
+            self.assertTrue(Path(status['run']).exists(), 'removed runtime before exit')
+            self.assertTrue((self.root / 'kit/active.json').exists())
+            self.assertFalse(select.select([fd], [], [], 0)[0])
+            signal.pidfd_send_signal(fd, signal.SIGCONT)
+            out, err = stopper.communicate(timeout=120)  # wait for all remaining process exits
+            self.assertEqual(stopper.returncode, 0, out + err)
+            self.assertNotIn(progress, err, 'duplicate held-child progress')
+            self.assertTrue(select.select([fd], [], [], 0)[0], 'stop returned before exit')
+            child.wait(timeout=30)
+            self.assertFalse(Path(status['run']).exists())
+            self.assertFalse((self.root / 'kit/active.json').exists())
+        finally:
+            # Resume before any termination/reap, even on a failed progress assert.
+            if child.poll() is None:
+                signal.pidfd_send_signal(fd, signal.SIGCONT)
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            child.wait(timeout=30)
+            child.stdin.close()
+            child.stdout.close()
+            os.close(fd)
+            if stopper is not None:
+                if stopper.poll() is None:
+                    stopper.kill()
+                stopper.communicate(timeout=30)
 
     # An atm-autostarted sibling is not the recorded initial foreground daemon.
     def test_stop_finds_autostarted_daemon(self):

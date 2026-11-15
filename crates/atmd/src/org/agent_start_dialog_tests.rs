@@ -507,10 +507,7 @@ async fn dialog_key_outcome_unknown_is_never_repeated() {
     progress(&mut starting.events, "up_answering", Some("q/lead")).await;
     starting.rig.client.stall_pane_effects(true);
     let result = call.await.unwrap();
-    assert!(
-        matches!(result, Err(AgentError::Reservation(_))),
-        "{result:?}"
-    );
+    assert_told_stuck(&result, &starting.agent().await.unwrap());
     assert_eq!(starting.effects(), starting.launched_then(&["Enter"]));
     let reason = starting.agent().await.unwrap().reason.unwrap_or_default();
     assert!(
@@ -543,15 +540,7 @@ async fn deadline_during_a_dialog_key_names_the_key() {
     progress_within(&mut starting.events, "up_answering", Some("q/lead"), 59).await;
     starting.rig.client.stall_pane_effects(true);
     let result = call.await.unwrap();
-    assert!(
-        matches!(
-            result,
-            Err(AgentError::Reservation(
-                crate::control::reservation::ReservationError::Timeout
-            ))
-        ),
-        "{result:?}"
-    );
+    assert_told_stuck(&result, &starting.agent().await.unwrap());
     assert_eq!(starting.effects(), starting.launched_then(&["Enter"]));
     starting
         .assert_stuck(&format!(
@@ -620,15 +609,7 @@ async fn accept_sent_then_unknown_screen_leaves_one_audit_and_names_the_key() {
         }
         let result = starting.up().await;
         if deadline {
-            assert!(
-                matches!(
-                    result,
-                    Err(AgentError::Reservation(
-                        crate::control::reservation::ReservationError::Timeout
-                    ))
-                ),
-                "{result:?}"
-            );
+            assert_told_stuck(&result, &starting.agent().await.unwrap());
         } else {
             assert!(result.is_err(), "{result:?}");
             assert_eq!(starting.unread(), 0);

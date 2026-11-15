@@ -1116,3 +1116,77 @@ async fn stopping_reserved_work_aborts_work_and_runs_cleanup_as_worker_stopped()
     cancel.cancel();
     task.await.unwrap();
 }
+
+/// How the test ends the reserved work that left a capture in the pacing queue.
+enum WorkEnds {
+    AtItsDeadline,
+    ByTheStop,
+}
+
+// A flow that polls its pane nearly always has a capture waiting out the
+// pacing interval when its work is stopped. The actor's stop must still end
+// when that capture is the last thing it drains: it is rejected by its stale
+// fence in a pass that nothing follows unless the actor closes its input then.
+async fn stop_ends_after_stopped_work_left_a_paced_capture(ends: WorkEnds) {
+    let (control, cancel, task, _) = actor();
+    let (entered, entry) = oneshot::channel();
+    let mut req = request("p/a", Some("%1"), ReservationKind::Up);
+    // Shorter than the pacing interval: the second capture is still queued.
+    let budget = Duration::from_millis(100);
+    if matches!(ends, WorkEnds::AtItsDeadline) {
+        req.deadline = Instant::now() + budget;
+    }
+    let job = queued(
+        &control,
+        req,
+        move |r| async move {
+            let pane = PaneId::parse("%1").unwrap();
+            // Admitted at once, whatever tmux answers: it opens the interval.
+            let _ = r.capture(&pane, CaptureFormat::Plain).await;
+            entered.send(()).unwrap();
+            // Paced: it waits in the actor's queue, as a polling flow's does.
+            let _ = r.capture(&pane, CaptureFormat::Plain).await;
+            panic!("the paced capture was answered before the work was stopped")
+        },
+        noop,
+    )
+    .await;
+    entry.await.unwrap();
+    // The actor has taken the second capture into its queue.
+    barrier(&control).await;
+    let result = match ends {
+        WorkEnds::AtItsDeadline => {
+            tokio::time::advance(budget).await;
+            job.await.unwrap()
+        }
+        WorkEnds::ByTheStop => {
+            control.stop_reserved_work();
+            job.await.unwrap()
+        }
+    };
+    assert!(
+        matches!(
+            (&ends, &result),
+            (WorkEnds::AtItsDeadline, Err(ReservationError::Timeout))
+                | (WorkEnds::ByTheStop, Err(ReservationError::Unavailable))
+        ),
+        "{result:?}"
+    );
+    cancel.cancel();
+    // A hang guard on the paused clock, not a duration: the actor ends, or
+    // nothing ever wakes it.
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("the control actor did not end after its last paced capture was drained")
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_ends_after_work_its_deadline_stopped_left_a_paced_capture() {
+    stop_ends_after_stopped_work_left_a_paced_capture(WorkEnds::AtItsDeadline).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_ends_after_work_the_stop_ended_left_a_paced_capture() {
+    stop_ends_after_stopped_work_left_a_paced_capture(WorkEnds::ByTheStop).await;
+}

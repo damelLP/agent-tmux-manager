@@ -13,7 +13,7 @@
 //! adopt, clear and respawn act on panes.
 
 use super::agent_flow::{adopt_baseline, classify_pane, PaneShape};
-use super::agent_lifecycle::pin;
+use super::agent_lifecycle::{deadline_answer, pin, stuck_record};
 pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
 pub use super::agent_types::*;
@@ -461,7 +461,7 @@ impl AgentHandle {
         );
         let waiting = super::agent_lifecycle::Waiting::default();
         let (work, cleanup) = (rt.clone(), rt.clone());
-        let why = waiting.clone();
+        let (why, record, whose) = (waiting.clone(), waiting.clone(), id.clone());
         self.lifecycle_for(
             p.caller_server,
             request,
@@ -469,6 +469,7 @@ impl AgentHandle {
             move |_, _| async move { cleanup.settle_up(&id, &why).await },
         )
         .await
+        .map_err(|error| deadline_answer(error, &whose, stuck_record(&record)))
     }
     pub async fn adopt(&self, p: AdoptParams) -> Result<AdoptResult, AgentError> {
         const OPERATION: &str = "agent.adopt";
@@ -533,12 +534,14 @@ impl AgentHandle {
         let waiting = super::agent_lifecycle::Waiting::default();
         let (work, cleanup) = (rt.clone(), rt.clone());
         let (id, why) = (p.agent.clone(), waiting.clone());
+        let (record, whose) = (waiting.clone(), p.agent.clone());
         self.lifecycle(
             request,
             move |r| async move { work.clear(&r, &p.agent, pane.as_ref(), &waiting).await },
             move |_, _| async move { cleanup.settle_clear(&id, &why).await },
         )
         .await
+        .map_err(|error| deadline_answer(error, &whose, stuck_record(&record)))
     }
     pub async fn respawn(
         &self,
@@ -592,6 +595,7 @@ impl AgentHandle {
         };
         let (work, cleanup) = (rt.clone(), rt.clone());
         let (why, changed) = (waiting.clone(), replace.effect.clone());
+        let (record, whose) = (waiting.clone(), id.clone());
         let started = self
             .lifecycle_for(
                 p.caller_server,
@@ -603,7 +607,8 @@ impl AgentHandle {
                         .await
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| deadline_answer(error, &whose, stuck_record(&record)))?;
         Ok(RespawnResult {
             agent_id: started.agent_id,
             pane: started.pane,

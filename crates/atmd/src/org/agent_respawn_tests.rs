@@ -523,6 +523,69 @@ async fn respawn_kill_done_and_down_not_recorded_quarantines() {
 }
 
 #[tokio::test]
+async fn respawn_that_ends_on_a_timeout_tells_the_stuck_reason() {
+    // The old pane is killed and the new one launched into; tmux takes the
+    // launch's Enter and its call never returns. The start ends on that
+    // timeout, its cleanup records the agent Stuck on the new pane, and the
+    // respawn's caller is told that reason, as a start's caller is
+    // (launch_enter_that_never_answers_is_reported_as_unknown). Twin:
+    // respawn_timeout_with_no_stuck_record_stays_a_timeout.
+    let mut starting = Starting::ready(CODEX).await;
+    starting.script_replace();
+    starting.script_launch_on_new();
+    let call = starting.respawning(None).await;
+    progress(&mut starting.events, "up_running", Some("q/lead")).await;
+    starting.rig.client.stall_pane_effects(true);
+    let result = call.await.unwrap();
+    let agent = starting.agent().await.unwrap();
+    assert_told_stuck(&result, &agent);
+    assert_eq!(agent.pane.as_deref(), Some("%2"));
+    let reason = agent.reason.unwrap_or_default();
+    assert!(
+        reason.starts_with(
+            "start did not complete: running the launch command failed, and whether it reached the pane is unknown"
+        ) && reason.ends_with("; inspect %2"),
+        "{reason}"
+    );
+    assert_eq!(starting.effects(), starting.respawned());
+}
+
+#[tokio::test]
+async fn respawn_timeout_with_no_stuck_record_stays_a_timeout() {
+    // tmux takes the kill of the old pane and its call never returns: the
+    // respawn ends on a timeout before its start began. The start's cleanup
+    // is not reached, so nothing is recorded Stuck, and the caller keeps the
+    // timeout: only a Stuck record of this call's own replaces it. Twin:
+    // up_deadline_is_stuck_with_owner_note (a timeout with that record).
+    let mut starting = Starting::ready(CODEX).await;
+    starting.inspect("%0", None);
+    starting.inspect("%1", Some("q/lead"));
+    starting
+        .rig
+        .client
+        .script_tag_check(&Starting::inspection("%1", Some("q/lead"), "zsh"))
+        .unwrap();
+    starting.rig.client.stall_pane_effects(true);
+    let result = starting.respawn().await;
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(starting.effects(), ["kill %1"]);
+    let agent = starting.agent().await.unwrap();
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.reason, None);
+    let state = starting.rig.org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 0, "nobody is told by a note");
+    assert!(quarantined(&starting.rig, "q/lead").await);
+}
+
+#[tokio::test]
 async fn respawn_refuses_when_recorded_pane_changed_before_acquisition() {
     // The respawn prepared against %1 while a preceding job held the agent;
     // that job leaves it Ready on %2. The stale respawn must not take down

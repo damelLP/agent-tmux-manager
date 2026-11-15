@@ -1055,3 +1055,70 @@ const DELIVERY: &str = "[delivery]\nstable_idle = { secs = 0, nanos = 1000000 }\
 #[test]
 #[ignore = "waits for Task 12: Task 8 plus U9b slice B integration"]
 fn clear_waits_behind_admitted_delivery() {}
+
+/// A daemon stopped during a start must not wait out the control stage's
+/// bound. The start polls its pane, so the flow the stop ends leaves a
+/// capture in the control actor's pacing queue, and the actor has to end
+/// once that is drained. The stand-in draws no screen, so the start is still
+/// in flight when the stop comes. No duration is asserted: an actor that
+/// never ends holds `atmd stop` until the rig's command guard gives up on
+/// it, and a stage that overruns its bound says so in the daemon's log.
+#[test]
+fn stop_during_a_start_that_draws_no_screen_does_not_overrun() {
+    let mut test = AgentRig::start(StandInMode::Pi);
+    // A harness that never draws: it only stays in the foreground.
+    let silent = test.rig.root().join("bin/silent");
+    std::fs::write(&silent, "#!/bin/sh\nexec tail -f /dev/null\n").unwrap();
+    std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test.rig.set_daemon_env("ATM_SPAWN_BIN", &silent);
+    test.rig.restart_daemon();
+    assert_eq!(test.rpc("agent.list", json!({}), None), json!([]));
+    test.role("quiet", StandInMode::Pi, "");
+    let placement = test.placement(&support::started_config(StandInMode::Pi));
+    let cursor = test.cursor();
+    let (socket, up) = (
+        test.rig.socket(),
+        atm_protocol::ClientMessage::request(
+            "lifecycle".into(),
+            "agent.up".into(),
+            json!({
+                "project_root": test.project,
+                "name": "quiet",
+                "caller_server": test.server(),
+            }),
+            Some(placement),
+        ),
+    );
+    // Its answer is lost with the daemon; the thread only keeps the call open.
+    let call = std::thread::spawn(move || {
+        stand_in::protocol_request(&socket, up, std::time::Duration::from_secs(90))
+    });
+    // The launch line has run: from here on the start only looks at the pane.
+    test.rig.wait("the launch to be recorded as run", || {
+        test.tail(cursor)
+            .iter()
+            .any(|event| event["kind"] == "control.spawned")
+    });
+    let stop = test.rig.run(
+        test.rig
+            .command(std::path::Path::new(env!("CARGO_BIN_EXE_atmd")))
+            .arg("stop"),
+    );
+    assert!(
+        stop.status.success(),
+        "{stop:?}\n{}",
+        test.rig.diagnostics()
+    );
+    let _ = call.join().unwrap();
+    let log = std::fs::read_to_string(test.rig.root().join("daemon.log")).unwrap();
+    assert!(log.contains("Shutdown signal received"), "{log}");
+    assert!(!log.contains("did not end by its bound"), "{log}");
+    // The stop ended the start through its cleanup: the agent is stuck.
+    test.rig.restart_daemon();
+    let agents = test.rpc("agent.list", json!({"project_root": test.project}), None);
+    let agents = agents.as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{agents:?}");
+    assert_eq!(agents[0]["state"], "stuck", "{agents:?}");
+    let reason = agents[0]["reason"].as_str().unwrap();
+    assert!(reason.starts_with("start did not complete: "), "{reason}");
+}

@@ -156,7 +156,8 @@ class ProtectedFiles(Sealed):
                                   'crates/future/tests/fixtures/golden.jsonl': 'A'})
 
     def test_hooks_and_clippy_config_changes_are_protected(self):
-        paths = ('.githooks/pre-commit', '.githooks/pre-push', 'clippy.toml')
+        paths = ('.githooks/pre-commit', '.githooks/pre-push',
+                 '.githooks/commit-msg', 'clippy.toml')
         (self.repo / '.githooks').mkdir()
         for path in paths:
             (self.repo / path).write_text('before')

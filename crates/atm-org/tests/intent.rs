@@ -179,6 +179,22 @@ fn fences_end_only_on_a_matching_run_without_trailing_text() {
     );
 }
 
+// Break caught: an owner-commented-out metric still being treated as an approved measure.
+#[test]
+fn html_comments_cannot_authorize_measures_or_duplicate_sections() {
+    for text in [
+        "## How we will know\n<!-- disabled until reviewed\n- mechanical: scripts/disabled\n-->\n- owner\n",
+        "<!-- example only\n## How we will know\n- mechanical: scripts/disabled\n-->\n## How we will know\n- owner\n",
+        "## How we will know\n<!-- closed --> <!-- still open\n- mechanical: scripts/disabled\n-->\n- owner\n",
+        "## How we will know\n<!-- disabled\n- mechanical: scripts/disabled\n    -->\n- owner\n",
+        "## How we will know\n<!--\n```\n- mechanical: scripts/disabled\n```\n-->\n- owner\n",
+        "## How we will know\n```\n<!-- not a real comment opener\n```\n- owner\n",
+        "## How we will know\n    <!-- indented example, not a comment opener\n- owner\n",
+    ] {
+        assert_eq!(parse_intent_measures(text).unwrap(), vec![TaskMeasure::Owner], "{text}");
+    }
+}
+
 // Break caught: trim_start turning an indented code example into approved measures.
 #[test]
 fn indented_code_cannot_authorize_measures() {

@@ -5,7 +5,7 @@
 //! Values may have matching inline backticks; their internal bytes stay exact.
 //! ATX/Setext headings and unordered/numbered lists are supported; nested
 //! headings stay in the section until a peer/ancestor heading ends it. Fenced
-//! and indented code is ignored, not evidence of an approved measure.
+//! and indented code and HTML-commented lines are ignored, not approvals.
 //! This is a small Markdown subset, not a general renderer. Present invalid
 //! or empty sections fail closed; the I/O boundary decides missing-file policy.
 
@@ -30,8 +30,13 @@ pub enum IntentError {
 pub fn parse_intent_measures(text: &str) -> Result<Vec<TaskMeasure>, IntentError> {
     let mut lines = text.lines().enumerate().peekable();
     let (mut found, mut section, mut fence) = (false, None, None);
+    let mut comment = false;
     let mut measures = Vec::new();
     while let Some((row, raw)) = lines.next() {
+        if comment {
+            commented_line(raw, &mut comment);
+            continue;
+        }
         let Some(line) = markdown_line(raw) else {
             continue;
         };
@@ -41,6 +46,9 @@ pub fn parse_intent_measures(text: &str) -> Result<Vec<TaskMeasure>, IntentError
             }) {
                 fence = None;
             }
+            continue;
+        }
+        if commented_line(line, &mut comment) {
             continue;
         }
         if let Some((marker, length, _)) = fence_run(line) {
@@ -83,6 +91,18 @@ pub fn parse_intent_measures(text: &str) -> Result<Vec<TaskMeasure>, IntentError
     } else {
         Ok(measures)
     }
+}
+
+// Ignore the whole line if any part is commented: unsupported inline-comment
+// formatting must not turn a partially hidden declaration into an approval.
+fn commented_line(mut line: &str, open: &mut bool) -> bool {
+    let mut commented = *open;
+    while let Some((_, tail)) = line.split_once(if *open { "-->" } else { "<!--" }) {
+        commented = true;
+        *open = !*open;
+        line = tail;
+    }
+    commented
 }
 
 fn markdown_line(raw: &str) -> Option<&str> {

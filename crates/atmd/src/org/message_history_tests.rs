@@ -211,6 +211,144 @@ fn agent_outage_resets_hold_on_recovery() {
 }
 
 #[test]
+fn running_revalidation_does_not_spend_not_ready_budget() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Working);
+    obs.facts.turn = TurnState::Running;
+    f.observe(obs, 0);
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        5_000,
+    );
+    for now in [125_000, 1_800_000] {
+        wait(f.consume(now), WaitReason::SessionBusy);
+        assert_eq!(f.snapshot(now).live.agent_not_ready_since, None);
+    }
+}
+
+#[test]
+fn non_running_observation_starts_one_fresh_not_ready_window() {
+    for turn in [TurnState::NotRunning, TurnState::Unknown] {
+        let mut f = Fixture::new(0);
+        let mut obs = observation(SessionStatus::Working);
+        obs.facts.turn = TurnState::Running;
+        f.observe(obs.clone(), 0);
+        f.apply(
+            OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+            5_000,
+        );
+        obs.facts.turn = turn;
+        obs.facts.input = InputState::Draft;
+        f.observe(obs.clone(), 300_000);
+        assert_eq!(
+            f.snapshot(300_000).live.agent_not_ready_since,
+            Some(at(300_000))
+        );
+        f.observe(obs, 400_000);
+        wait(f.step(419_999), WaitReason::AgentNotReady);
+        blocked(f.step(420_000), FailureReason::AgentNotReadyTimeout);
+    }
+}
+
+#[test]
+fn lost_running_evidence_starts_clock_once_but_keeps_focus_precedence() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Working);
+    obs.facts.turn = TurnState::Running;
+    f.observe(obs.clone(), 0);
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        5_000,
+    );
+    for now in [300_000, 400_000, 2_000_000] {
+        f.record(HistoryUpdate::ObservationLost { recipient: agent() }, now);
+        let live = f.snapshot(now).live;
+        assert_eq!(live.running_turn_since, None);
+        assert_eq!(live.agent_not_ready_since, Some(at(300_000)));
+        wait(f.step(now), WaitReason::OwnerFocused);
+    }
+    f.observe(obs.clone(), 2_100_000);
+    f.observe(obs, 2_200_000);
+    let live = f.snapshot(2_200_000).live;
+    assert_eq!(live.running_turn_since, Some(at(2_100_000)));
+    assert_eq!(live.agent_not_ready_since, None);
+    wait(f.step(2_200_000), WaitReason::SessionBusy);
+}
+
+#[test]
+fn running_continuity_survives_status_not_source_changes() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Working);
+    obs.facts.turn = TurnState::Running;
+    f.observe(obs.clone(), 1_000);
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        5_000,
+    );
+    f.observe(obs.clone(), 10_000);
+    f.apply(OrgEvent::AgentEditorReady { agent_id: agent() }, 20_000);
+    assert_eq!(f.snapshot(20_000).live.running_turn_since, Some(at(1_000)));
+    assert_eq!(f.snapshot(20_000).live.agent_not_ready_since, None);
+    wait(f.consume(500_000), WaitReason::SessionBusy);
+    assert_eq!(f.snapshot(500_000).live.hold_since, None);
+    assert_eq!(f.snapshot(500_000).live.stale_blocker_since, None);
+
+    // Replacing the binding invalidates even a still-running old observation.
+    f.apply(OrgEvent::AgentSessionLost { agent_id: agent() }, 600_000);
+    assert_eq!(f.snapshot(600_000).live.running_turn_since, None);
+    assert_eq!(
+        f.snapshot(600_000).live.agent_not_ready_since,
+        Some(at(600_000))
+    );
+    obs.session = None;
+    f.observe(obs.clone(), 700_000);
+    assert_eq!(
+        f.snapshot(700_000).live.running_turn_since,
+        Some(at(700_000))
+    );
+    f.apply(OrgEvent::AgentClearRequested { agent_id: agent() }, 710_000);
+    assert_eq!(
+        f.snapshot(710_000).live.running_turn_since,
+        Some(at(700_000))
+    );
+    assert_eq!(f.snapshot(710_000).live.agent_not_ready_since, None);
+    // Losing the observed source without an applied binding change also resets.
+    obs.session = Some(SessionObservation {
+        id: "s2".into(),
+        harness: Harness::Pi,
+        status: SessionStatus::Working,
+        last_event_at: Some(at(720_000)),
+    });
+    f.observe(obs, 720_000);
+    assert_eq!(
+        f.snapshot(720_000).live.running_turn_since,
+        Some(at(720_000))
+    );
+}
+
+#[test]
+fn running_fact_on_unknown_or_gone_pane_is_not_busy_evidence() {
+    for presence in [PanePresence::Unknown, PanePresence::Gone] {
+        let mut f = Fixture::new(0);
+        let mut obs = observation(SessionStatus::Working);
+        obs.facts.turn = TurnState::Running;
+        f.observe(obs.clone(), 0);
+        f.apply(
+            OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+            5_000,
+        );
+        obs.presence = presence;
+        f.observe(obs, 300_000);
+        assert_eq!(f.snapshot(300_000).live.running_turn_since, None);
+        assert_eq!(
+            f.snapshot(300_000).live.agent_not_ready_since,
+            Some(at(300_000))
+        );
+        blocked(f.step(420_000), FailureReason::AgentNotReadyTimeout);
+    }
+}
+
+#[test]
 fn revalidation_starts_not_ready_clock_and_keeps_observation() {
     let mut f = Fixture::new(0);
     let mut obs = observation(SessionStatus::Idle);

@@ -60,10 +60,12 @@
 //! | Queued retry with landing evidence | Blocked(ProbablyDelivered) |
 //! | Queued retry before logged failed_at + retry delay | RetryAt; no new failure event |
 //! | Queued, owner focused (unknown focus is focused) | Wait(OwnerFocused), notice, no timeout |
-//! | Queued, agent starting/clearing | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after the current not-ready window + readiness_timeout |
+//! | Queued, agent starting/clearing, positively running turn | Wait(SessionBusy); no readiness clock |
+//! | Queued, agent starting/clearing, no running evidence | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after the current not-ready window + readiness_timeout |
 //! | Queued, agent stuck/down | Blocked(AgentUnavailable); ready resumes |
 //! | Queued, another message delivering or retry-pending for recipient | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
+//! | Queued, positively running turn on a Ready agent | Wait(SessionBusy), regardless of row age or send_now |
 //! | Queued, fresh non-idle row, no send_now OR input not EmptySince | Wait(SessionBusy) until stale or new observation |
 //! | Copy mode, or unknown copy-mode/dialog guard | Wait; Blocked after continuous hold + readiness_timeout |
 //! | Stale non-idle row, draft/dialog (earlier guards satisfied) | Wait; Blocked after three guard polls of this blocker, capped by the overall hold |
@@ -100,6 +102,9 @@
 //! the restart veto. The independent agent-not-ready clock survives Starting /
 //! Clearing transitions and focus waits, but restarts when Starting or Clearing
 //! follows Stuck or Down; see [`RecipientLiveView::agent_not_ready_since`].
+//! Positive running-turn evidence clears that clock. Its first loss starts a
+//! fresh window; repeated unknown observations never restart it. Unknown focus
+//! still waits ahead of agent status, even if that window has expired.
 //! `EmptySince` means a positively recognized
 //! empty editor **and no running turn**, never a blank screen or an empty box
 //! during active work. `send_now` skips row status/stability only once the editor
@@ -253,6 +258,12 @@ pub struct RecipientLiveView {
     /// is NOT this clock (even recording a pane changes it). Without history, start at the
     /// first observation; None starts now and must be retained on later polls.
     pub agent_not_ready_since: Option<DateTime<Utc>>,
+    /// First continuously positive Running observation on the same live
+    /// pane/session source. Clear on any non-running/unknown/lost observation
+    /// or source change; a later Running starts anew. While Some, the agent's
+    /// not-ready clock is None; losing it starts a fresh non-ready window.
+    /// This is observed continuity, not a durable harness turn identity.
+    pub running_turn_since: Option<DateTime<Utc>>,
     /// Another message has an unconfirmed attempt for this recipient agent,
     /// including queued retries and blocked attempts, even after a pane move.
     /// Compute with delivery_in_flight over other messages, excluding this message
@@ -322,6 +333,7 @@ impl RecipientLiveView {
             pane: PaneLiveness::Unknown,
             agent_status: agent.status,
             agent_not_ready_since: None,
+            running_turn_since: None,
             other_delivery_in_flight: others
                 .into_iter()
                 .any(|other| other.id != message.id && delivery_in_flight(other, &agent.id)),
@@ -408,6 +420,7 @@ pub fn track_stale_blocker(
         && live.agent_status == AgentStatus::Ready
         && !live.owner_focused
         && !live.other_delivery_in_flight
+        && live.running_turn_since.is_none()
         && live.copy_mode == Some(false)
     {
         match (live.dialog_open, live.input_line) {
@@ -684,6 +697,9 @@ pub fn next_delivery(
     }
     match live.agent_status {
         AgentStatus::Starting | AgentStatus::Clearing => {
+            if live.running_turn_since.is_some() {
+                return poll(WaitReason::SessionBusy);
+            }
             return bounded_wait(
                 WaitReason::AgentNotReady,
                 FailureReason::AgentNotReadyTimeout,
@@ -704,6 +720,9 @@ pub fn next_delivery(
     }
     if let Some(step) = pane_guard()? {
         return Ok(step);
+    }
+    if live.running_turn_since.is_some() {
+        return poll(WaitReason::SessionBusy);
     }
     let stale_at = live
         .session
@@ -974,6 +993,7 @@ mod tests {
             pane: PaneLiveness::Alive,
             agent_status: AgentStatus::Ready,
             agent_not_ready_since: None,
+            running_turn_since: None,
             other_delivery_in_flight: false,
             last_paste_at: None,
             hold_since: Some(time(0)),
@@ -1177,6 +1197,54 @@ mod tests {
                 live.hold_since = since;
                 track_hold(&mut live, &DeliveryStep::Blocked { reason }, time(1000));
                 assert_eq!(live.hold_since, since);
+            }
+        }
+    }
+
+    #[test]
+    fn positive_running_turn_never_spends_readiness_even_with_a_stale_or_missing_row() {
+        let h = History::new(false);
+        for status in [
+            AgentStatus::Starting,
+            AgentStatus::Clearing,
+            AgentStatus::Ready,
+        ] {
+            for row in [true, false] {
+                for send_now in [true, false] {
+                    let mut live = ready();
+                    live.agent_status = status;
+                    live.running_turn_since = Some(time(0));
+                    live.input_line = InputLine::NonEmpty;
+                    live.send_now = send_now;
+                    live.session = row.then_some(LiveSession {
+                        status: SessionStatus::Working,
+                        status_since: time(0),
+                        last_event_at: time(0),
+                    });
+                    for now in [0, 120, 1800, 86400] {
+                        let step = h.step(&live, now);
+                        wait(step.clone(), WaitReason::SessionBusy);
+                        track_hold(&mut live, &step, time(now));
+                        assert_eq!(live.hold_since, None);
+                    }
+                    live.owner_focused = true;
+                    wait(h.step(&live, 86400), WaitReason::OwnerFocused);
+                    live.owner_focused = false;
+                    live.agent_status = AgentStatus::Stuck;
+                    assert_eq!(
+                        h.step(&live, 86400),
+                        DeliveryStep::Blocked {
+                            reason: FailureReason::AgentUnavailable,
+                        }
+                    );
+                    live.agent_status = AgentStatus::Down;
+                    assert_eq!(
+                        h.step(&live, 86400),
+                        DeliveryStep::Blocked {
+                            reason: FailureReason::AgentUnavailable,
+                        }
+                    );
+                }
             }
         }
     }

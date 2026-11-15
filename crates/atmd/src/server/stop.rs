@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 pub const CONNECTIONS: Duration = Duration::from_secs(2);
 /// Messages, from the work stop: an attempt's cleanup (10 s), the accounting
 /// of what it committed (9 s), and a margin.
+/// An in-flight pane operation is not counted: if tmux does not answer, a stop during a paste can overrun this stage, but no Enter is sent and the next start holds the attempt.
 pub const MESSAGES: Duration = Duration::from_secs(20);
 /// Agents, from the work stop: their cleanups (10 s) ended long before; this
 /// is 2 s after the latest end of the message stage.

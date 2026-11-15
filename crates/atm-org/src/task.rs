@@ -60,9 +60,10 @@
 //!
 //! A review is a task of kind `review` that names the task it judges when it
 //! is created. `StartReview` names it and moves the judged task to
-//! `in review`. A verdict may name a review task: it must judge this task and
-//! be `submitted`. The verdict then writes two events, its own and the review
-//! task's `accepted`; every event changes exactly one task.
+//! `in review`. A verdict may name a review task: it must judge this task, be
+//! `submitted`, and not be handed in by this task's own agent. The verdict then
+//! writes two events, its own and the review task's `accepted`; every event
+//! changes exactly one task.
 //!
 //! Accepting a *result* depends on the task's measure. Mechanical: authority.
 //! Reviewed: the verdict names a submitted review task, unless the owner
@@ -369,6 +370,11 @@ pub enum TaskRefusal {
     ReviewNotSubmitted {
         review_task: TaskId,
         state: TaskState,
+    },
+    #[error("review task {review_task} was handed in by the agent of task {task_id} itself")]
+    OwnReview {
+        task_id: TaskId,
+        review_task: TaskId,
     },
     #[error("accepting the result of task {task_id} needs {needs}")]
     Measure {
@@ -702,6 +708,14 @@ impl OrgState {
                             return Err(TaskRefusal::ReviewNotSubmitted {
                                 review_task: id.clone(),
                                 state: review.state,
+                            }
+                            .into());
+                        }
+                        // Nobody judges its own work, through a review either.
+                        if review.agent_id.is_some() && review.agent_id == task.agent_id {
+                            return Err(TaskRefusal::OwnReview {
+                                task_id: task_id.clone(),
+                                review_task: id.clone(),
                             }
                             .into());
                         }

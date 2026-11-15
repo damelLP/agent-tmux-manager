@@ -867,6 +867,54 @@ fn rule_8_the_named_task_must_be_a_handed_in_review_of_this_task() {
 }
 
 #[test]
+fn rule_8_a_review_handed_in_by_the_judged_tasks_own_agent_does_not_count() {
+    // The agent makes a review of its own task, takes it and hands it in. It
+    // may do all three with a task it created; the review must not count.
+    let (mut rig, task) = handed_in(reviewed(), TaskSubmission::Result);
+    let mut body = new_task(TaskKind::Review, mechanical(), BUILD);
+    body.judges = Some(task.clone());
+    let own = rig.create(body);
+    rig.ok(assign(&own, BUILD, by(BUILD)));
+    rig.ok(submit(
+        &own,
+        TaskSubmission::Result,
+        "self-review.md",
+        by(BUILD),
+    ));
+    let before = rig.task(&task).clone();
+    for who in [by(LEAD), as_lead(BOSS), by("owner")] {
+        for given in [TaskVerdict::Accepted, TaskVerdict::ChangesRequested] {
+            assert_eq!(
+                rig.run(verdict(&task, given, Some(&own), who.clone())),
+                Err(Refusal::Task(TaskRefusal::OwnReview {
+                    task_id: task.clone(),
+                    review_task: own.clone(),
+                })),
+                "{given:?} by {}",
+                who.who
+            );
+        }
+    }
+    assert_eq!(rig.task(&task), &before);
+    assert_eq!(rig.task(&own).state, S::Submitted);
+    // With no review that counts, the reviewed measure still refuses the lead.
+    assert_measure_refusal(
+        rig.run(verdict(&task, TaskVerdict::Accepted, None, by(LEAD))),
+        &task,
+    );
+    // A review that another agent handed in counts.
+    let review = rig.submitted_review(&task);
+    rig.ok(verdict(
+        &task,
+        TaskVerdict::Accepted,
+        Some(&review),
+        by(LEAD),
+    ));
+    assert_eq!(rig.task(&task).state, S::Accepted);
+    assert_eq!(rig.task(&own).state, S::Submitted);
+}
+
+#[test]
 fn starting_a_review_needs_a_live_review_task_of_this_task() {
     let mut case = situation(Sit::SubmittedResult);
     let task = case.task.clone();

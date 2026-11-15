@@ -284,6 +284,55 @@ async fn inbox_delivery_text_is_readable_and_omits_absent_fields() {
     }
 }
 
+async fn assert_inbox_diagnostics(delivery: Value, line: &str) {
+    let mut entry = inbox_entry("diagnostics");
+    entry["status"] = json!("queued");
+    entry["delivery"] = delivery;
+    let result = json!({"messages":[entry],"unread_count":1,"next_after":null,"extra_result":true});
+    for format in ["text", "json"] {
+        let out = run(
+            &["inbox", "--format", format],
+            None,
+            vec![ok("msg.inbox", inbox(), result.clone())],
+            true,
+        )
+        .await;
+        if format == "json" {
+            assert_eq!(
+                out.stdout,
+                format!("{result}\n").as_bytes(),
+                "JSON bytes must not change"
+            );
+        } else {
+            let text = String::from_utf8(out.stdout).unwrap();
+            assert_eq!(
+                text.lines().find(|line| line.starts_with("delivery:")),
+                Some(line)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn inbox_text_shows_a_blocking_predecessor() {
+    assert_inbox_diagnostics(
+        json!({
+            "phase":"queued","reason":null,"attempt":0,"pane":null,"session_id":null,
+            "confirmation":null,"retry_at":null,"blocked_by":"m2","extra_delivery":true
+        }),
+        "delivery: queued blocked_by=m2",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn inbox_text_shows_the_retry_time() {
+    assert_inbox_diagnostics(json!({
+        "phase":"waiting","reason":"agent busy","attempt":2,"pane":"%7","session_id":null,
+        "confirmation":null,"retry_at":"2026-11-14T00:05:00Z","blocked_by":null,"extra_delivery":true
+    }), "delivery: waiting pane=%7 attempt=2 retry_at=2026-11-14T00:05:00+00:00 reason=agent busy").await;
+}
+
 #[tokio::test]
 async fn inbox_text_preserves_code_backslashes_newlines_and_tabs() {
     let body = "printf 'a\\nb'\nregex \\d+\nC:\\path\n\tindented\n";

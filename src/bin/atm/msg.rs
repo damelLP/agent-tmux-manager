@@ -257,6 +257,16 @@ fn render_inbox(
         if delivery.attempt > 0 {
             write!(out, " attempt={}", delivery.attempt)?;
         }
+        if let Some(blocked_by) = &delivery.blocked_by {
+            write!(
+                out,
+                " blocked_by={}",
+                escaped(&blocked_by.to_string(), false)
+            )?;
+        }
+        if let Some(retry_at) = &delivery.retry_at {
+            write!(out, " retry_at={}", escaped(&retry_at.to_rfc3339(), false))?;
+        }
         if let Some(reason) = &delivery.reason {
             write!(out, " reason={}", escaped(reason, false))?;
         }

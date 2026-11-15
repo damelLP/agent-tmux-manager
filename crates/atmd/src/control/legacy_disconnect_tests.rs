@@ -22,6 +22,8 @@ struct Connection {
     run: JoinHandle<Option<String>>,
     admitted: Arc<Semaphore>,
     returned: Arc<AtomicBool>,
+    gate_entered: Arc<Semaphore>,
+    gate: Arc<Semaphore>,
 }
 
 async fn write(peer: &mut BufReader<UnixStream>, message: ClientMessage) {
@@ -72,6 +74,19 @@ async fn connection(
             },
         )
         .unwrap();
+    let gate_entered = Arc::new(Semaphore::new(0));
+    let gate = Arc::new(Semaphore::new(0));
+    let (entered, held) = (gate_entered.clone(), gate.clone());
+    router
+        .register("gate", Duration::from_secs(60), move |_, _| {
+            let (entered, held) = (entered.clone(), held.clone());
+            async move {
+                entered.add_permits(1);
+                held.acquire().await.unwrap().forget();
+                Ok(serde_json::Value::Null)
+            }
+        })
+        .unwrap();
     let (ours, peer) = UnixStream::pair().unwrap();
     let (reader, writer) = ours.into_split();
     let handler = ConnectionHandler::new(
@@ -97,6 +112,8 @@ async fn connection(
         run,
         admitted,
         returned,
+        gate_entered,
+        gate,
     }
 }
 
@@ -130,7 +147,29 @@ async fn parked(half_close: bool, then_disconnect: bool) {
     barrier(&control).await;
     assert!(input_calls(&mock).is_empty());
     if half_close {
+        for id in ["gate-a", "gate-b"] {
+            write(
+                &mut connection.peer,
+                ClientMessage::request(id.into(), "gate".into(), serde_json::Value::Null, None),
+            )
+            .await;
+            connection.gate_entered.acquire().await.unwrap().forget();
+        }
         connection.peer.get_mut().shutdown().await.unwrap();
+        // The first reply requires a driver turn after shutdown. The second
+        // requires a later handler poll, whose biased select polls the monitor
+        // first. Keep the reservation held until both replies have arrived, so
+        // mistaking READ_CLOSED for full closure cannot race behind the send.
+        for expected in ["gate-a", "gate-b"] {
+            connection.gate.add_permits(1);
+            let reply = read(&mut connection.peer).await;
+            assert!(
+                matches!(&reply, DaemonMessage::Response { id, payload: ResponsePayload::Result(value) }
+                    if id == expected && value.is_null()),
+                "half-close lost the parked send before {expected}: {reply:?}"
+            );
+        }
+        assert!(input_calls(&mock).is_empty());
     }
     if !half_close || then_disconnect {
         drop(connection.peer);
@@ -152,9 +191,12 @@ async fn parked(half_close: bool, then_disconnect: bool) {
         mock.set_next_raw_output("0 1");
         release.send(()).unwrap();
         job.await.unwrap().unwrap();
-        assert!(matches!(read(&mut connection.peer).await,
-            DaemonMessage::Response { id, payload: ResponsePayload::Result(value) }
-            if id == "send" && value == serde_json::json!({"pane":"%1"})));
+        let reply = read(&mut connection.peer).await;
+        assert!(
+            matches!(&reply, DaemonMessage::Response { id, payload: ResponsePayload::Result(value) }
+                if id == "send" && *value == serde_json::json!({"pane":"%1"})),
+            "half-closed caller lost its parked send: {reply:?}"
+        );
         connection.run.await.unwrap();
         assert_eq!(
             input_calls(&mock),

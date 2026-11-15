@@ -3231,6 +3231,66 @@ mod reconciliation {
     }
 
     #[tokio::test]
+    async fn restart_changed_foreground_between_looks_pins_nothing() {
+        // A foreground job changes between the inspection and capture: the
+        // capture alone cannot establish which harness owns the pane.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        inspect_with(&rig, "node");
+        let capture = PaneCapture::new(
+            IDLE.into(),
+            Rig::inspection("%1", "p/lead", false).with_foreground_process(None, Some("pi".into())),
+            CaptureFormat::Ansi,
+        );
+        rig.client.script_capture(&capture).unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+    }
+
+    #[tokio::test]
+    async fn restart_capture_tagged_for_another_pins_nothing() {
+        // The pane changes owner after the first look, before the capture.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        inspect_with(&rig, "pi");
+        let capture = PaneCapture::new(
+            IDLE.into(),
+            Rig::inspection("%1", "p/other", false)
+                .with_foreground_process(None, Some("pi".into())),
+            CaptureFormat::Ansi,
+        );
+        rig.client.script_capture(&capture).unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+    }
+
+    #[tokio::test]
+    async fn restart_dead_capture_pins_nothing() {
+        // A pane alive at inspection dies before its capture is returned.
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        inspect_with(&rig, "pi");
+        let capture = PaneCapture::new(
+            IDLE.into(),
+            Rig::inspection("%1", "p/lead", true).with_foreground_process(None, Some("pi".into())),
+            CaptureFormat::Ansi,
+        );
+        rig.client.script_capture(&capture).unwrap();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(unread(&rig), 0);
+        assert_eq!(told(&agents).await.2, PaneBaseline::unproven());
+    }
+
+    #[tokio::test]
     async fn restart_without_row_keeps_starting() {
         // The same pane with no row of the harness yet (the registry is empty
         // until discovery or the harness's next event): nothing is pinned, the
@@ -3337,6 +3397,28 @@ mod reconciliation {
             agents.baseline_of(&"p/lead".parse().unwrap(), "%1"),
             PaneBaseline::unproven()
         );
+    }
+
+    #[tokio::test]
+    async fn gone_pane_forgets_its_baseline() {
+        for inspection in [
+            None,
+            Some(Rig::inspection("%1", "p/lead", true)),
+            Some(Rig::inspection("%1", "p/other", false)),
+        ] {
+            let (rig, agents) = pinned_ready().await;
+            let mut events = agents.observation_events();
+            rig.client
+                .script_inspect(&PaneId::parse("%1").unwrap(), inspection.as_ref())
+                .unwrap();
+            rig.row("pending-300", "%1", false).await;
+            progress(&mut events, "finished", Some("p/lead")).await;
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Down);
+            assert_eq!(
+                agents.baseline_of(&"p/lead".parse().unwrap(), "%1"),
+                PaneBaseline::unproven()
+            );
+        }
     }
 
     #[tokio::test]

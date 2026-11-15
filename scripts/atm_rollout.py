@@ -702,7 +702,11 @@ class Rollout:
             say('  ' + line)
 
     def status_line_note(self, before):
-        """atm setup replaces a statusLine that is not atm's own; say so, restore nothing."""
+        """Report a replacement by an older setup, which rollback can reinstall.
+
+        Setup before custom statusLine preservation replaces non-ATM entries;
+        current setup keeps them.
+        """
         was, now = before['status_line'], self.status_line()
         if not self.tool_ran or was is None or was == now:
             return

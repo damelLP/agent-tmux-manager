@@ -1083,11 +1083,34 @@ class Smoke(Rig):
 
 
 class AfterTheSwap(Rig):
+    def legacy_setup(self, modes, installed=False):
+        # Model setup before custom statusLine preservation (including e4a0d00),
+        # which rollback can reinstall. Delegate every other step to this build.
+        self.wrap(modes, installed=installed)
+        wrapper = self.bin / 'atm' if installed else self.candidate / 'bin/atm'
+        legacy = '''
+if sys.argv[1:] == ['setup']:
+    from pathlib import Path
+    home = Path(os.environ['HOME'])
+    path = home / '.claude/settings.json'
+    settings = json.loads(path.read_text())
+    entry = dict(type='command', command=str(home / '.local/bin/atm-hook'))
+    if settings['statusLine'] != entry:
+        backup = Path(os.environ['XDG_CONFIG_HOME']) / 'atm/claude-statusline-backup.json'
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_text(json.dumps(dict(statusLine=settings['statusLine']), indent=2, sort_keys=True))
+        settings['statusLine'] = entry
+        path.write_text(json.dumps(settings))
+'''
+        wrapper.write_text(wrapper.read_text().replace('os.execv(', legacy + '\nos.execv(', 1))
+        self.manifest()
+
     def test_a_status_line_that_setup_replaced_is_reported_with_the_command_that_restores_it(self):
         settings = self.home / '.claude/settings.json'
         settings.parent.mkdir()
         mine = dict(type='command', command=str(self.home / 'bin/my-statusline'), padding=0)
         settings.write_text(json.dumps(dict(statusLine=mine, keep='this')))
+        self.legacy_setup({})
         self.start_tmux()
         self.start_daemon()
         code, out, err = self.in_process(*self.args())
@@ -1096,6 +1119,7 @@ class AfterTheSwap(Rig):
         self.assertNotEqual(now, mine)
         backup = self.home / '.config/atm/claude-statusline-backup.json'
         self.assertTrue(backup.is_file())
+        self.assertEqual(json.loads(backup.read_text()), dict(statusLine=mine))
         for line in (f"atm setup CHANGED Claude's statusLine in {settings}:", f"  was: {mine['command']}",
                      f"  now: {now['command']}", f'  setup keeps the one it replaced in {backup}'):
             self.assertIn(line, out)
@@ -1106,11 +1130,27 @@ class AfterTheSwap(Rig):
         self.assertEqual(json.loads(settings.read_text())['statusLine'], mine)
 
     def mine(self):
-        """A statusLine of the owner's in the fake HOME, which atm setup replaces."""
+        """Seed a custom statusLine; return the note expected only from legacy setup."""
         settings = self.home / '.claude/settings.json'
         settings.parent.mkdir()
         settings.write_text(json.dumps(dict(statusLine=dict(type='command', command='/home/bin/mine'))))
         return f"atm setup CHANGED Claude's statusLine in {settings}:"
+
+    def test_current_setup_keeps_a_custom_status_line_without_a_changed_note(self):
+        self.mine()
+        settings = self.home / '.claude/settings.json'
+        mine = dict(type='command', command='/home/bin/mine')
+        # Prime the hooks/formatting so the rollout must keep the entire file byte-identical.
+        self.checked([self.bin / 'atm', 'setup'])
+        before = settings.read_bytes()
+        self.start_tmux()
+        self.start_daemon()
+        code, out, err = self.in_process(*self.args())
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(json.loads(settings.read_text())['statusLine'], mine)
+        self.assertEqual(settings.read_bytes(), before)
+        self.assertFalse((self.home / '.config/atm/claude-statusline-backup.json').exists())
+        self.assertNotIn('atm setup CHANGED', out)
 
     def test_a_swap_whose_recovery_failed_is_not_restarted(self):
         # Neither build's setup works, so atm-promote's restore of the old pair fails too.
@@ -1131,6 +1171,7 @@ class AfterTheSwap(Rig):
     def test_a_swap_that_failed_after_setup_ran_says_what_setup_did(self):
         note = self.mine()
         self.wrap({'setup': 1})  # the candidate's setup fails; atm-promote reruns the old one
+        self.legacy_setup({}, installed=True)
         self.start_tmux()
         old = self.pair()
         daemon = self.start_daemon()
@@ -1146,7 +1187,7 @@ class AfterTheSwap(Rig):
     def test_the_status_line_note_is_printed_when_the_run_needs_the_owner(self):
         note = self.mine()
         self.wrap({'send': 1})  # the new build fails a check, and after the rollback
-        self.wrap({'send': 1}, installed=True)  # the previous one fails it too
+        self.legacy_setup({'send': 1}, installed=True)  # the previous one fails it too
         self.start_tmux()
         old = self.pair()
         self.start_daemon()

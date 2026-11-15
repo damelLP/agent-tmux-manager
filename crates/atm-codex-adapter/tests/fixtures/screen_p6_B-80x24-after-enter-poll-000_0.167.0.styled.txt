@@ -1,0 +1,25 @@
+Captured: codex-cli 0.167.0, 2026-11-15, P6 sealed loopback-only private tmux 3.8 capture-pane -p -e -N; B-80x24-after-enter-poll-000.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

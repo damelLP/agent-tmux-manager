@@ -1,5 +1,5 @@
 {
   "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-clear-invalid-timeout","method":"agent.clear","params":{"agent":"project/lead","timeout_ms":120001}},
-  "response": {"type":"response","id":"agent-clear-invalid-timeout","error":{"code":"invalid_params","message":"invalid agent parameters: timeout_ms must be in 1..=120000"}},
+  "response": {"type":"response","id":"agent-clear-invalid-timeout","error":{"code":"invalid_params","message":"invalid agent parameters: timeout_ms must be in 5000..=120000"}},
   "ignore": []
 }

@@ -32,8 +32,9 @@ def require(condition, reason):
         raise Refused(reason)
 
 
-# Keep in sync with STOP_WAIT_TIMEOUT in src/bin/atmd.rs: 64 s of nominal drains
-# (2 connections + 30 control + 30 audits + 2 concurrent flushes) plus margin.
+# The same number as STOP_WAIT_TIMEOUT in src/bin/atmd.rs, whose tests compare the
+# two: the daemon's 66 s of nominal shutdown (2 connections + 62 from the stop of
+# reserved work to the end of control and audits + 2 concurrent flushes) plus margin.
 # Blocking I/O is unbounded; this is not a hard daemon-exit bound.
 STOP_WAIT_TIMEOUT = 75
 STOP_PROGRESS_AFTER = 5

@@ -174,6 +174,19 @@ impl AgentRig {
             .unwrap(),
         )
         .unwrap();
+        // The window must be born at its size. The shell's prompt is printed
+        // by the rig's PROMPT_COMMAND hook with PS1 empty; a resize that
+        // arrives after it makes readline redraw the empty PS1 over that
+        // prompt, and the pane then stays empty. So the size is the server's
+        // default before the window exists, as in `StandInRig::launch`.
+        checked(self.rig.tmux(&[
+            "set-option",
+            "-g",
+            "default-size",
+            &format!("{}x{}", config.columns.max(200), config.rows.max(50)),
+        ]));
+        // This window contains only its shell. Geometry never changes after
+        // input starts the stand-in, even if another agent window is created.
         let pane_id = checked(self.rig.tmux(&[
             "new-window",
             "-d",
@@ -183,17 +196,6 @@ impl AgentRig {
             "-c",
             self.project.to_str().unwrap(),
             "/bin/bash --noprofile --norc",
-        ]));
-        // This window contains only its shell. Geometry never changes after
-        // input starts the stand-in, even if another agent window is created.
-        checked(self.rig.tmux(&[
-            "resize-window",
-            "-t",
-            &pane_id,
-            "-x",
-            &config.columns.max(200).to_string(),
-            "-y",
-            &config.rows.max(50).to_string(),
         ]));
         let root =
             checked(

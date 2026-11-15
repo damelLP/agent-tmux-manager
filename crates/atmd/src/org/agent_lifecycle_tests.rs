@@ -1349,10 +1349,11 @@ async fn recorded_with_role(more: Vec<OrgCommand>, rows: &[(&str, bool, Harness)
     let recorded = rig.org.snapshot().await.unwrap();
     let recorded = recorded.agent(&adoptee()).unwrap();
     // The restart check: a Starting agent's reads its screen, and uses none
-    // of it without a session; a session-less Ready agent's only inspects.
+    // of it without a session; a Ready agent's reads it to pin its harness
+    // (the screen is unknown, so nothing is pinned); any other only inspects.
     let tagged = Adoption::inspection(Some("q/lead"), "pi", "unknown\n");
     rig.client.script_inspect(&pane("%1"), Some(&tagged)).unwrap();
-    if recorded.status == AgentStatus::Starting {
+    if matches!(recorded.status, AgentStatus::Starting | AgentStatus::Ready) {
         rig.client
             .script_capture(&PaneCapture::new("unknown\n".into(), tagged, CaptureFormat::Ansi))
             .unwrap();

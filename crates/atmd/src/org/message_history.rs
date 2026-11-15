@@ -346,6 +346,7 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::TaskReminded(_)
         | OrgEvent::TaskFlagged(_)
         | OrgEvent::TaskCostRecorded(_)
+        | OrgEvent::TaskUsageObserved(_)
         | OrgEvent::SessionSummary(_)
         | OrgEvent::ControlSent(_)
         | OrgEvent::ControlSpawned(_)

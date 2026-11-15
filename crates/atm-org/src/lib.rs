@@ -177,6 +177,7 @@
 
 mod command;
 mod config;
+mod cost;
 mod decision;
 pub mod delivery;
 mod event;
@@ -187,6 +188,7 @@ mod state;
 mod task;
 pub use command::*;
 pub use config::*;
+pub use cost::{TaskUsageObservation, TaskUsageObserved};
 pub use decision::*;
 pub use event::*;
 pub use ids::*;

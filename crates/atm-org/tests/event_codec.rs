@@ -27,6 +27,16 @@ fn all_golden_event_bodies() {
 }
 
 #[test]
+fn task_usage_is_a_known_additive_event() {
+    // Synthetic: a baseline observation with no eligible task.
+    let body = json!({"session_id":"s", "task_id":null, "turn":true,
+        "cumulative_cost":{"microdollars":125000}, "context_percent":70});
+    let event = OrgEvent::from_parts("task.usage_observed", &body).unwrap();
+    assert!(event.is_some(), "task observations must survive replay");
+    assert_eq!(event.unwrap().to_body(), body);
+}
+
+#[test]
 fn malformed_known_events_error_unknown_kinds_skip() {
     for (kind, _) in support::bodies() {
         let error = OrgEvent::from_parts(kind, &json!({}))

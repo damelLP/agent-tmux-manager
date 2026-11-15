@@ -86,6 +86,7 @@ pub enum OrgCommand {
         message_ids: Vec<MessageId>,
     },
     Task(TaskCommand),
+    ObserveTaskUsage(TaskUsageObservation),
     RecordSummary(SessionSummary),
     ControlSent(ControlAudit),
     ControlSpawned(ControlAudit),
@@ -207,6 +208,7 @@ impl OrgCommand {
             },
             Self::ReadMessages { message_ids, .. } => OrgEvent::MessageRead { message_ids },
             Self::Task(command) => command.event(),
+            Self::ObserveTaskUsage(input) => input.event(None),
             Self::RecordSummary(summary) => OrgEvent::SessionSummary(summary),
             Self::ControlSent(audit) => OrgEvent::ControlSent(audit),
             Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
@@ -452,6 +454,7 @@ impl OrgState {
                 unread
             }
             OrgCommand::Task(command) => return self.decide_task(command, event),
+            OrgCommand::ObserveTaskUsage(input) => return self.decide_usage(input),
             OrgCommand::RecordSummary(summary) => {
                 self.session_summary(&summary.session_id) != Some(summary)
             }

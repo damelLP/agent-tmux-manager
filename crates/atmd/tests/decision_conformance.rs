@@ -331,6 +331,43 @@ async fn decision_method_success_and_refusal_golden_fixtures() {
     assert!(coverage.values().all(|seen| *seen == (true, true)));
 }
 
+// Break caught: a replay-only decision kind bypasses RPC validation and reaches policy.
+#[tokio::test]
+async fn unknown_decision_request_kind_is_invalid_params_without_writes() {
+    let rig = Rig::new().await;
+    let disabled = atmd::server::methods::router(MethodServices::new(spawn_registry())).unwrap();
+    let before = rig.org.snapshot().await.unwrap();
+    let cursor = rig.org.status().unwrap();
+    for word in ["bogus", "unknown"] {
+        let mut params = request();
+        params["kind"] = json!(word);
+        let result = rig
+            .call("decision.request", params.clone(), Some("%7"))
+            .await;
+        assert_eq!(rig.org.snapshot().await.unwrap(), before);
+        assert_eq!(rig.org.status().unwrap(), cursor);
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "invalid_params", "{params}: {error:?}");
+        assert!(error.message.contains("kind"), "{error:?}");
+        let error = disabled
+            .call(
+                atmd::server::methods::CallContext {
+                    client_id: atmd::server::methods::CallerId("unknown-kind".into()),
+                    from_pane: None,
+                },
+                "decision.request",
+                params,
+            )
+            .await
+            .unwrap_err()
+            .0;
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("kind"));
+    }
+    assert_eq!(rig.request().await, json!({"decision_id":"d4"}));
+    rig.stop().await;
+}
+
 #[tokio::test]
 async fn decision_method_schemas_and_semantic_refusals() {
     let rig = Rig::new().await;

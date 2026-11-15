@@ -102,6 +102,8 @@ fn assemble_context(
         .inbox(&Address::Agent(agent.id.clone()))
         .into_iter()
         .filter(|message| message.read_at.is_none())
+        // The start line only points here; listing it would point here again.
+        .filter(|message| !super::start_line::is_start_line(&message.content))
         .map(|message| ContextMessage {
             message_id: message.id,
             kind: message.content.kind,
@@ -340,6 +342,55 @@ mod tests {
             assemble_context(&state, state.agent(&id).unwrap(), None, false),
             Err(AgentError::Refused(_))
         ));
+    }
+
+    // Break caught: atm me listing the start line, whose only text is "run atm
+    // me", as an unread message to handle and acknowledge.
+    #[test]
+    fn context_omits_start_lines_and_keeps_other_system_notes() {
+        use atm_org::{MessageContent, OrgEvent};
+        let now = "2026-01-15T12:00:00Z".parse().unwrap();
+        let id: AgentId = "project/worker".parse().unwrap();
+        let note = MessageContent {
+            from: Address::System,
+            to: Address::Agent(id.clone()),
+            kind: MessageKind::Note,
+            body: "New session: run atm me later".into(),
+            attachments: vec![],
+            task: None,
+        };
+        let mut state = OrgState::default();
+        for (seq, event) in [
+            OrgEvent::ProjectRegistered {
+                project_id: id.project.clone(),
+                root: "/project".into(),
+            },
+            OrgEvent::AgentAdopted {
+                agent_id: id.clone(),
+                pane: "%7".into(),
+                session_id: None,
+            },
+            OrgEvent::MessageSent(super::super::start_line::start_line(&id)),
+            OrgEvent::MessageSent(note),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.apply(seq as u64 + 1, now, &event).unwrap();
+        }
+        let context = assemble_context(&state, state.agent(&id).unwrap(), None, false).unwrap();
+        let listed: Vec<_> = context
+            .unread_messages
+            .iter()
+            .map(|message| (message.message_id.to_string(), message.first_line.clone()))
+            .collect();
+        assert_eq!(
+            listed,
+            [(
+                "m4".to_string(),
+                "New session: run atm me later".to_string()
+            )]
+        );
     }
 
     // Break caught: caller timeout drops the worker's permit and permits an

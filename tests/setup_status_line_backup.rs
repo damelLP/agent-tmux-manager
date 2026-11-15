@@ -165,6 +165,189 @@ fn setup_advisory_forwards_stdin_to_the_configured_hook_path() {
 }
 
 #[test]
+fn uninstall_removes_only_exact_current_and_legacy_entries() {
+    for source in ["current", "history", "fallback"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("user's home");
+        let settings_path = home.join(CLAUDE);
+        write_json(&settings_path, &json!({"userKey": "kept"}));
+        run_atm_ok(&home, "setup");
+        let mut settings = read_json(&settings_path);
+        // c2a89f0's generator wrote this same two-field object, with a raw path.
+        let legacy = json!({
+            "type": "command",
+            "command": if source == "fallback" {
+                "/usr/local/bin/atm-hook".to_string()
+            } else {
+                home.join(".local/bin/atm-hook").to_string_lossy().into_owned()
+            }
+        });
+        if source == "current" {
+            assert_eq!(settings["statusLine"], legacy);
+        } else {
+            settings["statusLine"] = legacy.clone();
+            write_json(&settings_path, &settings);
+        }
+        let before = fs::read(&settings_path).unwrap();
+        let setup = run_atm_ok(&home, "setup");
+        assert!(
+            setup.contains("statusLine - already configured"),
+            "{source}: {setup}"
+        );
+        assert_eq!(fs::read(&settings_path).unwrap(), before);
+
+        let stdout = run_atm_ok(&home, "uninstall");
+
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("statusLine"))
+                .collect::<Vec<_>>(),
+            ["statusLine configuration removed"],
+            "{source}: {stdout}"
+        );
+        assert_eq!(
+            read_json(&settings_path),
+            json!({"userKey": "kept", "hooks": {}})
+        );
+        assert!(!home.join(BACKUP).exists());
+    }
+}
+
+#[test]
+fn uninstall_keeps_inline_forwarders_with_or_without_a_backup() {
+    for with_backup in [false, true] {
+        let home = tempfile::tempdir().expect("tempdir");
+        let settings_path = home.path().join(CLAUDE);
+        let command = home.path().join(".local/bin/atm-hook");
+        let custom = json!({
+            "type": "command",
+            "command": format!("input=$(cat); printf '%s' \"$input\" | '{}'; echo my-status", command.display())
+        });
+        write_json(
+            &settings_path,
+            &json!({"userKey": "kept", "statusLine": custom}),
+        );
+        let before = fs::read(&settings_path).unwrap();
+        if with_backup {
+            write_json(
+                &home.path().join(BACKUP),
+                &json!({"statusLine": user_status_line()}),
+            );
+        }
+
+        let stdout = run_atm_ok(home.path(), "uninstall");
+
+        assert_eq!(fs::read(&settings_path).unwrap(), before, "{stdout}");
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("statusLine"))
+                .collect::<Vec<_>>(),
+            ["statusLine - kept yours; not an atm-generated entry"],
+            "{stdout}"
+        );
+        assert!(!home.path().join(BACKUP).exists());
+    }
+}
+
+#[test]
+fn setup_and_uninstall_keep_custom_status_lines() {
+    for case in [
+        "inline",
+        "pipeline",
+        "chain",
+        "wrapper",
+        "padding",
+        "other-path",
+        "former-home",
+        "wrong-type",
+        "string",
+        "null",
+    ] {
+        for with_backup in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let home = dir.path().join("user's home");
+            let settings_path = home.join(CLAUDE);
+            let backup_path = home.join(BACKUP);
+            write_json(&settings_path, &json!({"userKey": "kept"}));
+            run_atm_ok(&home, "setup");
+            let command = home
+                .join(".local/bin/atm-hook")
+                .to_string_lossy()
+                .into_owned();
+            let custom = match case {
+                "inline" => {
+                    json!({"type": "command", "command": format!("input=$(cat); printf '%s' \"$input\" | \"{command}\"; echo my-status")})
+                }
+                "pipeline" => {
+                    json!({"type": "command", "command": format!("echo my-status | \"{command}\"")})
+                }
+                "chain" => {
+                    json!({"type": "command", "command": format!("echo my-status; \"{command}\"")})
+                }
+                "wrapper" => json!({"type": "command", "command": "~/bin/atm-hook-wrapper.sh"}),
+                "padding" => json!({"type": "command", "command": command, "padding": 2}),
+                "other-path" => {
+                    json!({"type": "command", "command": "/opt/elsewhere/bin/atm-hook"})
+                }
+                "former-home" => {
+                    json!({"type": "command", "command": "/former-home/.local/bin/atm-hook"})
+                }
+                "wrong-type" => json!({"type": "prompt", "command": command}),
+                "string" => json!(command),
+                "null" => Value::Null,
+                _ => unreachable!("test case"),
+            };
+            let mut settings = read_json(&settings_path);
+            settings["statusLine"] = custom.clone();
+            write_json(&settings_path, &settings);
+            if with_backup {
+                write_json(&backup_path, &json!({"statusLine": user_status_line()}));
+            }
+            let backup_before = fs::read(&backup_path).ok();
+            for _ in 0..2 {
+                let before = fs::read(&settings_path).unwrap();
+                let stdout = run_atm_ok(&home, "setup");
+                assert_eq!(
+                    stdout
+                        .lines()
+                        .filter(|line| line.contains("statusLine - kept yours"))
+                        .count(),
+                    1,
+                    "{case}: {stdout}"
+                );
+                assert!(
+                    !stdout.contains("statusLine - already configured"),
+                    "{case}: {stdout}"
+                );
+                assert_eq!(read_json(&settings_path)["statusLine"], custom, "{case}");
+                assert_eq!(fs::read(&settings_path).unwrap(), before, "{case}");
+                assert_eq!(fs::read(&backup_path).ok(), backup_before, "{case}");
+            }
+
+            let stdout = run_atm_ok(&home, "uninstall");
+
+            assert_eq!(
+                read_json(&settings_path)["statusLine"],
+                custom,
+                "{case}: {stdout}"
+            );
+            assert_eq!(read_json(&settings_path)["userKey"], "kept");
+            assert_eq!(
+                stdout
+                    .lines()
+                    .filter(|line| line.starts_with("statusLine"))
+                    .collect::<Vec<_>>(),
+                ["statusLine - kept yours; not an atm-generated entry"],
+                "{case}: {stdout}"
+            );
+            assert!(!backup_path.exists(), "{case}: stale backup left behind");
+        }
+    }
+}
+
+#[test]
 fn uninstall_without_a_backup_keeps_the_users_status_line() {
     let home = tempfile::tempdir().expect("tempdir");
     let settings_path = home.path().join(CLAUDE);
@@ -174,7 +357,7 @@ fn uninstall_without_a_backup_keeps_the_users_status_line() {
     let stdout = run_atm_ok(home.path(), "uninstall");
 
     assert!(
-        stdout.contains("statusLine - not configured by atm"),
+        stdout.contains("statusLine - kept yours; not an atm-generated entry"),
         "{stdout}"
     );
     assert_eq!(fs::read(&settings_path).unwrap(), before);
@@ -183,21 +366,30 @@ fn uninstall_without_a_backup_keeps_the_users_status_line() {
 
 #[test]
 fn uninstall_restores_the_status_line_an_older_setup_replaced() {
-    let home = tempfile::tempdir().expect("tempdir");
-    setup_legacy_install(home.path());
+    for fallback in [false, true] {
+        let home = tempfile::tempdir().expect("tempdir");
+        setup_legacy_install(home.path());
+        if fallback {
+            let settings_path = home.path().join(CLAUDE);
+            let mut settings = read_json(&settings_path);
+            settings["statusLine"] =
+                json!({"type": "command", "command": "/usr/local/bin/atm-hook"});
+            write_json(&settings_path, &settings);
+        }
 
-    let stdout = run_atm_ok(home.path(), "uninstall");
+        let stdout = run_atm_ok(home.path(), "uninstall");
 
-    let backup = home.path().join(BACKUP);
-    assert!(
-        stdout.contains(&format!("statusLine restored from {}", backup.display())),
-        "{stdout}"
-    );
-    assert_eq!(
-        read_json(&home.path().join(CLAUDE)),
-        json!({"userKey": "kept", "statusLine": user_status_line(), "hooks": {}})
-    );
-    assert!(!backup.exists(), "backup left behind");
+        let backup = home.path().join(BACKUP);
+        assert!(
+            stdout.contains(&format!("statusLine restored from {}", backup.display())),
+            "{stdout}"
+        );
+        assert_eq!(
+            read_json(&home.path().join(CLAUDE)),
+            json!({"userKey": "kept", "statusLine": user_status_line(), "hooks": {}})
+        );
+        assert!(!backup.exists(), "backup left behind");
+    }
 }
 
 #[test]
@@ -213,7 +405,7 @@ fn uninstall_keeps_a_status_line_that_replaced_atms_and_drops_the_backup() {
     let stdout = run_atm_ok(home.path(), "uninstall");
 
     assert!(
-        stdout.contains("statusLine - not configured by atm"),
+        stdout.contains("statusLine - kept yours; not an atm-generated entry"),
         "{stdout}"
     );
     assert_eq!(read_json(&settings_path)["statusLine"], newer);

@@ -11,6 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::super::{
+    message_delivery::inbox_reference,
     message_evidence::{AttemptScope, MAX_MESSAGES},
     message_history::{EffectCertainty, PanePresence, SessionObservation},
     message_service_tests::{

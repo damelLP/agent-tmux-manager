@@ -59,9 +59,7 @@
 //! again. Lost observations break that interval, including across restart.
 
 use super::agents::{AgentHandle, Recipient};
-use super::message_delivery::{
-    attempt_session, deliver, inbox_reference, observation, ATTEMPT_WORK_BUDGET,
-};
+use super::message_delivery::{attempt_session, deliver, observation, ATTEMPT_WORK_BUDGET};
 use super::message_history::{
     DeliverySnapshot, ExecutorHold, HistoryUpdate, PanePresence, RecipientObservation,
 };
@@ -70,6 +68,7 @@ use super::messages::{
     focus_notice, Address, DeliveryPhase, DeliveryStatus, MessageContent, MessageError, MessageId,
     MessageKind, MessageRuntime, Service,
 };
+use super::start_line::delivery_line;
 use super::OrgServiceError;
 use crate::{
     control::{
@@ -902,7 +901,8 @@ impl Job {
             // its reference for ever.
             return Ok(Next::Change);
         }
-        let Err(error) = service.rt.evidence.register(id, inbox_reference(id)) else {
+        let line = delivery_line(id, &snapshot.message.content);
+        let Err(error) = service.rt.evidence.register(id, line) else {
             return Ok(Next::Again);
         };
         let text = error.to_string();

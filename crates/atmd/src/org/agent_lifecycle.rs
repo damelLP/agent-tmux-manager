@@ -849,6 +849,7 @@ impl AgentRuntime {
                         },
                     };
                     self.org.execute(command, chrono::Utc::now()).await?;
+                    self.queue_start_line(id, session_id.as_ref()).await;
                     return Ok(ClearResult {
                         agent_id: id.clone(),
                         session_id,
@@ -1401,16 +1402,21 @@ impl AgentRuntime {
                 session.as_ref(),
             ) {
                 Step::Ready(ready) => {
-                    let command = match ready {
-                        Ready::Session(session_id) => OrgCommand::SessionBound {
+                    let session_id = match ready {
+                        Ready::Session(session_id) => Some(session_id),
+                        Ready::Editor => None,
+                    };
+                    let command = match session_id.clone() {
+                        Some(session_id) => OrgCommand::SessionBound {
                             agent_id: id.clone(),
                             session_id,
                         },
-                        Ready::Editor => OrgCommand::EditorReady {
+                        None => OrgCommand::EditorReady {
                             agent_id: id.clone(),
                         },
                     };
                     self.org.execute(command, chrono::Utc::now()).await?;
+                    self.queue_start_line(&id, session_id.as_ref()).await;
                     return Ok(UpResult {
                         agent_id: id,
                         pane: pane.to_string(),

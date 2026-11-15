@@ -628,7 +628,7 @@ impl Job {
                 Err(error) => Err(error),
             };
         };
-        // Committed pane-less state needs no capture or pacing.
+        // Only a pane capture is paced; the pane-less state above is read every round.
         let poll = rt.policy.settings().guard_poll_interval;
         if self.observed.is_some_and(|at| at.elapsed() < poll) {
             return Ok(());

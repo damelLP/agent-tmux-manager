@@ -335,6 +335,39 @@ fn lost_running_evidence_starts_clock_once_but_keeps_focus_precedence() {
 }
 
 #[test]
+fn session_lost_while_starting_and_running_starts_not_ready_clock_at_event() {
+    let mut f = Fixture::new(0);
+    let mut obs = observation(SessionStatus::Working);
+    obs.facts.turn = TurnState::Running;
+    f.observe(obs.clone(), 0);
+    f.apply(
+        OrgEvent::AgentRevalidationRequested { agent_id: agent() },
+        5_000,
+    );
+    assert_eq!(
+        f.snapshot(5_000).live.agent_status,
+        atm_org::AgentStatus::Starting
+    );
+    assert_eq!(f.snapshot(5_000).live.agent_not_ready_since, None);
+    f.apply(OrgEvent::AgentSessionLost { agent_id: agent() }, 600_000);
+    let live = f.snapshot(600_000).live;
+    assert_eq!(live.agent_status, atm_org::AgentStatus::Starting);
+    assert_eq!(live.running_turn_since, None);
+    assert_eq!(live.agent_not_ready_since, Some(at(600_000)));
+    // Recover known-unfocused observations without resurrecting the old turn.
+    obs.session = None;
+    obs.facts.turn = TurnState::Unknown;
+    f.observe(obs.clone(), 600_001);
+    f.observe(obs, 700_000);
+    assert_eq!(
+        f.snapshot(700_000).live.agent_not_ready_since,
+        Some(at(600_000))
+    );
+    wait(f.step(719_999), WaitReason::AgentNotReady);
+    blocked(f.step(720_000), FailureReason::AgentNotReadyTimeout);
+}
+
+#[test]
 fn running_continuity_survives_status_not_source_changes() {
     let mut f = Fixture::new(0);
     let mut obs = observation(SessionStatus::Working);

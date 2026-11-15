@@ -350,34 +350,30 @@ fn agent_error(error: AgentError) -> MessageError {
     }
 }
 
-/// One capture of a recipient's pane as history's observation, with the
-/// session an attempt on it may be confirmed against ([`attempt_session`]'s
-/// answer). `recipient` is one [`AgentHandle::recipient`](super::agents::AgentHandle::recipient)
+/// One capture of a recipient's pane as history's observation. `recipient`
+/// is one [`AgentHandle::recipient`](super::agents::AgentHandle::recipient)
 /// answer and `capture` a capture of its pane in its screen's format, both
 /// taken for this call: the session row and the screen facts are read from
 /// these two and nothing else.
 ///
 /// Shared by the executor, under its reservation, and the scheduler's
-/// observer, so that both describe a recipient to history in one way. An
-/// error means the recipient could not be observed as a delivery needs it,
-/// and the caller records a lost observation: also while the agent service
-/// has not pinned the pane's harness (a start, an adopt, the pass after a
-/// daemon restart), when the screen dispatch would answer unknown facts.
+/// observer, so that both describe a recipient to history in one way. It
+/// answers for an agent in any status: whether the agent may take an attempt
+/// is [`attempt_session`]'s question, which the executor asks beside it. An
+/// error means the recipient could not be observed, and the caller records a
+/// lost observation: also while the agent service has not pinned the pane's
+/// harness (a start, an adopt, the pass after a daemon restart), when the
+/// screen dispatch would answer unknown facts.
 pub(super) fn observation(
     recipient: &Recipient,
     capture: &PaneCapture,
-) -> Result<(Option<SessionId>, RecipientObservation), MessageError> {
+) -> Result<RecipientObservation, MessageError> {
     if recipient.baseline.harness_command().is_none() {
         return Err(MessageError::Refused(format!(
             "the harness on {} is not established yet",
             recipient.pane
         )));
     }
-    let session_id = attempt_session(
-        recipient.status,
-        recipient.session_id.as_ref(),
-        recipient.session.as_ref().map(|row| &row.id),
-    )?;
     // History keeps its own activity clock for a session it already saw.
     let session = recipient.session.as_ref().map(|row| SessionObservation {
         id: row.id.clone(),
@@ -386,7 +382,7 @@ pub(super) fn observation(
         last_event_at: None,
     });
     let facts = recipient.screen.facts(capture, &recipient.baseline);
-    Ok((session_id, recipient_observation(capture, session, facts)?))
+    recipient_observation(capture, session, facts)
 }
 
 /// One capture as the plain facts a delivery guard decides on.
@@ -450,7 +446,12 @@ impl Attempt {
         };
         let seen = match r.capture(pane, format).await {
             Ok(capture) => tagged(capture).and_then(|capture| {
-                let (session_id, observation) = observation(&recipient, &capture)?;
+                let observation = observation(&recipient, &capture)?;
+                let session_id = attempt_session(
+                    recipient.status,
+                    recipient.session_id.as_ref(),
+                    recipient.session.as_ref().map(|row| &row.id),
+                )?;
                 Ok((capture, session_id, observation))
             }),
             Err(error) => Err(error.into()),

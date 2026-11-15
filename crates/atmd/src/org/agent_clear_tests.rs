@@ -605,6 +605,27 @@ async fn clear_refuses_what_it_cannot_identify() {
         Err(AgentError::NotFound(_))
     ));
     assert!(clearing.sent().is_empty());
+
+    // An agent that is Clearing without this call having made it so (another
+    // clear's record): refused like any agent that is not Ready, and this
+    // call's cleanup leaves that clear's state alone.
+    let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+    clearing
+        .rig
+        .command(OrgCommand::Clear { agent_id: lead() })
+        .await;
+    let before = clearing.rig.org.status().unwrap();
+    match clearing.clear().await {
+        Err(AgentError::Refused(refusal)) => {
+            assert!(
+                refusal.contains("is clearing; only a ready agent"),
+                "{refusal}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(clearing.agent().await.status, AgentStatus::Clearing);
+    assert_eq!(clearing.rig.org.status().unwrap(), before);
 }
 
 #[tokio::test(start_paused = true)]

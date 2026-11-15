@@ -392,6 +392,113 @@ pub(super) fn launch_line_is_staged(capture: &PaneCapture, before: &str, text: &
     })
 }
 
+/// Why a capture does not allow typing a launch into the pane's shell; `None`
+/// allows. Both guards of a launch require this of the control actor's own
+/// capture: the agent's tag, a live pane out of copy mode, the recorded shell
+/// in the foreground of the recorded root process, no client focused on the
+/// pane (a person may be typing there), and no harness screen on it.
+#[must_use]
+pub(super) fn shell_refusal(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+) -> Option<&'static str> {
+    let pane = &capture.inspection;
+    if pane.local_agent_tag.as_deref() != Some(tag) {
+        Some("the pane no longer carries the agent's tag")
+    } else if pane.dead {
+        Some("the shell in the pane has exited")
+    } else if pane.in_mode {
+        Some("the pane is in copy mode")
+    } else if screen.foreground(capture, baseline) != Some(Foreground::Shell) {
+        Some("the pane's shell is not known to be its foreground program")
+    } else if screen.recognises(capture) {
+        Some("the pane shows a harness's screen before anything was launched")
+    } else {
+        match capture.focused {
+            Some(false) => None,
+            Some(true) => Some("the pane is focused"),
+            None => Some("whether the pane is focused could not be read"),
+        }
+    }
+}
+
+/// Whether `line` may be taken as the shell's line before the paste, when a
+/// paste guard refused the line taken before it (`refused`). A prompt may be
+/// drawn again and read differently; a line that is the refused one with more
+/// after it is that prompt with something typed at it, and typing the launch
+/// after it would run both.
+#[must_use]
+pub(super) fn prompt_line_allowed(refused: Option<&str>, line: &str) -> bool {
+    refused.is_none_or(|refused| line == refused || !line.starts_with(refused))
+}
+
+/// The paste guard of a launch: the shell's line still reads exactly `before`.
+#[must_use]
+pub(super) fn launch_paste_allowed(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+    before: &str,
+) -> bool {
+    shell_refusal(screen, capture, baseline, tag).is_none()
+        && launch_line(capture).as_deref() == Some(before)
+}
+
+/// The Enter guard of a launch, on the control actor's own capture.
+#[must_use]
+pub(super) fn launch_enter_allowed(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+    (before, text): (&str, &str),
+) -> bool {
+    shell_refusal(screen, capture, baseline, tag).is_none()
+        && launch_line_is_staged(capture, before, text)
+}
+
+/// Where a role's `pane` hint puts the agent's new pane: `<side>:<agent>`,
+/// the side of that agent's pane to split off (`below:lead`).
+#[must_use]
+pub(super) fn placement(hint: &str) -> Option<(atm_tmux::PaneDirection, &str)> {
+    use atm_tmux::PaneDirection::{Above, Below, Left, Right};
+    let (side, agent) = hint.split_once(':')?;
+    let direction = match side {
+        "left" => Left,
+        "right" => Right,
+        "above" => Above,
+        "below" => Below,
+        _ => return None,
+    };
+    (!agent.is_empty()).then_some((direction, agent))
+}
+
+/// The session a start produced, among the rows on the agent's new pane: its
+/// one top-level session of the agent's harness, once the registry has
+/// accepted its start. `Ok(None)` waits: no such row yet, or a row something
+/// other than a start created. More than one is an error; nothing says which
+/// is the agent's.
+pub(super) fn started_session(
+    harness: &str,
+    rows: &[PaneSession],
+) -> Result<Option<SessionId>, String> {
+    let mut own = rows.iter().filter(|row| {
+        row.view.parent_session_id.is_none()
+            && !row.view.id.is_pending()
+            && row.view.harness == harness
+    });
+    let Some(row) = own.next() else {
+        return Ok(None);
+    };
+    if own.next().is_some() {
+        return Err("more than one session appeared on the new pane".into());
+    }
+    Ok(row.start.as_ref().map(|_| row.view.id.clone()))
+}
+
 /// What procfs says about a pane's root process. A flow reads it once, when it
 /// records a baseline or checks for a return to the shell; never a guard.
 #[derive(Debug, Clone, PartialEq, Eq)]

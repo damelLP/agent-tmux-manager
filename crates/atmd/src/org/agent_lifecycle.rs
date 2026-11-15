@@ -6,16 +6,26 @@
 //! from a screen lives in `agent_flow`, which is pure.
 
 use super::agent_flow::{
-    adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, input_refusal,
-    safe_editor, safe_to_paste, submit_allowed, submit_step, ClearProgress, Ready, Step,
+    adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, decide_start,
+    input_refusal, launch_enter_allowed, launch_line, launch_line_is_staged, launch_paste_allowed,
+    placement, prompt_line_allowed, safe_editor, safe_to_paste, shell_baseline, shell_refusal,
+    start_view, started_session, submit_allowed, submit_step, ClearProgress, Ready, StartProgress,
+    StartView, Step,
 };
-use super::agent_screen::{agent_screen, AgentScreen};
+use super::agent_launch::{launch_command, LaunchCommand};
+use super::agent_project::PreparedAgent;
+use super::agent_screen::{agent_screen, AgentScreen, PaneBaseline};
 use super::agents::{
     harness, matches_agent, AdoptResult, AgentError, AgentRuntime, ClearResult, DownResult,
+    UpResult,
 };
-use crate::control::reservation::{ExpectedTag, PaneId, Reservation, ReservationError};
+use crate::control::reservation::{
+    ExpectedTag, PaneCapture, PaneId, PaneKey, Reservation, ReservationError,
+};
+use crate::control::{service::ServiceError, SpawnContext};
 use crate::registry::PaneSession;
-use atm_core::harness_control::{ClearProof, ControlDialog};
+use crate::server::methods::CallContext;
+use atm_core::harness_control::{ClearProof, ControlDialog, SessionArrival};
 use atm_core::{Harness, SessionId, SessionView};
 use atm_org::{AgentId, AgentStatus, OrgCommand};
 use std::sync::{
@@ -439,10 +449,11 @@ fn waiting_for(waiting: &Waiting, reason: impl Into<String>) {
     }
 }
 
-/// A clear that stops by its own decision: the reason goes to the caller and,
-/// through `waiting`, into the agent's Stuck record.
-fn incomplete(waiting: &Waiting, id: &AgentId, reason: String) -> AgentError {
-    let error = AgentError::Refused(format!("agent {id}: the clear did not complete: {reason}"));
+/// A flow (`what`: a clear, a start) that stops by its own decision: the
+/// reason goes to the caller and, through `waiting`, into the agent's Stuck
+/// record.
+fn stopped(waiting: &Waiting, id: &AgentId, what: &str, reason: String) -> AgentError {
+    let error = AgentError::Refused(format!("agent {id}: the {what} did not complete: {reason}"));
     waiting_for(waiting, reason);
     error
 }
@@ -626,7 +637,7 @@ impl AgentRuntime {
                     waiting,
                     format!("the clear command was typed and not submitted: {reason}"),
                 ),
-                Step::Stuck(reason) => return Err(incomplete(waiting, id, reason)),
+                Step::Stuck(reason) => return Err(stopped(waiting, id, "clear", reason)),
                 Step::Ready(_) => {
                     return Err(AgentError::Internal("a submit step reported ready".into()))
                 }
@@ -641,7 +652,7 @@ impl AgentRuntime {
             if announces {
                 let rows = self.pane_sessions(&pane).await?;
                 session = cleared_session(policy, harness.short_tag(), &rows, &before)
-                    .map_err(|reason| incomplete(waiting, id, reason))?;
+                    .map_err(|reason| stopped(waiting, id, "clear", reason))?;
                 if session.is_none() {
                     waiting_for(waiting, "the harness has not announced a new session");
                     #[cfg(test)]
@@ -700,7 +711,7 @@ impl AgentRuntime {
                     }
                 }
                 Step::Wait(reason) => waiting_for(waiting, reason),
-                Step::Stuck(reason) => return Err(incomplete(waiting, id, reason)),
+                Step::Stuck(reason) => return Err(stopped(waiting, id, "clear", reason)),
             }
         }
     }
@@ -715,20 +726,41 @@ impl AgentRuntime {
         id: &AgentId,
         waiting: &Waiting,
     ) -> Result<(), AgentError> {
+        self.settle(id, waiting, AgentStatus::Clearing, "clear")
+            .await
+    }
+
+    /// The cleanup of a start, as [`Self::settle_clear`]: an agent the flow
+    /// left Starting after it recorded its Up is marked Stuck, and its owner
+    /// is told. A start that refused before its Up committed to nothing.
+    pub(super) async fn settle_up(
+        &self,
+        id: &AgentId,
+        waiting: &Waiting,
+    ) -> Result<(), AgentError> {
+        self.settle(id, waiting, AgentStatus::Starting, "start")
+            .await
+    }
+
+    async fn settle(
+        &self,
+        id: &AgentId,
+        waiting: &Waiting,
+        unfinished: AgentStatus,
+        what: &str,
+    ) -> Result<(), AgentError> {
         let state = self.org.snapshot().await?;
         let committed = waiting
             .lock()
             .map_or_else(|_| Some("its progress was lost".into()), |w| w.clone());
         let (Some(waiting), Some(agent)) = (
             committed,
-            state
-                .agent(id)
-                .filter(|agent| agent.status == AgentStatus::Clearing),
+            state.agent(id).filter(|agent| agent.status == unfinished),
         ) else {
             return Ok(());
         };
         let reason = format!(
-            "clear did not complete: {waiting}; inspect {}",
+            "{what} did not complete: {waiting}; inspect {}",
             agent.pane.as_deref().unwrap_or("its pane")
         );
         self.org
@@ -752,5 +784,387 @@ impl AgentRuntime {
             .execute(OrgCommand::SendMessage(note), chrono::Utc::now())
             .await?;
         Ok(())
+    }
+}
+
+/// Everything a start needs that is settled before its reservation: the role
+/// as read from the project, the command to type, and where to split.
+#[derive(Debug)]
+pub(super) struct Launch {
+    pub prepared: PreparedAgent,
+    command: LaunchCommand,
+    context: SpawnContext,
+    direction: atm_tmux::PaneDirection,
+    /// The agent whose pane the role's `pane` hint names, if it has one.
+    beside: Option<AgentId>,
+}
+
+impl AgentRuntime {
+    /// Resolve what `agent.up` types and where it splits, with no effect on
+    /// any pane. A launch text that can't be typed safely, a `pane` hint that
+    /// can't be read and a hint that names an agent without a pane refuse here.
+    pub(super) async fn prepare_launch(
+        &self,
+        prepared: PreparedAgent,
+        caller: CallContext,
+        server: Option<String>,
+    ) -> Result<Launch, AgentError> {
+        let command = launch_command(&prepared, |key| (self.spawn_env)(key))?;
+        let role = &prepared.role;
+        let (direction, beside) = match role.config.pane.as_deref().map(placement) {
+            None => (atm_tmux::PaneDirection::Below, None),
+            Some(Some((direction, name))) => {
+                let beside = AgentId::new(prepared.agent_id.project.clone(), name)
+                    .map_err(|error| AgentError::Refused(format!("role {}: {error}", role.name)))?;
+                (direction, Some(beside))
+            }
+            Some(None) => {
+                return Err(AgentError::Refused(format!(
+                    "role {}: its pane hint is not `<left|right|above|below>:<agent name>`",
+                    role.name
+                )))
+            }
+        };
+        let target = match &beside {
+            None => None,
+            Some(beside) => Some(
+                self.org
+                    .snapshot()
+                    .await?
+                    .agent(beside)
+                    .filter(|agent| agent.status != AgentStatus::Down)
+                    .and_then(|agent| agent.pane.clone())
+                    .ok_or_else(|| {
+                        AgentError::Refused(format!(
+                            "agent {beside}, which role {} is placed beside, has no pane",
+                            role.name
+                        ))
+                    })?,
+            ),
+        };
+        let context = self
+            .control
+            .clone()
+            .for_server(server)
+            .prepare_spawn(
+                target,
+                prepared.cwd.to_str().map(str::to_owned),
+                caller.from_pane.map(|pane| pane.0),
+                None,
+            )
+            .await
+            .map_err(|error| match error {
+                ServiceError::Timeout => AgentError::Timeout,
+                ServiceError::ServerRefused(reason) => AgentError::Refused(reason),
+                error => AgentError::Unavailable(format!("finding a pane to split: {error}")),
+            })?
+            .with_detached(true);
+        Ok(Launch {
+            prepared,
+            command,
+            context,
+            direction,
+            beside,
+        })
+    }
+
+    /// Start an agent: split a new pane off without selecting it, tag it,
+    /// type the launch command into its shell and run it, then wait for the
+    /// harness to be ready: its new session and then a safe editor, or a fresh
+    /// safe editor for a harness that announces its session later.
+    ///
+    /// Nothing is typed until the new pane's root is proven an idle shell
+    /// whose line can be read exactly, and the command is run only when the
+    /// line reads that prompt followed by the command and nothing else. The
+    /// command is pasted once and run once, each under a guard on the control
+    /// actor's own capture; an input whose outcome is unknown is never
+    /// repeated. From the Up it records onwards the flow never gives up
+    /// quietly: every failure, and the deadline, leaves the agent Starting for
+    /// [`Self::settle_up`] to mark Stuck.
+    pub(super) async fn up(
+        &self,
+        r: &Reservation,
+        launch: Launch,
+        waiting: &Waiting,
+    ) -> Result<UpResult, AgentError> {
+        let Launch {
+            prepared,
+            command,
+            context,
+            direction,
+            beside,
+        } = launch;
+        let id = prepared.agent_id.clone();
+        let harness = prepared.role.config.harness;
+        let screen = agent_screen(harness).ok_or_else(|| {
+            AgentError::Refused(format!(
+                "agent {id}: no screen reader for harness {}",
+                harness.short_tag()
+            ))
+        })?;
+        let (policy, format, tag) = (screen.policy(), screen.capture_format(), id.to_string());
+        // The pane to split: read only, it grants no input.
+        let target = PaneId::parse(context.target_pane.clone())?;
+        let refused = |reason: String| {
+            AgentError::Refused(format!(
+                "agent {id} was not started: {reason}; nothing was changed"
+            ))
+        };
+        let found = r
+            .inspect(&target)
+            .await?
+            .filter(|found| !found.dead)
+            .ok_or_else(|| refused(format!("the pane to split, {target}, is gone")))?;
+        if let Some(beside) = &beside {
+            if found.local_agent_tag.as_deref() != Some(&beside.to_string()) {
+                return Err(refused(format!(
+                    "{target} is no longer agent {beside}'s pane"
+                )));
+            }
+        }
+        // The organisation refuses an agent that is already up.
+        self.org
+            .execute(
+                OrgCommand::Up {
+                    agent_id: id.clone(),
+                    role: prepared.role.clone(),
+                },
+                chrono::Utc::now(),
+            )
+            .await?;
+        waiting_for(waiting, "its pane was not created");
+        let pane = r.split(context, direction, "50%".into()).await?;
+        waiting_for(waiting, format!("{pane} was created and not recorded"));
+        r.tag(&pane, ExpectedTag::Absent).await?;
+        self.org
+            .execute(
+                OrgCommand::PaneCreated {
+                    agent_id: id.clone(),
+                    pane: pane.to_string(),
+                },
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        waiting_for(waiting, "the shell in the new pane is not at its prompt");
+        let text = command.text;
+        let mut refused_line = None;
+        let (mut baseline, before) = loop {
+            let (baseline, before) = self
+                .idle_shell(r, &id, &pane, screen, refused_line.as_deref(), waiting)
+                .await?;
+            let guard = {
+                let (baseline, tag, before) = (baseline.clone(), tag.clone(), before.clone());
+                move |capture: &_| launch_paste_allowed(screen, capture, &baseline, &tag, &before)
+            };
+            #[cfg(test)]
+            self.progress("up_pasting", Some(id.clone()));
+            match r
+                .paste_guarded(&pane, id.clone(), text.clone(), format, guard)
+                .await
+            {
+                Ok(()) => break (baseline, before),
+                // Nothing was sent: read the shell's line again.
+                Err(ReservationError::ScreenChanged { .. }) => {
+                    waiting_for(
+                        waiting,
+                        "the shell's line changed before the launch command was typed",
+                    );
+                    refused_line = Some(before);
+                }
+                Err(error) => {
+                    return Err(unknown_outcome(waiting, "typing the launch command", error))
+                }
+            }
+        };
+        // Subscribed before the command runs: a session that arrives from
+        // here on is an event.
+        let mut events = self.registry.subscribe();
+        waiting_for(
+            waiting,
+            "the launch command did not appear at the shell's prompt",
+        );
+        loop {
+            let capture = r.capture(&pane, format).await?;
+            let reason = match shell_refusal(screen, &capture, &baseline, &tag) {
+                Some(reason) => reason,
+                None if launch_line_is_staged(&capture, &before, &text) => {
+                    let guard = {
+                        let (baseline, tag) = (baseline.clone(), tag.clone());
+                        let (before, text) = (before.clone(), text.clone());
+                        move |capture: &_| {
+                            launch_enter_allowed(screen, capture, &baseline, &tag, (&before, &text))
+                        }
+                    };
+                    #[cfg(test)]
+                    self.progress("up_running", Some(id.clone()));
+                    match r
+                        .keys_guarded(&pane, id.clone(), PaneKey::Enter, format, guard)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(ReservationError::ScreenChanged { .. }) => {
+                            "the shell's line changed before the command was run"
+                        }
+                        Err(error) => {
+                            return Err(unknown_outcome(
+                                waiting,
+                                "running the launch command",
+                                error,
+                            ))
+                        }
+                    }
+                }
+                None => "the shell's line is not its prompt followed by the command",
+            };
+            waiting_for(
+                waiting,
+                format!("the launch command was typed and not run: {reason}"),
+            );
+        }
+        waiting_for(waiting, "the launch has started no harness");
+        self.org
+            .execute(
+                OrgCommand::ControlSpawned(atm_org::ControlAudit {
+                    pane: pane.to_string(),
+                    action: serde_json::json!({
+                        "method": "agent.up",
+                        "agent": tag,
+                        "binary": command.binary,
+                    }),
+                }),
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        let announces = policy.session_arrival == SessionArrival::AtStart;
+        let progress = StartProgress::default();
+        loop {
+            let mut session = None;
+            if announces {
+                let rows = self.pane_sessions(&pane).await?;
+                session = started_session(harness.short_tag(), &rows)
+                    .map_err(|reason| stopped(waiting, &id, "start", reason))?;
+            }
+            let capture = r.capture(&pane, format).await?;
+            let control = match start_view(screen, &capture, &baseline) {
+                StartView::Wait(reason) => {
+                    waiting_for(waiting, reason);
+                    continue;
+                }
+                StartView::Stuck(reason) => return Err(stopped(waiting, &id, "start", reason)),
+                StartView::Pin {
+                    baseline: pinned,
+                    control,
+                } => {
+                    self.record_baseline(id.clone(), pane.as_str(), pinned.clone());
+                    baseline = pinned;
+                    control
+                }
+                StartView::Harness(control) => control,
+            };
+            match decide_start(
+                policy,
+                &control,
+                &progress,
+                &prepared.trust_dirs,
+                session.as_ref(),
+            ) {
+                Step::Ready(ready) => {
+                    let command = match ready {
+                        Ready::Session(session_id) => OrgCommand::SessionBound {
+                            agent_id: id.clone(),
+                            session_id,
+                        },
+                        Ready::Editor => OrgCommand::EditorReady {
+                            agent_id: id.clone(),
+                        },
+                    };
+                    self.org.execute(command, chrono::Utc::now()).await?;
+                    return Ok(UpResult {
+                        agent_id: id,
+                        pane: pane.to_string(),
+                        state: AgentStatus::Ready,
+                    });
+                }
+                Step::Wait(reason) => {
+                    waiting_for(waiting, reason);
+                    if announces && session.is_none() && safe_editor(&control) {
+                        #[cfg(test)]
+                        self.progress("up_awaiting_session", Some(id.clone()));
+                        // The session arrives as a registry event, or not at all.
+                        if let Err(tokio::sync::broadcast::error::RecvError::Closed) =
+                            events.recv().await
+                        {
+                            return Err(AgentError::Unavailable("session registry stopped".into()));
+                        }
+                    }
+                }
+                // Answering a start's dialogs is not built yet.
+                Step::Key { .. } => {
+                    return Err(stopped(
+                        waiting,
+                        &id,
+                        "start",
+                        "the harness asks a question at its start that atm does not answer yet"
+                            .into(),
+                    ))
+                }
+                Step::Stuck(reason) => return Err(stopped(waiting, &id, "start", reason)),
+            }
+        }
+    }
+
+    /// Wait until the new pane's root is proven a shell at its prompt, and
+    /// record that as the pane's baseline. Returns it with the shell's line
+    /// before the cursor, which the paste and its Enter are checked against.
+    ///
+    /// The process facts are read between two captures and used only when both
+    /// show the same root process, shell and line. A line that is
+    /// `refused_line` with more typed after it is never taken.
+    async fn idle_shell(
+        &self,
+        r: &Reservation,
+        id: &AgentId,
+        pane: &PaneId,
+        screen: &'static AgentScreen,
+        refused_line: Option<&str>,
+        waiting: &Waiting,
+    ) -> Result<(PaneBaseline, String), AgentError> {
+        let (format, tag) = (screen.capture_format(), id.to_string());
+        let seen = |capture: &PaneCapture| {
+            capture
+                .inspection
+                .pane_root_pid()
+                .zip(capture.inspection.foreground_command.clone())
+        };
+        loop {
+            let first = r.capture(pane, format).await?;
+            let Some((root, command)) = seen(&first) else {
+                continue;
+            };
+            let Some(baseline) = (self.proc)(root)
+                .await
+                .and_then(|facts| shell_baseline(&facts, root, &command))
+            else {
+                continue;
+            };
+            // The second capture must show that root and shell again.
+            let second = r.capture(pane, format).await?;
+            if let Some(reason) = shell_refusal(screen, &second, &baseline, &tag) {
+                waiting_for(waiting, reason);
+                continue;
+            }
+            match launch_line(&second) {
+                Some(line)
+                    if launch_line(&first).as_ref() == Some(&line)
+                        && prompt_line_allowed(refused_line, &line) =>
+                {
+                    self.record_baseline(id.clone(), pane.as_str(), baseline.clone());
+                    return Ok((baseline, line));
+                }
+                _ => waiting_for(waiting, "the shell's prompt could not be read as settled"),
+            }
+        }
     }
 }

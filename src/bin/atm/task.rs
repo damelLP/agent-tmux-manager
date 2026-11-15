@@ -186,6 +186,7 @@ fn command(action: TaskAction) -> Result<(&'static str, Value)> {
             "task.create",
             serde_json::to_value(CreateParams {
                 title,
+                project_id: None,
                 kind,
                 parent,
                 judges,

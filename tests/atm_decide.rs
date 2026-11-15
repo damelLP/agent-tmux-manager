@@ -1,5 +1,16 @@
 //! Decision CLI arguments, exact output and private RPC, no harness/fallback.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "support/message_delivery.rs"]
+mod delivery_support;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "support/agent_lifecycle.rs"]
+mod lifecycle;
+#[cfg(target_os = "linux")]
+#[path = "support/stand_in.rs"]
+mod stand_in;
 use serde_json::{json, Value};
 use std::{
     path::Path,
@@ -318,6 +329,60 @@ async fn decision_cli_refusals_old_daemon_malformed_result_and_write_errors_fail
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("No space left on device"));
 }
+// Break caught: the built CLI/daemon only record a mark, or duplicate a rule after retry/restart.
+#[cfg(target_os = "linux")]
+#[test]
+fn real_cli_rule_command_appends_once_through_a_private_daemon() {
+    use delivery_support::{about, Confirmation, MessageRig};
+    let mut rig = MessageRig::start(Confirmation::Generous);
+    let seat = rig.ready_agent("worker", stand_in::StandInMode::Pi);
+    std::fs::write(
+        rig.test.project.join(".atm/intent.md"),
+        "## How we will know\n- mechanical: scripts/check\n",
+    )
+    .unwrap();
+    let task = rig.call("task.create", json!({"title":"Private smoke","measure":{"kind":"mechanical","command":"scripts/check"}}), Some(&seat.pane)).unwrap();
+    assert_eq!(task["changed"], true);
+    assert_eq!(rig.call("task.create", json!({"title":"Unapproved smoke","measure":{"kind":"mechanical","command":"scripts/other"}}), Some(&seat.pane)).unwrap_err().0, "refused");
+    let mut watch = rig.watch();
+    let result = rig.call("decision.request", json!({"kind":"policy","title":"CLI policy","options":["yes","no"],"may_be_undone":true,"changes_intent":false}), Some(&seat.pane)).unwrap();
+    let id = result["decision_id"].as_str().unwrap();
+    let args = [
+        "decide",
+        id,
+        "yes",
+        "Always use this shape",
+        "--rule",
+        "--format",
+        "json",
+    ];
+    assert_eq!(rig.atm_json(None, &args)["changed"], true);
+    let rules = rig.test.project.join(".atm/rules.md");
+    let text = std::fs::read_to_string(&rules).unwrap();
+    assert!(text.contains("Always use this shape"));
+    assert!(text.contains("Answer: yes"));
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == format!("<!-- atm-rule:{id} -->"))
+            .count(),
+        1
+    );
+    assert_eq!(rig.atm_json(None, &args)["changed"], false);
+    assert_eq!(std::fs::read_to_string(&rules).unwrap(), text);
+    let sent = watch.wait("the answer enqueue", |e| {
+        e["kind"] == "msg.sent" && e["body"]["kind"] == "answer" && e["body"]["to"] == seat.id
+    });
+    let message = format!("m{}", sent["seq"]);
+    watch.wait("the confirmed answer", about("msg.delivered", &message));
+    rig.finish_turn(&seat.pane);
+    rig.test.rig.restart_daemon();
+    assert_eq!(rig.atm_json(None, &args)["changed"], false);
+    assert_eq!(std::fs::read_to_string(&rules).unwrap(), text);
+    let inbox = rig.call("msg.inbox", json!({"for":seat.id}), None).unwrap();
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    rig.test.rig.close();
+}
+
 #[tokio::test]
 async fn decision_cli_argument_errors_do_not_contact_a_daemon() {
     for args in [

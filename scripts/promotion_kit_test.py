@@ -76,8 +76,8 @@ class ProtectedFiles(Sealed):
         self.before = self.commit(self.repo)
         self.git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.before)
 
-    def report(self, *refs, env=None, ok=True, cwd=None):
-        result = self.command([sys.executable, SCRIPTS / 'atm-protected-files.py', *refs],
+    def report(self, *refs, env=None, ok=True, cwd=None, script=None):
+        result = self.command([sys.executable, script or SCRIPTS / 'atm-protected-files.py', *refs],
                               cwd=cwd or self.repo, env=env)
         self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
         changes = {}
@@ -166,6 +166,81 @@ class ProtectedFiles(Sealed):
             (self.repo / path).write_text('after')
         after = self.commit(self.repo)
         self.assertEqual(self.report(before, after)[0], {path: 'M' for path in paths})
+
+    # Removing any intent/rule/rubric or its admission/append judge must remain visible.
+    def test_intent_rules_measures_and_their_judges_are_protected(self):
+        paths = ('.atm/intent.md', '.atm/rules.md', '.atm/measures/nested/structure.md',
+                 'crates/atm-org/src/intent.rs', 'crates/atm-org/tests/intent.rs',
+                 'crates/atmd/src/org/intent.rs', 'crates/atmd/src/org/standing_rules.rs',
+                 'crates/atmd/src/org/tasks.rs', 'crates/atmd/src/org/task_methods.rs',
+                 'crates/atmd/src/org/decisions.rs', 'crates/atmd/tests/intent.rs',
+                 'crates/atmd/tests/standing_rules.rs',
+                 'crates/atmd/tests/fixtures/intent/methods.json',
+                 'crates/atmd/tests/fixtures/standing_rules/methods.json',
+                 'crates/atmd/tests/decision_conformance.rs', 'tests/atm_decide.rs')
+        before = self.before
+        for status, content in (('A', 'initial'), ('M', 'changed'), ('D', None)):
+            with self.subTest(status=status):
+                for path in paths:
+                    file = self.repo / path
+                    if content is None:
+                        file.unlink()
+                    else:
+                        file.parent.mkdir(parents=True, exist_ok=True)
+                        file.write_text(content)
+                (self.repo / 'ordinary').write_text(status)
+                after = self.commit(self.repo)
+                self.assertEqual(self.report(before, after)[0], {path: status for path in paths})
+            before = after
+
+    # Policy fixture judges stay explicit even if the generic fixture glob is narrowed.
+    def test_policy_fixtures_do_not_depend_on_the_generic_fixture_glob(self):
+        script = self.root / 'policy-report/atm-protected-files.py'
+        script.parent.mkdir()
+        script.write_bytes((SCRIPTS / script.name).read_bytes())
+        manifest = (SCRIPTS / 'protected-files.txt').read_text()
+        script.with_name('protected-files.txt').write_text('\n'.join(
+            line for line in manifest.splitlines() if line != 'crates/*/tests/fixtures/*'))
+        paths = ('crates/atmd/tests/fixtures/intent/methods.json',
+                 'crates/atmd/tests/fixtures/standing_rules/methods.json')
+        for path in paths:
+            file = self.repo / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('before')
+        before = self.commit(self.repo)
+        for path in paths:
+            (self.repo / path).write_text('after')
+        after = self.commit(self.repo)
+        self.assertEqual(self.report(before, after, script=script)[0],
+                         {path: 'M' for path in paths})
+
+    # Current shipped rules must not mask a regression in the historical-list union.
+    def test_historical_intent_measures_survive_current_list_narrowing_and_deletion(self):
+        files = ('.atm/intent.md', '.atm/rules.md', '.atm/measures/nested/structure.md')
+        self.rules.write_text((SCRIPTS / 'protected-files.txt').read_text())
+        for path in files:
+            file = self.repo / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('before')
+        before = self.commit(self.repo)
+        script = self.root / 'narrowed/atm-protected-files.py'
+        script.parent.mkdir()
+        script.write_bytes((SCRIPTS / script.name).read_bytes())
+        script.with_name('protected-files.txt').write_text('scripts/*\n')
+        (self.repo / '.atm/intent.md').write_text('after')
+        (self.repo / '.atm/rules.md').unlink()
+        (self.repo / '.atm/measures/nested/structure.md').write_text('after')
+        for replacement, status in (('scripts/*\n', 'M'), (None, 'D')):
+            with self.subTest(replacement=replacement):
+                if replacement is None:
+                    self.rules.unlink()
+                else:
+                    self.rules.write_text(replacement)
+                after = self.commit(self.repo)
+                changes, _ = self.report(before, after, script=script)
+                self.assertEqual(changes, {'.atm/intent.md': 'M', '.atm/rules.md': 'D',
+                                          '.atm/measures/nested/structure.md': 'M',
+                                          'scripts/protected-files.txt': status})
 
     def test_invalid_ref_and_invalid_manifest_fail(self):
         self.report('no-such-commit', ok=False)

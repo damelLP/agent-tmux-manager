@@ -378,28 +378,55 @@ impl DecisionHandle {
         p: ResolveParams,
         caller: CallContext,
     ) -> Result<MutationResult, DecisionError> {
-        self.call(true, async {
-            let state = self.org.snapshot().await?;
+        let permit = self
+            .requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DecisionError::Unavailable("request limit reached".into()))?;
+        let handle = self.clone();
+        // The admitted resolve/append chain, not its RPC waiter, owns capacity.
+        // Dropping the waiter detaches this finite worker rather than cancelling
+        // an append after the durable resolution. Filesystem work stays detached.
+        let worker = tokio::spawn(async move {
+            let _permit = permit;
+            tokio::time::timeout(BUDGET, handle.initialized())
+                .await
+                .map_err(|_| DecisionError::Timeout)??;
+            let state = handle.org.snapshot().await?;
             let by = caller_address(&state, &caller)?;
             if by != Address::Owner {
                 return Err(DecisionError::Refused(
                     "only the owner may resolve a decision".into(),
                 ));
             }
-            self.mutate(
-                p.id,
-                DecisionCommand::Resolve(DecisionResolution {
-                    decision_id: p.id,
-                    option: p.option,
-                    by,
-                    note: p.note,
-                    standing_rule: p.standing_rule,
-                }),
-                caller,
-            )
+            let root = if p.standing_rule {
+                Some(super::standing_rules::project_root(&state, p.id)?)
+            } else {
+                None
+            };
+            let result = handle
+                .mutate(
+                    p.id,
+                    DecisionCommand::Resolve(DecisionResolution {
+                        decision_id: p.id,
+                        option: p.option,
+                        by,
+                        note: p.note,
+                        standing_rule: p.standing_rule,
+                    }),
+                    caller,
+                )
+                .await?;
+            if let Some(root) = root {
+                super::standing_rules::append(root, result.decision.decision.clone()).await
+                    .map_err(|error| DecisionError::Unavailable(format!("decision {} committed; standing-rule append was not confirmed: {error}; retry the identical answer to repair it", p.id)))?;
+            }
+            Ok(result)
+        });
+        tokio::time::timeout(BUDGET, worker)
             .await
-        })
-        .await
+            .map_err(|_| DecisionError::Timeout)?
+            .map_err(|error| DecisionError::Internal(format!("resolution worker: {error}")))?
     }
     pub async fn withdraw(
         &self,

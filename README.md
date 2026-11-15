@@ -86,7 +86,7 @@ atm peek <id> --prompt             # extract the active prompt
 atm list -f json --status working  # list working agents as JSON
 atm task list --open               # unfinished tasks; get t41 shows every field
 atm decisions                      # pending/provisional decisions for you
-atm decide d41 yes 'Approved'      # owner answer; --rule records a rule mark
+atm decide d41 yes 'Approved'      # owner answer; --rule appends a standing rule
 atm away                           # you will not answer: agents go on under the away rules
 atm back                           # you are back: nothing more is decided for you
 atm status                         # one-line summary for tmux status bar
@@ -337,6 +337,34 @@ Limits:
 - A turn whose end the harness does not report is not reminded: Esc during a reply in Claude Code or Codex, or a denied dialog.
 - A session that reads idle while the harness still answers (a blocked `Stop` hook, an auto-compact) for longer than the delay gets a reminder it may no longer need, typed after the turn really ends.
 
+## Intent and task measures
+
+The owner writes and approves `<project>/.atm/intent.md` in the main checkout; agents do not create or change it automatically. Its **How we will know** section lists the measures against which tasks may be accepted. This is a syntax example, not a set of approved measures:
+
+```markdown
+# Project intent
+## How we will know
+- mechanical: `cargo test --workspace`
+- reviewed: `.atm/measures/structure.md`
+- owner
+```
+
+The pure parser supports ATX (`##`) and Setext headings, unordered/numbered list items, and optional matching inline backticks around command/rubric values. The heading is case-insensitive; the three measure keywords are lowercase. Nested headings stay within the section until a peer/ancestor heading ends it. Fenced/indented code examples and HTML-commented lines are ignored (including a whole declaration line with an inline comment). Values must be nonempty, control-free single lines; wrapped or lazy continuations immediately after a measure are refused, not truncated. `<!--` starts an ignored comment even inside inline backticks. This is a documented Markdown subset, not a general Markdown renderer. Duplicate sections, empty sections, malformed measure entries and unsafe rubric paths are refused; duplicate identical entries are harmless. Reviewed rubric paths must be canonical repository-relative files below `.atm/measures/`, without empty, `.` or `..` components or backslashes.
+
+`task.create` reads that project's intent **on every call**, before committing a task. The typed measure must match a listed entry exactly: a mechanical command, a reviewed rubric path, or `{"kind":"owner"}`. Outside whitespace/backtick delimiters are removed; internal command bytes are not normalized. An owner caller is subject to the same measure list. Commands/rubrics are not executed or evaluated by this check; the existing task verdict rules still decide who may accept work. A refused create adds no task or event, and changes to the current intent do not invalidate replay of existing tasks.
+
+A missing intent file preserves legacy unchecked creation. A **present** empty/malformed file or missing section does not disable validation. Intent reads are bounded to 256 KiB and 5 seconds; nonregular/symlink policy paths, invalid UTF-8, oversize files and read failures are explicit errors. No intent directory/file is created while checking policy.
+
+The additive optional `project_id` parameter selects a **registered** project for owner creates. Named callers use their own project and cannot override it with another id. For an owner with no selector, a sole registered project is used; multiple projects require `project_id`, and no registered projects preserve legacy unchecked creation. An unknown selected id is `not_found`. This selector is a method parameter, not a task/event field; the daemon never guesses the project from its own working directory.
+
+For example, after the normal 1.1 handshake, an unbound owner can create a task in a registered project with this one-line request (the command must be listed in that project's intent if one exists):
+
+```json
+{"protocol_version":{"major":1,"minor":1},"type":"request","id":"task-1","method":"task.create","params":{"project_id":"example","title":"Check the change","measure":{"kind":"mechanical","command":"cargo test --workspace"}}}
+```
+
+Intent, standing rules, rubric files and their admission/append judges are on the [protected-file report list](scripts/atm-promotion.md#protected-file-report). Keep project rubric files under `.atm/measures/` and mechanical judge scripts under the already-protected `scripts/` directory. Reporting detects committed endpoint changes; it does not prevent same-user writes or discover arbitrary command dependencies. Setup does not install a project intent or rubric on the owner's behalf.
+
 ## Decisions
 
 Named agents raise questions through `decision.request`; the owner answers from an **unbound** shell:
@@ -356,7 +384,15 @@ An agent pane sees its own requests; an unbound owner caller sees all. Pending a
 
 Only the owner resolves. A pane bound to an agent is refused; an unbound pane (or absent pane) counts as owner, just as for messages. This is **attribution, not authentication**: clients supply their pane, and processes running as the owner can claim an unbound one. Resolved/overruled log bodies include the optional caller pane; the fold and repeat rule ignore that audit metadata. Old bodies without it still replay unchanged.
 
-The exact same answer (option, note and rule mark) again is an accepted no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. `--rule` currently **records the standing-rule mark only**; it does not append a project rules file. Automatic deadline expiry and rule-file updates are separate features; a deadline is stored but no expiry timer runs. What happens to a decision while you are away is described under [Away](#away).
+The exact same answer (option, note and rule mark) again is an accepted decision no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. A stored deadline does not run an expiry timer. What happens to a decision while you are away is described under [Away](#away).
+
+### Standing rules
+
+An accepted owner `atm decide … --rule` also appends the final question, answer and optional note to the **requester's registered main project** at `.atm/rules.md`, creating the policy directory/file if necessary but never recreating a missing project checkout. A projectless system request cannot become a standing rule; that refusal happens before resolution. Ordinary answers, agent callers and rejected answers do not touch this file. Existing historical rule marks are not backfilled on startup: the owner can repeat the identical marked answer to publish one.
+
+Appends preserve existing UTF-8 text and mode bits. A whole-line decision-id marker deduplicates identical/concurrent retries, including after restart; user question/note lines are quoted so they cannot manufacture another marker. Daemon writes are serialized through one retained filesystem slot, limited to 5 seconds and 1 MiB including the new entry. Nonregular/symlink policy paths and invalid UTF-8 are refused. Publication writes and syncs a same-directory temporary file, renames it atomically and syncs the policy directory (and its project parent when preparing the directory), so a partial marker is never presented as a complete rule. Coordinate manual edits separately: they are not transactionally merged with an in-flight daemon write.
+
+The event log and project file are **not one transaction**. Success confirms both the resolution and rule publication. If publication fails after the decision commits, the error says the resolution committed and the append was not confirmed: fix the file problem and retry the **identical option, note and `--rule`**. The decision stays unchanged while a missing rule is repaired once. The same explicit retry repairs a daemon crash between commit and publication; there is no background rules-file rewrite. Admitted resolve/append work retains its capacity after RPC cancellation/timeouts, but an error/timeout is not a rollback—inspect the decision and file before retrying.
 
 ### Decision API
 

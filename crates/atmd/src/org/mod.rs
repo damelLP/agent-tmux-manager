@@ -38,6 +38,7 @@ mod agents_tests;
 pub mod away;
 mod decision_methods;
 pub mod decisions;
+mod intent;
 pub mod message_delivery;
 #[cfg(test)]
 mod message_delivery_gate;
@@ -60,6 +61,7 @@ mod message_service_tests;
 pub mod message_types;
 pub mod messages;
 mod raw;
+mod standing_rules;
 mod start_line;
 #[cfg(test)]
 mod start_line_tests;

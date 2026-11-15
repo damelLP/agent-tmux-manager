@@ -1,0 +1,4 @@
+[
+  {"params":{"option":"yes","note":"Always use this shape","standing_rule":true},"pane":null,"success":true},
+  {"params":{"option":"yes","note":"Always use this shape","standing_rule":true},"pane":"%7","error":"refused"}
+]

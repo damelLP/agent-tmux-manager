@@ -6,7 +6,7 @@
 use super::agent_screen::*;
 use crate::control::reservation::{CaptureFormat, PaneCapture, PaneInspection};
 use atm_core::harness_control::{ControlDialog, ControlScreen, HookListEntry};
-use atm_core::{DialogState, Harness, InputState, ScreenFacts, ScreenInput};
+use atm_core::{DialogState, Harness, InputState, ScreenFacts, ScreenInput, TurnState};
 
 pub(super) const ROOT: u32 = 4100;
 
@@ -302,6 +302,42 @@ fn facts_are_unknown_unless_harness_is_foreground() {
             ),
             ScreenFacts::default()
         );
+    }
+}
+
+/// Real idle Claude editors in manual mode, which the adapter's legacy
+/// observer reads all Unknown: three launches and one after a conversation.
+const CLAUDE_MANUAL_IDLE: [&str; 4] = [
+    include_str!(
+        "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A80-ready-80x40_2.1.325.txt"
+    ),
+    include_str!(
+        "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-ready-120x40_2.1.325.txt"
+    ),
+    include_str!(
+        "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A200-ready-200x40_2.1.325.txt"
+    ),
+    include_str!(
+        "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_B-baseline-conversation-120x40_2.1.325.txt"
+    ),
+];
+
+#[test]
+fn facts_read_real_idle_claude_editors_as_the_control_read_does() {
+    let screen = agent_screen(Harness::ClaudeCode).unwrap();
+    let baseline = pinned("claude");
+    for fixture in CLAUDE_MANUAL_IDLE {
+        let frame = capture(fixture, CaptureFormat::Ansi, Some(ROOT), Some("claude"));
+        let facts = screen.facts(&frame, &baseline);
+        assert_eq!(facts, screen.control(&frame, &baseline).facts);
+        assert_eq!(facts.input, InputState::Empty);
+        assert_eq!(facts.turn, TurnState::NotRunning);
+        assert_eq!(facts.dialog, DialogState::None);
+        // Synthetic: a shell prompt below the same frame. The editor above it
+        // is history now, so nothing may be read from it.
+        let mutated = format!("{}\nshell$ ", body(fixture));
+        let frame = capture(&mutated, CaptureFormat::Ansi, Some(ROOT), Some("claude"));
+        assert_eq!(screen.facts(&frame, &baseline), ScreenFacts::default());
     }
 }
 

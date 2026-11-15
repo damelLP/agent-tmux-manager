@@ -5213,6 +5213,7 @@ mod reconciliation {
 
     mod lifecycle {
         include!("agent_lifecycle_tests.rs");
+        include!("agent_lead_screen_tests.rs");
         include!("agent_clear_tests.rs");
         include!("agent_up_tests.rs");
         include!("agent_start_dialog_tests.rs");

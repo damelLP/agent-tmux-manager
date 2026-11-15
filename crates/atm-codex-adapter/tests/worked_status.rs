@@ -1,5 +1,6 @@
 use atm_codex_adapter::screen::{observe_control_screen, observe_screen};
-use atm_core::{ScreenInput, TurnState};
+use atm_core::harness_control::ControlDialog;
+use atm_core::{DialogState, FreshEditorEvidence, InputState, ScreenInput, TurnState};
 
 macro_rules! styled {
     ($name:literal) => {
@@ -48,6 +49,48 @@ fn captured_finished_turns_and_historical_worked_lines() {
             turn
         );
     }
+}
+
+#[test]
+fn captured_normal_footer_minute_completions_are_not_running() {
+    // Captured: codex-cli 0.167.0, 2026-11-14, P3 sealed loopback stub held
+    // 65 seconds; typed prompt, private tmux capture-pane -p -e -N, then resize.
+    for capture in [
+        include_str!("fixtures/screen_styled_p3_A-p1-typed-100x32-idle_0.167.0.txt"),
+        include_str!(
+            "fixtures/screen_styled_p3_A-p1-typed-100x32-minute-idle-resized-120x40_0.167.0.txt"
+        ),
+    ] {
+        let text = capture.split_once('\n').unwrap().1;
+        assert!(text.contains("Worked for 1m 5s • 22:08"));
+        assert_conversation_facts(text, TurnState::NotRunning);
+    }
+}
+
+#[test]
+fn captured_running_status_with_trailing_tip_remains_unknown() {
+    // Captured: codex-cli 0.167.0, 2026-11-14, P3 sealed loopback stub held
+    // over a minute; private tmux capture-pane -p -e -N at 100x32.
+    // Known limit: the tip is the last nonblank history row, masking Working.
+    let text =
+        include_str!("fixtures/screen_styled_p3_A-p1-typed-100x32-held-over-minute_0.167.0.txt")
+            .split_once('\n')
+            .unwrap()
+            .1;
+    assert!(text.contains("Working") && text.contains("Tip:"));
+    assert_conversation_facts(text, TurnState::Unknown);
+}
+
+fn assert_conversation_facts(text: &str, turn: TurnState) {
+    let facts = observe_screen(ScreenInput::Styled(text), None);
+    assert_eq!(facts.input, InputState::Empty);
+    assert_eq!(facts.turn, turn);
+    assert_eq!(facts.dialog, DialogState::None);
+    assert_eq!(facts.fresh_editor, FreshEditorEvidence::Unknown);
+    let control = observe_control_screen(ScreenInput::Styled(text), None);
+    assert_eq!(control.facts, facts);
+    assert_eq!(control.dialog, ControlDialog::None);
+    assert!(control.conversation);
 }
 
 #[test]

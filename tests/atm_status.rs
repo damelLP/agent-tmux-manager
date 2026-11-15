@@ -210,6 +210,50 @@ async fn status_decision_counts_and_failures_are_independent_of_unread() {
     status_aggregates((json!({"error":{"code":"unavailable","message":"messages unavailable"}}), true), (json!({"result":{"decisions":[],"pending_count":2,"provisional_count":0,"next_after":null}}), true), "2↑ 1! $3.50 ? unread 2 decisions\n", Some("unread count unavailable"), false).await;
 }
 
+// Break caught: a status line that hides a forgotten `atm back`, shows the
+// mark while the owner is present, or shows it for a daemon that cannot say.
+#[tokio::test]
+async fn status_shows_away_only_while_the_daemon_says_so() {
+    let unread = json!({"result":{"messages":[],"unread_count":4,"next_after":null}});
+    let decisions = |pending: u64, away: Option<bool>| {
+        let mut result =
+            json!({"decisions":[],"pending_count":pending,"provisional_count":2,"next_after":null});
+        if let Some(away) = away {
+            result["away"] = json!(away);
+        }
+        (json!({ "result": result }), true)
+    };
+    for (pending, away, expected) in [
+        (3, Some(true), "2↑ 1! $3.50 4 unread 3 decisions away\n"),
+        (0, Some(true), "2↑ 1! $3.50 4 unread away\n"),
+        (3, Some(false), "2↑ 1! $3.50 4 unread 3 decisions\n"),
+        // A daemon from before the away switch sends no such field.
+        (3, None, "2↑ 1! $3.50 4 unread 3 decisions\n"),
+        (0, None, "2↑ 1! $3.50 4 unread\n"),
+    ] {
+        status_aggregates(
+            (unread.clone(), true),
+            decisions(pending, away),
+            expected,
+            None,
+            false,
+        )
+        .await;
+    }
+    // The mark is not guessed when the count cannot be read.
+    status_aggregates(
+        (unread, true),
+        (
+            json!({"error":{"code":"unavailable","message":"org unavailable"}}),
+            true,
+        ),
+        "2↑ 1! $3.50 4 unread ? decisions\n",
+        Some("decision count unavailable"),
+        false,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn status_rejects_decision_rows_without_printing_private_context() {
     let mut rows: Value =

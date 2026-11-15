@@ -42,6 +42,7 @@ use atm_tui::tmux;
 
 mod agent;
 mod agent_target;
+mod away;
 mod cli;
 mod decide;
 mod me;
@@ -213,6 +214,10 @@ enum Command {
     Decide(decide::DecideArgs),
     /// List pending and provisional decisions
     Decisions(decide::DecisionsArgs),
+    /// Tell the daemon you will not answer: agents go on under the away rules
+    Away(away::SwitchArgs),
+    /// Tell the daemon you are back: nothing more is decided for you
+    Back(away::SwitchArgs),
     /// Send, acknowledge or resolve durable messages
     Msg {
         #[command(subcommand)]
@@ -445,6 +450,8 @@ async fn main() -> Result<()> {
         Some(Command::Task(args)) => return task::cmd_task(args).await,
         Some(Command::Decide(args)) => return decide::cmd_decide(args).await,
         Some(Command::Decisions(args)) => return decide::cmd_decisions(args).await,
+        Some(Command::Away(args)) => return away::cmd_away(args).await,
+        Some(Command::Back(args)) => return away::cmd_back(args).await,
         Some(Command::Msg { action }) => return msg::cmd_msg(action).await,
         Some(Command::Inbox(args)) => return msg::cmd_inbox(args).await,
         Some(Command::Agent { action }) => return agent::cmd_agent(action).await,

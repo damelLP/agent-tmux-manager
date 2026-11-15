@@ -35,6 +35,7 @@ mod agent_types;
 pub mod agents;
 #[cfg(test)]
 mod agents_tests;
+pub mod away;
 mod decision_methods;
 pub mod decisions;
 pub mod message_delivery;

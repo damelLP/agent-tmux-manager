@@ -217,6 +217,10 @@ pub enum OrgEvent {
     DecisionExpired { decision_id: DecisionId },
     #[serde(rename = "decision.withdrawn")]
     DecisionWithdrawn(DecisionWithdrawal),
+    #[serde(rename = "owner.away")]
+    OwnerAway(crate::OwnerAway),
+    #[serde(rename = "owner.back")]
+    OwnerBack(crate::OwnerBack),
 }
 
 impl OrgEvent {
@@ -261,6 +265,8 @@ impl OrgEvent {
             Self::DecisionOverruled(_) => "decision.overruled",
             Self::DecisionExpired { .. } => "decision.expired",
             Self::DecisionWithdrawn(_) => "decision.withdrawn",
+            Self::OwnerAway(_) => "owner.away",
+            Self::OwnerBack(_) => "owner.back",
         }
     }
 
@@ -318,6 +324,8 @@ impl OrgEvent {
                 | "decision.overruled"
                 | "decision.expired"
                 | "decision.withdrawn"
+                | "owner.away"
+                | "owner.back"
         ) {
             return Ok(None);
         }

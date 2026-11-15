@@ -187,14 +187,11 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
     let handover_org = services.org.clone();
     crate::org::tasks::register_task_methods(&mut router, services.org.clone())?;
-    crate::org::decisions::register_decision_methods(
-        &mut router,
-        services.decisions.unwrap_or_else(|| {
-            crate::org::decisions::DecisionHandle::disabled(
-                "decision operations are not configured",
-            )
-        }),
-    )?;
+    let decisions = services.decisions.unwrap_or_else(|| {
+        crate::org::decisions::DecisionHandle::disabled("decision operations are not configured")
+    });
+    crate::org::away::register_away_methods(&mut router, decisions.clone())?;
+    crate::org::decisions::register_decision_methods(&mut router, decisions)?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();

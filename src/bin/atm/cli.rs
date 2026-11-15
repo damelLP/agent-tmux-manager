@@ -342,8 +342,15 @@ pub(super) async fn cmd_status() -> Result<()> {
         }
     }
     match super::decide::pending_count().await {
-        Ok(0) => {}
-        Ok(count) => parts.push(format!("{count} decisions")),
+        Ok((count, away)) => {
+            if count > 0 {
+                parts.push(format!("{count} decisions"));
+            }
+            // So that a forgotten `atm back` shows in the status line.
+            if away {
+                parts.push("away".into());
+            }
+        }
         Err(error) => {
             parts.push("? decisions".into());
             eprintln!("decision count unavailable: {error}");

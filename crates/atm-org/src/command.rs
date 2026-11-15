@@ -91,6 +91,8 @@ pub enum OrgCommand {
     ControlSpawned(ControlAudit),
     ControlKilled(ControlAudit),
     Decision(DecisionCommand),
+    /// The away switch, and the away table applied to one pending decision.
+    Owner(OwnerCommand),
     /// Audit: a handover asked the agent to save with this message.
     SaveRequested {
         agent_id: AgentId,
@@ -142,6 +144,8 @@ pub enum Refusal {
     InvalidValue { field: &'static str, reason: String },
     #[error(transparent)]
     Decision(#[from] DecisionRefusal),
+    #[error(transparent)]
+    Away(#[from] AwayRefusal),
 }
 
 impl OrgCommand {
@@ -212,6 +216,7 @@ impl OrgCommand {
             Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
             Self::ControlKilled(audit) => OrgEvent::ControlKilled(audit),
             Self::Decision(command) => command.event(),
+            Self::Owner(command) => command.event(),
             Self::SaveRequested {
                 agent_id,
                 message_id,
@@ -462,6 +467,7 @@ impl OrgState {
                 true
             }
             OrgCommand::Decision(command) => return self.decide_decision(command, event, now),
+            OrgCommand::Owner(command) => return self.decide_owner(command, event, now),
             OrgCommand::SaveRequested {
                 agent_id,
                 message_id,

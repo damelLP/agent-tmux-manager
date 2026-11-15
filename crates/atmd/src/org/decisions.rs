@@ -3,6 +3,7 @@
 
 pub use super::decision_methods::register_decision_methods;
 use super::{
+    agent_project::AgentProjects,
     message_inbox::caller_address,
     messages::{MessageClock, MessageError},
     OrgHandle, OrgServiceError,
@@ -123,6 +124,10 @@ pub struct ListResult {
     pub pending_count: usize,
     pub provisional_count: usize,
     pub next_after: Option<DecisionId>,
+    /// The owner has said he is away. Present only while true, so a result
+    /// from before the away switch, or while he is present, is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub away: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetResult {
@@ -175,6 +180,7 @@ fn list(
             .filter(|d| d.status == DecisionStatus::TakenProvisionally)
             .count(),
         next_after: None,
+        away: state.owner().away_since.is_some(),
     };
     if params.count_only {
         return Ok(result);
@@ -254,10 +260,12 @@ fn missing_resolution_messages(state: &OrgState) -> Vec<MessageContent> {
 
 #[derive(Clone, Debug)]
 pub struct DecisionHandle {
-    org: OrgHandle,
-    clock: MessageClock,
+    pub(super) org: OrgHandle,
+    pub(super) clock: MessageClock,
     health: watch::Receiver<Result<bool, String>>,
     requests: Arc<Semaphore>,
+    /// The away switch's own configuration lane; None while disabled.
+    pub(super) projects: Option<AgentProjects>,
 }
 impl DecisionHandle {
     pub fn disabled(reason: impl Into<String>) -> Self {
@@ -268,6 +276,7 @@ impl DecisionHandle {
             clock: MessageClock::new(tokio::time::Instant::now(), Utc::now()),
             health,
             requests: Arc::new(Semaphore::new(64)),
+            projects: None,
         }
     }
     pub async fn initialized(&self) -> Result<(), DecisionError> {
@@ -281,7 +290,7 @@ impl DecisionHandle {
             .map(|_| ())
             .map_err(DecisionError::Unavailable)
     }
-    async fn call<T>(
+    pub(super) async fn call<T>(
         &self,
         mutation: bool,
         work: impl Future<Output = Result<T, DecisionError>>,
@@ -437,7 +446,12 @@ impl DecisionHandle {
 async fn reconcile(org: &OrgHandle, clock: &MessageClock) -> Result<(), DecisionError> {
     loop {
         let result = async {
-            for message in missing_resolution_messages(&org.snapshot().await?) {
+            super::away::apply_pending(org, clock).await?;
+            let state = org.snapshot().await?;
+            for message in missing_resolution_messages(&state)
+                .into_iter()
+                .chain(super::away::missing_notices(&state))
+            {
                 org.execute(OrgCommand::SendMessage(message), clock.now()?)
                     .await?;
             }
@@ -466,7 +480,7 @@ pub fn spawn_decisions(
 ) -> (DecisionHandle, JoinHandle<()>) {
     let watch = org
         .status()
-        .and_then(|cursor| org.watch(vec!["decision.".into()], cursor));
+        .and_then(|cursor| org.watch(vec!["decision.".into(), "owner.".into()], cursor));
     let mut watch = match watch {
         Ok(watch) => watch,
         Err(error) => {
@@ -477,11 +491,14 @@ pub fn spawn_decisions(
         }
     };
     let (health, status) = watch::channel(Ok(false));
+    // Detached: the lane stops with this bridge's token.
+    let (projects, _) = AgentProjects::spawn(org.clone(), cancel.clone());
     let handle = DecisionHandle {
         org: org.clone(),
         clock: clock.clone(),
         health: status,
         requests: Arc::new(Semaphore::new(64)),
+        projects: Some(projects),
     };
     let task = tokio::spawn(async move {
         let work = async {

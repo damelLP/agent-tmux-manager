@@ -87,6 +87,8 @@ atm list -f json --status working  # list working agents as JSON
 atm task list --open               # unfinished tasks; get t41 shows every field
 atm decisions                      # pending/provisional decisions for you
 atm decide d41 yes 'Approved'      # owner answer; --rule records a rule mark
+atm away                           # you will not answer: agents go on under the away rules
+atm back                           # you are back: nothing more is decided for you
 atm status                         # one-line summary for tmux status bar
 
 atm workspace create               # new session with ATM sidebar + agent + shell
@@ -330,7 +332,7 @@ An agent pane sees its own requests; an unbound owner caller sees all. Pending a
 
 Only the owner resolves. A pane bound to an agent is refused; an unbound pane (or absent pane) counts as owner, just as for messages. This is **attribution, not authentication**: clients supply their pane, and processes running as the owner can claim an unbound one. Resolved/overruled log bodies include the optional caller pane; the fold and repeat rule ignore that audit metadata. Old bodies without it still replay unchanged.
 
-The exact same answer (option, note and rule mark) again is an accepted no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. `--rule` currently **records the standing-rule mark only**; it does not append a project rules file. Away/provisional scheduling, automatic deadline expiry, and rule-file updates are separate features; D2 stores a deadline but does not run an expiry timer.
+The exact same answer (option, note and rule mark) again is an accepted no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. `--rule` currently **records the standing-rule mark only**; it does not append a project rules file. Automatic deadline expiry and rule-file updates are separate features; a deadline is stored but no expiry timer runs. What happens to a decision while you are away is described under [Away](#away).
 
 ### Decision API
 
@@ -361,6 +363,44 @@ The org event log retains requests and answers across daemon restarts. Recording
 The final decision is the bridge's recoverable work item; an exact canonical answer `msg.sent` is its completion marker, regardless of delivery/read status. Restart fills a missing enqueue and does not duplicate an existing one. An organisation snapshot or enqueue timeout backs off and reconciles from fresh committed state; the serial actor and exact-content check prevent duplicate late enqueues. A stopped actor or other terminal bridge failure requires restart; reads remain available when org persistence is healthy. Delivery failures/holds retain the normal message recovery rules. The canonical answer text is therefore a persistence correlation contract, not presentation-only text to change without considering old logs.
 
 New pending requests also run the owner's existing `[notify]` command, using a short `d41 from project/worker: atm decisions` reference, not private title/context/options. This shares the owner-message notifier described below; resolved, provisional, withdrawn or expired decisions suppress a delayed notice. External notices remain best effort, not the durable decision record.
+
+## Away
+
+```sh
+atm away      # from a shell that is not an agent's pane
+atm back
+```
+
+`atm away` tells the daemon you will not answer. Until `atm back`, every pending decision, whether asked before you left or after, is put through this table. While you are present nothing is ever taken for you.
+
+| The request says | While you are away |
+|---|---|
+| It can be undone and does not change the intent (a detail) | The agent that asked decides: its own recommended option is recorded, `by` the agent |
+| It can be undone and changes the intent | Taken provisionally on the recommended option, `by` `system` |
+| It cannot be undone or reaches outside | Waits for you |
+| Its kind is `action`, `hire` or `budget`, whatever else it says | Waits for you |
+| It names no recommended option | Waits for you |
+
+The two fields that give a decision its class are filled in by the agent that asks, so the kinds that reach outside wait whatever they claim. Both recorded outcomes are the existing `taken_provisionally` state: they stay in `atm decisions`, and `atm decide` with the same option confirms one (`resolved`) and with another overrules it (`overruled`). `atm back` takes nothing back and answers nothing; it prints how many decisions wait for your answer. A digest of what was decided is not built yet.
+
+The requester is told through the confirmed-message runtime, like an answer: one `system` message when its decision is taken provisionally, is its own to decide, or waits because you are away. `decision.request` itself answers as before. Your `[notify]` command still runs for a new pending decision.
+
+**The stacking cap.** A provisional decision may carry the task in progress to its end; nothing else may be built on it until you have answered it. A task built on a decision names it in `rests_on` when it is created. Such a task may be created and stays `open`, but `task.assign` refuses it (`refused`) while the cap is reached, and lifts by itself once you answer the decision; being back is not enough. The cap counts tasks, the task in progress being the first: with the default of 1 no further task starts, with N, N − 1 may. Only a provisional decision that changes the intent is capped. A task already assigned runs on. Known limits: a task that does not name its decision is not seen, and chains (a child of such a task, a second decision raised inside one) are not followed.
+
+The cap is a setting per project, in `<project>/.atm/away.toml`:
+
+```toml
+stacking_cap = 1
+```
+
+No file means 1. The daemon reads the file of every registered project when you run `atm away`, records the caps with the switch, and prints them; a change takes effect at the next `atm away`. A value below 1, an unknown key or a file that is not TOML refuses `atm away` with the file's path, and you stay present. A decision's project is that of the agent that asked.
+
+Only the owner sets the switch: as for `atm decide`, a pane bound to an agent is refused and an unbound pane counts as you. This is attribution, not authentication. The switch is in the org event log (`owner.away`, `owner.back`), so it survives a daemon restart; after one, the daemon handles whatever was left pending. Repeating either command changes nothing and says so. `--format json` prints the daemon's result. While you are away `atm status` ends with `away`, so a forgotten `atm back` shows in your status line; the mark comes with the decision count (`decision.list` adds `"away": true` to its result, and only then), so it is absent when that count cannot be read.
+
+| Method | Params | Result |
+|---|---|---|
+| `owner.away` | none | `changed`, `away_since`, `stacking_caps` (every registered project), `pending_count` (as the call found it) |
+| `owner.back` | none | `changed`, `away_since` (null if you were not away), `provisional_count`, `pending_count` |
 
 ## Notifications
 

@@ -209,7 +209,8 @@ pub async fn cmd_decisions(args: DecisionsArgs) -> Result<()> {
     }
 }
 
-pub(super) async fn pending_count() -> Result<usize> {
+/// The global pending count, and whether the owner is marked away.
+pub(super) async fn pending_count() -> Result<(usize, bool)> {
     let (result, _): (ListResult, _) = request(
         "decision.list",
         ListParams {
@@ -223,5 +224,5 @@ pub(super) async fn pending_count() -> Result<usize> {
     if !result.decisions.is_empty() || result.next_after.is_some() {
         bail!("invalid decision aggregate result from daemon");
     }
-    Ok(result.pending_count)
+    Ok((result.pending_count, result.away))
 }

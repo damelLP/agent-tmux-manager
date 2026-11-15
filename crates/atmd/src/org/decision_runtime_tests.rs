@@ -234,13 +234,21 @@ fn decision_overrule_wakes_bridge_without_another_decision_event() {
         *idle.lock().unwrap() = Some(reply);
         guarded(reached_idle).await.unwrap();
         let state = org.snapshot().await.unwrap();
-        assert_eq!(state.messages().count(), 1, "overrule must wake the bridge");
+        // The take has a notice of its own since the away switch. Whether the
+        // bridge sent it depends on whether it ran between the two commands.
+        let answers: Vec<_> = state
+            .messages()
+            .map(|message| message.content.clone())
+            .filter(|content| !content.body.contains("taken provisionally"))
+            .collect();
+        assert!(state.messages().count() <= 2);
         assert_eq!(
-            state.messages().next().unwrap().content,
-            MessageContent {
+            answers,
+            [MessageContent {
                 body: "Decision d3 overruled: no\nNote: go\nStanding rule: yes".into(),
                 ..content()
-            }
+            }],
+            "overrule must wake the bridge"
         );
         cancel.cancel();
         guarded(bridge).await.unwrap();

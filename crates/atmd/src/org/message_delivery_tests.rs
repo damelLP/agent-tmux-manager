@@ -2335,6 +2335,57 @@ async fn final_no_effect_attempt_is_left_to_the_policy() {
     assert_eq!(rig.step(id), failed);
 }
 
+/// Even a final no-effect attempt needs a retained NotStarted record
+/// before it can be left to policy. Exercise the failure-settlement seam
+/// with the real unavailable-history backend: neither the record nor a
+/// fallback hold can be retained, so cleanup must fail, not report success.
+#[tokio::test(start_paused = true)]
+async fn final_no_effect_attempt_is_not_left_to_policy_without_history_record() {
+    let mut rig = Rig::start(Fold::Hand, true, one_attempt(), None).await;
+    let id = rig.ready_message().await;
+    let seq = rig
+        .commit(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: pane().to_string(),
+        })
+        .await;
+    rig.fold();
+    assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+    let progress = Progress {
+        attempt: AttemptCommit::Committed,
+        number: 1,
+        before: seq - 1,
+        seq: Some(seq),
+        paste: NOT_STARTED,
+        enter: NOT_STARTED,
+        format: Some(CaptureFormat::Ansi),
+        settled: None,
+    };
+    let mut rt = rig.rt.clone();
+    rt.history = MessageHistoryHandle::disabled("history is unavailable");
+    let attempt = Attempt {
+        rt,
+        id,
+        pane: pane(),
+        progress: Arc::new(Mutex::new(progress)),
+    };
+
+    let settled = attempt
+        .fail(progress, Instant::now() + ATTEMPT_CLEANUP_BUDGET)
+        .await;
+
+    assert_eq!(settled, Settled::Neither);
+    assert!(!cleanup_succeeds(AttemptDisposition::Fail, settled));
+    assert!(rig.effects().is_empty());
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(
+        rig.org.status().unwrap(),
+        seq,
+        "no failure may be written without the record"
+    );
+}
+
 /// The same final attempt under the service's own recipient job: the policy
 /// fails the message once, and the owner is told once.
 #[tokio::test(start_paused = true)]

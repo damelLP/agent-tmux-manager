@@ -108,6 +108,11 @@ use the same naming and equal-width run-root substitution as above:
   conversation, followed by the existing `B-120x40-before-enter` popup and
   the ordered post-Enter captures. Poll 000 is transitional Unknown; 001
   through 004 show the fresh editor.
+- `B-80x24-finished-P6_OLD_ANSWER_B-80x24` and
+  `B-80x24-after-enter-poll-000` through `001` from `b-enter`: the matching
+  narrow-pane sequence. Its existing `B-80x24-before-enter` popup is accepted
+  by the finished-turn boundary. Removing only that popup row's inverse
+  selection is a hand-changed refusal twin, not a real capture.
 
 The daemon clear tests replay these without running a harness.
 

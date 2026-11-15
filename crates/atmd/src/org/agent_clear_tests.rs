@@ -51,6 +51,13 @@ const CODEX_FRESH: &str = fixture!("codex", "styled_p1_b14-fresh-baseline-32-100
 const CODEX_P6_CONVERSATION: &str =
     fixture!("codex", "p6_B-120x40-finished-P6_OLD_ANSWER_B-120x40_0.167.0.styled");
 const CODEX_P6_POPUP: &str = fixture!("codex", "p6_B-120x40-before-enter_0.167.0.styled");
+const CODEX_P6_80_CONVERSATION: &str =
+    fixture!("codex", "p6_B-80x24-finished-P6_OLD_ANSWER_B-80x24_0.167.0.styled");
+const CODEX_P6_80_POPUP: &str = fixture!("codex", "p6_B-80x24-before-enter_0.167.0.styled");
+const CODEX_P6_80_AFTER_ENTER: [&str; 2] = [
+    fixture!("codex", "p6_B-80x24-after-enter-poll-000_0.167.0.styled"),
+    fixture!("codex", "p6_B-80x24-after-enter-poll-001_0.167.0.styled"),
+];
 const CODEX_P6_AFTER_ENTER: [&str; 5] = [
     fixture!("codex", "p6_B-120x40-after-enter-poll-000_0.167.0.styled"),
     fixture!("codex", "p6_B-120x40-after-enter-poll-001_0.167.0.styled"),
@@ -1143,7 +1150,7 @@ async fn codex_clear_goes_from_conversation_to_fresh_editor() {
     // Codex announces no session when it clears: the proof is the screen.
     // Replay one real P6 session in order, including its transitional Unknown
     // frame. The first fresh poll completes the clear; later polls stay unread.
-    // The following test checks exclusion until the next prompt binds.
+    // A neighboring test checks exclusion until the next prompt binds.
     let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
     let mut committed = clearing.rig.org.committed.subscribe();
     clearing.frames_through_enter(CODEX_P6_CONVERSATION, CODEX_P6_POPUP);
@@ -1166,6 +1173,84 @@ async fn codex_clear_goes_from_conversation_to_fresh_editor() {
     assert_eq!(agent.status, AgentStatus::Ready);
     assert_eq!(agent.session_id, None);
     assert_eq!(agent.excluded_session_id, Some(SessionId::new("old")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_p6_80x24_finished_popup_gets_one_enter() {
+    let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    let reader = crate::org::agent_screen::agent_screen(Harness::Codex).unwrap();
+    let baseline = clearing.agents.baseline_of(&lead(), "%1");
+    let mut popup = clearing.capture(CODEX_P6_80_POPUP);
+    popup.inspection.pane.width = 80;
+    assert_eq!(
+        reader.control(&popup, &baseline).dialog,
+        atm_core::harness_control::ControlDialog::None
+    );
+    // One real P6 session: finished conversation, selected popup, transitional
+    // Unknown, then fresh editor. The finished-turn boundary permits Enter.
+    for frame in [
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_POPUP,
+        CODEX_P6_80_POPUP,
+    ]
+    .into_iter()
+    .chain(CODEX_P6_80_AFTER_ENTER)
+    {
+        clearing.frame_with(frame, |capture| capture.inspection.pane.width = 80);
+    }
+    let result = clearing.clear().await;
+    assert_eq!(clearing.sent(), ["paste %1 /new", "keys %1 Enter"]);
+    assert_eq!(result.unwrap().session_id, None);
+    assert_eq!(clearing.unread(), 0);
+    let agent = clearing.agent().await;
+    assert_eq!(agent.status, AgentStatus::Ready);
+    assert_eq!(agent.session_id, None);
+    assert_eq!(agent.excluded_session_id, Some(SessionId::new("old")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_p6_80x24_popup_without_inverse_gets_no_enter() {
+    let popup = body(CODEX_P6_80_POPUP);
+    let selected = popup
+        .lines()
+        .find(|line| line.contains("start a new chat during a conversation"))
+        .unwrap();
+    // Synthetic, hand-changed: remove only inverse selection from the real
+    // popup row. Without positive selection evidence the guard must refuse
+    // Enter, even though the composer still holds exactly /new.
+    let unselected = selected
+        .replace("\x1b[0;1;7m", "\x1b[0;1m")
+        .replace("\x1b[0;7m", "\x1b[0m");
+    assert_ne!(unselected, selected);
+    let changed = popup.replacen(selected, &unselected, 1);
+    let clearing = Clearing::new(Harness::Codex, Old::SameProcess).await;
+    let reader = crate::org::agent_screen::agent_screen(Harness::Codex).unwrap();
+    let baseline = clearing.agents.baseline_of(&lead(), "%1");
+    let mut capture = clearing.capture(&changed);
+    capture.inspection.pane.width = 80;
+    assert_eq!(
+        reader.control(&capture, &baseline).dialog,
+        atm_core::harness_control::ControlDialog::Unknown
+    );
+    for frame in [
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_CONVERSATION,
+        CODEX_P6_80_POPUP,
+        &changed,
+        &changed,
+    ] {
+        clearing.frame_with(frame, |capture| capture.inspection.pane.width = 80);
+    }
+    // The staged read is recognized, but selection disappears on the guard's
+    // own capture and stays absent until the scripted frames run out.
+    let result = clearing.clear().await;
+    assert_eq!(clearing.sent(), ["paste %1 /new"]);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(clearing.unread(), 0);
+    clearing
+        .assert_stuck(&format!("{NOT_SUBMITTED}: the screen was not recognised"))
+        .await;
 }
 
 #[tokio::test(start_paused = true)]

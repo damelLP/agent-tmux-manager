@@ -1757,6 +1757,24 @@ async fn observer(
                             errors.send_modify(|errors| { errors.remove(&id); });
                         }
                     },
+                    // `session.kill` closed a pane without a reservation: look at the
+                    // agent that had it now. The registry's row removal comes later,
+                    // and never for an agent whose session has no row.
+                    Ok(event) if killed_pane(&event).is_some() => {
+                        let pane = killed_pane(&event);
+                        let ids: BTreeSet<AgentId> = routes.agents.iter()
+                            .filter(|(_, route)| route.pane.as_deref() == pane)
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        if !ids.is_empty() {
+                            pull_in(&ids, &backoff, &mut next_observation);
+                            if let Err(error) = schedule(&rt, &mut pending, ids, Wake::Observe).await {
+                                tracing::warn!(%error, "Agent scheduling failed; waiting for next wake");
+                            }
+                            #[cfg(test)]
+                            rt.progress("killed_scheduled", None);
+                        }
+                    },
                     Ok(_) => {},
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let result = match routes.rebuild(&rt).await {
@@ -1790,6 +1808,23 @@ async fn observer(
     // Keep the control/org alive until all admitted Observe jobs finish cleanup.
     while jobs.join_next().await.is_some() {}
     Ok(())
+}
+
+/// The pane that a successful `session.kill` closed, from its audit event.
+/// A lifecycle flow's own kill (`agent.down`, a respawn) is logged under its
+/// own method and records its agent itself.
+fn killed_pane(event: &crate::eventlog::Envelope) -> Option<&str> {
+    let field = |pointer| {
+        event
+            .body
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+    };
+    (event.kind == "control.killed"
+        && field("/action/method") == Some("session.kill")
+        && field("/action/outcome") == Some("ok"))
+    .then(|| field("/pane"))
+    .flatten()
 }
 
 /// A wake for an agent whose observations are failing brings its next retry in

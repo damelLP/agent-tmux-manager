@@ -61,9 +61,11 @@
 //! A review is a task of kind `review` that names the task it judges when it
 //! is created. `StartReview` names it and moves the judged task to
 //! `in review`. A verdict may name a review task: it must judge this task, be
-//! `submitted`, and not be handed in by this task's own agent. The verdict then
-//! writes two events, its own and the review task's `accepted`; every event
-//! changes exactly one task.
+//! `submitted` as a result, and not be handed in by this task's own agent. The
+//! verdict then writes two events, its own and the review task's `accepted`;
+//! every event changes exactly one task.
+//! Closing the named review is bookkeeping, not acceptance under its own measure,
+//! so the own-agent verdict and measure checks (rules 7 and 9) do not apply to it.
 //!
 //! Accepting a *result* depends on the task's measure. Mechanical: authority.
 //! Reviewed: the verdict names a submitted review task, unless the owner
@@ -82,6 +84,10 @@
 //!
 //! The ten `task.*` kinds are additive: an older daemon skips them, and no
 //! other kind refers to a task. `tests/task_golden.rs` states every body.
+//! Known limit: an older build rejects a new task kind, measure kind, file kind,
+//! state, verdict, submission, or `seconds_in_state` key inside a known body as a
+//! body error, as with stage 0's enums; whether additive values must be tolerated
+//! is decided before T2a writes task events.
 //! Every task stays in memory, in creation order; none is ever removed.
 
 use crate::command::nonempty;

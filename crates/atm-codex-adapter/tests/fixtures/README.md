@@ -1,5 +1,33 @@
 # Codex screen fixtures
 
+## Staged clear command (P5)
+
+Captured: codex-cli 0.167.0, 2026-11-14, P5 sealed loopback-only private
+tmux 3.8 `capture-pane -p -e -N` (styled) and `-p -N` (plain).
+Each row maps `a-initial/A-codex-<size>-<state>.{styled-N,plain-N}.txt`
+to `screen_p5_<size>-<state>_0.167.0.{styled,plain}.txt`.
+
+| Size | State |
+|---|---|
+| 80x40 | staged |
+| 80x40 | popup |
+| 80x40 | first-after-down |
+| 100x40 | staged |
+| 100x40 | popup |
+| 100x40 | first-after-down |
+| 120x40 | staged |
+| 120x40 | popup |
+| 120x40 | first-after-down |
+
+Only private run roots become equal-width generic `/tmp/xxx…` paths. All
+terminal rows, ANSI sequences and spaces remain; tests strip only the added
+provenance line. Distinct samples are retained even when bytes coincide.
+Styled frames match `/new` exactly and retain delivery Draft / NotRunning /
+Other; Plain retained-space frames are Unknown and cannot prove a staged
+draft. The sole selected candidate is inverse across both command and
+description, not just its arrow. `tests/staged_clear.rs` pins these facts
+and labels editor/text mutations Synthetic. A match alone never authorizes Enter.
+
 ## Finished-turn clocks (U8g)
 
 Captured: codex-cli 0.167.0, 2026-11-14, U5 and sealed P1 private-tmux

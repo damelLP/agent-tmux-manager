@@ -2141,6 +2141,62 @@ async fn final_no_effect_attempt_ends_failed_with_one_owner_notice() {
     assert!(rig.committed.try_recv().is_err());
 }
 
+/// The same final attempt when its work ends with an error: the reply to
+/// its commit is lost, so nothing is armed and nothing typed. Cleanup finds
+/// the attempt, records that it typed nothing and leaves it to the policy,
+/// and the executor reports no error for it. The scheduler would hold a
+/// committed attempt that came back with an error as "input outcome is
+/// unknown", for the owner to give up. Instead the message ends failed,
+/// with one notice, as when work returned normally.
+#[tokio::test(start_paused = true)]
+async fn final_no_effect_attempt_with_a_work_error_ends_failed() {
+    let effects = Effects {
+        deliver: Arc::new(|rt, id, deadline| Box::pin(deliver(rt, id, deadline))),
+        observe: Arc::new(|_| Box::pin(async { Ok(idle_observation()) })),
+    };
+    let mut rig = Rig::start(Fold::Service, true, one_attempt(), Some(effects)).await;
+    while rig.committed.try_recv().is_ok() {}
+    rig.script(&[pi(IDLE), focused()]);
+    let id = MessageId::new(rig.commit(Rig::message(worker())).await);
+    let before = rig.org.status().unwrap();
+    rig.hold();
+    assert_eq!(rig.entered().await, before + 1);
+    // The writer's reply deadline passes; cleanup's snapshot then queues
+    // behind the held append.
+    tokio::time::advance(Duration::from_secs(7)).await;
+    until("cleanup asked the writer", || {
+        rig.org.requests.capacity() < rig.org.requests.max_capacity()
+    })
+    .await;
+    rig.release();
+
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        events.push(rig.message_event().await);
+    }
+
+    assert!(
+        matches!(&events[0], OrgEvent::MessageSent(sent) if sent.to == Address::Agent(worker()))
+    );
+    assert!(
+        matches!(&events[1], OrgEvent::MessageDeliveryAttempted { message_id, attempt: 1, .. } if *message_id == id),
+        "{events:?}"
+    );
+    assert!(
+        matches!(&events[2], OrgEvent::MessageDeliveryFailed { message_id, final_failure: true, .. } if *message_id == id),
+        "{events:?}"
+    );
+    assert!(
+        matches!(&events[3], OrgEvent::MessageSent(notice) if notice.to == Address::Owner && notice.body.contains("failed")),
+        "{events:?}"
+    );
+    // The paste guard's frame was never read, and nothing is held.
+    assert_eq!((rig.pastes(), rig.reads()), (0, 3));
+    assert_eq!(rig.snapshot(id).hold, None);
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert!(rig.committed.try_recv().is_err());
+}
+
 // ---------------------------------------------------------------------------
 // After the paste: the staged draft, the one Enter, the receipt
 // ---------------------------------------------------------------------------

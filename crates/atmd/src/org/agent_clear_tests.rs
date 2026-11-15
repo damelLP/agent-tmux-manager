@@ -890,6 +890,51 @@ async fn deadline_during_the_enter_says_the_command_may_have_been_submitted() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn session_that_starts_before_the_enter_is_not_the_clears_proof() {
+    // Review 23, probe r3. Somebody clears by hand in the agent's pane after
+    // the flow's first read and before its Enter: that session is not what
+    // the flow's Enter produced. The flow waits for one that starts after it.
+    // Twin: clear_types_submits_and_binds_the_new_session.
+    for (harness, command, conversation, staged, cleared) in ANNOUNCING {
+        let mut clearing = Clearing::new(harness, Old::SameProcess).await;
+        let mut committed = clearing.rig.org.committed.subscribe();
+        clearing.frames_through_enter(conversation, staged);
+        clearing.frame(cleared);
+        let call = clearing.start();
+        // The Clear is committed after the precheck's capture, and the
+        // paste's guard is paced after that capture.
+        loop {
+            if committed.recv().await.unwrap().kind == "agent.clear_requested" {
+                break;
+            }
+        }
+        clearing.session_start("early", Some("clear")).await;
+        clearing.awaiting_session().await;
+        assert_eq!(
+            clearing.sent(),
+            [format!("paste %1 {command}"), "keys %1 Enter".to_owned()],
+        );
+        let agent = clearing.agent().await;
+        assert_eq!(
+            (agent.status, agent.session_id.clone()),
+            (AgentStatus::Clearing, None),
+            "{harness:?}"
+        );
+        clearing.session_start("new", Some("clear")).await;
+        let result = call.await.unwrap().unwrap();
+        assert_eq!(
+            result.session_id,
+            Some(SessionId::new("new")),
+            "{harness:?}"
+        );
+        assert_eq!(
+            clearing.agent().await.session_id,
+            Some(SessionId::new("new"))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn clear_paste_outcome_unknown_never_repeats_paste() {
     let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
     let mut committed = clearing.rig.org.committed.subscribe();

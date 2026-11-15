@@ -475,7 +475,7 @@ impl AgentRuntime {
 /// both looks show the same root process and command. `None` pins nothing: the
 /// looks differ, the process shape places no harness, the command is the
 /// shell's own, or the adapter does not recognise the screen.
-pub(super) fn pin(
+fn pin(
     screen: &AgentScreen,
     seen: (u32, &str),
     facts: &ProcFacts,

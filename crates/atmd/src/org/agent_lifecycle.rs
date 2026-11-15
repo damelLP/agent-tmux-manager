@@ -524,6 +524,35 @@ pub(super) struct Unfinished {
     /// The audit of an accept whose dialog has not been seen to go. The
     /// cleanup writes it when the flow ends before that was seen.
     unaudited: Option<atm_org::ControlAudit>,
+    /// The reason the cleanup recorded the agent Stuck with, once it has.
+    stuck: Option<String>,
+}
+
+/// The Stuck reason the cleanup of `waiting`'s flow recorded, if it did.
+pub(super) fn stuck_record(waiting: &Waiting) -> Option<String> {
+    waiting
+        .lock()
+        .ok()
+        .and_then(|waiting| waiting.stuck.clone())
+}
+
+/// What the caller of a flow that ended on a timeout is told: the Stuck
+/// reason that flow's own cleanup recorded (`stuck`), in the words of the
+/// owner's note. A timeout without one stays a timeout: it ran out waiting
+/// for the reservation, or before the flow committed to anything, and an
+/// agent stuck since an earlier call is not this call's outcome. Every other
+/// error is the caller's as it is.
+pub(super) fn deadline_answer(
+    error: AgentError,
+    id: &AgentId,
+    stuck: Option<String>,
+) -> AgentError {
+    match (error, stuck) {
+        (AgentError::Reservation(ReservationError::Timeout), Some(reason)) => {
+            AgentError::Refused(format!("agent {id}: {reason}"))
+        }
+        (error, _) => error,
+    }
 }
 
 fn waiting_for(waiting: &Waiting, reason: impl Into<String>) {
@@ -925,14 +954,14 @@ impl AgentRuntime {
                 .execute(OrgCommand::ControlSent(audit), chrono::Utc::now())
                 .await;
         }
-        let (Some(waiting), Some(agent)) = (
+        let (Some(why), Some(agent)) = (
             committed,
             state.agent(id).filter(|agent| agent.status == unfinished),
         ) else {
             return Ok(());
         };
         let reason = format!(
-            "{what} did not complete: {waiting}; inspect {}",
+            "{what} did not complete: {why}; inspect {}",
             agent.pane.as_deref().unwrap_or("its pane")
         );
         self.org
@@ -944,6 +973,10 @@ impl AgentRuntime {
                 chrono::Utc::now(),
             )
             .await?;
+        // For the caller's answer: the record is written, whatever follows.
+        if let Ok(mut waiting) = waiting.lock() {
+            waiting.stuck = Some(reason.clone());
+        }
         let note = atm_org::MessageContent {
             from: atm_org::Address::System,
             to: atm_org::Address::Owner,

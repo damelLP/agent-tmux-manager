@@ -12,6 +12,13 @@ use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
 };
 
+const MODE_FOOTERS: [&str; 4] = [
+    "⏵⏵ auto mode on (shift+tab to cycle)",
+    "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    "⏸ manual mode on",
+    "⏸ manual mode on · ← for agents",
+];
+
 pub const CONTROL_POLICY: ControlPolicy = ControlPolicy::new(
     SCREEN_TEXT_FORMAT,
     SessionArrival::AtStart,
@@ -84,13 +91,7 @@ pub fn observe_control_screen(
         .trim()
         .split_once("  ")
         .map_or(footer.trim(), |(left, _)| left);
-    let footers = [
-        "⏵⏵ auto mode on (shift+tab to cycle)",
-        "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
-        "⏸ manual mode on",
-        "⏸ manual mode on · ← for agents",
-    ];
-    if !footers.contains(&footer) {
+    if !MODE_FOOTERS.contains(&footer) {
         return result;
     }
     // Without a complete header, only already-recognized ordinary facts apply.
@@ -103,7 +104,8 @@ pub fn observe_control_screen(
             line.starts_with("❯ ")
                 || line.starts_with("❯\u{a0}")
                 || line.starts_with("● ")
-                || footers.contains(&trimmed.split_once("  ").map_or(trimmed, |(left, _)| left))
+                || MODE_FOOTERS
+                    .contains(&trimmed.split_once("  ").map_or(trimmed, |(left, _)| left))
         }) {
             result.facts.fresh_editor = FreshEditorEvidence::Unknown;
         }

@@ -324,7 +324,8 @@ mod shared_entry_tests {
     fn a_status_line_script_whose_name_only_contains_the_marker_is_not_atms() {
         let wrapper = json!({"type": "command", "command": "/home/u/bin/atm-hook-wrapper.sh"});
 
-        assert!(!has_atm_status_line(&wrapper));
-        assert!(has_atm_status_line(&create_status_line_entry()));
+        let atm_entry = create_status_line_entry();
+        assert!(!has_atm_status_line(&wrapper, &atm_entry));
+        assert!(has_atm_status_line(&atm_entry, &atm_entry));
     }
 }

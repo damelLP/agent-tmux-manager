@@ -13,30 +13,82 @@ use stand_in::{bounded, StandInConfig, StandInMode, StandInRig};
 #[test]
 fn stand_in_forwarder_identity() {
     let mut rig = StandInRig::start();
+    assert!(rig
+        .tmux(&["set-environment", "-g", "ATM_STANDIN_TRACE_HOOKS", "1"])
+        .status
+        .success());
     for mode in [StandInMode::Claude, StandInMode::Codex] {
         let mut config = StandInConfig::new(mode);
         config.manual_clock = true;
+        eprintln!("identity {}: launch", mode.name());
         let pane = rig.launch(&config);
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pane.pid)).unwrap();
-        assert_eq!(comm.trim(), mode.name());
-        rig.discover();
-        if mode == StandInMode::Codex {
-            let pending = rig.wait_for_row(&pane, |_| true);
-            assert_eq!(pending.id.as_str(), format!("pending-{}", pane.pid));
-            rig.paste(&pane, "identity prompt");
+        let mut step = "process identity";
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", pane.pid)).unwrap();
+            assert_eq!(comm.trim(), mode.name());
+            step = "initial discovery";
+            rig.discover();
+            if mode == StandInMode::Codex {
+                step = "Codex pending row with pane";
+                let pending = rig.wait_for_row(&pane, |_| true);
+                assert_eq!(pending.id.as_str(), format!("pending-{}", pane.pid));
+                rig.paste(&pane, "identity prompt");
+            }
+            step = "hook promotion to non-pending pane row";
+            let row = rig.wait_for_row(&pane, |r| !r.id.is_pending());
+            assert_eq!(row.tmux_pane.as_deref(), Some(pane.pane_id.as_str()));
+            step = "rediscovery deduplication";
+            rig.discover();
+            assert_eq!(
+                rig.pane_rows(&pane).len(),
+                1,
+                "hook and discovery must share a PID"
+            );
+            step = "SessionEnd row removal";
+            rig.paste(&pane, "/atm/exit");
+            rig.wait_for_absent(&row.id);
+            step = "retained shell prompt";
+            rig.wait_for_shell(&pane);
+        }));
+        if let Err(error) = result {
+            eprintln!(
+                "identity {} failed at {step}; pid={} pane={}\njournal={:?}\nhook trace:\n{}",
+                mode.name(),
+                pane.pid,
+                pane.pane_id,
+                rig.journal(&pane),
+                std::fs::read_to_string(pane.log.with_extension("hook-trace.log"))
+                    .unwrap_or_default()
+            );
+            eprintln!("fresh rows={:?}\n{}", rig.rows(), rig.diagnostics());
+            std::panic::resume_unwind(error);
         }
-        let row = rig.wait_for_row(&pane, |r| !r.id.is_pending());
-        assert_eq!(row.tmux_pane.as_deref(), Some(pane.pane_id.as_str()));
-        rig.discover();
-        assert_eq!(
-            rig.pane_rows(&pane).len(),
-            1,
-            "hook and discovery must share a PID"
-        );
-        rig.paste(&pane, "/atm/exit");
-        rig.wait_for_absent(&row.id);
-        rig.wait_for_shell(&pane);
     }
+    rig.close();
+}
+
+#[test]
+fn stand_in_shell_wait_observes_prompt_after_each_exit() {
+    let mut rig = StandInRig::start();
+    let first = rig.launch(&StandInConfig::new(StandInMode::Pi));
+    rig.paste(&first, "/atm/exit");
+    rig.wait_for_shell(&first);
+    let screen = rig.capture_plain(&first);
+    assert!(screen.trim_end().ends_with("stand-in-shell$"), "{screen:?}");
+    // Relaunch in the same shell: its earlier prompt must not satisfy this wait.
+    let command = format!(
+        "{} --atm-config {}",
+        first.launcher.display(),
+        first.log.with_extension("config.json").display()
+    );
+    rig.paste(&first, &command);
+    let second = rig.observe_pane(first.pane_id.clone(), StandInMode::Pi, first.log.clone());
+    assert_ne!(first.pid, second.pid);
+    rig.wait_ready(&second, None);
+    rig.paste(&second, "/atm/exit");
+    rig.wait_for_shell(&second);
+    let screen = rig.capture_plain(&second);
+    assert!(screen.trim_end().ends_with("stand-in-shell$"), "{screen:?}");
     rig.close();
 }
 
@@ -60,6 +112,93 @@ fn stand_in_private_server_isolation() {
         .tmux(&["display-message", "-p", "#{pid}"])
         .status
         .success());
+    second.close();
+}
+
+/// A matching process outside either private server, held on stdin until drop.
+/// The ready byte is written after exec, so discovery never races its cmdline.
+struct HeadlessAgent(std::process::Child);
+
+impl HeadlessAgent {
+    fn start(rig: &StandInRig) -> Self {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        let path = rig.root().join("tmp/claude");
+        std::os::unix::fs::symlink("/bin/sh", &path).unwrap();
+        let (mut ready, writer) = UnixStream::pair().unwrap();
+        ready
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let agent = Self(
+            rig.command(&path)
+                .args(["-c", "printf r; read -r line"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .spawn()
+                .unwrap(),
+        );
+        let mut byte = [0];
+        ready.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"r");
+        agent
+    }
+}
+
+impl Drop for HeadlessAgent {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn private_discovery_excludes_foreign_server_and_headless_processes() {
+    let mut first = StandInRig::start();
+    let mut second = StandInRig::start();
+    let decoy = HeadlessAgent::start(&first);
+    let config = StandInConfig::new(StandInMode::Codex);
+    let a = first.launch(&config);
+    let b = second.launch(&config);
+    assert_eq!(a.pane_id, b.pane_id, "pane IDs overlap across servers");
+    eprintln!(
+        "discovery isolation check: {}",
+        success(first.tmux(&["-V"]))
+    );
+
+    // Codex has not sent a hook: only discovery can create these pending rows.
+    // Restart exercises initial discovery with both owned and foreign agents
+    // already running, then DiscoverComplete is the barrier for each rescan.
+    let check = |rig: &StandInRig, own: &stand_in::StandInPane, foreign: &stand_in::StandInPane| {
+        let rows = rig.rows();
+        assert!(rows.iter().any(|r| {
+            r.id == atm_core::SessionId::pending_from_pid(own.pid)
+                && r.tmux_pane.as_deref() == Some(own.pane_id.as_str())
+        }));
+        let present = |pid| {
+            rows.iter()
+                .any(|r| r.id == atm_core::SessionId::pending_from_pid(pid))
+        };
+        let observed = [
+            present(own.pid),
+            present(foreign.pid),
+            present(decoy.0.id()),
+        ];
+        // Never dump the full snapshot: baseline failures contain host sessions.
+        eprintln!("owned / foreign / headless pending rows: {observed:?}");
+        assert_eq!(observed, [true, false, false]);
+        assert!(rows.iter().all(|r| r.tmux_pane.is_some()));
+    };
+    first.restart_daemon();
+    check(&first, &a, &b);
+    first.discover();
+    check(&first, &a, &b);
+    second.discover();
+    check(&second, &b, &a);
+    drop(decoy);
+    first.close();
     second.close();
 }
 
@@ -837,6 +976,7 @@ fn stand_in_model_contract() {
                 "-v",
                 "test_model",
                 "test_runtime",
+                "test_shell_prompt",
                 "test_screens",
                 "test_dialogs",
                 "test_scene",

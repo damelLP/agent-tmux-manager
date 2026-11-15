@@ -1,5 +1,26 @@
 # Claude screen fixtures
 
+## Staged clear command (P5)
+
+Captured: Claude Code 2.1.325, 2026-11-14, P5 sealed loopback-only private
+tmux 3.8 `capture-pane -p -e -N` (styled) and `-p -N` (plain).
+Each row maps `a-initial/A-claude-<size>-<state>.{styled-N,plain-N}.txt`
+to `screen_p5_<size>-<state>_2.1.325.{styled,plain}.txt`.
+
+| Size | State |
+|---|---|
+| 80x40 | staged |
+| 100x40 | staged |
+| 120x40 | staged |
+
+Only private run roots become equal-width generic `/tmp/xxx…` paths. All
+terminal rows, ANSI sequences and spaces remain; tests strip only the added
+provenance line. The selected `/clear` completion has a wrapping description
+at narrower widths. Styled staged matching is exact and control is None;
+delivery remains Unknown. Plain retained-space frames remain Unknown and
+cannot prove a staged draft. `tests/staged_clear.rs` pins these facts and
+labels editor/text mutations Synthetic. A match alone never authorizes Enter.
+
 ## Lifecycle control observations (B0)
 
 Captured: Claude Code 2.1.325, 2026-11-14, sealed P1 private-tmux

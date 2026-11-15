@@ -75,7 +75,7 @@ fn expected(key: &str) -> ScreenFacts {
     use InputState::{Draft, Empty, Unknown};
     use TurnState::{NotRunning, Running, Unknown as TurnUnknown};
     // U5/U5b expectations transcribed from the adapters' captured_screens tests.
-    // P1 modal expectations are deliberately conservative under unchanged U8a.
+    // P1 modal expectations deliberately pin the conservative legacy observe_screen API.
     let (input, turn, dialog, fresh) = match key {
         "claude.fresh.rich-enabled" | "claude.fresh.u5" | "claude.fresh.restart"
         | "claude.draft-identical.poor"
@@ -374,6 +374,40 @@ fn claude_effort_footer_keeps_facts_at_clipped_token_widths() {
 }
 
 #[test]
+fn claude_deleted_text_hint_keeps_clear_facts_at_clipped_widths() {
+    let mut rig = StandInRig::start();
+    for rows in [19, 24, 30, 40] {
+        for columns in (71..=97).chain([100, 120]) {
+            let mut config = StandInConfig::new(StandInMode::Claude);
+            config.manual_clock = true;
+            config.screen_variant = "poor".into();
+            config.columns = columns;
+            config.rows = rows;
+            let pane = rig.launch(&config);
+            let after = rig.event_cursor(&pane);
+            rig.paste(&pane, "/clear");
+            rendered(&rig, &pane, after, "clearing");
+            let after = rig.event_cursor(&pane);
+            rig.control(
+                &pane,
+                serde_json::json!({"command":"advance_to", "now_ms":100}),
+            );
+            rendered(&rig, &pane, after, "clear-complete");
+            assert_eq!(
+                observe(StandInMode::Claude, &rig.capture_plain(&pane)),
+                expected("claude.clear-complete.poor"),
+                "poor clear-complete at {columns}x{rows}"
+            );
+            assert!(rig
+                .tmux(&["kill-window", "-t", &pane.pane_id])
+                .status
+                .success());
+        }
+    }
+    rig.close();
+}
+
+#[test]
 fn value_only_variants_keep_lifecycle_facts_without_pinning_literals() {
     let mut rig = StandInRig::start();
     for (mode, version, model) in [
@@ -419,16 +453,40 @@ fn value_only_variants_keep_lifecycle_facts_without_pinning_literals() {
 #[test]
 fn narrow_split_reports_minimum_through_the_rig() {
     let mut rig = StandInRig::start();
-    for mode in [StandInMode::Codex, StandInMode::Pi] {
+    for (mode, columns, minimum) in [
+        (StandInMode::Claude, 52, "53x2"),
+        (StandInMode::Codex, 60, "80x19"),
+        (StandInMode::Pi, 60, "86x19"),
+    ] {
         let mut config = StandInConfig::new(mode);
-        config.columns = 60;
+        config.columns = columns;
         config.rows = 40;
         let failure =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.launch(&config)))
-                .expect_err("60-column split must refuse misleading chrome");
+                .expect_err("narrow split must refuse misleading chrome");
         let message = failure.downcast_ref::<String>().unwrap();
-        assert!(message.contains("requires at least"), "{message}");
-        assert!(message.contains("60x40"), "{message}");
+        assert!(
+            message.contains(&format!("requires at least {minimum}")),
+            "{message}"
+        );
+        assert!(message.contains(&format!("{columns}x40")), "{message}");
+    }
+    rig.close();
+}
+
+#[test]
+fn claude_minimum_width_keeps_fresh_facts() {
+    let mut rig = StandInRig::start();
+    for rows in [19, 24, 30, 40] {
+        let mut config = StandInConfig::new(StandInMode::Claude);
+        config.columns = 53;
+        config.rows = rows;
+        let pane = rig.launch(&config);
+        assert_eq!(
+            observe(StandInMode::Claude, &rig.capture_plain(&pane)),
+            expected("claude.fresh.u5"),
+            "fresh at 53x{rows}"
+        );
     }
     rig.close();
 }

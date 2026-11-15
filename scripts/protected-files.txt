@@ -1,0 +1,23 @@
+# Repository-relative fnmatchcase patterns: * includes directory separators.
+# Report-only judges, fixtures and promotion tools; not write protection.
+.github/workflows/*
+.githooks/pre-commit
+.githooks/pre-push
+clippy.toml
+crates/*/tests/fixtures/*
+tests/support/stand_in/fixtures/*
+tests/support/stand_in/screens.json
+tests/support/stand_in/*replay.py
+crates/atm-org/tests/replay.rs
+crates/atm-org/tests/support/*
+crates/atm-org/tests/event_codec.rs
+crates/atmd/tests/conformance.rs
+crates/atmd/tests/server_integration.rs
+tests/atmd_eventlog.rs
+crates/atmd/src/eventlog/test*.rs
+crates/atm-protocol/tests/*
+crates/atm-core/proptest-regressions/*
+crates/atm/tests/snapshots/*
+crates/atm/tests/ui_snapshots.rs
+tests/candidate_kit.rs
+scripts/*

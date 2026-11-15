@@ -32,6 +32,32 @@ def require(condition, reason):
         raise Refused(reason)
 
 
+# Keep in sync with STOP_WAIT_TIMEOUT in src/bin/atmd.rs: 64 s of nominal drains
+# (2 connections + 30 control + 30 audits + 2 concurrent flushes) plus margin.
+# Blocking I/O is unbounded; this is not a hard daemon-exit bound.
+STOP_WAIT_TIMEOUT = 75
+STOP_PROGRESS_AFTER = 5
+
+
+def wait_for_exit(fd, pid, started):
+    """Observe the pinned process, never infer exit from signal or file cleanup."""
+    reported = False
+    while True:
+        if select.select([fd], [], [], 0)[0]:
+            return
+        elapsed = time.monotonic() - started
+        require(elapsed < STOP_WAIT_TIMEOUT,
+                f'process {pid} did not exit within {STOP_WAIT_TIMEOUT} seconds; '
+                'it may still be shutting down; retained runtime')
+        if not reported and elapsed >= STOP_PROGRESS_AFTER:
+            print(f'Process {pid} is still stopping; waiting for shutdown to finish...',
+                  file=sys.stderr, flush=True)
+            reported = True
+        next_event = STOP_WAIT_TIMEOUT if reported else STOP_PROGRESS_AFTER
+        if select.select([fd], [], [], max(0, next_event - elapsed))[0]:
+            return
+
+
 def run(args, env=None, cwd=None, timeout=30):
     return subprocess.run(list(map(str, args)), env=env, cwd=cwd, check=True,
                           capture_output=True, text=True, timeout=timeout).stdout.strip()
@@ -410,14 +436,17 @@ class Kit:
             if not self.owns(a, pid):
                 # Exit can clear environ after the stat read. Wait on the pinned
                 # process, never signal without ownership or mistake exit for reuse.
-                require(bool(select.select([fd], [], [], 30)[0]),
-                        'process ownership changed; refusing signal')
+                try:
+                    wait_for_exit(fd, pid, time.monotonic())
+                except Refused as error:
+                    raise Refused('process ownership changed; refusing signal; ' + str(error)) from error
                 return
+            started = time.monotonic()
             try:
                 signal.pidfd_send_signal(fd, signal.SIGTERM)
             except ProcessLookupError:
                 return
-            require(bool(select.select([fd], [], [], 30)[0]), f'process {pid} did not exit; retained runtime')
+            wait_for_exit(fd, pid, started)
         finally:
             os.close(fd)
 
@@ -506,8 +535,9 @@ class Kit:
             fd = os.pidfd_open(a['server']['pid'])
             try:
                 self.verify_server(a)  # recheck immediately before kill-server
+                started = time.monotonic()
                 self.tm(a, 'kill-server')
-                require(bool(select.select([fd], [], [], 30)[0]), 'tmux server did not exit')
+                wait_for_exit(fd, a['server']['pid'], started)
             finally:
                 os.close(fd)
         for proc in processes:

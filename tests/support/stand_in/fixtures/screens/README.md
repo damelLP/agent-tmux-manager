@@ -39,17 +39,24 @@ P1 sealed private tmux `capture-pane -p`. The `p1_` filename includes the origin
 capture stem, geometry and harness version. Each file has its own provenance label.
 Run-directory prefixes were replaced by `/fixture/` plus equal-length `x` padding,
 so all original columns, line wrapping, text outside paths, and trailing spaces
-remain unchanged. No identifiers or local infrastructure paths were added.
+remain unchanged, except for a18's trimmed trailing ASCII padding noted below.
+No identifiers or local infrastructure paths were added.
 
 | Harness | Original stems | Meaning |
 |---|---|---|
 | Claude | A80/A120/A200-default and -selected | Negative-default trust and selected Yes, 80/120/200x40 |
 | Codex | a16-default-fresh-folder-trust, a17-default-fresh-hook-trust | Folder access and Hooks need review, 100x24 |
 | Codex | a04-review-detail | Hook list, 100x32; this early probe's hook command was not executable, so the screen is evidence only, not proof of hook delivery |
+| Codex | a18-default-fresh-idle-100x24 | Compact fresh/clear-complete source, 100x24; trailing ASCII padding trimmed |
 | Codex | b31-nodaemon-clear-dialog, b35-default-repo-clear-dialog | Current/new worktree choice, 100x32 and 100x24 |
 | Codex | b13-after-completed-new | Blank clear transition, 100x32; not guaranteed to be sampled |
 | Codex | c16-permission-visible | Real three-option approval dialog, 100x32 (not U5's misleading permission filename) |
 | pi | C4-one-draft, C4-multi-draft | Real draft frames, 120x40; names describe probe scenarios, not necessarily visible draft line count |
+
+The a18 copy retains its existing `codex-fresh-100x24_0.167.0.txt` filename,
+which `screens.json` pins for both `p1-compact` entries, rather than adopting the
+`p1_` naming used by the other copies. Its provenance label records P1 a18,
+path sanitization and trimmed trailing ASCII padding.
 
 These P1 entries currently use plain output. A later change can attach a validated
 `style`/`cursor_source` pair in the catalog without changing the runtime or model.

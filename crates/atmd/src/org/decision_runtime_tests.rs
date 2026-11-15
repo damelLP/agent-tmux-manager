@@ -414,6 +414,96 @@ async fn answer_bridge_restart_after_enqueue_does_not_duplicate() {
     new_cancel.cancel();
 }
 
+async fn reconciled_messages(org: &OrgHandle) -> Vec<MessageContent> {
+    let cancel = CancellationToken::new();
+    let (handle, task) = spawn_decisions(
+        org.clone(),
+        MessageClock::new(tokio::time::Instant::now(), now()),
+        cancel.clone(),
+    );
+    guarded(handle.initialized()).await.unwrap();
+    let messages = org
+        .snapshot()
+        .await
+        .unwrap()
+        .messages()
+        .map(|message| message.content.clone())
+        .collect();
+    cancel.cancel();
+    guarded(task).await.unwrap();
+    messages
+}
+
+// Break caught: treating any earlier answer to a requester as the completion
+// marker for all of that requester's decisions.
+#[tokio::test]
+async fn decision_bridge_sends_two_distinct_answers_to_the_same_requester() {
+    let dir = tempfile::tempdir().unwrap();
+    let (org, cancel) = seed(dir.path(), true).await;
+    org.execute(
+        OrgCommand::Decision(DecisionCommand::Request(request(
+            "p/worker".parse().unwrap(),
+        ))),
+        now(),
+    )
+    .await
+    .unwrap();
+    org.execute(
+        OrgCommand::Decision(DecisionCommand::Resolve(DecisionResolution {
+            decision_id: DecisionId::new(6),
+            option: "no".into(),
+            by: Address::Owner,
+            note: None,
+            standing_rule: false,
+        })),
+        now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reconciled_messages(&org).await,
+        [
+            content(),
+            MessageContent {
+                body: "Decision d6 resolved: no\nStanding rule: no".into(),
+                ..content()
+            }
+        ]
+    );
+    // A second reconciliation must preserve both durable completion markers.
+    assert_eq!(reconciled_messages(&org).await.len(), 2);
+    cancel.cancel();
+}
+
+// Break caught: an agent's public answer-kind message suppressing the system
+// answer because only recipient and kind, not exact content, are compared.
+#[tokio::test]
+async fn decision_bridge_ignores_another_agents_earlier_answer_as_a_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (org, cancel) = seed(dir.path(), false).await;
+    org.execute(
+        OrgCommand::Adopt {
+            agent_id: "p/other".parse().unwrap(),
+            pane: "%8".into(),
+            session_id: None,
+        },
+        now(),
+    )
+    .await
+    .unwrap();
+    let peer_answer = MessageContent {
+        from: "p/other".parse().unwrap(),
+        body: "An earlier peer answer".into(),
+        ..content()
+    };
+    org.execute(OrgCommand::SendMessage(peer_answer.clone()), now())
+        .await
+        .unwrap();
+    assert_eq!(reconciled_messages(&org).await, [peer_answer, content()]);
+    assert_eq!(reconciled_messages(&org).await.len(), 2);
+    cancel.cancel();
+}
+
 // Break caught: a snapshot or accepted enqueue timing out permanently disables
 // the bridge. Hold only the response boundary; the real actor still processes
 // the accepted request before any retry, including a late SendMessage commit.

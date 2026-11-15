@@ -33,7 +33,9 @@
 //! # An automatic handover
 //!
 //! - At most one is started per session. Whatever becomes of it, the daemon
-//!   tries no more in that session.
+//!   tries no more in that session. A session whose start-line turn ends at
+//!   or above its line is noted and excluded from both automatic rules for
+//!   the whole session, so a large starting context cannot cause a loop.
 //! - It is refused at admission like any handover (the agent is not ready, a
 //!   handover of it already runs): nothing was sent, nobody is told, and the
 //!   session's one attempt is not used up.
@@ -244,7 +246,7 @@ struct Watch {
     seen: HashMap<SessionId, Row>,
     /// The session each agent was last noted in.
     noted: BTreeMap<AgentId, SessionId>,
-    /// The session each agent's last automatic handover was started in.
+    /// The session each agent last tried or excluded for starting at its line.
     attempted: BTreeMap<AgentId, SessionId>,
     ended: mpsc::Sender<(Attempt, Outcome)>,
 }
@@ -410,13 +412,21 @@ impl Watch {
                 }
             }
             AutoStep::Flag { look_again_at } => {
+                if !input.worked {
+                    self.attempted.insert(agent.id.clone(), session.clone());
+                }
                 if let Some(row) = self.seen.get_mut(session) {
-                    row.wake = look_again_at;
+                    row.wake = look_again_at.filter(|_| input.worked);
                 }
                 let note = context_note(&state, session, seen.share, &settings.limits, now);
-                let Some((agent, note)) = note else {
+                let Some((agent, mut note)) = note else {
                     return;
                 };
+                if !input.worked {
+                    note.body.push_str(
+                        " This session started above its line, so it will not be handed over automatically.",
+                    );
+                }
                 if self.noted.get(&agent) == Some(session) {
                     return;
                 }

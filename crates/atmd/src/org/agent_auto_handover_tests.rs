@@ -624,13 +624,39 @@ async fn a_session_whose_only_turn_was_its_start_is_noted_and_not_handed_over() 
     auto.rig.turn("s1").await;
     assert_eq!(
         auto.message(&DELIVERY).await,
-        ("p/lead".to_owned(), line_note("worker", 63))
+        (
+            "p/lead".to_owned(),
+            format!(
+                "{} This session started above its line, so it will not be handed over automatically.",
+                line_note("worker", 63)
+            )
+        )
     );
-    // The next turn is work: now the session is handed over.
-    assert_eq!(auto.started(), 0);
-    auto.rig.turn("s1").await;
-    auto.one_started().await;
-    auto.save_requested("worker", &[]).await;
+    auto.quiet(&[]).await;
+}
+
+#[tokio::test]
+async fn a_session_starting_at_its_line_is_not_handed_over_after_a_second_turn() {
+    for keys in [ON, IDLE] {
+        let mut auto = Auto::new(keys).await;
+        let line = auto.send(start_line(&id("worker"))).await;
+        auto.confirm(line, "s1", "%1").await;
+        auto.rig.share("s1", 600).await;
+        auto.rig.turn("s1").await;
+        auto.message(&DELIVERY).await;
+        auto.quiet(&[]).await;
+        // A worked turn and the idle limit must not re-enable either rule
+        // in this session, even when its share moves above the line.
+        auto.rig.share("s1", 640).await;
+        auto.rig.turn("s1").await;
+        auto.caught_up().await;
+        auto.set(after(IDLE_LIMIT));
+        auto.rig.share("s1", 650).await;
+        auto.caught_up().await;
+        let asks: Vec<_> = std::iter::from_fn(|| auto.asked.try_recv().ok()).collect();
+        assert!(asks.is_empty(), "{keys}: asks: {asks:?}");
+        auto.quiet(&[]).await;
+    }
 }
 
 #[tokio::test]

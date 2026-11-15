@@ -50,7 +50,7 @@
 //! | 1 | the agent is not ready, or not bound to this session | `Nothing` |
 //! | 2 | no turn end is on record (a turn runs, a dialog is open, or none was seen) | `Nothing` |
 //! | 3 | the idle session shows background work | `Nothing` |
-//! | 4 | an automatic handover was already started for this session | `Nothing` |
+//! | 4 | this session was already attempted or excluded for starting at its line | `Nothing` |
 //! | 5 | the cache is cold | at the line `Flag`, else `Nothing` |
 //! | 6 | at the line, `"context"` off | `Flag` |
 //! | 7 | neither rule is due | `LookAgainAt(idle_since + idle limit)` before that time with `"idle"` on, else `Nothing` |
@@ -80,6 +80,9 @@
 //!   it misleads, are the caller's.
 //! - `Flag` is the note at the context line, once per session; its
 //!   `look_again_at` keeps the idle rule scheduled even when already noted.
+//!   If `worked` is false, the caller marks this session attempted instead
+//!   and drops the wake: neither rule may run later in a session that
+//!   started at or above its line.
 //! - `Run` is one handover. The caller remembers that it started one for the
 //!   session (row 4), tells the agent's manager how it ended, and for
 //!   `give_up_at` stops waiting at that time.
@@ -223,7 +226,7 @@ pub struct AutoInput<'a> {
     pub background: bool,
     /// The session has ended a turn other than the one its start line began.
     pub worked: bool,
-    /// An automatic handover was already started for this session.
+    /// This session was already attempted or excluded for starting at its line.
     pub attempted: bool,
     /// The owner has said he will not answer.
     pub away: bool,

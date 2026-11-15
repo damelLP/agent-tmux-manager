@@ -164,19 +164,17 @@ mod delivered_reference_and_exact_inbox_body {
     }
 
     #[test]
-    #[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait), so nothing is Delivered"]
     fn claude() {
         run(StandInMode::Claude);
     }
 
     #[test]
-    #[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait), so nothing is Delivered"]
     fn pi() {
         run(StandInMode::Pi);
     }
 
     #[test]
-    #[ignore = "gate S2 + U9b B Task 3, as for claude; and the Codex stand-in at 200x50 is adopted Starting, never Ready (adoption finds no safe editor on its screen, after a finished turn too)"]
+    #[ignore = "the Codex stand-in at 200x50 is adopted Starting, never Ready: adoption finds no safe editor on its screen, after a finished turn too (a stand-in or U8 gap, no gate of this unit)"]
     fn codex() {
         run(StandInMode::Codex);
     }
@@ -209,7 +207,6 @@ fn safe_retry_after_known_zero_effect() {
 /// The prompt hook is lost after Enter and the session shows activity: the
 /// message is held for the owner, never failed and never typed again.
 #[test]
-#[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait)"]
 fn lost_hook_with_activity_blocks() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let lead = rig.ready_agent("lead", StandInMode::Claude);
@@ -281,6 +278,9 @@ fn focused_pane_never_pasted() {
     rig.test
         .rig
         .wait_event(&lead.pane, cursor, drafted(&reference(&id)));
+    watch.wait("the receipt", about("msg.delivered", &id));
+    assert_eq!(rig.accepted_since(&lead.pane, cursor), [reference(&id)]);
+    rig.finish_turn(&lead.pane);
     drop(client);
     rig.test.rig.close();
 }
@@ -314,7 +314,6 @@ fn block_head(rig: &MessageRig, watch: &mut Watch, lead: &support::Recipient, he
 /// The notice for a blocked message lists the messages queued behind it, and
 /// none of those is typed while it is held.
 #[test]
-#[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait)"]
 fn blocked_queue_notice_lists_followers() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let mut watch = rig.watch();
@@ -350,7 +349,6 @@ fn blocked_queue_notice_lists_followers() {
 /// The owner gives up on the held message: it fails for good, and the
 /// messages behind it are delivered in their order.
 #[test]
-#[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait)"]
 fn give_up_releases_queue() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let mut watch = rig.watch();
@@ -391,7 +389,6 @@ fn give_up_releases_queue() {
 /// after the retry. The stand-in can drop a hook but cannot hold one and
 /// release it later; that part stays with atmd's scripted tests.
 #[test]
-#[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait); its late-receipt part also needs a stand-in control that holds a hook and releases it later"]
 fn owner_retry_same_id_preserves_late_receipt_and_fifo() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let mut watch = rig.watch();
@@ -437,9 +434,8 @@ fn owner_retry_same_id_preserves_late_receipt_and_fifo() {
 /// and the message queued behind it stays queued: the new daemon types
 /// nothing for either.
 ///
-/// Written to hold with the observer alone (the paste is held) and with
-/// Task 3 on top (Enter, the hook lost): in both, the old daemon's attempt
-/// has ended in a hold before it is stopped.
+/// The head's Enter lands and its hook is lost, so the old daemon's attempt
+/// has ended in a hold before that daemon is stopped.
 #[test]
 fn restart_queued_and_delivering_hold() {
     let mut rig = MessageRig::start(Confirmation::Default);
@@ -459,6 +455,7 @@ fn restart_queued_and_delivering_hold() {
         "the blocked notice",
         notice(&format!("{} blocked: ", ids[0])),
     );
+    assert_eq!(rig.accepted_since(&lead.pane, cursor), [reference(&ids[0])]);
     let end = rig.test.cursor();
     drop(watch);
 
@@ -502,10 +499,8 @@ fn restart_queued_and_delivering_hold() {
 /// A message that was never attempted is not held by a restart: the new
 /// daemon attempts it as its first attempt once the recipient is free.
 ///
-/// With Task 3 this also ends in `msg.delivered`; the wait for it is added
-/// when that gate opens.
 #[test]
-#[ignore = "after a daemon restart nothing derives the recipient pane's baseline again, so every observation is refused (the harness on the pane is not established yet) and the queued message is never attempted; it passes when the agent is adopted again after the restart"]
+#[ignore = "waits for U8n item 2: the baseline is re-derived after a daemon restart"]
 fn unattempted_restart_recovers() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Claude);
@@ -525,9 +520,13 @@ fn unattempted_restart_recovers() {
 
     let attempted = watch.wait("the attempt", about("msg.delivery_attempted", &id));
     assert_eq!(attempted["body"]["attempt"], 1);
-    rig.test
-        .rig
-        .wait_event(&lead.pane, cursor, drafted(&reference(&id)));
+    let delivered = watch.wait("the receipt", about("msg.delivered", &id));
+    assert_eq!(
+        delivered["body"]["session_id"].as_str(),
+        lead.session.as_deref()
+    );
+    assert_eq!(rig.accepted_since(&lead.pane, cursor), [reference(&id)]);
+    rig.finish_turn(&lead.pane);
     // The only attempt in the whole log is the new daemon's.
     let log = rig.test.tail(0);
     let all: Vec<_> = log
@@ -552,7 +551,6 @@ fn unattempted_restart_recovers() {
 /// On pi: after a clear the Claude stand-in shows its fresh frame, which is
 /// never adopted Ready at 200 columns (it has no placeholder style proof).
 #[test]
-#[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait); agent.clear is in the base"]
 fn clear_then_message_not_merged() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let lead = rig.ready_agent("lead", StandInMode::Pi);
@@ -611,12 +609,12 @@ fn clear_then_message_not_merged() {
 /// When the clear arrives after the attempt has ended the order still holds,
 /// but the two did not overlap.
 #[test]
-#[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste (no Enter, no receipt wait); its delivered form also needs a stand-in control that holds a hook and releases it later"]
 fn delivery_then_clear_fifo() {
     let mut rig = MessageRig::start(Confirmation::Default);
     let lead = rig.ready_agent("lead", StandInMode::Pi);
     rig.stand_in_control(&lead.pane, "/atm/drop-next input", "drop armed");
-    let mut watch = rig.watch();
+    let start = rig.test.cursor();
+    let mut watch = Watch::open(&rig, start);
     let cursor = rig.test.rig.event_cursor(&lead.pane);
 
     let id = rig.send(None, &lead.id, "before the clear");
@@ -653,8 +651,10 @@ fn delivery_then_clear_fifo() {
             "the reference and the clear command were joined: {record}"
         );
     }
-    // The attempt is held for the owner; the clear released nothing.
-    watch.wait("the blocked notice", notice(&format!("{id} blocked: ")));
+    // The attempt is held for the owner; the clear released nothing. The
+    // notice and the clear request are committed in either order, so it is
+    // looked for from the start, on a watch of its own.
+    Watch::open(&rig, start).wait("the blocked notice", notice(&format!("{id} blocked: ")));
     assert_eq!(attempts(&mut watch, &rig, &id).len(), 1);
     assert!(watch.all(about("msg.delivery_failed", &id)).is_empty());
     rig.test.rig.close();
@@ -663,7 +663,7 @@ fn delivery_then_clear_fifo() {
 /// A Codex agent that has no session yet is bound by the prompt that the
 /// delivery itself submits, and the receipt names that session.
 #[test]
-#[ignore = "gate S2 + U9b B Task 3: no production message observer on this base, and deliver ends at the applied paste; and a fresh Codex stand-in at 200x50 is adopted Starting, never Ready and unbound (adoption finds no safe editor on its screen)"]
+#[ignore = "a fresh Codex stand-in at 200x50 is adopted Starting, never Ready and unbound: adoption finds no safe editor on its screen (a stand-in or U8 gap, no gate of this unit)"]
 fn lazy_codex_id_binds_only_after_prompt() {
     let mut rig = MessageRig::start(Confirmation::Generous);
     let pane = rig

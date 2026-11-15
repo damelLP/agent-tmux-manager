@@ -432,9 +432,40 @@ All tests are pure, with no waits or terminal operations.
   supplied text, not protection in the real capture pipeline. Styled capture
   with `-N` is deferred to U8d; no plain-text fix is claimed here.
 - **F9:** permission recognition still requires the captured Bash auto-mode
-  ask-rule wording. Editor footer modes other than auto (accept-edits, plan,
-  bypass-permissions, shortcut-only, background shell/agents) remain Unknown.
+  ask-rule wording. Accept-edits, plan, bypass-permissions, shortcut-only,
+  monitor/mixed task pills and agent selectors remain unsupported. The legacy
+  observer still refuses an unadorned manual-mode editor; the control observer
+  supports its captured manual-mode forms. The verified shell-count footer
+  described below is supported in auto and manual modes.
   Configuration-specific dialogs need more real captures before generalizing.
 
 The unit adds no RPC method. These capture tables and synthetic refusals are
 parser conformance coverage; launch/clear constants have exact policy tests.
+
+## Lead shell-count footer and native update-failure notice
+
+Captured: Claude Code 2.1.325, 2026-11-15, read-only tmux `capture-pane -e -N -p`
+from a working and an idle lead pane at 144x80. The `screen_styled_lead-{idle,working}-shells_2.1.325.txt`
+fixtures retain the original 144x80 geometry and final seven rows: real turn
+status, right-aligned update notice, both editor borders/input, custom status
+slot and shell-count footer. Earlier transcript rows were blanked; the
+identifying status prefix was replaced with `[fixture]`, leaving its remaining
+values/styles intact. Their
+`screen_claude-lead-*-shells_2.1.325.txt` companions represent plain `-p`
+capture by removing SGR and trailing ASCII padding only (never NBSP).
+
+The idle count was 15 shells, the working count 14. Read-only inspection of the
+installed 2.1.325 bundle confirmed the shell-only task pill uses `1 shell` or
+`N shells`, and that the shared auto/manual mode component can combine with
+an agents hint before or after that pill. The native installation-failure
+notice is exactly `✘ Auto-update failed · Run claude doctor`. It is accepted
+only in its captured immediately-pre-border row with a two-cell right margin,
+not as arbitrary transcript/progress text. Value/layout mutations in
+`screen/lead_tests.rs` are explicitly synthetic. Other task labels, monitor
+mixtures, management hints and selectors below the footer stay unsupported;
+the older full coordinator-selector fixture remains Unknown.
+
+The shared stand-in replays both sanitized sources at their original 144x80.
+Its shell counts are replayed UI values,
+not a claim that it spawned those background jobs. Native-geometry delivery
+and restart tests use the real private daemon and never invoke a model CLI.

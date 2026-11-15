@@ -12,12 +12,48 @@ use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
 };
 
-const MODE_FOOTERS: [&str; 4] = [
+pub(super) const MODE_FOOTERS: [&str; 4] = [
     "⏵⏵ auto mode on (shift+tab to cycle)",
     "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
     "⏸ manual mode on",
     "⏸ manual mode on · ← for agents",
 ];
+
+/// Existing modes plus the shell-only task pill emitted by Claude 2.1.325.
+/// Verified: installed 2.1.325 bundle, 2026-11-15, read-only footer assembly and
+/// local_bash pluralization. The agents hint can precede or follow that pill;
+/// other task pills stay unknown. MODE_FOOTERS remains the one mode-label list.
+pub(super) fn mode_footer(footer: &str) -> bool {
+    MODE_FOOTERS.contains(&footer) || background_shell_footer(footer)
+}
+
+pub(super) fn background_shell_footer(footer: &str) -> bool {
+    let mut parts = footer.split(" · ");
+    let Some(mode) = parts.next() else {
+        return false;
+    };
+    if !MODE_FOOTERS.iter().copied().any(|known| {
+        let known = known.strip_suffix(" · ← for agents").unwrap_or(known);
+        known.strip_suffix(" (shift+tab to cycle)").unwrap_or(known) == mode
+    }) {
+        return false;
+    }
+    let shell_count = |value: &str| {
+        value == "1 shell"
+            || value.strip_suffix(" shells").is_some_and(|count| {
+                !count.is_empty()
+                    && !count.starts_with('0')
+                    && count != "1"
+                    && count.bytes().all(|c| c.is_ascii_digit())
+            })
+    };
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(count), None, None)
+        | (Some(count), Some("← for agents"), None)
+        | (Some("← for agents"), Some(count), None) => shell_count(count),
+        _ => false,
+    }
+}
 
 pub const CONTROL_POLICY: ControlPolicy = ControlPolicy::new(
     SCREEN_TEXT_FORMAT,
@@ -91,7 +127,7 @@ pub fn observe_control_screen(
         .trim()
         .split_once("  ")
         .map_or(footer.trim(), |(left, _)| left);
-    if !MODE_FOOTERS.contains(&footer) {
+    if !mode_footer(footer) {
         return result;
     }
     // Without a complete header, only already-recognized ordinary facts apply.
@@ -104,8 +140,7 @@ pub fn observe_control_screen(
             line.starts_with("❯ ")
                 || line.starts_with("❯\u{a0}")
                 || line.starts_with("● ")
-                || MODE_FOOTERS
-                    .contains(&trimmed.split_once("  ").map_or(trimmed, |(left, _)| left))
+                || mode_footer(trimmed.split_once("  ").map_or(trimmed, |(left, _)| left))
         }) {
             result.facts.fresh_editor = FreshEditorEvidence::Unknown;
         }
@@ -214,7 +249,7 @@ fn parse_completion_draft(screen: &StyledScreen) -> Option<CompletionDraft<'_>> 
     } else if ordinary.is_some()
         || below.last().is_some_and(|footer| {
             let footer = footer.trim();
-            MODE_FOOTERS.contains(&footer.split_once("  ").map_or(footer, |(left, _)| left))
+            mode_footer(footer.split_once("  ").map_or(footer, |(left, _)| left))
         })
     {
         // A recognized mode footer owns its opaque status slot, including in

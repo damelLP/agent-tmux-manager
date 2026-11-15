@@ -342,10 +342,11 @@ are synthetic, not a complete vendor TUI.
 
 ## Captured screens and optional dialogs
 
-The runtime renders `screens.json`'s 76 source variants through the pure
+The runtime renders `screens.json`'s 78 source variants through the pure
 `screens.py` renderer and `scene.py` lifecycle mapping. Sources reuse adapter plain
-captures, 20 U5b SGR/cursor pairs, and 16 sanitized P1 captures (provenance in
-`fixtures/screens/README.md`). No runtime ID or diagnostic status text is visible.
+captures, 20 U5b SGR/cursor pairs, 16 sanitized P1 captures (provenance in
+`fixtures/screens/README.md`), and two Claude lead-shell styled/plain excerpts
+(provenance in the Claude adapter fixture README). No runtime ID or diagnostic status text is visible.
 `frame` records the model's fresh, working, idle after a turn, clearing,
 clear-complete, interrupted and modal phases; `source` identifies the actual
 capture chosen, including draft/completion-menu substitutions. Claude clear shows the real SessionEnd hook spinner;
@@ -425,8 +426,8 @@ No frame/ready event is emitted after exit. Codex hook-review Esc and permission
 Pure source/scene/key tests run through the Cargo Python contract; private tmux
 integration tests cover native fresh replay, modal keys and retained shells.
 `stand_in_screens` calls all three real adapters, not copied parsers. It compares
-all 76 sources through private tmux with independent source text and pinned legacy
-`observe_screen` facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
+all 78 sources through private tmux with independent source text and pinned legacy
+`observe_screen` facts; 22 styled pairs compare dim/reverse attributes and cursor-space cells,
 allowing tmux to normalize SGR encodings. Separate key-driven tests cover drafts,
 working/idle, each clear phase, repeated identical clear snapshots, interruptions,
 actual retained shells, trust, update, hook review/list, worktree and permission.

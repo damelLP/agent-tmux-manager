@@ -722,5 +722,25 @@
     "source": "tests/support/stand_in/fixtures/screens/p1_pi_C4-multi-draft-120x40_1.5.0.txt",
     "columns": 120,
     "rows": 40
+  },
+  {
+    "key": "claude.idle.lead-shells",
+    "mode": "claude",
+    "state": "idle",
+    "variant": "lead-shells",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-lead-idle-shells_2.1.325.txt",
+    "style": "crates/atm-claude-adapter/tests/fixtures/screen_styled_lead-idle-shells_2.1.325.txt",
+    "columns": 144,
+    "rows": 80
+  },
+  {
+    "key": "claude.working.lead-shells",
+    "mode": "claude",
+    "state": "working",
+    "variant": "lead-shells",
+    "source": "crates/atm-claude-adapter/tests/fixtures/screen_claude-lead-working-shells_2.1.325.txt",
+    "style": "crates/atm-claude-adapter/tests/fixtures/screen_styled_lead-working-shells_2.1.325.txt",
+    "columns": 144,
+    "rows": 80
   }
 ]

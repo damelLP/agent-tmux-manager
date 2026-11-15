@@ -38,6 +38,7 @@ mod message_methods;
 pub mod message_notify;
 #[cfg(test)]
 mod message_persistence_tests;
+mod message_scheduler;
 #[cfg(test)]
 mod message_seam_tests;
 #[cfg(test)]

@@ -17,6 +17,10 @@
 //! At most 64 requests are in flight; one more is refused, never parked.
 //! A caller that goes away does not cancel a command the writer accepted.
 //!
+//! Delivery itself is scheduled by `message_scheduler`: one job per recipient,
+//! which also serves the owner's retry and give-up. On cancellation the fold
+//! loop keeps running until those jobs have let their attempt settle.
+//!
 //! # Policy-step ownership
 //!
 //! | Step / transition | Owner |
@@ -50,10 +54,13 @@ use super::message_history::{
 };
 use super::message_inbox::{caller_address, inbox, Progress};
 pub use super::message_methods::register_message_methods;
+use super::message_scheduler::{self, Board, Effects, Resolution, Resolve};
 pub use super::message_types::*;
 use super::{
-    message_delivery::inbox_reference, message_evidence::MessageEvidence,
-    message_history::MessageHistoryHandle, EventWatch, OrgHandle, OrgServiceError,
+    message_delivery::{inbox_reference, MESSAGE_RESOLUTION_BUDGET},
+    message_evidence::MessageEvidence,
+    message_history::MessageHistoryHandle,
+    EventWatch, OrgHandle, OrgServiceError,
 };
 use crate::{
     control::{
@@ -65,7 +72,9 @@ use crate::{
     server::methods::CallContext,
 };
 use atm_core::ScreenFacts;
-use atm_org::{delivery::DeliveryPolicy, OrgCommand, OrgEvent, OrgState};
+use atm_org::{
+    delivery::DeliveryPolicy, Agent, DeliveryReceipt, Message, OrgCommand, OrgEvent, OrgState,
+};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -74,7 +83,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{watch, Semaphore},
+    sync::{oneshot, watch, Semaphore},
     task::JoinHandle,
     time::Instant,
 };
@@ -284,13 +293,52 @@ struct View {
     /// Counted against the state just before that event, so a batch that
     /// repeats already-read IDs counts only its transitions.
     reads: BTreeMap<u64, usize>,
+    /// Per recipient, in FIFO order: its queued and delivering messages. Kept
+    /// at the fold, so the scheduler never scans the log's messages.
+    open: BTreeMap<AgentId, BTreeSet<MessageId>>,
 }
 
-struct Service {
-    rt: MessageRuntime,
+impl View {
+    /// File a message under its recipient while it can still be scheduled.
+    fn index(&mut self, id: MessageId) {
+        let Some(message) = self.state.message(&id) else {
+            return;
+        };
+        let Address::Agent(recipient) = &message.content.to else {
+            return;
+        };
+        if matches!(
+            message.status,
+            DeliveryStatus::Queued | DeliveryStatus::Delivering
+        ) {
+            self.open.entry(recipient.clone()).or_default().insert(id);
+        } else if let Some(open) = self.open.get_mut(recipient) {
+            open.remove(&id);
+            if open.is_empty() {
+                self.open.remove(recipient);
+            }
+        }
+    }
+}
+
+/// A retained receipt and the message it confirms, as committed state has it.
+pub(super) struct Receipt {
+    pub recipient: AgentId,
+    pub id: MessageId,
+    pub receipt: DeliveryReceipt,
+    /// Already Delivered: only evidence still has to forget the message.
+    pub delivered: bool,
+}
+
+pub(super) struct Service {
+    pub(super) rt: MessageRuntime,
     view: Mutex<View>,
     startup: watch::Sender<Startup>,
     requests: Semaphore,
+    /// The last sequence whose fold is complete: projection, history and the
+    /// evidence registration. The scheduler's wake for committed changes.
+    pub(super) folded: watch::Sender<u64>,
+    pub(super) board: Board,
 }
 
 /// Committed events in sequence order: the organisation's own watch, which
@@ -324,7 +372,7 @@ impl Service {
     }
 
     /// Replay complete, or the reason the service cannot be used.
-    async fn ready(&self) -> Result<(), MessageError> {
+    pub(super) async fn ready(&self) -> Result<(), MessageError> {
         let mut startup = self.startup.subscribe();
         let state = startup
             .wait_for(|state| *state != Startup::Replaying)
@@ -334,6 +382,74 @@ impl Service {
             Startup::Failed(reason) => Err(MessageError::Unavailable(reason.clone())),
             _ => Ok(()),
         }
+    }
+
+    /// Replayed and still folding: the only state in which jobs may decide.
+    pub(super) fn running(&self) -> bool {
+        *self.startup.borrow() == Startup::Ready
+    }
+
+    /// Resolves when the service stops or fails.
+    pub(super) async fn stopped(&self) {
+        let mut startup = self.startup.subscribe();
+        let _ = startup
+            .wait_for(|state| matches!(state, Startup::Failed(_)))
+            .await;
+    }
+
+    /// Wait until history and evidence have everything the projection shows.
+    /// The fold writes the projection first, so a reader of the projection
+    /// could otherwise name a message history has not folded yet.
+    pub(super) async fn settled(&self) -> Result<(), MessageError> {
+        let cursor = self.view()?.cursor;
+        let mut folded = self.folded.subscribe();
+        tokio::time::timeout(ORDINARY_BUDGET, folded.wait_for(|seq| *seq >= cursor))
+            .await
+            .map_err(|_| MessageError::Timeout)?
+            .map_err(|_| MessageError::Unavailable("message service stopped".into()))?;
+        Ok(())
+    }
+
+    /// The recipient's queued and delivering messages, in FIFO order.
+    pub(super) fn open(&self, recipient: &AgentId) -> Result<Vec<MessageId>, MessageError> {
+        let view = self.view()?;
+        Ok((view.open.get(recipient).into_iter().flatten().copied()).collect())
+    }
+
+    /// Every recipient with a message that can still be scheduled.
+    pub(super) fn recipients(&self) -> Result<Vec<AgentId>, MessageError> {
+        Ok(self.view()?.open.keys().cloned().collect())
+    }
+
+    pub(super) fn agent(&self, id: &AgentId) -> Result<Option<Agent>, MessageError> {
+        Ok(self.view()?.state.agent(id).cloned())
+    }
+
+    pub(super) fn message(&self, id: MessageId) -> Result<Option<Message>, MessageError> {
+        Ok(self.view()?.state.message(&id).cloned())
+    }
+
+    /// Receipts evidence retains, for one recipient or for all. Bounded by
+    /// evidence's own capacity, not by the log. An evidence store that cannot
+    /// answer has no receipt to settle.
+    pub(super) fn receipts(&self, only: Option<&AgentId>) -> Result<Vec<Receipt>, MessageError> {
+        let confirmed = self.rt.evidence.confirmed().unwrap_or_default();
+        let view = self.view()?;
+        Ok(confirmed
+            .into_iter()
+            .filter_map(|(id, receipt)| {
+                let message = view.state.message(&id)?;
+                let Address::Agent(recipient) = &message.content.to else {
+                    return None;
+                };
+                only.is_none_or(|only| only == recipient).then(|| Receipt {
+                    recipient: recipient.clone(),
+                    id,
+                    receipt,
+                    delivered: message.status == DeliveryStatus::Delivered,
+                })
+            })
+            .collect())
     }
 
     /// One bounded request: admission without a waiter, then a deadline that
@@ -358,7 +474,7 @@ impl Service {
 
     /// Submit to the one organisation writer, then wait until the fold loop
     /// has accounted for what it committed, so the caller reads its own write.
-    async fn execute(&self, command: OrgCommand) -> Result<Vec<Envelope>, MessageError> {
+    pub(super) async fn execute(&self, command: OrgCommand) -> Result<Vec<Envelope>, MessageError> {
         let committed = self.rt.org.execute(command, self.rt.clock.now()?).await?;
         if let Some(last) = committed.last() {
             self.rt.history.folded(last.seq).await?;
@@ -402,6 +518,13 @@ impl Service {
                     view.reads.pop_first();
                 }
             }
+            match event {
+                OrgEvent::MessageSent(_) => view.index(MessageId::new(envelope.seq)),
+                OrgEvent::MessageDeliveryAttempted { message_id, .. }
+                | OrgEvent::MessageDelivered { message_id, .. }
+                | OrgEvent::MessageDeliveryFailed { message_id, .. } => view.index(*message_id),
+                _ => {}
+            }
         }
         view.cursor = envelope.seq;
         drop(view);
@@ -420,12 +543,13 @@ impl Service {
                 self.expect(MessageId::new(envelope.seq), &content.to);
             }
         }
+        self.folded.send_replace(envelope.seq);
         Ok(())
     }
 
     /// Evidence must know a message's reference before any decision about it:
     /// an unknown ID is unavailable there, never "no receipt".
-    fn expect(&self, id: MessageId, to: &Address) {
+    pub(super) fn expect(&self, id: MessageId, to: &Address) {
         if !matches!(to, Address::Agent(_)) {
             return;
         }
@@ -451,7 +575,10 @@ impl Service {
         Ok(())
     }
 
-    async fn run(&self, mut events: Events, fence: u64) {
+    /// Fold until the scheduler has stopped (it stops on cancellation, once
+    /// its jobs have let their attempt settle) or the fold itself fails.
+    async fn run(&self, mut events: Events, fence: u64, scheduler: impl Future<Output = ()>) {
+        tokio::pin!(scheduler);
         let stopped = async {
             if fence == 0 {
                 self.replayed()?;
@@ -468,15 +595,23 @@ impl Service {
                 }
             }
         };
-        let reason = tokio::select! {
+        let failed = tokio::select! {
             biased;
-            () = self.rt.cancel.cancelled() => "message service stopped".to_string(),
+            () = &mut scheduler => None,
             Err::<(), MessageError>(error) = stopped => {
                 tracing::error!(%error, "Message service stopped; restart to recover");
-                error.to_string()
+                Some(error.to_string())
             }
         };
-        self.startup.send_replace(Startup::Failed(reason));
+        let drained = failed.is_none();
+        self.startup.send_replace(Startup::Failed(
+            failed.unwrap_or_else(|| "message service stopped".into()),
+        ));
+        if !drained {
+            // Jobs see the failure and stop; an attempt in flight is awaited,
+            // never dropped.
+            scheduler.await;
+        }
     }
 }
 
@@ -490,7 +625,12 @@ pub fn spawn_messages(
     startup_high_water: u64,
 ) -> (MessageHandle, JoinHandle<()>) {
     match runtime.org.watch(Vec::new(), 0) {
-        Ok(events) => spawn_service(runtime, Events::Watch(Box::new(events)), startup_high_water),
+        Ok(events) => spawn_service(
+            runtime,
+            Events::Watch(Box::new(events)),
+            startup_high_water,
+            Some(Effects::production()),
+        ),
         Err(error) => (
             MessageHandle::disabled(error.to_string()),
             tokio::spawn(async {}),
@@ -498,20 +638,32 @@ pub fn spawn_messages(
     }
 }
 
+/// Without effects nothing is scheduled: send, inbox and ack only (tests).
 fn spawn_service(
     runtime: MessageRuntime,
     events: Events,
     startup_high_water: u64,
+    effects: Option<Effects>,
 ) -> (MessageHandle, JoinHandle<()>) {
     let service = Arc::new(Service {
         rt: runtime,
         view: Mutex::new(View::default()),
         startup: watch::Sender::new(Startup::Replaying),
         requests: Semaphore::new(MAX_REQUESTS),
+        folded: watch::Sender::new(0),
+        board: Board::default(),
     });
     let task = tokio::spawn({
         let service = service.clone();
-        async move { service.run(events, startup_high_water).await }
+        async move {
+            let scheduler = async {
+                match effects {
+                    Some(effects) => message_scheduler::run(service.clone(), effects).await,
+                    None => service.rt.cancel.cancelled().await,
+                }
+            };
+            service.run(events, startup_high_water, scheduler).await;
+        }
     });
     (
         MessageHandle {
@@ -526,8 +678,9 @@ pub(super) fn spawn_service_for_test(
     runtime: MessageRuntime,
     events: tokio::sync::broadcast::Receiver<Arc<Envelope>>,
     startup_high_water: u64,
+    effects: Option<Effects>,
 ) -> (MessageHandle, JoinHandle<()>) {
-    spawn_service(runtime, Events::Memory(events), startup_high_water)
+    spawn_service(runtime, Events::Memory(events), startup_high_water, effects)
 }
 
 #[derive(Clone)]
@@ -558,12 +711,12 @@ impl MessageHandle {
         }
     }
 
-    fn unavailable(&self) -> MessageError {
+    /// The live service, for tests that drive one scheduling step by hand.
+    #[cfg(test)]
+    pub(super) fn service(&self) -> Option<Arc<Service>> {
         match &self.inner {
-            Backend::Disabled(reason) => MessageError::Unavailable(reason.to_string()),
-            Backend::Live(_) => {
-                MessageError::Unavailable("message delivery resolution is not configured".into())
-            }
+            Backend::Disabled(_) => None,
+            Backend::Live(service) => Some(service.clone()),
         }
     }
 
@@ -627,7 +780,7 @@ impl MessageHandle {
                 inbox(&view.state, &caller, &p, |message| Progress {
                     blocked_by: (service.rt.history.snapshot(message.id, now).ok())
                         .and_then(|snapshot| snapshot.blocked_by),
-                    ..Progress::default()
+                    ..service.board.progress(message.id)
                 })
             })
             .await
@@ -664,10 +817,14 @@ impl MessageHandle {
     /// Resolution uses the recipient slot, never an Observe reservation.
     pub async fn retry(
         &self,
-        _p: ResolveParams,
-        _caller: CallContext,
+        p: ResolveParams,
+        caller: CallContext,
     ) -> Result<RetryResult, MessageError> {
-        Err(self.unavailable())
+        let status = self.resolve(Resolve::Retry, p.id, caller).await?;
+        Ok(RetryResult {
+            message_id: p.id,
+            status,
+        })
     }
 
     /// Owner cancellation of any held Queued/Delivering message, not only Blocked.
@@ -675,10 +832,53 @@ impl MessageHandle {
     /// Resolution uses the recipient slot, never an Observe reservation.
     pub async fn give_up(
         &self,
-        _p: ResolveParams,
-        _caller: CallContext,
+        p: ResolveParams,
+        caller: CallContext,
     ) -> Result<GiveUpResult, MessageError> {
-        Err(self.unavailable())
+        let status = self.resolve(Resolve::GiveUp, p.id, caller).await?;
+        Ok(GiveUpResult {
+            message_id: p.id,
+            status,
+        })
+    }
+
+    /// Queue the owner's decision for the recipient's slot and wait for its
+    /// answer within the resolution budget. The slot serves it only between
+    /// attempts, so an attempt in flight settles first. A timeout cancels
+    /// nothing that was started; a decision nobody waits for any more is not
+    /// started.
+    async fn resolve(
+        &self,
+        kind: Resolve,
+        id: MessageId,
+        caller: CallContext,
+    ) -> Result<DeliveryStatus, MessageError> {
+        let service = self.live()?;
+        service
+            .call(MESSAGE_RESOLUTION_BUDGET, async {
+                let (reply, answer) = oneshot::channel();
+                {
+                    let view = service.view()?;
+                    if caller_address(&view.state, &caller)? != Address::Owner {
+                        return Err(MessageError::Refused(
+                            "only the owner may retry or give up a delivery".into(),
+                        ));
+                    }
+                    let message = view.state.message(&id).ok_or_else(|| {
+                        MessageError::NotFound(format!("message {id} was not found"))
+                    })?;
+                    let Address::Agent(recipient) = &message.content.to else {
+                        // Never scheduled: delivered to the owner at its fold.
+                        return Err(kind.refuse_delivered(id));
+                    };
+                    let resolution = Resolution { kind, id, reply };
+                    service.board.resolve(recipient.clone(), resolution)?;
+                }
+                answer
+                    .await
+                    .map_err(|_| MessageError::Unavailable("message service stopped".into()))?
+            })
+            .await
     }
 
     /// The startup replay is complete, or the reason the service cannot be used.

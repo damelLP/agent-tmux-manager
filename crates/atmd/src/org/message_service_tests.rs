@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::{
-    message_evidence::MessageEvidence, message_history::MessageHistoryHandle, messages::*,
-    OrgHandle, OrgServiceError, Request,
+    message_evidence::MessageEvidence, message_history::MessageHistoryHandle,
+    message_scheduler::Effects, messages::*, OrgHandle, OrgServiceError, Request,
 };
 use crate::{
     eventlog::{Envelope, EventLogError},
@@ -21,33 +21,33 @@ use tokio::sync::{broadcast, mpsc, watch, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-fn utc() -> DateTime<Utc> {
+pub(super) fn utc() -> DateTime<Utc> {
     DateTime::from_timestamp(1_700_000_000, 0).unwrap()
 }
 
-fn owner() -> CallContext {
+pub(super) fn owner() -> CallContext {
     CallContext {
         client_id: CallerId("test".into()),
         from_pane: None,
     }
 }
 
-fn pane(pane: &str) -> CallContext {
+pub(super) fn pane(pane: &str) -> CallContext {
     CallContext {
         client_id: CallerId("test".into()),
         from_pane: Some(CallerPane(pane.into())),
     }
 }
 
-fn worker() -> AgentId {
+pub(super) fn worker() -> AgentId {
     "demo/worker".parse().unwrap()
 }
 
-fn other() -> AgentId {
+pub(super) fn other() -> AgentId {
     "demo/other".parse().unwrap()
 }
 
-fn note(to: Address, body: &str) -> SendParams {
+pub(super) fn note(to: Address, body: &str) -> SendParams {
     SendParams {
         to,
         kind: MessageKind::Note,
@@ -57,7 +57,7 @@ fn note(to: Address, body: &str) -> SendParams {
     }
 }
 
-fn page() -> InboxParams {
+pub(super) fn page() -> InboxParams {
     InboxParams {
         recipient: None,
         unread_only: false,
@@ -68,17 +68,17 @@ fn page() -> InboxParams {
     }
 }
 
-fn code(error: MessageError) -> String {
+pub(super) fn code(error: MessageError) -> String {
     MethodError::from(error).0.code
 }
 
-fn ids(result: &InboxResult) -> Vec<u64> {
+pub(super) fn ids(result: &InboxResult) -> Vec<u64> {
     result.messages.iter().map(|m| m.message_id.seq()).collect()
 }
 
 /// A hang guard, not a wait: on the paused clock it only elapses once every
 /// task is idle, so a step that can never complete fails at once.
-async fn guarded<T>(work: impl std::future::Future<Output = T>) -> T {
+pub(super) async fn guarded<T>(work: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(std::time::Duration::from_secs(60), work)
         .await
         .expect("hang guard: the awaited step never completed")
@@ -86,7 +86,7 @@ async fn guarded<T>(work: impl std::future::Future<Output = T>) -> T {
 
 /// Run the other tasks until a condition they produce holds. Not a time wait:
 /// the clock is paused and a yield does not advance it.
-async fn until(what: &str, condition: impl Fn() -> bool) {
+pub(super) async fn until(what: &str, condition: impl Fn() -> bool) {
     for _ in 0..10_000 {
         if condition() {
             return;
@@ -124,16 +124,17 @@ pub(super) fn runtime(
 }
 
 /// A real organisation actor whose appends stay in memory and pass a gate.
-struct Rig {
-    org: OrgHandle,
-    rt: MessageRuntime,
-    messages: MessageHandle,
+pub(super) struct Rig {
+    pub(super) org: OrgHandle,
+    pub(super) rt: MessageRuntime,
+    pub(super) messages: MessageHandle,
     /// Zero permits hold every append after it was entered.
     gate: Arc<Semaphore>,
     /// The sequence of each append, sent when it is entered.
     entered: mpsc::UnboundedReceiver<u64>,
-    cancel: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
+    /// Stops the organisation writer and, through its child, the messages.
+    pub(super) cancel: CancellationToken,
+    pub(super) task: tokio::task::JoinHandle<()>,
     /// Set when the test relays committed events to the service by hand.
     relay: Option<Relay>,
 }
@@ -146,12 +147,20 @@ type Relay = (
 
 impl Rig {
     async fn new() -> Self {
-        Self::build(false).await
+        Self::build(false, None).await
     }
 
     /// The service folds a committed event only when the test relays it.
     async fn relayed() -> Self {
-        Self::build(true).await
+        Self::build(true, None).await
+    }
+
+    /// The seeded rig with the recipient scheduler running on these effects.
+    /// The messages stop on `rt.cancel` alone; the writer outlives them.
+    pub(super) async fn scheduled(effects: Effects) -> Self {
+        let rig = Self::build(false, Some(effects)).await;
+        rig.seed().await;
+        rig
     }
 
     fn relay(&mut self) {
@@ -161,7 +170,7 @@ impl Rig {
         }
     }
 
-    async fn build(relayed: bool) -> Self {
+    async fn build(relayed: bool, effects: Option<Effects>) -> Self {
         let gate = Arc::new(Semaphore::new(1));
         let (enter, entered) = mpsc::unbounded_channel();
         let (requests, receive) = mpsc::channel::<Request>(64);
@@ -193,13 +202,13 @@ impl Rig {
             committed: committed.clone(),
             reads: None,
         };
-        let rt = runtime(org.clone(), 0, &cancel);
+        let rt = runtime(org.clone(), 0, &cancel.child_token());
         let relay = relayed.then(|| (committed.subscribe(), broadcast::channel(64).0));
         let source = match &relay {
             Some((_, service)) => service.subscribe(),
             None => committed.subscribe(),
         };
-        let (messages, task) = spawn_service_for_test(rt.clone(), source, 0);
+        let (messages, task) = spawn_service_for_test(rt.clone(), source, 0, effects);
         let rig = Self {
             org,
             rt,
@@ -217,6 +226,12 @@ impl Rig {
     /// A project, `demo/worker` bound on %1 and `demo/other` bound on %2.
     async fn seeded() -> Self {
         let rig = Self::new().await;
+        rig.seed().await;
+        rig
+    }
+
+    async fn seed(&self) {
+        let rig = self;
         rig.run(OrgCommand::RegisterProject {
             project_id: "demo".parse().unwrap(),
             root: "/demo".into(),
@@ -231,39 +246,38 @@ impl Rig {
             })
             .await;
         }
-        rig
     }
 
     /// Execute directly on the writer and wait for the service's fold.
-    async fn run(&self, command: OrgCommand) -> u64 {
+    pub(super) async fn run(&self, command: OrgCommand) -> u64 {
         let committed = guarded(self.org.execute(command, utc())).await.unwrap();
         let seq = committed.last().unwrap().seq;
         self.folded(seq).await;
         seq
     }
 
-    async fn folded(&self, seq: u64) {
+    pub(super) async fn folded(&self, seq: u64) {
         guarded(self.rt.history.folded(seq)).await.unwrap();
     }
 
     /// The sequence of the next append the writer enters.
-    async fn entered(&mut self) -> u64 {
+    pub(super) async fn entered(&mut self) -> u64 {
         guarded(self.entered.recv()).await.unwrap()
     }
 
-    async fn send(&self, caller: CallContext, to: Address, body: &str) -> MessageId {
+    pub(super) async fn send(&self, caller: CallContext, to: Address, body: &str) -> MessageId {
         guarded(self.messages.send(note(to, body), caller))
             .await
             .unwrap()
             .message_id
     }
 
-    async fn inbox(&self, caller: CallContext, p: InboxParams) -> InboxResult {
+    pub(super) async fn inbox(&self, caller: CallContext, p: InboxParams) -> InboxResult {
         guarded(self.messages.inbox(p, caller)).await.unwrap()
     }
 
     /// Mark an agent message delivered, as an executor would.
-    async fn deliver(&self, id: MessageId, pane: &str, session: &str) {
+    pub(super) async fn deliver(&self, id: MessageId, pane: &str, session: &str) {
         self.run(OrgCommand::DeliveryAttempted {
             message_id: id,
             attempt: 1,
@@ -280,12 +294,12 @@ impl Rig {
 
     /// Hold every later append once it is entered; `entered` then yields the
     /// held append's sequence, not an earlier one's.
-    fn hold(&mut self) {
+    pub(super) fn hold(&mut self) {
         self.gate.forget_permits(usize::MAX);
         while self.entered.try_recv().is_ok() {}
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.gate.add_permits(1);
     }
 }
@@ -1128,7 +1142,7 @@ impl Replay {
         let (events, source) = broadcast::channel(64);
         let cancel = CancellationToken::new();
         let rt = runtime(OrgHandle::disabled("replay only"), high_water, &cancel);
-        let (messages, _task) = spawn_service_for_test(rt.clone(), source, high_water);
+        let (messages, _task) = spawn_service_for_test(rt.clone(), source, high_water, None);
         Self {
             events,
             rt,
@@ -1359,7 +1373,7 @@ async fn cancelled_service_reports_unavailable() {
 }
 
 /// A capture as U8c's reserved or read-only observation returns it.
-fn capture(
+pub(super) fn capture(
     pane: &str,
     dead: bool,
     in_mode: bool,
@@ -1379,7 +1393,7 @@ fn capture(
     PaneCapture::new("screen text".into(), inspection, CaptureFormat::Plain).with_focus(focused)
 }
 
-fn idle_session() -> super::message_history::SessionObservation {
+pub(super) fn idle_session() -> super::message_history::SessionObservation {
     super::message_history::SessionObservation {
         id: "s1".into(),
         harness: atm_core::Harness::Pi,
@@ -1390,7 +1404,7 @@ fn idle_session() -> super::message_history::SessionObservation {
 
 /// An empty editor, no running turn, no dialog: what an adapter reads on an
 /// idle screen.
-fn empty_editor() -> atm_core::ScreenFacts {
+pub(super) fn empty_editor() -> atm_core::ScreenFacts {
     let mut facts = atm_core::ScreenFacts::default();
     facts.input = atm_core::InputState::Empty;
     facts.turn = atm_core::TurnState::NotRunning;

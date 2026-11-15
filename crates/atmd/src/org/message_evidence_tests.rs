@@ -1090,3 +1090,132 @@ async fn each_tapped_event_reaches_history_with_its_own_receive_time() {
     tokio::time::advance(std::time::Duration::from_secs(60)).await;
     assert_eq!(last_event(e.clock().now().unwrap()), later);
 }
+
+fn latched(e: &MessageEvidence) -> bool {
+    e.snapshot(id()).unwrap().probably_landed
+}
+
+/// Every kind of plain activity in the attempted session and pane.
+fn session_activity(e: &MessageEvidence) {
+    observe(e, "session", "%7", Harness::Pi, "more work");
+    e.observe_activity(&SessionId::new("session"), Some("%7"))
+        .unwrap();
+    unproven(e, "session", Some("%7"), None);
+}
+
+#[test]
+fn owner_release_clears_the_latch_and_that_attempts_activity_no_longer_sets_it() {
+    let e = armed();
+    session_activity(&e);
+    assert!(latched(&e));
+    e.release(id(), 124).unwrap();
+    assert!(!latched(&e));
+    // The session keeps working after the owner's retry: the next evidence
+    // copy must not find the released attempt held again.
+    session_activity(&e);
+    assert!(!latched(&e));
+    // Scopes and the reference are kept: releasing again is harmless.
+    e.release(id(), 124).unwrap();
+    assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn released_attempt_still_confirms_by_a_late_receipt() {
+    let e = armed();
+    session_activity(&e);
+    e.release(id(), 124).unwrap();
+    exact(&e);
+    let receipt = e.receipt(id()).unwrap().unwrap();
+    assert_eq!(receipt.session_id.as_str(), "session");
+    assert_eq!(e.confirmed().unwrap(), [(id(), receipt)]);
+}
+
+#[test]
+fn exact_reference_still_holds_a_released_attempt() {
+    let e = armed();
+    session_activity(&e);
+    e.release(id(), 124).unwrap();
+    // Only the paste produces this text: submitted where it confirms
+    // nothing, it holds the message again, release or not.
+    observe(&e, "stranger", "%9", Harness::Pi, REFERENCE);
+    assert!(latched(&e));
+    assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn new_arm_after_a_release_latches_again() {
+    let e = armed();
+    session_activity(&e);
+    e.release(id(), 124).unwrap();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        ..scope()
+    })
+    .unwrap();
+    assert!(!latched(&e));
+    session_activity(&e);
+    assert!(latched(&e));
+}
+
+#[test]
+fn release_refuses_a_superseded_attempt_and_an_unknown_message() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        ..scope()
+    })
+    .unwrap();
+    session_activity(&e);
+    // A retry decided on attempt 124 is stale once 130 is armed.
+    assert!(matches!(
+        e.release(id(), 124),
+        Err(MessageError::Conflict(_))
+    ));
+    assert!(latched(&e));
+    // An attempt committed after the last arm (its own arm failed) is the
+    // latest one: its release clears what the older scope latched.
+    e.release(id(), 140).unwrap();
+    assert!(!latched(&e));
+    session_activity(&e);
+    assert!(!latched(&e));
+    assert!(matches!(
+        e.release("m999".parse().unwrap(), 1),
+        Err(MessageError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn release_of_an_attempt_never_armed_here_is_accepted() {
+    // A replayed message: registered at startup, attempted by the previous
+    // process, so no scope exists to compare the sequence with.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.release(id(), 124).unwrap();
+    assert!(!latched(&e));
+}
+
+#[test]
+fn release_wakes_only_when_it_cleared_a_latch() {
+    let e = armed();
+    let wake = e.subscribe();
+    e.release(id(), 124).unwrap();
+    assert!(!wake.has_changed().unwrap());
+    let e = armed();
+    session_activity(&e);
+    let wake = e.subscribe();
+    e.release(id(), 124).unwrap();
+    assert!(wake.has_changed().unwrap());
+}
+
+#[test]
+fn confirmed_lists_each_receipt_until_it_is_acknowledged() {
+    let e = armed();
+    let other = other_armed(&e);
+    assert_eq!(e.confirmed().unwrap(), []);
+    exact(&e);
+    let receipt = e.receipt(id()).unwrap().unwrap();
+    assert_eq!(e.confirmed().unwrap(), [(id(), receipt.clone())]);
+    assert!(e.receipt(other).unwrap().is_none());
+    e.acknowledge(id(), &receipt).unwrap();
+    assert_eq!(e.confirmed().unwrap(), []);
+}

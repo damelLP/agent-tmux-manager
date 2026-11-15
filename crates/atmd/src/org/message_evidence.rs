@@ -96,6 +96,9 @@ struct Entry {
     scopes: Vec<Scope>,
     receipt: Option<DeliveryReceipt>,
     probably_landed: bool,
+    /// The owner released the latest attempt's latch: until a new arm, that
+    /// attempt's session activity no longer sets it.
+    released: bool,
 }
 
 #[derive(Debug, Default)]
@@ -154,7 +157,7 @@ impl MessageEvidence {
     /// One wake per consumer for every changed fact (a latch, a receipt, an
     /// arm, a disable), not for every event; see the module docs.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.wake.subscribe()
     }
 
@@ -203,6 +206,7 @@ impl MessageEvidence {
                 scopes: Vec::new(),
                 receipt: None,
                 probably_landed: false,
+                released: false,
             },
         );
         Ok(())
@@ -249,10 +253,47 @@ impl MessageEvidence {
                 lazy_session: None,
             });
             entry.probably_landed = false;
+            entry.released = false;
             state.scopes += 1;
         }
         self.wake();
         Ok(())
+    }
+
+    /// The owner's retry of the latest attempt, accepting the duplicate risk.
+    /// Clears the latch, and that attempt's session activity no longer sets
+    /// it: otherwise the next evidence copy would undo the retry. Scopes and
+    /// a receipt stay, so a late receipt still confirms, and the message's
+    /// exact reference still holds it. A newer armed attempt refuses the
+    /// release as stale; an attempt that was never armed here (it predates
+    /// this process, or its arm failed) has no scope to compare with.
+    pub(crate) fn release(&self, id: MessageId, attempt_seq: u64) -> Result<(), MessageError> {
+        let mut state = self.state()?;
+        let entry = state
+            .messages
+            .get_mut(&id)
+            .ok_or_else(|| MessageError::Unavailable("message reference not registered".into()))?;
+        if (entry.scopes.last()).is_some_and(|scope| scope.identity.attempt_seq > attempt_seq) {
+            return Err(MessageError::Conflict(
+                "message attempt sequence does not match".into(),
+            ));
+        }
+        let changed = entry.probably_landed;
+        entry.probably_landed = false;
+        entry.released = true;
+        if changed {
+            self.wake();
+        }
+        Ok(())
+    }
+
+    /// Every retained receipt nobody has acknowledged yet: what the scheduler
+    /// still has to persist as Delivered, for a finally failed message too.
+    pub(crate) fn confirmed(&self) -> Result<Vec<(MessageId, DeliveryReceipt)>, MessageError> {
+        let state = self.state()?;
+        Ok((state.messages.iter())
+            .filter_map(|(id, entry)| Some((*id, entry.receipt.clone()?)))
+            .collect())
     }
 
     /// An unknown or acknowledged ID is unavailable, as in `snapshot`: Ok(None)
@@ -393,7 +434,7 @@ impl MessageEvidence {
                         scope.lazy_session = Some(session.clone());
                     }
                 }
-                if latest {
+                if latest && !entry.released {
                     entry.probably_landed = true;
                 }
                 if trusted && named && pane.is_some() && entry.receipt.is_none() {

@@ -32,6 +32,8 @@ pub struct MethodServices {
     pub agents: Option<crate::org::agents::AgentHandle>,
     /// Confirmed-message service; None advertises explicitly unavailable operations.
     pub messages: Option<crate::org::messages::MessageHandle>,
+    /// Decision API and its sole restart-recoverable answer bridge.
+    pub decisions: Option<crate::org::decisions::DecisionHandle>,
     /// None leaves library callers unconfigured; the binary supplies its single
     /// config parse result. Invalid settings disable messages with that cause.
     pub delivery_policy: Option<Result<atm_org::delivery::DeliveryPolicy, String>>,
@@ -59,6 +61,7 @@ impl MethodServices {
             control: None,
             agents: None,
             messages: None,
+            decisions: None,
             delivery_policy: None,
             message_tap: None,
             state_dir: crate::eventlog::state_dir(),
@@ -184,6 +187,14 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
     let handover_org = services.org.clone();
     crate::org::tasks::register_task_methods(&mut router, services.org.clone())?;
+    crate::org::decisions::register_decision_methods(
+        &mut router,
+        services.decisions.unwrap_or_else(|| {
+            crate::org::decisions::DecisionHandle::disabled(
+                "decision operations are not configured",
+            )
+        }),
+    )?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();

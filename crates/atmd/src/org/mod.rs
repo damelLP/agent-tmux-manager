@@ -17,6 +17,9 @@ mod actor;
 mod agent_flow;
 #[cfg(test)]
 mod agent_flow_tests;
+mod agent_launch;
+#[cfg(test)]
+mod agent_launch_tests;
 mod agent_lifecycle;
 mod agent_methods;
 mod agent_proc;

@@ -1,7 +1,7 @@
-//! Legacy CLI commands still fetch ListSessions from a fake daemon.
-//! Send, kill and interrupt instead exercise the real method router and an
-//! injected tmux client; they and spawn also autostart a real private daemon
-//! with a stand-in tmux. To kill and interrupt the fake daemon is an old one.
+//! List/status still fetch ListSessions from a fake daemon. Session control
+//! commands exercise the real method router and an injected tmux client, and
+//! autostart a private daemon with stand-in tmux. None falls back to an old
+//! daemon's legacy exchange or the CLI's own tmux.
 //!
 //! Every CLI child has a cleared environment with private socket/state/tmux
 //! paths. No test reaches a real tmux server or launches a model harness.
@@ -178,7 +178,8 @@ esac
         .map(|e| e.kind.as_str())
         .collect();
     match args.first() {
-        Some(&"send") | Some(&"interrupt") => assert_eq!(kinds, ["control.sent"]),
+        Some(&"send") | Some(&"interrupt") | Some(&"reply") => assert_eq!(kinds, ["control.sent"]),
+        Some(&"peek") => assert!(kinds.is_empty(), "read-only captures are not audited"),
         Some(&"kill") => assert_eq!(kinds, ["control.killed"]),
         _ => assert_eq!(kinds, ["control.spawned", "control.sent"]),
     }
@@ -202,6 +203,195 @@ fn kill_autostarts_a_stopped_private_daemon() {
 #[test]
 fn interrupt_autostarts_a_stopped_private_daemon() {
     autostart_control(&["interrupt", "%7"], b"Interrupted %7\n");
+}
+
+#[test]
+fn reply_autostarts_a_stopped_private_daemon() {
+    autostart_control(&["reply", "%7", "-y"], b"Sent Enter to %7\n");
+}
+
+#[test]
+fn peek_autostarts_a_stopped_private_daemon() {
+    autostart_control(&["peek", "%7"], b"");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_and_peek_use_the_daemon_and_preserve_exact_output_and_refusals() {
+    use atm_core::SessionDomain;
+    use atm_tmux::{mock::MockCall, MockTmuxClient};
+    use atmd::{
+        control::service::spawn_control,
+        server::{methods::MethodServices, DaemonServer},
+    };
+    use tokio_util::sync::CancellationToken;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = atmd::registry::spawn_registry();
+    for (id, pane) in [
+        ("abc-session-1", Some("%5")),
+        ("dup-1111", Some("%6")),
+        ("dup-2222", Some("%7")),
+        ("bare-session", None),
+    ] {
+        registry
+            .register(SessionDomain {
+                id: SessionId::new(id),
+                tmux_pane: pane.map(str::to_owned),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mock = MockTmuxClient::new();
+    mock.set_pane_content(
+        "%5",
+        [
+            "earlier  ",
+            "Choose café?",
+            "❯ 1. Sí",
+            "  2. No",
+            "Enter to select",
+            "",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    );
+    let cancel = CancellationToken::new();
+    let org_cancel = CancellationToken::new();
+    let org = atmd::org::OrgHandle::open(dir.path().join("org"), org_cancel.clone()).await;
+    let (control, actor) = spawn_control(
+        Box::new(mock.clone()),
+        registry.clone(),
+        org.clone(),
+        cancel.clone(),
+    );
+    let mut services = MethodServices::new(registry);
+    services.org = org.clone();
+    services.control = Some(control.clone());
+    let server =
+        DaemonServer::with_services(dir.path().join("atmd.sock"), services, cancel.clone());
+    let server = tokio::spawn(async move { server.run().await });
+    control_support::wait_for_socket(&dir.path().join("atmd.sock")).await;
+    let socket = dir
+        .path()
+        .join(format!("tmux-{}/default", unsafe { libc::getuid() }));
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::fs::write(&socket, "").unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
+    for (args, expected, keys, captures) in [
+        (
+            vec!["reply", "abc"],
+            "Sent Enter to %5\n",
+            vec!["Enter"],
+            false,
+        ),
+        (
+            vec!["reply", "abc", "-y"],
+            "Sent Enter to %5\n",
+            vec!["Enter"],
+            false,
+        ),
+        (
+            vec!["reply", "abc", "-n"],
+            "Sent Escape to %5\n",
+            vec!["Escape"],
+            false,
+        ),
+        (
+            vec!["reply", "abc", "-o", "3"],
+            "Selected option 3 on %5\n",
+            vec!["Down", "Down", "Enter"],
+            true,
+        ),
+        (
+            vec!["reply", "abc", "-o", "0"],
+            "Selected option 0 on %5\n",
+            vec!["Up", "Enter"],
+            true,
+        ),
+        (
+            vec!["peek", "abc"],
+            "earlier  \nChoose café?\n❯ 1. Sí\n  2. No\nEnter to select\n\n",
+            vec![],
+            true,
+        ),
+        (vec!["peek", "abc", "-n", "0"], "", vec![], true),
+        (
+            vec!["peek", "abc", "-n", "2"],
+            "Enter to select\n\n",
+            vec![],
+            true,
+        ),
+        (
+            vec!["peek", "abc", "--prompt", "-n", "0"],
+            "Choose café?\n❯ 1. Sí\n  2. No\nEnter to select\n",
+            vec![],
+            true,
+        ),
+    ] {
+        mock.clear_calls();
+        mock.set_next_raw_output(socket.to_str().unwrap());
+        let out = atm(exe, dir.path(), &args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert_eq!(out.stdout, expected.as_bytes());
+        let mut expected_calls = Vec::new();
+        if captures {
+            expected_calls.push(MockCall::CapturePane { pane: "%5".into() });
+        }
+        expected_calls.extend(keys.into_iter().map(|keys| MockCall::SendKeys {
+            pane: "%5".into(),
+            keys: keys.into(),
+        }));
+        assert_eq!(
+            mock.calls()
+                .into_iter()
+                .filter(|call| !matches!(call, MockCall::RawCommand { .. }))
+                .collect::<Vec<_>>(),
+            expected_calls,
+            "prefix must reach the daemon's tmux as %5"
+        );
+    }
+    for command in ["reply", "peek"] {
+        for (target, expected) in [
+            ("nope", "Error: No session matching 'nope'"),
+            ("bare", "Error: Session bare-ses has no tmux pane"),
+        ] {
+            mock.clear_calls();
+            mock.set_next_raw_output(socket.to_str().unwrap());
+            let args = [command, target];
+            assert_fails_with(&atm(exe, dir.path(), &args), &args, expected);
+            assert!(matches!(
+                mock.calls().as_slice(),
+                [MockCall::RawCommand { .. }]
+            ));
+        }
+        mock.clear_calls();
+        mock.set_next_raw_output(socket.to_str().unwrap());
+        let out = atm(exe, dir.path(), &[command, "dup"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!([
+            "Error: Ambiguous target 'dup' matches 2 sessions: dup-1111, dup-2222\n",
+            "Error: Ambiguous target 'dup' matches 2 sessions: dup-2222, dup-1111\n"
+        ]
+        .contains(&String::from_utf8(out.stderr).unwrap().as_str()));
+        assert!(matches!(
+            mock.calls().as_slice(),
+            [MockCall::RawCommand { .. }]
+        ));
+    }
+    cancel.cancel();
+    server.await.unwrap().unwrap();
+    actor.await.unwrap();
+    let records = org.tail(atmd::org::TailParams::default()).await.unwrap();
+    assert_eq!(
+        records.len(),
+        5,
+        "only five replies, never a capture, are audited"
+    );
+    assert!(records
+        .iter()
+        .all(|e| e.kind == "control.sent" && e.body["action"]["method"] == "session.reply"));
+    org_cancel.cancel();
 }
 
 /// The CLI has no tmux executable: the daemon resolves the target in its
@@ -392,22 +582,19 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
     actor.await.unwrap();
 }
 
-/// The two legacy commands that resolve an agent through ListSessions.
-fn pane_commands(target: &str) -> Vec<Vec<&str>> {
-    vec![vec!["reply", target], vec!["peek", target]]
-}
-
-/// The two pane commands that are daemon requests. They read no session list.
+/// Pane commands that are daemon requests. They read no session list.
 fn daemon_commands(target: &str) -> Vec<Vec<&str>> {
-    vec![vec!["kill", target], vec!["interrupt", target]]
+    vec![
+        vec!["kill", target],
+        vec!["interrupt", target],
+        vec!["reply", target],
+        vec!["peek", target],
+    ]
 }
 
-/// Every command that reads the session list. `%0` is a pane ID, which
-/// the pane commands use as is, with no lookup.
+/// Every command that still reads the legacy session list.
 fn all_commands() -> Vec<Vec<&'static str>> {
-    let mut commands = vec![vec!["list", "--format", "json"], vec!["status"]];
-    commands.extend(pane_commands("%0"));
-    commands
+    vec![vec!["list", "--format", "json"], vec!["status"]]
 }
 
 /// Runs `exe` with a cleared environment rooted in `dir`. `PATH` is
@@ -482,8 +669,7 @@ fn test_commands_fail_when_the_daemon_cannot_start() {
     }
 }
 
-/// A daemon that hangs up before sending SessionList fails every command,
-/// including the pane commands whose `%0` target needs no lookup.
+/// A daemon that hangs up before SessionList fails both legacy list readers.
 #[test]
 fn test_commands_fail_when_the_daemon_closes_before_the_session_list() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -499,9 +685,8 @@ fn test_commands_fail_when_the_daemon_closes_before_the_session_list() {
     }
 }
 
-/// `list` and `status` print the daemon's list, and the pane commands
-/// look their target up in it: a known prefix reaches tmux with the
-/// session's pane, and an unknown one fails before tmux.
+/// List/status still print the daemon's legacy session list. Pane prefix and
+/// refusal assertions now live in the real-router tests above.
 #[test]
 fn test_commands_read_the_daemons_session_list() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -515,17 +700,6 @@ fn test_commands_read_the_daemons_session_list() {
         }]),
     );
     let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
-    // A stand-in `tmux` that logs each call and succeeds.
-    let tmux_log = dir.path().join("tmux.log");
-    let tmux = dir.path().join("path").join("tmux");
-    std::fs::create_dir_all(dir.path().join("path")).expect("mkdir PATH dir");
-    std::fs::write(
-        &tmux,
-        format!("#!/bin/sh\necho \"$*\" >> '{}'\n", tmux_log.display()),
-    )
-    .expect("write stand-in tmux");
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).expect("chmod tmux");
-
     let list = atm(exe, dir.path(), &["list", "--format", "json"]);
     assert!(list.status.success(), "atm list: {list:?}");
     let listed: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list JSON");
@@ -547,48 +721,9 @@ fn test_commands_read_the_daemons_session_list() {
         .contains("unread count unavailable: the daemon is too old; restart atmd"));
     assert!(String::from_utf8_lossy(&status.stderr)
         .contains("decision count unavailable: the daemon is too old; restart atmd"));
-
-    // Each legacy command's tmux subcommands, in `pane_commands` order.
-    let subcommands: [&[&str]; 2] = [&["send-keys"], &["capture-pane"]];
-    for (args, subcommands) in pane_commands("abc").into_iter().zip(subcommands) {
-        let _ = std::fs::remove_file(&tmux_log);
-        let out = atm(exe, dir.path(), &args);
-        assert!(out.status.success(), "atm {args:?}: {out:?}");
-        let log = std::fs::read_to_string(&tmux_log).expect("tmux was called");
-        // Each call starts with `-u`, so tmux prints UTF-8 whatever the
-        // caller's locale (#138); the subcommand comes next.
-        let calls: Vec<&str> = log
-            .lines()
-            .map(|call| {
-                call.strip_prefix("-u ")
-                    .unwrap_or_else(|| panic!("atm {args:?}: tmux called without -u: {call:?}"))
-            })
-            .collect();
-        let called: Vec<&str> = calls
-            .iter()
-            .map(|call| call.split(' ').next().unwrap_or_default())
-            .collect();
-        assert_eq!(called, subcommands, "atm {args:?}: {calls:?}");
-        for call in &calls {
-            let words: Vec<&str> = call.split(' ').collect();
-            let subcommand = words.first().copied().unwrap_or_default();
-            if subcommand == "load-buffer" {
-                continue;
-            }
-            let pane = words.iter().skip_while(|w| **w != "-t").nth(1);
-            assert_eq!(pane, Some(&"%5"), "atm {args:?}: {call:?}");
-        }
-    }
-
-    let _ = std::fs::remove_file(&tmux_log);
-    for args in pane_commands("nope") {
-        let out = atm(exe, dir.path(), &args);
-        assert_fails_with(&out, &args, "Error: No session matching 'nope'");
-    }
-    assert!(!tmux_log.exists(), "an unknown target reached tmux");
 }
 
-/// A daemon that does not list the method is too old. Kill and interrupt say
+/// A daemon that does not list the method is too old. All pane commands say
 /// so and stop: they never fall back to a tmux call of their own, which
 /// would be unordered and unlogged.
 #[test]

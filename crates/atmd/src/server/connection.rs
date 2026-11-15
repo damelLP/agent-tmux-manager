@@ -143,9 +143,9 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     /// A broken peer stops input/replies, but accepted handlers still finish.
     peer_failed: CancellationToken,
 
-    /// Full socket closure drops only the waiting session.send and
-    /// agent.handover method futures. A handover runs on as its own task; its
-    /// dropped call is how it learns that nobody takes its answer.
+    /// Full socket closure drops waiting send/reply/capture and handover calls.
+    /// Admitted input belongs to the control actor. A handover runs as its own
+    /// task; its dropped call is how it learns that nobody takes its answer.
     caller_gone: CancellationToken,
     disconnect_monitor: Option<AsyncFd<OwnedFd>>,
 
@@ -415,8 +415,8 @@ where
         self.stop_watcher().await;
         let mut writable = result.is_ok() && !self.peer_failed.is_cancelled();
         // EOF/protocol Disconnect closes only input. Finish accepted work up to
-        // its deadline. Full socket closure separately drops session.send's wait
-        // (and agent.handover's, whose work is a task of its own and carries on);
+        // its deadline. Full closure drops send/reply/capture waits separately
+        // (and handover's, whose work is a task of its own and carries on);
         // the control actor decides whether its first effect has already begun.
         // Only daemon shutdown aborts every remaining job via this JoinSet.
         while !requests.is_empty() {
@@ -590,7 +590,7 @@ where
                     let result = tokio::select! {
                         biased;
                         _ = caller_gone.cancelled(),
-                            if matches!(method.as_str(), "session.send" | "agent.handover") =>
+                            if matches!(method.as_str(), "session.send" | "session.reply" | "session.capture" | "agent.handover") =>
                         {
                             Err(MethodError::new(error_code::UNAVAILABLE, "caller disconnected"))
                         }
@@ -3591,6 +3591,120 @@ mod tests {
             release.notify_one();
             run.await.unwrap();
             assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_disconnect_drops_waiting_reply_and_capture_only() {
+        timeout(Duration::from_secs(60), async {
+            for method in ["session.reply", "session.capture"] {
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+                let mut router = MethodRouter::default();
+                router
+                    .register(method, Duration::from_secs(60), move |_, _| {
+                        let (entry, gate, finished) =
+                            (entry.clone(), gate.clone(), finished.clone());
+                        async move {
+                            entry.notify_one();
+                            gate.notified().await;
+                            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(serde_json::Value::Null)
+                        }
+                    })
+                    .unwrap();
+                let (mut handler, peer) = handshake_pair();
+                handler.methods = Arc::new(router);
+                let handler = handler.with_disconnect_monitor().unwrap();
+                let gone = handler.caller_gone.clone();
+                let run = tokio::spawn(handler.run());
+                let mut peer = BufReader::new(peer);
+                send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+                assert!(matches!(
+                    receive(&mut peer).await,
+                    DaemonMessage::Connected { .. }
+                ));
+                send_client(
+                    peer.get_mut(),
+                    ClientMessage::request(
+                        "dialog".into(),
+                        method.into(),
+                        serde_json::json!({}),
+                        None,
+                    ),
+                )
+                .await;
+                entered.notified().await;
+                drop(peer);
+                gone.cancelled().await;
+                release.notify_one();
+                run.await.unwrap();
+                assert!(
+                    !completed.load(std::sync::atomic::Ordering::SeqCst),
+                    "{method} outlived full socket closure"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_and_capture_half_close_and_protocol_disconnect_still_drain() {
+        timeout(Duration::from_secs(60), async {
+            for method in ["session.reply", "session.capture"] {
+                for half_close in [true, false] {
+                    let entered = Arc::new(tokio::sync::Notify::new());
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let (entry, gate) = (entered.clone(), release.clone());
+                    let mut router = MethodRouter::default();
+                    router
+                        .register(method, Duration::from_secs(60), move |_, _| {
+                            let (entry, gate) = (entry.clone(), gate.clone());
+                            async move {
+                                entry.notify_one();
+                                gate.notified().await;
+                                Ok(serde_json::json!("finished"))
+                            }
+                        })
+                        .unwrap();
+                    let (mut handler, peer) = handshake_pair();
+                    handler.methods = Arc::new(router);
+                    let run = tokio::spawn(handler.with_disconnect_monitor().unwrap().run());
+                    let mut peer = BufReader::new(peer);
+                    send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+                    assert!(matches!(
+                        receive(&mut peer).await,
+                        DaemonMessage::Connected { .. }
+                    ));
+                    send_client(
+                        peer.get_mut(),
+                        ClientMessage::request(
+                            "dialog".into(),
+                            method.into(),
+                            serde_json::json!({}),
+                            None,
+                        ),
+                    )
+                    .await;
+                    entered.notified().await;
+                    if half_close {
+                        peer.get_mut().shutdown().await.unwrap();
+                    } else {
+                        send_client(peer.get_mut(), ClientMessage::disconnect()).await;
+                    }
+                    release.notify_one();
+                    assert_eq!(
+                        serde_json::to_value(receive(&mut peer).await).unwrap(),
+                        serde_json::json!({"type":"response","id":"dialog","result":"finished"})
+                    );
+                    run.await.unwrap();
+                }
+            }
         })
         .await
         .unwrap();

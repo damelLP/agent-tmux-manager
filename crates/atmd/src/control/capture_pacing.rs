@@ -18,6 +18,7 @@ impl Pacing {
     pub(super) fn admit(&mut self, command: Command, now: Instant) -> Option<Command> {
         let (pane, deadline) = match &command {
             Command::Observe { pane, deadline, .. } => (pane, *deadline),
+            Command::LegacyCapture(request) => (&request.pane, request.deadline()),
             Command::Pane {
                 action:
                     Action::Capture(pane, _)
@@ -60,11 +61,11 @@ impl Pacing {
         Some(command)
     }
 
-    pub(super) fn take_ready(&mut self, now: Instant) -> Vec<Command> {
-        let mut ready = Vec::new();
+    pub(super) fn take_ready(&mut self, now: Instant) -> Option<Command> {
+        let mut ready = None;
         for (due, pane, command) in std::mem::take(&mut self.waiting) {
-            if due <= now {
-                ready.push(command);
+            if due <= now && ready.is_none() {
+                ready = Some(command);
             } else {
                 self.waiting.push((due, pane, command));
             }
@@ -82,7 +83,7 @@ impl Pacing {
 
     pub(super) fn stop(&mut self) {
         for (due, pane, command) in std::mem::take(&mut self.waiting) {
-            if matches!(command, Command::Observe { .. }) {
+            if matches!(command, Command::Observe { .. } | Command::LegacyCapture(_)) {
                 command.reject();
             } else {
                 // Admitted pane actions still fence at execution. In particular,

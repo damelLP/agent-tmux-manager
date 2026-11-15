@@ -414,6 +414,8 @@ mod reservation_audit_tests;
 #[path = "legacy_input_tests.rs"]
 mod legacy_input_tests;
 
+#[path = "dialog_request.rs"]
+pub(super) mod dialog_request;
 #[path = "legacy_input.rs"]
 mod legacy_input;
 #[path = "org_mirror.rs"]
@@ -421,6 +423,9 @@ mod org_mirror;
 #[path = "pane_request.rs"]
 mod pane_request;
 
+#[cfg(test)]
+#[path = "dialog_request_tests.rs"]
+mod dialog_request_tests;
 #[cfg(test)]
 #[path = "pane_request_tests.rs"]
 mod pane_request_tests;
@@ -446,7 +451,7 @@ use super::{
         jobs::{Command, Jobs},
         ReservationError,
     },
-    ControlError, SpawnContext,
+    ControlError, ReplyOutcome, SpawnContext,
 };
 use crate::{org::OrgHandle, registry::RegistryHandle, server::methods::CallContext};
 
@@ -528,6 +533,19 @@ enum Request {
     Interrupt {
         target: String,
         reply: Reply<String>,
+    },
+    Reply {
+        target: String,
+        option: Option<usize>,
+        yes: bool,
+        no: bool,
+        reply: Reply<ReplyOutcome>,
+    },
+    Capture {
+        target: String,
+        tail: Option<usize>,
+        prompt: bool,
+        reply: Reply<Vec<String>>,
     },
 }
 
@@ -726,6 +744,43 @@ impl ControlHandle {
             .await
     }
 
+    /// Answer with the legacy keys, after reservation/mirror admission. A
+    /// numbered capture shares observation pacing; the original deadline also
+    /// bounds navigation. Caller loss after the first key does not cancel it.
+    pub async fn reply(
+        &self,
+        target: String,
+        option: Option<usize>,
+        yes: bool,
+        no: bool,
+    ) -> Result<ReplyOutcome, ServiceError> {
+        self.request(|reply| Request::Reply {
+            target,
+            option,
+            yes,
+            no,
+            reply,
+        })
+        .await
+    }
+
+    /// Read the legacy-format viewport through shared capture pacing. This is
+    /// read-only, needs no ownership, and deliberately writes no audit event.
+    pub async fn capture(
+        &self,
+        target: String,
+        tail: Option<usize>,
+        prompt: bool,
+    ) -> Result<Vec<String>, ServiceError> {
+        self.request(|reply| Request::Capture {
+            target,
+            tail,
+            prompt,
+            reply,
+        })
+        .await
+    }
+
     pub async fn prepare_spawn(
         &self,
         target: Option<String>,
@@ -854,6 +909,16 @@ where
             let work_stopped = work.is_cancelled();
             jobs.ready(Instant::now());
             jobs.capture_ready(&*client, work_stopped).await;
+            drain_legacy_captures(
+                &*client,
+                &registry,
+                &mut jobs,
+                &mirror,
+                &mut parked,
+                &audits,
+                stopping,
+            )
+            .await;
             // Read after the pass has drained what it can: a paced capture of
             // stopped work can be the last thing here, and nothing wakes the
             // actor after it.
@@ -864,13 +929,36 @@ where
             // against current registry, org projection and reservation ownership.
             for _ in 0..parked.len() {
                 if let Some(pending) = parked.pop_front() {
-                    if let Some(pending) = legacy_input::dispatch(
-                        &*client, &registry, &mut jobs, &mirror, pending, &audits, !stopping,
-                    )
-                    .await
-                    {
+                    let pending = if dialog_request::is_request(&pending) {
+                        dialog_request::dispatch(
+                            &*client,
+                            &registry,
+                            &mut jobs,
+                            &mirror,
+                            (pending, None),
+                            &audits,
+                            !stopping,
+                        )
+                        .await
+                    } else {
+                        legacy_input::dispatch(
+                            &*client, &registry, &mut jobs, &mirror, pending, &audits, !stopping,
+                        )
+                        .await
+                    };
+                    if let Some(pending) = pending {
                         parked.push_back(pending);
                     }
+                    drain_legacy_captures(
+                        &*client,
+                        &registry,
+                        &mut jobs,
+                        &mirror,
+                        &mut parked,
+                        &audits,
+                        stopping,
+                    )
+                    .await;
                 }
             }
             #[cfg(test)]
@@ -927,10 +1015,14 @@ where
                         pending if pane_request::is_pane_request(&pending) => {
                             pane_request::dispatch(&*client, &registry, &mut jobs, pending, &audits).await;
                         }
-                        pending if legacy_input::is_input(&pending) => {
-                            if let Some(pending) = legacy_input::dispatch(&*client, &registry, &mut jobs, &mirror, pending, &audits, !stopping && parked.len() < CAPACITY).await {
-                                parked.push_back(pending);
-                            }
+                        pending if legacy_input::is_input(&pending) || dialog_request::is_request(&pending) => {
+                            let may_park = !stopping && parked.len() < CAPACITY;
+                            let pending = if dialog_request::is_request(&pending) {
+                                dialog_request::dispatch(&*client, &registry, &mut jobs, &mirror, (pending, None), &audits, may_park).await
+                            } else {
+                                legacy_input::dispatch(&*client, &registry, &mut jobs, &mirror, pending, &audits, may_park).await
+                            };
+                            if let Some(pending) = pending { parked.push_back(pending); }
                         }
                         pending => {
                             // Keep U7's drain: never cancel admitted paste before Enter.
@@ -989,6 +1081,34 @@ pub fn spawn_control_with_org(
     cancel: CancellationToken,
 ) -> (ControlHandle, JoinHandle<()>) {
     spawn_control(client, registry, org, cancel)
+}
+
+/// Drain a grant immediately, including a parked request's first ready capture
+/// and a changed target's reschedule, before another actor operation can pass it.
+async fn drain_legacy_captures(
+    client: &dyn TmuxClient,
+    registry: &RegistryHandle,
+    jobs: &mut Jobs,
+    mirror: &org_mirror::Mirror,
+    parked: &mut VecDeque<Pending>,
+    audits: &AuditQueue,
+    stopping: bool,
+) {
+    while let Some(deferred) = jobs.take_legacy_capture() {
+        if let Some(pending) = dialog_request::dispatch(
+            client,
+            registry,
+            jobs,
+            mirror,
+            deferred.ready(),
+            audits,
+            !stopping && parked.len() < CAPACITY,
+        )
+        .await
+        {
+            parked.push_back(pending);
+        }
+    }
 }
 
 async fn outcome<T>(

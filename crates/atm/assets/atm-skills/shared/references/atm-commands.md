@@ -131,9 +131,11 @@ Answers a dialog by pressing keys: `-y` presses Enter on the highlighted
 option, `-n` presses Escape, `-o N` moves Claude's `❯` cursor to option N and
 presses Enter. With no flag it presses Enter.
 
-It refuses nothing: the keys go to whatever is on screen. Peek with
-`--prompt` first, and reply only when you know what you're approving.
-Otherwise ask the user.
+It does not check what's on screen: the keys go to whatever is there. Peek
+with `--prompt` first, and reply only when you know what you're approving.
+Otherwise ask the user. Replies wait behind reserved work and are refused
+while an agent is clearing or quarantined; peek is read-only and still works.
+Both use the daemon, with no direct-tmux fallback on an old daemon.
 
 Claude Code sends no hook when a dialog is answered. After `-y` the row reads
 `attention_needed` until the approved tool ends, so wait with

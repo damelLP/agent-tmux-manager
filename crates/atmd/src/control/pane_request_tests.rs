@@ -13,13 +13,13 @@ use std::{error::Error, future::Future, task::Poll};
 const CLEARING: &str = "Refusing to interrupt %1: agent p/a is clearing; try again in a moment";
 const QUARANTINED: &str = "pane %1: agent p/a is quarantined; restart atmd and reconcile";
 
-fn pane() -> PaneId {
+pub(super) fn pane() -> PaneId {
     PaneId::parse("%1").unwrap()
 }
-fn agent() -> AgentId {
+pub(super) fn agent() -> AgentId {
     "p/a".parse().unwrap()
 }
-fn request(kind: ReservationKind) -> ReservationRequest {
+pub(super) fn request(kind: ReservationKind) -> ReservationRequest {
     ReservationRequest::new(
         agent(),
         Some(pane()),
@@ -28,11 +28,11 @@ fn request(kind: ReservationKind) -> ReservationRequest {
         Instant::now() + Duration::from_secs(60),
     )
 }
-async fn noop(_: Reservation, _: Completion) -> Result<(), ReservationError> {
+pub(super) async fn noop(_: Reservation, _: Completion) -> Result<(), ReservationError> {
     Ok(())
 }
 /// Poll once, so the request is in the actor's queue, then run it as a task.
-async fn queued<T: Send + 'static>(
+pub(super) async fn queued<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> JoinHandle<T> {
     let mut future = Box::pin(future);
@@ -45,7 +45,7 @@ async fn queued<T: Send + 'static>(
 }
 /// A reservation of `kind` on `%1` whose work has started and waits for the
 /// returned sender. `after` runs inside the work once it is released.
-async fn hold<F, Fut>(
+pub(super) async fn hold<F, Fut>(
     control: &ControlHandle,
     kind: ReservationKind,
     after: F,
@@ -76,7 +76,9 @@ where
     entry.await.unwrap();
     (job, release)
 }
-fn start(client: Box<dyn TmuxClient>) -> (ControlHandle, JoinHandle<()>, CancellationToken) {
+pub(super) fn start(
+    client: Box<dyn TmuxClient>,
+) -> (ControlHandle, JoinHandle<()>, CancellationToken) {
     let cancel = CancellationToken::new();
     let (control, actor) = spawn_control(
         client,
@@ -86,13 +88,13 @@ fn start(client: Box<dyn TmuxClient>) -> (ControlHandle, JoinHandle<()>, Cancell
     );
     (control, actor, cancel)
 }
-async fn logged() -> (tempfile::TempDir, OrgHandle, CancellationToken) {
+pub(super) async fn logged() -> (tempfile::TempDir, OrgHandle, CancellationToken) {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
     let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
     (dir, org, cancel)
 }
-async fn events(org: &OrgHandle) -> Vec<(String, serde_json::Value)> {
+pub(super) async fn events(org: &OrgHandle) -> Vec<(String, serde_json::Value)> {
     org.tail(crate::org::TailParams::default())
         .await
         .unwrap()
@@ -100,7 +102,7 @@ async fn events(org: &OrgHandle) -> Vec<(String, serde_json::Value)> {
         .map(|event| (event.kind, event.body))
         .collect()
 }
-fn effects(mock: &MockTmuxClient) -> Vec<MockCall> {
+pub(super) fn effects(mock: &MockTmuxClient) -> Vec<MockCall> {
     mock.calls()
         .into_iter()
         .filter(|call| !matches!(call, MockCall::RawCommand { .. }))

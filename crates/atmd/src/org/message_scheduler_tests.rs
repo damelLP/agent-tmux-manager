@@ -1111,7 +1111,7 @@ async fn unobservable_stuck_recipient_keeps_its_reason_and_resumes_when_ready() 
     .await;
     let id = rig.send().await;
     rig.round(0).await;
-    assert!(rig.job.lost.is_some());
+    assert!(rig.job.lost.is_none());
     let now = rig.job.service.rt.clock.now().unwrap();
     let live = rig.job.service.rt.history.snapshot(id, now).unwrap().live;
     assert_eq!(live.agent_status, atm_org::AgentStatus::Stuck);
@@ -1163,6 +1163,78 @@ async fn unobservable_stuck_recipient_keeps_its_reason_and_resumes_when_ready() 
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
     assert_eq!(snapshot.message.last_attempt.unwrap().attempt, 1);
     assert_eq!(rig.notes().await, [notice]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_loss_after_ready_does_not_include_the_stuck_interval() {
+    let mut rig = ManualJob::new().await;
+    rig.command(OrgCommand::Stuck {
+        agent_id: worker(),
+        reason: "needs recovery".into(),
+    })
+    .await;
+    let id = rig.send().await;
+    let mut queued = rig.job.service.board.queued.subscribe();
+    assert!(matches!(
+        guarded(rig.job.round(&mut queued)).await.unwrap(),
+        Next::Change
+    ));
+    let notice = blocked_notice(id, "recipient agent is stuck or down", &[], false);
+    assert_eq!(rig.notes().await, std::slice::from_ref(&notice));
+    assert_eq!(rig.screens.calls(&worker()), 1);
+    // The blocked job waits for a change, not a poll. The readable hour is
+    // not sampled and cannot count towards a later observation loss.
+    rig.screens.set(worker(), ready("%1", "s1"));
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(rig.screens.calls(&worker()), 1);
+    rig.screens.lose(&worker());
+    rig.command(OrgCommand::Adopt {
+        agent_id: worker(),
+        pane: "%1".into(),
+        session_id: Some("s1".into()),
+    })
+    .await;
+    rig.round(0).await;
+    assert_eq!(rig.notes().await, std::slice::from_ref(&notice));
+    rig.round(999).await;
+    assert_eq!(rig.notes().await, std::slice::from_ref(&notice));
+    // At one second the pane is readable again. Unknown focus prevents
+    // input without claiming the owner is there or starting another hold.
+    rig.screens
+        .set(worker(), with(ready("%1", "s1"), |o| o.focused = None));
+    rig.round(1).await;
+    assert!(rig.job.lost.is_none());
+    rig.round(120_000).await;
+    assert_eq!(rig.notes().await, [notice]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sustained_loss_after_ready_gets_its_full_window_and_one_notice() {
+    let mut rig = ManualJob::new().await;
+    rig.command(OrgCommand::Stuck {
+        agent_id: worker(),
+        reason: "needs recovery".into(),
+    })
+    .await;
+    let id = rig.send().await;
+    rig.round(0).await;
+    let notice = blocked_notice(id, "recipient agent is stuck or down", &[], false);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    rig.command(OrgCommand::Adopt {
+        agent_id: worker(),
+        pane: "%1".into(),
+        session_id: Some("s1".into()),
+    })
+    .await;
+    // Failed looks continue, but their new measured window starts at Ready.
+    rig.round(0).await;
+    assert_eq!(rig.notes().await, std::slice::from_ref(&notice));
+    rig.round(119_999).await;
+    assert_eq!(rig.notes().await, std::slice::from_ref(&notice));
+    rig.round(1).await;
+    assert_eq!(rig.notes().await, [notice.clone(), unobserved(id)]);
+    rig.round(3_600_000).await;
+    assert_eq!(rig.notes().await, [notice, unobserved(id)]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1294,6 +1366,36 @@ async fn paneless_starting_observations_preserve_readiness_and_hold_clocks() {
                 }
             ));
         }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pane_observations_are_throttled_across_frequent_job_wakes() {
+    let mut rig = ManualJob::new().await;
+    rig.screens
+        .set(worker(), with(ready("%1", "s1"), |o| o.focused = None));
+    let id = rig.send().await;
+    for (advance_ms, captures) in [
+        (0, 1),
+        (0, 1),
+        (1, 1),
+        (248, 1),
+        (0, 1),
+        (1, 2),
+        (0, 2),
+        (249, 2),
+        (1, 3),
+    ] {
+        tokio::time::advance(Duration::from_millis(advance_ms)).await;
+        // Retain observed across completed rounds: wakes within 250 ms may
+        // reevaluate delivery, but must not capture the same pane again.
+        let mut queued = rig.job.service.board.queued.subscribe();
+        guarded(rig.job.round(&mut queued)).await.unwrap();
+        assert_eq!(rig.screens.calls(&worker()), captures);
+        let rt = &rig.job.service.rt;
+        let snapshot = rt.history.snapshot(id, rt.clock.now().unwrap()).unwrap();
+        assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+        assert!(snapshot.message.last_attempt.is_none());
     }
 }
 

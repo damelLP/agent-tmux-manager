@@ -40,10 +40,13 @@
 //! history refused what it returned) is not a focused pane. While that lasts,
 //! the inbox shows "recipient cannot be observed" where the policy answers
 //! its unbounded focus wait, and once it has lasted the policy's readiness
-//! timeout the owner gets one notice per loss, for the oldest open message.
+//! timeout the owner gets at most one notice per loss, for the oldest open
+//! message only, and never again for the same message while it remains open.
 //! A Stuck or Down recipient keeps its own blocked reason and notice instead,
-//! whatever the focus, and gets no unobserved notice. Nothing is held: the
-//! message stays queued until observations return and delivery guards clear.
+//! whatever the focus, and ends the measured loss without an unobserved notice:
+//! the blocked job does not poll. A loss after Ready is measured anew. Nothing
+//! is held: the message stays queued until observations return and delivery
+//! guards clear.
 //! An observation that succeeded with an unknown focus is no loss; it waits
 //! as the next paragraph says.
 //!
@@ -691,7 +694,7 @@ impl Job {
                 Err(error) => Err(error),
             };
         };
-        // Committed pane-less state needs no capture or pacing.
+        // Only a pane capture is paced; the pane-less state above is read every round.
         let poll = rt.policy.settings().guard_poll_interval;
         if self.observed.is_some_and(|at| at.elapsed() < poll) {
             return Ok(());
@@ -855,6 +858,9 @@ impl Job {
                 Ok(Next::Again)
             }
             DeliveryStep::Blocked { reason } => {
+                if reason == FailureReason::AgentUnavailable {
+                    self.lost = None;
+                }
                 let latched = latched(&step);
                 let text = blocked_reason(reason, snapshot.hold);
                 self.show(id, DeliveryPhase::Blocked, Some(text.clone()), None);

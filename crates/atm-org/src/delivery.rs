@@ -2839,6 +2839,38 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_and_retry_accounting_precede_agent_unavailability() {
+        for status in [AgentStatus::Stuck, AgentStatus::Down] {
+            let mut h = History::new(false);
+            let mut live = ready();
+            live.agent_status = status;
+            h.attempt(1, 0);
+            assert_eq!(
+                h.step(&live, 2),
+                DeliveryStep::AwaitConfirmation { until: time(3) },
+                "inside confirmation window: {status:?}"
+            );
+            assert_eq!(
+                h.step(&live, 4),
+                DeliveryStep::RetryAt {
+                    at: time(5),
+                    reason: FailureReason::ConfirmationTimeout
+                },
+                "past confirmation deadline: {status:?}"
+            );
+            h.failure(false, 4);
+            assert_eq!(
+                h.step(&live, 4),
+                DeliveryStep::RetryAt {
+                    at: time(5),
+                    reason: FailureReason::ConfirmationTimeout
+                },
+                "queued before retry delay: {status:?}"
+            );
+        }
+    }
+
+    #[test]
     fn retry_rechecks_guards_and_uses_actual_failure_timestamp() {
         let mut h = History::new(false);
         h.attempt(1, 0);

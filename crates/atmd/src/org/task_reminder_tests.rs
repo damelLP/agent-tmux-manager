@@ -1047,3 +1047,80 @@ fn an_invalid_reminder_section_is_an_error_and_never_a_guess() {
         assert!(!error.contains("SECRET"), "{text:?}: {error}");
     }
 }
+
+// ------------------------------------------------------------ a real capture
+
+/// One whole Claude Code session replayed through the registry, as the
+/// connection does for each hook call (translate, then apply with the
+/// adapter's context), with the watch reading what the registry publishes.
+/// Status lines are left out: they change neither status nor activity.
+///
+/// Captured: Claude Code 2.1.310, 2026-10-24, the daemon's interleaved
+/// fixture (see `tests/server_integration.rs`); the line numbers are its.
+#[tokio::test]
+async fn a_captured_claude_session_arms_a_wait_at_its_turn_ends_only() {
+    let registry = crate::registry::spawn_registry();
+    let mut rows = registry.subscribe();
+    let mut watch = Watch::default();
+    let mut waits = Vec::new();
+    let capture = include_str!("../../tests/fixtures/claude_tui_interleaved_2.1.310.jsonl");
+    for (index, line) in capture.lines().enumerate() {
+        let mut call: serde_json::Value = serde_json::from_str(line).unwrap();
+        if call["kind"] != "hook" {
+            continue;
+        }
+        let mut payload = call["payload"].take();
+        // atm-hook adds the harness's pid; any live one will do.
+        payload["pid"] = std::process::id().into();
+        let raw: atm_claude_adapter::RawHookEvent = serde_json::from_value(payload).unwrap();
+        let Some(event) = raw.to_lifecycle_event() else {
+            continue;
+        };
+        let session = raw.session_id();
+        registry
+            .apply_lifecycle_event_with_context(
+                session.clone(),
+                event,
+                atm_core::Harness::ClaudeCode,
+                raw.pid,
+                None,
+                raw.lifecycle_context(),
+            )
+            .await
+            .unwrap();
+        // The call has answered, so all it published is in the channel.
+        let before = watch.pending.contains_key(&session);
+        while let Ok(row) = rows.try_recv() {
+            watch.observe(&row, &settings(), at(index as i64));
+        }
+        let after = watch.pending.contains_key(&session);
+        if before != after {
+            let what = if after { "armed" } else { "dropped" };
+            waits.push((index + 1, raw.hook_event_name.clone(), what));
+        }
+    }
+    let expected = [
+        // Two turns, each with a permission dialog, each ended by its Stop
+        // and followed by the next prompt.
+        (10, "Stop", "armed"),
+        (12, "UserPromptSubmit", "dropped"),
+        (18, "Stop", "armed"),
+        (20, "UserPromptSubmit", "dropped"),
+        // Line 25 is a Stop while a background agent runs: no wait. The
+        // turn its task notification starts (line 28) ends at line 29.
+        (29, "Stop", "armed"),
+        // The idle notice a minute later (line 31) keeps that wait.
+        // `/compact` at the idle prompt reads as a turn of its own.
+        (32, "PreCompact", "dropped"),
+        (35, "SessionStart", "armed"),
+        // `/clear`: the row goes, and the new session's first row is idle
+        // with no turn before it. So is the resumed session's.
+        (37, "SessionEnd", "dropped"),
+    ];
+    let waits: Vec<(usize, &str, &str)> = waits
+        .iter()
+        .map(|(line, name, what)| (*line, name.as_str(), *what))
+        .collect();
+    assert_eq!(waits, expected);
+    assert_eq!(watch.next_wake(), None);
+}

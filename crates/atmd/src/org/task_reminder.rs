@@ -8,6 +8,11 @@
 //! It adds no way to type into a pane: both notes are messages, delivered by
 //! the message runtime with all its guards.
 //!
+//! This is also the single task-budget scheduler: committed task events and
+//! startup reconcile budgets, and its one timer chooses the earliest reminder
+//! or budget deadline. Disabling reminders leaves budget deadlines running.
+//! Registry lag drops reminder observations, never the durable budget deadline.
+//!
 //! # What counts as a turn end
 //!
 //! A session's row going from not idle to idle, the only turn-end fact the
@@ -406,20 +411,43 @@ async fn settle(
     }
 }
 
-/// Registry events are read before a wake is taken (`biased`), so a turn
-/// that started before the wait was over has dropped it.
+async fn budget_wake(org: &OrgHandle, clock: &impl Fn() -> DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match super::task_budget::reconcile_budgets(org, clock()).await {
+        Ok(wake) => wake,
+        Err(error) => {
+            tracing::warn!(%error, "Task budgets deferred; a new snapshot precedes retry");
+            if org.status().is_ok() {
+                clock().checked_add_signed(TimeDelta::seconds(1))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Registry events are read before a reminder wake (`biased`), so a turn
+/// that started before its wait was over has dropped it. Budget deadlines
+/// are independent: check them after every event so busy rows cannot starve them.
 async fn run(
     org: OrgHandle,
     mut rows: broadcast::Receiver<SessionEvent>,
-    settings: ReminderSettings,
+    settings: impl Into<Option<ReminderSettings>>,
     clock: impl Fn() -> DateTime<Utc>,
     cancel: CancellationToken,
 ) {
+    let settings = settings.into();
+    // Subscribe before the first snapshot; overlap is harmless because the
+    // message log is the latch, and a lag is repaired by a fresh snapshot.
+    let mut committed = org.committed.subscribe();
+    let mut budget_at = budget_wake(&org, &clock).await;
     let mut watch = Watch::default();
     loop {
         // A clock that stepped back makes the wait longer, never shorter.
         let wait = watch
             .next_wake()
+            .into_iter()
+            .chain(budget_at)
+            .min()
             .map(|wake| (wake - clock()).to_std().unwrap_or_default());
         let wake = async {
             match wait {
@@ -427,28 +455,42 @@ async fn run(
                 None => std::future::pending().await,
             }
         };
-        let row = tokio::select! {
+        tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            row = rows.recv() => Some(row),
-            () = wake => None,
-        };
-        match row {
-            Some(Ok(row)) => watch.observe(&row, &settings, clock()),
-            Some(Err(RecvError::Lagged(_))) => watch.forget(),
-            Some(Err(RecvError::Closed)) => return,
-            None => settle(&org, &mut watch, &settings, clock()).await,
+            row = rows.recv() => match row {
+                Ok(row) => if let Some(settings) = &settings {
+                    watch.observe(&row, settings, clock());
+                },
+                Err(RecvError::Lagged(_)) => watch.forget(),
+                Err(RecvError::Closed) => return,
+            },
+            event = committed.recv() => match event {
+                Ok(event) if event.kind.starts_with("task.") => {
+                    budget_at = budget_wake(&org, &clock).await;
+                },
+                Err(RecvError::Lagged(_)) => budget_at = budget_wake(&org, &clock).await,
+                Err(RecvError::Closed) => return,
+                _ => {},
+            },
+            () = wake => if let Some(settings) = &settings {
+                settle(&org, &mut watch, settings, clock()).await;
+            },
+        }
+        if budget_at.is_some_and(|at| at <= clock()) {
+            budget_at = budget_wake(&org, &clock).await;
         }
     }
 }
 
-/// Starts the scheduler on the registry's events `rows`. It runs until
+/// Starts the single task scheduler on registry and committed task events.
+/// None disables reminders only; budget deadlines still run. It runs until
 /// `cancel` or until the registry stops.
 pub fn spawn_task_reminders(
     org: OrgHandle,
     rows: broadcast::Receiver<SessionEvent>,
-    settings: ReminderSettings,
+    settings: impl Into<Option<ReminderSettings>>,
     cancel: CancellationToken,
 ) {
-    tokio::spawn(run(org, rows, settings, Utc::now, cancel));
+    tokio::spawn(run(org, rows, settings.into(), Utc::now, cancel));
 }

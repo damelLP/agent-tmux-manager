@@ -109,6 +109,8 @@ pub struct ListResult {
 #[derive(Debug, Serialize)]
 pub struct GetResult {
     pub task: Task,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_status: Option<atm_org::budget::BudgetStatus>,
 }
 
 /// Canonical task sequence; legacy free-text message references are not task IDs.
@@ -393,8 +395,15 @@ impl TaskHandle {
         tokio::time::timeout(READ_BUDGET, async {
             let state = self.org.snapshot().await?;
             caller_address(&state, &caller)?;
+            let task = task(&state, &params.task_id)?;
             let result = GetResult {
-                task: task(&state, &params.task_id)?.clone(),
+                task: task.clone(),
+                budget_status: atm_org::budget::budget_status(
+                    &state,
+                    task,
+                    &atm_org::TaskCost::default(),
+                    chrono::Utc::now(),
+                ),
             };
             bounded(&result)?;
             Ok(result)

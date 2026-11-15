@@ -8,7 +8,7 @@ mod tasks;
 
 use atm_core::Money;
 use atm_org::{
-    budget::{budget_crossings, budget_note, BudgetKind},
+    budget::{budget_crossings, budget_note, budget_status, budget_step, BudgetKind},
     *,
 };
 use chrono::Duration;
@@ -294,6 +294,97 @@ fn budget_body_roundtrips_unchanged() {
     let partial: TaskBudget =
         serde_json::from_value(json!({"turns": 10, "future": "skip"})).unwrap();
     assert_eq!(partial, limits(None, Some(10)));
+}
+
+// Break caught: no timer for the earliest future deadline, or rearming after
+// a cost crossing already queued the task's single canonical notification.
+#[test]
+fn budget_step_selects_earliest_unnotified_deadline_and_supplied_usage() {
+    let mut rig = Rig::new();
+    let mut body = new_task(TaskKind::Work, mechanical(), LEAD);
+    body.budget = Some(TaskBudget {
+        deadline: Some(ts(30)),
+        ..limits(Some(0), None)
+    });
+    let first = rig.create(body.clone());
+    body.budget.as_mut().unwrap().deadline = Some(ts(20));
+    let second = rig.create(body);
+    let step = budget_step(&rig.state, ts(0), |_| None);
+    assert!(step.notes.is_empty());
+    assert_eq!(step.wake_at, Some(ts(20)));
+    let due = budget_step(&rig.state, ts(20), |_| None);
+    assert_eq!(due.notes.len(), 1);
+    assert_eq!(due.notes.first().unwrap().task, Some(second));
+    assert_eq!(due.wake_at, Some(ts(30)));
+    let charged = budget_step(&rig.state, ts(0), |id| {
+        (id == &first).then(|| usage(Some(1), None))
+    });
+    assert_eq!(charged.notes.len(), 1);
+    assert_eq!(charged.notes.first().unwrap().task, Some(first));
+    assert_eq!(charged.wake_at, Some(ts(20)));
+}
+
+// Break caught: delivery/read/failure or state changes rearm budget alerts, or
+// an ordinary note suppresses the task's required budget notification.
+#[test]
+fn note_survives_state_and_delivery_changes_and_replay() {
+    for outcome in ["queued", "delivered", "read", "failed"] {
+        let mut rig = Rig::new();
+        let mut body = new_task(TaskKind::Work, mechanical(), LEAD);
+        body.budget = Some(TaskBudget {
+            deadline: Some(ts(20)),
+            ..limits(None, None)
+        });
+        let id = rig.create(body);
+        let mut ordinary = budget_note(rig.task(&id)).unwrap();
+        ordinary.body = "An unrelated note".into();
+        rig.org(OrgCommand::SendMessage(ordinary)).unwrap();
+        let due = budget_step(&rig.state, ts(20), |_| None);
+        assert_eq!(due.notes.len(), 1, "ordinary note is not the latch");
+        rig.org(OrgCommand::SendMessage(due.notes.first().unwrap().clone()))
+            .unwrap();
+        let message_id = MessageId::new(rig.seq);
+        if matches!(outcome, "delivered" | "read") {
+            rig.org(OrgCommand::Delivered {
+                message_id,
+                session_id: atm_core::SessionId::new("s1"),
+                confirmation: "observed".into(),
+            })
+            .unwrap();
+        }
+        if outcome == "read" {
+            rig.org(OrgCommand::ReadMessages {
+                who: LEAD.parse().unwrap(),
+                message_ids: vec![message_id],
+            })
+            .unwrap();
+        }
+        if outcome == "failed" {
+            rig.org(OrgCommand::DeliveryFailed {
+                message_id,
+                reason: "gave up".into(),
+                final_failure: true,
+            })
+            .unwrap();
+        }
+        rig.ok(assign(&id, BUILD, by(LEAD)));
+        let mut replayed = OrgState::default();
+        for (seq, event) in &rig.log {
+            replayed.apply(*seq, ts(*seq), event).unwrap();
+        }
+        let status = budget_status(
+            &replayed,
+            replayed.task(&id).unwrap(),
+            &TaskCost::default(),
+            ts(100),
+        )
+        .unwrap();
+        assert_eq!(status.crossed, vec![BudgetKind::Deadline]);
+        assert_eq!(status.notification, Some(message_id));
+        let next = budget_step(&replayed, ts(100), |_| None);
+        assert!(next.notes.is_empty(), "{outcome} must retain the latch");
+        assert_eq!(next.wake_at, None);
+    }
 }
 
 proptest! {

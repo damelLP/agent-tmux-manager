@@ -12,6 +12,9 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
+#[path = "support/control.rs"]
+mod control_support;
+
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -267,7 +270,9 @@ fn test_client_with_other_state_dir_uses_the_running_daemon() {
     let mut daemon = atmd(&socket, &dir.path().join("state1"), &[])
         .spawn()
         .expect("spawn atmd");
-    wait_for("the socket", || socket.exists());
+    wait_for("an accepting socket", || {
+        control_support::socket_is_ready(&socket)
+    });
 
     let started = Instant::now();
     let list = Command::new(env!("CARGO_BIN_EXE_atm"))

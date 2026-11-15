@@ -5,6 +5,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+/// Readiness predicate for synchronous startup loops: bind alone is not ready.
+pub fn socket_is_ready(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
 /// Register before probing so binding between probe and wait cannot be missed.
 /// Readiness means an accepting socket, not merely a filesystem entry.
 pub async fn wait_for_socket(socket: &Path) {
@@ -106,7 +111,7 @@ impl Daemon {
             dir: dir.to_owned(),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !dir.join("atmd.sock").exists() {
+        while !socket_is_ready(&dir.join("atmd.sock")) {
             assert!(
                 daemon.child.try_wait().unwrap().is_none(),
                 "daemon exited: {}",
@@ -287,6 +292,11 @@ mod socket_readiness_tests {
             Some(libc::ECONNREFUSED)
         );
 
+        assert!(socket.exists());
+        assert!(
+            !socket_is_ready(&socket),
+            "synchronous startup must not mistake bind for listen"
+        );
         let ready = wait_for_socket(&socket);
         tokio::pin!(ready);
         poll_fn(|cx| {
@@ -298,6 +308,7 @@ mod socket_readiness_tests {
         assert_eq!(unsafe { libc::listen(fd.as_raw_fd(), 1) }, 0);
         let listener = UnixListener::from(fd);
         ready.await;
+        assert!(socket_is_ready(&socket));
         listener
             .accept()
             .expect("readiness required a real connect");

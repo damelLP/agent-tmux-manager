@@ -354,6 +354,17 @@ fn measure_continuations_are_refused_at_any_indent() {
     );
 }
 
+// Break caught: an inline comment hiding a weaker measure prefix (probe P3c).
+#[test]
+fn commented_continuation_cannot_authorize_a_measure_prefix() {
+    assert_eq!(
+        parse_intent_measures(
+            "## How we will know\n- mechanical: cargo test\n  --release <!-- note -->\n"
+        ),
+        Err(IntentError::InvalidMeasure { line: 3 })
+    );
+}
+
 // Break caught: confusing a Markdown boundary with a wrapped measure value.
 #[test]
 fn markdown_boundaries_after_measures_are_not_continuations() {

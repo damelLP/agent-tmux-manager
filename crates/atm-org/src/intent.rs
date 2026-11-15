@@ -44,7 +44,7 @@ pub fn parse_intent_measures(text: &str) -> Result<Vec<TaskMeasure>, IntentError
             && heading(text, lines.peek().map(|(_, s)| *s)).is_none()
             && fence_run(text).is_none()
             && !thematic_break(text)
-            && !text.contains("<!--")
+            && !text.starts_with("<!--")
         {
             return Err(IntentError::InvalidMeasure {
                 line: row.saturating_add(1),

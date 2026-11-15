@@ -77,7 +77,12 @@ fn every_decision_kind_has_a_golden_body_that_round_trips() {
             .unwrap();
         assert_eq!(event.kind(), line.kind);
         assert!(event.to_body().is_object(), "{}", line.kind);
-        assert_eq!(event.to_body(), line.body, "{} seq {}", line.kind, line.seq);
+        let mut expected = line.body.clone();
+        if line.seq == 14 {
+            // A newer kind folds, but its spelling is lost in this reader.
+            expected["kind"] = json!("unknown");
+        }
+        assert_eq!(event.to_body(), expected, "{} seq {}", line.kind, line.seq);
         assert_eq!(
             OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(),
             Some(event)
@@ -99,7 +104,7 @@ fn malformed_decision_bodies_error_and_additive_fields_are_tolerated() {
     }
     for (kind, field, bad) in [
         ("decision.requested", "requester", json!("p/bad name")),
-        ("decision.requested", "kind", json!("other")),
+        ("decision.requested", "kind", json!(1)),
         ("decision.requested", "may_be_undone", json!("true")),
         ("decision.requested", "deadline", json!("tomorrow")),
         ("decision.requested", "options", json!("a")),
@@ -112,6 +117,23 @@ fn malformed_decision_bodies_error_and_additive_fields_are_tolerated() {
         let mut body = golden_event(kind).to_body();
         body[field] = bad;
         assert!(OrgEvent::from_parts(kind, &body).is_err(), "{kind} {field}");
+    }
+}
+
+#[test]
+fn unknown_decision_kinds_decode_to_a_fallback_without_the_original_word() {
+    for kind in ["merge", "unknown"] {
+        let mut body = request_body();
+        body["kind"] = json!(kind);
+        let event = OrgEvent::from_parts("decision.requested", &body)
+            .unwrap()
+            .unwrap();
+        body["kind"] = json!("unknown");
+        assert_eq!(event.to_body(), body);
+        assert_eq!(
+            OrgEvent::from_parts("decision.requested", &event.to_body()).unwrap(),
+            Some(event)
+        );
     }
 }
 
@@ -134,7 +156,7 @@ fn the_class_follows_from_the_two_facts() {
 fn golden_log_folds_to_the_expected_state() {
     let state = folded();
     let ids: Vec<_> = state.decisions().map(|decision| decision.id).collect();
-    assert_eq!(ids, [3, 6, 9, 11, 13].map(d));
+    assert_eq!(ids, [3, 6, 9, 11, 13, 14].map(d));
 
     // Taken provisionally on `a`, then overruled by the owner with `b`.
     let overruled = state.decision(&d(3)).unwrap();
@@ -240,6 +262,32 @@ fn golden_log_folds_to_the_expected_state() {
                 deadline: None,
             },
             requested_at: at(13),
+            status: DecisionStatus::Pending,
+            provisional: None,
+            taken_at: None,
+            resolution: None,
+            withdrawal: None,
+            closed_at: None,
+        }
+    );
+    let future = state.decision(&d(14)).unwrap();
+    assert_eq!(
+        future,
+        &Decision {
+            id: d(14),
+            request: DecisionRequest {
+                requester: Address::System,
+                kind: DecisionKind::Unknown,
+                title: "A decision from a newer build".into(),
+                context: String::new(),
+                files: vec![],
+                options: vec!["yes".into(), "no".into()],
+                recommended: None,
+                may_be_undone: false,
+                changes_intent: true,
+                deadline: None,
+            },
+            requested_at: at(14),
             status: DecisionStatus::Pending,
             provisional: None,
             taken_at: None,
@@ -955,12 +1003,13 @@ fn a_request_is_checked_before_it_is_logged() {
         })
     };
     type Change = fn(&mut DecisionRequest);
-    let cases: [(Change, &'static str, &str); 10] = [
+    let cases: [(Change, &'static str, &str); 11] = [
         (
             |r| r.requester = Address::Owner,
             "requester",
             "must be an agent or system",
         ),
+        (|r| r.kind = DecisionKind::Unknown, "kind", "must be known"),
         (|r| r.title.clear(), "title", "must not be empty"),
         (|r| r.options.clear(), "options", "need at least two"),
         (|r| r.options.truncate(1), "options", "need at least two"),

@@ -115,10 +115,10 @@
 //! Before the state is looked at, Resolve refuses anyone but the owner, and
 //! Withdraw refuses anyone but the requester and the owner. On a pending or
 //! provisional decision, Resolve refuses an option that is not listed.
-//! Request accepts only a known agent or `system` as requester and refuses an
-//! empty title, fewer than two options, an empty or repeated option, a
-//! recommendation that is not an option, and a deadline not
-//! after `now`. Whether the owner is away is not known here: the caller decides
+//! Request accepts only a known agent or `system` as requester and a known
+//! [`DecisionKind`]. It refuses an empty title, fewer than two options, an empty
+//! or repeated option, a recommendation that is not an option, and a deadline
+//! not after `now`. Whether the owner is away is not known here: the caller decides
 //! when to take a decision provisionally, this policy whether it may.
 //!
 //! # Delivery policy
@@ -141,7 +141,8 @@
 //! A newer daemon must read every older log. An older daemon may fail on a newer
 //! log: a new message kind or address form, or a known event referring to an entity
 //! created by a skipped unknown kind. On such replay errors the daemon must disable
-//! organisation methods, not fail to start. Closed enums have no Other variants.
+//! organisation methods, not fail to start. Unknown decision kinds fold as
+//! [`DecisionKind::Unknown`] (the original word is lost); new requests refuse it.
 //!
 //! # Data and limits
 //!

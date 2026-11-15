@@ -85,13 +85,14 @@ pub fn decision_event_case(slot: usize, text: String, n: u64, flag: bool) -> Org
             if !flag {
                 request.deadline = None;
             }
-            request.kind = match n % 6 {
+            request.kind = match n % 7 {
                 0 => DecisionKind::Action,
                 1 => DecisionKind::Hire,
                 2 => DecisionKind::Budget,
                 3 => DecisionKind::Policy,
                 4 => DecisionKind::Plan,
-                _ => DecisionKind::Dialog,
+                5 => DecisionKind::Dialog,
+                _ => DecisionKind::Unknown,
             };
             OrgEvent::DecisionRequested(request)
         }

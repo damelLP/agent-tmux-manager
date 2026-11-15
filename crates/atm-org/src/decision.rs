@@ -20,7 +20,9 @@
 //! Optional facts (`recommended`, `deadline`, `note`, `reason`) emit null.
 //! Applying a fact checks references only (the decision exists, the requester
 //! and `by` are known, the ID is new) and never today's policy, so a late or
-//! older fact still folds. Older readers skip all six kinds.
+//! older fact still folds. Readers predating decisions skip all six kinds.
+//! An unrecognised request `kind` folds as [`DecisionKind::Unknown`], losing
+//! its original word; policy refuses new requests with that fallback.
 
 use crate::{Address, OrgEvent, OrgState, Refusal};
 use chrono::{DateTime, Utc};
@@ -85,6 +87,9 @@ pub enum DecisionKind {
     Policy,
     Plan,
     Dialog,
+    /// Read-only fallback for later kinds; the original word is not retained.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +390,9 @@ fn check_request(request: &DecisionRequest, now: DateTime<Utc>) -> Result<(), Re
     };
     if request.requester == Address::Owner {
         return invalid("requester", "must be an agent or system");
+    }
+    if request.kind == DecisionKind::Unknown {
+        return invalid("kind", "must be known");
     }
     let options = &request.options;
     if request.title.is_empty() {

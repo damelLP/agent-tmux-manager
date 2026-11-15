@@ -496,11 +496,24 @@ async fn decision_lists_count_all_pages_and_keep_provisional_answers_visible() {
         counts,
         json!({"decisions":[],"pending_count":100,"provisional_count":1,"next_after":null})
     );
+    let mut answers = rig
+        .org
+        .watch(vec!["msg.sent".into()], rig.org.status().unwrap())
+        .unwrap();
     let answer = rig
         .call("decision.resolve", json!({"id":"d4","option":"no"}), None)
         .await
         .unwrap();
     assert_eq!(answer["decision"]["status"], "overruled");
+    let message = tokio::time::timeout(Duration::from_secs(60), answers.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        message.body,
+        json!({"from":"system","to":"project/worker","kind":"answer","body":"Decision d4 overruled: no\nStanding rule: no","attachments":[],"task":null})
+    );
     assert_eq!(
         rig.call("decision.list", json!({"statuses":["overruled"]}), None)
             .await

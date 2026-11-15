@@ -82,6 +82,17 @@ fn decision_answer_mapping_uses_status_and_exact_durable_message() {
         .apply(4, now(), &OrgEvent::DecisionResolved(answer().into()))
         .unwrap();
     assert_eq!(missing_resolution_messages(&state), [content()]);
+    let mut overruled = pending();
+    overruled
+        .apply(4, now(), &OrgEvent::DecisionOverruled(answer().into()))
+        .unwrap();
+    assert_eq!(
+        missing_resolution_messages(&overruled),
+        [MessageContent {
+            body: "Decision d3 overruled: yes\nNote: go\nStanding rule: yes".into(),
+            ..content()
+        }]
+    );
     for event in [
         OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
             decision_id: DecisionId::new(3),
@@ -147,6 +158,94 @@ fn decision_answer_mapping_uses_status_and_exact_durable_message() {
         missing_resolution_messages(&system).is_empty(),
         "system has no inbox"
     );
+}
+
+// Break caught: subscribing only to decision.resolved leaves an overrule
+// unanswered until another resolution. The current-thread runtime's park hook
+// is an idle barrier: all actor/bridge I/O here is in-memory, so no elapsed-time
+// wait or subsequent event is needed to inspect the completed reaction.
+#[test]
+fn decision_overrule_wakes_bridge_without_another_decision_event() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    };
+    use tokio::sync::{broadcast, mpsc, oneshot, watch};
+
+    let idle = Arc::new(Mutex::new(None::<oneshot::Sender<()>>));
+    let parked = idle.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_park(move || {
+            if let Some(reply) = parked.lock().unwrap().take() {
+                let _ = reply.send(());
+            }
+        })
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (requests, receive) = mpsc::channel(64);
+        let (health, status) = watch::channel(Ok(3));
+        let (committed, _) = broadcast::channel(1024);
+        let cancel = CancellationToken::new();
+        let seq = AtomicU64::new(3);
+        let actor = tokio::spawn(crate::org::actor::run(
+            pending(),
+            receive,
+            health,
+            committed.clone(),
+            cancel.clone(),
+            move |_| std::future::ready(Ok(seq.fetch_add(1, Ordering::SeqCst) + 1)),
+        ));
+        let org = OrgHandle {
+            requests,
+            health: status,
+            committed,
+            reads: Some(crate::org::watch::ReadAccess {
+                reader: crate::org::storage::Reader::start(dir.path().into()).unwrap(),
+            }),
+        };
+        let (handle, bridge) = spawn_decisions(
+            org.clone(),
+            MessageClock::new(tokio::time::Instant::now(), now()),
+            cancel.child_token(),
+        );
+        guarded(handle.initialized()).await.unwrap();
+        org.execute(
+            OrgCommand::Decision(DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                decision_id: DecisionId::new(3),
+                option: "yes".into(),
+                by: Address::System,
+            })),
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut overrule = answer();
+        overrule.option = "no".into();
+        org.execute(
+            OrgCommand::Decision(DecisionCommand::Resolve(overrule)),
+            now(),
+        )
+        .await
+        .unwrap();
+        let (reply, reached_idle) = oneshot::channel();
+        *idle.lock().unwrap() = Some(reply);
+        guarded(reached_idle).await.unwrap();
+        let state = org.snapshot().await.unwrap();
+        assert_eq!(state.messages().count(), 1, "overrule must wake the bridge");
+        assert_eq!(
+            state.messages().next().unwrap().content,
+            MessageContent {
+                body: "Decision d3 overruled: no\nNote: go\nStanding rule: yes".into(),
+                ..content()
+            }
+        );
+        cancel.cancel();
+        guarded(bridge).await.unwrap();
+        guarded(actor).await.unwrap();
+    });
 }
 
 // Break caught: truncating a row, ignoring the byte cap, or revalidating a

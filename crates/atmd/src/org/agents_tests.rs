@@ -64,6 +64,9 @@ mod reconciliation {
                 std::collections::VecDeque<Option<super::super::agent_flow::ProcFacts>>,
             >,
         >,
+        /// The daemon's `ATM_SPAWN_*` start environment the service reads;
+        /// empty by default.
+        spawn_env: std::collections::HashMap<String, String>,
     }
     impl Rig {
         async fn new() -> Self {
@@ -163,6 +166,7 @@ mod reconciliation {
                 ))),
                 proc_after_enter: Default::default(),
                 proc_script: Default::default(),
+                spawn_env: Default::default(),
             }
         }
         async fn command(&self, command: OrgCommand) {
@@ -275,7 +279,10 @@ mod reconciliation {
                 self.control.clone(),
                 self.cancel.child_token(),
                 self.reader(),
-                std::sync::Arc::new(|_| None),
+                {
+                    let env = self.spawn_env.clone();
+                    std::sync::Arc::new(move |key| env.get(key).cloned())
+                },
             )
         }
         /// The scripted procfs reader. Every test starts the service with it:

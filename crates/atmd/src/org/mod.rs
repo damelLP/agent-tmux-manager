@@ -54,6 +54,9 @@ mod message_service_tests;
 pub mod message_types;
 pub mod messages;
 mod raw;
+mod start_line;
+#[cfg(test)]
+mod start_line_tests;
 mod storage;
 mod summary;
 mod watch;

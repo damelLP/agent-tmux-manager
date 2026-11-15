@@ -759,8 +759,13 @@ impl Job {
     ) -> Result<Next, MessageError> {
         let service = self.service.clone();
         let snapshot = service.rt.history.snapshot(id, now)?;
-        if snapshot.message.status == DeliveryStatus::Delivered {
-            // Delivered and acknowledged while this round ran.
+        if matches!(
+            snapshot.message.status,
+            DeliveryStatus::Delivered | DeliveryStatus::Failed
+        ) {
+            // Settled while this round ran: delivered and acknowledged, or
+            // failed for good and forgotten. Expecting it again would hold
+            // its reference for ever.
             return Ok(Next::Change);
         }
         let Err(error) = service.rt.evidence.register(id, inbox_reference(id)) else {

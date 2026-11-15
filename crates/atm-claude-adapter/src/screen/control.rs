@@ -64,11 +64,11 @@ pub fn observe_control_screen(
         return result;
     }
     match styled.map(completion_draft) {
-        Some(Ok(Some(_))) => {
+        Some(CompletionDraft::Recognised { .. }) => {
             result.dialog = ControlDialog::None;
             return result;
         }
-        Some(Err(())) => return result,
+        Some(CompletionDraft::Invalid) => return result,
         _ => {}
     }
     let header = lines.iter().enumerate().find_map(|(i, line)| {
@@ -133,11 +133,21 @@ pub fn observe_control_screen(
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompletionDraft<'a> {
+    Absent,
+    Recognised { draft: &'a str, selected: &'a str },
+    Invalid,
+}
+
 /// Captured completion layouts: above the editor with optional other matches,
-/// or the older single item below it. None means absent; Err means a popup was
-/// present but invalid, so neither consumer may fall back to the ordinary editor.
+/// or the older single item below it. Only Absent permits ordinary fallback.
 /// Description wording is not command identity; the selected name must be whole.
-pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &str)>, ()> {
+pub(super) fn completion_draft(screen: &StyledScreen) -> CompletionDraft<'_> {
+    parse_completion_draft(screen).unwrap_or(CompletionDraft::Invalid)
+}
+
+fn parse_completion_draft(screen: &StyledScreen) -> Option<CompletionDraft<'_>> {
     let mut lines: Vec<_> = screen
         .text()
         .lines()
@@ -147,16 +157,15 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
         lines.pop();
     }
     let Some(lower) = lines.iter().rposition(|s| rule(s, '─')) else {
-        return Ok(None);
+        return Some(CompletionDraft::Absent);
     };
-    let before = lines.get(..lower).ok_or(())?;
+    let before = lines.get(..lower)?;
     let Some(top) = before.iter().rposition(|s| rule(s, '─')) else {
-        return Ok(None);
+        return Some(CompletionDraft::Absent);
     };
-    let history = lines.get(..top).ok_or(())?;
+    let history = lines.get(..top)?;
     let below: Vec<_> = lines
-        .get(lower + 1..)
-        .ok_or(())?
+        .get(lower + 1..)?
         .iter()
         .copied()
         .filter(|s| !s.is_empty())
@@ -175,19 +184,19 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
     let mut above = &[][..];
     let mut end = history.len();
     while end > 0 {
-        let prefix = history.get(..end).ok_or(())?;
+        let prefix = history.get(..end)?;
         let Some(last) = prefix.iter().rposition(|s| !s.is_empty()) else {
             break;
         };
-        let prefix = prefix.get(..last + 1).ok_or(())?;
+        let prefix = prefix.get(..last + 1)?;
         let start = prefix
             .iter()
             .rposition(|s| s.is_empty())
             .map_or(0, |i| i + 1);
-        let block = prefix.get(start..).ok_or(())?;
+        let block = prefix.get(start..)?;
         if has_menu(block) {
             // Retain gaps: an interrupted menu is invalid, not an absent popup.
-            above = history.get(start..).ok_or(())?;
+            above = history.get(start..)?;
             break;
         }
         if !block.iter().all(|s| s.starts_with("     ")) {
@@ -195,12 +204,9 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
         }
         end = start;
     }
-    if above.is_empty()
-        && end < history.len()
-        && history.get(..end).ok_or(())?.iter().all(|s| s.is_empty())
-    {
+    if above.is_empty() && end < history.len() && history.get(..end)?.iter().all(|s| s.is_empty()) {
         // Continuations reached the pane top without a command/selector row.
-        return Err(());
+        return None;
     }
     let ordinary = editor(&lines, Some(screen));
     let (menu, above_editor) = if !above.is_empty() {
@@ -213,11 +219,11 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
     {
         // A recognized mode footer owns its opaque status slot, including in
         // manual mode. The ordinary/control readers still validate the frame.
-        return Ok(None);
+        return Some(CompletionDraft::Absent);
     } else if has_menu(&below) {
         (below.as_slice(), false)
     } else {
-        return Ok(None);
+        return Some(CompletionDraft::Absent);
     };
     if lines.get(top) != lines.get(lower)
         || (above_editor
@@ -225,15 +231,12 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
                 .as_ref()
                 .is_some_and(|(facts, _)| facts.input == InputState::Draft))
     {
-        return Err(());
+        return None;
     }
-    let [row] = lines.get(top + 1..lower).ok_or(())? else {
-        return Err(());
+    let [row] = lines.get(top + 1..lower)? else {
+        return None;
     };
-    let draft = row
-        .strip_prefix("❯\u{a0}")
-        .filter(|s| !s.is_empty())
-        .ok_or(())?;
+    let draft = row.strip_prefix("❯\u{a0}").filter(|s| !s.is_empty())?;
     let offset = screen
         .text()
         .split_inclusive('\n')
@@ -245,7 +248,7 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
         .char_indices()
         .any(|(i, c)| !c.is_whitespace() && screen.faint_at(offset + i) != Some(false))
     {
-        return Err(());
+        return None;
     }
     let mut selected = None;
     let mut commands = Vec::new();
@@ -259,17 +262,17 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
                 .map(|s| (s, false))
         });
         if let Some((label, is_selected)) = entry {
-            let (command, description) = label.split_once("  ").ok_or(())?;
+            let (command, description) = label.split_once("  ")?;
             if command.chars().any(char::is_whitespace) || description.trim().is_empty() {
-                return Err(());
+                return None;
             }
             let column = row.chars().count() - description.trim_start().chars().count();
             if description_start.is_some_and(|start| start != column) {
-                return Err(());
+                return None;
             }
             description_start = Some(column);
             if selected == Some(command) || (is_selected && commands.contains(&command)) {
-                return Err(());
+                return None;
             }
             commands.push(command);
             if is_selected
@@ -280,16 +283,19 @@ pub(super) fn completion_draft(screen: &StyledScreen) -> Result<Option<(&str, &s
                             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
                 }) || selected.replace(command).is_some())
             {
-                return Err(());
+                return None;
             }
         } else if description_start != Some(row.len() - row.trim_start_matches(' ').len())
             || row.trim().is_empty()
             || row.contains('❯')
         {
-            return Err(());
+            return None;
         }
     }
-    Ok(Some((draft, selected.ok_or(())?)))
+    Some(CompletionDraft::Recognised {
+        draft,
+        selected: selected?,
+    })
 }
 
 fn trust_dialog(lines: &[&str]) -> Option<ControlDialog> {

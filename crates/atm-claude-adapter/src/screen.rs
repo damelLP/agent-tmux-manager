@@ -157,8 +157,12 @@ pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bo
     }
     if let ScreenInput::Styled(text) = input {
         let screen = StyledScreen::parse(text).ok()?;
-        if let Some((draft, selected)) = control::completion_draft(&screen).ok()? {
-            return Some(draft == expected && selected == expected);
+        match control::completion_draft(&screen) {
+            control::CompletionDraft::Recognised { draft, selected } => {
+                return Some(draft == expected && selected == expected);
+            }
+            control::CompletionDraft::Invalid => return None,
+            control::CompletionDraft::Absent => {}
         }
     }
     let (_, draft) = inspect(input, None);

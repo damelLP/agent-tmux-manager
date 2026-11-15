@@ -53,6 +53,11 @@ impl Screens {
         self.seen.lock().unwrap().insert(agent, observation);
     }
 
+    /// The observer fails for this recipient from now on.
+    fn lose(&self, agent: &AgentId) {
+        self.seen.lock().unwrap().remove(agent);
+    }
+
     fn calls(&self, agent: &AgentId) -> usize {
         self.calls.lock().unwrap().get(agent).copied().unwrap_or(0)
     }
@@ -678,6 +683,13 @@ async fn owner_focus_notice_is_inbox_only_and_told_once() {
     bench.pass(300).await;
     assert_eq!(bench.notes().await.len(), 1);
     assert!(bench.entries().is_empty());
+    // The observation is lost: the last focus that was seen is no longer
+    // known, so a message that arrives now waits without a note.
+    bench.screens.lose(&worker());
+    bench.pass(1).await;
+    bench.send(worker(), "later").await;
+    bench.pass(60).await;
+    assert_eq!(bench.notes().await.len(), 1);
     // Focus moves away: the message is pasted, with no further note.
     bench.screens.set(worker(), ready("%1", "s1"));
     assert_eq!(bench.entered().await, id);

@@ -137,15 +137,16 @@ pub mod tests {
             }
         }
 
+        let (stdout, output) = std::os::unix::net::UnixStream::pair().unwrap();
+        stdout.set_read_timeout(Some(GUARD)).unwrap();
         let mut child = Command::new("/bin/sh")
             .args(["-c", "printf 'ready\\n'; read -r finish"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::from(OwnedFd::from(output)))
             .spawn()
             .unwrap();
         // Keep stdin open independently: simply dropping Child must not release it.
         let _input = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
         assert!(raw >= 0);
         let fallback = Fallback(unsafe { OwnedFd::from_raw_fd(raw as i32) });

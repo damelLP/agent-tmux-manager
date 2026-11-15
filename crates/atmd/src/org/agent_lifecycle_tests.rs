@@ -1268,6 +1268,10 @@ async fn adopt_tag_whose_call_outlives_the_deadline_quarantines() {
             .await
     });
     while mutations(&adoption.rig).is_empty() {
+        // An adopt that ends before its tag never writes one: fail, don't spin.
+        if call.is_finished() {
+            panic!("the adopt ended before its tag: {:?}", call.await);
+        }
         tokio::task::yield_now().await;
     }
     tokio::time::pause();
@@ -1486,5 +1490,143 @@ async fn adopt_of_an_agent_with_a_role_reads_the_screen_only_of_its_live_harness
                 "{case}"
             );
         }
+    }
+}
+
+// --- cp-u8-21: a second adopt of a Clearing or Stuck agent ---
+
+/// `q/lead` with a pi role, Ready without a session on %1, its harness's
+/// discovery row on the pane, and the service started.
+async fn ready_with_role() -> Adoption {
+    let adoption = recorded_with_role(
+        vec![OrgCommand::EditorReady {
+            agent_id: adoptee(),
+        }],
+        &[("pending-100", false, Harness::Pi)],
+    )
+    .await;
+    *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
+    adoption
+}
+
+/// A session row arrives on %1. It wakes one observation, which inspects.
+async fn row_arrives(adoption: &Adoption, session: &str) {
+    adoption
+        .rig
+        .client
+        .script_inspect(
+            &pane("%1"),
+            Some(&Adoption::inspection(Some("q/lead"), "pi", "")),
+        )
+        .unwrap();
+    adoption.rig.row(session, "%1", false).await;
+    settle(adoption).await;
+    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn second_adopt_of_a_clearing_agent_changes_nothing() {
+    // Decision A, Clearing. A clear that did not finish keeps waiting for its
+    // own proof: an adopt answers Clearing and reads, tags and writes nothing,
+    // on a safe idle screen, with only a discovery row and with a new session
+    // on the pane. Twin: second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready.
+    for session in [None, Some("s2")] {
+        let adoption = ready_with_role().await;
+        adoption
+            .rig
+            .command(OrgCommand::Clear {
+                agent_id: adoptee(),
+            })
+            .await;
+        if let Some(session) = session {
+            row_arrives(&adoption, session).await;
+        }
+        let recorded = adoption.agent().await.unwrap();
+        assert_eq!(recorded.status, AgentStatus::Clearing);
+        let mut committed = adoption.rig.org.committed.subscribe();
+        let before = adoption.rig.org.status().unwrap();
+        script_readopt(&adoption, PI_PADDED, "pi");
+        let result = adoption.adopt().await.unwrap();
+        assert_eq!(result.state, AgentStatus::Clearing, "{session:?}");
+        assert_eq!(
+            adoption.rig.client.pending_reads(&pane("%1")).unwrap(),
+            6,
+            "nothing was read after the inspection"
+        );
+        assert!(mutations(&adoption.rig).is_empty(), "{session:?}");
+        assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+        assert_eq!(adoption.rig.org.status().unwrap(), before);
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{session:?}");
+
+        // Named on another pane, it is refused before that pane is looked at:
+        // the agent is not moved and the other pane gets no tag.
+        let elsewhere = adoption
+            .agents
+            .adopt(AdoptParams {
+                project_root: adoption.project.path().join("q"),
+                name: "lead".into(),
+                pane: "%2".into(),
+                caller_server: None,
+            })
+            .await;
+        match elsewhere {
+            Err(AgentError::Refused(reason)) => {
+                assert!(reason.contains("already runs in %1"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(mutations(&adoption.rig).is_empty());
+        assert_eq!(adoption.agent().await.unwrap(), recorded);
+    }
+}
+
+#[tokio::test]
+async fn second_adopt_of_a_stuck_agent_on_a_safe_screen_makes_it_ready() {
+    // Decision A, Stuck (the owner's choice, 2026-11-15): an explicit adopt is
+    // the owner's way out of Stuck. On a safe idle screen it makes the agent
+    // Ready and clears the reason; it binds the pane's one session, if any.
+    for bound in [false, true] {
+        let mut adoption = ready_with_role().await;
+        if bound {
+            row_arrives(&adoption, "s1").await;
+            assert_eq!(
+                adoption.agent().await.unwrap().session_id,
+                Some(SessionId::new("s1"))
+            );
+        }
+        adoption
+            .rig
+            .command(OrgCommand::Stuck {
+                agent_id: adoptee(),
+                reason: "the trust dialog reset again".into(),
+            })
+            .await;
+        // The twin: a busy screen establishes nothing, and Stuck stays.
+        let recorded = adoption.agent().await.unwrap();
+        assert_eq!(recorded.status, AgentStatus::Stuck);
+        let mut committed = adoption.rig.org.committed.subscribe();
+        script_readopt(&adoption, PI_RUNNING, "pi");
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Stuck);
+        assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
+        assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
+        assert_eq!(adoption.agent().await.unwrap(), recorded, "{bound}");
+
+        script_readopt(&adoption, PI_PADDED, "pi");
+        adoption.script_follow_up(None);
+        assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
+        assert_eq!(
+            committed_kinds(&mut committed),
+            if bound {
+                vec!["agent.adopted"]
+            } else {
+                vec!["agent.adopted", "agent.editor_ready"]
+            }
+        );
+        let agent = adoption.agent().await.unwrap();
+        assert_eq!(agent.status, AgentStatus::Ready, "{bound}");
+        assert_eq!(agent.reason, None, "{bound}");
+        assert_eq!(agent.session_id, bound.then(|| SessionId::new("s1")));
+        assert!(mutations(&adoption.rig).is_empty(), "{bound}");
+        adoption.followed().await;
     }
 }

@@ -267,6 +267,16 @@ impl AgentRuntime {
                 )));
             }
         };
+        // A clear that did not finish waits for its own proof: an adopt of
+        // the agent's pane answers the unchanged state.
+        if existing
+            .is_some_and(|agent| agent.pane.is_some() && agent.status == AgentStatus::Clearing)
+        {
+            return Ok(AdoptResult {
+                agent_id: id.clone(),
+                state: AgentStatus::Clearing,
+            });
+        }
         let role = state.agent(id).and_then(|agent| agent.role.as_ref());
         let excluded = existing.and_then(|agent| agent.excluded_session_id.clone());
         let candidates = |rows: &[PaneSession]| -> Result<Option<SessionId>, AgentError> {

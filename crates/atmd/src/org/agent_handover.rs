@@ -7,6 +7,9 @@
 //! `agent.clear` with its own reservation, guards and cleanup. No reservation
 //! is held while the agent saves, because delivery needs the pane.
 //!
+//! The watcher that sends the note, and that runs this handover itself for a
+//! seat whose role file switches that on, is `agent_auto_handover`.
+//!
 //! # Steps, and what each refusal leaves behind
 //!
 //! | Step | Goes on when | Refused when |
@@ -73,7 +76,7 @@ use atm_protocol::error_code;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::BTreeSet,
     fs,
     future::Future,
     io,
@@ -87,7 +90,6 @@ use tokio::{
     sync::{broadcast, oneshot, Semaphore},
     time::Instant,
 };
-use tokio_util::sync::CancellationToken;
 
 /// The save may take this long: queueing, delivery and the save turn.
 pub const HANDOVER_TIMEOUT_MS: RangeInclusive<u64> = 30_000..=1_800_000;
@@ -286,10 +288,13 @@ impl Drop for Running {
     }
 }
 
+/// The handover service: one per daemon, shared by the method and the
+/// watcher, so that a command and the daemon never hand one agent over at
+/// the same time.
 #[derive(Clone)]
-pub(super) struct Handovers {
-    org: OrgHandle,
-    registry: RegistryHandle,
+pub struct Handovers {
+    pub(super) org: OrgHandle,
+    pub(super) registry: RegistryHandle,
     clearer: Arc<dyn Clearer>,
     running: Arc<Mutex<BTreeSet<AgentId>>>,
     files: Arc<Semaphore>,
@@ -304,6 +309,12 @@ fn refused(message: String) -> MethodError {
 }
 
 impl Handovers {
+    /// The service that clears through `agents`.
+    #[must_use]
+    pub fn for_agents(agents: AgentHandle, org: OrgHandle, registry: RegistryHandle) -> Self {
+        Self::new(org, registry, Arc::new(agents))
+    }
+
     pub(super) fn new(org: OrgHandle, registry: RegistryHandle, clearer: Arc<dyn Clearer>) -> Self {
         Self {
             org,
@@ -484,7 +495,7 @@ pub(super) struct Job {
     session: SessionId,
     memory: PathBuf,
     before: Option<Fingerprint>,
-    message_id: MessageId,
+    pub(super) message_id: MessageId,
     deadline: Deadline,
     seconds: u64,
     committed: broadcast::Receiver<Arc<crate::eventlog::Envelope>>,
@@ -685,11 +696,8 @@ impl Job {
 /// Always advertised; with agents or persistence disabled it answers unavailable.
 pub fn register_agent_handover_method(
     router: &mut MethodRouter,
-    agents: AgentHandle,
-    org: OrgHandle,
-    registry: RegistryHandle,
+    service: Handovers,
 ) -> Result<(), MethodError> {
-    let service = Handovers::new(org, registry, Arc::new(agents));
     router.register("agent.handover", METHOD_DEADLINE, move |caller, params| {
         let service = service.clone();
         async move {
@@ -749,87 +757,4 @@ pub(super) fn context_note(
         task: None,
     };
     Some((agent.id.clone(), note))
-}
-
-/// What the watcher has seen of one session.
-#[derive(Debug, Clone, Copy)]
-struct Seen {
-    status: SessionStatus,
-    /// A turn was seen to end in this session.
-    ended: bool,
-}
-
-/// Sends the note at the context line: once per session, to the agent's
-/// manager, when a session whose turn has ended is idle at or above the line.
-/// The share is looked at on every update after a turn end, not only on the
-/// one that carries the status change, because a harness may report its
-/// share after it reports the turn's end. Runs until `cancel` or until the
-/// registry stops.
-pub fn spawn_context_notes(org: OrgHandle, registry: RegistryHandle, cancel: CancellationToken) {
-    let mut rows = registry.subscribe();
-    tokio::spawn(async move {
-        let limits = HandoverLimits::default();
-        let mut seen: HashMap<SessionId, Seen> = HashMap::new();
-        // The session each agent was last noted in.
-        let mut noted: BTreeMap<AgentId, SessionId> = BTreeMap::new();
-        loop {
-            let row = tokio::select! {
-                () = cancel.cancelled() => return,
-                row = rows.recv() => row,
-            };
-            let session = match row {
-                Ok(SessionEvent::Updated { session }) => session,
-                Ok(SessionEvent::Removed { session_id, .. }) => {
-                    seen.remove(&session_id);
-                    continue;
-                }
-                Ok(_) => continue,
-                // Missed events: forget what was seen, so that no turn end is
-                // made up from a stale status.
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    seen.clear();
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
-            };
-            let idle = session.status == SessionStatus::Idle;
-            let before = seen.get(&session.id).copied();
-            let ended = before.is_some_and(|before| {
-                before.ended || (idle && before.status != SessionStatus::Idle)
-            });
-            let status = session.status;
-            seen.insert(session.id.clone(), Seen { status, ended });
-            let now = Utc::now();
-            // The policy first: most turn ends are below the line and need no
-            // look at the organisation.
-            if !(idle && ended && at_the_line(session.context_percentage, &limits, now)) {
-                continue;
-            }
-            let state = match org.snapshot().await {
-                Ok(state) => state,
-                Err(error) => {
-                    tracing::warn!(%error, "Context note skipped: organisation state unavailable");
-                    continue;
-                }
-            };
-            let Some((agent, note)) = context_note(
-                &state,
-                &session.id,
-                session.context_percentage,
-                &limits,
-                now,
-            ) else {
-                continue;
-            };
-            if noted.get(&agent) == Some(&session.id) {
-                continue;
-            }
-            match org.execute(OrgCommand::SendMessage(note), now).await {
-                Ok(_) => {
-                    noted.insert(agent, session.id.clone());
-                }
-                Err(error) => tracing::warn!(%agent, %error, "Context note was not recorded"),
-            }
-        }
-    });
 }

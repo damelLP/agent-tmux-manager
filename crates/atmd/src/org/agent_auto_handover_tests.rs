@@ -1,0 +1,688 @@
+//! The handover watcher on the handover tests' rig: a real organisation
+//! actor, a real registry, real role files, the recorder for the clear. The
+//! test plays the message runtime and the agent, as there, and moves the
+//! watcher's clock by hand. Every wait is on a committed event, on the
+//! recorder, or on the clock being asked for a time; nothing sleeps.
+
+use super::super::agent_auto_handover::{
+    outcome_note, settle, spawn_watch, start_lines, still_shows, why, Attempt, Timer,
+};
+use super::super::start_line::start_line;
+use super::*;
+use atm_core::{BackgroundActivity, LifecycleContext, SessionView};
+use atm_org::auto_handover::{handover_settings, HandoverSettings};
+use atm_org::idle::HandoverReason;
+use chrono::{DateTime, TimeDelta, TimeZone};
+use std::collections::BTreeMap;
+use tokio::sync::watch;
+
+fn t0() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap()
+}
+
+fn after(secs: i64) -> DateTime<Utc> {
+    t0() + TimeDelta::seconds(secs)
+}
+
+/// A clock the test moves. Every time it is asked for is reported, so a test
+/// can wait until the watcher has asked to be woken.
+struct Clock {
+    now: watch::Sender<DateTime<Utc>>,
+    asked: mpsc::UnboundedSender<DateTime<Utc>>,
+}
+
+impl Timer for Clock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.now.borrow()
+    }
+    fn at(&self, at: DateTime<Utc>) -> Deadline {
+        let _ = self.asked.send(at);
+        let mut now = self.now.subscribe();
+        Box::pin(async move {
+            if now.wait_for(|now| *now >= at).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+}
+
+const ON: &str = "auto_handover = ['context']";
+
+struct Auto {
+    rig: Rig,
+    clock: Arc<Clock>,
+    asked: mpsc::UnboundedReceiver<DateTime<Utc>>,
+    /// A second reader of the committed events, for the probe's notes only.
+    fence: broadcast::Receiver<Arc<Envelope>>,
+    /// How many sessions the probe has had.
+    probes: u32,
+}
+
+impl Auto {
+    /// The rig with the watcher running and `keys` in the worker's role file.
+    async fn new(keys: &str) -> Self {
+        let rig = Rig::new().await;
+        let (asked, asks) = mpsc::unbounded_channel();
+        let clock = Arc::new(Clock {
+            now: watch::Sender::new(t0()),
+            asked,
+        });
+        let mut auto = Self {
+            fence: rig.org.committed.subscribe(),
+            rig,
+            clock,
+            asked: asks,
+            probes: 0,
+        };
+        auto.role("worker", keys);
+        // A third agent, switched off and with no manager: see `settled`.
+        auto.rig
+            .agent("probe", "+++\nharness='pi'\n+++\n", "%9", None)
+            .await;
+        auto.rig.kinds();
+        spawn_watch(
+            auto.rig.service.clone(),
+            auto.clock.clone(),
+            auto.rig.cancel.clone(),
+        );
+        auto
+    }
+
+    /// Writes `name`'s role file with `keys` in its front matter.
+    fn role(&self, name: &str, keys: &str) {
+        let text = format!("+++\nharness = 'pi'\nmanager = 'lead'\n{keys}\n+++\nWork\n");
+        self.file(name, &text);
+    }
+
+    fn file(&self, name: &str, text: &str) {
+        let roles = self.rig.root.join(".atm/roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join(format!("{name}.md")), text).unwrap();
+    }
+
+    fn set(&self, now: DateTime<Utc>) {
+        self.clock.now.send_replace(now);
+    }
+
+    /// Returns once the watcher has asked the clock for `at`.
+    async fn asked_for(&mut self, at: DateTime<Utc>) {
+        tokio::time::timeout(GUARD, async {
+            while self.asked.recv().await.unwrap() != at {}
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the watcher never asked for {at}"));
+    }
+
+    /// The committed events up to and including the next of `kind`, the
+    /// probe's own left out.
+    async fn until(&mut self, kind: &str) -> Vec<Arc<Envelope>> {
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(GUARD, self.rig.committed.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no {kind} was committed after {events:?}"))
+                .unwrap();
+            if probes(&event) {
+                continue;
+            }
+            let last = event.kind == kind;
+            events.push(event);
+            if last {
+                return events;
+            }
+        }
+    }
+
+    /// The next message: no event comes before it but those of `between`.
+    async fn message(&mut self, between: &[&str]) -> (String, String) {
+        let events = self.until("msg.sent").await;
+        assert_eq!(kinds(&events), [between, &["msg.sent"]].concat());
+        let sent = events.last().unwrap();
+        (
+            sent.body["to"].as_str().unwrap().to_owned(),
+            sent.body["body"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// The save request the watcher's handover queued for `name`, with no
+    /// event before it but those of `between`; its audit follows.
+    async fn save_requested(&mut self, name: &str, between: &[&str]) -> MessageId {
+        let request = save_request(&id(name), &self.rig.memory(name));
+        assert_eq!(
+            self.message(between).await,
+            (format!("p/{name}"), request.body)
+        );
+        let audit = self.until("agent.save_requested").await;
+        assert_eq!(kinds(&audit), ["agent.save_requested"]);
+        serde_json::from_value(audit[0].body["message_id"].clone()).unwrap()
+    }
+
+    /// Returns once the watcher has dealt with every registry event sent
+    /// so far.
+    ///
+    /// The probe ends a turn at the line in a session of its own. The
+    /// watcher takes registry events in order and sends a note at the line
+    /// before it takes the next one, so the probe's note is behind
+    /// everything the watcher did about the events before it: its notes are
+    /// committed, and the clock has been asked for the deadline of every
+    /// handover it started.
+    async fn caught_up(&mut self) {
+        self.probes += 1;
+        let session = format!("probe-{}", self.probes);
+        self.rig.bind("probe", &session, "%9").await;
+        self.rig.share(&session, 600).await;
+        self.rig.turn(&session).await;
+        tokio::time::timeout(GUARD, async {
+            while !noted(&self.fence.recv().await.unwrap()) {}
+        })
+        .await
+        .expect("the probe was not noted");
+    }
+
+    /// How many handovers the watcher has started since the last call. It
+    /// asks the clock for a handover's deadline before it starts one, ten
+    /// minutes from now at the context line.
+    fn started(&mut self) -> usize {
+        let deadline = self.clock.now() + TimeDelta::seconds(600);
+        std::iter::from_fn(|| self.asked.try_recv().ok())
+            .filter(|at| *at == deadline)
+            .count()
+    }
+
+    /// Up to now the watcher has sent nothing and started no handover; the
+    /// only events committed are those of `between`.
+    async fn quiet(&mut self, between: &[&str]) {
+        self.caught_up().await;
+        let committed: Vec<_> = std::iter::from_fn(|| self.rig.committed.try_recv().ok())
+            .filter(|event| !probes(event))
+            .collect();
+        assert_eq!(kinds(&committed), between);
+        assert_eq!(self.started(), 0);
+    }
+
+    /// The watcher has started exactly one handover since the last look.
+    async fn one_started(&mut self) {
+        self.caught_up().await;
+        assert_eq!(self.started(), 1);
+    }
+
+    /// Queues `content` and reads its own event off the stream.
+    async fn send(&mut self, content: MessageContent) -> MessageId {
+        let sent = self.rig.run(OrgCommand::SendMessage(content)).await;
+        let id = MessageId::new(sent[0].seq);
+        let events = self.until("msg.sent").await;
+        assert_eq!(events.last().unwrap().seq, id.seq());
+        id
+    }
+
+    /// A queued message to `name` that is not a save request.
+    async fn mail(&mut self, name: &str) -> MessageId {
+        self.send(MessageContent {
+            from: Address::Owner,
+            to: Address::Agent(id(name)),
+            kind: MessageKind::Note,
+            body: "Read this".into(),
+            attachments: Vec::new(),
+            task: None,
+        })
+        .await
+    }
+
+    /// `message_id` is confirmed in `session` without a turn starting.
+    async fn confirm(&self, message_id: MessageId, session: &str, pane: &str) {
+        self.rig
+            .run(OrgCommand::DeliveryAttempted {
+                message_id,
+                attempt: 1,
+                pane: pane.into(),
+            })
+            .await;
+        self.rig
+            .run(OrgCommand::Delivered {
+                message_id,
+                session_id: session.into(),
+                confirmation: "prompt".into(),
+            })
+            .await;
+    }
+}
+
+/// The note at the line for the probe.
+fn noted(event: &Envelope) -> bool {
+    event.kind == "msg.sent" && event.body["body"] == line_note("probe", 60)
+}
+
+/// An event of the probe's own: its sessions' bindings and its notes.
+fn probes(event: &Envelope) -> bool {
+    event.body["agent_id"] == "p/probe" || noted(event)
+}
+
+fn kinds(events: &[Arc<Envelope>]) -> Vec<&str> {
+    events.iter().map(|event| event.kind.as_str()).collect()
+}
+
+const DELIVERY: [&str; 2] = ["msg.delivery_attempted", "msg.delivered"];
+
+// The pure parts.
+
+fn attempt(session: &str) -> Attempt {
+    Attempt {
+        agent: id("worker"),
+        session: SessionId::new(session),
+        why: "context 63%, line 60%".into(),
+        memory: "/p/.atm/memory/worker.md".into(),
+    }
+}
+
+fn done() -> HandoverResult {
+    HandoverResult {
+        agent_id: id("worker"),
+        message_id: MessageId::new(12),
+        state: HandoverState::Cleared,
+        session_id: Some(SessionId::new("s2")),
+    }
+}
+
+#[test]
+fn an_admitted_handover_ends_in_one_note_to_the_manager_and_keeps_the_attempt() {
+    let lead = Address::Agent(id("lead"));
+    let attempted = BTreeMap::from([(id("worker"), SessionId::new("s1"))]);
+    let note = |to: Address, body: &str| MessageContent {
+        from: Address::System,
+        to,
+        kind: MessageKind::Note,
+        body: body.into(),
+        attachments: Vec::new(),
+        task: None,
+    };
+    let mut after_done = attempted.clone();
+    assert_eq!(
+        settle(
+            &mut after_done,
+            attempt("s1"),
+            Ok((lead.clone(), Ok(done())))
+        ),
+        Some(note(
+            lead,
+            "automatic handover of p/worker done (context 63%, line 60%): it saved to \
+             /p/.atm/memory/worker.md (m12) and has a new session."
+        ))
+    );
+    assert_eq!(after_done, attempted);
+    let failed = MethodError::new(error_code::REFUSED, "it did not save; nothing was cleared");
+    let mut after_failure = attempted.clone();
+    assert_eq!(
+        settle(
+            &mut after_failure,
+            attempt("s1"),
+            Ok((Address::Owner, Err(failed)))
+        ),
+        Some(note(
+            Address::Owner,
+            "automatic handover of p/worker (context 63%, line 60%) did not complete: it did \
+             not save; nothing was cleared. Nothing more is tried in this session. By hand: \
+             atm agent handover p/worker"
+        ))
+    );
+    assert_eq!(after_failure, attempted);
+}
+
+#[test]
+fn a_handover_refused_at_admission_gets_no_note_and_gives_the_attempt_back() {
+    let refused = || Err(MethodError::new(error_code::CONFLICT, "already running"));
+    let mut attempted = BTreeMap::from([
+        (id("worker"), SessionId::new("s1")),
+        (id("lead"), SessionId::new("lead-1")),
+    ]);
+    assert_eq!(settle(&mut attempted, attempt("s1"), refused()), None);
+    assert_eq!(
+        attempted,
+        BTreeMap::from([(id("lead"), SessionId::new("lead-1"))])
+    );
+    // The agent has moved on to another session, whose attempt is its own.
+    let mut later = BTreeMap::from([(id("worker"), SessionId::new("s2"))]);
+    assert_eq!(settle(&mut later, attempt("s1"), refused()), None);
+    assert_eq!(later.get(&id("worker")), Some(&SessionId::new("s2")));
+}
+
+#[test]
+fn the_note_says_why_in_the_seats_own_numbers() {
+    let settings = |keys: &str| -> HandoverSettings {
+        let role = format!("+++\nharness = 'pi'\n{keys}\n+++\n");
+        handover_settings(&atm_org::parse_role("worker", &role).unwrap().config).unwrap()
+    };
+    let idle = Duration::from_secs(48 * 60 + 59);
+    assert_eq!(
+        why(
+            HandoverReason::ContextLine,
+            72.6,
+            &settings("context_line = 70"),
+            idle
+        ),
+        "context 73%, line 70%"
+    );
+    let cached = settings("auto_handover = ['idle']\ncache_minutes = 60");
+    assert_eq!(
+        why(HandoverReason::ContextLine, 61.0, &cached, idle),
+        "context 61%, line 60%"
+    );
+    assert_eq!(
+        why(HandoverReason::CacheExpiring, 12.0, &cached, idle),
+        "idle 48 min; nothing it waits for comes before its cache expires at 60 min"
+    );
+    let note = outcome_note(
+        &id("worker"),
+        "why",
+        std::path::Path::new("/m.md"),
+        Address::Owner,
+        &Ok(done()),
+    );
+    assert_eq!(
+        note.body,
+        "automatic handover of p/worker done (why): it saved to /m.md (m12) and has a new session."
+    );
+}
+
+#[tokio::test]
+async fn only_start_lines_delivered_to_the_session_are_counted() {
+    let mut auto = Auto::new("").await;
+    let (worker, s1) = (id("worker"), SessionId::new("s1"));
+    let count = |state: &OrgState| start_lines(state, &worker, &s1);
+    assert_eq!(count(&auto.rig.state().await), 0);
+    // Other mail, a start line still queued, one to another agent, and one
+    // delivered to another session of the worker: none counts.
+    let other = auto.mail("worker").await;
+    auto.confirm(other, "s1", "%1").await;
+    let queued = auto.send(start_line(&worker)).await;
+    let leads = auto.send(start_line(&id("lead"))).await;
+    auto.confirm(leads, "s1", "%0").await;
+    assert_eq!(count(&auto.rig.state().await), 0);
+    auto.confirm(queued, "s0", "%1").await;
+    assert_eq!(count(&auto.rig.state().await), 0);
+    let here = auto.send(start_line(&worker)).await;
+    auto.confirm(here, "s1", "%1").await;
+    assert_eq!(count(&auto.rig.state().await), 1);
+}
+
+#[test]
+fn a_row_that_has_moved_on_is_not_the_row_that_was_judged() {
+    let mut row = SessionDomain::new(
+        SessionId::new("s1"),
+        AgentType::GeneralPurpose,
+        Model::Unknown,
+    );
+    row.apply_lifecycle_event(&LifecycleEvent::Idle);
+    let idle = SessionView::from_domain(&row);
+    assert_eq!(idle.status, SessionStatus::Idle);
+    assert!(still_shows(&idle, idle.context_percentage, false));
+    assert!(!still_shows(&idle, idle.context_percentage + 1.0, false));
+    assert!(!still_shows(&idle, idle.context_percentage, true));
+    let background = SessionView {
+        activity_detail: Some("1 bg task".into()),
+        ..idle.clone()
+    };
+    assert!(!still_shows(&background, idle.context_percentage, false));
+    assert!(still_shows(&background, idle.context_percentage, true));
+    row.apply_lifecycle_event(&LifecycleEvent::WorkingStart);
+    let working = SessionView::from_domain(&row);
+    assert!(!still_shows(&working, working.context_percentage, false));
+}
+
+// The watcher.
+
+#[tokio::test]
+async fn a_seat_that_is_switched_on_is_handed_over_at_the_line_with_one_note() {
+    let mut auto = Auto::new(ON).await;
+    // Below the line nothing is asked.
+    auto.rig.share("s1", 599).await;
+    auto.rig.turn("s1").await;
+    auto.rig.share("s1", 630).await;
+    auto.rig.turn("s1").await;
+    auto.one_started().await;
+    // No command was given: the daemon asks the worker to save, and sends
+    // no note at the line first.
+    let request = auto.save_requested("worker", &[]).await;
+    auto.rig.deliver(request, "s1", "%1").await;
+    std::fs::write(auto.rig.memory("worker"), "state").unwrap();
+    auto.rig.report("s1", LifecycleEvent::Idle).await;
+    assert_eq!(
+        tokio::time::timeout(GUARD, auto.rig.cleared.recv())
+            .await
+            .unwrap(),
+        Some(id("worker"))
+    );
+    let memory = auto.rig.memory("worker");
+    assert_eq!(
+        auto.message(&[DELIVERY.as_slice(), &["agent.saved"]].concat())
+            .await,
+        (
+            "p/lead".to_owned(),
+            format!(
+                "automatic handover of p/worker done (context 63%, line 60%): it saved to {} \
+                 ({request}) and has a new session.",
+                memory.display()
+            )
+        )
+    );
+    // The recorder cleared nothing, so the worker is still in that session:
+    // another turn end above the line starts no second handover.
+    auto.rig.share("s1", 700).await;
+    auto.rig.turn("s1").await;
+    auto.quiet(&[]).await;
+}
+
+#[tokio::test]
+async fn a_seat_that_is_off_is_noted_at_its_own_line() {
+    let mut auto = Auto::new("context_line = 70").await;
+    auto.rig.share("s1", 650).await;
+    auto.rig.turn("s1").await;
+    auto.rig.share("s1", 700).await;
+    assert_eq!(
+        auto.message(&[]).await,
+        (
+            "p/lead".to_owned(),
+            "agent p/worker is at 70% of its context (line 70%). \
+             Hand it over: atm agent handover p/worker"
+                .to_owned()
+        )
+    );
+}
+
+#[tokio::test]
+async fn the_role_file_is_read_at_every_turn_end() {
+    let mut auto = Auto::new(ON).await;
+    auto.rig.share("s1", 500).await;
+    auto.rig.turn("s1").await;
+    // Switched off by an edit: the next turn end gets the note, no handover.
+    auto.role("worker", "");
+    auto.rig.share("s1", 650).await;
+    auto.rig.turn("s1").await;
+    assert_eq!(
+        auto.message(&[]).await,
+        ("p/lead".to_owned(), line_note("worker", 65))
+    );
+    // Switched on again, with no respawn: the session that was noted is
+    // handed over at its next turn end.
+    auto.role("worker", ON);
+    auto.rig.turn("s1").await;
+    auto.one_started().await;
+    auto.save_requested("worker", &[]).await;
+}
+
+#[tokio::test]
+async fn a_role_file_that_is_not_valid_is_off() {
+    let mut auto = Auto::new(ON).await;
+    // A session of its own for every file: a session is noted once.
+    for (session, text) in [
+        ("n1", "auto_handover = ['context']"),
+        (
+            "n2",
+            "+++\nharness = 'pi'\nauto_handover = ['context', 'later']\n+++\n",
+        ),
+        ("n3", "+++\nharness = 'pi'\nauto_handover = ['idle']\n+++\n"),
+    ] {
+        auto.file("worker", text);
+        auto.rig.bind("worker", session, "%1").await;
+        auto.rig.share(session, 650).await;
+        auto.rig.turn(session).await;
+        assert_eq!(
+            auto.message(&["agent.session_bound"]).await,
+            ("p/lead".to_owned(), line_note("worker", 65)),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_save_is_told_once_and_not_tried_again_in_that_session() {
+    let mut auto = Auto::new(ON).await;
+    auto.rig.share("s1", 630).await;
+    auto.rig.turn("s1").await;
+    auto.one_started().await;
+    let request = auto.save_requested("worker", &[]).await;
+    // The worker ends its save turn and has written nothing.
+    auto.rig.deliver(request, "s1", "%1").await;
+    auto.rig.report("s1", LifecycleEvent::Idle).await;
+    let memory = auto.rig.memory("worker");
+    assert_eq!(
+        auto.message(&DELIVERY).await,
+        (
+            "p/lead".to_owned(),
+            format!(
+                "automatic handover of p/worker (context 63%, line 60%) did not complete: \
+                 p/worker ended its save turn and {} did not change; nothing was cleared. \
+                 Nothing more is tried in this session. By hand: atm agent handover p/worker",
+                memory.display()
+            )
+        )
+    );
+    assert!(auto.rig.cleared.try_recv().is_err());
+    // More turn ends above the line in that session: no request, no note.
+    auto.rig.share("s1", 700).await;
+    auto.rig.turn("s1").await;
+    auto.quiet(&[]).await;
+    // A new session has an attempt of its own.
+    auto.rig.bind("worker", "s2", "%1").await;
+    auto.rig.share("s2", 640).await;
+    auto.rig.turn("s2").await;
+    auto.one_started().await;
+    auto.save_requested("worker", &["agent.session_bound"])
+        .await;
+}
+
+#[tokio::test]
+async fn a_session_is_not_handed_over_while_it_shows_background_work() {
+    let mut auto = Auto::new(ON).await;
+    // The lead, switched on too, ends a turn at the line with a background
+    // task still running: the registry reports the idle row, then the same
+    // row with that work on it.
+    auto.role("lead", ON);
+    auto.rig.share("lead-1", 640).await;
+    auto.rig
+        .report("lead-1", LifecycleEvent::WorkingStart)
+        .await;
+    let background = LifecycleContext {
+        background_activity: Some(BackgroundActivity {
+            running: 1,
+            scheduled: 0,
+        }),
+        ..LifecycleContext::default()
+    };
+    auto.rig
+        .registry
+        .apply_lifecycle_event_with_context(
+            SessionId::new("lead-1"),
+            LifecycleEvent::Idle,
+            Harness::Pi,
+            None,
+            None,
+            background,
+        )
+        .await
+        .unwrap();
+    let row = auto.rig.registry.get_session(SessionId::new("lead-1"));
+    assert_eq!(
+        row.await.unwrap().activity_detail.as_deref(),
+        Some("1 bg task")
+    );
+    // A share that moves while that work runs changes nothing.
+    auto.rig.share("lead-1", 650).await;
+    auto.quiet(&[]).await;
+    // The background work is over when the lead's next turn ends.
+    auto.rig.turn("lead-1").await;
+    auto.one_started().await;
+    auto.save_requested("lead", &[]).await;
+}
+
+#[tokio::test]
+async fn a_session_whose_only_turn_was_its_start_is_noted_and_not_handed_over() {
+    let mut auto = Auto::new(ON).await;
+    let line = auto.send(start_line(&id("worker"))).await;
+    auto.confirm(line, "s1", "%1").await;
+    auto.rig.share("s1", 630).await;
+    auto.rig.turn("s1").await;
+    assert_eq!(
+        auto.message(&DELIVERY).await,
+        ("p/lead".to_owned(), line_note("worker", 63))
+    );
+    // The next turn is work: now the session is handed over.
+    assert_eq!(auto.started(), 0);
+    auto.rig.turn("s1").await;
+    auto.one_started().await;
+    auto.save_requested("worker", &[]).await;
+}
+
+#[tokio::test]
+async fn mail_on_its_way_puts_the_handover_off_until_the_watcher_looks_again() {
+    let mut auto = Auto::new(ON).await;
+    let mail = auto.mail("worker").await;
+    auto.rig.share("s1", 630).await;
+    auto.rig.turn("s1").await;
+    // The watcher has looked and asks to be woken a minute later.
+    auto.asked_for(after(60)).await;
+    auto.quiet(&[]).await;
+    // The mail is delivered and starts no turn. Until the minute is over
+    // nothing is looked at; then the handover starts.
+    auto.confirm(mail, "s1", "%1").await;
+    auto.set(after(60));
+    auto.save_requested("worker", &DELIVERY).await;
+}
+
+#[tokio::test]
+async fn a_turn_that_starts_before_the_wake_drops_it() {
+    let mut auto = Auto::new(ON).await;
+    auto.mail("worker").await;
+    auto.rig.share("s1", 630).await;
+    auto.rig.turn("s1").await;
+    auto.asked_for(after(60)).await;
+    // A turn starts and the minute passes while it runs: nothing is due.
+    auto.rig.report("s1", LifecycleEvent::WorkingStart).await;
+    auto.set(after(60));
+    auto.quiet(&[]).await;
+    // Its end is a turn end like any other: the mail is still on its way,
+    // so the watcher asks for a minute from now.
+    auto.rig.report("s1", LifecycleEvent::Idle).await;
+    auto.asked_for(after(120)).await;
+}
+
+#[tokio::test]
+async fn a_session_that_was_removed_is_seen_anew() {
+    let mut auto = Auto::new(ON).await;
+    // The worker's session is working when its row leaves the registry.
+    auto.rig.turn("s1").await;
+    auto.rig.report("s1", LifecycleEvent::WorkingStart).await;
+    auto.rig
+        .registry
+        .remove(SessionId::new("s1"))
+        .await
+        .unwrap();
+    // It comes back idle and above the line. No turn was seen to end in it:
+    // the status from before the removal is not this row's past.
+    auto.rig.bind("worker", "s1", "%1").await;
+    auto.rig.share("s1", 640).await;
+    auto.quiet(&[]).await;
+    // Its next turn end is one.
+    auto.rig.turn("s1").await;
+    auto.one_started().await;
+    auto.save_requested("worker", &[]).await;
+}

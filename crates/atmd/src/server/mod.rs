@@ -179,14 +179,21 @@ impl DaemonServer {
                     control,
                     agents_cancel.clone(),
                 );
-                services.agents = Some(agents);
-                // The note at the context line, for the agents this server runs.
-                // It stops with their token.
-                crate::org::agent_handover::spawn_context_notes(
+                // One handover service for the method and the watcher: the
+                // note at the context line and the handovers the daemon runs
+                // itself, for the agents this server runs. The watcher stops
+                // with their token.
+                let handovers = crate::org::agent_handover::Handovers::for_agents(
+                    agents.clone(),
                     services.org.clone(),
                     self.registry.clone(),
+                );
+                services.handovers = Some(handovers.clone());
+                crate::org::agent_auto_handover::spawn_handover_watch(
+                    handovers,
                     agents_cancel.clone(),
                 );
+                services.agents = Some(agents);
                 task
             })
         } else {

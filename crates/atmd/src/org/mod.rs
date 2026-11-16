@@ -83,7 +83,7 @@ pub use summary::SummaryObserver;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use atm_org::{OrgCommand, OrgState, Refusal};
+use atm_org::{OrgCommand, OrgState, Refusal, Task, TaskCommand};
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, oneshot, watch as health_watch};
 use tokio_util::sync::CancellationToken;
@@ -109,12 +109,19 @@ pub enum OrgServiceError {
 
 type Health = Result<u64, String>;
 
+/// Private atomic task receipt; the before-image belongs to the deciding actor.
+#[derive(Debug)]
+struct TaskCommit {
+    events: Vec<Envelope>,
+    before: Option<Task>,
+}
+
 enum Request {
     Execute {
         command: Box<OrgCommand>,
         now: DateTime<Utc>,
         caller_pane: Option<String>,
-        reply: oneshot::Sender<Result<Vec<Envelope>, OrgServiceError>>,
+        reply: oneshot::Sender<Result<TaskCommit, OrgServiceError>>,
     },
     Snapshot(oneshot::Sender<OrgState>),
 }
@@ -212,6 +219,26 @@ impl OrgHandle {
         now: DateTime<Utc>,
         caller_pane: Option<String>,
     ) -> Result<Vec<Envelope>, OrgServiceError> {
+        self.execute_receipt(command, now, caller_pane)
+            .await
+            .map(|commit| commit.events)
+    }
+
+    async fn execute_task(
+        &self,
+        command: TaskCommand,
+        now: DateTime<Utc>,
+    ) -> Result<TaskCommit, OrgServiceError> {
+        self.execute_receipt(OrgCommand::Task(command), now, None)
+            .await
+    }
+
+    async fn execute_receipt(
+        &self,
+        command: OrgCommand,
+        now: DateTime<Utc>,
+        caller_pane: Option<String>,
+    ) -> Result<TaskCommit, OrgServiceError> {
         let (reply, response) = oneshot::channel();
         self.submit(Request::Execute {
             command: Box::new(command),

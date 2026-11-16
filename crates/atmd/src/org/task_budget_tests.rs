@@ -179,7 +179,7 @@ async fn budget_lost_enqueue_reply_is_resnapshotted_before_retry() {
                 },
                 super::super::Request::Execute { command, now, caller_pane, reply } => {
                     let lose = held_reply.is_none() && matches!(command.as_ref(), OrgCommand::SendMessage(_));
-                    let result = actor.execute_command(*command, now, caller_pane).await;
+                    let result = actor.execute_receipt(*command, now, caller_pane).await;
                     if lose { held_reply = Some(reply); } else { let _ = reply.send(result); }
                 },
             }

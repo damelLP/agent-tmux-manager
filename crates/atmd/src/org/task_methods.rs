@@ -409,12 +409,15 @@ mod tests {
             panic!("expected task creation");
         };
         reply
-            .send(Ok(vec![Envelope {
-                seq: 1,
-                ts: now,
-                kind: "task.created".into(),
-                body: serde_json::to_value(created).unwrap(),
-            }]))
+            .send(Ok(crate::org::TaskCommit {
+                before: None,
+                events: vec![Envelope {
+                    seq: 1,
+                    ts: now,
+                    kind: "task.created".into(),
+                    body: serde_json::to_value(created).unwrap(),
+                }],
+            }))
             .unwrap();
         let result = call.await.unwrap().unwrap();
         assert_eq!(result["task_id"], "t1");

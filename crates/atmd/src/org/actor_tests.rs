@@ -49,6 +49,66 @@ where
     )
 }
 
+// Break caught: task receipts capture a post-state, omit a no-op before-image, or alter public execute.
+#[tokio::test]
+async fn task_receipt_captures_the_deciding_actor_before_image() {
+    use atm_org::{TaskActor, TaskCommand, TaskState};
+    let mut seq = 0;
+    let (org, cancel, task) = spawn(move |_| {
+        seq += 1;
+        std::future::ready(Ok(seq))
+    });
+    org.execute(project(), now()).await.unwrap();
+    org.execute(
+        OrgCommand::Adopt {
+            agent_id: "demo/worker".parse().unwrap(),
+            pane: "%1".into(),
+            session_id: None,
+        },
+        now(),
+    )
+    .await
+    .unwrap();
+    let created = serde_json::from_value(serde_json::json!({"title":"Work","kind":"work","creator":"owner","parent":null,"judges":null,"measure":{"kind":"owner"},"budget":null,"files":[],"rests_on":null})).unwrap();
+    let receipt = org
+        .execute_task(TaskCommand::Create(created), now())
+        .await
+        .unwrap();
+    assert!(receipt.before.is_none());
+    assert_eq!(receipt.events.len(), 1);
+    let before = org
+        .snapshot()
+        .await
+        .unwrap()
+        .task(&"t3".parse().unwrap())
+        .unwrap()
+        .clone();
+    let command = TaskCommand::Assign {
+        task_id: "t3".parse().unwrap(),
+        agent_id: "demo/worker".parse().unwrap(),
+        by: TaskActor {
+            who: "owner".parse().unwrap(),
+            lead: false,
+        },
+    };
+    let receipt = org.execute_task(command.clone(), now()).await.unwrap();
+    assert_eq!(receipt.before, Some(before));
+    assert_eq!(receipt.events[0].kind, "task.assigned");
+    let before = org
+        .snapshot()
+        .await
+        .unwrap()
+        .task(&"t3".parse().unwrap())
+        .unwrap()
+        .clone();
+    assert_eq!(before.state, TaskState::Assigned);
+    let receipt = org.execute_task(command, now()).await.unwrap();
+    assert_eq!(receipt.before, Some(before));
+    assert!(receipt.events.is_empty());
+    cancel.cancel();
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn pending_append_is_not_replayed_or_released_live_before_apply() {
     let dir = tempfile::tempdir().unwrap();

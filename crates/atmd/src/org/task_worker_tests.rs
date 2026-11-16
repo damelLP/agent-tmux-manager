@@ -373,6 +373,92 @@ async fn partial_fanout_retains_worker_and_committed_truth() {
     }
 }
 
+// Break caught: a later failure overwrites the first error code or hides another failed/queued audience.
+#[tokio::test]
+async fn fanout_preserves_first_error_and_every_failed_audience() {
+    let (_dir, org, cancel) = org().await;
+    for (name, pane) in [("lead", "%2"), ("next", "%3")] {
+        org.execute(
+            OrgCommand::Adopt {
+                agent_id: format!("p/{name}").parse().unwrap(),
+                pane: pane.into(),
+                session_id: None,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    org.execute(
+        OrgCommand::Task(assign(TaskActor {
+            who: Address::Owner,
+            lead: false,
+        })),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let sender = org.clone();
+    let mut attempts = Vec::new();
+    let result = execute_mutation(
+        org.clone(),
+        CallContext {
+            from_pane: Some(CallerPane("%2".into())),
+            ..caller()
+        },
+        |by| TaskCommand::Assign {
+            task_id: "t3".parse().unwrap(),
+            agent_id: "p/next".parse().unwrap(),
+            by,
+        },
+        |content| {
+            attempts.push(content.to.to_string());
+            let error = match attempts.len() {
+                1 => Some(TaskError::Refused("first audience failed".into())),
+                2 => Some(TaskError::Organisation(OrgServiceError::Unavailable(
+                    "second audience failed".into(),
+                ))),
+                _ => None,
+            };
+            let sender = sender.clone();
+            async move {
+                match error {
+                    Some(error) => Err(error),
+                    None => enqueue(sender, content).await,
+                }
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(attempts, ["p/next", "p/worker", "owner"]);
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["notification"]["status"], "unconfirmed");
+    assert_eq!(
+        result["notification"]["error"]["code"], "refused",
+        "first failed send's code must survive later failures"
+    );
+    let diagnostic = result["notification"]["error"]["message"].as_str().unwrap();
+    for audience in [
+        "p/next (t3)",
+        "p/worker (t3)",
+        "first audience failed",
+        "second audience failed",
+    ] {
+        assert!(
+            diagnostic.contains(audience),
+            "lost failed audience: {diagnostic}"
+        );
+    }
+    let state = org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 1);
+    let queued = state.messages().next().unwrap();
+    assert_eq!(queued.content.to, Address::Owner);
+    assert!(diagnostic.contains(&queued.id.to_string()));
+    cancel.cancel();
+}
+
 // Break caught: replay synthesizes a missing loss Note or repeats a completed one.
 #[tokio::test]
 async fn notice_only_prefix_and_completed_replay_do_not_fabricate_messages() {

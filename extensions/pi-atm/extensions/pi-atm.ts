@@ -84,8 +84,9 @@ function logDebug(msg: string): void {
 /**
  * Persistent socket connection to atmd for the lifetime of this pi-atm
  * instance (pi 0.65+ loads a new instance, with its own connection, for
- * each session). Lazily opened on the first `send()`; reconnects automatically
- * if dropped (e.g. atmd restarts). One handshake per connection
+ * each session). Lazily opened on the first `send()`; after a drop (e.g.
+ * atmd restarts), the next forwarded event after backoff reconnects it.
+ * Idle sessions do not reconnect or re-register. One handshake per connection
  * instead of one per event keeps the daemon log quiet and avoids
  * thousands of short-lived connections in long pi sessions.
  *

@@ -7,8 +7,10 @@ separate approval. Do not enable unattended use on the strength of these files.
 This reference is installed beside both named skills. Each rule record below
 carries its reason, durable source, checked model/harness and remaining limits.
 Source paths refer to the ATM repository, not the installed skill directory.
-Contract records were inspected at `30475a20` on 2026-11-16; a source inspection
-is not a new test run. Historical captures/incidents do not verify this wording.
+Contract records were inspected at `30475a20` on 2026-11-16 unless noted below.
+Decision CLI contracts were rechecked from merged `bb07ce9b` source with a sealed
+build/help and private-daemon CLI tests. A source inspection is not a new test
+run; neither contract tests nor historical captures verify this wording.
 
 ## Commands, not a second protocol
 
@@ -123,16 +125,42 @@ atm inbox --unread --after m41
 atm decisions --all --format json
 ```
 
-## Decision and visibility gaps (M5, L1, L3)
+## Decision requests and visibility (M5, L1, L3)
 
-There is **no decision-request CLI** in this build. `decision.request` is an
-API method, not `atm decisions request`; withdrawal is API-only too. Its request
-has kind/title/context/files/options/recommended/may_be_undone/changes_intent/
-deadline. Do not invent a raw-socket client inside a task. Without an approved
-client, send a concrete question to the manager, state the recommendation and
-what waits, and say **no durable decision was created**. A question message
-does not enter automatic away processing. Complete decision creation needs a
-separate CLI/client unit; see the repository README's Decision API.
+Request an owner choice from your **bound named-agent pane**. Include the
+context, recommendation and what waits. Supply truthful safety facts, not
+values chosen to gain away permission:
+
+```sh
+atm decisions request --kind plan --title 'Approve this interface' \
+  --option smaller --option broader --recommended smaller \
+  --may-be-undone true --changes-intent true \
+  --context 'Undoable interface choice; dependent work waits for disposition' \
+  --attach /absolute/plan.md --format json
+# Only if your own still-Pending request is superseded:
+atm decisions withdraw d52 --reason 'Superseded' --format json
+```
+
+`--kind` is action/hire/budget/policy/plan/dialog; `--kind`, `--title`, repeated
+`--option` (2–32 distinct values), and both valued flags `--may-be-undone
+true|false`/`--changes-intent true|false` are required. The daemon derives the
+requester from your pane; there is no requester override, and unbound callers
+cannot request. Repeat `--attach` for literal paths, not uploads. Optional
+`--recommended` must match an option exactly; `--deadline` takes a future
+RFC3339 timestamp but starts no expiry timer. Put `--format json` after the
+mutation subcommand; do not combine list filters/cursors with a mutation.
+
+A returned `decision_id` or `dN requested` confirms creation, **not approval**,
+Pending status or notification delivery; away processing may already have
+acted. Wait for the recorded disposition/answer before dependent work. No extra
+manual question message is needed for the same owner choice. Ordinary scope or
+coordination questions still use the manager/message route; chat does not
+create a durable decision. Withdraw only your own Pending request; provisional
+or final decisions cannot be withdrawn (Owner also has withdrawal authority).
+After an uncertain request/withdraw outcome, inspect all `atm decisions --all`
+pages and your own inbox before retrying: every accepted request creates a new
+ID, and the CLI never retries automatically. See the repository README's
+Decisions section for the full CLI/API contract.
 
 A named caller's `atm decisions` lists only that caller's requests, including
 with `--all`; the latter changes status filtering, not authority. Only Owner
@@ -295,13 +323,15 @@ Keep a short visible end-of-turn marker as recovery, not a second notification.
 
 ### M5
 
-Ask with context/options/recommendation/dependency and await an authoritative
-answer. Without an approved request client, identify the question message as
-not creating a durable decision.
-**Why:** The CLI cannot create a decision and ordinary chat does not invoke away policy.
-**Source:** Repository README Decision API; `crates/atmd/src/org/decision_methods.rs`; `atm decisions --help` and `atm decide --help` read on 2026-11-16.
-**Checked:** 2026-11-16 source/help inspection at 30475a20; harness: N/A (model-free CLI/API contract); model: N/A.
-**Not verified:** Complete CLI decision creation (not built); new-skill question discipline.
+Request owner choices from the bound pane with `atm decisions request`, giving
+context/options/recommendation/dependency and truthful explicit safety flags;
+await the recorded disposition/answer, not just a creation receipt. Withdraw
+only your own Pending request with `atm decisions withdraw`; ordinary chat
+does not create a durable decision.
+**Why:** Durable requests enter owner/away policy; a receipt grants no approval.
+**Source:** Repository README Decisions; `src/bin/atm/decide.rs`; `crates/atmd/src/org/decision_methods.rs`; `tests/atm_decide.rs::real_cli_requests_and_withdrawals_use_pane_authority_and_survive_restart`.
+**Checked:** 2026-11-16 merged bb07ce9b source, actual sealed request/withdraw --help and private-daemon CLI tests; harness: N/A (model-free CLI/API contract and stand-ins); model: N/A.
+**Not verified:** New-skill decision-request/withdrawal discipline on real models/harnesses.
 
 ### M6
 
@@ -375,12 +405,13 @@ Do not assign work on a pending decision; link provisional dependencies with
 
 ### L6
 
-Route new owner choices while present; while away, continue only under approved
-intent/rules and recorded dispositions. Return does not confirm provisional choices.
+Route new owner choices with `atm decisions request`; while present await Owner,
+while away continue only under approved intent/rules and recorded dispositions.
+Neither a creation receipt nor return confirms provisional choices or releases caps.
 **Why:** Availability is not approval; external/publish/promotion/spend authority stays separate.
-**Source:** `tests/away_delivery.rs::a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart`; `crates/atm-org/tests/away.rs::nothing_is_taken_after_the_owner_is_back`.
-**Checked:** 2026-11-16 source inspection at 30475a20; harness: N/A (model-free policy/stand-in); model: N/A.
-**Not verified:** Real-model away/return behavior with these skills.
+**Source:** `src/bin/atm/decide.rs`; `tests/away_delivery.rs::a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart`; `crates/atm-org/tests/away.rs::nothing_is_taken_after_the_owner_is_back`.
+**Checked:** 2026-11-16 source inspection at 30475a20 (away) and merged bb07ce9b (CLI), actual sealed request/withdraw --help; harness: N/A (model-free policy/stand-in); model: N/A.
+**Not verified:** Real-model decision-request/away/return behavior with these skills.
 
 ### L7
 

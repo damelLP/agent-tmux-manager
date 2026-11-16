@@ -85,11 +85,13 @@ a command or boundary is unclear; do not replace missing evidence with a guess.
 
 ## Choices, away and save
 
-- **[M5](references/atm-named-agents.md#m5)** Ask a concrete question with
-  context/options/recommendation and what waits; consume the authoritative
-  answer before dependent work. There is **no decision-request CLI**: without
-  an approved client, a question message must say it created no durable
-  decision. *Why: chat alone does not enter automatic away processing.*
+- **[M5](references/atm-named-agents.md#m5)** Request owner choices from your
+  bound pane with `atm decisions request`, including context, options,
+  recommendation and truthful explicit `--may-be-undone`/`--changes-intent`
+  values (see recipe). Consume the recorded disposition/answer before dependent
+  work; a returned decision ID is not approval. Withdraw only your own Pending
+  request with `atm decisions withdraw dN --reason '...'`.
+  *Why: durable requests enter the owner/away workflow; ordinary chat does not.*
 - **[M6](references/atm-named-agents.md#m6)** While away, obey the recorded
   recommended disposition: detail may be agent-decided; undoable intent
   change may be provisional; irreversible/external, action/hire/budget/unknown

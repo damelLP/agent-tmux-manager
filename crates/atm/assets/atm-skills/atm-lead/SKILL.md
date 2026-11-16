@@ -95,13 +95,13 @@ recovery aid, not a reason to duplicate every automatic notification.
   honor the recorded provisional cap; do not bypass it by omitting links,
   creating child tasks or reopening work. *Why: the cap is not retroactive
   and cannot discover dependency chains or missing links.*
-- **[L6](references/atm-named-agents.md#l6)** Route new owner choices while
-  present; while away continue only under approved intent/standing rules and
-  recorded dispositions. There is **no decision-request CLI** (see
-  [M5](references/atm-named-agents.md#m5)): without an approved client, route
-  a concrete question and state no durable decision
-  was created. Return does not confirm provisional decisions or release caps.
-  *Why: silence/chat and `back` are not approval or automatic decision creation.*
+- **[L6](references/atm-named-agents.md#l6)** Route new owner choices with
+  `atm decisions request` (see [M5](references/atm-named-agents.md#m5)). While
+  present await Owner; while away continue only under approved intent/standing
+  rules and recorded dispositions. A creation receipt is not approval; return
+  does not confirm provisional decisions or release caps.
+  *Why: a durable request invokes decision policy; neither silence nor `back`
+  grants approval.*
 - **[L7](references/atm-named-agents.md#l7)** Clear/handover only authorized
   seats at safe boundaries, after work is committed/parked; dispatch the next
   unit only after a successful clear. On a save request, update the lead's

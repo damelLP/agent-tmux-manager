@@ -641,8 +641,9 @@ After a start/clear, `atm me` finds the role and memory but does **not** load a
 skill. An approved role instruction body can direct reading its installed
 `SKILL.md`; `skills = [...]` alone does not. Keep current priming until that
 bootstrap is verified on the harness/model. Installing skills does not adopt
-agents or enable automatic handover. Decision creation is API-only (no request
-CLI), named leads cannot inspect every agent's decisions/inbox, and the A2
+agents or enable automatic handover. Named agents use `atm decisions request`
+and `atm decisions withdraw` for durable owner choices (see [Decisions](#decisions)).
+Named leads still cannot inspect every agent's decisions/inbox, and the A2
 digest/A3 drift scheduler are not built. The skills expose these limits rather
 than silently bypassing them.
 

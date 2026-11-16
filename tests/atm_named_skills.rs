@@ -192,6 +192,70 @@ fn named_skills_use_automatic_verdict_answers_without_duplicate_send() {
     assert!(record.contains("**Not verified:**"));
 }
 
+// Break caught: shipped recipes authorize obsolete work or duplicate automatic invalidation; structural only, not model compliance.
+#[test]
+fn named_skills_recheck_ownership_and_coordinate_only_uncovered_task_changes() {
+    let normalize = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let member = normalize(document("atm-member"));
+    for required in [
+        "agent_id",
+        "`atm me`",
+        "accepted`/`cancelled",
+        "stop",
+        "judges",
+        "question",
+        "waiting",
+        "blocked",
+        "note alone",
+        "not interrupt",
+    ] {
+        assert!(
+            member.contains(required),
+            "member missing invalidation boundary: {required}"
+        );
+    }
+    let lead = normalize(document("atm-lead"));
+    for required in [
+        "current task",
+        "before expensive review",
+        "do not duplicate automatic",
+        "late files",
+        "unlinked review",
+        "not interrupt",
+        "missing enqueue",
+    ] {
+        assert!(
+            lead.contains(required),
+            "lead missing invalidation boundary: {required}"
+        );
+    }
+    let reference = normalize(fs::read_to_string(source().join("shared").join(REFERENCE)).unwrap())
+        .to_lowercase();
+    for required in [
+        "former holder",
+        "withdrawn",
+        "linked live review",
+        "at most three",
+        "first failed",
+        "known queued",
+        "no attachments",
+        "not interrupt",
+        "no automatic review-state",
+        "same-state cycles",
+        "actionable late files",
+        "unlinked review",
+        "authorized diagnostics",
+        "not verified",
+    ] {
+        assert!(
+            reference.contains(required),
+            "reference missing invalidation boundary: {required}"
+        );
+    }
+    assert!(!reference.contains("cancel immediately interrupts"));
+    assert!(!reference.contains("always send a cancellation note"));
+}
+
 // Break caught: a distributed entry example is too large for the recorded
 // Claude slash-command boundary or names a different skill. This checks the
 // example size, not the unverified current-harness paste boundary itself.

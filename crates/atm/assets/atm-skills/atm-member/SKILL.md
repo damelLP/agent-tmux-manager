@@ -61,12 +61,19 @@ a command or boundary is unclear; do not replace missing evidence with a guess.
   start/drive other seats. *Why: unattended dialogs and overlapping work stall
   the organisation; role/brief/repository restrictions remain binding.*
 - **[M2](references/atm-named-agents.md#m2)** If given a canonical task `tN`,
-  `atm task get tN` and branch on its state. Keep `submitted`/`in_review`
+  `atm task get tN`, compare its `agent_id` with `atm me`, and branch on state.
+  If `accepted`/`cancelled` or no longer assigned to you, stop obsolete work;
+  do not submit, resume or clear on a note alone. For a review, also read its
+  `judges` task before continuing. Invalidation Notes do not interrupt a running
+  turn, so re-check at work boundaries, not only after messages arrive.
+  Keep `submitted`/`in_review`
   unchanged and await the verdict; withdraw a `submitted` task only on an
   explicit authorized request (`in_review` cannot return to `working`). From
   `assigned`/`working`/`waiting`/`blocked`/`changes_requested`, set `working`
   only when authorized work can proceed. When stopping that work, use
-  `waiting --reason '...'` or `blocked --reason '...'`.
+  `waiting --reason '...'` or `blocked --reason '...'`. If help/choice is needed,
+  send an explicit question to the lead (or M5 decision request for an owner
+  choice); those states/reasons do not automatically ask anyone for action.
   *Why: setting a submitted task to working retracts it, not just resumes it.*
 - **[M3](references/atm-named-agents.md#m3)** At a plan stop submit with
   `--what plan` and stop until acceptance. On the lead's task-correlated answer

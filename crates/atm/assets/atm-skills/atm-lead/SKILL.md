@@ -74,8 +74,9 @@ not successful model evaluations or permission to activate unattended operation.
   ask the manager/Owner for cross-inbox diagnostics or owner-only recovery.
   Do not force raw tmux input, resend repeatedly or touch unauthorized seats.
   *Why: readiness/placeholder failures have stranded apparently sent work.*
-- **[L4](references/atm-named-agents.md#l4)** Read report/evidence and judge
-  against the approved measure. Use an independent submitted review task when
+- **[L4](references/atm-named-agents.md#l4)** Get the current task state/assignee
+  before expensive review; a Report may have been withdrawn or superseded.
+  Read current report/evidence and judge against the approved measure. Use an independent submitted review task when
   required, then accept or request changes; never accept your own assigned
   work. Non-final verdicts automatically queue one task-correlated `answer`;
   do not send a duplicate. The assignee re-reads the current task state before
@@ -89,6 +90,13 @@ The linked reference supplies one durable-task lifecycle and the message-only
 fallback. Submission already queues a report; questions still need their own
 concrete message when a decision is required. Short visible markers remain a
 recovery aid, not a reason to duplicate every automatic notification.
+Cancellation, lost ownership, withdrawal and displaced linked live reviews
+queue bounded invalidation Notes; do not duplicate automatic notices. They do
+not interrupt running turns, clear seats, or change review-task state. For urgent
+stand-down use separately authorized coordination. Explicitly communicate
+actionable late files or unlinked review changes: attachments and unlinked child
+tasks do not produce these wakes. Investigate a missing enqueue through S6 and
+authorized diagnostics before conditional recovery, not blind resend.
 
 ## Decide, preserve dependencies, hand over
 

@@ -153,6 +153,759 @@ fn verdict_fact(verdict: TaskVerdict) -> TaskVerdictGiven {
     }
 }
 
+// Break caught: an identity snapshot, rather than the actor's actual before-image, routes revocation.
+#[tokio::test]
+async fn ownership_routing_uses_actor_beforeimage() {
+    use crate::org::Request;
+    let (_dir, real, cancel) = org().await;
+    for (name, pane) in [("middle", "%2"), ("next", "%3")] {
+        real.execute(
+            OrgCommand::Adopt {
+                agent_id: format!("p/{name}").parse().unwrap(),
+                pane: pane.into(),
+                session_id: None,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    real.execute(
+        OrgCommand::Task(assign(TaskActor {
+            who: Address::Owner,
+            lead: false,
+        })),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let (requests, mut receive) = mpsc::channel(8);
+    let proxy = OrgHandle {
+        requests,
+        ..real.clone()
+    };
+    let (entered, entry) = oneshot::channel();
+    let (release, gate) = oneshot::channel();
+    let forward = real.clone();
+    let forwarding = tokio::spawn(async move {
+        let mut pause = Some((entered, gate));
+        while let Some(request) = receive.recv().await {
+            if matches!(&request, Request::Execute { command, .. } if matches!(command.as_ref(), OrgCommand::Task(_)))
+            {
+                let (entered, gate) = pause.take().unwrap();
+                entered.send(()).unwrap();
+                gate.await.unwrap();
+            }
+            forward.submit(request).unwrap();
+        }
+    });
+    let sender = real.clone();
+    let call = tokio::spawn(execute_mutation(
+        proxy,
+        owner_caller(),
+        |by| TaskCommand::Assign {
+            task_id: "t3".parse().unwrap(),
+            agent_id: "p/next".parse().unwrap(),
+            by,
+        },
+        move |content| enqueue(sender.clone(), content),
+    ));
+    entry.await.unwrap(); // identity snapshot has been read, task mutation has not reached the actor.
+    real.execute(
+        OrgCommand::Task(TaskCommand::Assign {
+            task_id: "t3".parse().unwrap(),
+            agent_id: "p/middle".parse().unwrap(),
+            by: TaskActor {
+                who: Address::Owner,
+                lead: false,
+            },
+        }),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    let result = call.await.unwrap().unwrap();
+    assert!(matches!(
+        result.notification,
+        Some(Notification::Queued { .. })
+    ));
+    let state = real.snapshot().await.unwrap();
+    let audiences: Vec<_> = state
+        .messages()
+        .map(|m| (m.content.to.to_string(), m.content.kind))
+        .collect();
+    assert_eq!(
+        audiences,
+        [
+            ("p/next".into(), MessageKind::Brief),
+            ("p/middle".into(), MessageKind::Note)
+        ],
+        "missing actual previous-holder notice"
+    );
+    forwarding.await.unwrap();
+    cancel.cancel();
+}
+
+// Break caught: partial fanout stops early/lies about queued truth, or waiter loss drops worker ownership.
+#[tokio::test]
+async fn partial_fanout_retains_worker_and_committed_truth() {
+    for lost_waiter in [0, 1, 2] {
+        // await, abort, timeout
+        for failed in [0, 1] {
+            let (_dir, org, cancel) = org().await;
+            for (name, pane) in [("lead", "%2"), ("next", "%3")] {
+                org.execute(
+                    OrgCommand::Adopt {
+                        agent_id: format!("p/{name}").parse().unwrap(),
+                        pane: pane.into(),
+                        session_id: None,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            }
+            org.execute(
+                OrgCommand::Task(assign(TaskActor {
+                    who: Address::Owner,
+                    lead: false,
+                })),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            let tasks = TaskHandle::new(org.clone());
+            let workers = tasks.workers.clone();
+            let sender = org.clone();
+            let (entered, mut entry) = mpsc::unbounded_channel();
+            let (done, finished) = oneshot::channel();
+            let call = tokio::spawn(async move {
+                let worker_org = tasks.org.clone();
+                tasks
+                    .run(async move {
+                        let result = execute_mutation(
+                            worker_org,
+                            CallContext {
+                                from_pane: Some(CallerPane("%2".into())),
+                                ..caller()
+                            },
+                            |by| TaskCommand::Assign {
+                                task_id: "t3".parse().unwrap(),
+                                agent_id: "p/next".parse().unwrap(),
+                                by,
+                            },
+                            move |content| {
+                                let (release, gate) = oneshot::channel();
+                                entered.send((content.clone(), release)).unwrap();
+                                let sender = sender.clone();
+                                async move {
+                                    if gate.await.unwrap() {
+                                        enqueue(sender, content).await
+                                    } else {
+                                        Err(TaskError::Organisation(OrgServiceError::Unavailable(
+                                            "test send failed".into(),
+                                        )))
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        done.send(serde_json::to_value(result).unwrap()).unwrap();
+                        Ok(())
+                    })
+                    .await
+            });
+            let (first, release) = entry.recv().await.unwrap();
+            assert_eq!(first.to.to_string(), "p/next");
+            assert!(workers.clone().try_acquire_many_owned(64).is_err());
+            if lost_waiter == 1 {
+                call.abort();
+                assert!(call.await.unwrap_err().is_cancelled());
+            } else if lost_waiter == 2 {
+                tokio::time::pause(); // mutation is committed; only this in-memory gate is pending.
+                assert!(matches!(call.await.unwrap(), Err(TaskError::Timeout)));
+                tokio::time::resume();
+            } else {
+                // Retain the waiter; its detached JoinHandle still allows the worker to run.
+                drop(call);
+            }
+            release.send(failed != 0).unwrap();
+            for (index, audience) in [(1, "p/worker"), (2, "owner")] {
+                let request = tokio::select! {
+                    request = entry.recv() => request,
+                    _ = workers.acquire_many(64) => panic!("fanout ended before {audience} was attempted"),
+                };
+                let (content, release) = request.expect("missing remaining invalidation send");
+                assert_eq!(content.to.to_string(), audience);
+                assert_eq!(content.kind, MessageKind::Note);
+                assert!(workers.clone().try_acquire_many_owned(64).is_err());
+                release.send(index != failed).unwrap();
+            }
+            let result = finished.await.unwrap();
+            assert_eq!(result["changed"], true);
+            assert_eq!(result["notification"]["status"], "unconfirmed");
+            assert_eq!(result["notification"]["error"]["code"], "unavailable");
+            let diagnostic = result["notification"]["error"]["message"].as_str().unwrap();
+            assert!(diagnostic.contains(if failed == 0 { "p/next" } else { "p/worker" }));
+            let state = org.snapshot().await.unwrap();
+            assert_eq!(
+                state
+                    .task(&"t3".parse().unwrap())
+                    .unwrap()
+                    .agent_id
+                    .as_ref()
+                    .unwrap()
+                    .to_string(),
+                "p/next"
+            );
+            assert_eq!(state.messages().count(), 2);
+            for message in state.messages() {
+                assert!(
+                    diagnostic.contains(&message.id.to_string()),
+                    "lost queued ID: {diagnostic}"
+                );
+            }
+            drop(workers.acquire_many_owned(64).await.unwrap());
+            cancel.cancel();
+        }
+    }
+}
+
+// Break caught: a later failure overwrites the first error code or hides another failed/queued audience.
+#[tokio::test]
+async fn fanout_preserves_first_error_and_every_failed_audience() {
+    let (_dir, org, cancel) = org().await;
+    for (name, pane) in [("lead", "%2"), ("next", "%3")] {
+        org.execute(
+            OrgCommand::Adopt {
+                agent_id: format!("p/{name}").parse().unwrap(),
+                pane: pane.into(),
+                session_id: None,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    org.execute(
+        OrgCommand::Task(assign(TaskActor {
+            who: Address::Owner,
+            lead: false,
+        })),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let sender = org.clone();
+    let mut attempts = Vec::new();
+    let result = execute_mutation(
+        org.clone(),
+        CallContext {
+            from_pane: Some(CallerPane("%2".into())),
+            ..caller()
+        },
+        |by| TaskCommand::Assign {
+            task_id: "t3".parse().unwrap(),
+            agent_id: "p/next".parse().unwrap(),
+            by,
+        },
+        |content| {
+            attempts.push(content.to.to_string());
+            let error = match attempts.len() {
+                1 => Some(TaskError::Refused("first audience failed".into())),
+                2 => Some(TaskError::Organisation(OrgServiceError::Unavailable(
+                    "second audience failed".into(),
+                ))),
+                _ => None,
+            };
+            let sender = sender.clone();
+            async move {
+                match error {
+                    Some(error) => Err(error),
+                    None => enqueue(sender, content).await,
+                }
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(attempts, ["p/next", "p/worker", "owner"]);
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["notification"]["status"], "unconfirmed");
+    assert_eq!(
+        result["notification"]["error"]["code"], "refused",
+        "first failed send's code must survive later failures"
+    );
+    let diagnostic = result["notification"]["error"]["message"].as_str().unwrap();
+    for audience in [
+        "p/next (t3)",
+        "p/worker (t3)",
+        "first audience failed",
+        "second audience failed",
+    ] {
+        assert!(
+            diagnostic.contains(audience),
+            "lost failed audience: {diagnostic}"
+        );
+    }
+    let state = org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 1);
+    let queued = state.messages().next().unwrap();
+    assert_eq!(queued.content.to, Address::Owner);
+    assert!(diagnostic.contains(&queued.id.to_string()));
+    cancel.cancel();
+}
+
+// Break caught: replay synthesizes a missing loss Note or repeats a completed one.
+#[tokio::test]
+async fn notice_only_prefix_and_completed_replay_do_not_fabricate_messages() {
+    for complete in [false, true] {
+        let (dir, org, cancel) = org().await;
+        org.execute(
+            OrgCommand::Task(assign(TaskActor {
+                who: Address::Owner,
+                lead: false,
+            })),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let sender = org.clone();
+        let (entered, entry) = oneshot::channel();
+        let mut entered = Some(entered);
+        let call = tokio::spawn(execute_mutation(
+            org.clone(),
+            owner_caller(),
+            |by| TaskCommand::SetState {
+                task_id: "t3".parse().unwrap(),
+                state: TaskState::Cancelled,
+                reason: None,
+                by,
+            },
+            move |content| {
+                let entered = entered.take().unwrap();
+                let sender = sender.clone();
+                async move {
+                    entered.send(()).unwrap();
+                    if complete {
+                        enqueue(sender, content).await
+                    } else {
+                        std::future::pending::<Result<MessageId, TaskError>>().await
+                    }
+                }
+            },
+        ));
+        tokio::select! {
+            result = entry => result.expect("missing cancellation Note enqueue"),
+            _ = org.requests.closed() => panic!("actor stopped"),
+        }
+        if complete {
+            assert!(matches!(
+                call.await.unwrap().unwrap().notification,
+                Some(Notification::Queued { .. })
+            ));
+        } else {
+            call.abort();
+            assert!(call.await.unwrap_err().is_cancelled());
+        }
+        let before = org.snapshot().await.unwrap();
+        assert_eq!(before.messages().count(), usize::from(complete));
+        assert_eq!(
+            before.task(&"t3".parse().unwrap()).unwrap().state,
+            TaskState::Cancelled
+        );
+        let next = tempfile::tempdir().unwrap();
+        copy(dir.path(), next.path());
+        cancel.cancel();
+        let stop = CancellationToken::new();
+        let reopened = OrgHandle::open(next.path().into(), stop.clone()).await;
+        assert_eq!(reopened.snapshot().await.unwrap(), before);
+        stop.cancel();
+    }
+}
+
+fn invalidation_context(
+    base: u64,
+    review_state: TaskState,
+    assigned: bool,
+    related: bool,
+) -> (OrgState, TaskId, TaskId) {
+    let mut state = verdict_snapshot(TaskState::Working, true);
+    let now = chrono::Utc::now();
+    let id: TaskId = format!("t{base}").parse().unwrap();
+    let review: TaskId = format!("t{}", base + 4).parse().unwrap();
+    let mut work = created("é".repeat(512));
+    work.files = (0..40)
+        .map(|n| atm_org::TaskFile {
+            path: format!("old-{n}.md"),
+            kind: TaskFileKind::Report,
+            note: Some("é".repeat(8192)),
+        })
+        .collect();
+    state
+        .apply(base, now, &OrgEvent::TaskCreated(work))
+        .unwrap();
+    state
+        .apply(
+            base + 1,
+            now,
+            &OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+                task_id: id.clone(),
+                agent_id: "p/worker".parse().unwrap(),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    state
+        .apply(
+            base + 2,
+            now,
+            &OrgEvent::TaskSubmitted(atm_org::TaskSubmitted {
+                task_id: id.clone(),
+                what: TaskSubmission::Result,
+                files: vec![],
+                by: "p/worker".parse().unwrap(),
+            }),
+        )
+        .unwrap();
+    state
+        .apply(
+            base + 3,
+            now,
+            &OrgEvent::AgentAdopted {
+                agent_id: "p/reviewer".parse().unwrap(),
+                pane: "%2".into(),
+                session_id: None,
+            },
+        )
+        .unwrap();
+    let mut body = created("Review".into());
+    body.kind = TaskKind::Review;
+    body.judges = Some(if related {
+        id.clone()
+    } else {
+        "t3".parse().unwrap()
+    });
+    state
+        .apply(base + 4, now, &OrgEvent::TaskCreated(body))
+        .unwrap();
+    if assigned {
+        state
+            .apply(
+                base + 5,
+                now,
+                &OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+                    task_id: review.clone(),
+                    agent_id: "p/reviewer".parse().unwrap(),
+                    by: Address::Owner,
+                }),
+            )
+            .unwrap();
+    }
+    state
+        .apply(
+            base + 6,
+            now,
+            &OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+                task_id: review.clone(),
+                state: review_state,
+                reason: Some("é".repeat(8192)),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    state
+        .apply(
+            base + 7,
+            now,
+            &OrgEvent::TaskReviewStarted(atm_org::TaskReviewStarted {
+                task_id: id.clone(),
+                review_task: review.clone(),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    (state, id, review)
+}
+
+// Break caught: historical files/Unicode reasons overflow Notes, or superseded/current/unrelated work is woken.
+#[test]
+fn invalidation_bounds_and_supersession() {
+    for base in [20, u64::MAX - 100] {
+        let (mut state, id, review) = invalidation_context(base, TaskState::Working, true, true);
+        let before = state.task(&id).unwrap().clone();
+        let event = OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+            task_id: id.clone(),
+            state: TaskState::Cancelled,
+            reason: Some("🙂".repeat(4096)),
+            by: Address::Owner,
+        });
+        state.apply(base + 8, chrono::Utc::now(), &event).unwrap();
+        let notes = notifications(&event, Some(&before), &state).unwrap();
+        assert_eq!(notes.len(), 2, "missing bounded live-review notice");
+        assert_eq!(notes[0].task, Some(id.clone()));
+        assert_eq!(notes[1].task, Some(review.clone()));
+        for note in &notes {
+            assert!(note.body.len() < 512);
+            assert!(note.attachments.is_empty());
+            assert!(!note.body.contains('é') && !note.body.contains('🙂'));
+            assert!(note.body.contains(&format!("atm task get {id}")));
+            validate_send(&SendParams {
+                to: note.to.clone(),
+                kind: note.kind,
+                body: note.body.clone(),
+                attachments: note.attachments.clone(),
+                task: note.task.clone(),
+            })
+            .unwrap();
+        }
+        assert!(notes[1].body.contains(&format!("atm task get {review}")));
+        // Restoring the exact linked review suppresses its obsolete invalidation.
+        state
+            .apply(
+                base + 9,
+                chrono::Utc::now(),
+                &OrgEvent::TaskReviewStarted(atm_org::TaskReviewStarted {
+                    task_id: id,
+                    review_task: review,
+                    by: Address::Owner,
+                }),
+            )
+            .unwrap();
+        assert!(notifications(&event, Some(&before), &state)
+            .unwrap()
+            .is_empty());
+    }
+    for review_state in [
+        TaskState::Open,
+        TaskState::Assigned,
+        TaskState::Working,
+        TaskState::Waiting,
+        TaskState::Blocked,
+        TaskState::ChangesRequested,
+        TaskState::Submitted,
+        TaskState::Accepted,
+        TaskState::Cancelled,
+        TaskState::Unknown,
+    ] {
+        for assigned in [false, true] {
+            for related in [false, true] {
+                let (mut state, id, review) =
+                    invalidation_context(20, review_state, assigned, related);
+                let before = state.task(&id).unwrap().clone();
+                let event = OrgEvent::TaskVerdict(TaskVerdictGiven {
+                    task_id: id.clone(),
+                    verdict: TaskVerdict::Accepted,
+                    review_task: None,
+                    note: Some("é".repeat(8192)),
+                    by: Address::Owner,
+                });
+                state.apply(28, chrono::Utc::now(), &event).unwrap();
+                let messages = notifications(&event, Some(&before), &state).unwrap();
+                let live = matches!(
+                    review_state,
+                    TaskState::Assigned
+                        | TaskState::Working
+                        | TaskState::Waiting
+                        | TaskState::Blocked
+                        | TaskState::ChangesRequested
+                );
+                assert_eq!(
+                    messages.len(),
+                    usize::from(live && assigned && related),
+                    "review {review_state:?}, assigned={assigned}, related={related}"
+                );
+                if let Some(note) = messages.first() {
+                    assert_eq!(note.task.as_ref(), Some(&review));
+                    assert_eq!(note.kind, MessageKind::Note);
+                }
+                // A still-current linked R must never be called superseded.
+                let mut current = state.clone();
+                current
+                    .apply(
+                        29,
+                        chrono::Utc::now(),
+                        &OrgEvent::TaskReviewStarted(atm_org::TaskReviewStarted {
+                            task_id: id.clone(),
+                            review_task: review.clone(),
+                            by: Address::Owner,
+                        }),
+                    )
+                    .unwrap();
+                assert!(notifications(&event, Some(&before), &current)
+                    .unwrap()
+                    .is_empty());
+                // An unlinked child that judges T is not discovered by a scan.
+                let mut unlinked = before.clone();
+                unlinked.review_task = None;
+                unlinked.state = TaskState::Submitted;
+                assert!(notifications(&event, Some(&unlinked), &state)
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
+    let mut state = verdict_snapshot(TaskState::Working, true);
+    state
+        .apply(
+            6,
+            chrono::Utc::now(),
+            &OrgEvent::AgentAdopted {
+                agent_id: "p/next".parse().unwrap(),
+                pane: "%2".into(),
+                session_id: None,
+            },
+        )
+        .unwrap();
+    let before = state.task(&"t3".parse().unwrap()).unwrap().clone();
+    let event = OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+        task_id: before.id.clone(),
+        agent_id: "p/next".parse().unwrap(),
+        by: Address::Owner,
+    });
+    state.apply(7, chrono::Utc::now(), &event).unwrap();
+    state
+        .apply(
+            8,
+            chrono::Utc::now(),
+            &OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+                task_id: before.id.clone(),
+                agent_id: "p/worker".parse().unwrap(),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    assert!(notifications(&event, Some(&before), &state)
+        .unwrap()
+        .iter()
+        .all(|m| m.kind != MessageKind::Note));
+    let mut state = verdict_snapshot(TaskState::Submitted, true);
+    let before = state.task(&"t3".parse().unwrap()).unwrap().clone();
+    let withdrawal = OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+        task_id: before.id.clone(),
+        state: TaskState::Working,
+        reason: None,
+        by: "p/worker".parse().unwrap(),
+    });
+    state.apply(6, chrono::Utc::now(), &withdrawal).unwrap();
+    assert_eq!(
+        notifications(&withdrawal, Some(&before), &state)
+            .unwrap()
+            .len(),
+        1,
+        "missing withdrawal notice"
+    );
+    let working = state.task(&before.id).unwrap().clone();
+    assert!(notifications(&withdrawal, Some(&working), &state)
+        .unwrap()
+        .is_empty());
+    state
+        .apply(
+            7,
+            chrono::Utc::now(),
+            &OrgEvent::TaskSubmitted(atm_org::TaskSubmitted {
+                task_id: before.id.clone(),
+                what: TaskSubmission::Result,
+                files: vec![],
+                by: "p/worker".parse().unwrap(),
+            }),
+        )
+        .unwrap();
+    assert!(notifications(&withdrawal, Some(&before), &state)
+        .unwrap()
+        .is_empty());
+}
+
+// Break caught: missing committed context guesses a recipient or silently reports no notification.
+#[tokio::test]
+async fn missing_invalidation_context_is_explicitly_unconfirmed() {
+    use crate::{
+        eventlog::Envelope,
+        org::{Request, TaskCommit},
+    };
+    use tokio::sync::{broadcast, watch};
+    for missing_before in [false, true] {
+        let (requests, mut receive) = mpsc::channel(8);
+        let (_health, health) = watch::channel(Ok(5));
+        let (committed, _) = broadcast::channel(8);
+        let org = OrgHandle {
+            requests,
+            health,
+            committed,
+            reads: None,
+        };
+        let (before_state, _, _) = invalidation_context(20, TaskState::Working, true, true);
+        let before = before_state.task(&"t20".parse().unwrap()).cloned();
+        let call = tokio::spawn(execute_mutation(
+            org,
+            owner_caller(),
+            |by| TaskCommand::SetState {
+                task_id: "t20".parse().unwrap(),
+                state: TaskState::Cancelled,
+                reason: None,
+                by,
+            },
+            |_| async { panic!("must not guess a notification audience") },
+        ));
+        let Request::Snapshot(reply) = receive.recv().await.unwrap() else {
+            panic!("identity snapshot")
+        };
+        reply.send(before_state.clone()).unwrap();
+        let Request::Execute { reply, now, .. } = receive.recv().await.unwrap() else {
+            panic!("mutation")
+        };
+        let event = OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+            task_id: "t20".parse().unwrap(),
+            state: TaskState::Cancelled,
+            reason: None,
+            by: Address::Owner,
+        });
+        reply
+            .send(Ok(TaskCommit {
+                before: if missing_before { None } else { before },
+                events: vec![Envelope {
+                    seq: 28,
+                    ts: now,
+                    kind: event.kind().into(),
+                    body: event.to_body(),
+                }],
+            }))
+            .unwrap();
+        let Request::Snapshot(reply) = receive.recv().await.unwrap() else {
+            panic!("post-commit snapshot")
+        };
+        let mut current = if missing_before {
+            before_state
+        } else {
+            // Preserve T but omit the linked R from the supplied snapshot.
+            let mut current = verdict_snapshot(TaskState::Working, true);
+            current
+                .apply(20, now, &OrgEvent::TaskCreated(created("Work".into())))
+                .unwrap();
+            current
+        };
+        current.apply(28, now, &event).unwrap();
+        reply.send(current).unwrap();
+        let result = serde_json::to_value(call.await.unwrap().unwrap()).unwrap();
+        assert_eq!(result["changed"], true);
+        assert_eq!(
+            result["notification"]["status"], "unconfirmed",
+            "missing context must be explicit"
+        );
+        assert_eq!(
+            result["notification"]["error"]["code"],
+            if missing_before {
+                "internal"
+            } else {
+                "not_found"
+            }
+        );
+    }
+}
+
 // Break caught: answer copies an oversized note/stale files, loses review access, or guesses an assignee.
 #[test]
 fn verdict_answer_reads_note_and_review_by_reference() {
@@ -318,12 +1071,17 @@ async fn superseded_verdict_snapshot_does_not_emit_stale_wake() {
             };
             let event = OrgEvent::TaskVerdict(verdict_fact(choice));
             reply
-                .send(Ok(vec![Envelope {
-                    seq: 6,
-                    ts: now,
-                    kind: event.kind().into(),
-                    body: event.to_body(),
-                }]))
+                .send(Ok(crate::org::TaskCommit {
+                    before: verdict_snapshot(TaskState::Submitted, true)
+                        .task(&"t3".parse().unwrap())
+                        .cloned(),
+                    events: vec![Envelope {
+                        seq: 6,
+                        ts: now,
+                        kind: event.kind().into(),
+                        body: event.to_body(),
+                    }],
+                }))
                 .unwrap();
             let request = tokio::select! {
                 request = receive.recv() => request,
@@ -398,18 +1156,23 @@ async fn verdict_worker_retains_enqueue_after_waiter_loss() {
             let (release, gate) = oneshot::channel();
             let (done, finished) = oneshot::channel();
             let sender = org.clone();
+            let mut gate = Some((entered, gate, done));
             let call = tokio::spawn(async move {
                 tasks
                     .run(execute_mutation(
                         tasks.org.clone(),
                         owner_caller(),
                         move |by| verdict(by, choice),
-                        move |content| async move {
-                            entered.send(()).unwrap();
-                            gate.await.unwrap();
-                            let result = enqueue(sender, content).await;
-                            done.send(()).unwrap();
-                            result
+                        move |content| {
+                            let (entered, gate, done) = gate.take().unwrap();
+                            let sender = sender.clone();
+                            async move {
+                                entered.send(()).unwrap();
+                                gate.await.unwrap();
+                                let result = enqueue(sender, content).await;
+                                done.send(()).unwrap();
+                                result
+                            }
                         },
                     ))
                     .await
@@ -457,7 +1220,7 @@ async fn verdict_prefix_and_answer_replay_do_not_fabricate_messages() {
                 org.clone(),
                 owner_caller(),
                 |by| verdict(by, TaskVerdict::Accepted),
-                move |content| enqueue(sender, content),
+                move |content| enqueue(sender.clone(), content),
             )
             .await
             .unwrap();
@@ -467,13 +1230,17 @@ async fn verdict_prefix_and_answer_replay_do_not_fabricate_messages() {
             );
         } else {
             let (entered, entry) = oneshot::channel();
+            let mut entered = Some(entered);
             let call = tokio::spawn(execute_mutation(
                 org.clone(),
                 owner_caller(),
                 |by| verdict(by, TaskVerdict::Accepted),
-                |_| async move {
-                    entered.send(()).unwrap();
-                    std::future::pending::<Result<MessageId, TaskError>>().await
+                move |_| {
+                    let entered = entered.take().unwrap();
+                    async move {
+                        entered.send(()).unwrap();
+                        std::future::pending::<Result<MessageId, TaskError>>().await
+                    }
                 },
             ));
             entry.await.expect("missing verdict answer enqueue");
@@ -536,18 +1303,23 @@ async fn retained_worker(timeout: bool) {
     let (release, gate) = oneshot::channel();
     let (done, finished) = oneshot::channel();
     let sender = org.clone();
+    let mut gate = Some((entered, gate, done));
     let call = tokio::spawn(async move {
         tasks
             .run(execute_mutation(
                 tasks.org.clone(),
                 caller(),
                 assign,
-                move |content| async move {
-                    entered.send(()).unwrap();
-                    gate.await.unwrap();
-                    let result = enqueue(sender, content).await;
-                    done.send(()).unwrap();
-                    result
+                move |content| {
+                    let (entered, gate, done) = gate.take().unwrap();
+                    let sender = sender.clone();
+                    async move {
+                        entered.send(()).unwrap();
+                        gate.await.unwrap();
+                        let result = enqueue(sender, content).await;
+                        done.send(()).unwrap();
+                        result
+                    }
                 },
             ))
             .await
@@ -646,15 +1418,14 @@ async fn enqueue_failure_is_a_partial_result_not_a_failed_transition() {
 async fn task_only_durable_prefix_replays_without_fabricating_a_message() {
     let (dir, org, cancel) = org().await;
     let (entered, entry) = oneshot::channel();
-    let task = tokio::spawn(execute_mutation(
-        org.clone(),
-        caller(),
-        assign,
-        |_| async move {
+    let mut entered = Some(entered);
+    let task = tokio::spawn(execute_mutation(org.clone(), caller(), assign, move |_| {
+        let entered = entered.take().unwrap();
+        async move {
             entered.send(()).unwrap();
             std::future::pending::<Result<MessageId, TaskError>>().await
-        },
-    ));
+        }
+    }));
     entry.await.unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());

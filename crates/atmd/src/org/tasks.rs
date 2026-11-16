@@ -242,6 +242,117 @@ pub fn notification(
     }))
 }
 
+fn notice(id: &TaskId, by: &Address, to: Address, change: &str) -> MessageContent {
+    MessageContent {
+        from: by.clone(),
+        to,
+        kind: MessageKind::Note,
+        body: format!("Task {id} changed: {change}.\nInspect current state and assignee: atm task get {id}\nDo not continue obsolete work or resume/clear on this note alone."),
+        attachments: Vec::new(),
+        task: Some(id.clone()),
+    }
+}
+
+/// Invalidate only an actual lost binding; the identity snapshot is not evidence.
+fn transition_notices(
+    event: &OrgEvent,
+    before: Option<&Task>,
+    current: &OrgState,
+) -> Result<Vec<MessageContent>, TaskError> {
+    let (id, by, change) = match event {
+        OrgEvent::TaskAssigned(e) => (&e.task_id, &e.by, "assigned"),
+        OrgEvent::TaskStateChanged(e) => match e.state {
+            TaskState::Open => (&e.task_id, &e.by, "open"),
+            TaskState::Cancelled => (&e.task_id, &e.by, "cancelled"),
+            TaskState::Working => (&e.task_id, &e.by, "submission_withdrawn"),
+            _ => return Ok(Vec::new()),
+        },
+        OrgEvent::TaskVerdict(e) => (&e.task_id, &e.by, "review_superseded"),
+        _ => return Ok(Vec::new()),
+    };
+    let before = before
+        .ok_or_else(|| TaskError::Internal(format!("task {id} missing mutation before-image")))?;
+    let now = task(current, id)?;
+    let mut notes = Vec::new();
+    let revoked = matches!(change, "assigned" | "open" | "cancelled")
+        && before.agent_id.as_ref().is_some_and(|old| {
+            if change == "cancelled" {
+                now.state == TaskState::Cancelled
+            } else {
+                now.agent_id.as_ref() != Some(old)
+            }
+        });
+    if revoked {
+        if let Some(old) = &before.agent_id {
+            notes.push(notice(id, by, Address::Agent(old.clone()), change));
+        }
+    }
+    let withdrawn = change == "submission_withdrawn"
+        && before.state == TaskState::Submitted
+        && now.state == TaskState::Working
+        && now.agent_id == before.agent_id;
+    if withdrawn && now.agent_id.is_none() {
+        return Err(TaskError::Internal(format!(
+            "task {id} has no assignee for withdrawal"
+        )));
+    }
+    if revoked || withdrawn {
+        let creator = if before.creator == Address::System {
+            Address::Owner
+        } else {
+            before.creator.clone()
+        };
+        notes.push(notice(id, by, creator, change));
+    }
+    if before.state == TaskState::InReview {
+        let review_id = before
+            .review_task
+            .as_ref()
+            .ok_or_else(|| TaskError::Internal(format!("task {id} missing prior review link")))?;
+        if now.review_task.as_ref() != Some(review_id) {
+            let review = task(current, review_id)?;
+            if review.kind == TaskKind::Review
+                && review.judges.as_ref() == Some(id)
+                && matches!(
+                    review.state,
+                    TaskState::Assigned
+                        | TaskState::Working
+                        | TaskState::Waiting
+                        | TaskState::Blocked
+                        | TaskState::ChangesRequested
+                )
+            {
+                if let Some(agent) = &review.agent_id {
+                    let mut note =
+                        notice(id, by, Address::Agent(agent.clone()), "review_superseded");
+                    note.body.push_str(&format!("\nReview task: atm task get {review_id}; re-check the judged task above before continuing."));
+                    note.task = Some(review_id.clone());
+                    notes.push(note);
+                }
+            }
+        }
+    }
+    notes.retain(|n| &n.to != by);
+    Ok(notes)
+}
+
+fn notifications(
+    event: &OrgEvent,
+    before: Option<&Task>,
+    state: &OrgState,
+) -> Result<Vec<MessageContent>, TaskError> {
+    let mut contents: Vec<_> = notification(event, state)?.into_iter().collect();
+    for note in transition_notices(event, before, state)? {
+        if !contents
+            .iter()
+            .any(|c| c.to == note.to && c.task == note.task)
+        {
+            contents.push(note);
+        }
+    }
+    Ok(contents)
+}
+
 async fn enqueue(org: OrgHandle, content: MessageContent) -> Result<MessageId, TaskError> {
     validate_send(&SendParams {
         to: content.to.clone(),
@@ -259,7 +370,7 @@ async fn enqueue(org: OrgHandle, content: MessageContent) -> Result<MessageId, T
         .ok_or_else(|| TaskError::Internal("message enqueue committed no event".into()))
 }
 
-fn target(command: &TaskCommand) -> Option<TaskId> {
+pub(super) fn target(command: &TaskCommand) -> Option<TaskId> {
     match command {
         TaskCommand::Create(_) => None,
         TaskCommand::Assign { task_id, .. }
@@ -278,11 +389,11 @@ async fn execute_mutation<F, E, EF>(
     org: OrgHandle,
     caller: CallContext,
     make: F,
-    send: E,
+    mut send: E,
 ) -> Result<MutationResult, TaskError>
 where
     F: FnOnce(TaskActor) -> TaskCommand,
-    E: FnOnce(MessageContent) -> EF,
+    E: FnMut(MessageContent) -> EF,
     EF: Future<Output = Result<MessageId, TaskError>>,
 {
     let state = org.snapshot().await?;
@@ -294,8 +405,8 @@ where
         TaskCommand::Verdict { review_task, .. } => review_task.clone(),
         _ => None,
     };
-    let events = org
-        .execute(OrgCommand::Task(command), chrono::Utc::now())
+    let commit = org
+        .execute_task(command, chrono::Utc::now())
         .await
         .map_err(|source| match (&id, review, &source) {
             (
@@ -309,6 +420,7 @@ where
             },
             _ => TaskError::Organisation(source),
         })?;
+    let events = commit.events;
     let task_id = match id {
         Some(id) => id,
         None => events
@@ -328,22 +440,63 @@ where
     if let Some(envelope) = events.first().filter(|e| {
         matches!(
             e.kind.as_str(),
-            "task.assigned" | "task.submitted" | "task.verdict"
+            "task.assigned" | "task.submitted" | "task.verdict" | "task.state_changed"
         )
     }) {
-        let sent = async {
+        let composed = async {
             let event = OrgEvent::from_parts(&envelope.kind, &envelope.body)
                 .map_err(|e| TaskError::Internal(e.to_string()))?
                 .ok_or_else(|| {
                     TaskError::Internal("committed task event was not recognized".into())
                 })?;
             let state = org.snapshot().await?;
-            let Some(content) = notification(&event, &state)? else {
-                return Ok(None);
-            };
-            send(content).await.map(Some)
+            notifications(&event, commit.before.as_ref(), &state)
         }
         .await;
+        let sent = match composed {
+            Err(error) => Err(MethodError::from(error).0),
+            Ok(contents) => {
+                let mut queued = Vec::new();
+                let mut failures = Vec::new();
+                let mut first_error = None;
+                for content in contents {
+                    let audience = format!(
+                        "{} ({})",
+                        content.to,
+                        content
+                            .task
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    );
+                    match send(content).await {
+                        Ok(id) => queued.push(id),
+                        Err(error) => {
+                            let error = MethodError::from(error).0;
+                            failures.push(format!("{audience}: {}", error.message));
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
+                if let Some(mut error) = first_error {
+                    error.message = format!(
+                        "{}; failed audiences: {}; known queued message IDs: {}",
+                        error.message,
+                        failures.join(", "),
+                        queued
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    Err(error)
+                } else {
+                    Ok(queued.into_iter().next())
+                }
+            }
+        };
         result.notification = match sent {
             Ok(Some(message_id)) => Some(Notification::Queued { message_id }),
             Ok(None) => None,
@@ -351,9 +504,10 @@ where
                 let kind = match envelope.kind.as_str() {
                     "task.assigned" => "brief",
                     "task.submitted" => "report",
-                    _ => "answer",
+                    "task.verdict" => "answer",
+                    _ => "note",
                 };
-                let mut error = MethodError::from(error).0;
+                let mut error = error;
                 error.message = format!("task {} committed; automatic {kind} enqueue was not confirmed: {}; inspect the task and inbox before resending", result.task_id, error.message);
                 Some(Notification::Unconfirmed { error })
             }
@@ -406,7 +560,7 @@ impl TaskHandle {
         let org = self.org.clone();
         let sender = org.clone();
         self.run(execute_mutation(org, caller, make, move |content| {
-            enqueue(sender, content)
+            enqueue(sender.clone(), content)
         }))
         .await
     }

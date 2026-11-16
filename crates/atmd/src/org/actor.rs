@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::{Health, OrgServiceError, Request};
+use super::{Health, OrgServiceError, Request, TaskCommit};
 use crate::eventlog::{Envelope, EventLogError};
 
 pub(super) async fn run<F, Fut>(
@@ -63,6 +63,12 @@ pub(super) async fn run<F, Fut>(
                 caller_pane,
                 reply,
             } => {
+                let before = match command.as_ref() {
+                    OrgCommand::Task(command) => {
+                        super::tasks::target(command).and_then(|id| state.task(&id).cloned())
+                    }
+                    _ => None,
+                };
                 let result = execute(
                     &mut state,
                     &command,
@@ -74,7 +80,7 @@ pub(super) async fn run<F, Fut>(
                 )
                 .await;
                 let failed = matches!(result, Err(OrgServiceError::Unavailable(_)));
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|events| TaskCommit { events, before }));
                 if failed {
                     // Dropping the queue resolves pending callers without ever
                     // deciding another command against an uncertain state.

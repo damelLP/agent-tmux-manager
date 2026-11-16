@@ -619,6 +619,103 @@ mod tests {
         assert_eq!((count("SubagentStart"), count("SubagentStop")), (1, 2));
     }
 
+    fn turn_boundary_case(session: &str) -> Vec<RawHookEvent> {
+        captured(include_str!(
+            "../tests/fixtures/claude_turn_boundaries_2.1.325.jsonl"
+        ))
+        .into_iter()
+        .filter(|event| event.session_id == session)
+        .collect()
+    }
+
+    #[test]
+    fn captured_final_and_blocked_stops_do_not_prove_finality() {
+        // Captured: Claude Code 2.1.325, 2026-11-16, sealed rig stub mode.
+        // Both the final Stop and the Stop another hook blocks have false;
+        // the continuation's final Stop has true. Neither flag is finality.
+        let normal = turn_boundary_case("normal-session");
+        let blocked = turn_boundary_case("blocked-session");
+        for (event, active) in [
+            (&normal[4], false),
+            (&blocked[2], false),
+            (&blocked[5], true),
+        ] {
+            assert_eq!(event.hook_event_name, "Stop");
+            assert_eq!(event.stop_hook_active, Some(active));
+            assert_eq!(event.to_lifecycle_event(), Some(LifecycleEvent::WorkingEnd));
+            assert_eq!(event.lifecycle_context().child, None);
+        }
+        assert_eq!(
+            blocked[3].to_lifecycle_event(),
+            Some(LifecycleEvent::ToolCallStart {
+                name: Tool::Bash,
+                tool_use_id: Some("blocked-tool-1".into()),
+                input: Some(serde_json::json!({"command": "printf continued"})),
+            })
+        );
+        assert_eq!(
+            blocked[4].to_lifecycle_event(),
+            Some(LifecycleEvent::ToolCallEnd {
+                name: Tool::Bash,
+                tool_use_id: Some("blocked-tool-1".into()),
+                is_error: false,
+            })
+        );
+    }
+
+    #[test]
+    fn captured_async_rewake_maps_its_own_prompt_and_terminal() {
+        // Captured: Claude Code 2.1.325, 2026-11-16, sealed rig stub mode.
+        // A socket-gated asyncRewake hook exited 2 after the first idle turn.
+        let events = turn_boundary_case("async-session");
+        let wake = &events[5];
+        assert_eq!(wake.hook_event_name, "UserPromptSubmit");
+        assert!(wake
+            .prompt
+            .as_deref()
+            .unwrap()
+            .starts_with("<task-notification>"));
+        assert!(matches!(
+            wake.to_lifecycle_event(),
+            Some(LifecycleEvent::PromptSubmit { prompt: Some(_) })
+        ));
+        assert_eq!(wake.lifecycle_context().child, None);
+        assert_eq!(events[6].stop_hook_active, Some(true));
+        assert_eq!(
+            events[6].to_lifecycle_event(),
+            Some(LifecycleEvent::WorkingEnd)
+        );
+    }
+
+    #[test]
+    fn captured_manual_post_compact_is_currently_unrecognized() {
+        // Captured: Claude Code 2.1.325, 2026-11-16, sealed rig stub mode.
+        // Only this capture omitted --disable-slash-commands; see crate docs
+        // for the request-body capability audit and unchanged isolation.
+        let events = turn_boundary_case("compact-session");
+        assert_eq!(
+            events[5].to_lifecycle_event(),
+            Some(LifecycleEvent::ContextCompactStart {
+                trigger: Some("manual".into()),
+            })
+        );
+        for event in &events[6..8] {
+            assert!(matches!(
+                event.to_lifecycle_event(),
+                Some(LifecycleEvent::ChildSessionEnd { .. })
+            ));
+        }
+        assert_eq!(
+            events[8].to_lifecycle_event(),
+            Some(LifecycleEvent::SessionStart {
+                source: Some("compact".into()),
+            })
+        );
+        assert_eq!(events[9].hook_event_name, "PostCompact");
+        assert_eq!(events[9].trigger.as_deref(), Some("manual"));
+        assert_eq!(events[9].to_lifecycle_event(), None);
+    }
+
     #[test]
     fn captured_stop_failure_2_1_310_ends_the_turn() {
         // Captured: Claude Code 2.1.310, 2026-10-25 (see the crate docs).

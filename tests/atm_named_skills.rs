@@ -148,3 +148,28 @@ fn claude_bootstrap_examples_fit_the_recorded_skill_call_limit() {
         assert!(lines.len() <= 3);
     }
 }
+
+// Break caught: an evidence catalogue is shipped but a skill omits one of its
+// instruction blocks (for example a lead still has only a scaffold of links).
+// This validates the rule-ID structure, not compliance with the prose.
+#[test]
+fn named_skills_expose_each_rule_as_an_instruction() {
+    for (skill, prefix, count) in [("atm-member", 'M', 7), ("atm-lead", 'L', 9)] {
+        let text = document(skill);
+        let actual: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("- **["))
+            .map(|rest| rest.split_once("](").expect("linked rule").0.to_owned())
+            .collect();
+        let wanted: BTreeSet<_> = (1..=7)
+            .map(|n| format!("S{n}"))
+            .chain((1..=count).map(|n| format!("{prefix}{n}")))
+            .collect();
+        assert_eq!(actual.len(), wanted.len(), "{skill}: rule blocks");
+        assert_eq!(
+            actual.into_iter().collect::<BTreeSet<_>>(),
+            wanted,
+            "{skill}"
+        );
+    }
+}

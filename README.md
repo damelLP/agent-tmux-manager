@@ -601,7 +601,32 @@ Inside the container the hook needs `jq` and either `socat` or `nc`, and the hoo
 
 ## Coordinating agents (experimental)
 
-`atm setup` installs two skills for Claude Code, pi and Codex: `atm-coordinate` lets one agent drive long-lived implementer agents through `atm list`, `peek`, `send` and `reply`, and `atm-implement` gives each implementer its rules. Invoke them as `/atm-coordinate` (Claude Code), `/skill:atm-coordinate` (pi) or `$atm-coordinate` (Codex). Their source, install layout and usage are in [`crates/atm/assets/atm-skills`](crates/atm/assets/atm-skills/README.md).
+`atm setup` installs four skills for Claude Code, pi and Codex:
+
+- **Named agents:** `atm-lead` and `atm-member` use `atm me`, durable tasks,
+  confirmed messages, decisions and the away rules. They are **drafts,
+  unevaluated for model compliance**, not an unattended-operation guarantee.
+- **Legacy unnamed panes:** `atm-coordinate` and `atm-implement` keep the
+  existing `list`/`peek`/`send`/`reply` loop. Both remain available; do not mix
+  that loop with the named-agent protocol.
+
+Invoke a named skill at the harness input as `/atm-lead` or `/atm-member`
+(Claude Code), `/skill:atm-lead` or `/skill:atm-member` (pi), or `$atm-lead` or
+`$atm-member` (Codex). Claude skill calls must stay within the recorded
+800-character/3-line limit; use one short line and keep briefs in files.
+
+After a start/clear, `atm me` finds the role and memory but does **not** load a
+skill. An approved role instruction body can direct reading its installed
+`SKILL.md`; `skills = [...]` alone does not. Keep current priming until that
+bootstrap is verified on the harness/model. Installing skills does not adopt
+agents or enable automatic handover. Decision creation is API-only (no request
+CLI), named leads cannot inspect every agent's decisions/inbox, and the A2
+digest/A3 drift scheduler are not built. The skills expose these limits rather
+than silently bypassing them.
+
+Source, per-rule reasons/model/harness verification records, installation and
+usage: [`crates/atm/assets/atm-skills`](crates/atm/assets/atm-skills/README.md).
+`atm uninstall` removes all four ATM skill folders, leaving unrelated skills.
 
 ## Documentation
 

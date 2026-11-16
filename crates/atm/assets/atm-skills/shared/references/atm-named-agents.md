@@ -263,7 +263,7 @@ Submit a durable task's plan/result once with its files; for message-only work
 send one correlated report/question to the manager, with attachment and marker.
 Keep a short visible end-of-turn marker as recovery, not a second notification.
 **Why:** Submit already reports to the creator; every extra message costs a lead turn.
-**Source:** `crates/atmd/src/org/tasks.rs::notification`; `task_worker_tests.rs::system_created_task_report_falls_back_to_owner`; real chunk-7 pi submission capture.
+**Source:** `crates/atmd/src/org/tasks.rs::notification`; `crates/atmd/src/org/task_worker_tests.rs::system_created_task_report_falls_back_to_owner`; real chunk-7 pi submission capture.
 **Checked:** 2026-11-15; harness: pi 1.5.2; model: gpt-6.1-sol low; automatic report observed. New duplicate-avoidance/marker wording has no model trial.
 **Not verified:** New-skill report frequency, question routing and duplicate prevention.
 
@@ -284,7 +284,7 @@ agent-decided; undoable intent change may be provisional; external/irreversible,
 action/hire/budget/unknown kinds or no recommendation wait. Never reclassify
 for permission.
 **Why:** Away changes availability, not the limits of delegated authority.
-**Source:** `crates/atm-org/tests/away.rs::away_table_every_cell` and `apply_away_takes_a_change_of_intent_by_system_and_a_detail_by_its_requester`; `away_kinds.rs`; `tests/away_delivery.rs`.
+**Source:** `crates/atm-org/tests/away.rs::away_table_every_cell` and `apply_away_takes_a_change_of_intent_by_system_and_a_detail_by_its_requester`; `crates/atm-org/tests/away_kinds.rs`; `tests/away_delivery.rs`.
 **Checked:** 2026-11-16 source inspection at 30475a20; harness: N/A (model-free policy/stand-in); model: N/A.
 **Not verified:** Real-harness away decisions/new-skill compliance.
 
@@ -303,7 +303,7 @@ end the turn. No raw self-clear or self-handover without explicit role authority
 Reconstruct from context/memory, open-task pages and own inbox/decisions; carry
 members' relevant decision facts in reports/memory and record visibility gaps.
 **Why:** Named leads lack global decision and cross-inbox privileges.
-**Source:** `crates/atmd/src/org/decisions.rs::visible`; `message_service_tests.rs::agent_inbox_isolation_and_owner_inspection`; `crates/atm-org/tests/task_fallback_replay.rs`.
+**Source:** `crates/atmd/src/org/decisions.rs::visible`; `crates/atmd/src/org/message_service_tests.rs::agent_inbox_isolation_and_owner_inspection`; `crates/atm-org/tests/task_fallback_replay.rs`.
 **Checked:** 2026-11-16 source inspection at 30475a20; harness: N/A (model-free visibility/replay contract); model: N/A.
 **Not verified:** Complete fresh-lead reconstruction; global decision/receipt view not built.
 

@@ -3,7 +3,9 @@
 [![Build Status](https://github.com/damelLP/agent-tmux-manager/actions/workflows/release.yml/badge.svg)](https://github.com/damelLP/agent-tmux-manager/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Real-time management for coding agents across tmux sessions.
+A live dashboard and a daemon-backed control plane for coding agents in tmux.
+
+**0.4.0 ships the implemented named-agent and coordination commands alongside the dashboard.** It is not the complete unattended workflow: see [known limits and not yet](#known-limits-and-not-yet). Remaining coordination work is deferred to 0.5.0.
 
 ## What it does
 
@@ -11,23 +13,135 @@ ATM gives you a live dashboard and CLI for coding agents running in tmux, includ
 
 - **Dashboard** — real-time TUI with session tree, context bars, cost tracking, and live terminal capture
 - **Agent control** — spawn, kill, interrupt, send text, and reply to prompts from the CLI
+- **Named agents** — project-local roles with stable `project/name` identities, start/adopt/clear/respawn commands, and save-before-clear handover
+- **Durable coordination** — confirmed message references and inboxes, tasks with reviews and observed usage, owner decisions, standing rules, and explicit away/back policy
 - **Workspaces** — create tmux sessions with built-in ATM sidebars, or inject sidebars into existing sessions
 - **Layouts** — preset multi-agent arrangements (solo, pair, squad, grid) with one command
 - **Tmux native** — status bar integration, popup picker, vim-style keybindings
 
-## Install
+Named coordination is not a security sandbox or a guarantee of unattended agent behavior. A delivery receipt means the harness accepted a message reference, not that the model read it or completed the task. The named-agent skills are drafts; keep human review in the loop.
+
+- [Install and setup](#install-and-setup)
+- [Named-agent/project quick start](#named-agentproject-quick-start)
+- [Upgrade](#upgrade)
+- [Dashboard and daemon](#dashboard-and-daemon)
+- [CLI reference](#cli-at-a-glance)
+- [Known limits and not yet](#known-limits-and-not-yet)
+- [Source builds and rollout](#building-from-source-and-rolling-out)
+- [Changelog](#changelog)
+
+## Install and setup
+
+### Linux with Cargo (recommended)
+
+Building from crates.io requires **Rust 1.88 or later**. You also need tmux and an installed supported harness; the shell hooks use `jq` and either `socat` or `nc`.
+
+Initialize/configure your chosen harness in this HOME first, including any provider/login setup it requires. Having its executable on PATH alone is not enough for ATM setup to detect it.
+
+Install the **`atm` crate** from crates.io. It provides both programs, **`atm` and `atmd`**; `atmd` and `atm-tui` are library-only crate names, not separate program installation targets.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/damelLP/agent-tmux-manager/main/scripts/install.sh | sh
+cargo install --locked atm
+atm setup
 ```
 
-Or via Cargo:
+Cargo normally installs the pair in `~/.cargo/bin`. Make sure that directory is on `PATH`, then complete [setup verification](#verify-harness-setup) before the quick start.
+
+### Optional prebuilt archives
+
+The release workflow also builds **Linux x86_64 and aarch64, glibc** archives. It does not publish macOS or Windows binaries. The Bash installer downloads the latest published release, installs `atm`, `atmd` and `atm-hook` in `~/.local/bin` by default (`ATM_INSTALL_DIR` overrides it), then runs setup:
 
 ```bash
-cargo install atm && atm setup
+curl -fsSL https://raw.githubusercontent.com/damelLP/agent-tmux-manager/main/scripts/install.sh | bash
 ```
 
-## Quick start
+Use one installation of the **pair**, `atm` and `atmd`, with its directory first on `PATH`. Check `command -v atm` and `command -v atmd` if you have used both routes. Installer completion is not a substitute for the setup verification below.
+
+### Verify harness setup
+
+Run `atm setup` and verify that its **Detected coding agents** output marks your chosen harness as present before proceeding. If it reports **No supported agent installations found**, initialize that harness in this HOME and rerun setup. Detection uses the harness home directories, not executable presence on PATH: setup's zero exit status or the installer's **Installation complete!** message alone does not prove an integration was installed.
+
+For detected harnesses, setup installs these integrations:
+
+| Harness | What setup installs | After setup |
+|---|---|---|
+| Claude Code | `~/.local/bin/atm-hook`, hooks and an ATM statusLine only if yours is absent | Keep your own statusLine; forward its stdin to `atm-hook` for context/model/cost ([details](#how-it-works)) |
+| pi | Local `pi-atm` package in `~/.pi/agent/packages/pi-atm/`, registered in `settings.json` | Restart pi to load changed extension code |
+| Codex CLI | `~/.local/bin/atm-codex-hook` and `~/.codex/hooks.json` | Approve the installed hooks with `/hooks` inside Codex |
+
+For pi, before starting or restarting it, verify that `~/.pi/agent/packages/pi-atm/package.json` and `~/.pi/agent/packages/pi-atm/extensions/pi-atm.ts` exist, and that the `packages` array in `~/.pi/agent/settings.json` contains `"packages/pi-atm"`. If any are missing, rerun setup and check its output.
+
+It also refreshes four ATM skill folders for each detected harness, writes tmux bindings, and creates ATM's config only if absent. With no supported harness directory it reports that and makes no setup changes. Setup does not start or adopt named agents, create project intent, or enable automatic handover. It replaces ATM's installed skill folders whole: do not keep local edits there. It writes the bindings file but does not source it into a running tmux server.
+
+Codex launches through ATM require codex-cli **0.158.0 or later** for `--no-daemon`; ATM adds the required argument.
+
+The pi integration in 0.4.0 keeps the existing forwarder. The final-idle/settled-event forwarder update is **not included**; this release does not introduce its newer-pi requirement. See [known limits and not yet](#known-limits-and-not-yet).
+
+## Named-agent/project quick start
+
+Run these commands from an ordinary, **unbound owner shell inside tmux**, in the project's main checkout. First complete [harness initialization and setup verification](#verify-harness-setup) in this HOME, including the package/registration check if using pi. Do not proceed just because setup exited successfully. Starting an agent starts that harness and can initiate a model turn; this is not a dry run.
+
+1. Create `.atm/roles/` and a **new** `.atm/roles/worker.md` (choose another name if it already exists):
+
+   ```markdown
+   +++
+   harness = "pi"
+   cwd = "."
+   +++
+   # Worker
+   At each new session run the shell command `atm me`, read your role and
+   existing memory, then read the indicated inbox messages. Follow the brief;
+   ask the owner about missing requirements. Acknowledge delivered messages
+   with `atm msg ack <id>` after reading them.
+   ```
+
+   The `+++` section is TOML; the rest is the role's instruction body. `harness` can instead be `claude` or `codex`. An omitted manager means reports go to the owner. `skills = [...]` is metadata, not automatic skill loading.
+
+2. Start and inspect it; leave the new pane unfocused until the launch completes:
+
+   ```bash
+   atm agent up worker --project-root "$PWD"
+   atm agent list
+   ```
+
+   The first use registers the project and writes `.atm/project.toml` with its id. A named agent is addressed as `project/name`; the bare `worker` resolves in this project's context. `up` prints the agent id, pane and state (or use `--format json`). A `stuck` start needs inspection, not an assumption that the harness is ready. Folder trust is accepted only for the role's explicit `trust_dirs`; other startup questions can need your answer. See [Starting a named agent](#starting-a-named-agent) for launch limits.
+
+3. Put the actual task in `brief.md`, then send a reference from the owner shell:
+
+   ```bash
+   atm msg send --to worker --kind brief --body 'Read the attached brief and report the result.' --attach "$PWD/brief.md"
+   atm inbox --for worker
+   ```
+
+   Attachment paths are literal references, not uploaded file contents. `queued` is not confirmation: inspect the inbox's delivery status. The agent receives `[mN] Read: atm inbox --id mN`, retrieves the body, and acknowledges only once Delivered. Focused panes, drafts, dialogs and running turns can hold delivery. Use `atm inbox --for owner` for the agent's report.
+
+4. Save context before replacing it, or stop it when finished:
+
+   ```bash
+   atm agent handover worker     # asks it to save; clears only after the file changes and the turn ends
+   atm agent down worker --kill  # stops the named agent and closes its pane
+   ```
+
+After a successful start/clear, ATM queues `[mN] New session: run the shell command atm me`. From the bound pane, `atm me` finds the current role, `.atm/memory/worker.md`, unread work and reporting command. It does not itself load a skill or acknowledge messages. Owner-only commands such as `atm decide`, `atm away` and `atm back` must come from the unbound owner shell, not an agent pane.
+
+## Upgrade
+
+1. Quit **every** ATM TUI/sidebar and stop other callers that could autostart the daemon. Save important agent context and avoid upgrading during a start, clear or message delivery.
+2. Run `atmd stop` with the **existing installation and environment**. Wait for confirmed exit; a timeout does not mean it is safe to swap binaries. An open TUI or another CLI caller can start it again.
+3. Preserve the existing state directory and configuration. Replace `atm` and `atmd` together using one install route. Do not erase the organisation log to make an older binary start.
+4. Run the newly installed `atm setup` to refresh embedded hooks, pi extension and skills, and complete [setup verification](#verify-harness-setup) before proceeding. Check the pi package/registration before restarting pi, and approve Codex hooks if prompted. Existing ATM config and custom Claude statusLine are preserved, but ATM-owned skill folders are replaced.
+5. Start `atmd start -d` from the intended environment, reopen sidebars, and check `atmd status`, `atm list`, `atm status`, `atm agent list` and the inbox. For source-checkout deployments use the [rollout tools](#source-checkout-rollout) below instead of manually copying over a running pair.
+
+Protocol **1.1** retains major-1 hook compatibility, including the existing 1.0 hook frames. That is not a promise that an old daemon has the new commands, or that an older binary can replay newer persistent state. A restart cannot recover historical data that an older release only kept in memory; some session metadata returns only on the harness's next event. Back up important persistent state while the daemon is stopped before trying a downgrade.
+
+## Known limits and not yet
+
+- **Pi clear:** `atm agent clear` refuses on a pi seat showing pi's **Update Available** notice; dismiss it or type `/new` by hand. A refused clear is not a fresh session.
+- **Pi turn completion:** the final-idle forwarder update is not in 0.4.0. The existing event stream can leave a working/idle row out of step with the harness; inspect the pane rather than treating a status label as proof that a turn has settled.
+- **Named skills and automation:** `atm-lead`/`atm-member` remain drafts, unevaluated for model compliance. Role metadata and `atm me` do not load a skill, and setup does not enable automatic handover. Keep human review and the documented guards.
+- **Not yet:** a review digest, a drift scheduler and the remaining end-to-end coordination acceptance work are deferred to **0.5.0**. The implemented commands are available now; they are not a guarantee of unattended operation.
+
+## Dashboard and daemon
 
 ```bash
 atm                    # launch TUI (starts daemon automatically)
@@ -536,7 +650,7 @@ Only the owner sets the switch: as for `atm decide`, a pane bound to an agent is
 command = ["notify-send", "atm", "--"]
 ```
 
-`atmd` appends one message as the last argument, such as `agent-tmux-manager/main %5: claude needs input (Bash: cargo test)` (project and branch, pane, harness, and what it asks; a subagent's row says `claude subagent`), and runs the command directly. No shell parses the message. Keep the `--` for a command that takes options, so a message that starts with `-` isn't read as one. The message names the tool and a short summary of its input, such as the start of a shell command, so a script that sends it off your machine (Slack, ntfy) can trim it first.
+`atmd` appends one message as the last argument, such as `example/main %5: claude needs input (Bash: cargo test)` (project and branch, pane, harness, and what it asks; a subagent's row says `claude subagent`), and runs the command directly. No shell parses the message. Keep the `--` for a command that takes options, so a message that starts with `-` isn't read as one. The message names the tool and a short summary of its input, such as the start of a shell command, so a script that sends it off your machine (Slack, ntfy) can trim it first.
 
 - It runs once each time a session changes into needing input. Nothing runs while a session stays there, when a turn ends, or for Claude's "waiting for your input" reminder (`idle_prompt`), and the sessions `atmd` finds at startup never set it off. A subagent's dialog that stays open for more than about 6 seconds also sends a second message for its lead, because Claude marks the lead as waiting too.
 - `delay_secs = N` (default `0`, at once) waits N seconds first, and sends nothing if the dialog was answered by then; a new dialog starts its own wait. Claude Code waits about 6 seconds before its own reminder for an open dialog, so around `10` reads as "I'm away from the desk". Claude Code sends no hook when you approve a dialog, so the session keeps reading as needing input (in the TUI too) until the approved tool finishes: approving a command that runs longer than the delay still sends a message.
@@ -565,7 +679,7 @@ jq -n --arg text "$1" '{text: $text}' |
 
 ```toml
 [notify]
-command = ["/home/you/bin/atm-slack"]
+command = ["/absolute/path/to/atm-slack"]
 ```
 
 ## How it works
@@ -654,9 +768,9 @@ skill. An approved role instruction body can direct reading its installed
 bootstrap is verified on the harness/model. Installing skills does not adopt
 agents or enable automatic handover. Named agents use `atm decisions request`
 and `atm decisions withdraw` for durable owner choices (see [Decisions](#decisions)).
-Named leads still cannot inspect every agent's decisions/inbox, and the A2
-digest/A3 drift scheduler are not built. The skills expose these limits rather
-than silently bypassing them.
+Named leads still cannot inspect every agent's decisions/inbox. A review digest
+and a drift scheduler are not in 0.4.0; remaining coordination work is deferred
+to 0.5.0. The skills expose these limits rather than silently bypassing them.
 
 Source, per-rule reasons/model/harness verification records, installation and
 usage: [`crates/atm/assets/atm-skills`](crates/atm/assets/atm-skills/README.md).
@@ -666,13 +780,95 @@ usage: [`crates/atm/assets/atm-skills`](crates/atm/assets/atm-skills/README.md).
 
 See the **[Wiki](https://github.com/damelLP/agent-tmux-manager/wiki)** for the full user guide, tmux integration, architecture, and troubleshooting.
 
-## Building from source
+## Building from source and rolling out
+
+The manifest requires Rust **1.88 or later**. From a Linux checkout:
 
 ```bash
 git clone https://github.com/damelLP/agent-tmux-manager.git
 cd agent-tmux-manager
-cargo build --release
+cargo build --locked --release --bin atm --bin atmd
 ```
+
+The resulting pair is `target/release/atm` and `target/release/atmd`. Building it does not update the installed daemon, hooks, extension or skills. Follow the upgrade procedure before replacing a live pair, then run the installed binary's `setup`.
+
+### Source-checkout rollout
+
+The repository includes Linux owner-run tools (Python 3.9+, Bash, git, tmux; source installs also need rustup/Cargo). They are not commands that agents should use to upgrade themselves.
+
+**Try a reviewed commit separately first:**
+
+```bash
+scripts/atm-candidate install HEAD
+scripts/atm-candidate installs
+scripts/atm-candidate start
+scripts/atm-candidate status
+scripts/atm-candidate atm list -f json
+scripts/atm-candidate attach       # run from a terminal OUTSIDE tmux
+# Exit the attached client, then stop from outside the candidate server:
+scripts/atm-candidate stop
+```
+
+The candidate kit builds an immutable SHA/profile-named binary pair, with a private socket, state and tmux server. It never runs `atm setup` and reuses your installed forwarders; `status` reports asset drift. It shares HOME, harness configuration and credentials, so it is **routing isolation, not a sandbox**. Its wrapper refuses `setup`, `uninstall` and `workspace`; do not bypass that wrapper with a direct candidate binary call. Stop before switching candidates; stop retains the per-install state. Full locations, cleanup and limits: [candidate kit](scripts/atm-candidate.md).
+
+**Promote only when the owner has reviewed the candidate and protected-file changes.** Run from a checkout at the candidate commit, in a pane of the intended tmux server, with the environment intended for the restarted daemon. Choose absolute paths for the candidate install (the directory containing `install.json` and `bin/`), installed binary directory and daemon socket; on a first rollout also supply the commit of the installed build:
+
+```bash
+scripts/atm-rollout "$CANDIDATE_INSTALL" --bin-dir "$INSTALLED_BIN" --socket "$DAEMON_SOCKET" --installed-commit "$INSTALLED_COMMIT" --dry-run
+scripts/atm-rollout "$CANDIDATE_INSTALL" --bin-dir "$INSTALLED_BIN" --socket "$DAEMON_SOCKET" --installed-commit "$INSTALLED_COMMIT"
+```
+
+Set those variables to your reviewed deployment's values; there is no implicit live destination. A dry run reads and reports; it is not the smoke test or an install. The real command asks you to accept the protected-file report, smokes the candidate on private endpoints with a model-free stand-in, checks for lifecycle/delivery work in flight, stops sidebars and daemon, promotes the pair and refreshes setup, restarts and checks it, and restores sidebars. A failed post-swap check attempts rollback. Leave the rollout terminal open; do not suspend it. Do not add `--real` unless you explicitly intend a real, potentially billed harness run; that route is not real-harness-verified.
+
+Exit **0** means the selected pair passed the rollout checks, **1** a refusal (read whether it restarted the unchanged build), **2** usage, **3** a checked rollback, **4** `NEEDS YOU`. A `down` agent can still have a live pane and pass the checks: inspect warnings, not just the exit code. Rollback swaps binaries and managed setup assets, **not** organisation state or arbitrary configuration; compatibility with an older daemon remains a separate check. The pair replacement is not atomic across both files, and concurrent installers/autostarts are outside the tools' lock. Detailed recovery, the explicit `--rollback` command, protected-file reporting and limits: [promotion and rollout](scripts/atm-promotion.md).
+
+## Changelog
+
+### 0.4.0
+
+Adds daemon-backed, named-agent coordination alongside the existing tmux dashboard and pane-control CLI. This release ships the landed commands; remaining coordination work follows in 0.5.0. The wire protocol remains **1.1**, and the source MSRV is **Rust 1.88**.
+
+#### New
+
+- **Project-local named agents.** Roles in `.atm/roles/<name>.md`, project registration in `.atm/project.toml`, and stable `project/name` identities. `atm agent up`, `adopt`, `clear`, `respawn`, `down` and `list` manage lifecycle; bare targets resolve within the caller's project.
+- **Session recovery and handover.** `atm me` finds the current role, existing memory, unread work and reporting command. A successful start/clear queues a guarded start-line message. `atm agent handover` requires a changed memory file and an ended save turn before clearing. Automatic context/idle handover is opt-in, off by default.
+- **Durable messages and inboxes.** Queuing, harness-confirmed delivery and explicit read acknowledgement are separate. Attachment paths are literal references, not uploads. Held deliveries have explicit inspection/retry/give-up controls.
+- **Tasks and reviews.** Create, assign, submit, review and record verdicts with `atm task`. Cancellation, reassignment, withdrawn submissions and displaced live reviews can notify the relevant holders/creator through guarded inbox references. These notices do not interrupt a running turn or automatically cancel a review: inspect current state and assignee before continuing.
+- **Observed usage, budgets and reminders.** Prompt turns, task-state time, review/rework counts, cumulative-cost deltas and peak reported context. Optional cost/turn/deadline budgets notify rather than stop work; idle reminders surface tasks left in an acting state. Missing measurements stay unknown, not zero.
+- **Owner choices and policy.** Named agents request/withdraw durable decisions; owners inspect and answer with `atm decisions`/`atm decide`. `--rule` can append a standing rule to the requester's project. Owner-approved `.atm/intent.md` restricts listed task measures at creation without executing a judge.
+- **Away/back policy.** Explicit reversible/provisional/wait handling of pending decisions, with a per-project stacking cap for tasks explicitly resting on a provisional intent-changing decision. Returning does not undo earlier choices; irreversible/external actions still wait for the owner.
+- **Persistent organisation state.** Event-log replay after daemon restart, with `ATM_STATE_DIR` for persistent PID/log/event/TUI state. This cannot recover history an older release only kept in memory.
+- **Source trial and rollout tools.** Private-endpoint candidate trials and owner-run protected-file review, model-free smoke, pair promotion, restart checks and attempted rollback. Explicit paths are required; this is not an unattended updater or a credential sandbox.
+
+#### Integration and control
+
+- Setup refreshes four ATM skills per detected harness: draft `atm-lead`/`atm-member` for named agents, plus legacy `atm-coordinate`/`atm-implement` for unnamed panes. Do not mix their protocols; role metadata does not load a skill.
+- Claude setup preserves an existing custom `statusLine`; forward its stdin to `atm-hook` for ATM context/model/cost. Uninstall keeps custom commands and removes/restores only an exact ATM-generated entry.
+- Codex launches add required `--no-daemon` arguments and require codex-cli **0.158.0 or later**. Remove redundant raw overrides, make wrappers forward required arguments, and approve hooks with `/hooks` after setup.
+- pi context/turn-end/agent-end frames omit unneeded conversation bodies while retaining envelope identity/model/usage. This is not a universal frame-size cap, heartbeat or final-idle fix; 0.4.0 retains the existing forwarder.
+- Message admission refuses an unconfirmed pending process row for a known real-session agent. A successful `queued` receipt still is not delivery confirmation; inspect identity and inbox rather than blindly resending.
+- Immediate input and daemon control share reservation checks. `atm send` refuses synchronized panes, disabled input, unsafe controls, copy mode and dialogs, but can merge an existing draft. `atm reply -y/-n` can wait without rechecking the released screen.
+- Coordinator pane tags survive harness restart/clear and appear in JSON session listings and the TUI. Dashboard, workspaces, layouts, popup picker, notifications and immediate controls remain available.
+- `atmd stop` waits for process exit, reports progress after five seconds and gives up after 75 seconds without force-killing or deleting state. Blocking I/O can outlast that allowance; a timeout does not permit swapping a still-running pair.
+
+#### Install, upgrade and limits
+
+On Linux, install the **`atm` crate** from crates.io for both `atm` and `atmd`; `atmd` and `atm-tui` are library-only packages. Use Rust **1.88 or later**:
+
+```sh
+cargo install --locked atm
+atm setup
+```
+
+Initialize/configure the chosen harness in this HOME, including any required provider/login setup, and complete [setup verification](#verify-harness-setup) before the [named-agent quick start](#named-agentproject-quick-start). An executable on PATH, setup exit 0 or installer completion alone is insufficient. For pi, check the installed package files and `packages/pi-atm` registration before starting/restarting.
+
+For an upgrade, save context, quit every TUI/sidebar and caller that could autostart the daemon, stop the old daemon and wait for confirmed exit, preserve state/config, replace both programs through one install route, rerun/verify setup, then restart in the intended environment and inspect sessions, agents and inboxes. See [Upgrade](#upgrade) and the [source rollout procedure](#source-checkout-rollout).
+
+Major-1 hook frames remain compatible with protocol 1.1, but new RPC methods need the matching daemon. Rollback does not undo organisation state or arbitrary configuration; an interrupted non-atomic pair swap needs explicit recovery before restart. Older-state compatibility remains a separate check.
+
+**Known pi limit:** `atm agent clear` refuses while pi shows its **Update Available** notice; dismiss it or type `/new` by hand. The final-idle forwarder update is not included in 0.4.0. Named-skill compliance, review digest, drift scheduler and remaining end-to-end coordination acceptance are not completed by this release; see [known limits and not yet](#known-limits-and-not-yet).
+
+A receipt confirms acceptance of a reference, not model reading/compliance or task completion. Local pane attribution is not authentication against hostile same-user clients. Task usage is observed accounting, not billing; budgets only notify. External notifications are best effort. Rollout checks can pass with a down agent's pane still alive: read warnings, not just the exit code. Real-harness rollout smoke remains unverified; `--real` can start billed turns.
 
 ## License
 

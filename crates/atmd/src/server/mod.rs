@@ -193,12 +193,13 @@ impl DaemonServer {
                     handovers,
                     agents_cancel.clone(),
                 );
-                // The reminder on a silent turn end stops with them too.
-                if let Some(settings) = reminder_settings(&services) {
+                // One scheduler, only when notes can be delivered. With valid
+                // delivery, reminders off still leaves budget deadlines running.
+                if matches!(&services.delivery_policy, Some(Ok(_))) {
                     crate::org::task_reminder::spawn_task_reminders(
                         services.org.clone(),
                         self.registry.subscribe(),
-                        settings,
+                        reminder_settings(&services),
                         agents_cancel.clone(),
                     );
                 }

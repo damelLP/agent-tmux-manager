@@ -111,6 +111,8 @@ pub struct GetResult {
     pub task: Task,
     /// Running observed totals, or the frozen accepted record.
     pub usage: TaskCost,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_status: Option<atm_org::budget::BudgetStatus>,
 }
 
 /// Canonical task sequence; legacy free-text message references are not task IDs.
@@ -395,13 +397,15 @@ impl TaskHandle {
         tokio::time::timeout(READ_BUDGET, async {
             let state = self.org.snapshot().await?;
             caller_address(&state, &caller)?;
+            let task = task(&state, &params.task_id)?;
+            let now = chrono::Utc::now();
+            let usage = state
+                .task_cost(&task.id, now)
+                .ok_or_else(|| TaskError::Internal("known task has no usage projection".into()))?;
             let result = GetResult {
-                task: task(&state, &params.task_id)?.clone(),
-                usage: state
-                    .task_cost(&params.task_id, chrono::Utc::now())
-                    .ok_or_else(|| {
-                        TaskError::Internal("known task has no usage projection".into())
-                    })?,
+                task: task.clone(),
+                budget_status: atm_org::budget::budget_status(&state, task, &usage, now),
+                usage,
             };
             bounded(&result)?;
             Ok(result)

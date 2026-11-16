@@ -69,6 +69,7 @@ mod start_line;
 mod start_line_tests;
 mod storage;
 mod summary;
+mod task_budget;
 mod task_methods;
 pub mod task_reminder;
 pub mod tasks;

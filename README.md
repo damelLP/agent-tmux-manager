@@ -251,6 +251,12 @@ pane_gone_grace = { secs = 2, nanos = 0 }
 
 Durations must be positive and fit the policy's checked timestamp arithmetic; retry delays must be nondecreasing. Maximum attempts are the number of retry delays plus one (four by default); an empty retry list permits one attempt. Timing defaults do not prove a harness editor is safe: observations and safety guards still control delivery.
 
+## Task budgets
+
+A task's optional `budget` on `task.create` accepts exact cost (`{"microdollars":1000000}`), turns and an RFC3339 UTC deadline. Cost and turns cross strictly **above** their limits; a deadline is due **at** its timestamp. Unavailable usage is unknown, not zero. A past deadline is valid; a newly requested negative cost is refused.
+
+A crossed limit sends the creator one ordinary system note **per task**, across all its limits and state changes. A system-created task notifies the owner. The committed message is the latch even when queued, read or failed, so restarts do not create duplicate notes. `task.get` includes `budget_status` with current crossed limits and the notification id. Deadlines include open, waiting and review time; accepted/cancelled tasks are evaluated through their completion time, not a later restart time. **Nothing is stopped, cancelled or blocked.** Notifications need a valid delivery configuration; after fixing it and restarting, budget checks catch up. With valid delivery, `[reminder] enabled=false` disables reminders only, never budget deadlines.
+
 ## Task usage
 
 `atm task get <id>` (or the `task.get` RPC) includes `usage`: observed prompt turns, wall-clock seconds in each task state, review rounds, changes-requested verdicts, cumulative-cost deltas, and peak reported context percentage. The same totals are readable while work runs. Final result acceptance persists a frozen copy in `task.cost`; approving a plan instead resumes work. Records and running baselines survive daemon restart, and a missing cost append after an accepted verdict is repaired on startup.

@@ -13,8 +13,10 @@ Four skills installed for Claude Code, pi and Codex. Choose one protocol:
 checked model and harness/version, with unverified behavior stated explicitly
 in [`shared/references/atm-named-agents.md`](shared/references/atm-named-agents.md).
 Source/installation checks are not permission for unattended activation.
-Decision creation has no CLI; decision lists are requester-scoped and only
-Owner can inspect another inbox. A2 digest/A3 drift scheduling are not built.
+Create durable owner choices with `atm decisions request`, and withdraw your own
+Pending requests with `atm decisions withdraw`. Decision lists remain
+requester-scoped, and only Owner can inspect another inbox. A2 digest/A3 drift
+scheduling are not built.
 The skills do not create substitute clients or bypass those authority limits.
 
 At each new session run the shell command `atm me`, read its current role and

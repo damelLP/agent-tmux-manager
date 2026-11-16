@@ -53,9 +53,13 @@ atm task create 'Build the change' \
   --measure '{"kind":"mechanical","command":"cargo test --workspace"}' \
   --file '{"path":"/absolute/brief.md","kind":"brief","note":null}'
 atm task assign t41 project/member
-# Assigned member:
+# Assigned member: inspect the state first, including after a verdict answer.
 atm task get t41
+# Keep submitted/in_review unchanged and await the verdict. Withdraw submitted
+# only on an explicit authorized request; in_review cannot return to working.
+# From assigned/working/waiting/blocked/changes_requested, if work may proceed:
 atm task set-state t41 working
+# When stopping that work:
 atm task set-state t41 waiting --reason 'Waiting for decision d52'
 atm task set-state t41 blocked --reason 'Required fixture is missing'
 # At a plan stop, submit the plan and stop; accepted plan resumes working.
@@ -87,13 +91,29 @@ atm task verdict t41 accepted --review-task t63 --note 'Checked the measure'
 atm task verdict t41 changes_requested --note 'Missing regression coverage'
 ```
 
+After accepting a **plan** or requesting changes, the lead sends one answer to
+wake the assignee; an accepted result is final and does not need this resume step:
+
+```sh
+atm msg send --to project/member --kind answer --task t41 \
+  --body 'Verdict recorded for t41; re-read atm task get t41 before resuming.'
+# Assignee: re-read state, then follow the M2 state branches above.
+atm task get t41
+```
+
+The answer is not a duplicate submission report. Unlike assign/submit, verdicts
+have **no automatic assignee notification**; reminders depend on turn-end
+observations, not just a later verdict. Automatic verdict wake-up is a candidate
+follow-up; real-harness execution of this manual loop is **not verified**.
+
 Creation/assignment/submission and message enqueue are separate durable writes.
 `queued mN` is not delivery. `notification: unconfirmed`, a connection error or
 a mutation timeout does not mean rollback: inspect `task get`, task pages and
 your own inbox before recovery. Do not blindly submit or send again. Restart
 replays a committed task but does not repair a missing task-notification enqueue.
 
-For S5/L1, list/get can be paged. Continue `next_after`/`next: --after` with the
+For S5/L1, task lists, inboxes and decision lists are paged; `task get` returns
+one whole task and has no cursor. Continue `next_after`/`next: --after` with the
 same filters until there is no cursor:
 
 ```sh
@@ -205,9 +225,10 @@ end the turn rather than awaiting delivery into that busy turn.
 
 ### S5
 
-Use returned canonical IDs/full task addresses and follow all filtered pages.
+Use returned canonical IDs/full task addresses and follow all filtered task-list,
+inbox and decision-list pages. `task get` returns one whole task without paging.
 **Why:** IDs are not consecutive and a first page is not the entire backlog.
-**Source:** `tests/atm_task.rs::lists_gets_controls_pagination_and_cost_are_visible_and_safe`; `crates/atmd/src/org/message_service_tests.rs::inbox_sequence_pagination_and_filters`; nonconsecutive IDs in switch capture.
+**Source:** `src/bin/atm/task.rs`; `tests/atm_task.rs::lists_gets_controls_pagination_and_cost_are_visible_and_safe`; `crates/atmd/src/org/message_service_tests.rs::inbox_sequence_pagination_and_filters`; nonconsecutive IDs in switch capture.
 **Checked:** 2026-11-16 source inspection at 30475a20; harness: N/A (model-free contract); model: N/A. Historical ID observation: Claude Code 2.1.325/Haiku 5.5 and pi 1.5.0/sol, 2026-11-15.
 **Not verified:** Model pagination/ID discipline with new skills.
 
@@ -242,16 +263,21 @@ interactive question/plan-approval dialogs.
 
 ### M2
 
-Get the canonical assigned task; mark working, or waiting/blocked with a reason.
-**Why:** Durable state survives a clear/restart and makes stopped work legible.
+Get the canonical assigned task and branch on state. Keep submitted/in_review
+unchanged pending verdict; withdraw submitted only on an explicit authorized
+request (in_review cannot return to working). From assigned/working/waiting/
+blocked/changes_requested, mark working only when authorized work can proceed;
+use waiting/blocked with a reason when stopping that work.
+**Why:** Durable state survives a restart; submitted-to-working retracts the submission.
 **Source:** `crates/atm-org/src/task.rs` transitions; `crates/atmd/src/org/task_reminder_tests.rs`; real chunk-7 pi task capture, 2026-11-15.
 **Checked:** 2026-11-15; harness: pi 1.5.2; model: gpt-6.1-sol low; get/work/submit exercised. Other state contracts inspected at 30475a20 on 2026-11-16.
-**Not verified:** New-skill waiting/blocked discipline; Claude/Codex task execution.
+**Not verified:** New-skill resume/withdrawal and waiting/blocked discipline; Claude/Codex task execution.
 
 ### M3
 
-Submit a requested plan as plan and stop for acceptance; result submission is
-not acceptance and the assignee never gives its own verdict.
+Submit a requested plan as plan and stop for acceptance. On a non-final verdict
+answer, re-read task state before resuming under M2; result submission is not
+acceptance and the assignee never gives its own verdict.
 **Why:** Plan acceptance resumes work; result acceptance is final and judged.
 **Source:** `crates/atm-org/src/task.rs` transition/review table; `tests/atm_task.rs::every_task_command_works_against_the_real_private_daemon`.
 **Checked:** 2026-11-16 source inspection at 30475a20; harness: N/A (model-free task contract); model: N/A. Real result-only path: pi 1.5.2/gpt-6.1-sol low, 2026-11-15.
@@ -329,11 +355,14 @@ blindly or drive raw tmux around the guards.
 ### L4
 
 Read report/evidence, require independent review when the measure calls for it,
-then accept/request changes; an accepted plan is not a finished task or clear boundary.
-**Why:** Verdict authority and measures constrain acceptance, not a DONE marker.
-**Source:** `crates/atm-org/src/task.rs` Reviews and measures; `tests/atm_task.rs`; legacy `evals/atm-skills/atm-coordinate/done-plan-no-clear/` scenario (not run for this change).
+then accept/request changes. After plan acceptance or changes requested, send one
+task-correlated answer to the assignee, who re-reads state before resuming. This
+wake-up is not a duplicate submission report; an accepted plan is not a finished
+task or clear boundary.
+**Why:** Verdict authority/measures constrain acceptance; verdicts do not notify the assignee.
+**Source:** `crates/atm-org/src/task.rs` Reviews and measures; `crates/atmd/src/org/tasks.rs::execute_mutation`; `crates/atmd/src/org/task_reminder.rs::Watch::observe`; `tests/atm_task.rs`; legacy `evals/atm-skills/atm-coordinate/done-plan-no-clear/` scenario (not run for this change).
 **Checked:** 2026-11-16 source inspection at 30475a20; harness: N/A (model-free verdict contract); model: N/A. Legacy scenario result/version not recorded here.
-**Not verified:** New-skill review quality/plan handling; billed evaluation deferred.
+**Not verified:** New-skill review quality/plan handling and real-harness verdict wake-up; billed evaluation deferred. Automatic assignee notification on task.verdict is absent, a candidate follow-up.
 
 ### L5
 

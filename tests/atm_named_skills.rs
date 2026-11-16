@@ -3,7 +3,7 @@
 //! catch unusable metadata, broken installed references and missing evidence slots.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +27,28 @@ fn field<'a>(text: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing nonempty {key} field"))
 }
 
+// These assets use three flat, single-line, unquoted scalar fields. Reject
+// unsupported YAML syntax instead of accepting it as an opaque field value;
+// this is intentionally a portable subset, not a general-purpose YAML parser.
+fn frontmatter(text: &str) -> Option<BTreeMap<&str, &str>> {
+    let (front, _) = text.strip_prefix("---\n")?.split_once("\n---\n")?;
+    let mut fields = BTreeMap::new();
+    for line in front.lines() {
+        let (key, value) = line.split_once(": ")?;
+        if !matches!(key, "name" | "description" | "disable-model-invocation")
+            || value.trim() != value
+            || !value.starts_with(|c: char| c.is_ascii_alphabetic())
+            || value
+                .chars()
+                .any(|c| c.is_control() || ":#[]{}\"'".contains(c))
+            || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+    }
+    (fields.len() == 3).then_some(fields)
+}
+
 fn links(text: &str) -> impl Iterator<Item = &str> {
     text.split("](")
         .skip(1)
@@ -39,18 +61,28 @@ fn links(text: &str) -> impl Iterator<Item = &str> {
 fn named_skill_metadata_matches_its_folder_and_is_explicit_only() {
     for skill in SKILLS {
         let text = document(skill);
-        let (front, _) = text
-            .strip_prefix("---\n")
-            .and_then(|rest| rest.split_once("\n---\n"))
-            .expect("portable YAML frontmatter");
-        assert_eq!(field(front, "name:"), skill);
-        let description = field(front, "description:");
+        let front = frontmatter(&text).expect("portable YAML frontmatter");
+        assert_eq!(front.get("name"), Some(&skill));
+        let description = front.get("description").expect("description field");
         assert!(description.starts_with("Use when"));
         assert!(description.chars().count() <= 1024);
-        assert_eq!(field(front, "disable-model-invocation:"), "true");
+        assert_eq!(front.get("disable-model-invocation"), Some(&"true"));
     }
     let policy = fs::read_to_string(source().join("shared/agents/openai.yaml")).unwrap();
     assert_eq!(field(&policy, "  allow_implicit_invocation:"), "false");
+}
+
+// Break caught: an unquoted colon-space in the description creates a nested
+// YAML mapping that the skill loader rejects, despite matching the field prefix.
+#[test]
+fn named_frontmatter_rejects_unquoted_description_mapping() {
+    let text = document("atm-member");
+    let mutant = text.replacen("description: Use when", "description: Use when:", 1);
+    assert_ne!(text, mutant, "the review's mutant must be applied");
+    assert!(
+        frontmatter(&mutant).is_none(),
+        "unloadable description mapping was accepted"
+    );
 }
 
 // Break caught: adding a rule without an evidence record leaves its reason or

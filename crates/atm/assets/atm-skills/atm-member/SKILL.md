@@ -61,12 +61,18 @@ a command or boundary is unclear; do not replace missing evidence with a guess.
   start/drive other seats. *Why: unattended dialogs and overlapping work stall
   the organisation; role/brief/repository restrictions remain binding.*
 - **[M2](references/atm-named-agents.md#m2)** If given a canonical task `tN`,
-  `atm task get tN`, then `atm task set-state tN working`; when stopping use
+  `atm task get tN` and branch on its state. Keep `submitted`/`in_review`
+  unchanged and await the verdict; withdraw a `submitted` task only on an
+  explicit authorized request (`in_review` cannot return to `working`). From
+  `assigned`/`working`/`waiting`/`blocked`/`changes_requested`, set `working`
+  only when authorized work can proceed. When stopping that work, use
   `waiting --reason '...'` or `blocked --reason '...'`.
-  *Why: durable state, not silence, explains what is waiting across a restart.*
+  *Why: setting a submitted task to working retracts it, not just resumes it.*
 - **[M3](references/atm-named-agents.md#m3)** At a plan stop submit with
-  `--what plan` and stop until acceptance. A submitted result still needs a
-  verdict; never approve your own assigned task.
+  `--what plan` and stop until acceptance. On the lead's task-correlated answer
+  after plan acceptance or changes requested, re-read `atm task get tN` before
+  resuming under M2. A submitted result still needs a verdict; never approve
+  your own assigned task.
   *Why: plan acceptance resumes work; result acceptance finishes it.*
 - **[M4](references/atm-named-agents.md#m4)** For a durable task, submit its
   plan/result and files **once** with `atm task submit`; it already queues a

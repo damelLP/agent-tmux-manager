@@ -58,7 +58,7 @@ pub use super::message_methods::register_message_methods;
 use super::message_scheduler::{self, Board, Effects, Resolution, Resolve};
 pub use super::message_types::*;
 use super::{
-    agents::AgentHandle,
+    agents::{matches_agent, AgentHandle},
     message_delivery::MESSAGE_RESOLUTION_BUDGET,
     message_evidence::{AttemptScope, MessageEvidence},
     message_history::MessageHistoryHandle,
@@ -74,9 +74,10 @@ use crate::{
     registry::RegistryHandle,
     server::methods::CallContext,
 };
-use atm_core::ScreenFacts;
+use atm_core::{ScreenFacts, SessionView};
 use atm_org::{
-    delivery::DeliveryPolicy, Agent, DeliveryReceipt, Message, OrgCommand, OrgEvent, OrgState,
+    delivery::DeliveryPolicy, Agent, AgentStatus, DeliveryReceipt, Message, OrgCommand, OrgEvent,
+    OrgState,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use std::{
@@ -282,6 +283,8 @@ pub fn is_focus_notice(content: &MessageContent) -> bool {
 /// Send, inbox and ack answer within 8 s, queue wait and organisation work
 /// included; the router allows 10 s (see `message_methods`).
 const ORDINARY_BUDGET: Duration = Duration::from_secs(8);
+
+const SEND_IDENTITY_BUDGET: Duration = Duration::from_secs(5);
 /// Requests in flight. A full service refuses the next one; nothing is parked.
 const MAX_REQUESTS: usize = 64;
 /// Read-transition counts kept for acknowledgements that await their fold.
@@ -816,6 +819,18 @@ impl std::fmt::Debug for MessageHandle {
     }
 }
 
+/// A discovery row cannot confirm a Ready agent's recorded real session.
+/// Absence of all rows and lazy, unbound starts retain ordinary queue policy.
+pub(super) fn unconfirmed_discovery(agent: &Agent, rows: &[SessionView]) -> bool {
+    let Some(recorded) = agent.session_id.as_ref().filter(|id| !id.is_pending()) else {
+        return false;
+    };
+    let in_pane = || rows.iter().filter(|row| matches_agent(agent, row));
+    agent.status == AgentStatus::Ready
+        && in_pane().any(|row| row.id.is_pending())
+        && !in_pane().any(|row| &row.id == recorded)
+}
+
 impl MessageHandle {
     #[must_use]
     pub fn disabled(reason: impl Into<String>) -> Self {
@@ -857,6 +872,30 @@ impl MessageHandle {
                     ));
                 }
                 let from = caller_address(&service.view()?.state, &caller)?;
+                if let Address::Agent(id) = &p.to {
+                    if let Some(agent) = service.agent(id)?.filter(|agent| {
+                        agent.status == AgentStatus::Ready
+                            && agent.session_id.as_ref().is_some_and(|id| !id.is_pending())
+                    }) {
+                        if let Some(pane) = agent.pane.as_deref() {
+                            let rows: Vec<_> = tokio::time::timeout(
+                                SEND_IDENTITY_BUDGET,
+                                service.rt.registry.pane_sessions(pane),
+                            )
+                            .await
+                            .map_err(|_| MessageError::Timeout)?
+                            .map_err(|error| MessageError::Unavailable(format!("session registry: {error}")))?
+                            .into_iter()
+                            .map(|row| row.view)
+                            .collect();
+                            if unconfirmed_discovery(&agent, &rows) {
+                                return Err(MessageError::Refused(format!(
+                                    "agent {id} has a discovered process but its recorded session is not confirmed; message not queued; inspect atm list and atm agent list before retrying"
+                                )));
+                            }
+                        }
+                    }
+                }
                 let content = MessageContent {
                     from,
                     to: p.to,

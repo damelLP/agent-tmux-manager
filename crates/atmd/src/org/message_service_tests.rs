@@ -1,6 +1,7 @@
 //! The message service over an in-memory organisation actor: no log files, no
 //! tmux, no harness. Synchronization is by returned calls, the append gate and
-//! the fold cursor; time is paused and only in-memory I/O runs under it.
+//! the fold cursor. Time tests use a paused clock and only in-memory I/O;
+//! discovery cases use the ordinary clock for real registry/procfs calls.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::{
@@ -102,7 +103,15 @@ pub(super) fn runtime(
     high_water: u64,
     cancel: &CancellationToken,
 ) -> MessageRuntime {
-    let registry = crate::registry::spawn_registry();
+    runtime_with_registry(org, high_water, cancel, crate::registry::spawn_registry())
+}
+
+fn runtime_with_registry(
+    org: OrgHandle,
+    high_water: u64,
+    cancel: &CancellationToken,
+    registry: crate::registry::RegistryHandle,
+) -> MessageRuntime {
     let (control, _task) = crate::control::service::spawn_control(
         Box::new(atm_tmux::MockTmuxClient::new()),
         registry.clone(),
@@ -172,6 +181,14 @@ impl Rig {
     }
 
     async fn build(relayed: bool, effects: Option<Effects>) -> Self {
+        Self::build_registry(relayed, effects, crate::registry::spawn_registry()).await
+    }
+
+    async fn build_registry(
+        relayed: bool,
+        effects: Option<Effects>,
+        registry: crate::registry::RegistryHandle,
+    ) -> Self {
         let gate = Arc::new(Semaphore::new(1));
         let (enter, entered) = mpsc::unbounded_channel();
         let (requests, receive) = mpsc::channel::<Request>(64);
@@ -203,7 +220,7 @@ impl Rig {
             committed: committed.clone(),
             reads: None,
         };
-        let rt = runtime(org.clone(), 0, &cancel.child_token());
+        let rt = runtime_with_registry(org.clone(), 0, &cancel.child_token(), registry);
         let relay = relayed.then(|| (committed.subscribe(), broadcast::channel(64).0));
         let source = match &relay {
             Some((_, service)) => service.subscribe(),
@@ -309,6 +326,256 @@ impl Drop for Rig {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+// Broadening the predicate to other states/rows, or trusting a foreign real
+// row to clear a pending refusal, must fail this literal decision matrix.
+#[test]
+fn discovery_identity_admission_matrix() {
+    use atm_core::{
+        AgentType, Harness, Model, SessionDomain, SessionId, SessionStatus, SessionView,
+    };
+    use atm_org::{Agent, AgentStatus};
+    let agent = Agent {
+        id: worker(),
+        role: None,
+        status: AgentStatus::Ready,
+        pane: Some("%1".into()),
+        session_id: Some(SessionId::new("s1")),
+        excluded_session_id: None,
+        reason: None,
+        updated_at: utc(),
+    };
+    let row = |id: &str, pane: &str| {
+        let mut domain = SessionDomain::new(
+            SessionId::new(id),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        );
+        domain.harness = Harness::Pi;
+        domain.tmux_pane = Some(pane.into());
+        SessionView::from_domain(&domain)
+    };
+    let pending = row("pending-1", "%1");
+    let real = row("s1", "%1");
+    for status in [
+        SessionStatus::Idle,
+        SessionStatus::Working,
+        SessionStatus::AttentionNeeded,
+    ] {
+        let mut pending = pending.clone();
+        pending.status = status;
+        assert!(unconfirmed_discovery(&agent, &[pending]), "{status:?}");
+    }
+    for status in [
+        AgentStatus::Starting,
+        AgentStatus::Clearing,
+        AgentStatus::Down,
+        AgentStatus::Stuck,
+    ] {
+        let mut other = agent.clone();
+        other.status = status;
+        assert!(
+            !unconfirmed_discovery(&other, std::slice::from_ref(&pending)),
+            "{status:?}"
+        );
+    }
+    for binding in [None, Some(SessionId::new("pending-1"))] {
+        let mut unbound = agent.clone();
+        unbound.session_id = binding;
+        assert!(!unconfirmed_discovery(
+            &unbound,
+            std::slice::from_ref(&pending)
+        ));
+    }
+    let mut paneless = agent.clone();
+    paneless.pane = None;
+    assert!(!unconfirmed_discovery(
+        &paneless,
+        std::slice::from_ref(&pending)
+    ));
+    assert!(!unconfirmed_discovery(&agent, &[]));
+    assert!(!unconfirmed_discovery(&agent, std::slice::from_ref(&real)));
+    assert!(!unconfirmed_discovery(
+        &agent,
+        &[pending.clone(), real.clone()]
+    ));
+    assert!(!unconfirmed_discovery(&agent, &[row("other-real", "%1")]));
+    let mut child = pending.clone();
+    child.parent_session_id = Some(SessionId::new("parent"));
+    assert!(!unconfirmed_discovery(&agent, &[child]));
+    assert!(!unconfirmed_discovery(&agent, &[row("pending-1", "%2")]));
+    let mut excluded = agent.clone();
+    excluded.excluded_session_id = Some(pending.id.clone());
+    assert!(!unconfirmed_discovery(
+        &excluded,
+        std::slice::from_ref(&pending)
+    ));
+    let mut child = real.clone();
+    child.parent_session_id = Some(SessionId::new("parent"));
+    for foreign in [child, row("s1", "%2")] {
+        assert!(unconfirmed_discovery(&agent, &[pending.clone(), foreign]));
+    }
+    excluded.excluded_session_id = Some(real.id.clone());
+    assert!(unconfirmed_discovery(&excluded, &[pending, real]));
+}
+
+// Real registry calls use the ordinary clock: discovery reads procfs and cwd.
+async fn discovery_row(rig: &Rig) -> tempfile::TempDir {
+    let cwd = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    guarded(rig.rt.registry.register_discovered(
+        atm_core::SessionId::pending_from_pid(pid),
+        pid,
+        cwd.path().to_path_buf(),
+        Some("%1".into()),
+        atm_core::Harness::Pi,
+    ))
+    .await
+    .unwrap();
+    cwd
+}
+
+// Removing the preflight, or moving it after append, must fail this test.
+#[tokio::test]
+async fn send_to_discovery_only_bound_recipient_is_refused_before_append() {
+    for caller in [owner(), pane("%2")] {
+        let rig = Rig::seeded().await;
+        let _cwd = discovery_row(&rig).await;
+        let before = rig.org.status().unwrap();
+        let error = guarded(
+            rig.messages
+                .send(note(Address::Agent(worker()), "must not enqueue"), caller),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, MessageError::Refused(text) if text == "agent demo/worker has a discovered process but its recorded session is not confirmed; message not queued; inspect atm list and atm agent list before retrying"),
+            "{error:?}"
+        );
+        assert_eq!(code(error), "refused");
+        assert_eq!(rig.org.status().unwrap(), before);
+        assert!(rig.inbox(pane("%1"), page()).await.messages.is_empty());
+    }
+}
+
+// A refusal is not a latched failure: the accepted real-id event restores send.
+#[tokio::test]
+async fn send_after_real_identity_event_enqueues_once() {
+    let rig = Rig::seeded().await;
+    let _cwd = discovery_row(&rig).await;
+    let params = SendParams {
+        attachments: vec!["literal/brief.md".into()],
+        task: Some("task-1".parse().unwrap()),
+        ..note(Address::Agent(worker()), "original body\nsecond line")
+    };
+    assert!(matches!(
+        guarded(rig.messages.send(params.clone(), pane("%2"))).await,
+        Err(MessageError::Refused(_))
+    ));
+    guarded(rig.rt.registry.apply_lifecycle_event(
+        atm_core::SessionId::new("s1"),
+        atm_core::LifecycleEvent::WorkingEnd,
+        atm_core::Harness::Pi,
+        Some(std::process::id()),
+        Some("%1".into()),
+    ))
+    .await
+    .unwrap();
+    let before = rig.org.status().unwrap();
+    let sent = guarded(rig.messages.send(params, pane("%2")))
+        .await
+        .unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+    let inbox = rig.inbox(pane("%1"), page()).await;
+    assert_eq!(inbox.messages.len(), 1);
+    let entry = &inbox.messages[0];
+    assert_eq!(entry.message_id, sent.message_id);
+    assert_eq!(entry.status, DeliveryStatus::Queued);
+    assert_eq!(entry.delivery.attempt, 0);
+    assert_eq!(entry.content.from, Address::Agent(other()));
+    assert_eq!(entry.content.to, Address::Agent(worker()));
+    assert_eq!(entry.content.body, "original body\nsecond line");
+    assert_eq!(entry.content.attachments, ["literal/brief.md"]);
+    assert_eq!(entry.content.task, Some("task-1".parse().unwrap()));
+}
+
+fn registry_channel() -> (
+    crate::registry::RegistryHandle,
+    mpsc::Receiver<crate::registry::RegistryCommand>,
+) {
+    let (send, receive) = mpsc::channel(4);
+    let (events, _) = broadcast::channel(4);
+    (crate::registry::RegistryHandle::new(send, events), receive)
+}
+
+// A lost registry answer cannot turn into permission to enqueue.
+#[tokio::test(start_paused = true)]
+async fn send_identity_read_failure_never_appends() {
+    let (registry, receive) = registry_channel();
+    drop(receive);
+    let rig = Rig::build_registry(false, None, registry).await;
+    rig.seed().await;
+    let before = rig.org.status().unwrap();
+    let result = guarded(
+        rig.messages
+            .send(note(Address::Agent(worker()), "closed"), owner()),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(MessageError::Unavailable(_))),
+        "{result:?}"
+    );
+    assert_eq!(rig.org.status().unwrap(), before);
+
+    let (registry, mut receive) = registry_channel();
+    let rig = Rig::build_registry(false, None, registry).await;
+    rig.seed().await;
+    let before = rig.org.status().unwrap();
+    let sending = rig
+        .messages
+        .send(note(Address::Agent(worker()), "held"), owner());
+    tokio::pin!(sending);
+    let request = tokio::select! {
+        result = &mut sending => panic!("send answered without its registry read: {result:?}"),
+        request = receive.recv() => request.unwrap(),
+    };
+    let crate::registry::RegistryCommand::PaneSessions {
+        pane: target,
+        respond_to,
+    } = request
+    else {
+        panic!("unexpected registry request");
+    };
+    assert_eq!(target, "%1");
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    let result = std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(sending.as_mut(), cx);
+        assert!(
+            result.is_ready(),
+            "registry read exceeded its five-second budget"
+        );
+        result
+    })
+    .await;
+    assert!(matches!(result, Err(MessageError::Timeout)), "{result:?}");
+    assert_eq!(rig.org.status().unwrap(), before);
+    assert!(rig.inbox(pane("%1"), page()).await.messages.is_empty());
+    drop(respond_to);
+}
+
+// Owner messages must still succeed without a functioning registry.
+#[tokio::test(start_paused = true)]
+async fn owner_message_bypasses_identity_read() {
+    let (registry, receive) = registry_channel();
+    drop(receive);
+    let rig = Rig::build_registry(false, None, registry).await;
+    rig.seed().await;
+    let id = rig.send(pane("%2"), Address::Owner, "report").await;
+    let inbox = rig.inbox(owner(), page()).await;
+    assert_eq!(ids(&inbox), [id.seq()]);
+    assert_eq!(inbox.messages[0].status, DeliveryStatus::Delivered);
+    assert_eq!(inbox.messages[0].content.from, Address::Agent(other()));
 }
 
 #[tokio::test(start_paused = true)]

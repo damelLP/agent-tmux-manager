@@ -267,10 +267,11 @@ key-name variants. Hint actions and the reload paragraph are recognized across
 wrapped rows; a draft imitating dialog action words conservatively holds too.
 
 A synthetic draft ending in a full-width rule plus an empty row must not read
-Empty. Earlier same-width rules make the border selection ambiguous unless
-the preceding region is recognized startup-only chrome (e.g. the update box).
-This conservatively refuses some conversations containing full-width rules;
-plain text cannot reliably distinguish those rules from pasted editor borders.
+Empty. In Styled input every earlier same-width rule must belong to a complete
+update notice with its captured faint-label or bold-title proof (see below). An otherwise
+valid startup region never excuses an unexplained rule. Plain retains its
+legacy startup-only exception: it cannot supply that attribute proof. Other
+historical full-width rules remain ambiguous and conservatively refuse.
 
 No RPC method is added. Captured success and synthetic refusal tests cover
 parser conformance; static clear/launch policy has exact-value tests.
@@ -306,3 +307,79 @@ The existing P1 conversation/scrolled positives and zero-usage prompt/reply
 regression remain unchanged. `control_startup.rs` labels Synthetic mutations of
 values, spacing, suffix blocks, anchors, footer, borders and ANSI; these are not
 additional captures. Live post-build harness/daemon orchestration is unverified.
+
+## Update-notice/editor boundary (clear startup)
+
+Captured: pi 1.5.0, 2026-11-15, sealed private tmux 3.8
+`capture-pane -p -e -N`; startup and existing short-turn captures.
+Captured: pi 1.5.2, 2026-11-15, sealed private tmux 3.8
+`capture-pane -p -e -N`; offline/resource startups, no input or prompt.
+
+All `clear_*_pi_<version>.txt` bodies are verbatim captures with no added header or
+normalization. Only private run roots become equal-width `/tmp/xxx…` paths.
+`tests/clear_startup_notice.rs` records provenance beside each replay.
+
+| Fixture stem (`clear_<stem>_pi_1.5.0.txt`) | Source / state |
+|---|---|
+| `post_turn` | E2 before-clear captures, byte-identical pair; empty editor after a short turn |
+| `e2_startup` | Same E2 session before its first turn; full header, resources and update |
+| `rehearsal` | Independent short-turn refusal at 150 columns, header scrolled off |
+| `startup_224x16`, `startup_224x12`, `startup_120x16`, `startup_80x16`, `startup_60x20`, `startup_40x20` | Separate real startup-only processes; clipped/wrapped header and complete update |
+| `startup_224x48` | Full-header startup with update, after fd was installed |
+| `startup_dark`, `startup_light` | Built-in dark/light themes, 224x48, bold title and colored nonfaint labels; no input or prompt |
+| `startup_fd_status` | First 224x48 startup, fd downloading/installed status plus update |
+| `offline-wide`, `offline-narrow` | No update notice, 224x48 / 40x40 |
+| `resources-wide`, `resources-narrow` | Loaded context, skill and prompt, 224x48 / 40x40 |
+| `changelog-condensed-wide`, `changelog-condensed-narrow` | Unread core changelog, 224x48 / 40x40, nonfaint body; already Unknown |
+| `changelog-detailed-narrow` | Unread expanded core changelog, 40x60; unsupported underline SGR, already Unknown |
+| `atmd_before`, `atmd_after` | Before/after real atmd clear at 224x16; live update box before 1.5.0 clear |
+
+The four offline/resource stems and both `atmd_*` stems also have
+`_pi_1.5.2.txt` captures from the installed 1.5.2 CLI. Startup was synchronized
+on complete footer, expected
+resources/notice and the post-init tmux warning, never a fixed delay or resize.
+
+Cause: the update's full-width rules equal the editor lower border. Requiring
+*all history* to be startup-only made an idle editor Unknown after a short turn,
+with a cropped header, or even after fd download status. Styled now accounts for
+**every** colliding rule individually: only a complete `Update Available` notice,
+with either the observed faint New-version and Changelog labels or a bold
+`Update Available` title, can explain it. Every non-whitespace title character
+must be bold; a single styled glyph is insufficient. Built-in `dark`/`light`
+captures have colored, nonfaint labels and need the title proof. These verbatim
+fixtures map to the separate real `startup-dark`/`startup-light` captures from
+the same sealed theme probe; no model call occurred.
+Instruction wrapping at 40 columns is reconstructed only inside that complete
+notice. Decoded UTF-8 offsets include retained padding; Unicode history does not
+shift the attribute proof. Other borders, unsupported escapes, popups and missing
+proof still refuse. No changes to freshness/conversation criteria or Plain.
+
+The installed 1.5.2 normal notice markup and editor border rendering match
+1.5.0. The custom editor is identical; the base editor's only difference is
+paste-marker renumbering. The optional release-note Markdown rendering changed,
+but that notice form was already unsupported and stays Unknown.
+
+Each real daemon check used one guarded `/new` through `atm agent clear`, with
+start lines disabled. Both versions changed session ID and returned Ready/Idle,
+with an empty inbox, zero first prompts and no model-turn events. The 1.5.0
+before-frame is Unknown under the old observer and safe under the fixed one;
+pi removed the update box after `/new`. The 1.5.2 check had no update box. All
+servers, sockets and HOME directories were private; no resize/retry or direct
+terminal input was used to make clear succeed.
+
+Known limits intentionally remain refused: condensed/expanded unread core and
+extension changelogs, package-update notices, Update Available with a release
+note, experimental first-time setup and startup dialogs. Their appearance is
+not an empty-editor proof. Custom themes without either captured style proof and
+arbitrary custom UI imitating both chrome and styles remain unsupported. No
+text-only exception or submitting Enter is inferred from a notice match.
+
+Synthetic regressions cover staged `/new` exactness, running/typed/dialog
+editors, a valid notice plus an unexplained pasted rule, nonfaint notice-shaped
+drafts, missing bounds/labels/attributes, damaged footer/ANSI and varied values
+or history length. Restoring the old guard makes the real positive fail; changing
+all-rule coverage to any-rule, or dropping both style proofs, admits unsafe
+composers and fails the dedicated negatives. Bold titles do not excuse a draft,
+running turn, dialog, malformed notice or unexplained extra rule. Removing the
+bold-title path makes the real built-in-theme regressions fail. No new model
+turn was needed for this fix.

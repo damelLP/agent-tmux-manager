@@ -697,6 +697,29 @@ fn synthetic_style_and_frame_mutations_never_create_empty() {
     check("\x1b[7m \x1b[0m", ScreenFacts::default());
 }
 
+#[test]
+fn above_completion_preserves_legacy_draft_facts() {
+    // Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -e, no prompt.
+    // Recognizing a completion must not turn its unknown transcript tail into idle.
+    for text in [
+        capture!("s1_clear-multi-wrapped"),
+        capture!("s1_clear-single"),
+    ] {
+        check(
+            text,
+            facts(
+                InputState::Draft,
+                TurnState::Unknown,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(text), "/clear"),
+            Some(true)
+        );
+    }
+}
+
 // Native-cursor rendering: Claude shows the terminal's own cursor and draws no
 // inverse cell, so a suggestion row is faint from its first cell on.
 const NATIVE_FRESH: &str = capture!("s1_native-fresh-placeholder");

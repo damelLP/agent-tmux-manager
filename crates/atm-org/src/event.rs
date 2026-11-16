@@ -18,7 +18,7 @@
 //! this is another reason downgrading a newer log is not a safety guarantee.
 
 use crate::{
-    Address, AgentId, DecisionId, DecisionRequest, DecisionResolution, DecisionWithdrawal,
+    Address, AgentId, DecisionId, DecisionRequest, DecisionResolutionEvent, DecisionWithdrawal,
     MessageId, ProjectId, ProvisionalChoice, RoleSpec, TaskId,
 };
 use atm_core::{Harness, Money, SessionId};
@@ -140,6 +140,20 @@ pub enum OrgEvent {
     AgentStuck { agent_id: AgentId, reason: String },
     #[serde(rename = "agent.down")]
     AgentDown { agent_id: AgentId, reason: String },
+    /// Audit of a handover: the agent was asked, by this message, to save
+    /// its state. Changes no state.
+    #[serde(rename = "agent.save_requested")]
+    AgentSaveRequested {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
+    /// Audit of a handover: the agent's save turn ended and its memory file
+    /// had changed. Changes no state.
+    #[serde(rename = "agent.saved")]
+    AgentSaved {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
     #[serde(rename = "msg.sent")]
     MessageSent(MessageContent),
     #[serde(rename = "msg.delivery_attempted")]
@@ -183,6 +197,8 @@ pub enum OrgEvent {
     TaskFlagged(crate::TaskFlagged),
     #[serde(rename = "task.cost_recorded")]
     TaskCostRecorded(crate::TaskCostRecorded),
+    #[serde(rename = "task.usage_observed")]
+    TaskUsageObserved(crate::TaskUsageObserved),
     #[serde(rename = "session.summary")]
     SessionSummary(SessionSummary),
     #[serde(rename = "control.sent")]
@@ -196,13 +212,17 @@ pub enum OrgEvent {
     #[serde(rename = "decision.taken_provisionally")]
     DecisionTakenProvisionally(ProvisionalChoice),
     #[serde(rename = "decision.resolved")]
-    DecisionResolved(DecisionResolution),
+    DecisionResolved(DecisionResolutionEvent),
     #[serde(rename = "decision.overruled")]
-    DecisionOverruled(DecisionResolution),
+    DecisionOverruled(DecisionResolutionEvent),
     #[serde(rename = "decision.expired")]
     DecisionExpired { decision_id: DecisionId },
     #[serde(rename = "decision.withdrawn")]
     DecisionWithdrawn(DecisionWithdrawal),
+    #[serde(rename = "owner.away")]
+    OwnerAway(crate::OwnerAway),
+    #[serde(rename = "owner.back")]
+    OwnerBack(crate::OwnerBack),
 }
 
 impl OrgEvent {
@@ -220,6 +240,8 @@ impl OrgEvent {
             Self::AgentClearRequested { .. } => "agent.clear_requested",
             Self::AgentStuck { .. } => "agent.stuck",
             Self::AgentDown { .. } => "agent.down",
+            Self::AgentSaveRequested { .. } => "agent.save_requested",
+            Self::AgentSaved { .. } => "agent.saved",
             Self::MessageSent(_) => "msg.sent",
             Self::MessageDeliveryAttempted { .. } => "msg.delivery_attempted",
             Self::MessageDelivered { .. } => "msg.delivered",
@@ -235,6 +257,7 @@ impl OrgEvent {
             Self::TaskReminded(_) => "task.reminded",
             Self::TaskFlagged(_) => "task.flagged",
             Self::TaskCostRecorded(_) => "task.cost_recorded",
+            Self::TaskUsageObserved(_) => "task.usage_observed",
             Self::SessionSummary(_) => "session.summary",
             Self::ControlSent(_) => "control.sent",
             Self::ControlSpawned(_) => "control.spawned",
@@ -245,6 +268,8 @@ impl OrgEvent {
             Self::DecisionOverruled(_) => "decision.overruled",
             Self::DecisionExpired { .. } => "decision.expired",
             Self::DecisionWithdrawn(_) => "decision.withdrawn",
+            Self::OwnerAway(_) => "owner.away",
+            Self::OwnerBack(_) => "owner.back",
         }
     }
 
@@ -275,6 +300,8 @@ impl OrgEvent {
                 | "agent.clear_requested"
                 | "agent.stuck"
                 | "agent.down"
+                | "agent.save_requested"
+                | "agent.saved"
                 | "msg.sent"
                 | "msg.delivery_attempted"
                 | "msg.delivered"
@@ -290,6 +317,7 @@ impl OrgEvent {
                 | "task.reminded"
                 | "task.flagged"
                 | "task.cost_recorded"
+                | "task.usage_observed"
                 | "session.summary"
                 | "control.sent"
                 | "control.spawned"
@@ -300,6 +328,8 @@ impl OrgEvent {
                 | "decision.overruled"
                 | "decision.expired"
                 | "decision.withdrawn"
+                | "owner.away"
+                | "owner.back"
         ) {
             return Ok(None);
         }

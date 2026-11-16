@@ -95,7 +95,8 @@
 //! snapshots, require a known agent when bound, and deduplicate identical facts.
 //! They accept ended before started: wall-clock steps must not drop last cost.
 //! Control audits refuse an empty pane; otherwise they always emit and do not
-//! change organisation state.
+//! change organisation state. Handover audits (SaveRequested, Saved) need a
+//! known agent and message; they too always emit and change no state.
 //!
 //! # Decision policy
 //!
@@ -118,8 +119,21 @@
 //! Request accepts only a known agent or `system` as requester and a known
 //! [`DecisionKind`]. It refuses an empty title, fewer than two options, an empty
 //! or repeated option, a recommendation that is not an option, and a deadline
-//! not after `now`. Whether the owner is away is not known here: the caller decides
-//! when to take a decision provisionally, this policy whether it may.
+//! not after `now`. This policy says whether a decision may be taken
+//! provisionally; the away policy below says when one is.
+//!
+//! # Away policy
+//!
+//! The away switch arrives as [`OrgCommand::Owner`]: only the owner sets away
+//! and back, repeats write nothing, and `owner.away` records each project's
+//! stacking cap (at least one). While he is away the daemon reports every
+//! pending decision with [`OwnerCommand::ApplyAway`], which puts it through the
+//! away table in one decide step: a detail is recorded for its requester, a
+//! change of intent that can be undone is taken provisionally by `system`,
+//! both on the recommended option; anything else waits, as everything does
+//! while he is present. The stacking cap then holds `Assign` of an open task
+//! whose `rests_on` names a provisional change of intent until the owner has
+//! answered it. Both tables and their limits are in the away module's docs.
 //!
 //! # Tasks
 //!
@@ -174,21 +188,30 @@
 //! once per session (None if no cost was reported), using Money's saturation.
 //! Delivery timestamps and first read time come from apply's supplied timestamp.
 
+pub mod auto_handover;
+mod away;
+pub mod budget;
 mod command;
 mod config;
+mod cost;
 mod decision;
 pub mod delivery;
 mod event;
 pub mod idle;
 mod ids;
+mod intent;
+pub mod reminder;
 mod replay;
 mod state;
 mod task;
+pub use away::*;
 pub use command::*;
 pub use config::*;
+pub use cost::{TaskUsageObservation, TaskUsageObserved};
 pub use decision::*;
 pub use event::*;
 pub use ids::*;
+pub use intent::*;
 pub use replay::*;
 pub use state::*;
 pub use task::*;

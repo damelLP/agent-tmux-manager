@@ -87,6 +87,22 @@
 //! sources `startup` and `compact` only (unverified without `--model`).
 //! Claude sends no `pid` or `tmux_pane`; `atm-hook` adds them.
 //!
+//! The fixtures preserve the original hook stdin. Before forwarding,
+//! `atm-hook` removes only the top-level `last_assistant_message`, which
+//! [`RawHookEvent`] does not read. All other fields, including background
+//! tasks, scheduled work, child identity and nested same-name fields, stay.
+//! This prevents unused assistant text alone from making a terminal frame
+//! exceed atmd's 1 MiB line limit; it does not bound other payload fields
+//! or make the best-effort transport reliable.
+//!
+//! Synthetic: a sealed replay on 2026-11-16 enlarged the assistant text in
+//! a captured Claude Code 2.1.325 Stop to 1,100,000 characters. The original
+//! forwarder returned zero while private atmd rejected the oversized frame,
+//! leaving the row working. With the projection, the same replay published
+//! Idle with and without an injected pane. This is not a captured large Claude
+//! response or an attribution of a live busy-row incident. The regression tests in
+//! `tests/atm_hook_pid.rs` exercise the projection with and without a pane.
+//!
 //! For the events both captures have, every field the adapter reads is
 //! unchanged from 2.1.267, and this capture has only extra fields:
 //! `effort`, and on `SessionStart` `model`, `prompt_id` and, for
@@ -132,6 +148,57 @@
 //! a subagent's replies for seconds to keep it running. Each ends with a
 //! `SessionEnd` (reason `other`) from tearing the capture down. Paths
 //! were rewritten as above.
+//!
+//! ### Turn-boundary captures (2026-11-16)
+//!
+//! `tests/fixtures/claude_turn_boundaries_2.1.325.jsonl` contains four
+//! independent sessions, in hook-stdin order within each session:
+//! normal (lines 1–6), blocked Stop (7–13), asyncRewake (14–21), and
+//! manual `/compact` (22–32). Captured: Claude Code 2.1.325, 2026-11-16,
+//! sealed rig stub mode. The pinned real binary used a fake Messages API,
+//! a fake key and explicitly generated synthetic credentials, in an
+//! empty-root mount view with only loopback and no external route. Private
+//! HOME/config/project contained no personal settings, skills or plugins.
+//! Both connector opt-outs, empty strict MCP, empty setting sources,
+//! disabled CLAUDE.md loading and a fail-closed tool guard/session watcher
+//! stayed enabled. A pre-turn `mcp list` reported no configured servers.
+//!
+//! Only the compact capture omitted `--disable-slash-commands`, which
+//! otherwise disables `/compact` too. Its four actual API request bodies
+//! offered exactly Bash, Read, DeferredToolPlaceholder and Write; no skill,
+//! plugin or MCP server names/catalogs were offered. DeferredToolPlaceholder
+//! was the built-in inert deferred-loading sentinel ("never call this tool",
+//! empty input schema), not a connector. Skill/plugin/MCP names elsewhere
+//! in those bodies occurred only in classifier **deny** rules, not offers.
+//! All other flags/isolation stayed unchanged, and the rig's source pins
+//! matched before and after. Only exact synthetic printf commands could run.
+//!
+//! The driver preserved real hook stdin, then injected the actual private
+//! process/pane identity into a separate synchronous private-atmd delivery.
+//! Pong and registry replies recorded application, not just emission. This
+//! was not the production forwarder's best-effort transport. Fixture paths
+//! and session/prompt/tool/agent IDs are consistently pseudonymized; payload
+//! fields and synthetic stub output are otherwise preserved. SessionEnd
+//! records are teardown, not natural turn completion. Tests which reorder,
+//! omit or retarget captured frames are explicitly marked Synthetic.
+//!
+//! - A normal final Stop and a blocked Stop both carried
+//!   `stop_hook_active: false`. Blocking produced parent Pre/PostToolUse
+//!   with the **same prompt ID**, then Stop with `stop_hook_active: true`.
+//!   Current mapping idles at either Stop and reactivates at a parent tool
+//!   event. These flags cannot prove irrevocable closure. No obsolete
+//!   parent tool end arriving after an actually final Stop was captured.
+//! - A configured asyncRewake hook, socket-released to exit 2 after the
+//!   initial Stop/idle editor, produced a task-notification prompt with a
+//!   **new prompt ID**, then Stop (`stop_hook_active: true`). That real trace
+//!   had a terminal; tests withhold it synthetically, never claim silence
+//!   proves Idle. Interrupted/error wakes remain unverified on this version.
+//! - Manual compaction emitted PreCompact(manual), two compactor
+//!   SubagentStops, SessionStart(compact), then PostCompact(manual), with a
+//!   shared compaction prompt ID distinct from the preceding user turn.
+//!   Current mapping stays Working until SessionStart; PostCompact is
+//!   unrecognized. Missing SessionStart/all-completion and automatic or
+//!   active-parent compaction were not observed in this current-version run.
 //!
 //! The JSON payloads in the `wire.rs` tests, and those in the
 //! `status_line.rs` tests not marked `Captured:`, are hand-written (see
@@ -363,8 +430,11 @@
 //!     updates the row.
 //!   - After `/compact`, `PostCompact` (trigger `manual`) comes 23 ms
 //!     after `SessionStart` (source `compact`) has set the row idle, so
-//!     it would add nothing. It also carries `compact_summary`, the
-//!     conversation summary, which atm-hook would send to atmd.
+//!     it adds no row effect **when that SessionStart arrives**. This is
+//!     not evidence against its value when SessionStart is missing; the
+//!     2.1.325 characterization above withholds that start synthetically.
+//!     It also carries `compact_summary`, the conversation summary,
+//!     which atm-hook would send to atmd.
 //! - **`PermissionRequest` comes about 6 s before `Notification`
 //!   (`permission_prompt`) for the same dialog.** Both map to needs
 //!   input. The `Notification` carries no tool, so the row's label

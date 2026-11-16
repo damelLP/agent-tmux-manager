@@ -1,6 +1,6 @@
 //! `atm setup` installing the atm skills from `crates/atm/assets/atm-skills/`
 //! into each detected harness's own skills folder, and `atm uninstall`
-//! removing only atm's two folders. Each installed skill folder holds its
+//! removing only atm's four folders. Each installed skill folder holds its
 //! `SKILL.md` and a copy of everything in `shared/`.
 //!
 //! Every run gets its own HOME and XDG dirs in a temp dir, so nothing
@@ -19,7 +19,7 @@ use serde_json::Value;
 /// The skills' source, relative to the repo root.
 const SOURCE: &str = "crates/atm/assets/atm-skills";
 /// The skills `atm setup` installs, by folder name.
-const SKILLS: [&str; 2] = ["atm-coordinate", "atm-implement"];
+const SKILLS: [&str; 4] = ["atm-coordinate", "atm-implement", "atm-lead", "atm-member"];
 /// Each harness's directory, whose presence makes setup configure it, and
 /// its skills folder, relative to HOME.
 const HARNESSES: [(&str, &str); 3] = [
@@ -92,7 +92,7 @@ fn expected_skill(skill: &str) -> BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
-/// Asserts the skill folders in `skills` are exactly atm's two, as in the
+/// Asserts the skill folders in `skills` are exactly atm's four, as in the
 /// source, with the scripts executable and nothing else.
 fn assert_installed(skills: &Path) {
     for skill in SKILLS {
@@ -136,7 +136,7 @@ fn add_other_skills(skills: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     others(skills)
 }
 
-/// Every file in `skills` outside atm's two folders.
+/// Every file in `skills` outside atm's four folders.
 fn others(skills: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut files = files_under(skills);
     files.retain(|path, _| !SKILLS.iter().any(|skill| path.starts_with(skill)));
@@ -144,7 +144,7 @@ fn others(skills: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[test]
-fn setup_installs_both_skills_for_each_detected_harness() {
+fn setup_installs_all_skills_for_each_detected_harness() {
     let home = all_harnesses();
     let home = home.path();
 
@@ -205,8 +205,10 @@ fn setup_replaces_atms_copy_and_keeps_other_skills() {
     let mut kept = Vec::new();
     for (_, skills) in HARNESSES {
         let skills = home.join(skills);
-        fs::write(skills.join("atm-coordinate/SKILL.md"), "edited").unwrap();
-        fs::write(skills.join("atm-implement/stale.md"), "old").unwrap();
+        for skill in SKILLS {
+            fs::write(skills.join(skill).join("SKILL.md"), "edited").unwrap();
+            fs::write(skills.join(skill).join("stale.md"), "old").unwrap();
+        }
         kept.push(add_other_skills(&skills));
     }
 
@@ -223,25 +225,27 @@ fn setup_replaces_atms_copy_and_keeps_other_skills() {
 /// link and never writes through it into the checkout.
 #[test]
 fn setup_replaces_a_symlinked_skill_folder_and_leaves_its_target() {
-    let home = home_with(&[".claude"]);
-    let home = home.path();
-    let checkout = home.join("checkout/atm-implement");
-    fs::create_dir_all(&checkout).unwrap();
-    fs::write(checkout.join("SKILL.md"), "work in progress").unwrap();
-    let skills = home.join(".claude/skills");
-    fs::create_dir_all(&skills).unwrap();
-    symlink(&checkout, skills.join("atm-implement")).unwrap();
+    for skill in SKILLS {
+        let home = home_with(&[".claude"]);
+        let home = home.path();
+        let checkout = home.join("checkout").join(skill);
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(checkout.join("SKILL.md"), "work in progress").unwrap();
+        let skills = home.join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
+        symlink(&checkout, skills.join(skill)).unwrap();
 
-    run_atm_ok(home, "setup");
+        run_atm_ok(home, "setup");
 
-    assert!(!fs::symlink_metadata(skills.join("atm-implement"))
-        .unwrap()
-        .is_symlink());
-    assert_installed(&skills);
-    assert_eq!(
-        files_under(&checkout),
-        BTreeMap::from([(PathBuf::from("SKILL.md"), b"work in progress".to_vec())])
-    );
+        assert!(!fs::symlink_metadata(skills.join(skill))
+            .unwrap()
+            .is_symlink());
+        assert_installed(&skills);
+        assert_eq!(
+            files_under(&checkout),
+            BTreeMap::from([(PathBuf::from("SKILL.md"), b"work in progress".to_vec())])
+        );
+    }
 }
 
 #[test]
@@ -370,51 +374,82 @@ fn unlock(dir: &Path) {
     }
 }
 
-/// A failed install leaves each skill whole: setup builds a skill beside the
-/// installed one and swaps it in only once it's complete, and tries every
-/// skill. Here the older atm-coordinate has a folder setup can't empty (as a
-/// read-only `references/` from an older install would be), and an older
-/// atm-implement is due for replacement. As root, permissions don't stop the
-/// removal, so the install simply succeeds.
+/// A failed install leaves the old or new copy whole and still attempts the
+/// other skills. Repeat for each position in the manifest. As root the
+/// permission restriction does not fail, so the new copy is also allowed.
 #[test]
 fn a_failed_install_leaves_each_skill_whole() {
-    let home = home_with(&[".claude"]);
-    let home = home.path();
-    run_atm_ok(home, "setup");
-    let skills = home.join(".claude/skills");
-    let coordinate = skills.join("atm-coordinate");
-    fs::write(coordinate.join("SKILL.md"), "old atm-coordinate").unwrap();
-    fs::write(skills.join("atm-implement/SKILL.md"), "old atm-implement").unwrap();
-    let old_coordinate = files_under(&coordinate);
-    fs::set_permissions(
-        coordinate.join("references"),
-        fs::Permissions::from_mode(0o555),
-    )
-    .unwrap();
+    for failing in SKILLS {
+        let home = home_with(&[".claude"]);
+        let home = home.path();
+        run_atm_ok(home, "setup");
+        let skills = home.join(".claude/skills");
+        for skill in SKILLS {
+            fs::write(skills.join(skill).join("SKILL.md"), format!("old {skill}")).unwrap();
+        }
+        let blocked = skills.join(failing);
+        let old = files_under(&blocked);
+        fs::set_permissions(
+            blocked.join("references"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
 
-    let stdout = run_atm_ok(home, "setup");
-    unlock(home);
+        let stdout = run_atm_ok(home, "setup");
+        unlock(home);
 
-    let installed = files_under(&coordinate);
-    assert!(
-        installed == expected_skill("atm-coordinate") || installed == old_coordinate,
-        "atm-coordinate is neither the old copy nor the new one: {:?}\n{stdout}",
-        installed.keys().collect::<Vec<_>>()
-    );
-    assert_eq!(
-        files_under(&skills.join("atm-implement")),
-        expected_skill("atm-implement"),
-        "{stdout}"
-    );
-    let staging = skills.join(".atm-staging");
-    for name in ["atm-coordinate", "atm-implement"] {
+        let installed = files_under(&blocked);
         assert!(
-            !staging.join(name).exists(),
-            "a new {name} was left: {stdout}"
+            installed == expected_skill(failing) || installed == old,
+            "{failing} is neither the old copy nor the new one: {installed:?}\n{stdout}"
         );
+        let staging = skills.join(".atm-staging");
+        for skill in SKILLS {
+            if skill != failing {
+                assert_eq!(
+                    files_under(&skills.join(skill)),
+                    expected_skill(skill),
+                    "{stdout}"
+                );
+            }
+            assert!(
+                !staging.join(skill).exists(),
+                "a new {skill} was left: {stdout}"
+            );
+        }
+
+        run_atm_ok(home, "uninstall");
+        assert!(names_in(&skills).is_empty(), "{:?}", names_in(&skills));
+    }
+}
+
+// Break caught: adding named skills retires an old skill or overwrites an
+// unrelated skill when upgrading an existing two-skill installation.
+#[test]
+fn setup_upgrades_a_legacy_two_skill_home_without_removing_the_old_pair() {
+    let home = all_harnesses();
+    let home = home.path();
+    let mut kept = Vec::new();
+    for (_, dir) in HARNESSES {
+        let skills = home.join(dir);
+        for old in ["atm-coordinate", "atm-implement"] {
+            fs::create_dir_all(skills.join(old)).unwrap();
+            fs::write(skills.join(old).join("SKILL.md"), "legacy copy").unwrap();
+        }
+        kept.push(add_other_skills(&skills));
     }
 
-    // Uninstall clears the staging folder with the skills.
-    run_atm_ok(home, "uninstall");
-    assert!(names_in(&skills).is_empty(), "{:?}", names_in(&skills));
+    run_atm_ok(home, "setup");
+
+    for ((_, dir), kept) in HARNESSES.iter().zip(kept) {
+        let skills = home.join(dir);
+        for skill in SKILLS {
+            assert!(
+                skills.join(skill).join("SKILL.md").is_file(),
+                "missing {skill}"
+            );
+        }
+        assert_installed(&skills);
+        assert_eq!(others(&skills), kept);
+    }
 }

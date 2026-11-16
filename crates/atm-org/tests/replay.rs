@@ -124,6 +124,11 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::TaskReminded(_) => 33,
         OrgEvent::TaskFlagged(_) => 34,
         OrgEvent::TaskCostRecorded(_) => 35,
+        OrgEvent::AgentSaveRequested { .. } => 36,
+        OrgEvent::AgentSaved { .. } => 37,
+        OrgEvent::OwnerAway(_) => 38,
+        OrgEvent::OwnerBack(_) => 39,
+        OrgEvent::TaskUsageObserved(_) => 40,
     }
 }
 
@@ -211,7 +216,40 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
         18 => OrgEvent::AgentEditorReady { agent_id },
         19 => OrgEvent::AgentRevalidationRequested { agent_id },
         20..=25 => decision_support::decision_event_case(slot - 20, text, n, flag),
-        _ => task_event_case(slot, text, n, cost, flag),
+        26..=35 => task_event_case(slot, text, n, cost, flag),
+        36 => OrgEvent::AgentSaveRequested {
+            agent_id,
+            message_id,
+        },
+        37 => OrgEvent::AgentSaved {
+            agent_id,
+            message_id,
+        },
+        38 => OrgEvent::OwnerAway(OwnerAway {
+            by: owner_or(flag, agent_id),
+            stacking_caps: [("p".parse().unwrap(), (n % 5) as u32)]
+                .into_iter()
+                .filter(|_| !n.is_multiple_of(7))
+                .collect(),
+        }),
+        40 => OrgEvent::TaskUsageObserved(TaskUsageObserved {
+            session_id: text.into(),
+            task_id: flag.then(|| format!("t{n}").parse().unwrap()),
+            turn: flag,
+            cumulative_cost: Some(Money::from_microdollars(cost)),
+            context_percent: Some((n % 101) as u8),
+        }),
+        _ => OrgEvent::OwnerBack(OwnerBack {
+            by: owner_or(flag, agent_id),
+        }),
+    }
+}
+
+fn owner_or(owner: bool, agent_id: AgentId) -> Address {
+    if owner {
+        Address::Owner
+    } else {
+        Address::Agent(agent_id)
     }
 }
 
@@ -362,6 +400,10 @@ fn command_slot(command: &OrgCommand) -> usize {
         OrgCommand::Revalidate { .. } => 20,
         OrgCommand::Decision(_) => 21,
         OrgCommand::Task(_) => 22,
+        OrgCommand::SaveRequested { .. } => 23,
+        OrgCommand::Saved { .. } => 24,
+        OrgCommand::Owner(_) => 25,
+        OrgCommand::ObserveTaskUsage(_) => 26,
     }
 }
 
@@ -454,7 +496,36 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
             flag.then(|| time() + chrono::Duration::milliseconds(n as i64)),
             flag,
         )),
-        _ => OrgCommand::Task(task_command_case(n, flag)),
+        22 => OrgCommand::Task(task_command_case(n, flag)),
+        23 => OrgCommand::SaveRequested {
+            agent_id,
+            message_id,
+        },
+        24 => OrgCommand::Saved {
+            agent_id,
+            message_id,
+        },
+        26 => OrgCommand::ObserveTaskUsage(TaskUsageObservation {
+            session_id,
+            pane: Some(pane),
+            turn: flag,
+            cumulative_cost: Some(Money::from_microdollars((n % 1000000) as i64)),
+            context_percent: Some((n % 101) as u8),
+        }),
+        // Slot 25: the switch by the owner or an agent, caps from zero up, and
+        // the away table applied to the decision ids a history reaches.
+        _ => OrgCommand::Owner(match n % 3 {
+            0 => OwnerCommand::Away {
+                by: owner_or(flag, agent_id),
+                stacking_caps: [("p".parse().unwrap(), (n % 4) as u32)].into(),
+            },
+            1 => OwnerCommand::Back {
+                by: owner_or(flag, agent_id),
+            },
+            _ => OwnerCommand::ApplyAway {
+                decision_id: DecisionId::new(n),
+            },
+        }),
     }
 }
 
@@ -536,14 +607,14 @@ fn task_command_case(n: u64, flag: bool) -> TaskCommand {
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..36)
+    let events: Vec<_> = (0..41)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..36).collect::<Vec<_>>());
-    let commands: Vec<_> = (0..23)
+    assert_eq!(events, (0..41).collect::<Vec<_>>());
+    let commands: Vec<_> = (0..27)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
-    assert_eq!(commands, (0..23).collect::<Vec<_>>());
+    assert_eq!(commands, (0..27).collect::<Vec<_>>());
     let picks: Vec<_> = (0..5)
         .map(|pick| match command_case(21, pick, true) {
             OrgCommand::Decision(command) => decision_support::decision_command_pick(&command),
@@ -552,7 +623,7 @@ fn case_generators_cover_every_event_and_command_variant() {
         .collect();
     assert_eq!(picks, (0..5).collect::<Vec<_>>());
     let history = history::History::seeded();
-    let wide_commands: Vec<_> = (0..23)
+    let wide_commands: Vec<_> = (0..26)
         .map(|slot| {
             let seed = history::Seed {
                 slot,
@@ -566,7 +637,7 @@ fn case_generators_cover_every_event_and_command_variant() {
             command_slot(&seed.command(&history.state))
         })
         .collect();
-    assert_eq!(wide_commands, (0..23).collect::<Vec<_>>());
+    assert_eq!(wide_commands, (0..26).collect::<Vec<_>>());
 }
 
 // Synthetic: a restart-style history exercising clear, retry, owner delivery
@@ -721,7 +792,7 @@ impl ExcludedReach {
 
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..36, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..41, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
@@ -739,7 +810,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
         ..Config::default()
     });
     let inputs = (
-        prop::collection::vec((0usize..23, 0u64..50, any::<bool>()), 0..80),
+        prop::collection::vec((0usize..27, 0u64..50, any::<bool>()), 0..80),
         any::<usize>(),
     );
     runner
@@ -769,7 +840,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
                 }
                 // Every command is tried at every generated reachable state, not
                 // only the randomly selected command that advanced the history.
-                for candidate in 0..23 {
+                for candidate in 0..27 {
                     let mut probe = reachable.clone();
                     let command = command_case(candidate, n, flag);
                     let result = probe.decide(&command, time());

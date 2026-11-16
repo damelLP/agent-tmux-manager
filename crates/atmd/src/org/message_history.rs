@@ -121,6 +121,9 @@ pub struct RecipientObservation {
 
 /// Pure inputs in receive/apply order. IDs live on updates, not `record`, because
 /// one applied envelope can affect an agent or several messages at once.
+// Applied embeds the event directly. Boxing it touches every test that builds
+// one; the role keys of the automatic handover took it over clippy's limit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum HistoryUpdate {
     /// Committed fact only; None advances the cursor for a skipped unknown kind.
@@ -346,6 +349,7 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::TaskReminded(_)
         | OrgEvent::TaskFlagged(_)
         | OrgEvent::TaskCostRecorded(_)
+        | OrgEvent::TaskUsageObserved(_)
         | OrgEvent::SessionSummary(_)
         | OrgEvent::ControlSent(_)
         | OrgEvent::ControlSpawned(_)
@@ -355,7 +359,13 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::DecisionResolved(_)
         | OrgEvent::DecisionOverruled(_)
         | OrgEvent::DecisionExpired { .. }
-        | OrgEvent::DecisionWithdrawn(_) => None,
+        | OrgEvent::DecisionWithdrawn(_)
+        // Audits of a handover: they name an agent and change nothing in it.
+        | OrgEvent::AgentSaveRequested { .. }
+        | OrgEvent::AgentSaved { .. }
+        // The away switch names no agent.
+        | OrgEvent::OwnerAway(_)
+        | OrgEvent::OwnerBack(_) => None,
     }
 }
 

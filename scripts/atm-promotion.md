@@ -23,6 +23,24 @@ list and lists in both revisions, so narrowing/deleting the new list cannot hide
 changes covered by the old one. A missing historical list is allowed. The tools,
 list and their tests protect themselves through `scripts/*`.
 
+Owner policy is included: `.atm/intent.md`, `.atm/rules.md`, and all nested
+`.atm/measures/*` rubric files, together with the intent parser, daemon policy
+and rule-publication modules, admission/resolution hooks, and their tests.
+Keep reviewed rubric files below `.atm/measures/`; `task.create` checks the
+owner's listed measure on each call. Mechanical judge scripts belong under
+already-protected `scripts/*`. The reporter does not execute commands, parse
+intent, or discover arbitrary command dependencies.
+
+Review this report at each integration merge and again at promotion. In
+particular, treat an intent/rule/rubric deletion or a narrowed manifest as a
+judge change, not ordinary housekeeping. Only committed net endpoint changes
+are reported; untracked/local policy edits are not covered by a Git tree diff.
+This remains detection, not write protection or authorization to change the
+owner's intent. Project intent/rubrics are owner-approved inputs; setup does
+not generate them. An owner's accepted `atm decide --rule` appends one answer
+to the requester's project rules file; its file/event-log failure contract is
+in the README's standing-rules section.
+
 ## Install and rollback
 
 These scripts are **owner-run promotion tools**, not a release downloader or a

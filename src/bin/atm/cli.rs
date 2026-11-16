@@ -10,7 +10,7 @@ use atm_core::SessionView;
 use atm_protocol::{ClientMessage, DaemonMessage};
 use atm_tmux::RealTmuxClient;
 use atm_tui::{daemon, role};
-use atmd::control::{self, resolve_pane_id, ReplyOutcome};
+use atmd::control::{resolve_pane_id, ReplyOutcome};
 
 use super::{spawn::non_empty_env, ListFormat};
 
@@ -124,16 +124,29 @@ pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// One daemon request that names a target and answers with the pane it acted on.
+async fn pane_request(method: &str, target: String) -> Result<String> {
+    let result = super::rpc::call(
+        method,
+        serde_json::json!({"target": target}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    result
+        .get("pane")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("Invalid {method} response: missing pane"))
+}
+
 pub(super) async fn cmd_kill(target: String) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    let pane_id = control::kill(&RealTmuxClient::new(), &sessions, &target).await?;
+    let pane_id = pane_request("session.kill", target).await?;
     println!("Killed {pane_id}");
     Ok(())
 }
 
 pub(super) async fn cmd_interrupt(target: String) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    let pane_id = control::interrupt(&RealTmuxClient::new(), &sessions, &target).await?;
+    let pane_id = pane_request("session.interrupt", target).await?;
     println!("Interrupted {pane_id}");
     Ok(())
 }
@@ -261,8 +274,15 @@ pub(super) async fn cmd_reply(
     yes: bool,
     no: bool,
 ) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    match control::reply(&RealTmuxClient::new(), &sessions, &target, option, yes, no).await? {
+    let result = super::rpc::call(
+        "session.reply",
+        serde_json::json!({"target":target,"option":option,"yes":yes,"no":no}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let outcome: ReplyOutcome =
+        serde_json::from_value(result).context("Invalid session.reply response")?;
+    match outcome {
         ReplyOutcome::Escape { pane } => println!("Sent Escape to {pane}"),
         ReplyOutcome::Enter { pane } => println!("Sent Enter to {pane}"),
         ReplyOutcome::Selected { pane, option } => println!("Selected option {option} on {pane}"),
@@ -271,8 +291,17 @@ pub(super) async fn cmd_reply(
 }
 
 pub(super) async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    let output = control::peek(&RealTmuxClient::new(), &sessions, &target, tail, prompt).await?;
+    let result = super::rpc::call(
+        "session.capture",
+        serde_json::json!({"target":target,"tail":tail,"prompt":prompt}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let lines = result
+        .get("lines")
+        .context("Invalid session.capture response: missing lines")?;
+    let output: Vec<String> =
+        serde_json::from_value(lines.clone()).context("Invalid session.capture response: lines")?;
     for line in output {
         println!("{line}");
     }
@@ -326,6 +355,21 @@ pub(super) async fn cmd_status() -> Result<()> {
         Err(error) => {
             parts.push("? unread".into());
             eprintln!("unread count unavailable: {error}");
+        }
+    }
+    match super::decide::pending_count().await {
+        Ok((count, away)) => {
+            if count > 0 {
+                parts.push(format!("{count} decisions"));
+            }
+            // So that a forgotten `atm back` shows in the status line.
+            if away {
+                parts.push("away".into());
+            }
+        }
+        Err(error) => {
+            parts.push("? decisions".into());
+            eprintln!("decision count unavailable: {error}");
         }
     }
     use std::io::Write;

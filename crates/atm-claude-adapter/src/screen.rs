@@ -54,15 +54,34 @@
 //! captures.
 //!
 //! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
-//! Legacy facts stay Unknown; the staged matcher accepts only the complete
-//! captured completion layout with both editor and selected command exact.
+//! Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
+//! Fullscreen also places the menu above the editor, with other matching skills
+//! and aligned wrapped descriptions. It is recognized without a startup header;
+//! its transcript tail still proves neither idle nor freshness. Both completion
+//! layouts require the editor and selected command exact before Enter. A present
+//! but invalid menu refuses staging and control, never an ordinary-editor fallback.
 //! The control observer additionally recognizes captured launch/footer modes.
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-14, U5b private tmux 100x30 capture-pane -p; sanitized.
 //! Header, bordered input and footer are found by chrome, not absolute rows.
 //! Status is the transcript tail, independent of blank spacing. Right-aligned
 //! footer notices and the deleted-text hint are not turn evidence. Separate
-//! update/focus-warning footer rows remain unsupported and return Unknown.
+//! focus-warning and unseen update rows remain unsupported and return Unknown.
+//!
+//! Captured: Claude Code 2.1.325, 2026-11-15, read-only styled tmux lead captures.
+//! A shell-count footer and the exact right-aligned native auto-update failure
+//! immediately above the upper editor border are recognized. The installed
+//! 2.1.325 bundle confirms `1 shell` / `N shells`, auto/manual mode and an optional
+//! `← for agents` before or after the count. Counts are canonical positive ASCII
+//! digits, not a fixed numeric range. Monitor mixtures, other task labels and
+//! selectors below the footer stay Unknown. The notice keeps its observed two-cell
+//! right margin relative to the border; neither its text elsewhere nor a novel
+//! notice is skipped. These forms do not change draft, turn or freshness rules.
+//! Manual-mode parsing belongs to the control consumer, so plain manual mode stays
+//! Unknown in the legacy observer; `⏸ manual mode on · N shells` counts because
+//! the pill frame is the bundle's own.
+//! Pill attributes rely on the 2.1.325 bundle's routing: with footer focus, a typed
+//! key or paste goes to the prompt, so staged-then-Enter submission still lands there.
 //!
 //! Fresh layout evidence does not establish that a particular clear completed.
 //! `/clear` remains in history after a successful clear. Consumers own temporal,
@@ -136,8 +155,8 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
 ///
 /// Requires Styled and a nonempty expected string without controls or trailing
 /// whitespace. Compares after removing trailing ASCII spaces from the draft only;
-/// leading whitespace stays exact. The known single-command completion menu also
-/// matches when both the editor draft and selected command equal expected exactly;
+/// leading whitespace stays exact. A captured completion menu matches only
+/// when both the editor draft and selected command equal expected exactly;
 /// its description is not command identity. Other differences return Some(false);
 /// unknown layouts, faint text and multiline/wrapped drafts return None. A match proves
 /// visible text only, not that Enter submits it: consumers must handle popups
@@ -153,8 +172,12 @@ pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bo
     }
     if let ScreenInput::Styled(text) = input {
         let screen = StyledScreen::parse(text).ok()?;
-        if let Some((draft, selected)) = control::completion_draft(&screen) {
-            return Some(draft == expected && selected == expected);
+        match control::completion_draft(&screen) {
+            control::CompletionDraft::Recognised { draft, selected } => {
+                return Some(draft == expected && selected == expected);
+            }
+            control::CompletionDraft::Invalid => return None,
+            control::CompletionDraft::Absent => {}
         }
     }
     let (_, draft) = inspect(input, None);
@@ -231,11 +254,9 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
         .trim()
         .split_once("  ")
         .map_or(footer.trim(), |(left, _)| left);
-    if !matches!(
-        footer,
-        "⏵⏵ auto mode on (shift+tab to cycle)"
-            | "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
-    ) {
+    if !((footer.starts_with("⏵⏵ ") && control::MODE_FOOTERS.contains(&footer))
+        || control::background_shell_footer(footer))
+    {
         return None;
     }
     editor_facts(lines, styled, header_end, before_footer)
@@ -336,10 +357,18 @@ fn editor_facts(
     } else {
         InputState::Draft
     };
+    // The captured native-update failure is a right-aligned chrome row directly
+    // above the border, not active progress. No other history row is skipped here.
+    let history_end = match lines.get(..top)?.last().zip(lines.get(top)) {
+        Some((line, border)) if auto_update_failure_notice(line, border.chars().count()) => {
+            top.saturating_sub(1)
+        }
+        _ => top,
+    };
     // Status follows the transcript, whether the input is inline or bottom-pinned.
     // Only recognized trailing chrome may be skipped, never arbitrary progress text.
     let mut history: Vec<_> = lines
-        .get(header_end.unwrap_or(0)..top)?
+        .get(header_end.unwrap_or(0)..history_end)?
         .iter()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
@@ -382,6 +411,12 @@ fn editor_facts(
     facts.dialog = DialogState::None;
     facts.fresh_editor = fresh_editor;
     Some((facts, draft.filter(|_| input == InputState::Draft)))
+}
+
+fn auto_update_failure_notice(line: &str, columns: usize) -> bool {
+    line.starts_with("  ")
+        && line.trim_start_matches(' ') == "✘ Auto-update failed · Run claude doctor"
+        && line.chars().count().checked_add(2) == Some(columns)
 }
 
 fn skip_startup_notice(history: &mut Vec<&str>) {
@@ -433,6 +468,9 @@ fn effort_status(line: &str) -> bool {
         && level.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
         && (notice.is_empty() || notice.starts_with(" · "))
 }
+
+#[cfg(test)]
+mod lead_tests;
 
 #[cfg(test)]
 mod tests {

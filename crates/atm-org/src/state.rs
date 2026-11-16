@@ -117,8 +117,10 @@ pub struct OrgState {
     agents: BTreeMap<AgentId, Agent>,
     messages: BTreeMap<MessageId, Message>,
     pub(crate) tasks: BTreeMap<u64, Task>,
+    pub(crate) costs: crate::cost::CostLedger,
     summaries: HashMap<SessionId, SessionSummary>,
     decisions: BTreeMap<DecisionId, Decision>,
+    pub(crate) owner: OwnerState,
 }
 impl OrgState {
     /// Choose an unregistered folder slug, then the first free -2, -3, ...
@@ -315,6 +317,7 @@ impl OrgState {
             OrgEvent::TaskReminded(fact) => fact.check(self)?,
             OrgEvent::TaskFlagged(fact) => fact.check(self)?,
             OrgEvent::TaskCostRecorded(fact) => fact.check(self)?,
+            OrgEvent::TaskUsageObserved(fact) => fact.check(self)?,
             OrgEvent::SessionSummary(summary) => {
                 valid_external_id("session id", summary.session_id.as_str())?;
                 if let Some(pane) = &summary.pane {
@@ -330,11 +333,19 @@ impl OrgState {
             OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
                 decision_id, by, ..
             })
-            | OrgEvent::DecisionResolved(DecisionResolution {
-                decision_id, by, ..
+            | OrgEvent::DecisionResolved(DecisionResolutionEvent {
+                resolution:
+                    DecisionResolution {
+                        decision_id, by, ..
+                    },
+                ..
             })
-            | OrgEvent::DecisionOverruled(DecisionResolution {
-                decision_id, by, ..
+            | OrgEvent::DecisionOverruled(DecisionResolutionEvent {
+                resolution:
+                    DecisionResolution {
+                        decision_id, by, ..
+                    },
+                ..
             })
             | OrgEvent::DecisionWithdrawn(DecisionWithdrawal {
                 decision_id, by, ..
@@ -344,6 +355,20 @@ impl OrgState {
             }
             OrgEvent::DecisionExpired { decision_id } => {
                 self.require_decision(decision_id)?;
+            }
+            OrgEvent::OwnerAway(OwnerAway { by, .. }) | OrgEvent::OwnerBack(OwnerBack { by }) => {
+                self.validate_address(by)?;
+            }
+            OrgEvent::AgentSaveRequested {
+                agent_id,
+                message_id,
+            }
+            | OrgEvent::AgentSaved {
+                agent_id,
+                message_id,
+            } => {
+                self.require_agent(agent_id)?;
+                self.require_message(message_id)?;
             }
         }
         Ok(())
@@ -368,6 +393,7 @@ impl OrgState {
         {
             return Err(ApplyError::DuplicateDecision(DecisionId::new(seq)));
         }
+        self.track_cost_transition(event, ts);
         match event {
             OrgEvent::ProjectRegistered { project_id, root } => {
                 self.projects.insert(
@@ -547,12 +573,16 @@ impl OrgState {
             OrgEvent::TaskReminded(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
             OrgEvent::TaskFlagged(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
             OrgEvent::TaskCostRecorded(fact) => fact.fold(self.task_mut(&fact.task_id)?),
+            OrgEvent::TaskUsageObserved(fact) => self.apply_usage(fact),
             OrgEvent::SessionSummary(summary) => {
                 self.summaries
                     .insert(summary.session_id.clone(), summary.clone());
             }
-            OrgEvent::ControlSent(_) | OrgEvent::ControlSpawned(_) | OrgEvent::ControlKilled(_) => {
-            }
+            OrgEvent::ControlSent(_)
+            | OrgEvent::ControlSpawned(_)
+            | OrgEvent::ControlKilled(_)
+            | OrgEvent::AgentSaveRequested { .. }
+            | OrgEvent::AgentSaved { .. } => {}
             OrgEvent::DecisionRequested(request) => {
                 let id = DecisionId::new(seq);
                 self.decisions
@@ -564,7 +594,8 @@ impl OrgState {
                 decision.provisional = Some(choice.clone());
                 decision.taken_at = Some(ts);
             }
-            OrgEvent::DecisionResolved(resolution) | OrgEvent::DecisionOverruled(resolution) => {
+            OrgEvent::DecisionResolved(answer) | OrgEvent::DecisionOverruled(answer) => {
+                let resolution = &answer.resolution;
                 let decision = self.decision_mut(&resolution.decision_id)?;
                 decision.close(
                     if matches!(event, OrgEvent::DecisionResolved(_)) {
@@ -585,6 +616,8 @@ impl OrgState {
                 decision.close(DecisionStatus::Withdrawn, ts);
                 decision.withdrawal = Some(withdrawal.clone());
             }
+            OrgEvent::OwnerAway(fact) => fact.fold(&mut self.owner, ts),
+            OrgEvent::OwnerBack(_) => self.owner.away_since = None,
         }
         Ok(())
     }

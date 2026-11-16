@@ -179,6 +179,30 @@ impl DaemonServer {
                     control,
                     agents_cancel.clone(),
                 );
+                // One handover service for the method and the watcher: the
+                // note at the context line and the handovers the daemon runs
+                // itself, for the agents this server runs. The watcher stops
+                // with their token.
+                let handovers = crate::org::agent_handover::Handovers::for_agents(
+                    agents.clone(),
+                    services.org.clone(),
+                    self.registry.clone(),
+                );
+                services.handovers = Some(handovers.clone());
+                crate::org::agent_auto_handover::spawn_handover_watch(
+                    handovers,
+                    agents_cancel.clone(),
+                );
+                // One scheduler, only when notes can be delivered. With valid
+                // delivery, reminders off still leaves budget deadlines running.
+                if matches!(&services.delivery_policy, Some(Ok(_))) {
+                    crate::org::task_reminder::spawn_task_reminders(
+                        services.org.clone(),
+                        self.registry.subscribe(),
+                        reminder_settings(&services),
+                        agents_cancel.clone(),
+                    );
+                }
                 services.agents = Some(agents);
                 task
             })
@@ -188,7 +212,24 @@ impl DaemonServer {
         // After control exists and before the first connection is accepted.
         let messages_cancel = CancellationToken::new();
         let messages_task = start_messages(&mut services, &messages_cancel);
+        let decisions_cancel = CancellationToken::new();
+        let decisions_task = if services.decisions.is_none() {
+            let clock = crate::org::messages::MessageClock::new(
+                tokio::time::Instant::now(),
+                chrono::Utc::now(),
+            );
+            let (decisions, task) = crate::org::decisions::spawn_decisions(
+                services.org.clone(),
+                clock,
+                decisions_cancel.clone(),
+            );
+            services.decisions = Some(decisions);
+            Some(task)
+        } else {
+            None
+        };
         let result = self.run_with_services(services).await;
+        decisions_cancel.cancel();
         // Reserved work stops at once and its cleanups run while control and
         // the organisation writer still exist; then each stage, in order and
         // by its bound (see `stop`), which logs a stage that overruns.
@@ -213,7 +254,17 @@ impl DaemonServer {
                 control.stop_reserved_work();
             }
         };
-        stop::stop_stages(stop_work, stages).await;
+        // Drain the non-input bridge alongside the existing stages, not in
+        // addition to their global shutdown budget. Accepted org work survives.
+        let drain_decisions = async {
+            if let Some(mut task) = decisions_task {
+                if timeout(stop::MESSAGES, &mut task).await.is_err() {
+                    warn!("Decision bridge did not stop by its bound; aborting it");
+                    task.abort();
+                }
+            }
+        };
+        tokio::join!(drain_decisions, stop::stop_stages(stop_work, stages));
         result
     }
 
@@ -401,6 +452,17 @@ impl DaemonServer {
     }
 }
 
+/// The reminder's settings when its notes can be delivered. Without a valid
+/// delivery policy no message runtime starts, so a reminder would be recorded
+/// and its note never typed.
+fn reminder_settings(
+    services: &methods::MethodServices,
+) -> Option<atm_org::reminder::ReminderSettings> {
+    services
+        .reminder
+        .filter(|_| matches!(services.delivery_policy, Some(Ok(_))))
+}
+
 /// Start the confirmed-message service and install its tap, unless a handle
 /// was injected (that one stays authoritative) or no delivery policy was
 /// configured (the methods then stay explicitly unavailable). An invalid
@@ -498,6 +560,27 @@ pub enum ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reminders_start_only_when_their_notes_can_be_delivered() {
+        let settings = atm_org::reminder::ReminderSettings::default();
+        let mut services = methods::MethodServices::new(crate::registry::spawn_registry());
+        let policy = || Some(Ok(atm_org::delivery::DeliveryPolicy::default()));
+
+        // Off unless the caller asks, whatever the policy.
+        assert_eq!(reminder_settings(&services), None);
+        services.delivery_policy = policy();
+        assert_eq!(reminder_settings(&services), None);
+
+        services.reminder = Some(settings);
+        assert_eq!(reminder_settings(&services), Some(settings));
+        // No message runtime starts without a policy or with an invalid one:
+        // a reminder would be recorded and its note never typed.
+        services.delivery_policy = None;
+        assert_eq!(reminder_settings(&services), None);
+        services.delivery_policy = Some(Err("invalid [delivery] settings".into()));
+        assert_eq!(reminder_settings(&services), None);
+    }
 
     #[tokio::test]
     async fn message_evidence_connections_use_enriched_services() {

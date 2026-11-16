@@ -4,8 +4,10 @@
 //! Each handler owns its parameter schema; mutation handlers must tolerate being
 //! dropped on timeout or daemon shutdown (already performed effects are not undone).
 //! Client EOF/protocol Disconnect drains accepted calls. A full socket closure
-//! drops only session.send's wait: the control actor discards pre-effect input
-//! but still finishes Enter after an already-started paste.
+//! drops send/reply/capture waits: the actor discards pre-effect input, but
+//! finishes an admitted paste and bounds reply navigation by its total deadline.
+//! It also drops handover's wait: the handover is its own task and carries on,
+//! and tells the agent's manager if it then fails.
 
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::future::Future;
@@ -28,11 +30,19 @@ pub struct MethodServices {
     pub control: Option<crate::control::service::ControlHandle>,
     /// Named-agent service; None advertises explicitly unavailable operations.
     pub agents: Option<crate::org::agents::AgentHandle>,
+    /// The handover service the server shares with its watcher; None builds
+    /// one for the method alone.
+    pub handovers: Option<crate::org::agent_handover::Handovers>,
     /// Confirmed-message service; None advertises explicitly unavailable operations.
     pub messages: Option<crate::org::messages::MessageHandle>,
+    /// Decision API and its sole restart-recoverable answer bridge.
+    pub decisions: Option<crate::org::decisions::DecisionHandle>,
     /// None leaves library callers unconfigured; the binary supplies its single
     /// config parse result. Invalid settings disable messages with that cause.
     pub delivery_policy: Option<Result<atm_org::delivery::DeliveryPolicy, String>>,
+    /// The reminder on a silent turn end; None leaves it off. Library callers
+    /// start without it, the binary supplies its `[reminder]` settings.
+    pub reminder: Option<atm_org::reminder::ReminderSettings>,
     /// The connection tap's two destinations, as one pair: the shared
     /// receipt/activity store and the history its Activity is forwarded to.
     /// The server builds both with the message runtime, before it accepts a
@@ -56,8 +66,11 @@ impl MethodServices {
             registry,
             control: None,
             agents: None,
+            handovers: None,
             messages: None,
+            decisions: None,
             delivery_policy: None,
+            reminder: None,
             message_tap: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
@@ -180,6 +193,13 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         |error| error.to_string(),
     );
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
+    let handover_org = services.org.clone();
+    crate::org::tasks::register_task_methods(&mut router, services.org.clone())?;
+    let decisions = services.decisions.unwrap_or_else(|| {
+        crate::org::decisions::DecisionHandle::disabled("decision operations are not configured")
+    });
+    crate::org::away::register_away_methods(&mut router, decisions.clone())?;
+    crate::org::decisions::register_decision_methods(&mut router, decisions)?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();
@@ -203,12 +223,18 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
     })?;
 
     register_control(&mut router, services.control)?;
-    crate::org::agents::register_agent_methods(
-        &mut router,
-        services
-            .agents
-            .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable)),
-    )?;
+    let agents = services
+        .agents
+        .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable));
+    crate::org::agents::register_agent_methods(&mut router, agents.clone())?;
+    let handovers = services.handovers.unwrap_or_else(|| {
+        crate::org::agent_handover::Handovers::for_agents(
+            agents,
+            handover_org,
+            services.registry.clone(),
+        )
+    });
+    crate::org::agent_handover::register_agent_handover_method(&mut router, handovers)?;
 
     crate::org::messages::register_message_methods(
         &mut router,
@@ -246,6 +272,35 @@ struct SendParams {
     caller_server: Option<String>,
     target: String,
     text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaneParams {
+    caller_server: Option<String>,
+    target: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyParams {
+    caller_server: Option<String>,
+    target: String,
+    option: Option<usize>,
+    #[serde(default)]
+    yes: bool,
+    #[serde(default)]
+    no: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureParams {
+    caller_server: Option<String>,
+    target: String,
+    tail: Option<usize>,
+    #[serde(default)]
+    prompt: bool,
 }
 
 #[derive(Deserialize)]
@@ -338,6 +393,83 @@ fn register_control(
             }
         },
     )?;
+    let kill = control.clone();
+    router.register(
+        "session.kill",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = kill.clone();
+            async move {
+                let p: PaneParams = parse_params(params)?;
+                let pane = require_control(control, caller, p.caller_server)?
+                    .kill(p.target)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"pane": pane}))
+            }
+        },
+    )?;
+    let interrupt = control.clone();
+    router.register(
+        "session.interrupt",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = interrupt.clone();
+            async move {
+                let p: PaneParams = parse_params(params)?;
+                let pane = require_control(control, caller, p.caller_server)?
+                    .interrupt(p.target)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"pane": pane}))
+            }
+        },
+    )?;
+    let reply = control.clone();
+    router.register(
+        "session.reply",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = reply.clone();
+            async move {
+                let p: ReplyParams = parse_params(params)?;
+                if p.option.is_some_and(|option| option > 99) {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "option must be at most 99",
+                    ));
+                }
+                if (p.yes && p.no) || (p.option.is_some() && (p.yes || p.no)) {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "choose at most one of option, yes or no",
+                    ));
+                }
+                let result = require_control(control, caller, p.caller_server)?
+                    .reply(p.target, p.option, p.yes, p.no)
+                    .await
+                    .map_err(control_error)?;
+                serde_json::to_value(result)
+                    .map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))
+            }
+        },
+    )?;
+    let capture = control.clone();
+    router.register(
+        "session.capture",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = capture.clone();
+            async move {
+                let p: CaptureParams = parse_params(params)?;
+                let lines = require_control(control, caller, p.caller_server)?
+                    .capture(p.target, p.tail, p.prompt)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"lines": lines}))
+            }
+        },
+    )?;
     let prepare = control.clone();
     router.register("session.spawn_prepare", Duration::from_secs(35), move |caller, params| {
         let control = prepare.clone();
@@ -426,6 +558,171 @@ mod tests {
         services.control = Some(control.clone());
         services.org = org;
         (router(services).unwrap(), mock, cancel, task, control)
+    }
+
+    #[tokio::test]
+    async fn reply_accepts_option_99_but_refuses_100_before_control_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+        let (router, mock, cancel, task, _) = control_router(org).await;
+        mock.set_pane_content("%7", vec!["❯ 98. previous".into(), "  99. chosen".into()]);
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.reply",
+                    json!({"target":"%7","option":99})
+                )
+                .await
+                .unwrap(),
+            json!({"action":"selected","pane":"%7","option":99})
+        );
+        assert!(mock.calls().ends_with(&[
+            atm_tmux::mock::MockCall::SendKeys {
+                pane: "%7".into(),
+                keys: "Down".into()
+            },
+            atm_tmux::mock::MockCall::SendKeys {
+                pane: "%7".into(),
+                keys: "Enter".into()
+            },
+        ]));
+        mock.clear_calls();
+        let error = router
+            .call(
+                context(),
+                "session.reply",
+                json!({"target":"%7","option":100}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, error_code::INVALID_PARAMS);
+        assert_eq!(error.0.message, "option must be at most 99");
+        assert!(
+            mock.calls().is_empty(),
+            "invalid options must not enter the actor"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn reply_and_capture_keep_legacy_results_and_only_reply_is_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+        let (router, mock, cancel, task, control) = control_router(org.clone()).await;
+        mock.set_pane_content(
+            "%7",
+            vec![
+                "earlier".into(),
+                "Choose café?".into(),
+                "❯ 1. Sí".into(),
+                "  2. No".into(),
+                "Enter to select".into(),
+                "".into(),
+            ],
+        );
+        for (params, expected) in [
+            (
+                json!({"target":"audit"}),
+                json!({"action":"enter","pane":"%7"}),
+            ),
+            (
+                json!({"target":"%7","yes":true}),
+                json!({"action":"enter","pane":"%7"}),
+            ),
+            (
+                json!({"target":"%7","no":true}),
+                json!({"action":"escape","pane":"%7"}),
+            ),
+            (
+                json!({"target":"%7","option":2}),
+                json!({"action":"selected","pane":"%7","option":2}),
+            ),
+        ] {
+            assert_eq!(
+                router
+                    .call(context(), "session.reply", params)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.capture",
+                    json!({"target":"audit","tail":0})
+                )
+                .await
+                .unwrap(),
+            json!({"lines":[]})
+        );
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.capture",
+                    json!({"target":"%7","tail":0,"prompt":true})
+                )
+                .await
+                .unwrap(),
+            json!({"lines":["Choose café?","❯ 1. Sí","  2. No","Enter to select"]})
+        );
+        assert_eq!(
+            router
+                .call(context(), "session.capture", json!({"target":"%7"}))
+                .await
+                .unwrap(),
+            json!({"lines":["earlier","Choose café?","❯ 1. Sí","  2. No","Enter to select",""]})
+        );
+        for (method, params) in [
+            ("session.reply", json!({"target":"%7","yes":true,"no":true})),
+            (
+                "session.reply",
+                json!({"target":"%7","yes":true,"option":2}),
+            ),
+            ("session.reply", json!({"target":"%7","option":-1})),
+            ("session.reply", json!({"target":"%7","extra":true})),
+            ("session.capture", json!({"target":"%7","tail":-1})),
+            ("session.capture", json!({"target":"%7","prompt":"yes"})),
+            ("session.capture", json!({"target":"%7","extra":true})),
+        ] {
+            assert_eq!(
+                router
+                    .call(context(), method, params)
+                    .await
+                    .unwrap_err()
+                    .0
+                    .code,
+                error_code::INVALID_PARAMS
+            );
+        }
+        for method in ["session.reply", "session.capture"] {
+            let error = router
+                .call(context(), method, json!({"target":"missing"}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.0.code, error_code::NOT_FOUND);
+            assert_eq!(error.0.message, "No session matching 'missing'");
+        }
+        control.flush_audits().await;
+        let records = org.tail(crate::org::TailParams::default()).await.unwrap();
+        assert_eq!(records.len(), 4, "read-only capture must not flood the log");
+        for record in records {
+            assert_eq!(record.kind, "control.sent");
+            assert_eq!(
+                record.body,
+                json!({"pane":"%7","action":{"method":"session.reply","outcome":"ok","error":null,"client_id":"client","from_pane":"%12"}})
+            );
+        }
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
     }
 
     async fn successful_control_actions(router: &MethodRouter) {
@@ -710,6 +1007,64 @@ mod tests {
             assert_eq!(error.0.code, "unavailable");
             assert_eq!(error.0.message, message);
         }
+    }
+
+    #[tokio::test]
+    async fn kill_and_interrupt_reach_the_actor_and_a_clear_refuses_only_the_interrupt() {
+        use crate::control::reservation::{
+            PaneId, ReservationError, ReservationKind, ReservationRequest, WaitPolicy,
+        };
+        use atm_tmux::mock::MockCall;
+        let (router, mock, cancel, task, control) =
+            control_router(crate::org::OrgHandle::disabled("pane request router test")).await;
+        let call = |method: &'static str| router.call(context(), method, json!({"target":"audit"}));
+        assert_eq!(
+            call("session.interrupt").await.unwrap(),
+            json!({"pane":"%7"})
+        );
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let clear = tokio::spawn(async move {
+            control
+                .run_reserved(
+                    ReservationRequest::new(
+                        "project/lead".parse().unwrap(),
+                        Some(PaneId::parse("%7").unwrap()),
+                        ReservationKind::Clear,
+                        WaitPolicy::Wait,
+                        tokio::time::Instant::now() + Duration::from_secs(60),
+                    ),
+                    move |_| async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        Ok::<_, ReservationError>(())
+                    },
+                    |_, _| async { Ok(()) },
+                )
+                .await
+        });
+        entry.await.unwrap();
+        let error = call("session.interrupt").await.unwrap_err();
+        assert_eq!(error.0.code, "refused");
+        assert_eq!(
+            error.0.message,
+            "Refusing to interrupt %7: agent project/lead is clearing; try again in a moment"
+        );
+        assert_eq!(call("session.kill").await.unwrap(), json!({"pane":"%7"}));
+        release.send(()).unwrap();
+        clear.await.unwrap().unwrap();
+        let effects: Vec<_> = mock
+            .calls()
+            .into_iter()
+            .filter(|call| !matches!(call, MockCall::RawCommand { .. }))
+            .collect();
+        assert!(
+            matches!(effects.as_slice(), [MockCall::SendKeys { pane, keys }, MockCall::KillPane { pane: killed }]
+                if pane == "%7" && keys == "C-c" && killed == "%7"),
+            "{effects:?}"
+        );
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test]

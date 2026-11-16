@@ -267,6 +267,140 @@ unset ATM_SOCKET to use a default.
 
 ## Controls and fidelity
 
+### One-shot paste refusal (synthetic)
+
+Use the existing private control/event stream, not editor text:
+
+```rust,ignore
+rig.control(&pane, serde_json::json!({"command": "refuse_next_paste"}));
+let after = rig.event_cursor(&pane);
+rig.paste(&pane, "this input is not taken");
+rig.wait_event(&pane, after, |e| e["kind"] == "rejected"
+    && e["reason"] == "refuse_next_paste");
+```
+
+The arm acknowledgment precedes the action; the `rejected` event (with `text`)
+proves the entire next bracketed paste was consumed without entering the editor,
+model, queue, slash commands or dialog selection. Fragmented/multiline input is
+one paste. Its immediately following Enter is swallowed so an older draft is not
+submitted; the draft is preserved. New ordinary typing or another paste resumes
+normal input. Cursor reports, control messages, arrow keys and lone Escape do not consume that Enter.
+Ordinary typing/CLI prompts do not consume the arm. A duplicate arm, an unfinished
+paste/escape sequence, or a refusal still awaiting its Enter rejects arming without
+changing the existing input/arm. The next paste after the rejected submission is
+normal. No fake dialog or readiness frame is drawn.
+
+This is **harness non-acceptance after tmux pasted bytes**, not proof that the
+sender sent nothing. It cannot justify a known-zero-effect automatic retry or
+unignore `message_delivery::safe_retry_after_known_zero_effect`.
+
+### Releasable hook hold (synthetic)
+
+The same channel holds hooks without holding model time, terminal rendering or
+control processing. Arm only one gate per process:
+
+- `{"command":"hold_next_hook"}` holds the next emitted lifecycle hook.
+- `{"command":"hold_next_hook","event":"Stop"}` holds the next matching hook.
+  Names are case-sensitive and must exist in this mode's captured templates;
+  omission/JSON null means literally next. For pi's actual end use `agent_end`,
+  or omit `event` to hold both completion hooks in order.
+- A `kind=held` runtime event, with `event` and the exact `data`, is the fence that
+  the hook was withheld, **not** sent. It keeps its original session ID. Every
+  later lifecycle hook is also held in emission order, including across clear.
+  Thus pi's `agent_end` cannot overtake a held `turn_end`. Status payloads are
+  independent: neither held nor a consumer of the arm. Claude statuses can therefore
+  precede a held Stop or a new session's held SessionStart.
+- `{"command":"release_hook"}` forwards the buffered hooks exactly once, in
+  order, through the normal hook/replay path, then acknowledges the control.
+  It disarms the gate; later hooks flow normally. An acknowledgment is still only
+  completed forwarding attempts, not daemon receipt: await the daemon row/event
+  when receipt matters. A held shutdown also defers process exit until release,
+  keeping this control stream usable; exit otherwise behaves as before. An unfired
+  literal-next arm also holds `/atm/exit`'s SessionEnd/session_shutdown: use a named
+  completion arm instead, or await that shutdown's `held` event and `release_hook`
+  before `wait_for_shell`. Closing the pane (stdin EOF) or terminating the process
+  with a signal drops held hooks and any queued shutdown hook; none are replayed.
+- A duplicate arm (armed or holding), unknown/malformed name, or release with no
+  captured hook returns a control error without overwriting the gate/draft.
+  Release while only armed does not cancel that arm. Existing `/atm/drop-next`
+  takes precedence: a dropped hook neither consumes the hold nor reappears on
+  release, including when another hook is already held.
+
+For a late end, start a turn on manual time and await its Working row, then:
+
+```rust,ignore
+// Claude/Codex: optionally add "event": "Stop"; pi: omit it to hold both ends.
+rig.control(&pane, serde_json::json!({"command": "hold_next_hook"}));
+let after = rig.event_cursor(&pane);
+rig.control(&pane, serde_json::json!({"command": "advance_to", "now_ms": 500}));
+rig.wait_event(&pane, after, |e| e["kind"] == "held");
+rig.wait_event(&pane, after, |e| e["kind"] == "rendered" && e["state"] == "idle");
+// The editor looks idle but the completion hook has not been forwarded.
+rig.control(&pane, serde_json::json!({"command": "release_hook"}));
+rig.wait_for_row(&pane, |r| r.status == atm_core::SessionStatus::Idle);
+```
+
+Here `500` is the default `work_ms` from an initial manual clock of zero; use the
+turn's actual deadline if the test has advanced it. This is synthetic fault
+injection, not a claim about vendor hook scheduling. No sleeps are needed.
+
+### Next context share (synthetic)
+
+`{"command":"set_context_share","percent":40}` on the same duplex channel
+acknowledges a **one-shot** setting for the next generated context-bearing
+payload. It does not send a payload, advance time, end a turn or redraw. `percent`
+is a finite JSON number from 0 through 100 inclusive; booleans, null, missing,
+strings and out-of-range values return a control error without changing a pending
+setting/draft. Another valid setting replaces an unused setting. Tokens round to
+the nearest integer (ties to even); fractional shares can differ by half a token
+from the requested value. Unconfigured payloads and captured templates are unchanged.
+
+| Mode | Next eligible report | Fields changed / window |
+|---|---|---|
+| Claude | Next automatic status or `/atm/status [ID]` | `context_window.used_percentage`, `remaining_percentage`, `current_usage.input_tokens` with other current/cache fields zero, and matching one-request totals; captured `context_window_size` is 1000000 |
+| pi | Next usage-bearing `turn_end` envelope, including abort | `usage.contextTokens` over captured `model.contextWindow` 272000; cost/session-token snapshot stays unchanged |
+| Codex | Next non-ending lifecycle hook | Its `transcript_path` points to a new private JSONL `event_msg`/`token_count` record: `info.last_token_usage.total_tokens` and matching `total_token_usage.total_tokens`, over `model_context_window` 258400 |
+
+Claude's daemon adapter **calculates** context from current input/cache tokens;
+changing `used_percentage` alone would not move its line. Codex has no usage/status
+hook field, and the daemon skips transcript usage at `SessionEnd`, so that event
+does not consume the setting. Each synthetic Codex record is written before its
+referencing hook is forwarded, at a unique process/session/sequence path inside
+the rig root. Later settings never overwrite that file, including for held hooks.
+A subsequent unconfigured Codex hook reports no new usage, so the daemon keeps
+its last known share; use another setting (including zero) and a non-ending hook
+to reset it. Claude/pi return to their captured payload values after consumption.
+Real Codex reuses one rollout per session; this synthetic control switches paths,
+and unconfigured hooks reference an absent fixture transcript instead of rereading it.
+Synthetic pi `contextTokens` can exceed the unchanged session-token total; this
+control injects a context line, not internally consistent usage accounting.
+
+Consumption is at **generation**, not receipt: a dropped report consumes the
+setting; a held report keeps its generated value even if a new setting is armed
+before release. Ordinary non-usage pi events do not consume it. A pending setting
+is not a lifecycle end or a readiness signal. Await the real daemon row for the
+reported share; its control acknowledgment alone is not proof of receipt:
+
+```rust,ignore
+// After starting a manual-clock turn and awaiting its Working row:
+rig.control(&pane, serde_json::json!({"command":"set_context_share", "percent":40}));
+rig.control(&pane, serde_json::json!({"command":"advance_to", "now_ms":500}));
+rig.wait_for_row(&pane, |r| r.status == atm_core::SessionStatus::Idle
+    && (r.context_percentage - 40.0).abs() < 1e-6);
+```
+
+As above, use the actual work deadline rather than 500 if time already advanced.
+Use a tolerance: the daemon computes an f64 quotient, so even an integer share
+such as 58 can be reported as 57.99999999999999 rather than exactly 58.0.
+**Synthetic:** context counts/percentages and the Codex rollout composition are
+fault-injection values, not captured usage measurements. Codex's record shape and
+258400 capacity reuse the captured `codex_rollout_tokens_0.163.0.jsonl` documented
+by `atm-codex-adapter`, composed here with the stand-in's 0.167.0 hook templates;
+this is not a claim of a new Codex capture. No cost, terminal capture or production
+parser is changed.
+
+### Lifecycle fidelity
+
 | Mode | Startup | Prompt / completion | Clear | Interrupt |
 |---|---|---|---|---|
 | Claude | SessionStart + status | UserPromptSubmit / Stop + status | `/clear`: SessionEnd, gap, new SessionStart(source=clear) + status | no ending hook; restores interrupted prompt as draft |
@@ -342,10 +476,11 @@ are synthetic, not a complete vendor TUI.
 
 ## Captured screens and optional dialogs
 
-The runtime renders `screens.json`'s 76 source variants through the pure
+The runtime renders `screens.json`'s 78 source variants through the pure
 `screens.py` renderer and `scene.py` lifecycle mapping. Sources reuse adapter plain
-captures, 20 U5b SGR/cursor pairs, and 16 sanitized P1 captures (provenance in
-`fixtures/screens/README.md`). No runtime ID or diagnostic status text is visible.
+captures, 20 U5b SGR/cursor pairs, 16 sanitized P1 captures (provenance in
+`fixtures/screens/README.md`), and two Claude lead-shell styled/plain excerpts
+(provenance in the Claude adapter fixture README). No runtime ID or diagnostic status text is visible.
 `frame` records the model's fresh, working, idle after a turn, clearing,
 clear-complete, interrupted and modal phases; `source` identifies the actual
 capture chosen, including draft/completion-menu substitutions. Claude clear shows the real SessionEnd hook spinner;
@@ -425,8 +560,8 @@ No frame/ready event is emitted after exit. Codex hook-review Esc and permission
 Pure source/scene/key tests run through the Cargo Python contract; private tmux
 integration tests cover native fresh replay, modal keys and retained shells.
 `stand_in_screens` calls all three real adapters, not copied parsers. It compares
-all 76 sources through private tmux with independent source text and pinned legacy
-`observe_screen` facts; 20 styled pairs compare dim/reverse attributes and cursor-space cells,
+all 78 sources through private tmux with independent source text and pinned legacy
+`observe_screen` facts; 22 styled pairs compare dim/reverse attributes and cursor-space cells,
 allowing tmux to normalize SGR encodings. Separate key-driven tests cover drafts,
 working/idle, each clear phase, repeated identical clear snapshots, interruptions,
 actual retained shells, trust, update, hook review/list, worktree and permission.

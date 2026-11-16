@@ -651,6 +651,38 @@ async fn daemon_errors_never_retry_or_fall_back() {
     }
 }
 
+// Swallowing the send error or resubmitting after it must fail this contract.
+#[tokio::test]
+async fn discovery_identity_refusal_is_loud_and_never_retries() {
+    let diagnostic = "agent p/worker has a discovered process but its recorded session is not confirmed; message not queued; inspect atm list and atm agent list before retrying";
+    for pane in [None, Some("%7")] {
+        for format in ["text", "json"] {
+            let out = run(
+                &[
+                    "msg", "send", "--to", "p/worker", "--body", "brief", "--format", format,
+                ],
+                pane,
+                vec![Step {
+                    method: "msg.send",
+                    params: send("p/worker", "brief"),
+                    payload: json!({"error":{"code":"refused","message":diagnostic}}),
+                }],
+                false,
+            )
+            .await;
+            assert_eq!(out.status.code(), Some(1));
+            assert!(
+                out.stdout.is_empty(),
+                "no queued success or message id: {out:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(diagnostic),
+                "{out:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn old_daemon_is_rejected_before_sending_a_request() {
     let out = run(

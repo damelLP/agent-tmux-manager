@@ -1,0 +1,10 @@
+{"seq":1,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"p","root":"/project"}}
+{"seq":2,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"p/build","pane":"%1","session_id":"s"}}
+{"seq":3,"ts":"2026-01-01T00:00:00Z","kind":"task.created","body":{"title":"work","kind":"work","creator":"owner","measure":{"kind":"owner"},"files":[]}}
+{"seq":4,"ts":"2026-01-01T00:00:01Z","kind":"task.assigned","body":{"task_id":"t3","agent_id":"p/build","by":"owner"}}
+{"seq":5,"ts":"2026-01-01T00:00:02Z","kind":"task.usage_observed","body":{"session_id":"s","task_id":"t3","turn":true,"cumulative_cost":{"microdollars":100000},"context_percent":40}}
+{"seq":6,"ts":"2026-01-01T00:00:03Z","kind":"task.usage_observed","body":{"session_id":"s","task_id":"t3","turn":false,"cumulative_cost":{"microdollars":125000},"context_percent":70}}
+{"seq":7,"ts":"2026-01-01T00:00:04Z","kind":"task.submitted","body":{"task_id":"t3","what":"result","files":[],"by":"p/build"}}
+{"seq":8,"ts":"2026-01-01T00:00:05Z","kind":"task.verdict","body":{"task_id":"t3","verdict":"accepted","review_task":null,"note":null,"by":"owner"}}
+{"seq":9,"ts":"2026-01-01T00:00:05Z","kind":"task.cost_recorded","body":{"task_id":"t3","record":{"turns":1,"review_rounds":0,"changes_requested":0,"cost":{"microdollars":25000},"peak_context_percent":70,"seconds_in_state":{"open":1,"assigned":3,"submitted":1}}}}
+{"seq":10,"ts":"2026-01-01T00:00:05Z","kind":"future.unknown","body":["not a body today"]}

@@ -86,11 +86,24 @@ pub enum OrgCommand {
         message_ids: Vec<MessageId>,
     },
     Task(TaskCommand),
+    ObserveTaskUsage(TaskUsageObservation),
     RecordSummary(SessionSummary),
     ControlSent(ControlAudit),
     ControlSpawned(ControlAudit),
     ControlKilled(ControlAudit),
     Decision(DecisionCommand),
+    /// The away switch, and the away table applied to one pending decision.
+    Owner(OwnerCommand),
+    /// Audit: a handover asked the agent to save with this message.
+    SaveRequested {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
+    /// Audit: the agent's save turn ended with its memory file changed.
+    Saved {
+        agent_id: AgentId,
+        message_id: MessageId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -132,6 +145,8 @@ pub enum Refusal {
     InvalidValue { field: &'static str, reason: String },
     #[error(transparent)]
     Decision(#[from] DecisionRefusal),
+    #[error(transparent)]
+    Away(#[from] AwayRefusal),
 }
 
 impl OrgCommand {
@@ -197,11 +212,27 @@ impl OrgCommand {
             },
             Self::ReadMessages { message_ids, .. } => OrgEvent::MessageRead { message_ids },
             Self::Task(command) => command.event(),
+            Self::ObserveTaskUsage(input) => input.event(None),
             Self::RecordSummary(summary) => OrgEvent::SessionSummary(summary),
             Self::ControlSent(audit) => OrgEvent::ControlSent(audit),
             Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
             Self::ControlKilled(audit) => OrgEvent::ControlKilled(audit),
             Self::Decision(command) => command.event(),
+            Self::Owner(command) => command.event(),
+            Self::SaveRequested {
+                agent_id,
+                message_id,
+            } => OrgEvent::AgentSaveRequested {
+                agent_id,
+                message_id,
+            },
+            Self::Saved {
+                agent_id,
+                message_id,
+            } => OrgEvent::AgentSaved {
+                agent_id,
+                message_id,
+            },
         }
     }
 }
@@ -428,6 +459,7 @@ impl OrgState {
                 unread
             }
             OrgCommand::Task(command) => return self.decide_task(command, event),
+            OrgCommand::ObserveTaskUsage(input) => return self.decide_usage(input),
             OrgCommand::RecordSummary(summary) => {
                 self.session_summary(&summary.session_id) != Some(summary)
             }
@@ -438,6 +470,19 @@ impl OrgState {
                 true
             }
             OrgCommand::Decision(command) => return self.decide_decision(command, event, now),
+            OrgCommand::Owner(command) => return self.decide_owner(command, event, now),
+            OrgCommand::SaveRequested {
+                agent_id,
+                message_id,
+            }
+            | OrgCommand::Saved {
+                agent_id,
+                message_id,
+            } => {
+                self.require_agent(agent_id)?;
+                self.require_message(message_id)?;
+                true
+            }
         };
         Ok(if changed { vec![event] } else { vec![] })
     }

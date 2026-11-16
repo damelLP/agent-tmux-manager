@@ -106,6 +106,18 @@ fn extract_context_usage(messages: Option<&Value>) -> (Option<u64>, Option<f64>)
 }
 
 impl RawPiEvent {
+    /// Cumulative accounting only; the legacy context-message fallback is one
+    /// request's cost, not a session total. Leave cockpit compatibility intact.
+    /// Captured: pi 0.73.1, 2026-10-24, pi_session_cost fixture/socket tap.
+    #[must_use]
+    pub fn accounting_usage(&self) -> Option<LifecycleEvent> {
+        self.usage?;
+        match self.to_lifecycle_event()? {
+            event @ LifecycleEvent::ContextUpdate { .. } => Some(event),
+            _ => None,
+        }
+    }
+
     /// Complete translation: the original event, then any derived metadata.
     /// Only the first event is genuine activity; later events update registry
     /// metadata without entering message-delivery evidence. Never resurrect a
@@ -302,6 +314,14 @@ impl RawPiEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_per_request_usage_is_not_a_cumulative_accounting_sample() {
+        // Synthetic: old extension frame, deliberately without the usage snapshot.
+        let raw: crate::RawPiEvent = serde_json::from_value(serde_json::json!({"event":"context", "payload":{"messages":[{"role":"assistant","usage":{"totalTokens":10,"cost":{"total":0.5}}}]}})).unwrap();
+        assert!(raw.to_lifecycle_event().is_some());
+        assert!(raw.accounting_usage().is_none());
+    }
+
     use super::*;
     use crate::wire::{PiModel, PiPayload};
 
@@ -996,6 +1016,92 @@ mod tests {
                 reason: Some("quit".into())
             })
         );
+    }
+
+    #[test]
+    fn empty_context_bodies_keep_captured_usage_and_identity() {
+        // Synthetic: remove only context/turn_end bodies from the real capture.
+        // Captured: pi 0.73.1, 2026-10-24, private TUI socket tap and local
+        // fake provider; see the crate docs. The envelope is unchanged.
+        let mut samples = Vec::new();
+        for line in include_str!("../tests/fixtures/pi_session_cost_0.73.1.jsonl").lines() {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            let mut data = envelope["data"].clone();
+            if !matches!(data["event"].as_str(), Some("context" | "turn_end")) {
+                continue;
+            }
+            data["payload"] = serde_json::json!({});
+            let raw = frame(data);
+            assert_eq!(
+                raw.session_id.as_deref(),
+                Some("01a16f5b-6c34-7238-80bd-c31c15009fe9")
+            );
+            assert_eq!(raw.pid, Some(1_613_778));
+            assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
+            let events = raw.to_lifecycle_events();
+            let [LifecycleEvent::ContextUpdate {
+                tokens,
+                current_tokens,
+                context_window_size,
+                cost_usd,
+            }, model] = events.as_slice()
+            else {
+                panic!("expected usage and model, got {events:?}");
+            };
+            assert_eq!(
+                model,
+                &LifecycleEvent::ProviderModelChange {
+                    provider: Some("atmfake".into()),
+                    model: Some("fake-b".into()),
+                }
+            );
+            samples.push((*tokens, *current_tokens, *context_window_size, *cost_usd));
+        }
+        assert_eq!(
+            samples,
+            [
+                (Some(0), Some(6), Some(32_000), Some(0.0)),
+                (Some(1020), Some(1025), Some(32_000), Some(0.0033)),
+                (Some(1020), Some(1025), Some(32_000), Some(0.0033)),
+                (Some(2225), Some(1205), Some(32_000), Some(0.006975)),
+                (Some(2225), Some(1207), Some(32_000), Some(0.006975)),
+                (Some(3430), Some(1205), Some(32_000), Some(0.01065)),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_agent_end_bodies_keep_captured_working_end() {
+        // Synthetic: thin agent_end bodies only; the rest is a real capture.
+        // Captured: pi 0.73.1, 2026-10-24, same method as the test above.
+        let mut ends = 0;
+        for line in include_str!("../tests/fixtures/pi_session_cost_0.73.1.jsonl").lines() {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            let mut data = envelope["data"].clone();
+            if data["event"] != "agent_end" {
+                continue;
+            }
+            data["payload"] = serde_json::json!({});
+            let raw = frame(data);
+            assert_eq!(
+                raw.to_lifecycle_events(),
+                [
+                    LifecycleEvent::WorkingEnd,
+                    LifecycleEvent::ProviderModelChange {
+                        provider: Some("atmfake".into()),
+                        model: Some("fake-b".into()),
+                    },
+                ]
+            );
+            assert_eq!(
+                raw.session_id.as_deref(),
+                Some("01a16f5b-6c34-7238-80bd-c31c15009fe9")
+            );
+            assert_eq!(raw.pid, Some(1_613_778));
+            assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
+            ends += 1;
+        }
+        assert_eq!(ends, 2);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-handover-invalid-timeout","method":"agent.handover","params":{"agent":"project/lead","timeout_ms":29999}},
+  "response": {"type":"response","id":"agent-handover-invalid-timeout","error":{"code":"invalid_params","message":"invalid agent parameters: timeout_ms must be in 30000..=1800000"}},
+  "ignore": []
+}

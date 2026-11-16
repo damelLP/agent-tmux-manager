@@ -1,5 +1,40 @@
 # Claude screen fixtures
 
+## Above-editor completion without a startup header (stage 1)
+
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
+
+`screen_styled_s1_clear-<state>_2.1.325.txt` retains actual tmux 3.8
+`capture-pane -p -e -N` rows, attributes and allocated grid padding. The source
+mapping is:
+
+| State | Sealed source | Shape |
+|---|---|---|
+| `multi-wrapped` | `canonical-long/multi-native-116x12-clear.styled-N` | Clipped long skill label and wrapped descriptions, no complete startup header |
+| `single` | `attempt-3/single-native-116x14-clear.styled-N` | One match, no complete startup header |
+| `multi-80` | `attempt-3/multi-native-80x14-clear.styled-N` | Narrow multi-match viewport |
+| `multi-160` | `attempt-3/multi-native-160x14-clear.styled-N` | Wide multi-match viewport |
+| `multi-header` | `attempt-3/multi-native-116x32-clear.styled-N` | Complete startup header still visible |
+| `multi-drawn` | `attempt-3/multi-drawn-116x14-clear.styled-N` | Drawn inverse cursor rather than native cursor |
+
+The private HOME contained neutral local skills, a static colored statusLine,
+and no real credentials/hooks. The private tmux server ran in a loopback-only
+network namespace without routes, with fake credentials and a non-listening
+loopback API URL. `/clear` was pasted but never submitted; no prompt or model
+turn ran. Only private cwd run-root prefixes become equal-width generic
+`/tmp/xxx…` paths; every other captured byte is unchanged apart from the
+provenance line, which tests remove. No owner capture is included.
+
+The explicit completion reader now recognizes the complete adjacent menu
+above the editor, including unselected skills and aligned continuations,
+without a startup header. Exact staging requires both the active draft and
+selected command to equal the expected text. An invalid completion never
+falls back to the ordinary staged reader, even with a header. The menu tail
+is still not idle/freshness evidence: ordinary facts stay Draft/Unknown.
+Synthetic malformed-frame/selection/style, header and Insight variations
+are marked in the tests. The older below-editor single-item grammar stays
+supported; unsupported layouts are not inferred safe.
+
 ## Custom statusLine region (stage 1)
 
 Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e, custom statusLine.
@@ -48,8 +83,10 @@ Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, cu
 In these real fullscreen frames the selected slash menu is **above the upper
 editor rule**; the status row remains below the lower rule, and the normal
 auto-mode footer stays. The 80-column description is truncated, while the
-116-column description wraps. The ordinary staged/control readers already
-recognize the editor exactly; the older below-editor completion grammar is
+116-column description wraps. The ordinary staged/control fallback recognized these complete-header
+captures, but failed once the header was out of view and the menu obscured
+idle evidence. The explicit completion reader above now handles that case
+and validates the selected command too; the older below-editor grammar is
 unchanged. Tests also remove only the status row in a labelled Synthetic twin.
 
 `screen_styled_s1_status-color-{88,160}_2.1.325.txt` maps to
@@ -395,9 +432,40 @@ All tests are pure, with no waits or terminal operations.
   supplied text, not protection in the real capture pipeline. Styled capture
   with `-N` is deferred to U8d; no plain-text fix is claimed here.
 - **F9:** permission recognition still requires the captured Bash auto-mode
-  ask-rule wording. Editor footer modes other than auto (accept-edits, plan,
-  bypass-permissions, shortcut-only, background shell/agents) remain Unknown.
+  ask-rule wording. Accept-edits, plan, bypass-permissions, shortcut-only,
+  monitor/mixed task pills and agent selectors remain unsupported. The legacy
+  observer still refuses an unadorned manual-mode editor; the control observer
+  supports its captured manual-mode forms. The verified shell-count footer
+  described below is supported in auto and manual modes.
   Configuration-specific dialogs need more real captures before generalizing.
 
 The unit adds no RPC method. These capture tables and synthetic refusals are
 parser conformance coverage; launch/clear constants have exact policy tests.
+
+## Lead shell-count footer and native update-failure notice
+
+Captured: Claude Code 2.1.325, 2026-11-15, read-only tmux `capture-pane -e -N -p`
+from a working and an idle lead pane at 144x80. The `screen_styled_lead-{idle,working}-shells_2.1.325.txt`
+fixtures retain the original 144x80 geometry and final seven rows: real turn
+status, right-aligned update notice, both editor borders/input, custom status
+slot and shell-count footer. Earlier transcript rows were blanked; the
+identifying status prefix was replaced with `[fixture]`, leaving its remaining
+values/styles intact. Their
+`screen_claude-lead-*-shells_2.1.325.txt` companions represent plain `-p`
+capture by removing SGR and trailing ASCII padding only (never NBSP).
+
+The idle count was 15 shells, the working count 14. Read-only inspection of the
+installed 2.1.325 bundle confirmed the shell-only task pill uses `1 shell` or
+`N shells`, and that the shared auto/manual mode component can combine with
+an agents hint before or after that pill. The native installation-failure
+notice is exactly `✘ Auto-update failed · Run claude doctor`. It is accepted
+only in its captured immediately-pre-border row with a two-cell right margin,
+not as arbitrary transcript/progress text. Value/layout mutations in
+`screen/lead_tests.rs` are explicitly synthetic. Other task labels, monitor
+mixtures, management hints and selectors below the footer stay unsupported;
+the older full coordinator-selector fixture remains Unknown.
+
+The shared stand-in replays both sanitized sources at their original 144x80.
+Its shell counts are replayed UI values,
+not a claim that it spawned those background jobs. Native-geometry delivery
+and restart tests use the real private daemon and never invoke a model CLI.

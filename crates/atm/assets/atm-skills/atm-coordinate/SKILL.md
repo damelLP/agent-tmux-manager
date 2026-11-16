@@ -7,6 +7,10 @@ disable-model-invocation: true
 
 # atm coordinator
 
+**Legacy unnamed-pane workflow.** For a bound named lead use
+[atm-lead](../atm-lead/SKILL.md) instead; do not mix its durable task/message
+protocol with this pane-driven loop. Both skills remain installed.
+
 You coordinate implementer agents that run in other tmux panes. You and the
 user split the work into tasks. You send each task to an implementer, wait for
 it, read its report and review the work. Do all of it through `atm`. When atm

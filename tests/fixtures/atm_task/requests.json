@@ -1,0 +1,20 @@
+[
+  {"name":"assign-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"assign","method":"task.assign","from_pane":"%4","params":{"task_id":"t6","agent_id":"project/worker"}}},
+  {"name":"assign-success","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"assign","method":"task.assign","params":{"task_id":"t6","agent_id":"project/worker"}}},
+  {"name":"attach-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"attach","method":"task.attach","params":{"task_id":"t999","file":{"path":"evidence.log","kind":"evidence"}}}},
+  {"name":"attach-success","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"attach","method":"task.attach","params":{"task_id":"t6","file":{"path":"evidence.log","kind":"evidence"}}}},
+  {"name":"create-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"create","method":"task.create","params":{"title":"","measure":{"kind":"owner"}}}},
+  {"name":"create-success","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"create","method":"task.create","params":{"title":"New","measure":{"kind":"owner"}}}},
+  {"name":"get-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"get","method":"task.get","params":{"task_id":"t999"}}},
+  {"name":"get-success","setup":"accepted","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"get","method":"task.get","params":{"task_id":"t6"}}},
+  {"name":"list-refusal","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"list","method":"task.list","params":{"limit":0}}},
+  {"name":"list-success","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"list","method":"task.list","params":{}}},
+  {"name":"review-refusal","setup":"submitted","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"review","method":"task.review","params":{"task_id":"t6","review_task":"t6"}}},
+  {"name":"review-success","setup":"review","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"review","method":"task.review","params":{"task_id":"t6","review_task":"t9"}}},
+  {"name":"set_state-refusal","setup":"assigned","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"state","method":"task.set_state","params":{"task_id":"t6","state":"working"}}},
+  {"name":"set_state-success","setup":"assigned","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"state","method":"task.set_state","from_pane":"%2","params":{"task_id":"t6","state":"working"}}},
+  {"name":"submit-refusal","setup":"assigned","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"submit","method":"task.submit","from_pane":"%4","params":{"task_id":"t6"}}},
+  {"name":"submit-success","setup":"assigned","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"submit","method":"task.submit","from_pane":"%2","params":{"task_id":"t6"}}},
+  {"name":"verdict-refusal","setup":"submitted","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"verdict","method":"task.verdict","from_pane":"%2","params":{"task_id":"t6","verdict":"accepted"}}},
+  {"name":"verdict-success","setup":"submitted","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"verdict","method":"task.verdict","params":{"task_id":"t6","verdict":"accepted"}}}
+]

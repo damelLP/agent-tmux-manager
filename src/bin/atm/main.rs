@@ -42,11 +42,14 @@ use atm_tui::tmux;
 
 mod agent;
 mod agent_target;
+mod away;
 mod cli;
+mod decide;
 mod me;
 mod msg;
 pub mod rpc;
 mod spawn;
+mod task;
 mod tui;
 mod workspace;
 use cli::{cmd_interrupt, cmd_kill, cmd_list, cmd_peek, cmd_reply, cmd_role, cmd_send, cmd_status};
@@ -162,6 +165,65 @@ mod agent_contract_tests {
         }
     }
 
+    /// Changing only one side's validation or default must not leave a CLI
+    /// value that the daemon rejects, or silently default to a different budget.
+    #[tokio::test]
+    async fn clear_parser_and_daemon_validation_stay_in_sync() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            use atmd::server::methods::{router, CallContext, CallerId, MethodServices};
+            use serde_json::json;
+
+            let (send, _receive) = mpsc::channel(1);
+            let (events, _) = tokio::sync::broadcast::channel(1);
+            let registry = atmd::registry::RegistryHandle::new(send, events);
+            let router = router(MethodServices::new(registry)).unwrap();
+            for timeout in [0, 1, 4999, 5000, 30000, 120000, 120001, u64::MAX] {
+                let value = timeout.to_string();
+                let cli = Args::try_parse_from([
+                    "atm",
+                    "agent",
+                    "clear",
+                    "project/lead",
+                    "--timeout-ms",
+                    &value,
+                ]);
+                let error = router
+                    .call(
+                        CallContext {
+                            client_id: CallerId("validation".into()),
+                            from_pane: None,
+                        },
+                        "agent.clear",
+                        json!({"agent":"project/lead", "timeout_ms":timeout}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.0.code,
+                    if cli.is_ok() {
+                        "unavailable"
+                    } else {
+                        "invalid_params"
+                    },
+                    "{timeout}: {cli:?}"
+                );
+            }
+            let cli = Args::try_parse_from(["atm", "agent", "clear", "project/lead"]).unwrap();
+            let Some(Command::Agent {
+                action: agent::AgentAction::Clear { timeout_ms, .. },
+            }) = cli.command
+            else {
+                panic!("expected the clear command");
+            };
+            let daemon: atmd::org::agents::ClearParams =
+                serde_json::from_value(json!({"agent":"project/lead"})).unwrap();
+            assert_eq!(timeout_ms, daemon.timeout_ms);
+            assert_eq!(timeout_ms, 30_000);
+        })
+        .await
+        .expect("clear validation parity did not finish within its hang guard");
+    }
+
     #[test]
     fn clear_rejects_bad_ids_and_timeout_bounds() {
         for args in [
@@ -205,6 +267,16 @@ mod agent_contract_tests {
 enum Command {
     /// Show your identity, instructions, handover, unread work and reporting command
     Me(me::MeArgs),
+    /// Create, assign, inspect and review durable tasks
+    Task(task::TaskArgs),
+    /// Record the owner's answer to a decision
+    Decide(decide::DecideArgs),
+    /// List, request or withdraw durable decisions
+    Decisions(decide::DecisionsArgs),
+    /// Tell the daemon you will not answer: agents go on under the away rules
+    Away(away::SwitchArgs),
+    /// Tell the daemon you are back: nothing more is decided for you
+    Back(away::SwitchArgs),
     /// Send, acknowledge or resolve durable messages
     Msg {
         #[command(subcommand)]
@@ -434,6 +506,11 @@ async fn main() -> Result<()> {
     // Handle subcommands first (before TUI initialization)
     match args.command {
         Some(Command::Me(args)) => return me::cmd_me(args).await,
+        Some(Command::Task(args)) => return task::cmd_task(args).await,
+        Some(Command::Decide(args)) => return decide::cmd_decide(args).await,
+        Some(Command::Decisions(args)) => return decide::cmd_decisions(args).await,
+        Some(Command::Away(args)) => return away::cmd_away(args).await,
+        Some(Command::Back(args)) => return away::cmd_back(args).await,
         Some(Command::Msg { action }) => return msg::cmd_msg(action).await,
         Some(Command::Inbox(args)) => return msg::cmd_inbox(args).await,
         Some(Command::Agent { action }) => return agent::cmd_agent(action).await,

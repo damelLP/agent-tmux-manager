@@ -4,9 +4,9 @@ use atm_org::*;
 use serde_json::json;
 
 #[test]
-fn all_nineteen_golden_event_bodies() {
+fn all_golden_event_bodies() {
     let cases = support::bodies();
-    assert_eq!(cases.len(), 19);
+    assert_eq!(cases.len(), 23);
     for (kind, body) in cases {
         let event = OrgEvent::from_parts(kind, &body).unwrap().unwrap();
         assert_eq!(event.kind(), kind);
@@ -24,6 +24,16 @@ fn all_nineteen_golden_event_bodies() {
             Some(event)
         );
     }
+}
+
+#[test]
+fn task_usage_is_a_known_additive_event() {
+    // Synthetic: a baseline observation with no eligible task.
+    let body = json!({"session_id":"s", "task_id":null, "turn":true,
+        "cumulative_cost":{"microdollars":125000}, "context_percent":70});
+    let event = OrgEvent::from_parts("task.usage_observed", &body).unwrap();
+    assert!(event.is_some(), "task observations must survive replay");
+    assert_eq!(event.unwrap().to_body(), body);
 }
 
 #[test]

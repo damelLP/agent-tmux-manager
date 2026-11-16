@@ -4,14 +4,14 @@
 #[path = "actor_tests.rs"]
 mod tests;
 
-use std::{future::Future, sync::Arc};
+use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use atm_org::{OrgCommand, OrgState};
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::{Health, OrgServiceError, Request};
+use super::{Health, OrgServiceError, Request, TaskCommit};
 use crate::eventlog::{Envelope, EventLogError};
 
 pub(super) async fn run<F, Fut>(
@@ -25,6 +25,25 @@ pub(super) async fn run<F, Fut>(
     F: FnMut(Envelope) -> Fut,
     Fut: Future<Output = Result<u64, EventLogError>>,
 {
+    // Recover a verdict/cost prefix before serving any snapshot or mutation.
+    for (command, at) in super::cost::missing(&state) {
+        if let Err(error) = execute(
+            &mut state,
+            &command,
+            at,
+            None,
+            &health,
+            &publication,
+            &mut append,
+        )
+        .await
+        {
+            tracing::warn!(%error, "Accepted task cost repair incomplete");
+            if matches!(error, OrgServiceError::Unavailable(_)) {
+                return;
+            }
+        }
+    }
     loop {
         let request = tokio::select! {
             biased;
@@ -41,19 +60,27 @@ pub(super) async fn run<F, Fut>(
             Request::Execute {
                 command,
                 now,
+                caller_pane,
                 reply,
             } => {
+                let before = match command.as_ref() {
+                    OrgCommand::Task(command) => {
+                        super::tasks::target(command).and_then(|id| state.task(&id).cloned())
+                    }
+                    _ => None,
+                };
                 let result = execute(
                     &mut state,
                     &command,
                     now,
+                    caller_pane.as_deref(),
                     &health,
                     &publication,
                     &mut append,
                 )
                 .await;
                 let failed = matches!(result, Err(OrgServiceError::Unavailable(_)));
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|events| TaskCommit { events, before }));
                 if failed {
                     // Dropping the queue resolves pending callers without ever
                     // deciding another command against an uncertain state.
@@ -69,6 +96,7 @@ async fn execute<F, Fut>(
     state: &mut OrgState,
     command: &OrgCommand,
     now: DateTime<Utc>,
+    caller_pane: Option<&str>,
     health: &watch::Sender<Health>,
     publication: &broadcast::Sender<Arc<Envelope>>,
     append: &mut F,
@@ -92,9 +120,14 @@ where
     } else {
         command
     };
-    let events = state.decide(command, now)?;
+    let mut events: VecDeque<_> = state.decide(command, now)?.into();
     let mut committed = Vec::with_capacity(events.len());
-    for event in events {
+    while let Some(mut event) = events.pop_front() {
+        if let atm_org::OrgEvent::DecisionResolved(answer)
+        | atm_org::OrgEvent::DecisionOverruled(answer) = &mut event
+        {
+            answer.caller_pane = caller_pane.map(str::to_owned);
+        }
         let mut envelope = Envelope {
             seq: 0, // Assigned by the log, never predicted by a command caller.
             ts: now,
@@ -117,6 +150,9 @@ where
             let reason = format!("apply at sequence {}: {error}", envelope.seq);
             let _ = health.send_replace(Err(reason.clone()));
             return Err(OrgServiceError::Unavailable(reason));
+        }
+        if let Some(record) = super::cost::after_event(state, &event) {
+            events.push_front(record);
         }
         // One owner advances the replay fence and publishes only applied records.
         // Subscribing before reading that fence makes replay/live overlap gapless.

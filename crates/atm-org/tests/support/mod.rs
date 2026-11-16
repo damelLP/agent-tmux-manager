@@ -193,5 +193,15 @@ pub fn bodies() -> Vec<(&'static str, Value)> {
             json!({"pane":"%1","action":{"harness":"pi"}}),
         ),
         ("control.killed", json!({"pane":"%1","action":"kill"})),
+        (
+            "agent.save_requested",
+            json!({"agent_id":"p/lead","message_id":"m10"}),
+        ),
+        (
+            "agent.saved",
+            json!({"agent_id":"p/lead","message_id":"m10"}),
+        ),
+        ("owner.away", json!({"by":"owner","stacking_caps":{"p":1}})),
+        ("owner.back", json!({"by":"owner"})),
     ]
 }

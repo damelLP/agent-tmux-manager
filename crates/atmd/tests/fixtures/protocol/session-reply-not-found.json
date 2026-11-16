@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"reply-missing","method":"session.reply","params":{"target":"missing"}},"response":{"type":"response","id":"reply-missing","error":{"code":"not_found","message":"No session matching 'missing'"}},"ignore":[]}

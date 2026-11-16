@@ -6,7 +6,10 @@
 //! No Git subprocesses: only the supported main/linked-checkout layout is read.
 
 use super::{agents::AgentError, OrgHandle};
-use atm_org::{AgentId, OrgCommand, OrgState, ProjectFile, ProjectId, RoleSpec};
+use atm_org::{
+    AgentId, AwaySettings, AwaySettingsError, OrgCommand, OrgState, ProjectFile, ProjectId,
+    RoleSpec,
+};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -45,6 +48,7 @@ enum Operation {
     Prepare(String),
     Identify(String),
     Filter,
+    AwaySettings,
 }
 struct Input {
     root: PathBuf,
@@ -54,6 +58,7 @@ enum Output {
     Prepared(Box<PreparedAgent>),
     Identified(AgentId),
     Filtered(Option<ProjectId>),
+    AwaySettings(AwaySettings),
 }
 type Resolution = (Output, Option<OrgCommand>);
 struct Request {
@@ -62,7 +67,7 @@ struct Request {
     reply: oneshot::Sender<Result<Output, AgentError>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct AgentProjects {
     requests: mpsc::Sender<Request>,
 }
@@ -166,6 +171,14 @@ impl AgentProjects {
             _ => Err(unavailable()),
         }
     }
+    /// The away settings of the project recorded at `root`. Read-only: it
+    /// registers nothing and writes no file.
+    pub async fn away_settings(&self, root: PathBuf) -> Result<AwaySettings, AgentError> {
+        match self.request(root, Operation::AwaySettings).await? {
+            Output::AwaySettings(settings) => Ok(settings),
+            _ => Err(unavailable()),
+        }
+    }
 }
 
 fn unavailable() -> AgentError {
@@ -173,6 +186,12 @@ fn unavailable() -> AgentError {
 }
 
 fn resolve(input: Input, state: OrgState) -> Result<Resolution, AgentError> {
+    if matches!(input.operation, Operation::AwaySettings) {
+        // The root is a recorded one, read as it is: a project whose folder
+        // is gone has no settings file, which is the default.
+        let settings = read_away_settings(&input.root.join(".atm/away.toml"))?;
+        return Ok((Output::AwaySettings(settings), None));
+    }
     let root = project_root(&input.root)?;
     let file = root.join(".atm/project.toml");
     if matches!(input.operation, Operation::Filter) {
@@ -223,7 +242,7 @@ fn resolve(input: Input, state: OrgState) -> Result<Resolution, AgentError> {
     };
     let name = match input.operation {
         Operation::Prepare(name) | Operation::Identify(name) => name,
-        Operation::Filter => return Err(unavailable()),
+        Operation::Filter | Operation::AwaySettings => return Err(unavailable()),
     };
     let agent_id = AgentId::new(project.id.clone(), name)
         .map_err(|e| AgentError::InvalidParams(e.to_string()))?;
@@ -330,6 +349,18 @@ fn read_project(path: &Path) -> Result<Option<ProjectFile>, AgentError> {
             }
             Ok(None)
         }
+        Err(e) => Err(io_error(path, e)),
+    }
+}
+
+fn read_away_settings(path: &Path) -> Result<AwaySettings, AgentError> {
+    match fs::read_to_string(path) {
+        // TOML diagnostics can quote the file's text; never include them in RPC errors.
+        Ok(text) => atm_org::parse_away_settings(&text).map_err(|error| match error {
+            AwaySettingsError::Toml(_) => refused(path, "invalid away settings"),
+            AwaySettingsError::CapBelowOne => refused(path, "stacking_cap must be at least 1"),
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(AwaySettings::default()),
         Err(e) => Err(io_error(path, e)),
     }
 }
@@ -548,6 +579,78 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        writer.join().unwrap();
+    }
+
+    // Break caught: reading the away settings on the runtime or a blocking
+    // pool thread, where a FIFO at that path would hold the daemon or its exit.
+    #[tokio::test]
+    async fn away_settings_fifo_read_does_not_block_org_or_shutdown() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join(".atm")).unwrap();
+        let fifo = root.join(".atm/away.toml");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: CString supplies a valid NUL-terminated pathname for mkfifo.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let cancel = CancellationToken::new();
+        let org = OrgHandle::open(dir.path().join("state"), cancel.clone()).await;
+        let (entered, entry) = oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (finished, finish) = oneshot::channel();
+        let finished = Mutex::new(Some(finished));
+        let (projects, task) =
+            AgentProjects::spawn_with(org.clone(), cancel.clone(), move |input, state| {
+                entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                let result = resolve(input, state);
+                let _ = finished
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(result.map(|r| r.0));
+                Err(unavailable())
+            });
+        let caller = tokio::spawn(async move { projects.away_settings(root).await });
+        tokio::time::timeout(Duration::from_secs(30), entry)
+            .await
+            .unwrap()
+            .unwrap();
+        let (opened, open) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut file = OpenOptions::new().write(true).open(fifo).unwrap();
+            opened.send(()).unwrap(); // Reader and writer have both opened the FIFO.
+            gate.recv().unwrap();
+            file.write_all(b"stacking_cap = 4\n").unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(30), open)
+            .await
+            .unwrap()
+            .unwrap();
+        // The reader cannot finish until this test releases the writer; the
+        // organisation still answers, and the lane still stops.
+        assert_eq!(org.snapshot().await.unwrap().projects().count(), 0);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            caller.await.unwrap(),
+            Err(AgentError::Unavailable(_))
+        ));
+        release.send(()).unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(30), finish)
+            .await
+            .unwrap()
+            .unwrap();
+        // The held read was the settings file itself, and registered nothing.
+        assert!(matches!(
+            read,
+            Ok(Output::AwaySettings(AwaySettings { stacking_cap: 4 }))
+        ));
         writer.join().unwrap();
     }
 

@@ -101,8 +101,8 @@ pub fn decision_event_case(slot: usize, text: String, n: u64, flag: bool) -> Org
             option: text,
             by,
         }),
-        2 => OrgEvent::DecisionResolved(resolution),
-        3 => OrgEvent::DecisionOverruled(resolution),
+        2 => OrgEvent::DecisionResolved(resolution.into()),
+        3 => OrgEvent::DecisionOverruled(resolution.into()),
         4 => OrgEvent::DecisionExpired { decision_id },
         _ => OrgEvent::DecisionWithdrawn(DecisionWithdrawal {
             decision_id,

@@ -608,6 +608,8 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     services.org = org;
     services.raw = raw.clone();
     services.delivery_policy = Some(config.delivery);
+    // An invalid section never leaves the reminder on with guessed settings.
+    services.reminder = reminder_from(config.reminder);
     let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
@@ -656,6 +658,8 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
 struct StartupConfig {
     notify: Result<Option<NotifyConfig>, String>,
     delivery: Result<atm_org::delivery::DeliveryPolicy, String>,
+    /// `None` when `[reminder]` turns the reminder off.
+    reminder: Result<Option<atm_org::reminder::ReminderSettings>, String>,
 }
 
 async fn read_startup_config(path: Option<PathBuf>) -> StartupConfig {
@@ -684,16 +688,30 @@ fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
                     .map_err(|_| {
                         "invalid config: malformed TOML or invalid [delivery] settings".into()
                     }),
+                reminder: atmd::org::task_reminder::parse_reminder_settings(&text),
             }
         }
         Err(error) => {
             let reason = format!("cannot read config: {error}");
             StartupConfig {
                 notify: Err(reason.clone()),
-                delivery: Err(reason),
+                delivery: Err(reason.clone()),
+                reminder: Err(reason),
             }
         }
     }
+}
+
+/// The reminder's settings for the server. A section that could not be read
+/// never leaves the reminder on with guessed settings: it is off, with the
+/// reason logged.
+fn reminder_from(
+    config: Result<Option<atm_org::reminder::ReminderSettings>, String>,
+) -> Option<atm_org::reminder::ReminderSettings> {
+    config.unwrap_or_else(|reason| {
+        warn!(%reason, "Invalid reminder configuration; task reminders are off");
+        None
+    })
 }
 
 /// How long atmd waits for `config.toml` before it starts without it.
@@ -957,6 +975,58 @@ mod tests {
         let config = parse_startup_config(Ok(Some("[notify]\nunknown=1".into())));
         assert!(config.notify.is_err());
         assert!(config.delivery.is_ok());
+    }
+
+    #[test]
+    fn reminder_config_is_one_section_among_the_others() {
+        use atm_org::reminder::ReminderSettings;
+        let read = |text: &str| parse_startup_config(Ok(Some(text.into())));
+        let after = |secs| {
+            Ok(Some(ReminderSettings {
+                delay: std::time::Duration::from_secs(secs),
+            }))
+        };
+        // On after a minute when the file or the section is missing.
+        assert_eq!(parse_startup_config(Ok(None)).reminder, after(60));
+        assert_eq!(read("[notify]\ncommand=['true']\n").reminder, after(60));
+        assert_eq!(read("[reminder]\nenabled=false").reminder, Ok(None));
+        // Each section's mistake is its own.
+        let config = read("[notify]\ncommand=['true']\n[reminder]\nunknown='SECRET'");
+        let error = config.reminder.unwrap_err();
+        assert!(error.contains("[reminder]") && !error.contains("SECRET"));
+        assert!(config.notify.unwrap().is_some());
+        assert!(config.delivery.is_ok());
+        let config = read("[delivery]\nunknown=1\n[reminder]\ndelay_secs=5");
+        assert!(config.delivery.is_err());
+        assert_eq!(config.reminder, after(5));
+        // A file that cannot be read turns reminders off, with the reason.
+        let config = parse_startup_config(Err(anyhow::anyhow!("config read timed out")));
+        assert!(config.reminder.unwrap_err().contains("timed out"));
+    }
+
+    #[test]
+    fn an_invalid_or_unreadable_reminder_config_leaves_reminders_off() {
+        use atm_org::reminder::ReminderSettings;
+        let started =
+            |text: Result<Option<String>>| reminder_from(parse_startup_config(text).reminder);
+        let read = |text: &str| started(Ok(Some(text.into())));
+        // What the daemon hands the server: on by default, or as the file says.
+        assert_eq!(started(Ok(None)), Some(ReminderSettings::default()));
+        let five = ReminderSettings {
+            delay: std::time::Duration::from_secs(5),
+        };
+        assert_eq!(read("[reminder]\ndelay_secs=5"), Some(five));
+        assert_eq!(read("[reminder]\nenabled=false"), None);
+        // Never on with guessed settings.
+        for text in [
+            "[reminder]\nunknown=1",
+            "[reminder]\ndelay_secs=0",
+            "[reminder]\ndelay_secs='soon'",
+            "[reminder",
+        ] {
+            assert_eq!(read(text), None, "{text:?}");
+        }
+        assert_eq!(started(Err(anyhow::anyhow!("config read timed out"))), None);
     }
 
     #[test]

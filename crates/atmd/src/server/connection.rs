@@ -143,7 +143,9 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     /// A broken peer stops input/replies, but accepted handlers still finish.
     peer_failed: CancellationToken,
 
-    /// Full socket closure drops only the waiting session.send method future.
+    /// Full socket closure drops waiting send/reply/capture and handover calls.
+    /// Admitted input belongs to the control actor. A handover runs as its own
+    /// task; its dropped call is how it learns that nobody takes its answer.
     caller_gone: CancellationToken,
     disconnect_monitor: Option<AsyncFd<OwnedFd>>,
 
@@ -413,7 +415,8 @@ where
         self.stop_watcher().await;
         let mut writable = result.is_ok() && !self.peer_failed.is_cancelled();
         // EOF/protocol Disconnect closes only input. Finish accepted work up to
-        // its deadline. Full socket closure separately drops session.send's wait;
+        // its deadline. Full closure drops send/reply/capture waits separately
+        // (and handover's, whose work is a task of its own and carries on);
         // the control actor decides whether its first effect has already begun.
         // Only daemon shutdown aborts every remaining job via this JoinSet.
         while !requests.is_empty() {
@@ -548,19 +551,23 @@ where
                     let response = done.map_err(|e| ConnectionError::RequestTask(e.to_string()))?;
                     self.send_message(response).await?;
                 }
-                // The tail payload budget leaves room for ordinary IDs. A
-                // pathological ID can still push the complete line over 1 MiB.
+                // Bound the complete line, including IDs, for tail/capture readers.
                 // Check before admission too: overload errors must fit as well.
-                let tail_refusal = if method == "log.tail" {
+                let size_hint = match method.as_str() {
+                    "log.tail" => Some("limit"),
+                    "session.capture" => Some("tail"),
+                    _ => None,
+                };
+                let size_refusal = if let Some(size_hint) = size_hint {
                     let refusal = DaemonMessage::response_err(
                         id.clone(),
                         error_code::REFUSED,
-                        "log.tail response exceeds 1 MiB; use a shorter id or smaller limit",
+                        &format!("{method} response exceeds 1 MiB; use a shorter id or smaller {size_hint}"),
                     );
                     if !fits_response(&refusal) {
-                        return Err(ConnectionError::Io(
-                            "log.tail request id leaves no room for a response".into(),
-                        ));
+                        return Err(ConnectionError::Io(format!(
+                            "{method} request id leaves no room for a response"
+                        )));
                     }
                     Some(refusal)
                 } else {
@@ -586,7 +593,9 @@ where
                 requests.spawn(async move {
                     let result = tokio::select! {
                         biased;
-                        _ = caller_gone.cancelled(), if method == "session.send" => {
+                        _ = caller_gone.cancelled(),
+                            if matches!(method.as_str(), "session.send" | "session.reply" | "session.capture" | "agent.handover") =>
+                        {
                             Err(MethodError::new(error_code::UNAVAILABLE, "caller disconnected"))
                         }
                         result = methods.call(context, &method, params) => result,
@@ -597,7 +606,7 @@ where
                             DaemonMessage::response_err(id, &error.0.code, &error.0.message)
                         }
                     };
-                    match tail_refusal {
+                    match size_refusal {
                         Some(refusal) if !fits_response(&response) => refusal,
                         _ => response,
                     }
@@ -778,7 +787,7 @@ where
                 "status line is not a JSON object".to_string(),
             ));
         }
-        let (pid, pane, status) = parse_status_line_with_pane(data)?;
+        let (pid, pane, status, usage) = parse_status_line_with_pane(data)?;
         let session_id = SessionId::new(status.session_id.clone());
 
         // Send to registry for processing
@@ -791,6 +800,17 @@ where
                 atm_core::Harness::ClaudeCode,
             )
             .await;
+        if applied.is_ok() {
+            if let Some(usage) = usage {
+                self.observe_task_usage(
+                    &session_id,
+                    pane.as_deref(),
+                    atm_core::Harness::ClaudeCode,
+                    &usage,
+                )
+                .await;
+            }
+        }
         // Activity only: it can neither bind nor confirm, so it needs no parent
         // proof. The pane is the one the hook script reported (inside tmux),
         // never one repaired from the current row. An unparsable pane is an
@@ -823,13 +843,13 @@ where
         pane: Option<String>,
         context: atm_core::LifecycleContext,
     ) -> Result<(), ConnectionError> {
-        let tapped = context.child.is_none()
+        let parent = context.child.is_none()
             && !matches!(
                 event,
                 atm_core::LifecycleEvent::ChildSessionStart { .. }
                     | atm_core::LifecycleEvent::ChildSessionEnd { .. }
-            )
-            && self.message_tapped();
+            );
+        let tapped = parent && self.message_tapped();
         // A SessionEnd removes its row, so no snapshot can prove it afterwards.
         // It needs none: it is activity of a session that can bind no more.
         let ends = matches!(event, atm_core::LifecycleEvent::SessionEnd { .. });
@@ -844,6 +864,13 @@ where
                 context,
             )
             .await;
+        if parent
+            && applied.is_ok()
+            && matches!(event, atm_core::LifecycleEvent::PromptSubmit { .. })
+        {
+            self.observe_task_usage(&session, pane.as_deref(), harness, &event)
+                .await;
+        }
         if tapped {
             // An unparsable pane is an unknown pane. Without a pane no event
             // can bind or confirm, so there is nothing to prove.
@@ -856,6 +883,34 @@ where
             self.record_message_event(&session, pane, Some(harness), Some(&event), proven);
         }
         applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
+    }
+
+    /// Accounting takes only explicit, applied measurements with the event's
+    /// original proven parent identity. Submission never waits for the log.
+    async fn observe_task_usage(
+        &self,
+        session: &SessionId,
+        pane: Option<&str>,
+        harness: atm_core::Harness,
+        event: &atm_core::LifecycleEvent,
+    ) {
+        if self.org.status().is_err() {
+            return;
+        }
+        let pane = pane.filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
+        let Some(input) = atm_org::TaskUsageObservation::from_lifecycle(
+            session.clone(),
+            pane.map(str::to_owned),
+            event,
+        ) else {
+            return;
+        };
+        if !self.message_parent_proven(session, pane, harness).await {
+            return;
+        }
+        if let Err(error) = self.org.observe_task_usage(input, chrono::Utc::now()) {
+            warn!(%error, session_id = %session, "Task usage observation lost");
+        }
     }
 
     /// The proof a receipt or a lazy binding needs: one healthy snapshot shows
@@ -992,6 +1047,7 @@ where
             "Processing pi event"
         );
 
+        let accounting = raw_event.accounting_usage();
         // The first event is genuine activity; any following events are
         // derived metadata. Suppressed primary events yield no batch.
         let mut events = raw_event.to_lifecycle_events().into_iter();
@@ -1045,6 +1101,15 @@ where
                 .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
         }
 
+        if let Some(usage) = accounting {
+            self.observe_task_usage(
+                &session_id,
+                raw_event.tmux_pane.as_deref(),
+                atm_core::Harness::Pi,
+                &usage,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1151,16 +1216,24 @@ where
             };
 
             if let Some(usage) = usage {
+                let event = usage.to_lifecycle_event();
                 self.registry
                     .apply_lifecycle_event(
-                        session_id,
-                        usage.to_lifecycle_event(),
+                        session_id.clone(),
+                        event.clone(),
                         atm_core::Harness::Codex,
                         pid,
-                        tmux_pane,
+                        tmux_pane.clone(),
                     )
                     .await
                     .map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+                self.observe_task_usage(
+                    &session_id,
+                    tmux_pane.as_deref(),
+                    atm_core::Harness::Codex,
+                    &event,
+                )
+                .await;
             }
         }
 
@@ -1276,20 +1349,28 @@ where
 pub fn parse_status_line(
     data: serde_json::Value,
 ) -> Result<(Option<u32>, StatusLineData), ConnectionError> {
-    parse_status_line_with_pane(data).map(|(pid, _, status)| (pid, status))
+    parse_status_line_with_pane(data).map(|(pid, _, status, _)| (pid, status))
 }
+
+type ParsedStatusLine = (
+    Option<u32>,
+    Option<String>,
+    StatusLineData,
+    Option<atm_core::LifecycleEvent>,
+);
 
 /// [`parse_status_line`], with the tmux pane `atm-hook` adds inside tmux.
 fn parse_status_line_with_pane(
     data: serde_json::Value,
-) -> Result<(Option<u32>, Option<String>, StatusLineData), ConnectionError> {
+) -> Result<ParsedStatusLine, ConnectionError> {
     let raw: RawStatusLine =
         serde_json::from_value(data).map_err(|e| ConnectionError::ParseError(e.to_string()))?;
     // Always Some today; the Option predates the empty-model rules
     let status = raw
         .to_status_line_data()
         .ok_or_else(|| ConnectionError::ParseError("status line has no data".to_string()))?;
-    Ok((raw.pid, raw.tmux_pane, status))
+    let usage = raw.accounting_usage();
+    Ok((raw.pid, raw.tmux_pane, status, usage))
 }
 
 /// Errors that can occur during connection handling.
@@ -3343,6 +3424,76 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn oversized_capture_is_refused_within_the_response_budget() {
+        use super::super::methods::{router, MethodServices};
+        let mock = atm_tmux::MockTmuxClient::new();
+        mock.set_pane_content("%1", vec!["😀".repeat(MAX_MESSAGE_SIZE / 4)]);
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        let actor_cancel = CancellationToken::new();
+        let (control, actor) = crate::control::service::spawn_control(
+            Box::new(mock.clone()),
+            services.registry.clone(),
+            services.org.clone(),
+            actor_cancel.clone(),
+        );
+        services.control = Some(control);
+        let (mut read, mut write, cancel, run) =
+            request_connection(Arc::new(router(services).unwrap())).await;
+        send_client(
+            &mut write,
+            ClientMessage::request(
+                "large".into(),
+                "session.capture".into(),
+                serde_json::json!({"target":"%1"}),
+                None,
+            ),
+        )
+        .await;
+        let mut line = String::new();
+        timeout(Duration::from_secs(60), read.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            line.len() <= MAX_MESSAGE_SIZE,
+            "oversized capture must not escape the daemon's line budget"
+        );
+        match serde_json::from_str::<DaemonMessage>(&line).unwrap() {
+            DaemonMessage::Response {
+                id,
+                payload: atm_protocol::ResponsePayload::Error(error),
+            } => {
+                assert_eq!(id, "large");
+                assert_eq!(error.code, error_code::REFUSED);
+                assert_eq!(
+                    error.message,
+                    "session.capture response exceeds 1 MiB; use a shorter id or smaller tail"
+                );
+            }
+            _ => panic!("oversized capture was not refused"),
+        }
+        mock.set_pane_content("%1", vec!["café  ".into(), "".into()]);
+        send_client(
+            &mut write,
+            ClientMessage::request(
+                "small".into(),
+                "session.capture".into(),
+                serde_json::json!({"target":"%1"}),
+                None,
+            ),
+        )
+        .await;
+        assert!(matches!(receive(&mut read).await,
+            DaemonMessage::Response { id, payload: atm_protocol::ResponsePayload::Result(value) }
+                if id == "small" && value == serde_json::json!({"lines":["café  ", ""]})
+        ));
+        cancel.cancel();
+        run.await.unwrap();
+        actor_cancel.cancel();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn tail_response_limit_also_applies_when_request_queue_is_full() {
         let (mut read, mut write, cancel, run) = request_connection(request_router()).await;
         for n in 0..64 {
@@ -3586,6 +3737,175 @@ mod tests {
             release.notify_one();
             run.await.unwrap();
             assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_disconnect_drops_waiting_reply_and_capture_only() {
+        timeout(Duration::from_secs(60), async {
+            for method in ["session.reply", "session.capture"] {
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+                let mut router = MethodRouter::default();
+                router
+                    .register(method, Duration::from_secs(60), move |_, _| {
+                        let (entry, gate, finished) =
+                            (entry.clone(), gate.clone(), finished.clone());
+                        async move {
+                            entry.notify_one();
+                            gate.notified().await;
+                            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(serde_json::Value::Null)
+                        }
+                    })
+                    .unwrap();
+                let (mut handler, peer) = handshake_pair();
+                handler.methods = Arc::new(router);
+                let handler = handler.with_disconnect_monitor().unwrap();
+                let gone = handler.caller_gone.clone();
+                let run = tokio::spawn(handler.run());
+                let mut peer = BufReader::new(peer);
+                send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+                assert!(matches!(
+                    receive(&mut peer).await,
+                    DaemonMessage::Connected { .. }
+                ));
+                send_client(
+                    peer.get_mut(),
+                    ClientMessage::request(
+                        "dialog".into(),
+                        method.into(),
+                        serde_json::json!({}),
+                        None,
+                    ),
+                )
+                .await;
+                entered.notified().await;
+                drop(peer);
+                gone.cancelled().await;
+                release.notify_one();
+                run.await.unwrap();
+                assert!(
+                    !completed.load(std::sync::atomic::Ordering::SeqCst),
+                    "{method} outlived full socket closure"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_and_capture_half_close_and_protocol_disconnect_still_drain() {
+        timeout(Duration::from_secs(60), async {
+            for method in ["session.reply", "session.capture"] {
+                for half_close in [true, false] {
+                    let entered = Arc::new(tokio::sync::Notify::new());
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let (entry, gate) = (entered.clone(), release.clone());
+                    let mut router = MethodRouter::default();
+                    router
+                        .register(method, Duration::from_secs(60), move |_, _| {
+                            let (entry, gate) = (entry.clone(), gate.clone());
+                            async move {
+                                entry.notify_one();
+                                gate.notified().await;
+                                Ok(serde_json::json!("finished"))
+                            }
+                        })
+                        .unwrap();
+                    let (mut handler, peer) = handshake_pair();
+                    handler.methods = Arc::new(router);
+                    let run = tokio::spawn(handler.with_disconnect_monitor().unwrap().run());
+                    let mut peer = BufReader::new(peer);
+                    send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+                    assert!(matches!(
+                        receive(&mut peer).await,
+                        DaemonMessage::Connected { .. }
+                    ));
+                    send_client(
+                        peer.get_mut(),
+                        ClientMessage::request(
+                            "dialog".into(),
+                            method.into(),
+                            serde_json::json!({}),
+                            None,
+                        ),
+                    )
+                    .await;
+                    entered.notified().await;
+                    if half_close {
+                        peer.get_mut().shutdown().await.unwrap();
+                    } else {
+                        send_client(peer.get_mut(), ClientMessage::disconnect()).await;
+                    }
+                    release.notify_one();
+                    assert_eq!(
+                        serde_json::to_value(receive(&mut peer).await).unwrap(),
+                        serde_json::json!({"type":"response","id":"dialog","result":"finished"})
+                    );
+                    run.await.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A handover's wait ends with its caller's socket: the dropped call is
+    /// how the handover learns that nobody takes its answer. The handler is
+    /// released only after the close was seen, so one that is still polled
+    /// then completes, and one whose call was dropped never does.
+    #[tokio::test]
+    async fn full_disconnect_drops_a_waiting_agent_handover() {
+        timeout(Duration::from_secs(60), async {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+            let mut router = MethodRouter::default();
+            router
+                .register("agent.handover", Duration::from_secs(60), move |_, _| {
+                    let (entry, gate, finished) = (entry.clone(), gate.clone(), finished.clone());
+                    async move {
+                        entry.notify_one();
+                        gate.notified().await;
+                        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::Value::Null)
+                    }
+                })
+                .unwrap();
+            let (mut handler, peer) = handshake_pair();
+            handler.methods = Arc::new(router);
+            let handler = handler.with_disconnect_monitor().unwrap();
+            let gone = handler.caller_gone.clone();
+            let run = tokio::spawn(handler.run());
+            let mut peer = BufReader::new(peer);
+            send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::Connected { .. }
+            ));
+            let handover = ClientMessage::request(
+                "handover".into(),
+                "agent.handover".into(),
+                serde_json::json!({}),
+                Some("%12".into()),
+            );
+            send_client(peer.get_mut(), handover).await;
+            entered.notified().await;
+            drop(peer);
+            gone.cancelled().await;
+            release.notify_one();
+            run.await.unwrap();
+            assert!(
+                !completed.load(std::sync::atomic::Ordering::SeqCst),
+                "the handover's call was still waited for after its caller's socket closed"
+            );
         })
         .await
         .unwrap();

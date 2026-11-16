@@ -137,8 +137,17 @@ async fn scripted(
         );
     };
     let output = tokio::time::timeout(Duration::from_secs(30), async {
-        let ((), output) = tokio::join!(peer, child.wait_with_output());
-        output.unwrap()
+        let output = async {
+            let output = child.wait_with_output().await.unwrap();
+            assert_ne!(
+                output.status.code(),
+                Some(2),
+                "scripted invocation rejected by parser: {args:?}: {output:?}"
+            );
+            output
+        };
+        let ((), output) = tokio::join!(peer, output);
+        output
     })
     .await
     .unwrap();
@@ -338,12 +347,14 @@ async fn agent_cli_parse_failures_exit_two_without_connecting() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("rpc.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let output = tokio::time::timeout(
-            Duration::from_secs(30),
-            command(&args, dir.path(), &socket).output(),
-        )
+        let output = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut command = command(&args, dir.path(), &socket);
+            tokio::select! {
+                accepted = listener.accept() => panic!("parse failure connected: {args:?}: {accepted:?}"),
+                output = command.output() => output.unwrap(),
+            }
+        })
         .await
-        .unwrap()
         .unwrap();
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty());

@@ -1,0 +1,11 @@
+{
+  "assign":{"error":{"code":"refused","message":"project/other may not assign task t6"}},
+  "attach":{"error":{"code":"not_found","message":"unknown task t999"}},
+  "create":{"error":{"code":"invalid_params","message":"invalid title: must not be empty"}},
+  "get":{"error":{"code":"not_found","message":"unknown task t999"}},
+  "list":{"error":{"code":"invalid_params","message":"invalid task parameters: limit must be between 1 and 1000"}},
+  "review":{"error":{"code":"refused","message":"task t6 is not a review of task t6"}},
+  "set_state":{"error":{"code":"refused","message":"owner may not work on task t6"}},
+  "submit":{"error":{"code":"refused","message":"project/other may not submit task t6"}},
+  "verdict":{"error":{"code":"refused","message":"project/worker may not give the verdict on task t6"}}
+}

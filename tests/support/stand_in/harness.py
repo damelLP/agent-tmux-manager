@@ -169,6 +169,24 @@ class Runtime:
             else:
                 self.clock_ms = value
                 self.effects(self.model.tick(value))
+        elif message.get("command") == "refuse_next_paste":
+            try:
+                self.parser.arm_paste_refusal()
+            except ValueError as error:
+                reply["error"] = str(error)
+        elif message.get("command") == "set_context_share":
+            try:
+                self.model.set_context_share(message.get("percent"))
+            except ValueError as error:
+                reply["error"] = str(error)
+        elif message.get("command") in ("hold_next_hook", "release_hook"):
+            try:
+                if message["command"] == "hold_next_hook":
+                    self.model.arm_hook_hold(message.get("event"))
+                else:
+                    self.effects(self.model.release_hooks())
+            except ValueError as error:
+                reply["error"] = str(error)
         elif message.get("command") == "render_source":
             spec = next((s for s in self.screen_catalog if s["key"] == message.get("key")
                          and s["mode"] == self.mode), None)
@@ -283,6 +301,12 @@ class Runtime:
         for effect in effects:
             if not self.running:
                 break
+            if effect["kind"] == "usage":
+                path = Path(patch_paths(effect["path"], self.root))
+                if not path.resolve().is_relative_to(self.root):
+                    raise ValueError("usage transcript must stay inside the private root")
+                with path.open("x") as transcript:
+                    transcript.write(json.dumps(effect["data"]) + "\n")
             if effect["kind"] == "render":
                 if self.parser.pasting or self.parser.pending:
                     self.last_render = effect
@@ -356,6 +380,9 @@ class Runtime:
             self.effects([self.last_render])
 
     def action(self, action):
+        if action[0] == "paste_refused":
+            self.record({"kind": "rejected", "reason": "refuse_next_paste", "text": action[1]})
+            return
         if self.model.dialog is None and action == ("submit", "/clear" if self.mode == "claude" else "/new"):
             self.generation += 1
         self.effects(self.model.handle(action, self.now_ms(), self.next_id()))

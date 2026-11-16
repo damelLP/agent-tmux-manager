@@ -85,9 +85,9 @@ fn expected(key: &str) -> ScreenFacts {
         | "pi.fresh.u5" | "pi.fresh.notice" | "pi.clear-complete.u5" => (Empty, NotRunning, None, Present),
         "claude.draft.rich-enabled" | "claude.draft.poor" | "claude.interrupted.u5"
         | "pi.draft.p1" | "pi.draft.p1-multi" => (Draft, NotRunning, None, NotFresh),
-        "claude.working.u5" | "claude.clearing.u5" | "pi.working.u5"
+        "claude.working.u5" | "claude.working.lead-shells" | "claude.clearing.u5" | "pi.working.u5"
         | "pi.working.coordinator-1" | "pi.working.coordinator-2" => (Empty, Running, None, NotFresh),
-        "claude.idle.u5" | "claude.idle.after-turn" | "claude.denied.u5"
+        "claude.idle.u5" | "claude.idle.lead-shells" | "claude.idle.after-turn" | "claude.denied.u5"
         | "pi.idle.u5" | "pi.idle.after-turn" | "pi.clearing.u5" | "pi.interrupted.u5"
         | "pi.idle.coordinator-1" | "pi.idle.coordinator-2" => (Empty, NotRunning, None, NotFresh),
         "claude.permission.u5" | "claude.permission.denial-pending" => (Unknown, TurnUnknown, Permission, NotFresh),
@@ -905,7 +905,7 @@ fn every_native_source_replayed_through_tmux_matches_real_fixture_and_pinned_fac
     let sources = sources();
     assert_eq!(
         sources.len(),
-        76,
+        78,
         "review expectations when the catalog grows"
     );
     for mode in [StandInMode::Claude, StandInMode::Codex, StandInMode::Pi] {

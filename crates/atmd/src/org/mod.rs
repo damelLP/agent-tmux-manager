@@ -12,7 +12,12 @@
 //! its filesystem worker may still hold the stream lock. Restart to recover.
 
 mod actor;
+pub mod agent_auto_handover;
 pub mod agent_context;
+pub mod agent_handover;
+#[cfg(test)]
+mod agent_handover_tests;
+mod cost;
 // Pure decisions first; the flows that call them follow in their own commits.
 #[cfg_attr(not(test), allow(dead_code))]
 mod agent_flow;
@@ -32,6 +37,10 @@ mod agent_types;
 pub mod agents;
 #[cfg(test)]
 mod agents_tests;
+pub mod away;
+mod decision_methods;
+pub mod decisions;
+mod intent;
 pub mod message_delivery;
 #[cfg(test)]
 mod message_delivery_gate;
@@ -54,11 +63,16 @@ mod message_service_tests;
 pub mod message_types;
 pub mod messages;
 mod raw;
+mod standing_rules;
 mod start_line;
 #[cfg(test)]
 mod start_line_tests;
 mod storage;
 mod summary;
+mod task_budget;
+mod task_methods;
+pub mod task_reminder;
+pub mod tasks;
 mod watch;
 
 pub(crate) use watch::message as event_message;
@@ -69,7 +83,7 @@ pub use summary::SummaryObserver;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use atm_org::{OrgCommand, OrgState, Refusal};
+use atm_org::{OrgCommand, OrgState, Refusal, Task, TaskCommand};
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, oneshot, watch as health_watch};
 use tokio_util::sync::CancellationToken;
@@ -95,11 +109,19 @@ pub enum OrgServiceError {
 
 type Health = Result<u64, String>;
 
+/// Private atomic task receipt; the before-image belongs to the deciding actor.
+#[derive(Debug)]
+struct TaskCommit {
+    events: Vec<Envelope>,
+    before: Option<Task>,
+}
+
 enum Request {
     Execute {
         command: Box<OrgCommand>,
         now: DateTime<Utc>,
-        reply: oneshot::Sender<Result<Vec<Envelope>, OrgServiceError>>,
+        caller_pane: Option<String>,
+        reply: oneshot::Sender<Result<TaskCommit, OrgServiceError>>,
     },
     Snapshot(oneshot::Sender<OrgState>),
 }
@@ -188,10 +210,40 @@ impl OrgHandle {
         command: OrgCommand,
         now: DateTime<Utc>,
     ) -> Result<Vec<Envelope>, OrgServiceError> {
+        self.execute_command(command, now, None).await
+    }
+
+    pub(super) async fn execute_command(
+        &self,
+        command: OrgCommand,
+        now: DateTime<Utc>,
+        caller_pane: Option<String>,
+    ) -> Result<Vec<Envelope>, OrgServiceError> {
+        self.execute_receipt(command, now, caller_pane)
+            .await
+            .map(|commit| commit.events)
+    }
+
+    async fn execute_task(
+        &self,
+        command: TaskCommand,
+        now: DateTime<Utc>,
+    ) -> Result<TaskCommit, OrgServiceError> {
+        self.execute_receipt(OrgCommand::Task(command), now, None)
+            .await
+    }
+
+    async fn execute_receipt(
+        &self,
+        command: OrgCommand,
+        now: DateTime<Utc>,
+        caller_pane: Option<String>,
+    ) -> Result<TaskCommit, OrgServiceError> {
         let (reply, response) = oneshot::channel();
         self.submit(Request::Execute {
             command: Box::new(command),
             now,
+            caller_pane,
             reply,
         })?;
         // The actor retains the command if this waiting future is dropped.

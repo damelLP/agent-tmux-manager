@@ -34,6 +34,14 @@ class InputParser:
         self.pending = bytearray()
         self.draft = bytearray()
         self.pasting = False
+        self.refuse_paste = False
+        self.rejected_paste = None
+        self.skip_submit = False
+
+    def arm_paste_refusal(self):
+        if self.pending or self.pasting or self.refuse_paste or self.skip_submit:
+            raise ValueError("paste refusal requires complete input and no pending refusal")
+        self.refuse_paste = True
 
     def feed(self, data):
         self.pending.extend(data)
@@ -42,6 +50,15 @@ class InputParser:
             marker = b"\x1b[201~" if self.pasting else b"\x1b[200~"
             if self.pending.startswith(marker):
                 del self.pending[:len(marker)]
+                if not self.pasting:
+                    self.skip_submit = False
+                    if self.refuse_paste:
+                        self.refuse_paste = False
+                        self.rejected_paste = bytearray()
+                elif self.rejected_paste is not None:
+                    actions.append(("paste_refused", self.rejected_paste.decode("utf-8", errors="replace")))
+                    self.rejected_paste = None
+                    self.skip_submit = True
                 self.pasting = not self.pasting
                 continue
             if marker.startswith(self.pending):
@@ -62,8 +79,13 @@ class InputParser:
                         actions.append(("cursor_report", position))
                 continue
             byte = self.pending.pop(0)
+            if not self.pasting and self.skip_submit:
+                self.skip_submit = False
+                if byte in (10, 13):
+                    continue  # Consume this refused paste's Enter, not an older draft.
             if self.pasting:
-                self.draft.append(byte)
+                target = self.draft if self.rejected_paste is None else self.rejected_paste
+                target.append(byte)
             elif byte in (10, 13):
                 actions.append(("submit", self.draft.decode("utf-8", errors="replace")))
                 self.draft.clear()
@@ -111,10 +133,69 @@ class Model:
         self.state, self.deadline = "idle", None
         self.announced = False
         self.drop_next = None
+        self.hold_next = None
+        self.held_hooks = []
+        self.next_context_share = None
+        self.context_sequence = 0
         self.active_prompt = ""
         self.queue = []
         self.last_ctrl_c = None
         self.selection = 1
+
+    def set_context_share(self, percent):
+        if type(percent) not in (int, float) or not 0 <= percent <= 100:
+            raise ValueError("context share requires a finite number from 0 through 100")
+        self.next_context_share = float(percent)
+
+    def context_override(self, data):
+        if self.next_context_share is None:
+            return []
+        if self.mode == "claude":
+            if "context_window" not in data:
+                return []
+            window = data["context_window"]
+            capacity = window["context_window_size"]
+        elif self.mode == "pi":
+            if "usage" not in data:
+                return []
+            capacity = data["model"]["contextWindow"]
+        else:
+            if data.get("hook_event_name") == "SessionEnd":
+                return []  # The daemon deliberately does not read usage on end.
+            capacity = 258400  # Captured Codex 0.163.0 rollout capacity; Synthetic here.
+        percent, self.next_context_share = self.next_context_share, None
+        tokens = round(capacity * percent / 100)
+        # Synthetic: deterministic context-line injection, not measured usage.
+        if self.mode == "claude":
+            window.update(used_percentage=percent, remaining_percentage=100 - percent,
+                          total_input_tokens=tokens, total_output_tokens=0,
+                          current_usage={"input_tokens": tokens, "output_tokens": 0,
+                                         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        elif self.mode == "pi":
+            data["usage"]["contextTokens"] = tokens
+        else:
+            self.context_sequence += 1
+            path = f"/fixture/usage-{self.session_id}-{self.context_sequence}.jsonl"
+            data["transcript_path"] = path
+            return [{"kind": "usage", "path": path, "data": {"type": "event_msg", "payload": {
+                "type": "token_count", "info": {"model_context_window": capacity,
+                    "total_token_usage": {"total_tokens": tokens},
+                    "last_token_usage": {"total_tokens": tokens}}}}}]
+        return []
+
+    def arm_hook_hold(self, event=None):
+        known = {f["data"].get("event", f["data"].get("hook_event_name")) for f in self.frames}
+        if event is not None and (not isinstance(event, str) or event not in known):
+            raise ValueError("unknown lifecycle event for this mode")
+        if self.hold_next is not None or self.held_hooks:
+            raise ValueError("a hook hold is already armed or holding")
+        self.hold_next = "*" if event is None else event
+
+    def release_hooks(self):
+        if not self.held_hooks:
+            raise ValueError("no held hook to release")
+        effects, self.held_hooks = self.held_hooks, []
+        return effects
 
     def emit(self, name, variant=None, **updates):
         if not self.hooks_enabled:
@@ -135,10 +216,16 @@ class Model:
             data.pop("tmux_pane", None)
             data["session_id"] = self.session_id
             data.get("payload", data).update(updates)
+            usage = self.context_override(data)
             kind = "event"
             if self.drop_next in ("*", name):
                 kind, self.drop_next = "dropped", None
-            return [{"kind": kind, "event": name, "data": data}]
+            effect = {"kind": kind, "event": name, "data": data}
+            if kind == "event" and (self.held_hooks or self.hold_next in ("*", name)):
+                self.hold_next = None
+                self.held_hooks.append(effect)
+                return usage + [dict(effect, kind="held")]
+            return usage + [effect]
         raise ValueError(f"no captured template for {name}/{variant}")
 
     def render(self, detail=""):
@@ -158,6 +245,7 @@ class Model:
         # Captured shape; Synthetic: deterministic timing and replay of an old ID.
         data = deepcopy(next(f["data"] for f in self.frames if f["type"] == "status_update"))
         data["session_id"] = session_id or self.session_id
+        self.context_override(data)
         return [{"kind": "status", "data": data}]
 
     def start(self):
@@ -246,6 +334,9 @@ class Model:
                 for session_id in ids:
                     self.session_id = session_id
                     effects += self.emit("SessionEnd", "other" if self.mode == "codex" else "prompt_input_exit")
+            if self.held_hooks:
+                self.held_hooks.append({"kind": "exit"})  # Keep the control stream alive until release.
+                return effects
             return effects + [{"kind": "exit"}]
         if kind in ("up", "down"):
             return []

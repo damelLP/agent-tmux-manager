@@ -1,6 +1,13 @@
 //! Bounded daemon-owned jobs. No caller future owns release or callback lifetime.
 
-use std::{collections::HashMap, fmt::Display, future::Future, pin::Pin, sync::Arc};
+use crate::control::service::dialog_request::Deferred;
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Display,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 use tokio::{
     sync::oneshot,
     task::{Id, JoinSet},
@@ -160,6 +167,7 @@ pub(in crate::control) struct Admission {
 
 pub(in crate::control) enum Command {
     Acquire(Admission),
+    LegacyCapture(Box<Deferred>),
     Observe {
         pane: super::PaneId,
         format: super::CaptureFormat,
@@ -195,6 +203,7 @@ impl Command {
     pub(in crate::control) fn reject_with(self, error: ReservationError) {
         match self {
             Self::Acquire(admission) => admission.job.reject(error),
+            Self::LegacyCapture(request) => request.reject(error),
             Self::Observe { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -223,6 +232,7 @@ pub(in crate::control) struct Jobs {
     audit_queue: crate::control::service::AuditQueue,
     kill_audits: HashMap<OperationId, Vec<Arc<KillAudit>>>,
     captures: capture_pacing::Pacing,
+    legacy_captures: VecDeque<Deferred>,
 }
 
 impl Jobs {
@@ -239,6 +249,7 @@ impl Jobs {
             audit_queue,
             kill_audits: HashMap::new(),
             captures: capture_pacing::Pacing::default(),
+            legacy_captures: VecDeque::new(),
         }
     }
 
@@ -257,7 +268,10 @@ impl Jobs {
                 return;
             }
         }
-        if stopping && matches!(command, Command::Observe { .. }) {
+        if (stopping && matches!(command, Command::Observe { .. }))
+            || ((stopping || self.cancel.is_cancelled())
+                && matches!(command, Command::LegacyCapture(_)))
+        {
             command.reject();
             return;
         }
@@ -265,6 +279,7 @@ impl Jobs {
             return;
         };
         match command {
+            Command::LegacyCapture(request) => self.legacy_captures.push_back(*request),
             Command::Observe {
                 pane,
                 format,
@@ -396,14 +411,23 @@ impl Jobs {
         client: &dyn atm_tmux::TmuxClient,
         stopping: bool,
     ) {
-        for command in self.captures.take_ready(Instant::now()) {
+        // A legacy capture must run in the actor before a later ready frame
+        // can overtake its pacing grant or block it on another pane.
+        while self.legacy_captures.is_empty() {
+            let Some(command) = self.captures.take_ready(Instant::now()) else {
+                break;
+            };
             self.dispatch(command, Instant::now(), stopping, client)
                 .await;
         }
     }
 
+    pub(in crate::control) fn take_legacy_capture(&mut self) -> Option<Deferred> {
+        self.legacy_captures.pop_front()
+    }
+
     pub(in crate::control) fn idle(&self) -> bool {
-        self.is_empty() && self.captures.is_empty()
+        self.is_empty() && self.captures.is_empty() && self.legacy_captures.is_empty()
     }
 
     pub(in crate::control) fn ready(&mut self, now: Instant) {
@@ -449,6 +473,9 @@ impl Jobs {
 
     pub(in crate::control) fn stop_waiting(&mut self) {
         self.captures.stop();
+        for request in self.legacy_captures.drain(..) {
+            request.reject(ReservationError::Unavailable);
+        }
         self.state.stop_waiting();
         for (_, admission) in self.waiting.drain() {
             admission.job.reject(ReservationError::Unavailable);

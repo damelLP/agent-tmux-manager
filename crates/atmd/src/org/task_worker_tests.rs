@@ -153,6 +153,222 @@ fn verdict_fact(verdict: TaskVerdict) -> TaskVerdictGiven {
     }
 }
 
+// Break caught: a late actor receipt is discarded, losing the brief/report/answer/notice forever.
+#[tokio::test(start_paused = true)]
+async fn slow_actor_retains_assignment_brief() {
+    late_actor_message(
+        TaskState::Open,
+        assign,
+        owner_caller(),
+        TaskState::Assigned,
+        "p/worker",
+        MessageKind::Brief,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_actor_retains_submission_report() {
+    late_actor_message(
+        TaskState::Assigned,
+        |by| TaskCommand::Submit {
+            task_id: "t3".parse().unwrap(),
+            what: TaskSubmission::Plan,
+            files: vec![],
+            by,
+        },
+        caller(),
+        TaskState::Submitted,
+        "owner",
+        MessageKind::Report,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_actor_retains_changes_requested_answer() {
+    late_actor_message(
+        TaskState::Submitted,
+        |by| verdict(by, TaskVerdict::ChangesRequested),
+        owner_caller(),
+        TaskState::ChangesRequested,
+        "p/worker",
+        MessageKind::Answer,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_actor_retains_accepted_plan_answer() {
+    late_actor_message(
+        TaskState::Submitted,
+        |by| verdict(by, TaskVerdict::Accepted),
+        owner_caller(),
+        TaskState::Working,
+        "p/worker",
+        MessageKind::Answer,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_actor_retains_invalidation_notice() {
+    late_actor_message(
+        TaskState::Assigned,
+        |by| TaskCommand::SetState {
+            task_id: "t3".parse().unwrap(),
+            state: TaskState::Cancelled,
+            reason: None,
+            by,
+        },
+        owner_caller(),
+        TaskState::Cancelled,
+        "p/worker",
+        MessageKind::Note,
+    )
+    .await;
+}
+
+async fn late_actor_message(
+    before: TaskState,
+    make: fn(TaskActor) -> TaskCommand,
+    caller: CallContext,
+    wanted: TaskState,
+    to: &str,
+    kind: MessageKind,
+) {
+    use crate::{eventlog::Envelope, org::Request};
+    use tokio::sync::{broadcast, watch};
+
+    let mut state = verdict_snapshot(before, before != TaskState::Open);
+    if before == TaskState::Submitted {
+        state
+            .apply(
+                6,
+                chrono::Utc::now(),
+                &OrgEvent::TaskSubmitted(atm_org::TaskSubmitted {
+                    task_id: "t3".parse().unwrap(),
+                    what: TaskSubmission::Plan,
+                    files: vec![],
+                    by: "p/worker".parse().unwrap(),
+                }),
+            )
+            .unwrap();
+    }
+    let (requests, receive) = mpsc::channel(64);
+    let (health, status) = watch::channel(Ok(6));
+    let (committed, _) = broadcast::channel(32);
+    let cancel = CancellationToken::new();
+    let (entered, mut entry) = mpsc::unbounded_channel();
+    let mut seq = 6;
+    let actor = tokio::spawn(crate::org::actor::run(
+        state,
+        receive,
+        health,
+        committed.clone(),
+        cancel.clone(),
+        move |envelope: Envelope| {
+            seq += 1;
+            let seq = seq;
+            let gate = if envelope.kind == "control.sent" {
+                let (release, gate) = oneshot::channel();
+                entered.send(release).unwrap();
+                Some(gate)
+            } else {
+                None
+            };
+            async move {
+                if let Some(gate) = gate {
+                    // Match the production append bound, including queue admission.
+                    tokio::time::timeout(Duration::from_secs(5), gate)
+                        .await
+                        .expect("predecessor append exceeded its own deadline")
+                        .unwrap();
+                }
+                Ok(seq)
+            }
+        },
+    ));
+    let org = OrgHandle {
+        requests,
+        health: status,
+        committed,
+        reads: None,
+    };
+    let tasks = TaskHandle::new(org.clone());
+    let workers = tasks.workers.clone();
+    let forward = org.clone();
+    let calling = tasks.clone();
+    let context = caller.clone();
+    let call = tokio::spawn(async move {
+        calling
+            .mutate(context, move |by| {
+                // The identity snapshot has completed. Queue finite actor work
+                // ahead of the task command, not ahead of its caller lookup.
+                for _ in 0..2 {
+                    let (reply, _) = oneshot::channel();
+                    forward
+                        .submit(Request::Execute {
+                            command: Box::new(OrgCommand::ControlSent(atm_org::ControlAudit {
+                                pane: "%1".into(),
+                                action: serde_json::json!({"test": "actor backlog"}),
+                            })),
+                            now: chrono::Utc::now(),
+                            caller_pane: None,
+                            reply,
+                        })
+                        .unwrap();
+                }
+                make(by)
+            })
+            .await
+    });
+    let first = entry.recv().await.unwrap();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    first.send(()).unwrap();
+    let second = entry.recv().await.unwrap();
+    let error = call.await.unwrap().unwrap_err();
+    assert_eq!(MethodError::from(error).0.code, "timeout");
+    let retained = workers.clone().try_acquire_many_owned(64).is_err();
+    second.send(()).unwrap();
+    drop(workers.acquire_many(64).await.unwrap());
+
+    let state = org.snapshot().await.unwrap();
+    assert_eq!(state.task(&"t3".parse().unwrap()).unwrap().state, wanted);
+    let messages: Vec<_> = state.messages().map(|m| m.content.clone()).collect();
+    assert_eq!(messages.len(), 1, "late commit lost its automatic message");
+    assert!(retained, "RPC timeout released the task worker early");
+    let message = messages.first().unwrap();
+    assert_eq!(message.to.to_string(), to);
+    assert_eq!(message.kind, kind);
+    assert_eq!(message.task.as_ref().unwrap().to_string(), "t3");
+
+    let retry = tasks.mutate(caller, make).await;
+    if wanted == TaskState::Working {
+        // An accepted plan is already Working; another verdict is refused.
+        assert!(matches!(
+            retry,
+            Err(TaskError::Organisation(OrgServiceError::Refused(_)))
+        ));
+    } else {
+        let retry = retry.unwrap();
+        assert!(!retry.changed);
+        assert!(retry.notification.is_none());
+    }
+    assert_eq!(
+        org.snapshot()
+            .await
+            .unwrap()
+            .messages()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>(),
+        messages,
+        "retry duplicated the automatic message"
+    );
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
 // Break caught: an identity snapshot, rather than the actor's actual before-image, routes revocation.
 #[tokio::test]
 async fn ownership_routing_uses_actor_beforeimage() {

@@ -2070,6 +2070,111 @@ async fn test_e2e_claude_captured_background_agent_dialog_replay() {
 // 0.73.1 captures (tests/fixtures/*_0.73.1.jsonl) over the socket.
 // ============================================================================
 
+/// Captured: pi 1.5.2, 2026-11-16, sealed interactive PTY/local static
+/// provider, extension callbacks and private atmd socket proxy.
+/// Actual changed-forwarder frames; IDs/PIDs are anonymized/replaced, not
+/// lifecycle fields. Each ListSessions reply is a processing barrier.
+#[tokio::test]
+async fn pi_1_5_2_terminal_sequences() {
+    use atmd::server::{methods::MethodRouter, ConnectionHandler};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+    use tokio::sync::RwLock;
+
+    async fn send(writer: &mut WriteHalf<DuplexStream>, message: ClientMessage) {
+        writer
+            .write_all(serde_json::to_string(&message).unwrap().as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    async fn recv(reader: &mut BufReader<ReadHalf<DuplexStream>>) -> serde_json::Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    timeout(Duration::from_secs(30), async {
+        let registry = spawn_registry();
+        let (server, client) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(server);
+        let cancel = CancellationToken::new();
+        let handler = ConnectionHandler::new(
+            read,
+            write,
+            registry,
+            Arc::new(RwLock::new(HashMap::new())),
+            1,
+            cancel.clone(),
+            Arc::new(MethodRouter::default()),
+        );
+        let task = tokio::spawn(handler.run());
+        let (read, mut write) = tokio::io::split(client);
+        let mut read = BufReader::new(read);
+        send(&mut write, ClientMessage::connect(None)).await;
+        assert_eq!(recv(&mut read).await["type"], "connected");
+        let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../atm-pi-adapter");
+        if !adapter.join("Cargo.toml").exists() {
+            // Published atmd packages do not contain the sibling adapter fixtures.
+            cancel.cancel();
+            task.await.unwrap();
+            return;
+        }
+        let path = adapter.join("tests/fixtures/pi_turn_frames_1.5.2.jsonl");
+        let mut checked = 0;
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+            let mut data = frame["data"].clone();
+            let name = data["event"].as_str().unwrap().to_owned();
+            assert_ne!(
+                name, "agent_end",
+                "modern forwarder must wait for settlement"
+            );
+            let expected = match name.as_str() {
+                "session_start" | "agent_settled" => Some("idle"),
+                "session_shutdown" => None,
+                "input" | "agent_start" | "session_before_compact" => Some("working"),
+                "session_compact" | "session_compact_failed" => {
+                    Some(if data["payload"]["reason"] == "manual" {
+                        "idle"
+                    } else {
+                        "working"
+                    })
+                }
+                // Usage events preserve the current working state. The modern
+                // forwarder intentionally does not send low-level agent_end.
+                "context" | "turn_end" => Some("working"),
+                _ => continue,
+            };
+            let id = data["session_id"].clone();
+            data["pid"] = std::process::id().into();
+            send(&mut write, ClientMessage::pi_event(data)).await;
+            // The response on this same stream is a processing barrier even
+            // for suppressed outcomes, not a poll or readiness sleep.
+            send(&mut write, ClientMessage::new(MessageType::ListSessions)).await;
+            let response = recv(&mut read).await;
+            let rows = response["sessions"].as_array().unwrap();
+            match expected {
+                Some(status) => {
+                    assert_eq!(rows.len(), 1, "{name}: {response}");
+                    let row = rows.first().unwrap();
+                    assert_eq!(row["id"], id, "{name}: new/reload identity");
+                    assert_eq!(row["status"], status, "{name}: {response}");
+                }
+                None => assert!(rows.is_empty(), "{name}: {response}"),
+            }
+            checked += 1;
+        }
+        assert!(checked > 50);
+        cancel.cancel();
+        task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 fn pi_event_json(event: &str, payload: serde_json::Value) -> serde_json::Value {
     // No pid — the test session is registered with a synthetic PID;
     // the registry resolves via `session_id_to_pid`. (Production traffic

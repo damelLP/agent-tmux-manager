@@ -113,9 +113,9 @@
 //!
 //! ## Conversation bodies and busy-row limits
 //!
-//! pi-atm sends empty payloads for `context`, `turn_end` and `agent_end`.
-//! Context usage/model come from the envelope; `agent_end` needs no body
-//! to become `WorkingEnd`. Legacy full-body frames still translate.
+//! pi-atm sends empty payloads for `context`, `turn_end` and `agent_settled`.
+//! Context usage/model come from the envelope. Legacy `agent_end` frames,
+//! with or without conversation bodies, still become `WorkingEnd`.
 //!
 //! Captured: pi 1.5.2, 2026-11-16, sealed SDK session with a scripted local
 //! reply (no model call), events and outgoing Unix-socket frames measured.
@@ -135,10 +135,54 @@
 //! consumed an interactive input, original pi-atm and a private real atmd.
 //! Pi emitted session-start and input, but no agent-start or agent-end:
 //! pi was idle while atmd showed Working. No model was called. Payload
-//! thinning cannot fix an event that never fires. Pi 1.5.2 also distinguishes
-//! low-level `agent_end` from final `agent_settled`; pi-atm still forwards
-//! only the former. Heartbeat, restart resynchronization and final-idle
-//! semantics are unchanged. Neither probe verified the reported live cause.
+//! thinning cannot fix an event that never fires. This handled-input gap,
+//! heartbeat and restart resynchronization remain unchanged. Neither probe
+//! verified the reported live cause.
+//!
+//! ## Final settlement (pi 1.5.2+ forwarder)
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed interactive PTY, free in-process
+//! static provider, callback recorder and socket proxy to a private atmd.
+//! `tests/fixtures/pi_turn_events_1.5.2.jsonl` projects real callbacks, with
+//! measured ctx idle/pending alongside (not inside) payloads. Session ids
+//! and private paths are anonymized. It covers continuation, skills, Esc,
+//! manual and automatic compaction, overflow recovery, new/reload, and the
+//! still-unfixed handled-input, standalone-dialog and idle-reconnect gaps.
+//! Additional `late-failure/queued-failure` projection. Captured: pi 1.5.2,
+//! 2026-11-16, sealed interactive PTY/private atmd, an owned
+//! loopback fake HTTP provider held open and an earlier async failure
+//! handler held on a socket acknowledgment (no model call). The failure's
+//! `stage: after-earlier-async-handler` measures ctx when that handler
+//! resumes, before pi-atm runs, not at initial notification dispatch.
+//! `pi_turn_frames_1.5.2.jsonl` records the changed forwarder's actual frames
+//! from the original rig, with anonymous ids/PIDs and case/run labels.
+//!
+//! At `agent_end`, pi is still busy and may continue; only `agent_settled`
+//! is final (including aborts). The modern extension requires pi 1.5.2+ and
+//! forwards settled instead of end; the adapter retains end for old
+//! forwarders. Upgrade the daemon before the extension. Manual compaction
+//! emits success/failure but no settled, so those outcomes map to Idle only
+//! for reason=manual. Automatic outcomes await settled, even when willRetry
+//! is false. Manual success notifies before pi clears its compacting flag;
+//! later async completion handlers can still run. Manual failure clears
+//! that flag before notifying: queued work can start during an earlier
+//! async failure handler. The forwarder suppresses that stale failure when
+//! current ctx.isIdle() is false, preserving the newer running turn.
+//! Only compaction reason is
+//! forwarded, never preparation, branch history, summaries or error text.
+//!
+//! ## Historical input idle snapshots
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed interactive PTY, free in-process
+//! static provider, snapshot-sending pi-atm and private-atmd socket proxy.
+//! The `input2-*` frames in `pi_turn_frames_1.5.2.jsonl` retain those earlier
+//! input snapshots for regression tests and installed-forwarder compatibility.
+//! The 0.4.1 forwarder no longer adds `payload.idle`; the adapter ignores it
+//! on historical frames. Interactive input remains one raw `PromptSubmit`.
+//! A derived input Idle double-counted the start-line turn and could loop
+//! automatic handover. That correction is reverted for 0.4.1; atomic
+//! primary-plus-derived publication is deferred to stage 2. A later input
+//! consumer can therefore still leave the row Working without an agent run.
 //!
 //! ## Cost and tokens
 //!

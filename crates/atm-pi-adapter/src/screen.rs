@@ -31,6 +31,9 @@
 //! a sealed 1.5.0 probe confirmed `/new   ` executes new, not a prompt. Faint text
 //! is not typed draft evidence.
 //! The active upper border, not startup's interrupt help, establishes turn state.
+//! Styled refuses a same-width Working border above the chosen top: a queued
+//! draft's pasted rule must not hide a running turn. Real colored theme borders
+//! need not be faint, so faintness cannot identify the top. Plain is unchanged.
 //! Fresh layout requires zero usage and startup-only history: the new-session
 //! notice survives later turns and alone proves nothing. Present does not prove
 //! a particular clear completed. Consumers own viewport freshness, copy-mode,
@@ -120,6 +123,16 @@ fn rule(line: &str) -> bool {
     line.chars().count() >= 8 && line.chars().all(|c| c == '─')
 }
 
+fn working_border(upper: &str, lower: &str) -> bool {
+    upper
+        .strip_prefix("── ")
+        .and_then(|s| s.split_once(" Working "))
+        .is_some_and(|(frame, rest)| {
+            frame.chars().count() == 1 && "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(frame) && rule(rest)
+        })
+        && upper.chars().count() == lower.chars().count()
+}
+
 fn update_notice(block: &[&str]) -> bool {
     matches!(block, [upper, "Update Available", message, changelog, lower]
         if rule(upper)
@@ -195,6 +208,11 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
     // Every earlier border needs its own rendered-notice proof: a pasted
     // rule can masquerade as the editor top, even after otherwise valid startup.
     let history = lines.get(..top)?;
+    // A later pasted rule cannot hide the real Working border. Real pi themes
+    // also use colored, nonfaint borders, so faintness cannot prove the top.
+    if styled.is_some() && history.iter().any(|line| working_border(line, lower)) {
+        return None;
+    }
     if history.contains(lower)
         && !styled.map_or_else(
             || startup_only(history),
@@ -206,14 +224,7 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
     let upper = *lines.get(top)?;
     let turn = if upper == *lower {
         TurnState::NotRunning
-    } else if upper
-        .strip_prefix("── ")
-        .and_then(|s| s.split_once(" Working "))
-        .is_some_and(|(frame, rest)| {
-            frame.chars().count() == 1 && "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(frame) && rule(rest)
-        })
-        && upper.chars().count() == lower.chars().count()
-    {
+    } else if working_border(upper, lower) {
         TurnState::Running
     } else {
         return None;

@@ -50,12 +50,15 @@ const FORWARDED_EVENTS = [
 	"session_start",
 	"session_shutdown",
 	"agent_start",
-	"agent_end",
+	// pi 1.5.2+: agent_end may precede recovery or continuation.
+	"agent_settled",
 	"tool_call",
 	"tool_execution_end",
 	"model_select",
 	"input",
 	"session_before_compact",
+	"session_compact",
+	"session_compact_failed",
 	// `context` frames carry the session totals and the window that
 	// drive the TUI's cost + context-percentage display. The full
 	// conversation stays in pi: atmd reads the envelope's usage/model.
@@ -509,6 +512,7 @@ export default function (pi: ExtensionAPI): void {
 				const ctxAny = ctx as UsageContext & {
 					sessionManager?: { getSessionId?: () => string };
 					model?: unknown;
+					isIdle?: () => boolean;
 				};
 				cachedSessionId = ctxAny.sessionManager?.getSessionId?.() || cachedSessionId;
 				// Only pi's model_select carries the model, and never at
@@ -526,11 +530,17 @@ export default function (pi: ExtensionAPI): void {
 					uiPatched = patchUiSelectOnce(ctx, () => cachedSessionId);
 				}
 				const counted = eventName === "context" || eventName === "turn_end";
+				const compaction = eventName === "session_before_compact" || eventName === "session_compact" || eventName === "session_compact_failed";
+				const reason = (payload as { reason?: string } | null)?.reason;
+				// A queued turn can start before an earlier async failure handler finishes.
+				// Never let that old manual failure clear the newer running turn.
+				if (eventName === "session_compact_failed" && reason === "manual" && ctxAny.isIdle?.() === false) return;
 				const envelope = buildEnvelope(
 					eventName,
-					// Usage/model are in the envelope; these conversation
-					// bodies can exceed atmd's line limit and are not read.
-					counted || eventName === "agent_end" ? {} : withPickedModels(eventName, payload),
+					// Keep conversation/preparation/summary bodies in pi. Only
+					// manual compaction outcomes end work; auto outcomes await settled.
+					compaction ? { reason }
+						: counted || eventName === "agent_settled" ? {} : withPickedModels(eventName, payload),
 					cachedSessionId,
 					model,
 					counted ? usageSnapshot(ctxAny) : undefined,

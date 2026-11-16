@@ -87,6 +87,12 @@ pi keeps working unaffected.
 
 ## Forwarded events
 
+The runtime extension requires **pi 1.5.2 or later** for final settlement and
+compaction outcomes. Update `atmd` before installing this forwarder. The
+adapter still accepts `agent_end` from older installed forwarders; this
+extension no longer sends that low-level event because recovery or queued
+continuation may follow it.
+
 Only events that drive `LifecycleEvent` translation are forwarded
 (keeping wire traffic low):
 
@@ -95,12 +101,13 @@ Only events that drive `LifecycleEvent` translation are forwarded
 | `session_start`         | → `LifecycleEvent::SessionStart`                      |
 | `session_shutdown`      | → `LifecycleEvent::SessionEnd`                        |
 | `agent_start`           | → `LifecycleEvent::WorkingStart`                      |
-| `agent_end`             | → `LifecycleEvent::WorkingEnd` (payload cut to `{}`)   |
+| `agent_settled`         | → `LifecycleEvent::WorkingEnd`, after automatic continuation/recovery finishes (payload cut to `{}`) |
 | `tool_call`             | → `LifecycleEvent::ToolCallStart` (or `NeedsInput` when amplike's permission gate triggers via `ctx.ui.select`) |
 | `tool_execution_end`    | → `LifecycleEvent::ToolCallEnd`                       |
 | `model_select`          | → `LifecycleEvent::ProviderModelChange` (`model` and `previousModel` cut to `{id, provider, contextWindow}`) |
 | `input` (interactive)   | → `LifecycleEvent::PromptSubmit`                      |
-| `session_before_compact`| → `LifecycleEvent::ContextCompactStart`               |
+| `session_before_compact`| → `LifecycleEvent::ContextCompactStart` (payload cut to `{reason}`) |
+| `session_compact`, `session_compact_failed` | → `LifecycleEvent::Idle` for `reason: "manual"` only (payload cut to `{reason}`) |
 | `context`               | → `LifecycleEvent::ContextUpdate {tokens, cost, context window}`, before each request (payload cut to `{}`) |
 | `turn_end`              | → `LifecycleEvent::ContextUpdate`, after each reply is saved (payload cut to `{}`) |
 
@@ -115,24 +122,45 @@ assistant message in the session file, with `contextTokens` the size
 behind the footer's context percentage. pi prices each reply on its own,
 so atm takes the session's cost from this snapshot, not from a message.
 
-`context`, `turn_end` and `agent_end` send `{}` bodies rather than their
-conversation messages, replies and tool results. These bodies can exceed
-atmd's 1 MiB input-line limit and close the forwarder connection, losing
-the end-of-run signal. The envelope keeps session identity, pid, pane and
-model, plus `usage` on `context`/`turn_end`; the adapter needs no message
-body for these events. Older extension frames remain supported.
+`context` and `turn_end` send `{}` instead of conversation messages,
+replies and tool results, which can exceed atmd's 1 MiB line limit and
+close the connection. `agent_settled` also sends `{}`: the adapter needs
+only the event name, not its aborted flag. Compaction events retain only
+`{reason}`, omitting preparation, history, summaries and error text.
+The envelope keeps session identity, pid, pane and model, plus `usage`
+on `context`/`turn_end`. Older extension frames remain supported.
 This is not a general frame-size cap: other event bodies can still be large,
-and delivery remains best-effort during outages. It does not add heartbeat,
-resynchronization or final-idle detection (`agent_settled`).
+and delivery remains best-effort during outages. It does not add heartbeat
+or idle reconnect resynchronization.
 
 Maintainers can run the socket-level frame tests without pi installed:
-`node --disable-warning=ExperimentalWarning --test tests/pi_event_frames.mjs`
+`node --disable-warning=ExperimentalWarning --test tests/pi_event_frames.mjs tests/pi_turn_lifecycle.mjs`
 from the repository root (Node 24).
 
 High-frequency events (`message_update`, `before_provider_request`,
 `turn_start`) and duplicates of forwarded events
 (`tool_execution_start`, `tool_result`) are **not** subscribed — the
 daemon-side adapter would suppress them anyway.
+
+Manual compaction has no agent settlement event: its success, failure or
+cancellation notification ends the compaction. A manual failure is not
+forwarded when current `ctx.isIdle()` is false: an earlier asynchronous
+failure handler can yield while a queued prompt starts a new run. Idle
+failures/cancellations and manual success are unchanged. Automatic compaction outcomes
+never imply idle, even with `willRetry: false`; final `agent_settled` does.
+The manual success notification precedes pi clearing its compaction flag,
+so later asynchronous completion handlers can still be finishing.
+
+In 0.4.1, interactive `input` reports one raw-text `PromptSubmit` for
+receipts and turn accounting, without an idle correction. The pre-run idle
+snapshot correction was reverted because it counted the start-line turn
+twice and could loop automatic handover. Atomic primary-plus-derived
+publication is deferred to stage 2.
+
+An input consumed by a later extension handler can still leave the row
+Working without an agent run. A consumer before pi-atm short-circuits it
+without an input frame; busy input does not clear work. Idle reconnect
+registration and standalone-dialog resolution remain separate gaps.
 
 ## Permission-gate integration
 

@@ -1,9 +1,12 @@
 //! Task RPC facade over the sole organisation writer.
 //!
 //! Mutation and notification enqueue are two durable operations, not a transaction.
-//! A finite worker retains responsibility when its RPC waiter disappears. A daemon
-//! death between the writes can leave a task without its automatic message; inspect
-//! the task and inbox before repairing it. Replay never re-emits old notifications.
+//! A finite worker retains responsibility when its RPC waiter times out or
+//! disappears, including a late organisation receipt. The actor's bounded FIFO
+//! and five-second appends finish that wait or close its reply. Daemon death,
+//! composition failure or an unconfirmed enqueue can still leave a task without
+//! its automatic message; inspect the task and inbox before repairing it.
+//! Replay never re-emits old notifications.
 //! Delivery itself belongs exclusively to the existing confirmed-message runtime.
 
 use super::{
@@ -33,7 +36,7 @@ pub use super::task_methods::{
 };
 
 pub(super) const PAGE_BYTES: usize = 512 * 1024;
-const MUTATION_BUDGET: Duration = Duration::from_secs(25);
+const MUTATION_BUDGET: Duration = Duration::from_secs(6);
 const READ_BUDGET: Duration = Duration::from_secs(8);
 
 #[derive(Debug, thiserror::Error)]

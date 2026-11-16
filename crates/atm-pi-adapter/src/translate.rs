@@ -12,13 +12,15 @@
 //! | `session_start`         | `SessionStart { source: reason }`             |
 //! | `session_shutdown`      | `SessionEnd { reason }`                       |
 //! | `agent_start`           | `WorkingStart`                                |
-//! | `agent_end`             | `WorkingEnd`                                  |
+//! | `agent_settled`         | `WorkingEnd`                                  |
+//! | `agent_end` (legacy forwarders only) | `WorkingEnd`                        |
 //! | `input` (interactive)   | `PromptSubmit { prompt: text }`               |
 //! | `tool_execution_start`  | (suppressed — `tool_call` is the canonical signal) |
 //! | `tool_call`             | `ToolCallStart` *or* `NeedsInput{PermissionGate}` |
 //! | `tool_execution_end`    | `ToolCallEnd { is_error }`                    |
 //! | `tool_result`           | (suppressed — `tool_execution_end` is canonical) |
 //! | `session_before_compact`| `ContextCompactStart`                         |
+//! | `session_compact` / `session_compact_failed` (manual) | `Idle`             |
 //! | `model_select`          | `ProviderModelChange { provider, model }`     |
 //! | `context`, `turn_end`   | `ContextUpdate` from pi-atm's usage snapshot  |
 //!
@@ -180,7 +182,7 @@ impl RawPiEvent {
                 reason: p.reason.clone(),
             },
             PiEventType::AgentStart => LifecycleEvent::WorkingStart,
-            PiEventType::AgentEnd => LifecycleEvent::WorkingEnd,
+            PiEventType::AgentEnd | PiEventType::AgentSettled => LifecycleEvent::WorkingEnd,
 
             PiEventType::Input => match p.source.as_deref() {
                 Some("interactive") => LifecycleEvent::PromptSubmit {
@@ -226,6 +228,15 @@ impl RawPiEvent {
 
             PiEventType::SessionBeforeCompact => {
                 LifecycleEvent::ContextCompactStart { trigger: None }
+            }
+
+            // Manual compaction has no agent_settled. Automatic compaction
+            // may retry or continue, so its outcomes must await settlement.
+            PiEventType::SessionCompact | PiEventType::SessionCompactFailed => {
+                if p.reason.as_deref() != Some("manual") {
+                    return None;
+                }
+                LifecycleEvent::Idle
             }
 
             PiEventType::ModelSelect => LifecycleEvent::ProviderModelChange {
@@ -302,7 +313,6 @@ impl RawPiEvent {
             | PiEventType::ToolExecutionUpdate
             | PiEventType::SessionBeforeSwitch
             | PiEventType::SessionBeforeFork
-            | PiEventType::SessionCompact
             | PiEventType::SessionBeforeTree
             | PiEventType::SessionTree
             | PiEventType::ResourcesDiscover
@@ -601,6 +611,52 @@ mod tests {
             raw(PiEventType::AgentEnd, PiPayload::default()).to_lifecycle_event(),
             Some(LifecycleEvent::WorkingEnd)
         );
+    }
+
+    #[test]
+    fn pi_1_5_2_terminal_mapping() {
+        // Captured: pi 1.5.2, 2026-11-16, sealed interactive PTY/local
+        // static provider, extension callbacks and private atmd socket tap.
+        let mut settled = 0;
+        let mut manual = 0;
+        let mut automatic = 0;
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for line in include_str!("../tests/fixtures/pi_turn_events_1.5.2.jsonl").lines() {
+            let capture: Value = serde_json::from_str(line).unwrap();
+            let name = capture["event"].as_str().unwrap();
+            let expected = match name {
+                "agent_settled" => {
+                    settled += 1;
+                    Some(LifecycleEvent::WorkingEnd)
+                }
+                "session_compact" | "session_compact_failed" => {
+                    if capture["payload"]["reason"] == "manual" {
+                        manual += 1;
+                        Some(LifecycleEvent::Idle)
+                    } else {
+                        automatic += 1;
+                        None
+                    }
+                }
+                _ => continue,
+            };
+            let event: RawPiEvent = serde_json::from_value(capture).unwrap();
+            actual.push((event.event.as_str().to_owned(), event.to_lifecycle_event()));
+            wanted.push((event.event.as_str().to_owned(), expected));
+        }
+        assert!(settled > 0 && manual > 0 && automatic > 0);
+        assert_eq!(actual, wanted);
+        // Synthetic: absent/unknown reasons must not end an automatic run.
+        for name in ["session_compact", "session_compact_failed"] {
+            for reason in [Value::Null, Value::String("future".into())] {
+                let event: RawPiEvent = serde_json::from_value(serde_json::json!({
+                    "event": name, "payload": {"reason": reason}
+                }))
+                .unwrap();
+                assert_eq!(event.to_lifecycle_event(), None);
+            }
+        }
     }
 
     #[test]

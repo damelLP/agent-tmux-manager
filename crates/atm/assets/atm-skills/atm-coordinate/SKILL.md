@@ -7,6 +7,10 @@ disable-model-invocation: true
 
 # atm coordinator
 
+**Legacy unnamed-pane workflow.** For a bound named lead use
+[atm-lead](../atm-lead/SKILL.md) instead; do not mix its durable task/message
+protocol with this pane-driven loop. Both skills remain installed.
+
 You coordinate implementer agents that run in other tmux panes. You and the
 user split the work into tasks. You send each task to an implementer, wait for
 it, read its report and review the work. Do all of it through `atm`. When atm
@@ -57,9 +61,8 @@ in backticks. Write an apostrophe as `'\''`.
    `/skill:atm-implement` or `$atm-implement`) as `--prompt`, in single
    quotes, and wait (step 3) in the same command:
    `pane=$(atm spawn -H <harness> -w <dir> --prompt '<invoke> [--profile <name>] <brief file>') && bash <this skill's folder>/scripts/atm-wait "$pane"`.
-   Only `claude`, `pi` and `codex` take `--prompt`, and a `codex` one needs
-   `--no-daemon` (see the reference); for others, spawn, wait for the input
-   box, then send. If `atm-wait` prints `GONE` within seconds, peek: a
+   Only `claude`, `pi` and `codex` take `--prompt`; for others, spawn, wait
+   for the input box, then send. If `atm-wait` prints `GONE` within seconds, peek: a
    startup dialog (trust this folder?) holds the prompt until the user
    answers it, so run `atm-wait` again once they have; a harness still
    starting needs another `atm-wait` at once. If you are Codex, run as

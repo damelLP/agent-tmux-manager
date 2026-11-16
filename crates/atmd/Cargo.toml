@@ -22,6 +22,7 @@ path = "src/lib.rs"
 
 [dependencies]
 atm-core = { workspace = true }
+atm-org = { workspace = true }
 atm-protocol = { workspace = true }
 atm-claude-adapter = { workspace = true }
 atm-pi-adapter = { workspace = true }
@@ -39,6 +40,8 @@ tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 clap = { workspace = true }
 procfs = { workspace = true }
+libc = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

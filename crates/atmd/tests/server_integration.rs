@@ -202,6 +202,7 @@ async fn test_handshake_success() {
         DaemonMessage::Connected {
             protocol_version,
             client_id,
+            ..
         } => {
             assert_eq!(protocol_version, ProtocolVersion::CURRENT);
             assert_eq!(client_id, "test-client");
@@ -209,6 +210,47 @@ async fn test_handshake_success() {
         other => panic!("Expected Connected, got {other:?}"),
     }
 
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_legacy_hook_connect_is_accepted() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    let response = timeout(Duration::from_secs(2), async {
+        // Literal atm-hook handshake with a fixed session ID and PID.
+        client.writer.write_all(concat!(
+            r#"{"protocol_version":{"major":1,"minor":0},"type":"connect","client_id":"hook-source-check-1063205"}"#,
+            "\n"
+        ).as_bytes()).await.unwrap();
+        client.recv().await
+    }).await.expect("legacy handshake before timeout");
+    assert!(
+        matches!(response, DaemonMessage::Connected { client_id, .. }
+        if client_id == "hook-source-check-1063205")
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_request_placeholder_returns_unknown_method_with_id() {
+    let server = TestServer::spawn().await;
+    let mut client = server.connect().await;
+    client.handshake(None).await;
+    timeout(Duration::from_secs(2), async {
+        client.writer.write_all(concat!(
+            r#"{"protocol_version":{"major":1,"minor":1},"type":"request","id":"r1","method":"x.y"}"#,
+            "\n"
+        ).as_bytes()).await.unwrap();
+        let mut line = String::new();
+        client.reader.read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response, serde_json::json!({
+            "type": "response",
+            "id": "r1",
+            "error": {"code": "unknown_method", "message": "no method 'x.y'"}
+        }));
+    }).await.expect("request response before timeout");
     server.shutdown().await;
 }
 
@@ -1199,7 +1241,7 @@ async fn test_e2e_notification_permission_prompt_becomes_needs_input() {
 /// must idle that session, not spawn a `waiter@<teammate>` child under
 /// it. Captured: Claude Code 2.1.288, 2026-10-04, a tmux-mode team run
 /// (see atm-claude-adapter's crate docs); paths rewritten to
-/// `/home/user` and `/tmp/claude-user`.
+/// `/home/user` and `/tmp/xxxxxxxxxxx`.
 #[tokio::test]
 async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
     let (server, registry) = TestServer::spawn_with_registry().await;
@@ -1230,7 +1272,7 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
         "session_id": "34d56705-0907-49a6-8785-e72091a93178",
         "transcript_path": "/home/user/.claude/projects/-home-user-project/34d56705-0907-49a6-8785-e72091a93178.jsonl",
         "cwd": "/home/user/project",
-        "scratchpad_dir": "/tmp/claude-user/-home-user-project/34d56705-0907-49a6-8785-e72091a93178/scratchpad",
+        "scratchpad_dir": "/tmp/xxxxxxxxxxx/-home-user-project/34d56705-0907-49a6-8785-e72091a93178/scratchpad",
         "permission_mode": "auto",
         "agent_type": "general-purpose",
         "hook_event_name": "TeammateIdle",
@@ -1264,7 +1306,7 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
 /// `offset_ms` from the first call. Captured: Claude Code 2.1.310,
 /// 2026-10-24, the run described under "Captured payloads" in
 /// atm-claude-adapter's crate docs; paths rewritten to `/home/user` and
-/// `/tmp/claude-user`. The payloads are those of atm-claude-adapter's
+/// `/tmp/xxxxxxxxxxx`. The payloads are those of atm-claude-adapter's
 /// `claude_tui_session_2.1.310.jsonl` and
 /// `claude_status_line_2.1.310.jsonl`; this file adds their order.
 const CLAUDE_INTERLEAVED: &str = "tests/fixtures/claude_tui_interleaved_2.1.310.jsonl";
@@ -1431,6 +1473,297 @@ async fn test_e2e_claude_captured_status_lines_leave_status_alone() {
     assert_eq!(seen, expected);
 
     server.shutdown().await;
+}
+
+/// Characterize committed parent state, including metadata-only traffic between
+/// steps. No readiness/shutdown sleeps: biased join polls server.run() through
+/// its synchronous bind before connecting; Pong and actor replies order writes.
+async fn assert_claude_boundary_steps(events: &[serde_json::Value], steps: &[(usize, &str)]) {
+    let temp = tempfile::tempdir().expect("boundary server dir");
+    let socket = temp.path().join("boundary.sock");
+    let registry = spawn_registry();
+    let cancel = CancellationToken::new();
+    let server = DaemonServer::new(socket.clone(), registry.clone(), cancel.clone());
+    let id = SessionId::new(events[steps[0].0]["session_id"].as_str().unwrap());
+    // Synthetic: retarget a real 2.1.310 metadata frame after each live row
+    // checkpoint. This checks that metadata cannot substitute for completion;
+    // it makes no claim about the real 2.1.325 status-line timing or schema.
+    let Some(statuses) =
+        captured_hook_payloads("atm-claude-adapter", "claude_status_line_2.1.310.jsonl")
+    else {
+        return;
+    };
+    let mut status = statuses[0].clone();
+    status["session_id"] = id.as_str().into();
+    status["cwd"] = events[steps[0].0]["cwd"].clone();
+    let replay = async {
+        let stream = UnixStream::connect(&socket).await.expect("bound server");
+        let mut client = TestClient::new(stream);
+        client.handshake(None).await;
+        let mut first_prompt = None;
+        for (seq, &(index, expected)) in (1_u64..).zip(steps) {
+            let payload = &events[index];
+            assert_eq!(payload["session_id"], id.as_str());
+            if payload["hook_event_name"] == "UserPromptSubmit" && first_prompt.is_none() {
+                first_prompt = payload["prompt"].as_str();
+            }
+            send_applied(
+                &mut client,
+                seq * 2,
+                ClientMessage::hook_event(payload.clone()),
+            )
+            .await;
+            let view = registry.get_session(id.clone()).await;
+            assert_eq!(
+                view.as_ref()
+                    .map_or("absent", |view| view.status_label.as_str()),
+                expected,
+                "{} step {index}: {}",
+                id.as_str(),
+                payload["hook_event_name"],
+            );
+            if let Some(view) = view {
+                assert_eq!(
+                    view.first_prompt.as_deref(),
+                    first_prompt,
+                    "first prompt is not replaced by wake/compaction"
+                );
+                send_applied(
+                    &mut client,
+                    seq * 2 + 1,
+                    ClientMessage::status_update(status.clone()),
+                )
+                .await;
+                assert_eq!(
+                    registry.get_session(id.clone()).await.unwrap().status_label,
+                    expected,
+                    "metadata cannot change the parent phase at step {index}"
+                );
+            }
+        }
+        drop(client);
+        cancel.cancel();
+    };
+    let (result, ()) = timeout(Duration::from_secs(60), async {
+        tokio::join!(biased; server.run(), replay)
+    })
+    .await
+    .expect("boundary replay hang guard");
+    result.expect("boundary server shutdown");
+}
+
+#[tokio::test]
+async fn test_e2e_claude_captured_turn_boundaries() {
+    // Captured: Claude Code 2.1.325, 2026-11-16, sealed rig stub mode.
+    // See adapter crate docs for the compact-only flag exception, actual
+    // request-body capability proof, and teardown SessionEnd provenance.
+    let Some(events) =
+        captured_hook_payloads("atm-claude-adapter", "claude_turn_boundaries_2.1.325.jsonl")
+    else {
+        return;
+    };
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "normal-session",
+            &["idle", "working", "working", "working", "idle", "absent"],
+        ),
+        (
+            "blocked-session",
+            &[
+                "idle", "working", "idle", "working", "working", "idle", "absent",
+            ],
+        ),
+        (
+            "async-session",
+            &[
+                "idle", "working", "working", "working", "idle", "working", "idle", "absent",
+            ],
+        ),
+        (
+            "compact-session",
+            &[
+                "idle", "working", "working", "working", "idle", "working", "working", "working",
+                "idle", "idle", "absent",
+            ],
+        ),
+    ];
+    for &(id, expected) in cases {
+        let calls: Vec<_> = events
+            .iter()
+            .filter(|event| event["session_id"] == id)
+            .cloned()
+            .collect();
+        assert_eq!(calls.len(), expected.len(), "{id}");
+        if id == "blocked-session" {
+            assert_eq!(calls[1]["prompt_id"], calls[2]["prompt_id"]);
+            assert_eq!(calls[2]["prompt_id"], calls[3]["prompt_id"]);
+            assert_eq!(calls[3]["prompt_id"], calls[5]["prompt_id"]);
+        }
+        if id == "async-session" {
+            assert_ne!(calls[1]["prompt_id"], calls[5]["prompt_id"]);
+            assert_eq!(calls[5]["prompt_id"], calls[6]["prompt_id"]);
+        }
+        if id == "compact-session" {
+            assert_ne!(calls[1]["prompt_id"], calls[5]["prompt_id"]);
+            assert_eq!(calls[5]["prompt_id"], calls[8]["prompt_id"]);
+            assert_eq!(calls[8]["prompt_id"], calls[9]["prompt_id"]);
+        }
+        let steps: Vec<_> = expected.iter().copied().enumerate().collect();
+        assert_claude_boundary_steps(&calls, &steps).await;
+    }
+}
+
+#[tokio::test]
+async fn late_parent_tool_after_stop_reopens_working() {
+    // Captured: Claude Code 2.1.310, 2026-10-24, sealed TUI/fake Messages API
+    // (adapter crate docs). Synthetic: reorder parent tool ends/starts after
+    // Stop; these were NOT captured arriving late after an irrevocable end.
+    let Some(old) =
+        captured_hook_payloads("atm-claude-adapter", "claude_tui_session_2.1.310.jsonl")
+    else {
+        return;
+    };
+    assert_eq!(old[1]["prompt_id"], old[6]["prompt_id"]);
+    assert_eq!(old[2]["tool_use_id"], old[5]["tool_use_id"]);
+    let cases: &[&[(usize, &str)]] = &[
+        &[
+            (0, "idle"),
+            (1, "working"),
+            (2, "working"),
+            (6, "idle"),
+            (5, "working"),
+        ],
+        &[
+            (0, "idle"),
+            (7, "working"),
+            (8, "working"),
+            (12, "idle"),
+            (11, "working"),
+        ],
+        &[(0, "idle"), (1, "working"), (6, "idle"), (2, "working")],
+        // Synthetic child control: tagged child activity after a parent's
+        // Stop must not reactivate the parent, unlike an ordinary tool end.
+        &[
+            (0, "idle"),
+            (18, "idle"),
+            (17, "idle"),
+            (19, "idle"),
+            (20, "idle"),
+        ],
+    ];
+    for steps in cases {
+        assert_claude_boundary_steps(&old, steps).await;
+    }
+    // Captured: Claude Code 2.1.325, 2026-11-16, sealed rig stub mode.
+    // Synthetic: deliver this normal turn's PostToolUse after its Stop.
+    let Some(current) =
+        captured_hook_payloads("atm-claude-adapter", "claude_turn_boundaries_2.1.325.jsonl")
+    else {
+        return;
+    };
+    assert_claude_boundary_steps(
+        &current,
+        &[
+            (0, "idle"),
+            (1, "working"),
+            (2, "working"),
+            (4, "idle"),
+            (3, "working"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wake_requires_its_own_terminal() {
+    // Captured: Claude Code 2.1.310, 2026-10-24, sealed TUI/fake Messages API.
+    // Synthetic: omit the wake terminal while status/old child traffic arrives,
+    // then deliver it. The original historical wake did have this final Stop.
+    let Some(old) =
+        captured_hook_payloads("atm-claude-adapter", "claude_tui_session_2.1.310.jsonl")
+    else {
+        return;
+    };
+    assert!(old[21]["prompt"]
+        .as_str()
+        .unwrap()
+        .starts_with("<task-notification>"));
+    assert_ne!(old[18]["prompt_id"], old[21]["prompt_id"]);
+    assert_eq!(old[21]["prompt_id"], old[22]["prompt_id"]);
+    assert_claude_boundary_steps(
+        &old,
+        &[
+            (0, "idle"),
+            (18, "idle"),
+            (21, "working"),
+            (20, "working"),
+            (22, "idle"),
+        ],
+    )
+    .await;
+    // Captured: Claude Code 2.1.325, 2026-11-16, sealed rig stub mode.
+    // Synthetic: withhold the real configured asyncRewake turn's terminal
+    // until metadata has demonstrably left its new prompt Working.
+    let Some(current) =
+        captured_hook_payloads("atm-claude-adapter", "claude_turn_boundaries_2.1.325.jsonl")
+    else {
+        return;
+    };
+    let calls: Vec<_> = current
+        .into_iter()
+        .filter(|event| event["session_id"] == "async-session")
+        .collect();
+    assert_claude_boundary_steps(
+        &calls,
+        &[
+            (0, "idle"),
+            (1, "working"),
+            (4, "idle"),
+            (5, "working"),
+            (6, "idle"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn manual_compact_without_completion_stays_working() {
+    // Captured: Claude Code 2.1.310, 2026-10-24, sealed TUI/fake Messages API.
+    // Synthetic: omit SessionStart until after compactor/status traffic.
+    let Some(old) =
+        captured_hook_payloads("atm-claude-adapter", "claude_tui_session_2.1.310.jsonl")
+    else {
+        return;
+    };
+    assert_claude_boundary_steps(
+        &old,
+        &[(0, "idle"), (24, "working"), (25, "working"), (26, "idle")],
+    )
+    .await;
+    // Captured: Claude Code 2.1.325, 2026-11-16, sealed rig stub mode.
+    // Synthetic: withhold compact SessionStart, deliver the real PostCompact,
+    // then release SessionStart. Today PostCompact is suppressed, not Idle.
+    let Some(current) =
+        captured_hook_payloads("atm-claude-adapter", "claude_turn_boundaries_2.1.325.jsonl")
+    else {
+        return;
+    };
+    let calls: Vec<_> = current
+        .into_iter()
+        .filter(|event| event["session_id"] == "compact-session")
+        .collect();
+    assert_claude_boundary_steps(
+        &calls,
+        &[
+            (0, "idle"),
+            (5, "working"),
+            (6, "working"),
+            (7, "working"),
+            (9, "working"),
+            (8, "idle"),
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2111,9 +2444,9 @@ async fn assert_no_sessions(registry: &atmd::registry::RegistryHandle) {
 async fn test_e2e_pi_captured_run_upgrades_pending_session() {
     // Discovery registers an agent it recognizes as `pending-<pid>`.
     // pi-atm's first frame names the session, and atmd renames that row
-    // rather than adding a second one. (Discovery can't see pi 0.73.1, see
-    // atm-pi-adapter's Known gaps, so today pi's row starts at that first
-    // frame, as in the new-session test below.)
+    // rather than adding a second one. (A pi that starts after atmd is not
+    // discovered first: its row starts at that first frame, as in the
+    // new-session test below.)
     let Some(events) = captured_pi_events("pi_tool_run_0.73.1.jsonl") else {
         return;
     };
@@ -2216,21 +2549,48 @@ async fn test_e2e_pi_captured_session_cost_is_cumulative() {
     assert_eq!(last["event"], "session_shutdown");
 
     let (server, registry) = TestServer::spawn_with_registry().await;
+    let mut updates = registry.subscribe();
     let mut client = server.connect().await;
     client.handshake(None).await;
-    for event in rest {
-        client.send(ClientMessage::pi_event(event.clone())).await;
-    }
+    timeout(Duration::from_secs(60), async {
+        for event in rest {
+            client.send(ClientMessage::pi_event(event.clone())).await;
+        }
+        // The same connection handles frames in order: Pong is a barrier
+        // after every lifecycle and derived metadata apply, not a delay.
+        client.send(ClientMessage::ping(1)).await;
+        assert!(matches!(
+            client.recv().await,
+            DaemonMessage::Pong { seq: 1, .. }
+        ));
+    })
+    .await
+    .expect("captured pi frames applied");
 
-    let done = |s: &[SessionView]| matches!(s, [one] if one.cost_usd == 0.01065);
-    let sessions = sessions_when(&registry, done).await;
-    let shown: Vec<(f64, &str)> = sessions
+    let sessions = registry.get_all_sessions().await;
+    let shown: Vec<(&str, f64, &str)> = sessions
         .iter()
-        .map(|s| (s.cost_usd, s.context_display.as_str()))
+        .map(|s| (s.model.as_str(), s.cost_usd, s.context_display.as_str()))
         .collect();
-    assert_eq!(shown, [(0.01065, "3.8% (1.2K/32K)")]);
+    assert_eq!(shown, [("fake-b", 0.01065, "3.8% (1.2K/32K)")]);
+    let mut idle_costs = Vec::new();
+    while let Ok(event) = updates.try_recv() {
+        if let atmd::registry::SessionEvent::Updated { session } = event {
+            if session.status == atm_core::SessionStatus::Idle && session.cost_usd > 0.0 {
+                assert_eq!(session.model, "fake-b");
+                if idle_costs.last() != Some(&session.cost_usd) {
+                    idle_costs.push(session.cost_usd);
+                }
+            }
+        }
+    }
+    assert_eq!(idle_costs, [0.006975, 0.01065]);
 
-    server.shutdown().await;
+    server.cancel_token.cancel();
+    timeout(Duration::from_secs(60), server.run_task)
+        .await
+        .expect("server stops")
+        .unwrap();
 }
 
 // ============================================================================

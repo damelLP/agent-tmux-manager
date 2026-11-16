@@ -51,7 +51,7 @@
 //! another turn; added in ada96c5 on 2026-10-18. The other test payloads
 //! are hand-written (see `Synthetic:` there).
 
-use atm_core::{SessionDomain, StatusLineData};
+use atm_core::{ContextUsage, LifecycleEvent, SessionDomain, StatusLineData, TokenCount};
 use serde::Deserialize;
 
 /// Raw status line JSON structure from Claude Code.
@@ -148,6 +148,31 @@ pub struct RawCurrentUsage {
 }
 
 impl RawStatusLine {
+    /// Explicit measurements for accounting, preserving missing versus zero.
+    /// Captured: Claude Code 2.1.310, 2026-10-24, status-line stdin fixtures.
+    /// Unlike the cockpit mapping, never supplies a default context window.
+    #[must_use]
+    pub fn accounting_usage(&self) -> Option<LifecycleEvent> {
+        let context = self.context_window.as_ref();
+        let current_tokens = context.and_then(|c| c.current_usage.as_ref()).map(|u| {
+            ContextUsage {
+                current_input_tokens: TokenCount::new(u.input_tokens),
+                cache_creation_tokens: TokenCount::new(u.cache_creation_input_tokens),
+                cache_read_tokens: TokenCount::new(u.cache_read_input_tokens),
+                ..ContextUsage::default()
+            }
+            .context_tokens()
+            .as_u64()
+        });
+        let cost_usd = self.cost.as_ref().map(|cost| cost.total_cost_usd);
+        (current_tokens.is_some() || cost_usd.is_some()).then_some(LifecycleEvent::ContextUpdate {
+            tokens: None,
+            current_tokens,
+            context_window_size: context.map(|c| c.context_window_size).filter(|v| *v > 0),
+            cost_usd,
+        })
+    }
+
     /// Converts raw JSON data to a StatusLineData struct.
     ///
     /// Always `Some`: an absent or empty model id maps to "", which core
@@ -206,6 +231,24 @@ impl RawStatusLine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accounting_does_not_turn_missing_fields_into_reported_zero() {
+        // Synthetic: partial status line versus genuine zero cost/current usage.
+        let raw: super::RawStatusLine =
+            serde_json::from_value(serde_json::json!({"session_id":"s"})).unwrap();
+        assert!(raw.accounting_usage().is_none());
+        let raw: super::RawStatusLine = serde_json::from_value(serde_json::json!({"session_id":"s", "cost":{"total_cost_usd":0,"total_duration_ms":0}, "context_window":{"context_window_size":1000,"current_usage":{"input_tokens":0}}})).unwrap();
+        assert_eq!(
+            raw.accounting_usage(),
+            Some(atm_core::LifecycleEvent::ContextUpdate {
+                tokens: None,
+                current_tokens: Some(0),
+                context_window_size: Some(1000),
+                cost_usd: Some(0.0)
+            })
+        );
+    }
+
     use super::*;
     use atm_core::Model;
 

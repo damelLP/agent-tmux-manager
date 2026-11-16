@@ -1,0 +1,4 @@
+[
+  {"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"listed","method":"task.create","params":{"title":"Listed measure","measure":{"kind":"mechanical","command":"check"}},"from_pane":"%7"},"success":true},
+  {"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"unlisted","method":"task.create","params":{"title":"Unlisted measure","measure":{"kind":"mechanical","command":"other"}},"from_pane":"%7"},"error":"refused"}
+]

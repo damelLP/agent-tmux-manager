@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"split","method":"session.spawn","params":{"target_pane":"%7","caller_pane_missing":false,"direction":"below","size":"50%"}},"response":{"type":"response","id":"split","result":{"pane":"%42"}},"ignore":[]}

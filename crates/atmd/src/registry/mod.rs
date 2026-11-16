@@ -38,7 +38,9 @@ mod handle;
 mod infra;
 
 pub use actor::{RegistryActor, MAX_SESSIONS};
-pub use commands::{RegistryCommand, RegistryError, RemovalReason, SessionEvent};
+pub use commands::{
+    AcceptedStart, PaneSession, RegistryCommand, RegistryError, RemovalReason, SessionEvent,
+};
 pub use handle::RegistryHandle;
 
 /// Channel buffer sizes

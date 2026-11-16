@@ -1,0 +1,11 @@
+[
+  {"name":"create","key":"kind","value":"unknown","field":"kind","args":["task","create","New","--measure","{\"kind\":\"owner\"}","--kind","future_kind"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: kind must be known"}}},
+  {"name":"create","key":"measure","value":{"kind":"unknown"},"field":"measure.kind","args":["task","create","New","--measure","{\"kind\":\"future_measure\",\"data\":42}"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: measure.kind must be known"}}},
+  {"name":"create","key":"files","value":[{"path":"file","kind":"unknown","note":null}],"field":"file.kind","args":["task","create","New","--measure","{\"kind\":\"owner\"}","--file","{\"path\":\"file\",\"kind\":\"future_file\"}"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: file.kind must be known"}}},
+  {"name":"attach","key":"file","value":{"path":"file","kind":"unknown","note":null},"field":"file.kind","args":["task","attach","t6","file","--kind","future_file"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: file.kind must be known"}}},
+  {"name":"submit","key":"what","value":"unknown","field":"what","args":["task","submit","t6","--what","future_submission"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: what must be known"}}},
+  {"name":"verdict","key":"verdict","value":"unknown","field":"verdict","args":["task","verdict","t6","future_verdict"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: verdict must be known"}}},
+  {"name":"set_state","key":"state","value":"unknown","field":"state","args":["task","set-state","t6","future_state"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: state must be open, working, waiting, blocked or cancelled; use the corresponding task method for other transitions"}}},
+  {"name":"list","key":"state","value":"unknown","field":"state","args":["task","list","--state","future_state"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: state must be known"}}},
+  {"name":"list","key":"kind","value":"unknown","field":"kind","args":["task","list","--kind","future_kind"],"reply":{"error":{"code":"invalid_params","message":"invalid task parameters: kind must be known"}}}
+]

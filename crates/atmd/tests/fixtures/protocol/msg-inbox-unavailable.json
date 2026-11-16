@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"msg-inbox-unavailable","method":"msg.inbox","params":null},
+  "response": {"type":"response","id":"msg-inbox-unavailable","error":{"code":"unavailable","message":"message service unavailable: confirmed-message operations are not configured"}},
+  "ignore": []
+}

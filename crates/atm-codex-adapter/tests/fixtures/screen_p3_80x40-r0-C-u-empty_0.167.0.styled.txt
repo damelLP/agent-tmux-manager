@@ -1,0 +1,41 @@
+Captured: codex-cli 0.167.0, 2026-11-14, sealed loopback-only private tmux capture-pane -p -e -N; empty.
+                    
+  [38;2;99;168;248m>_ [1m[39mOpenAI Codex[0;2m (v0.167.0)[0m            
+     [2m/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxx[0m    
+                    
+[2m  To get started, describe a task or try one of these commands:[0m                 
+                    
+  /init[2m - create an AGENTS.md file with instructions for Codex[0m                  
+  /status[2m - show current session configuration[0m                                  
+  /permissions[2m - choose what Codex is allowed to do[0m                             
+  /model[2m - choose what model and reasoning effort to use[0m                        
+  /review[2m - review any changes and find issues[0m                                  
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+[1m›[0m [2mAsk Codex to do anything[0m              
+                    
+  [38;2;246;226;183mgpt-5.4 default[39m · [38;2;171;223;167m/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxx[39m                             
+  [1m←[0m for agents · [1m?[0m for shortcuts        

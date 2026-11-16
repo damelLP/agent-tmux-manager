@@ -7,6 +7,9 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
+#[path = "support/control.rs"]
+mod control_support;
+
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -19,6 +22,7 @@ fn atmd(dir: &Path) -> Command {
     cmd.arg("start")
         .env("ATM_SOCKET", dir.join("atmd.sock"))
         .env("XDG_STATE_HOME", dir.join("state"))
+        .env("ATM_STATE_DIR", dir.join("eventlog"))
         // atmd reads `[notify]` from atm's config.toml: never the developer's.
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("TMUX_TMPDIR", dir)
@@ -91,7 +95,10 @@ fn test_accept_errors_back_off() {
         });
     }
     let mut daemon = Daemon(cmd.spawn().expect("spawn atmd"));
-    assert!(wait_until(|| socket.exists()), "atmd never bound");
+    assert!(
+        wait_until(|| control_support::socket_is_ready(&socket)),
+        "atmd never accepted a connection"
+    );
 
     // Silent clients hold their descriptors until the 10s handshake
     // deadline, so the daemon runs out and the rest wait in the backlog.

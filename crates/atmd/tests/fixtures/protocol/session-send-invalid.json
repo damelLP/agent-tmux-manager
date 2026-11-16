@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"send-invalid","method":"session.send","params":{"target":"%7"}},
+  "response": {"type":"response","id":"send-invalid","error":{"code":"invalid_params","message":"missing field `text`"}},
+  "ignore": []
+}

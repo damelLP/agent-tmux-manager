@@ -17,9 +17,26 @@ use crate::client::resolve_socket_path;
 
 /// Returns the path to the daemon PID file.
 fn pid_file_path() -> PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("atm")
+    resolve_pid_file_path(
+        std::env::var("ATM_STATE_DIR").ok().as_deref(),
+        dirs::state_dir(),
+    )
+}
+
+// Keep this override/legacy fallback aligned with src/bin/atmd.rs. Event-log
+// storage has a separate resolver with different relative-XDG/HOME fallbacks.
+fn resolve_pid_file_path(
+    atm_state_dir: Option<&str>,
+    default_state_dir: Option<PathBuf>,
+) -> PathBuf {
+    atm_state_dir
+        .filter(|state| !state.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            default_state_dir
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("atm")
+        })
         .join("atmd.pid")
 }
 
@@ -113,23 +130,38 @@ fn spawn_daemon() -> std::io::Result<()> {
 /// Returns Ok(()) if daemon is running (or was started successfully).
 /// Returns Err with a message if daemon could not be started.
 pub fn ensure_daemon_running() -> Result<(), String> {
-    if is_daemon_running() {
+    ensure_ready(
+        is_daemon_running(),
+        || is_socket_listening(&resolve_socket_path()),
+        spawn_daemon,
+        || thread::sleep(Duration::from_millis(100)),
+    )
+}
+
+fn ensure_ready(
+    running: bool,
+    mut listening: impl FnMut() -> bool,
+    start: impl FnOnce() -> std::io::Result<()>,
+    mut wait: impl FnMut(),
+) -> Result<(), String> {
+    if listening() {
         debug!("Daemon already running");
         return Ok(());
     }
 
-    info!("Daemon not running, starting it...");
-
-    // Start the daemon
-    if let Err(e) = spawn_daemon() {
-        return Err(format!("Failed to start daemon: {e}"));
+    if !running {
+        info!("Daemon not running, starting it...");
+        if let Err(e) = start() {
+            return Err(format!("Failed to start daemon: {e}"));
+        }
     }
+    // A live PID may still be doing startup discovery. It is not readiness.
 
     // Wait for daemon to be ready (up to 3 seconds)
     for i in 0..30 {
-        thread::sleep(Duration::from_millis(100));
+        wait();
 
-        if is_daemon_running() {
+        if listening() {
             info!(attempts = i + 1, "Daemon started successfully");
             return Ok(());
         }
@@ -141,6 +173,89 @@ pub fn ensure_daemon_running() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Dropping override precedence, treating empty as a directory, or changing
+    // the legacy fallback would make the client address another daemon's PID.
+    #[test]
+    fn pid_path_override_and_legacy_defaults() {
+        for (override_dir, default_dir, expected) in [
+            (Some("/candidate"), Some("/state"), "/candidate/atmd.pid"),
+            (Some("relative"), Some("/state"), "relative/atmd.pid"),
+            (Some(""), Some("/state"), "/state/atm/atmd.pid"),
+            (None, Some("/state"), "/state/atm/atmd.pid"),
+            (None, None, "/tmp/atm/atmd.pid"),
+            (Some(""), None, "/tmp/atm/atmd.pid"),
+        ] {
+            assert_eq!(
+                resolve_pid_file_path(override_dir, default_dir.map(PathBuf::from)),
+                PathBuf::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn unset_override_preserves_the_existing_pid_path_byte_for_byte() {
+        let default = dirs::state_dir();
+        let legacy = default
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("atm")
+            .join("atmd.pid");
+        assert_eq!(
+            resolve_pid_file_path(None, default).as_os_str(),
+            legacy.as_os_str()
+        );
+    }
+
+    #[test]
+    fn readiness_requires_a_listener_even_when_the_pid_is_alive() {
+        use std::cell::{Cell, RefCell};
+        for running in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("delayed.sock");
+            let listener = RefCell::new(None);
+            let failed_probe = Cell::new(false);
+            let starts = Cell::new(0);
+            ensure_ready(
+                running,
+                || {
+                    let ready = is_socket_listening(&socket);
+                    if !ready {
+                        failed_probe.set(true);
+                    }
+                    ready
+                },
+                || {
+                    starts.set(starts.get() + 1);
+                    Ok(())
+                },
+                || {
+                    assert!(
+                        failed_probe.get(),
+                        "bind only after the first failed connection"
+                    );
+                    *listener.borrow_mut() =
+                        Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+                },
+            )
+            .unwrap();
+            assert!(
+                is_socket_listening(&socket),
+                "PID existence is not readiness"
+            );
+            assert_eq!(starts.get(), usize::from(!running));
+        }
+        let attempts = Cell::new(0);
+        let error = ensure_ready(
+            true,
+            || false,
+            || panic!("already starting"),
+            || attempts.set(attempts.get() + 1),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Daemon failed to start within 3 seconds");
+        assert_eq!(attempts.get(), 30);
+    }
 
     #[test]
     fn test_pid_file_path() {
@@ -167,12 +282,18 @@ mod tests {
         let socket = dir.path().join("atmd.sock");
         assert!(!is_socket_listening(&socket), "no socket file");
 
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-        assert!(is_socket_listening(&socket), "live listener");
-
-        // A crashed daemon leaves the socket file behind.
-        drop(listener);
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+        listener
+            .bind(&SockAddr::unix(&socket).unwrap())
+            .expect("bind");
+        // A bound, never-listened socket models a stale path without relying on
+        // drop closing the last descriptor while sibling tests may fork.
+        let _inherited_listener = listener.try_clone().unwrap();
+        assert!(socket.exists());
         assert!(!is_socket_listening(&socket), "stale socket file");
+
+        listener.listen(1).unwrap();
+        assert!(is_socket_listening(&socket), "live listener");
     }
 
     /// A stalled daemon whose backlog is full still counts, and the probe

@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"type","method":"session.spawn_type","params":{"pane":"%42","command":"printf probe;"}},"response":{"type":"response","id":"type","result":null},"ignore":[]}

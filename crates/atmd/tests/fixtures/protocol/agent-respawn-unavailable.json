@@ -1,0 +1,6 @@
+{
+  "agents_enabled": false,
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-respawn","method":"agent.respawn","params":{"agent":"project/lead"}},
+  "response": {"type":"response","id":"agent-respawn","error":{"code":"unavailable","message":"agent service unavailable: named-agent operations are not configured"}},
+  "ignore": []
+}

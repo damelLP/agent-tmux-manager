@@ -17,7 +17,7 @@ pub struct ProtocolVersion {
 
 impl ProtocolVersion {
     /// Current protocol version.
-    pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+    pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
     /// Creates a new ProtocolVersion.
     pub const fn new(major: u16, minor: u16) -> Self {

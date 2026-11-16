@@ -101,11 +101,15 @@ dependencies = [
 
 [[package]]
 name = "atm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atm-claude-adapter",
+ "atm-codex-adapter",
  "atm-core",
+ "atm-org",
+ "atm-pi-adapter",
  "atm-protocol",
  "atm-tmux",
  "atm-tui",
@@ -131,19 +135,21 @@ dependencies = [
 
 [[package]]
 name = "atm-claude-adapter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "atm-core",
+ "proptest",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "atm-codex-adapter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-core",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -151,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "atm-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -162,18 +168,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "atm-org"
+version = "0.4.0"
+dependencies = [
+ "atm-core",
+ "chrono",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "atm-pi-adapter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-core",
+ "proptest",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "atm-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "atm-core",
  "chrono",
@@ -185,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "atm-tmux"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -199,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "atm-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-codex-adapter",
@@ -225,16 +245,18 @@ dependencies = [
 
 [[package]]
 name = "atmd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-codex-adapter",
  "atm-core",
+ "atm-org",
  "atm-pi-adapter",
  "atm-protocol",
  "atm-tmux",
  "chrono",
  "clap",
+ "libc",
  "procfs",
  "serde",
  "serde_json",
@@ -246,6 +268,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

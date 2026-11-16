@@ -1,0 +1,2 @@
+Captured: codex-cli 0.167.0, 2026-11-14, display-message -p cursor_x,cursor_y (zero-based); poor.
+26,26; pane=100x30; cursor_flag=1

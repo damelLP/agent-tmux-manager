@@ -1,13 +1,13 @@
 //! `atm spawn`: which pane it splits, what it prints, and how `--prompt`
 //! reaches the harness's command line (#121, gap 1 of #130).
 //!
-//! `atm` runs with a cleared environment whose `PATH` holds only a
-//! stand-in `tmux`. The stand-in logs each call and answers like tmux:
+//! `atm` runs with a cleared environment and a forbidden `tmux` on PATH.
+//! A private real daemon owns the stand-in `tmux`, which logs calls and answers:
 //! `list-panes` lists an active `%1` in another session and the caller's
 //! inactive `%7` and `%9`, `display-message` gives the pane's path,
 //! `split-window` prints the new pane `%42`, and a split of any other pane
-//! fails with tmux's "can't find pane". Nothing reaches a real tmux server
-//! or harness: the typed command goes to the stand-in.
+//! fails with tmux's "can't find pane". All three spawn requests go through
+//! the daemon, but no real tmux server or harness runs the typed command.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
@@ -15,13 +15,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[path = "support/control.rs"]
+mod control_support;
+
 const STAND_IN_TMUX: &str = r#"#!/bin/sh
-echo "$*" >> 'DIR/tmux.log'
-# $1 is -u; the subcommand comes next.
-case $2 in
+[ "$1" = -u ] && shift
+if [ "$1" = -L ]; then shift; shift; fi
+echo "-u $*" >> 'DIR/tmux.log'
+case $1 in
   list-panes)
     printf '%%1\tother\t0\t100\t80\t24\t1\n%%7\tmine\t1\t101\t80\t24\t0\n%%9\tmine\t1\t102\t80\t24\t0\n' ;;
   display-message)
+    case "$*" in *'#{socket_path}'*) echo "$CONTROL_TEST_TMUX_SOCKET"; exit ;; esac
     # tmux 3.8 prints an empty line, rc 0, for a pane that is gone.
     case " $* " in
       *" -t %1 "*|*" -t %7 "*|*" -t %9 "*) echo /from/pane ;;
@@ -32,7 +37,7 @@ case $2 in
       *" -t %1 "*|*" -t %7 "*|*" -t %9 "*)
         if [ -e 'DIR/split-no-space' ]; then echo "no space for a new pane" >&2; exit 1; fi
         echo %42 ;;
-      *) echo "can't find pane: $4" >&2; exit 1 ;;
+      *) echo "can't find pane: $3" >&2; exit 1 ;;
     esac ;;
   send-keys)
     if [ -e 'DIR/fail-send-keys' ]; then echo "send-keys failed" >&2; exit 1; fi ;;
@@ -40,7 +45,19 @@ esac
 "#;
 
 /// A temp dir whose `path/` holds the stand-in `tmux`.
-fn rig() -> tempfile::TempDir {
+struct Rig {
+    // Drop the daemon before deleting its private state.
+    _daemon: control_support::Daemon,
+    dir: tempfile::TempDir,
+}
+
+impl Rig {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn rig() -> Rig {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("path");
     std::fs::create_dir_all(&path).expect("mkdir PATH dir");
@@ -48,7 +65,22 @@ fn rig() -> tempfile::TempDir {
     let script = STAND_IN_TMUX.replace("DIR", &dir.path().display().to_string());
     std::fs::write(&tmux, script).expect("write stand-in tmux");
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).expect("chmod tmux");
-    dir
+    let cli_path = dir.path().join("cli-path");
+    std::fs::create_dir(&cli_path).unwrap();
+    let forbidden = cli_path.join("tmux");
+    std::fs::write(
+        &forbidden,
+        "#!/bin/sh\necho 'CLI reached tmux' >&2\nexit 91\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&forbidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon =
+        control_support::Daemon::start(dir.path(), &path, Path::new(env!("CARGO_BIN_EXE_atmd")));
+    std::fs::write(dir.path().join("tmux.log"), "").unwrap();
+    Rig {
+        _daemon: daemon,
+        dir,
+    }
 }
 
 /// Runs `atm spawn <args>` inside a fake tmux client (`TMUX` set), with
@@ -61,10 +93,10 @@ fn spawn(dir: &Path, caller_pane: Option<&str>, args: &[&str]) -> Output {
 
 fn spawn_command(dir: &Path, caller_pane: Option<&str>, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atm"));
+    control_support::isolated(&mut cmd, dir);
     cmd.arg("spawn")
         .args(args)
-        .env_clear()
-        .env("PATH", dir.join("path"))
+        .env("PATH", dir.join("cli-path"))
         .env("HOME", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("XDG_STATE_HOME", dir.join("state"))
@@ -102,6 +134,81 @@ fn target_of(calls: &[String], subcommand: &str) -> Option<String> {
 
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn spawn_request_carries_callers_directory_separately_from_harness_cwd() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let caller = dir.path().join("caller");
+    std::fs::create_dir(&caller).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(dir.path().join("atmd.sock")).unwrap();
+    let expected = caller.clone();
+    let server_socket = dir
+        .path()
+        .join(format!("tmux-{}/control-test", unsafe { libc::getuid() }));
+    let peer = std::thread::spawn(move || {
+        for method in [
+            "session.spawn_prepare",
+            "session.spawn",
+            "session.spawn_type",
+        ] {
+            let (mut stream, mut read) = loop {
+                let mut ready = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut ready, 1, 30_000) },
+                    1,
+                    "client never connected"
+                );
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                    .unwrap();
+                let mut read = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if read.read_line(&mut line).unwrap() != 0 {
+                    break (stream, read);
+                }
+                // Startup probes open and close without a handshake.
+            };
+            writeln!(stream, "{}", serde_json::json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"test","methods":[method]})).unwrap();
+            let mut line = String::new();
+            read.read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], method);
+            assert_eq!(
+                request["params"]["caller_server"],
+                server_socket.to_str().unwrap()
+            );
+            let result = match method {
+                "session.spawn_prepare" => {
+                    serde_json::json!({"target_pane":"%7","cwd":"/from/pane","caller_pane_missing":false})
+                }
+                "session.spawn" => {
+                    assert_eq!(request["params"]["cwd"], expected.to_str().unwrap());
+                    serde_json::json!({"pane":"%42"})
+                }
+                _ => serde_json::Value::Null,
+            };
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({"type":"response","id":"r1","result":result})
+            )
+            .unwrap();
+        }
+    });
+    let out = spawn_command(dir.path(), Some("%7"), &[])
+        .current_dir(&caller)
+        .output()
+        .unwrap();
+    peer.join().unwrap();
+    assert!(out.status.success(), "{out:?}");
 }
 
 #[test]
@@ -281,6 +388,102 @@ fn assert_nothing_split(dir: &Path) {
     );
 }
 
+#[test]
+fn spawn_codex_requirements_survive_aliases_config_and_overrides() {
+    for (harness, configured, env, expected) in [
+        ("codex", false, vec![], "codex '--no-daemon'"),
+        ("codex-cli", false, vec![], "codex '--no-daemon'"),
+        ("codex-cli", true, vec![], "mise 'x' 'codex' '--no-daemon'"),
+        (
+            "codex",
+            true,
+            vec![("ATM_SPAWN_BIN", "/my stand-in")],
+            "'/my stand-in' '--no-daemon'",
+        ),
+        (
+            "codex-cli",
+            true,
+            vec![
+                ("ATM_SPAWN_BIN", "wrong"),
+                ("ATM_SPAWN_CODEX_BIN", "/my stand-in"),
+            ],
+            "'/my stand-in' '--no-daemon'",
+        ),
+        (
+            "codex",
+            true,
+            vec![("ATM_SPAWN_BIN", "mise"), ("ATM_SPAWN_ARGS", "x codex")],
+            "mise x codex '--no-daemon'",
+        ),
+        (
+            "codex-cli",
+            true,
+            vec![
+                ("ATM_SPAWN_CODEX_BIN", "mise"),
+                ("ATM_SPAWN_CODEX_ARGS", "x codex"),
+            ],
+            "mise x codex '--no-daemon'",
+        ),
+        (
+            "codex",
+            true,
+            vec![("ATM_SPAWN_ARGS", "--debug")],
+            "mise 'x' 'codex' --debug '--no-daemon'",
+        ),
+    ] {
+        let dir = rig();
+        if configured {
+            let config = dir.path().join("config/atm");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(
+                config.join("config.toml"),
+                "[harness.codex]\nbinary = 'mise'\ndefault_args = ['x', 'codex']\n",
+            )
+            .unwrap();
+        }
+        let out = spawn_command(
+            dir.path(),
+            Some("%7"),
+            &["-H", harness, "--prompt", "initial prompt"],
+        )
+        .envs(env)
+        .output()
+        .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            typed_command(dir.path()),
+            format!("cd '/from/pane' && {expected} 'initial prompt'")
+        );
+    }
+}
+
+#[test]
+fn spawn_counts_required_arguments_in_prompt_line_limit() {
+    for (cwd_len, succeeds) in [(3945, true), (3946, false)] {
+        let dir = rig();
+        let cwd = format!("/{}", "w".repeat(cwd_len - 1));
+        let out = spawn(
+            dir.path(),
+            Some("%7"),
+            &[
+                "-H",
+                "codex",
+                "-w",
+                &cwd,
+                "--prompt",
+                "/atm-implement /tmp/b.md",
+            ],
+        );
+        assert_eq!(out.status.success(), succeeds, "{out:?}");
+        if succeeds {
+            assert_eq!(typed_command(dir.path()).len(), 4000);
+        } else {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("4001 bytes"));
+            assert_nothing_split(dir.path());
+        }
+    }
+}
+
 /// Claude Code, pi and Codex take a first prompt as their last positional
 /// argument (verified 2026-11-05 against 2.1.318, 0.73.1 and 0.163.0). It
 /// goes last, after `ATM_SPAWN_*_ARGS` and `--model`, as one shell word.
@@ -310,16 +513,20 @@ fn spawn_puts_the_prompt_last_on_the_command_line() {
     );
 
     // Each harness's own skill call, as the coordinator sends it.
-    for (harness, prompt) in [
-        ("pi", "/skill:atm-implement --profile p /tmp/b.md"),
-        ("codex", "$atm-implement --profile p /tmp/b.md"),
+    for (harness, command, prompt) in [
+        ("pi", "pi", "/skill:atm-implement --profile p /tmp/b.md"),
+        (
+            "codex",
+            "codex '--no-daemon'",
+            "$atm-implement --profile p /tmp/b.md",
+        ),
     ] {
         let dir = rig();
         let out = spawn(dir.path(), Some("%7"), &["-H", harness, "--prompt", prompt]);
         assert!(out.status.success(), "atm spawn -H {harness}: {out:?}");
         assert_eq!(
             typed_command(dir.path()),
-            format!("cd '/from/pane' && {harness} '{prompt}'")
+            format!("cd '/from/pane' && {command} '{prompt}'")
         );
     }
 
@@ -462,6 +669,6 @@ fn spawn_refuses_a_one_word_or_dash_prompt_before_splitting() {
     assert!(out.status.success(), "atm spawn: {out:?}");
     assert_eq!(
         typed_command(dir.path()),
-        "cd '/from/pane' && codex '$atm-implement /tmp/b.md'"
+        "cd '/from/pane' && codex '--no-daemon' '$atm-implement /tmp/b.md'"
     );
 }

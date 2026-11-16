@@ -1,0 +1,1243 @@
+//! Synthetic neutral events: test correlation, not a vendor payload schema.
+use super::*;
+use crate::control::reservation::PaneId;
+use crate::org::messages::{MessageClock, MessageError};
+use atm_core::{Harness, LifecycleEvent, SessionId};
+use atm_org::{DeliveryReceipt, MessageId};
+use chrono::DateTime;
+use std::collections::HashSet;
+use tokio::time::Instant;
+
+fn evidence() -> MessageEvidence {
+    MessageEvidence::new(MessageClock::new(
+        Instant::now(),
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+    ))
+}
+fn id() -> MessageId {
+    "m123".parse().unwrap()
+}
+fn scope() -> AttemptScope {
+    AttemptScope {
+        message_id: id(),
+        attempt_seq: 124,
+        recipient: "demo/worker".parse().unwrap(),
+        pane: PaneId::parse("%7").unwrap(),
+        harness: Harness::Pi,
+        session_id: Some(SessionId::new("session")),
+        excluded_sessions: HashSet::new(),
+    }
+}
+const REFERENCE: &str = "[m123] Read: atm inbox --id m123";
+fn armed() -> MessageEvidence {
+    let evidence = evidence();
+    evidence.register(id(), REFERENCE.into()).unwrap();
+    evidence.arm(scope()).unwrap();
+    evidence
+}
+fn observe(e: &MessageEvidence, session: &str, pane: &str, harness: Harness, text: &str) {
+    e.observe(
+        &SessionId::new(session),
+        Some(pane),
+        harness,
+        &LifecycleEvent::PromptSubmit {
+            prompt: Some(text.into()),
+        },
+    )
+    .unwrap();
+}
+fn exact(e: &MessageEvidence) {
+    observe(e, "session", "%7", Harness::Pi, REFERENCE);
+}
+
+#[test]
+fn full_later_prompt_not_first_prompt_preview() {
+    let e = armed();
+    observe(
+        &e,
+        "session",
+        "%7",
+        Harness::Pi,
+        "an earlier prompt whose preview is irrelevant",
+    );
+    assert!(e.receipt(id()).unwrap().is_none());
+    exact(&e);
+    let receipt = e.receipt(id()).unwrap().unwrap();
+    assert_eq!(receipt.session_id.as_str(), "session");
+    assert_eq!(receipt.confirmation, "prompt_submit_exact_reference");
+}
+
+#[test]
+fn token_substring_and_body_mismatch_never_confirm() {
+    for text in [
+        "[m123]",
+        "body",
+        "[m123] Read: atm inbox --id m12",
+        " [m123] Read: atm inbox --id m123",
+        "[m123] Read: atm inbox --id m123\n",
+    ] {
+        let e = armed();
+        observe(&e, "session", "%7", Harness::Pi, text);
+        assert!(e.receipt(id()).unwrap().is_none(), "{text:?}");
+        assert!(e.snapshot(id()).unwrap().probably_landed);
+    }
+}
+
+#[test]
+fn wrong_pane_session_harness_and_pending_never_confirm() {
+    for (session, pane, harness) in [
+        ("other", "%7", Harness::Pi),
+        ("session", "%8", Harness::Pi),
+        ("session", "%7", Harness::Codex),
+        ("pending-42", "%7", Harness::Pi),
+    ] {
+        let e = armed();
+        observe(&e, session, pane, harness, REFERENCE);
+        let facts = e.snapshot(id()).unwrap();
+        assert!(facts.receipt.is_none());
+        // The reference was submitted somewhere: hold, never drop it.
+        assert!(facts.probably_landed, "{session} {pane} {harness:?}");
+    }
+    let e = armed();
+    e.observe(
+        &SessionId::new("session"),
+        None,
+        Harness::Pi,
+        &LifecycleEvent::PromptSubmit {
+            prompt: Some(REFERENCE.into()),
+        },
+    )
+    .unwrap();
+    assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn duplicate_exact_hooks_are_idempotent() {
+    let e = armed();
+    exact(&e);
+    let receipt = e.receipt(id()).unwrap().unwrap();
+    exact(&e);
+    assert_eq!(e.receipt(id()).unwrap(), Some(receipt.clone()));
+    let wrong = DeliveryReceipt {
+        session_id: SessionId::new("wrong"),
+        ..receipt.clone()
+    };
+    assert!(e.acknowledge(id(), &wrong).is_err());
+    assert_eq!(e.receipt(id()).unwrap(), Some(receipt.clone()));
+    e.acknowledge(id(), &receipt).unwrap();
+    e.acknowledge(id(), &receipt).unwrap();
+    assert!(matches!(e.receipt(id()), Err(MessageError::Unavailable(_))));
+}
+
+#[test]
+fn lazy_first_prompt_accepts_new_eligible_session_outside_baseline() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    let mut s = scope();
+    s.session_id = None;
+    s.excluded_sessions.insert(SessionId::new("old"));
+    e.arm(s).unwrap();
+    for session in ["old", "pending-42"] {
+        observe(&e, session, "%7", Harness::Pi, REFERENCE);
+        assert!(e.receipt(id()).unwrap().is_none());
+    }
+    observe(&e, "new", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(e.receipt(id()).unwrap().unwrap().session_id.as_str(), "new");
+}
+
+#[test]
+fn new_pane_occupant_is_not_old_attempt_evidence() {
+    let e = armed();
+    observe(&e, "replacement", "%7", Harness::Pi, REFERENCE);
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.receipt.is_none() && facts.probably_landed);
+    let lazy = evidence();
+    lazy.register(id(), REFERENCE.into()).unwrap();
+    lazy.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    lazy.observe(
+        &SessionId::new("first"),
+        Some("%7"),
+        Harness::Pi,
+        &LifecycleEvent::WorkingStart,
+    )
+    .unwrap();
+    observe(&lazy, "replacement", "%7", Harness::Pi, REFERENCE);
+    assert!(lazy.receipt(id()).unwrap().is_none());
+    observe(&lazy, "first", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        lazy.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "first"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn activity_before_arm_does_not_latch_and_after_arm_uses_receive_order() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.observe_activity(&SessionId::new("session"), Some("%7"))
+        .unwrap();
+    e.arm(scope()).unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // No clock advance: receive order, not a strictly increasing UTC test.
+    e.observe_activity(&SessionId::new("session"), Some("%7"))
+        .unwrap();
+    assert!(e.snapshot(id()).unwrap().probably_landed);
+    // Repeated arm of the same applied attempt must not erase evidence.
+    e.arm(scope()).unwrap();
+    assert!(e.snapshot(id()).unwrap().probably_landed);
+    assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn older_attempt_receipt_survives_new_arm_and_failure() {
+    let e = armed();
+    e.observe_activity(&SessionId::new("session"), Some("%7"))
+        .unwrap();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // No durable failure callback erases scopes; Failed is not receipt-terminal.
+    exact(&e);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "session"
+    );
+    e.arm(AttemptScope {
+        attempt_seq: 140,
+        ..scope()
+    })
+    .unwrap();
+    assert!(e.receipt(id()).unwrap().is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn coalesced_wake_retains_receipt() {
+    let e = armed();
+    let mut wake = e.subscribe();
+    exact(&e);
+    exact(&e);
+    // Two observations, one wake: the fact is in the store, not in the wake.
+    tokio::time::timeout(std::time::Duration::from_secs(60), wake.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!wake.has_changed().unwrap());
+    assert!(e.receipt(id()).unwrap().is_some());
+}
+
+#[test]
+fn capacity_refuses_without_evicting_or_disabling() {
+    for resource in ["messages", "scopes", "baseline"] {
+        let e = armed();
+        exact(&e);
+        let refused = match resource {
+            "messages" => (1..=MAX_MESSAGES)
+                .map(|n| {
+                    let id: MessageId = format!("m{}", n + 1000).parse().unwrap();
+                    e.register(id, crate::org::message_delivery::inbox_reference(id))
+                })
+                .find_map(Result::err),
+            "scopes" => (1..=MAX_SCOPES)
+                .map(|n| {
+                    e.arm(AttemptScope {
+                        attempt_seq: 124 + n as u64,
+                        ..scope()
+                    })
+                })
+                .find_map(Result::err),
+            _ => e
+                .arm(AttemptScope {
+                    attempt_seq: 125,
+                    excluded_sessions: (0..=MAX_SESSIONS)
+                        .map(|n| SessionId::new(format!("old-{n}")))
+                        .collect(),
+                    ..scope()
+                })
+                .err(),
+        };
+        assert!(
+            matches!(refused, Some(MessageError::Unavailable(_))),
+            "{resource}"
+        );
+        // The refusal is the caller's alone: nothing is evicted, and the
+        // retained confirmation stays readable.
+        assert!(e.receipt(id()).unwrap().is_some(), "{resource}");
+    }
+}
+
+#[test]
+fn poisoning_disables_even_previously_retained_receipts() {
+    let e = armed();
+    exact(&e);
+    let shared = e.clone();
+    assert!(std::thread::spawn(move || {
+        let _lock = shared.state.lock().unwrap();
+        panic!("synthetic poison");
+    })
+    .join()
+    .is_err());
+    assert!(matches!(e.receipt(id()), Err(MessageError::Unavailable(_))));
+    assert!(matches!(
+        e.snapshot(id()),
+        Err(MessageError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn stale_or_conflicting_arm_cannot_clear_landing() {
+    let e = armed();
+    exact(&e);
+    let before = e.snapshot(id()).unwrap();
+    for bad in [
+        // Same applied attempt, another pane.
+        AttemptScope {
+            pane: PaneId::parse("%8").unwrap(),
+            ..scope()
+        },
+        // An older attempt sequence.
+        AttemptScope {
+            attempt_seq: 100,
+            ..scope()
+        },
+        // Another recipient.
+        AttemptScope {
+            attempt_seq: 130,
+            recipient: "demo/other".parse().unwrap(),
+            ..scope()
+        },
+    ] {
+        assert!(matches!(e.arm(bad), Err(MessageError::Refused(_))));
+        assert_eq!(e.snapshot(id()).unwrap(), before);
+    }
+    assert!(before.probably_landed && before.receipt.is_some());
+}
+
+#[test]
+fn bad_arm_refuses_only_its_caller() {
+    let e = armed();
+    exact(&e);
+    let before = e.snapshot(id()).unwrap();
+    let other: MessageId = "m200".parse().unwrap();
+    e.register(other, "[m200] Read: atm inbox --id m200".into())
+        .unwrap();
+    for bad in [
+        // No applied DeliveryAttempted has sequence 0.
+        AttemptScope {
+            message_id: other,
+            attempt_seq: 0,
+            ..scope()
+        },
+        // A pending ID can never confirm.
+        AttemptScope {
+            message_id: other,
+            session_id: Some(SessionId::new("pending-42")),
+            ..scope()
+        },
+        // The bound session is in its own excluded baseline.
+        AttemptScope {
+            message_id: other,
+            excluded_sessions: HashSet::from([SessionId::new("session")]),
+            ..scope()
+        },
+    ] {
+        assert!(matches!(e.arm(bad), Err(MessageError::Refused(_))));
+    }
+    // m123 keeps its evidence, and m200 can still be armed properly.
+    assert_eq!(e.snapshot(id()).unwrap(), before);
+    let facts = e.snapshot(other).unwrap();
+    assert!(facts.receipt.is_none() && !facts.probably_landed);
+    e.arm(AttemptScope {
+        message_id: other,
+        ..scope()
+    })
+    .unwrap();
+}
+
+#[test]
+fn bad_register_refuses_only_its_caller() {
+    let e = armed();
+    exact(&e);
+    let other: MessageId = "m200".parse().unwrap();
+    for text in [
+        "[m123] Read: atm inbox --id m123",
+        "[m200]",
+        "[m200] Read: atm inbox --id m200\n",
+        "",
+    ] {
+        assert!(
+            matches!(
+                e.register(other, text.into()),
+                Err(MessageError::Refused(_))
+            ),
+            "{text:?}"
+        );
+    }
+    // Nothing was stored for m200, and m123 is untouched.
+    assert!(matches!(
+        e.arm(AttemptScope {
+            message_id: other,
+            ..scope()
+        }),
+        Err(MessageError::Unavailable(_))
+    ));
+    assert!(e.receipt(id()).unwrap().is_some());
+    e.register(other, "[m200] Read: atm inbox --id m200".into())
+        .unwrap();
+}
+
+#[test]
+fn receipt_of_unknown_id_is_unavailable() {
+    // Ok(None) would say "no receipt" about an attempt evidence knows nothing of.
+    let e = armed();
+    assert!(e.receipt(id()).unwrap().is_none());
+    let unknown: MessageId = "m999".parse().unwrap();
+    assert!(matches!(
+        e.receipt(unknown),
+        Err(MessageError::Unavailable(_))
+    ));
+    assert!(matches!(
+        e.snapshot(unknown),
+        Err(MessageError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn acknowledgement_reclaims_scope_and_registration_capacity() {
+    let e = armed();
+    exact(&e);
+    e.acknowledge(id(), &e.receipt(id()).unwrap().unwrap())
+        .unwrap();
+    assert_eq!(e.state().unwrap().scopes, 0);
+    assert!(e.state().unwrap().messages.is_empty());
+    assert!(matches!(
+        e.snapshot(id()),
+        Err(MessageError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn only_a_reference_without_a_scope_is_forgotten() {
+    // Never attempted: nothing could confirm it, and its reference is freed.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.forget_unscoped(id());
+    assert!(e.state().unwrap().messages.is_empty());
+    assert!(matches!(
+        e.snapshot(id()),
+        Err(MessageError::Unavailable(_))
+    ));
+    // Attempted: its scope stays for a late receipt, which still confirms.
+    let e = armed();
+    e.forget_unscoped(id());
+    assert_eq!(e.state().unwrap().scopes, 1);
+    exact(&e);
+    assert!(e.receipt(id()).unwrap().is_some());
+    // An unknown ID and a disabled store have nothing to forget.
+    e.forget_unscoped(MessageId::new(99));
+    MessageEvidence::disabled(e.clock().clone(), "down").forget_unscoped(id());
+}
+
+#[test]
+fn evidence_unavailable_blocks_retry() {
+    let e = MessageEvidence::disabled(evidence().clock().clone(), "retention unavailable");
+    assert!(matches!(
+        e.snapshot(id()),
+        Err(MessageError::Unavailable(_))
+    ));
+    assert!(matches!(e.receipt(id()), Err(MessageError::Unavailable(_))));
+}
+
+#[test]
+fn session_churn_never_disables_evidence() {
+    // Sessions that are not recipients come and go for the daemon's whole life.
+    let e = armed();
+    for n in 0..5000 {
+        let session = SessionId::new(format!("ended-{n}"));
+        e.observe(
+            &session,
+            Some("%9"),
+            Harness::Pi,
+            &LifecycleEvent::WorkingStart,
+        )
+        .unwrap();
+        e.observe_activity(&session, None).unwrap();
+    }
+    exact(&e);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "session"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_wake_subscribers_both_see_an_observation() {
+    // The scheduler and the executor's confirmation wait each hold a receiver.
+    let e = armed();
+    let (mut scheduler, mut executor) = (e.subscribe(), e.subscribe());
+    exact(&e);
+    for wake in [&mut scheduler, &mut executor] {
+        tokio::time::timeout(std::time::Duration::from_secs(60), wake.changed())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(e.receipt(id()).unwrap().is_some());
+}
+
+/// The tap's entry for an event whose parent proof is missing.
+fn unproven(e: &MessageEvidence, session: &str, pane: Option<&str>, text: Option<&str>) {
+    let event = match text {
+        Some(text) => LifecycleEvent::PromptSubmit {
+            prompt: Some(text.into()),
+        },
+        None => LifecycleEvent::WorkingStart,
+    };
+    e.tap(
+        &SessionId::new(session),
+        pane,
+        Some(Harness::Pi),
+        Some(&event),
+        false,
+        None,
+    )
+    .unwrap();
+}
+
+fn other_armed(e: &MessageEvidence) -> MessageId {
+    let other: MessageId = "m200".parse().unwrap();
+    e.register(other, "[m200] Read: atm inbox --id m200".into())
+        .unwrap();
+    e.arm(AttemptScope {
+        message_id: other,
+        attempt_seq: 201,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("other")),
+        ..scope()
+    })
+    .unwrap();
+    other
+}
+
+#[test]
+fn unproven_event_holds_only_what_it_could_affect() {
+    let e = armed();
+    let other = other_armed(&e);
+    unproven(&e, "session", Some("%7"), Some(REFERENCE));
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.probably_landed);
+    assert!(facts.receipt.is_none());
+    let facts = e.snapshot(other).unwrap();
+    assert!(!facts.probably_landed && facts.receipt.is_none());
+    // A later proven receipt still confirms the held message.
+    exact(&e);
+    assert!(e.receipt(id()).unwrap().is_some());
+}
+
+#[test]
+fn unproven_event_reaches_no_scope_the_proven_event_would_not() {
+    // Plain activity of another session on the bound scope's pane, of the
+    // bound session under another harness, of a pending ID: the proven path
+    // credits none of them, and none of them names the message.
+    for (session, pane, harness) in [
+        ("stranger", Some("%7"), Harness::Pi),
+        ("session", Some("%7"), Harness::Codex),
+        ("pending-42", Some("%7"), Harness::Pi),
+    ] {
+        let e = armed();
+        e.tap(
+            &SessionId::new(session),
+            pane,
+            Some(harness),
+            Some(&LifecycleEvent::WorkingStart),
+            false,
+            None,
+        )
+        .unwrap();
+        let facts = e.snapshot(id()).unwrap();
+        assert!(
+            !facts.probably_landed && facts.receipt.is_none(),
+            "{session} {pane:?} {harness:?}"
+        );
+    }
+    // A lazy scope ignores its excluded baseline, proven or not.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    let mut lazy = scope();
+    lazy.session_id = None;
+    lazy.excluded_sessions.insert(SessionId::new("old"));
+    e.arm(lazy).unwrap();
+    unproven(&e, "old", Some("%7"), None);
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+}
+
+/// Every way an event can carry m123's reference and still confirm nothing.
+fn named_without_proof() -> Vec<(&'static str, Option<&'static str>, Harness, bool)> {
+    vec![
+        // Another session on the scope's pane.
+        ("stranger", Some("%7"), Harness::Pi, true),
+        ("stranger", Some("%7"), Harness::Pi, false),
+        // The attempted session, reported on another pane or on none.
+        ("session", Some("%8"), Harness::Pi, true),
+        ("session", None, Harness::Pi, true),
+        // Another harness, a pending ID.
+        ("session", Some("%7"), Harness::Codex, true),
+        ("pending-42", Some("%7"), Harness::Pi, true),
+        // Nothing matches at all.
+        ("stranger", Some("%9"), Harness::Codex, false),
+    ]
+}
+
+fn named(e: &MessageEvidence, session: &str, pane: Option<&str>, harness: Harness, proven: bool) {
+    e.tap(
+        &SessionId::new(session),
+        pane,
+        Some(harness),
+        Some(&LifecycleEvent::PromptSubmit {
+            prompt: Some(REFERENCE.into()),
+        }),
+        proven,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn exact_reference_that_confirms_nothing_holds_its_message() {
+    // The text names the message, and nothing but its paste produces it. An
+    // event that carries it and cannot confirm must not vanish: the policy
+    // would time out and paste again.
+    for (session, pane, harness, proven) in named_without_proof() {
+        let e = armed();
+        let other = other_armed(&e);
+        named(&e, session, pane, harness, proven);
+        let facts = e.snapshot(id()).unwrap();
+        assert!(
+            facts.probably_landed && facts.receipt.is_none(),
+            "{session} {pane:?} {harness:?} {proven}"
+        );
+        // Only the named message is held.
+        assert!(!e.snapshot(other).unwrap().probably_landed);
+        // The attempt's own proven receipt still wins afterwards.
+        exact(&e);
+        assert!(e.receipt(id()).unwrap().is_some());
+    }
+    // A session in a lazy scope's excluded baseline submits the reference.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    let mut lazy = scope();
+    lazy.session_id = None;
+    lazy.excluded_sessions.insert(SessionId::new("old"));
+    e.arm(lazy).unwrap();
+    named(&e, "old", Some("%7"), Harness::Pi, true);
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.probably_landed && facts.receipt.is_none());
+    // Had "old" bound the scope, "new" could no longer confirm.
+    named(&e, "new", Some("%7"), Harness::Pi, true);
+    assert_eq!(e.receipt(id()).unwrap().unwrap().session_id.as_str(), "new");
+}
+
+#[test]
+fn exact_reference_without_a_usable_pane_holds_through_an_older_scope() {
+    // Attempt 1 was bound to "session" on %7; attempt 2 is bound elsewhere.
+    for proven in [true, false] {
+        let e = armed();
+        e.arm(AttemptScope {
+            attempt_seq: 130,
+            pane: PaneId::parse("%8").unwrap(),
+            session_id: Some(SessionId::new("new")),
+            ..scope()
+        })
+        .unwrap();
+        named(&e, "session", None, Harness::Pi, proven);
+        let facts = e.snapshot(id()).unwrap();
+        assert!(facts.probably_landed && facts.receipt.is_none(), "{proven}");
+    }
+}
+
+#[test]
+fn reference_of_a_message_that_was_never_attempted_holds_nothing() {
+    // No attempt, so no paste of ours: the text was typed by someone. History
+    // refuses a landing for a message without an attempt, so none is claimed.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    named(&e, "session", Some("%7"), Harness::Pi, true);
+    let facts = e.snapshot(id()).unwrap();
+    assert!(!facts.probably_landed && facts.receipt.is_none());
+}
+
+#[test]
+fn attempted_session_holds_whatever_pane_its_hook_reports() {
+    // Recorded shape: a hook can carry the pane of the process that forwards
+    // it, not the pane its session runs in. The scope is bound to "session"
+    // on %7; its events arrive naming %8, proven or not.
+    for proven in [true, false] {
+        let e = armed();
+        let other = other_armed(&e);
+        e.tap(
+            &SessionId::new("session"),
+            Some("%8"),
+            Some(Harness::Pi),
+            Some(&LifecycleEvent::WorkingStart),
+            proven,
+            None,
+        )
+        .unwrap();
+        let facts = e.snapshot(id()).unwrap();
+        assert!(facts.probably_landed && facts.receipt.is_none(), "{proven}");
+        // m200 is armed on %8 for another session: the pane alone is no claim.
+        assert!(!e.snapshot(other).unwrap().probably_landed);
+    }
+    // Only the latest attempt is held by plain activity.
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    e.tap(
+        &SessionId::new("session"),
+        Some("%8"),
+        Some(Harness::Pi),
+        Some(&LifecycleEvent::WorkingStart),
+        true,
+        None,
+    )
+    .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+}
+
+#[test]
+fn reference_on_another_pane_never_confirms_even_when_proven() {
+    // A proof is about the pane the event names. It cannot confirm a scope
+    // on another pane, whoever sent it.
+    let e = armed();
+    named(&e, "session", Some("%8"), Harness::Pi, true);
+    assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn wake_fires_only_when_a_fact_changed() {
+    let e = armed();
+    let other = other_armed(&e);
+    let mut wake = e.subscribe();
+    // Activity that reaches no scope changes nothing.
+    unproven(&e, "stranger", Some("%9"), None);
+    e.observe_activity(&SessionId::new("stranger"), None)
+        .unwrap();
+    assert!(!wake.has_changed().unwrap());
+    // A latch, then a receipt: each changes a fact once.
+    e.observe_activity(&SessionId::new("session"), None)
+        .unwrap();
+    assert!(wake.has_changed().unwrap());
+    wake.mark_unchanged();
+    e.observe_activity(&SessionId::new("session"), None)
+        .unwrap();
+    assert!(!wake.has_changed().unwrap());
+    exact(&e);
+    assert!(wake.has_changed().unwrap());
+    wake.mark_unchanged();
+    exact(&e);
+    assert!(!wake.has_changed().unwrap());
+    assert!(!e.snapshot(other).unwrap().probably_landed);
+}
+
+#[test]
+fn arm_wakes_subscribers() {
+    // An arm resets the latch: a waiter must look again.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    let wake = e.subscribe();
+    e.arm(scope()).unwrap();
+    assert!(wake.has_changed().unwrap());
+}
+
+#[test]
+fn lazy_scope_ignores_a_session_on_another_pane() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    // A proven session of the same harness, on a pane the attempt never used.
+    e.observe(
+        &SessionId::new("elsewhere"),
+        Some("%8"),
+        Harness::Pi,
+        &LifecycleEvent::WorkingStart,
+    )
+    .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // Had "elsewhere" bound the scope, the pane's own session could not confirm.
+    observe(&e, "started", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "started"
+    );
+}
+
+#[test]
+fn pending_id_is_no_activity_for_history() {
+    // A history that fails every write: a forwarded Activity would show as the
+    // evidence's disable.
+    let e = armed();
+    let history = crate::org::message_history::MessageHistoryHandle::disabled("synthetic");
+    e.tap(
+        &SessionId::new("pending-42"),
+        Some("%7"),
+        Some(Harness::Pi),
+        Some(&LifecycleEvent::WorkingStart),
+        true,
+        Some(&history),
+    )
+    .unwrap();
+    assert!(e.available());
+}
+
+#[test]
+fn unproven_event_never_binds_a_lazy_scope() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    unproven(&e, "first", Some("%7"), None);
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.probably_landed && facts.receipt.is_none());
+    // Had "first" bound the scope, "second" could no longer confirm.
+    observe(&e, "second", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "second"
+    );
+}
+
+#[test]
+fn unproven_exact_reference_of_an_older_scope_holds() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    // Plain activity in the older scope says nothing about the newer attempt.
+    unproven(&e, "session", Some("%7"), None);
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // Its exact reference may be the lost late receipt.
+    unproven(&e, "session", Some("%7"), Some(REFERENCE));
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.probably_landed && facts.receipt.is_none());
+}
+
+#[test]
+fn unproven_status_activity_holds_the_bound_session_only() {
+    let e = armed();
+    let other = other_armed(&e);
+    e.tap(&SessionId::new("session"), None, None, None, false, None)
+        .unwrap();
+    assert!(e.snapshot(id()).unwrap().probably_landed);
+    assert!(!e.snapshot(other).unwrap().probably_landed);
+}
+
+#[test]
+fn superseded_lazy_scope_holds_instead_of_confirming_a_stranger() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    // Attempt 1 is lazy on %7 and never sees its session.
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    // The recipient moved: attempt 2 is bound on %8.
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("moved")),
+        ..scope()
+    })
+    .unwrap();
+    // Later a stranger works on the reused %7. That is not the newer attempt.
+    e.observe(
+        &SessionId::new("stranger"),
+        Some("%7"),
+        Harness::Pi,
+        &LifecycleEvent::WorkingStart,
+    )
+    .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // The exact reference there shows the paste landed somewhere, no more.
+    observe(&e, "stranger", "%7", Harness::Pi, REFERENCE);
+    let facts = e.snapshot(id()).unwrap();
+    assert!(facts.receipt.is_none());
+    assert!(facts.probably_landed);
+    // The bound attempt's own receipt still wins.
+    observe(&e, "moved", "%8", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "moved"
+    );
+}
+
+#[test]
+fn latest_lazy_scope_binds_after_an_unbound_earlier_one() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    for attempt_seq in [124, 130] {
+        e.arm(AttemptScope {
+            attempt_seq,
+            session_id: None,
+            ..scope()
+        })
+        .unwrap();
+    }
+    observe(&e, "started", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "started"
+    );
+    // The binding is frozen: a later occupant gets nothing.
+    let receipt = e.receipt(id()).unwrap();
+    observe(&e, "occupant", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(e.receipt(id()).unwrap(), receipt);
+}
+
+#[test]
+fn activity_in_an_older_scope_does_not_latch() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    // The old attempt's session is still busy; that says nothing about the
+    // newer attempt, which resets the latch per reserved attempt.
+    e.observe(
+        &SessionId::new("session"),
+        Some("%7"),
+        Harness::Pi,
+        &LifecycleEvent::WorkingStart,
+    )
+    .unwrap();
+    e.observe_activity(&SessionId::new("session"), None)
+        .unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    e.observe_activity(&SessionId::new("new"), None).unwrap();
+    assert!(e.snapshot(id()).unwrap().probably_landed);
+}
+
+#[test]
+fn status_activity_never_binds_a_lazy_scope() {
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.arm(AttemptScope {
+        session_id: None,
+        ..scope()
+    })
+    .unwrap();
+    // Activity carries no harness identity, with or without a pane.
+    e.observe_activity(&SessionId::new("quiet"), Some("%7"))
+        .unwrap();
+    e.observe_activity(&SessionId::new("quiet"), None).unwrap();
+    assert!(!e.snapshot(id()).unwrap().probably_landed);
+    // Had "quiet" bound the scope, "talker" could no longer confirm.
+    observe(&e, "talker", "%7", Harness::Pi, REFERENCE);
+    assert_eq!(
+        e.receipt(id()).unwrap().unwrap().session_id.as_str(),
+        "talker"
+    );
+}
+
+#[test]
+fn first_receipt_is_never_overwritten() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        pane: PaneId::parse("%8").unwrap(),
+        session_id: Some(SessionId::new("new")),
+        ..scope()
+    })
+    .unwrap();
+    exact(&e);
+    let first = e.receipt(id()).unwrap().unwrap();
+    assert_eq!(first.session_id.as_str(), "session");
+    observe(&e, "new", "%8", Harness::Pi, REFERENCE);
+    assert_eq!(e.receipt(id()).unwrap(), Some(first));
+}
+
+/// A1's live history, with one agent bound to "session" on %7 and one
+/// message for it, as the fold of five committed events would leave it.
+/// `high_water` above 3 leaves the replay incomplete.
+fn live_history(high_water: u64) -> crate::org::message_history::MessageHistoryHandle {
+    use atm_org::{Address, MessageContent, MessageKind, OrgEvent};
+    let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let history = crate::org::message_history::MessageHistoryHandle::new(
+        high_water,
+        start,
+        atm_org::delivery::DeliveryPolicy::default(),
+    )
+    .unwrap();
+    let events = [
+        OrgEvent::ProjectRegistered {
+            project_id: "demo".parse().unwrap(),
+            root: "/project".into(),
+        },
+        OrgEvent::AgentAdopted {
+            agent_id: "demo/worker".parse().unwrap(),
+            pane: "%7".into(),
+            session_id: Some("session".into()),
+        },
+        OrgEvent::MessageSent(MessageContent {
+            from: Address::Owner,
+            to: Address::Agent("demo/worker".parse().unwrap()),
+            kind: MessageKind::Note,
+            body: "brief".into(),
+            attachments: vec![],
+            task: None,
+        }),
+    ];
+    for (seq, event) in (1..).zip(events) {
+        let update = HistoryUpdate::Applied {
+            seq,
+            at: start,
+            event: Some(event),
+        };
+        history.record(update, start).unwrap();
+    }
+    history
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_activity_never_disables_evidence() {
+    // One failed Activity write turns evidence off for everyone, so no
+    // ordinary event may fail it: not before the replay is complete, not for
+    // a session history has never seen, not without a pane, not unproven.
+    for high_water in [3, 9] {
+        let e = armed();
+        let history = live_history(high_water);
+        for session in ["session", "never-seen", "pending-42"] {
+            for pane in [Some("%7"), Some("%9"), None] {
+                for proven in [true, false] {
+                    let event = LifecycleEvent::PromptSubmit {
+                        prompt: Some("an ordinary prompt".into()),
+                    };
+                    for (harness, event) in [(Some(Harness::Pi), Some(&event)), (None, None)] {
+                        e.tap(
+                            &SessionId::new(session),
+                            pane,
+                            harness,
+                            event,
+                            proven,
+                            Some(&history),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+        assert!(e.available(), "{high_water}");
+        exact(&e);
+        assert!(e.receipt(id()).unwrap().is_some());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_tapped_event_reaches_history_with_its_own_receive_time() {
+    use crate::org::message_history::{PanePresence, RecipientObservation, SessionObservation};
+    use atm_core::{DialogState, InputState, ScreenFacts, SessionStatus, TurnState};
+    let e = evidence();
+    let start = e.clock().now().unwrap();
+    let history = live_history(3);
+    let mut facts = ScreenFacts::default();
+    facts.input = InputState::Empty;
+    facts.turn = TurnState::NotRunning;
+    facts.dialog = DialogState::None;
+    let observed = HistoryUpdate::Observed {
+        recipient: "demo/worker".parse().unwrap(),
+        observation: RecipientObservation {
+            pane: Some(PaneId::parse("%7").unwrap()),
+            session: Some(SessionObservation {
+                id: "session".into(),
+                harness: Harness::Pi,
+                status: SessionStatus::Working,
+                last_event_at: None,
+            }),
+            presence: PanePresence::Alive,
+            facts,
+            copy_mode: Some(false),
+            focused: Some(false),
+        },
+    };
+    history.record(observed, start).unwrap();
+    let last_event = |now| {
+        let snapshot = history.snapshot(MessageId::new(3), now).unwrap();
+        snapshot.live.session.unwrap().last_event_at
+    };
+    // Two events, 7 s apart on the evidence clock; nothing reads history in
+    // between. Each must carry the time it was received, not a later one.
+    let session = SessionId::new("session");
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    e.tap(&session, None, None, None, false, Some(&history))
+        .unwrap();
+    let first = e.clock().now().unwrap();
+    assert_eq!(first, start + chrono::TimeDelta::seconds(5));
+    tokio::time::advance(std::time::Duration::from_secs(7)).await;
+    let later = e.clock().now().unwrap();
+    assert_eq!(last_event(later), first);
+    e.tap(
+        &session,
+        Some("%7"),
+        Some(Harness::Pi),
+        Some(&LifecycleEvent::WorkingStart),
+        true,
+        Some(&history),
+    )
+    .unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    assert_eq!(last_event(e.clock().now().unwrap()), later);
+}
+
+fn latched(e: &MessageEvidence) -> bool {
+    e.snapshot(id()).unwrap().probably_landed
+}
+
+/// Every kind of plain activity in the attempted session and pane.
+fn session_activity(e: &MessageEvidence) {
+    observe(e, "session", "%7", Harness::Pi, "more work");
+    e.observe_activity(&SessionId::new("session"), Some("%7"))
+        .unwrap();
+    unproven(e, "session", Some("%7"), None);
+}
+
+#[test]
+fn owner_release_clears_the_latch_and_that_attempts_activity_no_longer_sets_it() {
+    let e = armed();
+    session_activity(&e);
+    assert!(latched(&e));
+    e.release(id(), 124).unwrap();
+    assert!(!latched(&e));
+    // The session keeps working after the owner's retry: the next evidence
+    // copy must not find the released attempt held again.
+    session_activity(&e);
+    assert!(!latched(&e));
+    // Scopes and the reference are kept: releasing again is harmless.
+    e.release(id(), 124).unwrap();
+    assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn released_attempt_still_confirms_by_a_late_receipt() {
+    let e = armed();
+    session_activity(&e);
+    e.release(id(), 124).unwrap();
+    exact(&e);
+    let receipt = e.receipt(id()).unwrap().unwrap();
+    assert_eq!(receipt.session_id.as_str(), "session");
+    assert_eq!(e.confirmed().unwrap(), [(id(), receipt)]);
+}
+
+#[test]
+fn exact_reference_still_holds_a_released_attempt() {
+    let e = armed();
+    session_activity(&e);
+    e.release(id(), 124).unwrap();
+    // Only the paste produces this text: submitted where it confirms
+    // nothing, it holds the message again, release or not.
+    observe(&e, "stranger", "%9", Harness::Pi, REFERENCE);
+    assert!(latched(&e));
+    assert!(e.receipt(id()).unwrap().is_none());
+}
+
+#[test]
+fn new_arm_after_a_release_latches_again() {
+    let e = armed();
+    session_activity(&e);
+    e.release(id(), 124).unwrap();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        ..scope()
+    })
+    .unwrap();
+    assert!(!latched(&e));
+    session_activity(&e);
+    assert!(latched(&e));
+}
+
+#[test]
+fn release_refuses_a_superseded_attempt_and_an_unknown_message() {
+    let e = armed();
+    e.arm(AttemptScope {
+        attempt_seq: 130,
+        ..scope()
+    })
+    .unwrap();
+    session_activity(&e);
+    // A retry decided on attempt 124 is stale once 130 is armed.
+    assert!(matches!(
+        e.release(id(), 124),
+        Err(MessageError::Conflict(_))
+    ));
+    assert!(latched(&e));
+    // An attempt committed after the last arm (its own arm failed) is the
+    // latest one: its release clears what the older scope latched.
+    e.release(id(), 140).unwrap();
+    assert!(!latched(&e));
+    session_activity(&e);
+    assert!(!latched(&e));
+    assert!(matches!(
+        e.release("m999".parse().unwrap(), 1),
+        Err(MessageError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn release_of_an_attempt_never_armed_here_is_accepted() {
+    // A replayed message: registered at startup, attempted by the previous
+    // process, so no scope exists to compare the sequence with.
+    let e = evidence();
+    e.register(id(), REFERENCE.into()).unwrap();
+    e.release(id(), 124).unwrap();
+    assert!(!latched(&e));
+}
+
+#[test]
+fn release_wakes_only_when_it_cleared_a_latch() {
+    let e = armed();
+    let wake = e.subscribe();
+    e.release(id(), 124).unwrap();
+    assert!(!wake.has_changed().unwrap());
+    let e = armed();
+    session_activity(&e);
+    let wake = e.subscribe();
+    e.release(id(), 124).unwrap();
+    assert!(wake.has_changed().unwrap());
+}
+
+#[test]
+fn confirmed_lists_each_receipt_until_it_is_acknowledged() {
+    let e = armed();
+    let other = other_armed(&e);
+    assert_eq!(e.confirmed().unwrap(), []);
+    exact(&e);
+    let receipt = e.receipt(id()).unwrap().unwrap();
+    assert_eq!(e.confirmed().unwrap(), [(id(), receipt.clone())]);
+    assert!(e.receipt(other).unwrap().is_none());
+    e.acknowledge(id(), &receipt).unwrap();
+    assert_eq!(e.confirmed().unwrap(), []);
+}

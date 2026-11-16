@@ -1,0 +1,45 @@
+ [2mPi can explain its own features and look up its docs. Ask it how to use or extend Pi.[0m                                  
+
+[38;5;3m[Skills][39m                                                    
+[2m  atm-coordinate, atm-implement, brainstorming, diagnosing-superpowers, dispatching-parallel-agents, executing-plans, feature-dev, finishing-a-development-branch, receiving-code-review, requesting-code-review, subagent-driven-development,  
+systematic-debugging, test-driven-development, using-git-worktrees, using-superpowers, verification-before-completion, writing-plans, writing-skills[0m                                                                                            
+
+[38;5;3m[Prompts][39m                                                   
+[2m  /feature-dev[0m                                              
+
+[38;5;3m[Extensions][39m                                                
+[2m  obra/superpowers:.pi/extensions/superpowers.ts, pi-atm.ts[0m 
+
+
+ [38;5;3mWarning: tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.[39m                                                                                               
+
+[38;5;3m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;3mUpdate Available[0m                                           
+ [2mNew version 1.5.2 is available. Run [0m[38;5;5mpi update[39m              
+ [2mChangelog: [0m[38;5;5mhttps://pi.dev/changelog[39m                        
+[38;5;3m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+[39m [m7] New session: run atm me                               
+
+
+
+ [1m$ atm me[0;2m (timeout 30s)[0m                                     
+
+ [2m... (3 earlier lines,[0m [2mctrl+o to expand)[0m                    
+ [2m  line: your agent id and the memory file path it showed. Run no other command and change no file.[0m                     
+ [2mMemory: /tmp/xxxxxxxxxxxxxxxxx/e2/.atm/memory/pi-seat.md (exists; read for handover)[0m                                   
+ [2mOpen tasks: none[0m                                           
+ [2mUnread: none[0m                                               
+ [2mReport: atm msg send --to owner --kind report --body 'DONE: <result>'[0m                                                  
+
+ [2mTook 0.1s[0m                                                  
+
+
+ e2/pi-seat — /tmp/xxxxxxxxxxxxxxxxx/e2/.atm/memory/pi-seat.md                                                          
+
+[38;5;4m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[7m[39m [0m                                                           
+[38;5;4m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[2m[39m/tmp/xxxxxxxxxxxxxxxxx/e2[0m                                   
+[2m↑3.8k ↓55 R3.5k CH93.0% $0.008 (sub) 0.7%/500k (auto)                                                                                                                                                                          gpt-6.1-sol • low

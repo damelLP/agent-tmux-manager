@@ -1,0 +1,10 @@
+{
+  "request": {
+    "protocol_version": {"major": 1, "minor": 1},
+    "type": "request", "id": "unbound", "method": "agent.context", "params": {}, "from_pane": "%9"
+  },
+  "response": {
+    "type": "response", "id": "unbound",
+    "error": {"code": "refused", "message": "atm me requires a named agent bound to the caller's pane"}
+  }
+}

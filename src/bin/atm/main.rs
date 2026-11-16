@@ -19,7 +19,6 @@
 //! ```
 
 use std::fs::{self, OpenOptions};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -41,8 +40,16 @@ use atm_tui::input::{ClientCommand, Event};
 use atm_tui::setup;
 use atm_tui::tmux;
 
+mod agent;
+mod agent_target;
+mod away;
 mod cli;
+mod decide;
+mod me;
+mod msg;
+pub mod rpc;
 mod spawn;
+mod task;
 mod tui;
 mod workspace;
 use cli::{cmd_interrupt, cmd_kill, cmd_list, cmd_peek, cmd_reply, cmd_role, cmd_send, cmd_status};
@@ -79,8 +86,209 @@ struct Args {
     compact: bool,
 }
 
+#[cfg(test)]
+mod agent_contract_tests {
+    use super::*;
+
+    #[test]
+    fn all_six_named_agent_commands_have_help_and_parse() {
+        for (action, operands) in [
+            ("up", vec!["lead"]),
+            ("adopt", vec!["lead", "%7"]),
+            ("clear", vec!["project/lead"]),
+            ("respawn", vec!["project/lead"]),
+            ("down", vec!["project/lead"]),
+            ("list", vec![]),
+        ] {
+            let help = Args::try_parse_from(["atm", "agent", action, "--help"]).unwrap_err();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp, "{action}");
+            let mut args = vec!["atm", "agent", action];
+            args.extend(operands);
+            assert!(Args::try_parse_from(args).is_ok(), "{action}");
+        }
+    }
+
+    #[test]
+    fn agent_names_are_validated_by_clap() {
+        for action in ["up", "adopt"] {
+            for (name, valid) in [
+                ("", false),
+                ("../lead", false),
+                ("a/b", false),
+                ("Lead", false),
+                ("léad", false),
+                ("-lead", false),
+                (" lead", false),
+                ("owner", false),
+                ("system", false),
+                ("012345678901234567890123456789012", false),
+                ("lead-", true),
+                ("0", true),
+                ("01234567890123456789012345678901", true),
+            ] {
+                let mut args = vec!["atm", "agent", action, name];
+                if action == "adopt" {
+                    args.push("%0");
+                }
+                let result = Args::try_parse_from(args);
+                assert_eq!(result.is_ok(), valid, "{action}: {name:?}");
+                if let Err(error) = result {
+                    assert_eq!(error.exit_code(), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_panes_are_validated_by_clap() {
+        for (pane, valid) in [
+            ("%0", true),
+            ("%7", true),
+            ("%123456789012345678901234567890", true),
+            ("%00", false),
+            ("%07", false),
+            ("7", false),
+            ("%", false),
+            ("%+7", false),
+            ("%-7", false),
+            ("%٧", false),
+            (" %7", false),
+            ("%7\n", false),
+            ("%7; kill-pane", false),
+            ("session:0.1", false),
+        ] {
+            let result = Args::try_parse_from(["atm", "agent", "adopt", "lead", pane]);
+            assert_eq!(result.is_ok(), valid, "{pane:?}");
+            if let Err(error) = result {
+                assert_eq!(error.exit_code(), 2);
+            }
+        }
+    }
+
+    /// Changing only one side's validation or default must not leave a CLI
+    /// value that the daemon rejects, or silently default to a different budget.
+    #[tokio::test]
+    async fn clear_parser_and_daemon_validation_stay_in_sync() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            use atmd::server::methods::{router, CallContext, CallerId, MethodServices};
+            use serde_json::json;
+
+            let (send, _receive) = mpsc::channel(1);
+            let (events, _) = tokio::sync::broadcast::channel(1);
+            let registry = atmd::registry::RegistryHandle::new(send, events);
+            let router = router(MethodServices::new(registry)).unwrap();
+            for timeout in [0, 1, 4999, 5000, 30000, 120000, 120001, u64::MAX] {
+                let value = timeout.to_string();
+                let cli = Args::try_parse_from([
+                    "atm",
+                    "agent",
+                    "clear",
+                    "project/lead",
+                    "--timeout-ms",
+                    &value,
+                ]);
+                let error = router
+                    .call(
+                        CallContext {
+                            client_id: CallerId("validation".into()),
+                            from_pane: None,
+                        },
+                        "agent.clear",
+                        json!({"agent":"project/lead", "timeout_ms":timeout}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.0.code,
+                    if cli.is_ok() {
+                        "unavailable"
+                    } else {
+                        "invalid_params"
+                    },
+                    "{timeout}: {cli:?}"
+                );
+            }
+            let cli = Args::try_parse_from(["atm", "agent", "clear", "project/lead"]).unwrap();
+            let Some(Command::Agent {
+                action: agent::AgentAction::Clear { timeout_ms, .. },
+            }) = cli.command
+            else {
+                panic!("expected the clear command");
+            };
+            let daemon: atmd::org::agents::ClearParams =
+                serde_json::from_value(json!({"agent":"project/lead"})).unwrap();
+            assert_eq!(timeout_ms, daemon.timeout_ms);
+            assert_eq!(timeout_ms, 30_000);
+        })
+        .await
+        .expect("clear validation parity did not finish within its hang guard");
+    }
+
+    #[test]
+    fn clear_rejects_bad_ids_and_timeout_bounds() {
+        for args in [
+            vec!["atm", "agent", "clear", "project/lead", "--timeout-ms", "0"],
+            vec!["atm", "agent", "clear", "project/lead", "--timeout-ms", "1"],
+            vec![
+                "atm",
+                "agent",
+                "clear",
+                "project/lead",
+                "--timeout-ms",
+                "4999",
+            ],
+            vec![
+                "atm",
+                "agent",
+                "clear",
+                "project/lead",
+                "--timeout-ms",
+                "120001",
+            ],
+        ] {
+            let error = Args::try_parse_from(args).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+        }
+        for timeout in ["5000", "120000"] {
+            assert!(Args::try_parse_from([
+                "atm",
+                "agent",
+                "clear",
+                "project/lead",
+                "--timeout-ms",
+                timeout
+            ])
+            .is_ok());
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Show your identity, instructions, handover, unread work and reporting command
+    Me(me::MeArgs),
+    /// Create, assign, inspect and review durable tasks
+    Task(task::TaskArgs),
+    /// Record the owner's answer to a decision
+    Decide(decide::DecideArgs),
+    /// List, request or withdraw durable decisions
+    Decisions(decide::DecisionsArgs),
+    /// Tell the daemon you will not answer: agents go on under the away rules
+    Away(away::SwitchArgs),
+    /// Tell the daemon you are back: nothing more is decided for you
+    Back(away::SwitchArgs),
+    /// Send, acknowledge or resolve durable messages
+    Msg {
+        #[command(subcommand)]
+        action: msg::MsgAction,
+    },
+    /// Read messages without marking them read
+    Inbox(msg::InboxArgs),
+    /// Manage durable named agents through the daemon
+    Agent {
+        #[command(subcommand)]
+        action: agent::AgentAction,
+    },
     /// Configure supported harness integrations for atm
     Setup,
     /// Remove atm integrations from supported harnesses
@@ -268,21 +476,8 @@ enum ListFormat {
 // Logging Setup
 // ============================================================================
 
-fn get_log_dir() -> Option<PathBuf> {
-    if let Some(xdg_state) = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        return Some(PathBuf::from(xdg_state).join("atm"));
-    }
-    std::env::var("HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|home| PathBuf::from(home).join(".local/state/atm"))
-}
-
 fn create_log_file() -> Option<std::fs::File> {
-    let log_dir = get_log_dir()?;
+    let log_dir = atmd::eventlog::state_dir();
 
     if let Err(e) = fs::create_dir_all(&log_dir) {
         eprintln!("Warning: Failed to create log directory {log_dir:?}: {e}");
@@ -310,6 +505,15 @@ async fn main() -> Result<()> {
 
     // Handle subcommands first (before TUI initialization)
     match args.command {
+        Some(Command::Me(args)) => return me::cmd_me(args).await,
+        Some(Command::Task(args)) => return task::cmd_task(args).await,
+        Some(Command::Decide(args)) => return decide::cmd_decide(args).await,
+        Some(Command::Decisions(args)) => return decide::cmd_decisions(args).await,
+        Some(Command::Away(args)) => return away::cmd_away(args).await,
+        Some(Command::Back(args)) => return away::cmd_back(args).await,
+        Some(Command::Msg { action }) => return msg::cmd_msg(action).await,
+        Some(Command::Inbox(args)) => return msg::cmd_inbox(args).await,
+        Some(Command::Agent { action }) => return agent::cmd_agent(action).await,
         Some(Command::Setup) => {
             return Ok(setup::setup()?);
         }

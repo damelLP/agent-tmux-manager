@@ -1,0 +1,112 @@
+mod support;
+use atm_core::Money;
+use atm_org::*;
+use serde_json::json;
+
+#[test]
+fn all_golden_event_bodies() {
+    let cases = support::bodies();
+    assert_eq!(cases.len(), 23);
+    for (kind, body) in cases {
+        let event = OrgEvent::from_parts(kind, &body).unwrap().unwrap();
+        assert_eq!(event.kind(), kind);
+        assert!(
+            event.to_body().is_object(),
+            "{kind} must take the derive's object path"
+        );
+        assert_eq!(
+            event.to_body(),
+            serde_json::to_value(&event).unwrap()["body"]
+        );
+        assert_eq!(event.to_body(), body, "{kind}");
+        assert_eq!(
+            OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(),
+            Some(event)
+        );
+    }
+}
+
+#[test]
+fn task_usage_is_a_known_additive_event() {
+    // Synthetic: a baseline observation with no eligible task.
+    let body = json!({"session_id":"s", "task_id":null, "turn":true,
+        "cumulative_cost":{"microdollars":125000}, "context_percent":70});
+    let event = OrgEvent::from_parts("task.usage_observed", &body).unwrap();
+    assert!(event.is_some(), "task observations must survive replay");
+    assert_eq!(event.unwrap().to_body(), body);
+}
+
+#[test]
+fn malformed_known_events_error_unknown_kinds_skip() {
+    for (kind, _) in support::bodies() {
+        let error = OrgEvent::from_parts(kind, &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(kind), "{error}");
+    }
+    for body in [json!(null), json!(42), json!({"anything":true})] {
+        assert_eq!(OrgEvent::from_parts("future.event", &body).unwrap(), None);
+    }
+    assert!(OrgEvent::from_parts(
+        "agent.down",
+        &json!({"agent_id":"p/bad name", "reason":"done"})
+    )
+    .is_err());
+    assert!(OrgEvent::from_parts(
+        "msg.delivery_failed",
+        &json!({"message_id":"m1", "reason":"no", "final":"true"})
+    )
+    .is_err());
+}
+
+#[test]
+fn event_json_tolerates_additive_fields_even_in_roles() {
+    let event = OrgEvent::AgentUpRequested {
+        agent_id: support::id(),
+        role: support::role(),
+    };
+    let mut body = event.to_body();
+    body["future"] = json!(1);
+    body["role"]["future"] = json!("new");
+    assert_eq!(
+        OrgEvent::from_parts(event.kind(), &body).unwrap(),
+        Some(event)
+    );
+    assert!(parse_role("lead", "+++\nharness='pi'\nfuture=1\n+++").is_err());
+}
+
+#[test]
+fn editor_ready_body_validates_identity_and_tolerates_additions() {
+    assert!(OrgEvent::from_parts("agent.editor_ready", &json!({"agent_id":"p/bad name"})).is_err());
+    assert_eq!(
+        OrgEvent::from_parts(
+            "agent.editor_ready",
+            &json!({"agent_id":"p/lead", "future":true})
+        )
+        .unwrap(),
+        Some(OrgEvent::AgentEditorReady {
+            agent_id: support::id()
+        })
+    );
+}
+
+#[test]
+fn summary_cost_and_message_ids_are_lossless_at_integer_extremes() {
+    for amount in [i64::MIN, -1, 0, i64::MAX] {
+        let mut summary = support::summary();
+        summary.cost = Some(Money::from_microdollars(amount));
+        let event = OrgEvent::SessionSummary(summary);
+        assert_eq!(event.to_body()["cost"], json!({"microdollars":amount}));
+        assert_eq!(
+            OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(),
+            Some(event)
+        );
+    }
+    let event = OrgEvent::MessageRead {
+        message_ids: vec![MessageId::new(u64::MAX)],
+    };
+    assert_eq!(
+        OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(),
+        Some(event)
+    );
+}

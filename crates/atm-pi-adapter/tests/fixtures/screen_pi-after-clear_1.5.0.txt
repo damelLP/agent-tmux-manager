@@ -1,0 +1,40 @@
+
+ ▀▀█  v1.5.0
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+[Extensions]
+  pi-atm.ts
+
+
+
+ ✓ New session started
+
+
+
+ [fixture2] reply with the word ok
+
+
+ ok
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/u8a-fixture/cwd/pi    
+↑1.1k ↓5 $0.000 (sub) 0.4%/272k (auto)                                                                  gpt-6-luna • low

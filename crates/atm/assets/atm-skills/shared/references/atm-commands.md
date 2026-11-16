@@ -1,13 +1,30 @@
 # atm command reference for coordinators
 
+This is the legacy pane-control reference for `atm-coordinate` and
+`atm-implement`. Bound named agents use `atm-lead`/`atm-member` and the
+[named-agent reference](atm-named-agents.md); do not apply the pane/waiter
+loop to their durable task/message workflow.
+
 The commands a coordinator uses to drive implementers, with what each one
 refuses and what to do instead. It follows atm's code after #119, #145, #154,
 #158 and #163 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run
 `atm <command> --help` for the full flags.
 
+## Named-agent start line
+
+After a named agent starts, respawns or clears to `ready`, atmd types
+`[mN] New session: run the shell command atm me`. Run `atm me` in the shell
+for the agent's role, memory path and unread messages, not a personal skill.
+`atm me` omits both current and historical start notes from its unread list.
+
 ## Targets: use the pane
 
-Commands that target an agent take a session id prefix or a tmux pane id (`%12`).
+The immediate controls below take a session id prefix or a tmux pane id (`%12`).
+This is not the addressing rule for `atm agent`, `atm msg` or `atm task`.
+Named lifecycle/message commands support project-scoped bare names; task agent
+addresses must be full `project/name` IDs.
+
+Commands that target a session take a session id prefix or a tmux pane id (`%12`).
 **Use the pane id.** A pane stays the same for an implementer's whole life,
 but its session id doesn't:
 
@@ -129,11 +146,14 @@ What it doesn't protect against:
 
 Answers a dialog by pressing keys: `-y` presses Enter on the highlighted
 option, `-n` presses Escape, `-o N` moves Claude's `❯` cursor to option N and
-presses Enter. With no flag it presses Enter.
+presses Enter. With no flag it presses Enter. `-o N` refuses values above 99
+before any pane action, bounding navigation work in the daemon.
 
-It refuses nothing: the keys go to whatever is on screen. Peek with
-`--prompt` first, and reply only when you know what you're approving.
-Otherwise ask the user.
+It does not check what's on screen: the keys go to whatever is there. Peek
+with `--prompt` first, and reply only when you know what you're approving.
+Otherwise ask the user. Replies wait behind reserved work and are refused
+while an agent is clearing or quarantined; peek is read-only and still works.
+Both use the daemon, with no direct-tmux fallback on an old daemon.
 
 Claude Code sends no hook when a dialog is answered. After `-y` the row reads
 `attention_needed` until the approved tool ends, so wait with
@@ -198,9 +218,9 @@ in `<dir>`. Options: `-d left|right|above|below` (default below), `-s 30%`
   Code and pi report at startup. Codex 0.163.0 reports at its first prompt,
   so its row appears only after your first send or its `--prompt`.
   `atm send %N` works without a row.
-- **Spawn a Codex implementer with `--no-daemon`**, added in front of any
-  `ATM_SPAWN_CODEX_ARGS` you already have:
-  `ATM_SPAWN_CODEX_ARGS="--no-daemon ${ATM_SPAWN_CODEX_ARGS:-}" atm spawn -H codex ...`.
+- **`atm spawn -H codex` adds `--no-daemon` itself.** Don't put it in
+  `ATM_SPAWN_CODEX_ARGS` or `ATM_SPAWN_ARGS`; remove it if you previously
+  supplied it there.
   Under Codex's default shared app-server daemon, every Codex session's
   hooks report the daemon's process and the pane of the Codex that started
   it (0.163.0): a second Codex's row lands on that pane, its own pane gets
@@ -233,14 +253,14 @@ network_access = true
 ```
 
 That also lets the coordinator's other commands reach the network. Approving
-each `atm` call to run outside the sandbox is the narrower option. An
-implementer never runs `atm`, so it needs neither.
+each `atm` call to run outside the sandbox is the narrower option. A legacy
+pane-driven implementer never runs `atm`, so it needs neither; a named member
+uses the socket for `me`, inbox and task/report commands too.
 
 ## Not in atm yet
 
 | Planned | Today |
 |---|---|
-| `atm name` and targets by name (#118) | keep a name-to-pane table in your notes and handover |
 | `atm profile show <name>` (#147) | `scripts/atm-profile <name>` |
 
 ## Scripts in this skill

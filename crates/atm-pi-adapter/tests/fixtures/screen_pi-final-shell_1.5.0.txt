@@ -1,0 +1,40 @@
+ [fixture2] reply with the word ok
+
+
+ ok
+
+
+ count from 1 to 60, one number per line
+
+
+ Operation aborted
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/u8a-fixture/cwd/pi    
+↑1.1k ↓5 $0.000 (sub) 0.4%/272k (auto)                                                                  gpt-6-luna • low
+
+To resume this session: pi --session-dir /tmp/u8a-fixture/pi-sessions --session 00000000-0000-4000-8000-000000000001    
+bash-5.3$ python3 /tmp/u8a-fixture/bin/capture.py subject pi
+U5 guard: live socket absent; private ATM_SOCKET=/tmp/u8a-fixture/tap.sock ATM_AGENT=fixture/pi  
+
+ ▀▀█  v1.5.0
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+[Extensions]
+  pi-atm.ts
+
+
+ Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf
+ and restart tmux.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/u8a-fixture/cwd/pi    
+$0.000 (sub) 0.0%/272k (auto)                                                                           gpt-6-luna • low
+bash-5.3$

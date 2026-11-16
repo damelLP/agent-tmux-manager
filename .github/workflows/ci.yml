@@ -38,6 +38,9 @@ jobs:
           node --disable-warning=ExperimentalWarning -e 'process.stdout.write(require("node:module").stripTypeScriptTypes(require("node:fs").readFileSync(process.argv[1], "utf8")))' extensions/pi-atm/extensions/pi-atm.ts \
             | node --check --input-type=module -
 
+      - name: Test pi-atm event frames
+        run: node --disable-warning=ExperimentalWarning --test tests/pi_event_frames.mjs
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,6 +54,9 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install hook transport
+        run: sudo apt-get update && sudo apt-get install -y socat
 
       - name: cargo test
         run: cargo test --workspace

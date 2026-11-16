@@ -1,0 +1,41 @@
+Captured: claude 2.1.325, 2026-11-14, P1 private tmux capture-pane -p -e -N; sanitized.
+
+
+probe$ bash "$RUN/launch.sh"  
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude[0m [1mCode[0m [38;5;246mv2.1.325[39m                             
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus[39m [38;5;246m5.5[39m [38;5;246m·[39m [38;5;246mAPI[39m [38;5;246mUsage[39m [38;5;246mBilling[39m                     
+[38;5;174m ▝▝[39m   [38;5;174m▝▝[39m   [38;5;246m/tmp/xxxxxxxxxxxxxxxxxxxxxxx/cwd[39m                 
+
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/clear[39m                                                                                                                
+
+[38;5;246m❯ [38;5;231mB_SENTINEL_6_event[39m                                                                                                    
+
+[38;5;231m[49m●[39m SEALED_REPLY_16                                                                                                       
+
+[38;5;246m✻[39m [38;5;246mChurned for 0s · done 4:32 PM[39m                             
+
+[38;5;246m[48;5;237m❯ [38;5;231mC3_REQUEST_PERMISSION[39m                                                                                                 
+
+[38;5;246m[49m●[39m [1mBash[0m(printf sealed > /tmp/xxxxxxxxxxxxxxxxxxxxxxx/permission-proof.txt)                                               
+[38;5;246m  ⎿  Waiting…[39m                                                                                                           
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mBash command[0m                 
+ [1mTip: auto mode handles these prompts for you — choose "switch to auto mode" below[0m                                      
+ [38;5;246mWrite a sealed probe marker[39m  
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m printf sealed > /tmp/xxxxxxxxxxxxxxxxxxxxxxx/permission-proof.txt                                                      
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to proceed?      
+ [38;5;153m❯[39m [38;5;246m1.[39m [38;5;153mYes[39m                     
+   [38;5;246m2.[39m Yes, and always allow access to [1m/tmp/xxxxxxxxxxxxxxxxxxxxxxx[0m from this project                                    
+   [38;5;246m3.[39m Yes, and switch to auto mode[38;5;246m ·[39m [38;5;246mauto[39m [38;5;246mmode[39m [38;5;246mhandles[39m [38;5;246mthese[39m [38;5;246mprompts[39m [38;5;246mfor[39m [38;5;246myou[39m                                            
+   [38;5;246m4.[39m No                      
+
+ [38;5;246mEsc[39m [38;5;246mto[39m [38;5;246mcancel[39m [38;5;246m·[39m [38;5;246mTab[39m [38;5;246mto[39m [38;5;246mamend[39m 
+
+
+
+
+

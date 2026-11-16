@@ -167,7 +167,9 @@
 //!   sees its own TUI's pid and pane, and `/quit` fires `SessionEnd`
 //!   (checked with two TUIs). `--dangerously-bypass-hook-trust` also
 //!   forces this embedded mode. Nothing in the hook's environment names
-//!   the client TUI. Fix pending, a user decision. The TUI's
+//!   the client TUI. Sessions atm launches receive `--no-daemon` from this
+//!   adapter's `LAUNCH_POLICY`, applied by `atmd::control::build_spawn_command`.
+//!   Sessions started manually without the flag still have this gap. The TUI's
 //!   `--no-daemon` flag is absent from codex-cli 0.155.0 and present in
 //!   0.158.0 (static check of the npm binaries, not run); that the
 //!   daemon is the default is checked on 0.163.0 only.
@@ -231,6 +233,7 @@
 //! - [`translate`] — translation from raw event to `LifecycleEvent`
 
 pub mod event;
+pub mod screen;
 pub mod transcript;
 pub mod translate;
 pub mod wire;

@@ -9,11 +9,15 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Claude Code adapter for ATM — translates Claude raw hook events into vendor-neutral LifecycleEvent and status lines into StatusLineData"
+readme = "../../README.md"
 
 [dependencies]
 atm-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

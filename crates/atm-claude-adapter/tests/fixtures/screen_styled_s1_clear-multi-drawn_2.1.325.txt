@@ -1,0 +1,15 @@
+Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
+
+[38;5;174m ▐[48;5;16m█▟███▟[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.325[39m                           
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 5.5 · API Usage Billing[39m                  
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/xxxxxxxxxxxxxxxxxxxxxxxxx/multi-drawn/home[39m                                                          
+
+
+  [38;5;153m❯ /[1mclear[0m[38;5;153m                         Start a new session with empty context; previous session stays on disk[39m           
+                                   [38;5;153m(resumable with /resume)[39m                                                         
+  [38;5;246m  /writing-[1m[39mclear[0m[38;5;246mly-and-briefly   Write [1m[39mclear[0m[38;5;246m neutral prose, using concise sentences. (user)[39m                       
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [38;5;153m/clear[7m[39m [0m                    
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m[fixture] ctx [38;5;151m▰[38;5;66m▱▱▱[38;5;246m 7% Demo Model (high)[39m                 
+  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m                    

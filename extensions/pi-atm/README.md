@@ -95,13 +95,13 @@ Only events that drive `LifecycleEvent` translation are forwarded
 | `session_start`         | → `LifecycleEvent::SessionStart`                      |
 | `session_shutdown`      | → `LifecycleEvent::SessionEnd`                        |
 | `agent_start`           | → `LifecycleEvent::WorkingStart`                      |
-| `agent_end`             | → `LifecycleEvent::WorkingEnd`                        |
+| `agent_end`             | → `LifecycleEvent::WorkingEnd` (payload cut to `{}`)   |
 | `tool_call`             | → `LifecycleEvent::ToolCallStart` (or `NeedsInput` when amplike's permission gate triggers via `ctx.ui.select`) |
 | `tool_execution_end`    | → `LifecycleEvent::ToolCallEnd`                       |
 | `model_select`          | → `LifecycleEvent::ProviderModelChange` (`model` and `previousModel` cut to `{id, provider, contextWindow}`) |
 | `input` (interactive)   | → `LifecycleEvent::PromptSubmit`                      |
 | `session_before_compact`| → `LifecycleEvent::ContextCompactStart`               |
-| `context`               | → `LifecycleEvent::ContextUpdate {tokens, cost, context window}`, before each request |
+| `context`               | → `LifecycleEvent::ContextUpdate {tokens, cost, context window}`, before each request (payload cut to `{}`) |
 | `turn_end`              | → `LifecycleEvent::ContextUpdate`, after each reply is saved (payload cut to `{}`) |
 
 Each frame also carries `model`, pi's current model (`ctx.model`) cut to
@@ -114,6 +114,20 @@ as pi's footer sums them: `{cost, tokens, contextTokens}` over every
 assistant message in the session file, with `contextTokens` the size
 behind the footer's context percentage. pi prices each reply on its own,
 so atm takes the session's cost from this snapshot, not from a message.
+
+`context`, `turn_end` and `agent_end` send `{}` bodies rather than their
+conversation messages, replies and tool results. These bodies can exceed
+atmd's 1 MiB input-line limit and close the forwarder connection, losing
+the end-of-run signal. The envelope keeps session identity, pid, pane and
+model, plus `usage` on `context`/`turn_end`; the adapter needs no message
+body for these events. Older extension frames remain supported.
+This is not a general frame-size cap: other event bodies can still be large,
+and delivery remains best-effort during outages. It does not add heartbeat,
+resynchronization or final-idle detection (`agent_settled`).
+
+Maintainers can run the socket-level frame tests without pi installed:
+`node --disable-warning=ExperimentalWarning --test tests/pi_event_frames.mjs`
+from the repository root (Node 24).
 
 High-frequency events (`message_update`, `before_provider_request`,
 `turn_start`) and duplicates of forwarded events

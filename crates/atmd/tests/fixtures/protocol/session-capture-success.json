@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"capture","method":"session.capture","params":{"target":"%7"}},"response":{"type":"response","id":"capture","result":{"lines":[]}},"ignore":[]}

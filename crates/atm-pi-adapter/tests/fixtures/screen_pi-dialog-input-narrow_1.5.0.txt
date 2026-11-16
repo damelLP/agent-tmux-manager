@@ -1,0 +1,10 @@
+Synthetic: rendered from pi 1.5.0's extension-input.js; no real capture
+────────────────────────────────────────
+
+ Enter a value
+
+>
+
+ enter submit  escape/ctrl+c cancel
+
+────────────────────────────────────────

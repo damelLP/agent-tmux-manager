@@ -8,8 +8,9 @@ use tokio::net::UnixStream;
 
 use atm_core::SessionView;
 use atm_protocol::{ClientMessage, DaemonMessage};
-use atm_tmux::{RealTmuxClient, TmuxClient};
+use atm_tmux::RealTmuxClient;
 use atm_tui::{daemon, role};
+use atmd::control::{resolve_pane_id, ReplyOutcome};
 
 use super::{spawn::non_empty_env, ListFormat};
 
@@ -99,35 +100,6 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     Ok(sessions)
 }
 
-/// Resolves a target (session ID prefix or pane ID) to a tmux pane ID.
-fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String> {
-    // If it starts with %, it's already a pane ID
-    if target.starts_with('%') {
-        return Ok(target.to_string());
-    }
-
-    // Search by session ID prefix
-    let matches: Vec<&SessionView> = sessions
-        .iter()
-        .filter(|s| s.id.as_str().starts_with(target) || s.id_short.starts_with(target))
-        .collect();
-
-    match matches.len() {
-        0 => bail!("No session matching '{target}'"),
-        1 => match &matches[0].tmux_pane {
-            Some(pane) => Ok(pane.clone()),
-            None => bail!("Session {} has no tmux pane", matches[0].id_short),
-        },
-        n => {
-            let ids: Vec<&str> = matches.iter().map(|s| s.id_short.as_str()).collect();
-            bail!(
-                "Ambiguous target '{target}' matches {n} sessions: {}",
-                ids.join(", ")
-            )
-        }
-    }
-}
-
 /// Starts the daemon if needed, then fetches its session list.
 async fn daemon_sessions() -> Result<Vec<SessionView>> {
     daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
@@ -137,7 +109,7 @@ async fn daemon_sessions() -> Result<Vec<SessionView>> {
 /// Fetches the daemon's session list, then resolves a CLI target in it with
 /// `resolve_pane_id` (which returns a `%` pane ID as is).
 async fn pane_for_target(target: &str) -> Result<String> {
-    resolve_pane_id(&daemon_sessions().await?, target)
+    Ok(resolve_pane_id(&daemon_sessions().await?, target)?)
 }
 
 pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
@@ -152,109 +124,46 @@ pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// One daemon request that names a target and answers with the pane it acted on.
+async fn pane_request(method: &str, target: String) -> Result<String> {
+    let result = super::rpc::call(
+        method,
+        serde_json::json!({"target": target}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    result
+        .get("pane")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("Invalid {method} response: missing pane"))
+}
+
 pub(super) async fn cmd_kill(target: String) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-    client
-        .kill_pane(&pane_id)
-        .await
-        .context(format!("Failed to kill pane {pane_id}"))?;
+    let pane_id = pane_request("session.kill", target).await?;
     println!("Killed {pane_id}");
     Ok(())
 }
 
 pub(super) async fn cmd_interrupt(target: String) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-    // C-c sends SIGINT to the foreground process in the pane
-    client
-        .send_keys(&pane_id, "C-c")
-        .await
-        .context(format!("Failed to interrupt pane {pane_id}"))?;
+    let pane_id = pane_request("session.interrupt", target).await?;
     println!("Interrupted {pane_id}");
     Ok(())
 }
 
 pub(super) async fn cmd_send(target: String, text: String) -> Result<()> {
-    let sessions = daemon_sessions().await?;
-    let pane_id = resolve_pane_id(&sessions, &target)?;
-    let client = RealTmuxClient::new();
-    let pane_state = client
-        .raw_command(
-            "display-message",
-            &[
-                "-p",
-                "-t",
-                &pane_id,
-                "#{pane_in_mode} #{bracket_paste_flag}",
-            ],
-        )
-        .await
-        .context(format!("Failed to read the state of pane {pane_id}"))?;
-    if let Some(reason) = send_refusal(&sessions, &target, &pane_id, &pane_state, &text) {
-        bail!("Refusing to send to {pane_id}: {reason}");
-    }
-    client
-        .paste_text(&pane_id, &text)
-        .await
-        .context(format!("Failed to paste into pane {pane_id}"))?;
-    // Send Enter to submit the text, on its own call: tmux reads an
-    // argument ending in `;` as a command separator.
-    client
-        .send_keys(&pane_id, "Enter")
-        .await
-        .context(format!("Failed to send Enter to pane {pane_id}"))?;
-    println!("Sent to {pane_id} by tmux paste");
+    let result = super::rpc::call(
+        "session.send",
+        serde_json::json!({"target": target, "text": text}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let pane = result
+        .get("pane")
+        .and_then(serde_json::Value::as_str)
+        .context("Invalid session.send response: missing pane")?;
+    println!("Sent to {pane} by tmux paste");
     Ok(())
-}
-
-/// Why `atm send` must not paste `text` into `pane` for `target`, if it
-/// must not (#116). `pane_state` is `#{pane_in_mode} #{bracket_paste_flag}`;
-/// tmux before 3.7 has no `bracket_paste_flag` and leaves it empty, which
-/// counts as unknown.
-fn send_refusal(
-    sessions: &[SessionView],
-    target: &str,
-    pane: &str,
-    pane_state: &str,
-    text: &str,
-) -> Option<&'static str> {
-    let mut fields = pane_state.split_whitespace();
-    let in_mode = fields.next().is_some_and(|modes| modes != "0");
-    let bracketed_paste = fields.next();
-    let in_pane = || {
-        sessions
-            .iter()
-            .filter(|s| s.tmux_pane.as_deref() == Some(pane))
-    };
-    let named = sessions
-        .iter()
-        .find(|s| s.id.as_str().starts_with(target) || s.id_short.starts_with(target));
-    // An in-process child, such as a Claude background subagent, carries its
-    // lead's pane. A `%N` target names the pane itself.
-    if !target.starts_with('%')
-        && named
-            .and_then(|s| s.parent_session_id.as_ref())
-            .is_some_and(|parent| in_pane().any(|s| &s.id == parent))
-    {
-        return Some("the session is a subagent in its lead's pane; the text would reach the lead");
-    }
-    // A dialog (permission, question, plan) takes the paste, and Enter picks
-    // its highlighted option. A subagent's dialog shows in its lead's pane.
-    // A dialog denied with Esc sends no event, so the status can outlast it.
-    if in_pane().any(|s| s.status == atm_core::SessionStatus::AttentionNeeded) {
-        return Some(
-            "the session is waiting on a dialog that Enter would answer; use `atm reply`, \
-             or, if the dialog is gone, type in the pane",
-        );
-    }
-    if in_mode {
-        return Some("the pane is in copy mode (or another mode), so Enter would go to tmux");
-    }
-    if bracketed_paste == Some("0") && text.contains(['\n', '\r']) {
-        return Some("the program didn't ask for bracketed paste, so each line would submit alone");
-    }
-    None
 }
 
 /// CLI-only metadata: the daemon's SessionView and wire format stay unchanged.
@@ -365,250 +274,38 @@ pub(super) async fn cmd_reply(
     yes: bool,
     no: bool,
 ) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-
-    if no {
-        // Escape dismisses/cancels the prompt
-        client
-            .send_keys(&pane_id, "Escape")
-            .await
-            .context("Failed to send Escape")?;
-        println!("Sent Escape to {pane_id}");
-        return Ok(());
+    let result = super::rpc::call(
+        "session.reply",
+        serde_json::json!({"target":target,"option":option,"yes":yes,"no":no}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let outcome: ReplyOutcome =
+        serde_json::from_value(result).context("Invalid session.reply response")?;
+    match outcome {
+        ReplyOutcome::Escape { pane } => println!("Sent Escape to {pane}"),
+        ReplyOutcome::Enter { pane } => println!("Sent Enter to {pane}"),
+        ReplyOutcome::Selected { pane, option } => println!("Selected option {option} on {pane}"),
     }
-
-    if yes || option.is_none() {
-        // Just press Enter to accept current selection
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-        println!("Sent Enter to {pane_id}");
-        return Ok(());
-    }
-
-    // Navigate to the desired option number
-    let desired = option.unwrap_or(1);
-
-    // Capture the pane to find which option the cursor is on
-    let lines = client
-        .capture_pane(&pane_id)
-        .await
-        .context("Failed to capture pane")?;
-
-    let current = find_selected_option(&lines).unwrap_or(1);
-
-    if desired == current {
-        // Already on the right option, just press Enter
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-    } else if desired > current {
-        // Navigate down
-        for _ in 0..(desired - current) {
-            client
-                .send_keys(&pane_id, "Down")
-                .await
-                .context("Failed to send Down")?;
-        }
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-    } else {
-        // Navigate up
-        for _ in 0..(current - desired) {
-            client
-                .send_keys(&pane_id, "Up")
-                .await
-                .context("Failed to send Up")?;
-        }
-        client
-            .send_keys(&pane_id, "Enter")
-            .await
-            .context("Failed to send Enter")?;
-    }
-
-    println!("Selected option {desired} on {pane_id}");
     Ok(())
 }
 
-/// Finds which numbered option currently has the ❯ cursor.
-/// Returns 1-based option number, or None if no cursor found.
-fn find_selected_option(lines: &[String]) -> Option<usize> {
-    for line in lines {
-        let trimmed = line.trim();
-        // Pattern: "❯ N. ..." where N is the option number
-        if let Some(rest) = trimmed.strip_prefix("❯ ") {
-            // Try to parse "N." at the start
-            if let Some(dot_pos) = rest.find('.') {
-                if let Ok(n) = rest[..dot_pos].trim().parse::<usize>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    // No cursor found — assume option 1 (default selection)
-    None
-}
-
 pub(super) async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) -> Result<()> {
-    let pane_id = pane_for_target(&target).await?;
-    let client = RealTmuxClient::new();
-    let lines = client
-        .capture_pane(&pane_id)
-        .await
-        .context(format!("Failed to capture pane {pane_id}"))?;
-
-    let output: &[String] = if prompt {
-        extract_prompt(&lines)
-    } else if let Some(n) = tail {
-        let start = lines.len().saturating_sub(n);
-        &lines[start..]
-    } else {
-        &lines
-    };
-
+    let result = super::rpc::call(
+        "session.capture",
+        serde_json::json!({"target":target,"tail":tail,"prompt":prompt}),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let lines = result
+        .get("lines")
+        .context("Invalid session.capture response: missing lines")?;
+    let output: Vec<String> =
+        serde_json::from_value(lines.clone()).context("Invalid session.capture response: lines")?;
     for line in output {
         println!("{line}");
     }
     Ok(())
-}
-
-/// Extracts the active prompt from captured pane content.
-///
-/// Scans backwards from the bottom looking for Claude Code prompt patterns:
-/// - Footer line: "Enter to select" / "Esc to cancel" / "(Y)es/(N)o"
-/// - Numbered options: "1. ...", "2. ..."
-/// - Separator lines (box drawing: ─── or ═══)
-/// - Question/title lines
-/// - Title blocks (☐/□/■)
-///
-/// Falls back to the last 15 lines if no prompt pattern is detected.
-fn extract_prompt(lines: &[String]) -> &[String] {
-    if lines.is_empty() {
-        return lines;
-    }
-
-    // Find the footer line (bottom of prompt)
-    let footer_idx = lines.iter().rposition(|l| {
-        let trimmed = l.trim();
-        trimmed.contains("Enter to select")
-            || trimmed.contains("Esc to cancel")
-            || trimmed.contains("(Y)es")
-            || trimmed.contains("(y/n)")
-            || trimmed.contains("to navigate")
-    });
-
-    let end = footer_idx.map_or(lines.len(), |i| i + 1);
-
-    // Scan backwards from footer to find the top of the prompt block.
-    // Strategy: keep going as long as lines look like prompt content.
-    // Stop when we hit a line that's clearly not part of the prompt
-    // (e.g., regular output, the ● response marker, the ❯ input line).
-    let mut start = end.saturating_sub(1);
-
-    for i in (0..end.saturating_sub(1)).rev() {
-        let trimmed = lines[i].trim();
-
-        // Part of prompt: numbered options, indented descriptions, cursor
-        if trimmed.starts_with("1.")
-            || trimmed.starts_with("2.")
-            || trimmed.starts_with("3.")
-            || trimmed.starts_with("4.")
-            || trimmed.starts_with("5.")
-            || trimmed.starts_with("6.")
-            || trimmed.starts_with("7.")
-            || trimmed.starts_with("8.")
-            || trimmed.starts_with("9.")
-        {
-            start = i;
-            continue;
-        }
-
-        // Cursor indicator on option
-        if trimmed.starts_with("❯ ") && trimmed.len() > 2 {
-            // "❯ 1. Yes" is a prompt option; bare "❯ " is the input line
-            let after_cursor = trimmed.get(4..).unwrap_or(""); // skip "❯ "
-            if after_cursor.starts_with("1.")
-                || after_cursor.starts_with("2.")
-                || after_cursor.starts_with("3.")
-                || after_cursor.starts_with("4.")
-                || after_cursor.starts_with("5.")
-            {
-                start = i;
-                continue;
-            }
-        }
-
-        // Indented description line (part of an option)
-        if lines[i].starts_with("    ") && !trimmed.is_empty() {
-            start = i;
-            continue;
-        }
-
-        // Separator line (─── or ═══ etc.)
-        if is_separator_line(trimmed) {
-            start = i;
-            continue;
-        }
-
-        // Empty line (spacing within prompt)
-        if trimmed.is_empty() {
-            start = i;
-            continue;
-        }
-
-        // Question line (contains ?)
-        if trimmed.contains('?') {
-            start = i;
-            continue;
-        }
-
-        // Title block (☐/□/■)
-        if trimmed.starts_with('☐') || trimmed.starts_with('□') || trimmed.starts_with('■') {
-            start = i;
-            break; // Title is the top of the prompt
-        }
-
-        // If we've already found prompt content (start < end-1),
-        // a non-matching line means we've gone past the prompt
-        if start < end.saturating_sub(1) {
-            break;
-        }
-    }
-
-    // If we didn't find any prompt markers, fall back to last 15 lines
-    if start == end.saturating_sub(1) && footer_idx.is_none() {
-        let fallback_start = lines.len().saturating_sub(15);
-        return &lines[fallback_start..];
-    }
-
-    // Trim leading blank/separator lines from the extracted prompt
-    while start < end {
-        let trimmed = lines.get(start).map(|l| l.trim()).unwrap_or("");
-        if trimmed.is_empty() || is_separator_line(trimmed) {
-            start += 1;
-        } else {
-            break;
-        }
-    }
-
-    &lines[start..end]
-}
-
-/// Returns true if a line is a box-drawing separator (────, ════, etc.)
-fn is_separator_line(trimmed: &str) -> bool {
-    if trimmed.len() < 3 {
-        return false;
-    }
-    let first_char = trimmed.chars().next().unwrap_or(' ');
-    matches!(first_char, '─' | '━' | '═' | '┄' | '┈')
-        && trimmed
-            .chars()
-            .all(|c| matches!(c, '─' | '━' | '═' | '┄' | '┈' | ' '))
 }
 
 pub(super) async fn cmd_status() -> Result<()> {
@@ -636,7 +333,47 @@ pub(super) async fn cmd_status() -> Result<()> {
         parts.push(format!("{attention}!"));
     }
     parts.push(format!("${total_cost:.2}"));
-    println!("{}", parts.join(" "));
+    use atmd::org::messages::{Address, InboxParams};
+    let unread = super::msg::inbox_request(InboxParams {
+        recipient: Some(Address::Owner),
+        unread_only: false,
+        count_only: true,
+        id: None,
+        after: None,
+        limit: 100,
+    })
+    .await
+    .and_then(|result| {
+        if !result.messages.is_empty() || result.next_after.is_some() {
+            bail!("invalid aggregate result from daemon");
+        }
+        Ok(result.unread_count)
+    });
+    match unread {
+        Ok(0) => {}
+        Ok(count) => parts.push(format!("{count} unread")),
+        Err(error) => {
+            parts.push("? unread".into());
+            eprintln!("unread count unavailable: {error}");
+        }
+    }
+    match super::decide::pending_count().await {
+        Ok((count, away)) => {
+            if count > 0 {
+                parts.push(format!("{count} decisions"));
+            }
+            // So that a forgotten `atm back` shows in the status line.
+            if away {
+                parts.push("away".into());
+            }
+        }
+        Err(error) => {
+            parts.push("? decisions".into());
+            eprintln!("decision count unavailable: {error}");
+        }
+    }
+    use std::io::Write;
+    writeln!(std::io::stdout().lock(), "{}", parts.join(" "))?;
 
     Ok(())
 }
@@ -671,186 +408,5 @@ mod list_tests {
                 );
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod prompt_tests {
-    use super::extract_prompt;
-
-    #[test]
-    fn test_extract_numbered_prompt() {
-        let lines: Vec<String> = vec![
-            "Some previous output",
-            "",
-            "Do you like pineapple on pizza?",
-            "",
-            "❯ 1. Yes",
-            "    Pineapple belongs on pizza",
-            "  2. No",
-            "    Pineapple does not belong on pizza",
-            "  3. Type something.",
-            "",
-            "  4. Chat about this",
-            "",
-            "Enter to select · ↑/↓ to navigate · Esc to cancel",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
-        let prompt = extract_prompt(&lines);
-        let text = prompt
-            .iter()
-            .map(|l| l.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            text.contains("pineapple on pizza"),
-            "should contain the question"
-        );
-        assert!(text.contains("1. Yes"), "should contain option 1");
-        assert!(text.contains("4. Chat"), "should contain option 4");
-        assert!(text.contains("Enter to select"), "should contain footer");
-        assert!(
-            !text.contains("previous output"),
-            "should not contain earlier output"
-        );
-    }
-
-    #[test]
-    fn test_extract_yn_prompt() {
-        let lines: Vec<String> = vec![
-            "lots of code output here",
-            "more code",
-            "",
-            "Allow Bash: git status? (Y)es/(N)o",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
-        let prompt = extract_prompt(&lines);
-        assert!(prompt.iter().any(|l| l.contains("(Y)es")));
-    }
-
-    #[test]
-    fn test_fallback_when_no_prompt() {
-        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
-
-        let prompt = extract_prompt(&lines);
-        assert_eq!(prompt.len(), 15);
-    }
-
-    #[test]
-    fn test_empty_input() {
-        let lines: Vec<String> = vec![];
-        let prompt = extract_prompt(&lines);
-        assert!(prompt.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod send_tests {
-    use super::send_refusal;
-    use atm_core::{SessionId, SessionStatus, SessionView};
-
-    fn row(id: &str, pane: Option<&str>, parent: Option<&str>) -> SessionView {
-        SessionView {
-            id: SessionId::new(id),
-            id_short: id.chars().take(8).collect(),
-            tmux_pane: pane.map(str::to_string),
-            parent_session_id: parent.map(SessionId::new),
-            ..SessionView::default()
-        }
-    }
-
-    fn needs_input(mut session: SessionView) -> SessionView {
-        session.status = SessionStatus::AttentionNeeded;
-        session
-    }
-
-    #[test]
-    fn a_command_or_message_to_an_idle_lead_is_sent() {
-        let sessions = [row("lead-aaaa", Some("%5"), None)];
-        for text in ["/clear", "!ls", "run the tests;"] {
-            assert_eq!(
-                send_refusal(&sessions, "lead", "%5", "0 1\n", text),
-                None,
-                "{text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_pane_in_copy_mode_is_refused() {
-        let sessions = [row("lead-aaaa", Some("%5"), None)];
-        let reason = send_refusal(&sessions, "%5", "%5", "1 1\n", "hello");
-        assert!(reason.is_some_and(|r| r.contains("copy mode")));
-    }
-
-    #[test]
-    fn multi_line_text_is_refused_only_when_the_flag_is_explicitly_off() {
-        let sessions = [row("lead-aaaa", Some("%5"), None)];
-        let two_lines = "line one\nline two";
-        assert!(send_refusal(&sessions, "%5", "%5", "0 0\n", two_lines)
-            .is_some_and(|r| r.contains("bracketed paste")));
-        assert!(send_refusal(&sessions, "%5", "%5", "0 0\n", "a\rb").is_some());
-        assert_eq!(
-            send_refusal(&sessions, "%5", "%5", "0 1\n", two_lines),
-            None
-        );
-        // tmux before 3.7 has no `bracket_paste_flag` and prints it empty.
-        assert_eq!(send_refusal(&sessions, "%5", "%5", "0 \n", two_lines), None);
-        assert_eq!(
-            send_refusal(&sessions, "%5", "%5", "0 0\n", "one line"),
-            None
-        );
-    }
-
-    #[test]
-    fn a_subagent_in_its_leads_pane_is_refused() {
-        let sessions = [
-            row("lead-aaaa", Some("%5"), None),
-            row("child-bbbb", Some("%5"), Some("lead-aaaa")),
-        ];
-        let reason = send_refusal(&sessions, "child", "%5", "0 1\n", "hi");
-        assert!(reason.is_some_and(|r| r.contains("subagent") && r.contains("lead")));
-        // A pane target means the pane itself, which the lead reads.
-        assert_eq!(send_refusal(&sessions, "%5", "%5", "0 1\n", "hi"), None);
-    }
-
-    #[test]
-    fn a_teammate_with_its_own_pane_is_sent() {
-        let sessions = [
-            row("lead-aaaa", Some("%5"), None),
-            row("mate-cccc", Some("%7"), Some("lead-aaaa")),
-        ];
-        assert_eq!(send_refusal(&sessions, "mate", "%7", "0 1\n", "hi"), None);
-    }
-
-    #[test]
-    fn a_dialog_in_the_target_pane_is_refused() {
-        let reason = |sessions: &[SessionView], target| {
-            send_refusal(sessions, target, "%5", "0 1\n", "/clear")
-        };
-        let lead_at_dialog = [needs_input(row("lead-aaaa", Some("%5"), None))];
-        // The status can outlive a dialog denied with Esc, so the reason
-        // names the way out too.
-        assert!(reason(&lead_at_dialog, "lead")
-            .is_some_and(|r| r.contains("atm reply") && r.contains("type in the pane")));
-        assert!(reason(&lead_at_dialog, "%5").is_some());
-        // A background subagent's dialog shows in its lead's pane.
-        let child_at_dialog = [
-            row("lead-aaaa", Some("%5"), None),
-            needs_input(row("child-bbbb", Some("%5"), Some("lead-aaaa"))),
-        ];
-        assert!(reason(&child_at_dialog, "lead").is_some());
-        // A dialog in another pane doesn't matter.
-        let other_pane = [
-            row("lead-aaaa", Some("%5"), None),
-            needs_input(row("else-dddd", Some("%9"), None)),
-        ];
-        assert_eq!(reason(&other_pane, "lead"), None);
     }
 }

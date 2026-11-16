@@ -1,0 +1,25 @@
+Captured: codex 0.167.0, 2026-11-14, P1 sealed private tmux capture-pane -p -e -N; sanitized.
+                         
+  [38;2;99;168;248m>_ [1m[39mOpenAI Codex[0;2m (v0.167.0)[0m                      
+     [2m/tmp/xxxxxxxxxxxxxxxxxxxxxx/project[0m          
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+[1m›[0m B_EARLY_PASTE                                   
+                         
+  [38;2;246;226;183mgpt-5.4 default[39m · [38;2;171;223;167m/tmp/xxxxxxxxxxxxxxxxxxxxxx/project[39m                                             
+                                                                           ⚠ [38;2;196;167;103m1 warning[39m · [1mf2[0m to view 

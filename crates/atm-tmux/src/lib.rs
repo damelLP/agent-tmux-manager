@@ -75,12 +75,16 @@ pub trait TmuxClient: Send + Sync {
     /// * `size` — Size specification (e.g., "30%", "20").
     /// * `direction` — Where to place the new pane relative to the target.
     /// * `command` — Optional command to run in the new pane.
+    /// * `cwd` — Optional shell start directory (`split-window -c`).
+    /// * `detached` — Leave the existing pane active (`split-window -d`); false preserves selection behavior.
     async fn split_window(
         &self,
         target: &str,
         size: &str,
         direction: PaneDirection,
         command: Option<&str>,
+        cwd: Option<&str>,
+        detached: bool,
     ) -> Result<String, TmuxError>;
 
     /// Returns the current working directory of a pane, or `None` if unavailable.

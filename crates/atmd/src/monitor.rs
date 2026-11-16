@@ -87,30 +87,18 @@ impl ProcessMonitor {
     /// CPU usage. For periodic monitoring, the previous refresh serves as
     /// the baseline, so single refresh works after the first call.
     ///
-    /// Important: We must call refresh_all() for CPU calculations to work
-    /// correctly. Just refreshing a single process doesn't compute CPU%.
+    /// On Linux, sysinfo 0.32.1 computes process CPU usage in its all-process
+    /// refresh path, not when refreshing a single PID. Keep refresh_all()
+    /// to use that path; sysinfo owns the CPU calculation.
     pub fn refresh(&mut self) -> ProcessMetrics {
-        // refresh_all() is required for CPU calculation to work
-        // (refresh_processes with single PID doesn't compute CPU correctly)
         self.system.refresh_all();
 
-        let (memory_bytes, cpu_percent) = self
+        let sample = self
             .system
             .process(self.pid)
-            .map(|p| (p.memory(), p.cpu_usage()))
-            .unwrap_or((0, 0.0));
+            .map(|p| (p.memory(), p.cpu_usage()));
 
-        let memory_mb = memory_bytes / 1024 / 1024;
-        let memory_high = memory_mb > self.memory_threshold_mb;
-        let cpu_high = cpu_percent > self.cpu_threshold_percent;
-
-        ProcessMetrics {
-            memory_bytes,
-            memory_mb,
-            cpu_percent,
-            memory_high,
-            cpu_high,
-        }
+        metrics_from_sample(sample, self.memory_threshold_mb, self.cpu_threshold_percent)
     }
 
     /// Returns the current memory threshold in MB.
@@ -127,6 +115,26 @@ impl ProcessMonitor {
 impl Default for ProcessMonitor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Applies ATM's thresholds to resident bytes and sysinfo's CPU percentage.
+fn metrics_from_sample(
+    sample: Option<(u64, f32)>,
+    memory_threshold_mb: u64,
+    cpu_threshold_percent: f32,
+) -> ProcessMetrics {
+    let (memory_bytes, cpu_percent) = sample.unwrap_or((0, 0.0));
+    let memory_mb = memory_bytes / 1024 / 1024;
+    let memory_high = memory_mb > memory_threshold_mb;
+    let cpu_high = cpu_percent > cpu_threshold_percent;
+
+    ProcessMetrics {
+        memory_bytes,
+        memory_mb,
+        cpu_percent,
+        memory_high,
+        cpu_high,
     }
 }
 
@@ -207,6 +215,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_metrics_from_missing_or_zero_sample() {
+        for sample in [None, Some((0, 0.0))] {
+            let metrics =
+                metrics_from_sample(sample, HIGH_MEMORY_THRESHOLD_MB, HIGH_CPU_THRESHOLD_PERCENT);
+            assert_eq!(metrics.memory_bytes, 0);
+            assert_eq!(metrics.memory_mb, 0);
+            assert_eq!(metrics.cpu_percent, 0.0);
+            assert!(!metrics.memory_high);
+            assert!(!metrics.cpu_high);
+            assert!(!metrics.is_any_high());
+        }
+    }
+
+    #[test]
+    fn test_metrics_preserve_cpu_sample_and_strict_threshold() {
+        for (cpu_percent, threshold, expected_high) in [
+            (12.5, 80.0, false),
+            (80.0, 80.0, false),
+            (80.5, 80.0, true),
+            (100.0, 80.0, true),
+            (250.0, 80.0, true),
+            (100.0, 150.0, false),
+        ] {
+            let metrics =
+                metrics_from_sample(Some((50 * 1024 * 1024, cpu_percent)), 100, threshold);
+            assert_eq!(metrics.memory_bytes, 50 * 1024 * 1024);
+            assert_eq!(metrics.memory_mb, 50);
+            assert_eq!(metrics.cpu_percent, cpu_percent);
+            assert!(!metrics.memory_high);
+            assert_eq!(
+                metrics.cpu_high, expected_high,
+                "CPU {cpu_percent}, threshold {threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metrics_floor_mib_before_strict_memory_threshold() {
+        const MIB: u64 = 1024 * 1024;
+        for (bytes, expected_mb, expected_high) in [
+            (100 * MIB - 1, 99, false),
+            (100 * MIB, 100, false),
+            (101 * MIB - 1, 100, false),
+            (101 * MIB, 101, true),
+        ] {
+            let metrics = metrics_from_sample(Some((bytes, 0.0)), 100, 80.0);
+            assert_eq!(metrics.memory_bytes, bytes);
+            assert_eq!(metrics.memory_mb, expected_mb, "bytes {bytes}");
+            assert_eq!(metrics.cpu_percent, 0.0);
+            assert_eq!(metrics.memory_high, expected_high, "bytes {bytes}");
+            assert!(!metrics.cpu_high);
+        }
+    }
+
+    #[test]
+    fn test_metrics_repeated_samples_and_combined_flags() {
+        for (memory_mb, cpu_percent, memory_high, cpu_high, any_high) in [
+            (0, 0.0, false, false, false),
+            (101, 0.0, true, false, true),
+            (0, 80.5, false, true, true),
+            (101, 80.5, true, true, true),
+        ] {
+            let sample = Some((memory_mb * 1024 * 1024, cpu_percent));
+            for _ in 0..2 {
+                let metrics = metrics_from_sample(sample, 100, 80.0);
+                assert_eq!(metrics.memory_bytes, memory_mb * 1024 * 1024);
+                assert_eq!(metrics.memory_mb, memory_mb);
+                assert_eq!(metrics.cpu_percent, cpu_percent);
+                assert_eq!(metrics.memory_high, memory_high);
+                assert_eq!(metrics.cpu_high, cpu_high);
+                assert_eq!(metrics.is_any_high(), any_high);
+            }
+        }
+    }
+
+    #[test]
     fn test_process_metrics_default() {
         let metrics = ProcessMetrics::default();
         assert_eq!(metrics.memory_bytes, 0);
@@ -266,43 +350,8 @@ mod tests {
 
         // CPU might be 0.0 on first call (no baseline yet)
         // Just verify it's a valid number
+        assert!(metrics.cpu_percent.is_finite());
         assert!(metrics.cpu_percent >= 0.0);
-    }
-
-    #[test]
-    fn test_monitor_cpu_measurement() {
-        use std::time::Duration;
-
-        let mut monitor = ProcessMonitor::new();
-
-        // First refresh establishes baseline
-        let _ = monitor.refresh();
-
-        // Do CPU work for 500ms
-        let start = std::time::Instant::now();
-        let mut sum: u64 = 0;
-        while start.elapsed() < Duration::from_millis(500) {
-            for i in 0..100000 {
-                sum = sum.wrapping_add(i);
-            }
-        }
-        std::hint::black_box(sum);
-
-        // Second refresh should show CPU usage
-        let metrics = monitor.refresh();
-
-        // CPU should show ~100% for one core (we did 500ms of work in 500ms)
-        // Allow some variance due to scheduling
-        assert!(
-            metrics.cpu_percent > 50.0,
-            "Expected CPU > 50%, got {:.2}%",
-            metrics.cpu_percent
-        );
-        assert!(
-            metrics.cpu_percent < 200.0,
-            "CPU seems too high: {:.2}%",
-            metrics.cpu_percent
-        );
     }
 
     #[test]

@@ -71,6 +71,32 @@ pub enum MessageType {
     /// harness with
     /// [`discovery_enabled`](atm_core::HarnessDefinition::discovery_enabled)
     Discover,
+
+    /// Invoke a control-plane method.
+    Request {
+        /// Caller-supplied correlation ID.
+        id: String,
+        /// Method name advertised by the daemon.
+        method: String,
+        /// Method-specific parameters; omitted means null.
+        #[serde(default)]
+        params: serde_json::Value,
+        /// Caller's tmux pane, when available.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from_pane: Option<String>,
+    },
+
+    /// Replay events after a cursor, then follow live events.
+    Watch {
+        /// Event-kind prefixes; empty means all events.
+        #[serde(default)]
+        topics: Vec<String>,
+        /// Last sequence seen by the caller; required even for a new watch.
+        cursor: u64,
+    },
+
+    /// Stop watching events.
+    Unwatch,
 }
 
 /// Messages sent from client to daemon.
@@ -96,6 +122,34 @@ impl ClientMessage {
     /// Creates a connect message.
     pub fn connect(client_id: Option<String>) -> Self {
         Self::new(MessageType::Connect { client_id })
+    }
+
+    /// Creates a control-plane request.
+    #[must_use]
+    pub fn request(
+        id: String,
+        method: String,
+        params: serde_json::Value,
+        from_pane: Option<String>,
+    ) -> Self {
+        Self::new(MessageType::Request {
+            id,
+            method,
+            params,
+            from_pane,
+        })
+    }
+
+    /// Creates an event watch starting after the supplied cursor.
+    #[must_use]
+    pub fn watch(topics: Vec<String>, cursor: u64) -> Self {
+        Self::new(MessageType::Watch { topics, cursor })
+    }
+
+    /// Creates a request to stop watching events.
+    #[must_use]
+    pub fn unwatch() -> Self {
+        Self::new(MessageType::Unwatch)
     }
 
     /// Creates a status update message.
@@ -144,6 +198,70 @@ impl ClientMessage {
     }
 }
 
+/// A control-plane method failure. Codes are open strings; see [`crate::error_code`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseError {
+    /// Machine-readable error code.
+    pub code: String,
+    /// Human-readable explanation.
+    pub message: String,
+}
+
+/// Exactly one result or error, flattened into a response's wire object.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsePayload {
+    /// Successful result, including JSON null.
+    Result(serde_json::Value),
+    /// Method failure.
+    Error(ResponseError),
+}
+
+impl<'de> Deserialize<'de> for ResponsePayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PayloadVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PayloadVisitor {
+            type Value = ResponsePayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("exactly one of result or error")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut payload = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "result" | "error" => {
+                            if payload.is_some() {
+                                return Err(serde::de::Error::custom(
+                                    "response must contain exactly one of result or error",
+                                ));
+                            }
+                            payload = Some(if key == "result" {
+                                ResponsePayload::Result(map.next_value()?)
+                            } else {
+                                ResponsePayload::Error(map.next_value()?)
+                            });
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                payload.ok_or_else(|| {
+                    serde::de::Error::custom("response must contain exactly one of result or error")
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 /// Messages sent from daemon to clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -154,6 +272,9 @@ pub enum DaemonMessage {
         protocol_version: ProtocolVersion,
         /// Assigned client ID
         client_id: String,
+        /// Supported control-plane methods; absent on protocol 1.0 daemons.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        methods: Vec<String>,
     },
 
     /// Connection rejected (version mismatch, etc.)
@@ -204,6 +325,29 @@ pub enum DaemonMessage {
         /// Number of discovery failures (logged at debug)
         failed: u32,
     },
+
+    /// Reply to a control-plane request.
+    Response {
+        /// Request correlation ID.
+        id: String,
+        /// Exactly one result or error on the wire.
+        #[serde(flatten)]
+        payload: ResponsePayload,
+    },
+
+    /// One event from a watched topic.
+    Event {
+        /// Event stream topic.
+        topic: String,
+        /// Sequence number used for replay cursors.
+        seq: u64,
+        /// Caller-supplied timestamp string.
+        ts: String,
+        /// Event kind, matched against watch prefixes.
+        kind: String,
+        /// Event-specific data.
+        body: serde_json::Value,
+    },
 }
 
 impl DaemonMessage {
@@ -212,6 +356,46 @@ impl DaemonMessage {
         Self::Connected {
             protocol_version: ProtocolVersion::CURRENT,
             client_id,
+            methods: Vec::new(),
+        }
+    }
+
+    /// Creates a successful control-plane response, including a null result.
+    #[must_use]
+    pub fn response_ok(id: String, value: serde_json::Value) -> Self {
+        Self::Response {
+            id,
+            payload: ResponsePayload::Result(value),
+        }
+    }
+
+    /// Creates a failed control-plane response.
+    #[must_use]
+    pub fn response_err(id: String, code: &str, message: &str) -> Self {
+        Self::Response {
+            id,
+            payload: ResponsePayload::Error(ResponseError {
+                code: code.to_string(),
+                message: message.to_string(),
+            }),
+        }
+    }
+
+    /// Creates an event using the supplied sequence and timestamp.
+    #[must_use]
+    pub fn event(
+        topic: String,
+        seq: u64,
+        ts: String,
+        kind: String,
+        body: serde_json::Value,
+    ) -> Self {
+        Self::Event {
+            topic,
+            seq,
+            ts,
+            kind,
+            body,
         }
     }
 

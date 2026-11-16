@@ -1,0 +1,33 @@
+Captured: codex 0.167.0, 2026-11-14, P1 private tmux capture-pane -p; 100x32; paths sanitized at equal width.
+  >_ OpenAI Codex (v0.167.0)                      
+     /fixture/xxxxxxxxxxxxxxxxxx/repo             
+                                                  
+                                                                                                    
+› B_NODAEMON_FIRST                                                                                  
+                                                                                                    
+                                                                                                    
+• PROBE_REPLY_4019643_4                                                                             
+                                                                                                    
+  Worked for <1s • 16:38                                                                            
+                                                                                                    
+                                                                                                    
+› C_PERMISSION_ON_REQUEST                                                                           
+                                                                                                    
+                                                                                                    
+• Running printf PROBE_TOOL_OK                                                                      
+                                                                                                    
+                                                                                                    
+  Would you like to run the following command?                                                      
+                                                                                                    
+  Environment: local                                                                                
+                                                                                                    
+  Reason: Allow the harmless sealed probe printf?                                                   
+                                                                                                    
+  $ printf PROBE_TOOL_OK 
+                                                  
+                         
+› 1. Yes, proceed (y)                                                                               
+  2. Yes, and don't ask again for commands that start with `printf PROBE_TOOL_OK` (p)               
+  3. No, and tell Codex what to do differently (esc)                                                
+                                                                                                    
+  Press enter to confirm or esc to cancel                                                           

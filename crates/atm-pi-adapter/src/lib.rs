@@ -39,6 +39,9 @@
 //! - **model** = `claude-sonnet-4-6` / `gpt-5.5` / etc.
 //!
 //! Provider+model changes ride [`atm_core::LifecycleEvent::ProviderModelChange`].
+//! The complete translation (`RawPiEvent::to_lifecycle_events`) also forwards
+//! the envelope's current model after the original event, so startup/resume
+//! needs no `model_select`. Derived metadata is not message activity.
 //! atm-core keeps only the model: `SessionDomain` has no provider.
 //!
 //! ## NeedsInput is extension-mediated
@@ -100,13 +103,42 @@
 //! The hand-copied JSON payloads in the `wire.rs` and `translate.rs`
 //! tests follow the spike trace. Captured: pi, version not recorded,
 //! 2026-05-02 (trace
-//! `/tmp/atm-pi-spike-pid1226148-2026-05-02T08-55-56-043Z.jsonl`, not
+//! `/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.jsonl`, not
 //! kept), pi-spike tracer in an interactive session, spike
 //! `agent-tmux-manager-9dn`; added in 7a20d86 on 2026-05-10.
 //!
 //! Tests that build `PiPayload` structs check mapping logic and claim
 //! no capture. `Synthetic:` marks the tests and examples whose shapes
 //! or values no capture produced.
+//!
+//! ## Conversation bodies and busy-row limits
+//!
+//! pi-atm sends empty payloads for `context`, `turn_end` and `agent_end`.
+//! Context usage/model come from the envelope; `agent_end` needs no body
+//! to become `WorkingEnd`. Legacy full-body frames still translate.
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed SDK session with a scripted local
+//! reply (no model call), events and outgoing Unix-socket frames measured.
+//! Seeded conversation text and the scripted reply were each 1,100,000
+//! characters: pi's raw context, turn-end and agent-end events each exceeded
+//! 1 MiB. Before thinning, context and agent-end wire frames exceeded atmd's
+//! 1 MiB line limit too; turn-end was already trimmed. The envelope carries
+//! the usage snapshot without those bodies.
+//!
+//! Synthetic: the same day's private-atmd probe fed the original extension
+//! an oversized agent-end callback. The daemon closed that connection and
+//! kept Working; an end sent during reconnect backoff was lost too. A small
+//! end after reconnect restored Idle. This is not attribution of a live
+//! stale-row incident, nor a general size bound on other event bodies.
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed SDK session, an input handler
+//! consumed an interactive input, original pi-atm and a private real atmd.
+//! Pi emitted session-start and input, but no agent-start or agent-end:
+//! pi was idle while atmd showed Working. No model was called. Payload
+//! thinning cannot fix an event that never fires. Pi 1.5.2 also distinguishes
+//! low-level `agent_end` from final `agent_settled`; pi-atm still forwards
+//! only the former. Heartbeat, restart resynchronization and final-idle
+//! semantics are unchanged. Neither probe verified the reported live cause.
 //!
 //! ## Cost and tokens
 //!
@@ -135,10 +167,8 @@
 //!
 //! - `model_select` fires only when the user changes model: pi's source
 //!   emits it for `set` and `cycle`, never for the declared `restore`.
-//!   A fresh or resumed session sends none, so its model shows as
-//!   unknown until the user switches. pi-atm's envelope snapshot of
-//!   `ctx.model` holds the startup model, but the adapter reads only its
-//!   context window.
+//!   The complete translation uses pi-atm's envelope snapshot instead;
+//!   older pi-atm without that snapshot still needs a model switch.
 //! - The context window comes from that snapshot, on `context` events.
 //!   pi-atm before the snapshot sends none, so context percentages use
 //!   the unknown model's 200K default until the user re-runs `atm setup`.
@@ -156,9 +186,9 @@
 //!   $0.003675, where the footer showed `$0.007` and `$0.011`.
 //! - After `/resume`, `/fork` or `/reload`, the new row shows $0 until the
 //!   next prompt's first `context` frame, while pi's footer shows the
-//!   session file's total at once. It shares a cause with the
-//!   `model_select` gap above: one pi event maps to one `LifecycleEvent`,
-//!   so `session_start` can't also carry the usage or the model.
+//!   session file's total at once. Unlike the model, usage is not
+//!   snapshotted on `session_start`, so even the complete translation
+//!   cannot restore the cost from that frame.
 //!   Unverified: read, not run.
 //! - Compaction and branch-summary calls aren't counted. pi's footer
 //!   doesn't count them either, since they aren't assistant messages.
@@ -179,19 +209,25 @@
 //!   "one session id held by two pids". Older pi-atm sent no
 //!   `session_id` (it read `currentSessionId`, which no pi release has),
 //!   so each pid got its own `pending-<pid>` and the case never arose.
-//! - Discovery can't see pi. pi sets `process.title = "pi"` (found in
-//!   0.50.0, 0.65.0, 0.70.0, 0.72.1 and 0.73.1, not in 0.10.0), so
-//!   `/proc` shows cmdline `pi` and exe `node`. pi's matchers need a
-//!   path, and pi rejects bare cmdline matches. A pi already running
-//!   when atmd starts appears only with pi-atm's next event.
+//! - Discovery sees pi by its bare name. pi sets `process.title = "pi"`
+//!   (found in 0.50.0, 0.65.0, 0.70.0, 0.72.1, 0.73.1 and 1.5.0, not in
+//!   0.10.0), so `/proc` shows cmdline `pi` with NUL padding, comm `pi`
+//!   and exe `node`. Captured: pi 1.5.0, 2026-11-15, `/proc` read of
+//!   running sessions. pi's registry entry therefore matches a bare `pi`
+//!   as argv0. A pi already running when atmd starts gets a
+//!   `pending-<pid>` row, without its model, cost or session id until
+//!   pi-atm's next event. Before that match existed, such a pi had no
+//!   row until that event. Checked with a stand-in of that shape running
+//!   pi-atm; a real pi across a daemon restart is unverified.
 //! - `/new`, `/resume`, `/fork` and `/reload` replace the session in the
 //!   same process. pi (0.65.0 and later) loads pi-atm afresh, so
 //!   `session_shutdown` comes from the old instance and `session_start`
 //!   from the new one on a new connection. atmd ends the old row and
 //!   starts a new one. That includes `/reload`, which keeps the id, so
-//!   the row's model and cost reset (fake-b at $0.0033 became Unknown at
-//!   $0). The old instance's connection stays open until atmd closes it
-//!   after 300 s idle. Over rpc, `new_session` and `clone` fired
+//!   the row's cost resets (the original check went from fake-b at
+//!   $0.0033 to Unknown at $0; complete translation now restores the
+//!   model from the snapshot). The old instance's connection stays open
+//!   until atmd closes it after 300 s idle. Over rpc, `new_session` and `clone` fired
 //!   `session_start` twice; the TUI's `/new` fired it once.
 //! - atmd renames a row from `pending-<pid>` to a real id on any event.
 //!   A `session_start` with another real id ends the session the pid's row
@@ -219,6 +255,7 @@
 //!   the first.
 
 pub mod event;
+pub mod screen;
 pub mod translate;
 pub mod wire;
 

@@ -1,0 +1,2 @@
+Captured: Claude Code 2.1.325, 2026-11-14, display-message -p cursor_x,cursor_y (zero-based); poor.
+2,6; pane=100x30; cursor_flag=0

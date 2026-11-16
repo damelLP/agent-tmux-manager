@@ -14,6 +14,42 @@ use serde_json::Value;
 
 use crate::event::PiEventType;
 
+/// Stored copy only: omit context conversations without cloning them first.
+/// Translation still receives the original frame. Captured: pi 1.5.0,
+/// 2026-11-14, private CLI/local static provider and pi-atm socket tap; context
+/// has payload.messages and independent envelope usage/model snapshots.
+#[must_use]
+pub fn raw_log_body(data: &Value) -> Value {
+    if data.get("event").and_then(Value::as_str) != Some("context") {
+        return data.clone();
+    }
+    let (Some(object), Some(payload)) = (
+        data.as_object(),
+        data.get("payload").and_then(Value::as_object),
+    ) else {
+        return data.clone();
+    };
+    Value::Object(
+        object
+            .iter()
+            .map(|(key, value)| {
+                let value = if key == "payload" {
+                    Value::Object(
+                        payload
+                            .iter()
+                            .filter(|(key, _)| key.as_str() != "messages")
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    )
+                } else {
+                    value.clone()
+                };
+                (key.clone(), value)
+            })
+            .collect(),
+    )
+}
+
 /// Wire envelope: pi extension forwards `{event, payload}` per event.
 ///
 /// This is what the TS extension (`pi-atm`, bead
@@ -234,6 +270,48 @@ fn non_empty(s: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_trim_keeps_usage_and_original_translation_input() {
+        // Captured: pi 0.73.1, 2026-10-24, private TUI/fake provider/socket tap.
+        let text = include_str!("../tests/fixtures/pi_session_cost_0.73.1.jsonl");
+        let mut contexts = 0;
+        for line in text.lines() {
+            let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+            let Some(data) = frame.get("data") else {
+                continue;
+            };
+            let original = data.clone();
+            let trimmed = super::raw_log_body(data);
+            if data.get("event").and_then(serde_json::Value::as_str) == Some("context") {
+                contexts += 1;
+                assert!(data["payload"].get("messages").is_some());
+                assert!(trimmed["payload"].get("messages").is_none());
+                assert_eq!(trimmed["usage"], data["usage"]);
+                let mut expected = data.clone();
+                expected["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("messages");
+                assert_eq!(trimmed, expected);
+            } else {
+                assert_eq!(trimmed, original);
+            }
+            assert_eq!(data, &original, "translation input was changed");
+        }
+        assert!(contexts > 0);
+    }
+
+    #[test]
+    fn raw_trim_retains_malformed_and_noncontext_payloads() {
+        // Synthetic: malformed/unknown envelopes must survive raw capture.
+        for data in [
+            serde_json::json!(null),
+            serde_json::json!({"event":"context","payload":[]}),
+            serde_json::json!({"event":"unknown","payload":{"messages":[1]}}),
+        ] {
+            assert_eq!(super::raw_log_body(&data), data);
+        }
+    }
     use super::*;
 
     // The `parse_*` payloads below follow the spike trace.

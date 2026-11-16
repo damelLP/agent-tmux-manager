@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"agent-up-invalid-name","method":"agent.up","params":{"project_root":"/project","name":"../lead"}},
+  "response": {"type":"response","id":"agent-up-invalid-name","error":{"code":"invalid_params","message":"invalid agent parameters: invalid agent name: \"../lead\" (expected 1..32 lowercase ASCII letters, digits or hyphens; first character alphanumeric; owner/system reserved)"}},
+  "ignore": []
+}

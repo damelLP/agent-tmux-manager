@@ -1,0 +1,34 @@
+
+
+ [38;5;3mWarning: tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.[39m     
+
+[38;5;3m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;3mUpdate Available[0m                    
+ [2mNew version 1.5.2 is available. Run [0m[38;5;5mpi update[39m                             
+ [2mChangelog: [0m[38;5;5mhttps://pi.dev/changelog[39m 
+[38;5;3m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+[39m [m54] Read: atm inbox --id m54      
+
+
+
+ [1m$ atm inbox --id m54[0;2m (timeout 30s)[0m  
+
+ [2m... (1 earlier lines,[0m [2mctrl+o to expand)[0m                                   
+ [2mdelivery:                                                                                                                                            
+[0m [2m{"phase":"delivered","reason":null,"attempt":1,"pane":"%3","session_id":"01a1df3f-d166-72f5-b320-24ad87c17dad","confirmation":"prompt_submit_exact_r 
+[0m [2meference","retry_at":null,"blocked_by":null}[0m                              
+ [2m  hello from cc, no reply needed[0m    
+ [2m1 unread[0m                            
+
+ [2mTook 0.1s[0m                           
+
+
+ m54 from [38;5;5mrehearsal/cc[39m: “hello from cc, no reply needed”                   
+
+[38;5;4m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[7m[39m [0m                                    
+[38;5;4m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[2m[39m/tmp/xxxxxxxxxxxxxxxxxx/rehearsal[0m    
+[2m↑3.8k ↓51 R3.5k CH93.4% $0.008 (sub) 0.7%/500k (auto)                                                                                gpt-6.1-sol • low

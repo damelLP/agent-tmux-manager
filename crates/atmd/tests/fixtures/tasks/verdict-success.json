@@ -1,0 +1,1 @@
+{"setup":"submitted","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"verdict","method":"task.verdict","params":{"task_id":"t6","verdict":"accepted"}},"response":{"type":"response","id":"verdict","result":{"task_id":"t6","changed":true,"notification":null}}}

@@ -1,0 +1,11 @@
+Synthetic: rendered from pi 1.5.0's extension-selector.js (interactive-mode.js); no real capture
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Summarize branch?
+
+ → Yes
+   No
+
+ ↑↓ navigate  enter select  escape/ctrl+c cancel
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

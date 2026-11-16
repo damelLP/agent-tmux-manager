@@ -1,0 +1,60 @@
+use std::path::PathBuf;
+
+/// Resolves state storage: nonempty ATM_STATE_DIR, XDG_STATE_HOME/atm,
+/// HOME/.local/state/atm, or /tmp/atm. Relative overrides are used as given.
+/// Like the original CLI resolver, non-UTF-8 environment values are ignored.
+pub fn state_dir() -> PathBuf {
+    if let Some(state) = std::env::var("ATM_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return PathBuf::from(state);
+    }
+    if let Some(xdg_state) = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return PathBuf::from(xdg_state).join("atm");
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/state/atm"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/atm"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolver_child() {
+        if let Ok(expected) = std::env::var("ATM_TEST_STATE_EXPECT") {
+            assert_eq!(serde_json::to_value(state_dir()).unwrap(), expected);
+        }
+    }
+
+    // Removing override precedence or the fallback breaks these public-API cases.
+    #[test]
+    fn resolver_precedence_in_isolated_processes() {
+        for (atm, xdg, home, expected) in [
+            ("/override", "/xdg", "/fixture", "/override"),
+            ("relative", "/xdg", "/fixture", "relative"),
+            ("", "/xdg", "/fixture", "/xdg/atm"),
+            ("", "relative", "/fixture", "relative/atm"),
+            ("", "", "/fixture", "/fixture/.local/state/atm"),
+            ("", "", "", "/tmp/atm"),
+        ] {
+            super::super::test_support::run_child(
+                "eventlog::state::tests::resolver_child",
+                |command| {
+                    command
+                        .env("ATM_STATE_DIR", atm)
+                        .env("XDG_STATE_HOME", xdg)
+                        .env("HOME", home)
+                        .env("ATM_TEST_STATE_EXPECT", expected);
+                },
+            );
+        }
+    }
+}

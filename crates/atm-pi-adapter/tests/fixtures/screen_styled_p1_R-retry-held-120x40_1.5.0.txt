@@ -1,0 +1,41 @@
+Captured: pi 1.5.0, 2026-11-14, P1 private tmux capture-pane -p -e -N; sanitized.
+
+ SEALED_REPLY_25              
+
+ [2mModel: sealed-model[0m          
+
+
+ C2-steer-visible_RUNNING     
+
+
+ SEALED_REPLY_26              
+
+
+ C2_STEER_VISIBLE             
+
+
+ SEALED_REPLY_27              
+
+
+ C2-follow-visible_RUNNING    
+
+
+ SEALED_REPLY_28              
+
+
+ C2_FOLLOW_VISIBLE            
+
+
+ SEALED_REPLY_29              
+
+
+ RETRY_TRANSIENT_529          
+
+
+ [38;5;1mError: 529 {"type":"error","error":{"type":"overloaded_error","message":"SEALED transient overloaded"}}[39m                
+
+[2m── ⠙[0m [2mWorking ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+[0;7m [0m                             
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/xxxxxxxxxxxxxxxxxxx/project[0m                            
+[2m↑1.6k ↓160 0.8%/200k (auto)                                                                                 sealed-model

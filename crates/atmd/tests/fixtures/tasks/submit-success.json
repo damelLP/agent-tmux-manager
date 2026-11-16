@@ -1,0 +1,1 @@
+{"setup":"assigned","request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"submit","method":"task.submit","from_pane":"%2","params":{"task_id":"t6"}},"response":{"type":"response","id":"submit","result":{"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m9"}}}}

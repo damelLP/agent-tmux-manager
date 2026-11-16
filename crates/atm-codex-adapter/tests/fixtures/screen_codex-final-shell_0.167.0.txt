@@ -1,0 +1,40 @@
+bash-5.3$ python3 /tmp/u8a-fixture/bin/capture.py subject codex
+U5 guard: live socket absent; private ATM_SOCKET=/tmp/u8a-fixture/tap.sock ATM_AGENT=fixture/codex  
+To continue this session, run:
+  codex resume 00000000-0000-4000-8000-000000000001
+bash-5.3$ python3 /tmp/u8a-fixture/bin/capture.py subject codex
+U5 guard: live socket absent; private ATM_SOCKET=/tmp/u8a-fixture/tap.sock ATM_AGENT=fixture/codex  
+Token usage: total=5,869 input=5,842 (+ 28,288 cached) output=27
+To continue this session, run:
+  codex resume 00000000-0000-4000-8000-000000000001
+Or run codex resume and select Reply ok.
+bash-5.3$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

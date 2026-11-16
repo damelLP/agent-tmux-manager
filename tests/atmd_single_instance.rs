@@ -12,6 +12,9 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
+#[path = "support/control.rs"]
+mod control_support;
+
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -25,6 +28,7 @@ fn atmd(socket: &Path, state: &Path, args: &[&str]) -> Command {
         .args(args)
         .env("ATM_SOCKET", socket)
         .env("XDG_STATE_HOME", state)
+        .env("ATM_STATE_DIR", state.join("eventlog"))
         // atmd reads `[notify]` from atm's config.toml: never the developer's.
         .env("XDG_CONFIG_HOME", state.join("config"))
         .env("RUST_LOG", "warn")
@@ -97,9 +101,9 @@ fn assert_concurrent_daemonized_starts_leave_one_daemon(stale_pid_file: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("atmd.sock");
     let state = dir.path().join("state");
-    let pid_file = state.join("atm").join("atmd.pid");
+    let pid_file = state.join("eventlog").join("atmd.pid");
     if stale_pid_file {
-        std::fs::create_dir_all(state.join("atm")).expect("mkdir state");
+        std::fs::create_dir_all(state.join("eventlog")).expect("mkdir state");
         std::fs::write(&pid_file, dead_pid()).expect("write stale PID");
     }
 
@@ -144,7 +148,7 @@ fn test_losing_start_leaves_the_pid_file_alone() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("atmd.sock");
     let state = dir.path().join("state");
-    let pid_file = state.join("atm").join("atmd.pid");
+    let pid_file = state.join("eventlog").join("atmd.pid");
 
     let mut daemon = atmd(&socket, &state, &[]).spawn().expect("spawn atmd");
     wait_for("the socket", || socket.exists());
@@ -176,8 +180,8 @@ fn test_status_and_stop_leave_a_stale_pid_file_alone() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("atmd.sock");
     let state = dir.path().join("state");
-    let pid_file = state.join("atm").join("atmd.pid");
-    std::fs::create_dir_all(state.join("atm")).expect("mkdir state");
+    let pid_file = state.join("eventlog").join("atmd.pid");
+    std::fs::create_dir_all(state.join("eventlog")).expect("mkdir state");
     std::fs::write(&pid_file, dead_pid()).expect("write stale PID");
 
     for command in ["status", "stop"] {
@@ -185,6 +189,7 @@ fn test_status_and_stop_leave_a_stale_pid_file_alone() {
             .arg(command)
             .env("ATM_SOCKET", &socket)
             .env("XDG_STATE_HOME", &state)
+            .env("ATM_STATE_DIR", state.join("eventlog"))
             .output()
             .expect("run atmd");
 
@@ -265,13 +270,16 @@ fn test_client_with_other_state_dir_uses_the_running_daemon() {
     let mut daemon = atmd(&socket, &dir.path().join("state1"), &[])
         .spawn()
         .expect("spawn atmd");
-    wait_for("the socket", || socket.exists());
+    wait_for("an accepting socket", || {
+        control_support::socket_is_ready(&socket)
+    });
 
     let started = Instant::now();
     let list = Command::new(env!("CARGO_BIN_EXE_atm"))
         .args(["list", "--format", "json"])
         .env("ATM_SOCKET", &socket)
         .env("XDG_STATE_HOME", dir.path().join("state2"))
+        .env("ATM_STATE_DIR", dir.path().join("state2"))
         .env("ATM_TMUX_SOCKET", "atm-single-instance")
         .env("TMUX_TMPDIR", dir.path())
         .output()

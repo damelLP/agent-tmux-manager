@@ -1,0 +1,12 @@
+Synthetic: rendered from pi 1.5.0's extension-selector.js; no real capture
+────────────────────────────────────────
+
+ Choose an option
+
+ → First
+   Second
+
+ ↑↓ navigate  enter select
+ escape/ctrl+c cancel
+
+────────────────────────────────────────

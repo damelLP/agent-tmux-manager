@@ -149,6 +149,9 @@ covers the steps below. Codex (#30) touched 23 files:
 4. `atmd`: the adapter dependency, and dispatch of the new message to the
    adapter in `server/connection.rs`. Discovery reads the registry entry;
    add the harness's process shapes to `discovery.rs`'s tests.
+   Add the adapter's `LAUNCH_POLICY` to `POLICIES` in `control/command.rs`;
+   `launch_policies_cover_exactly_discovery_enabled_harnesses` checks that
+   `POLICIES` covers exactly the harnesses with `discovery_enabled: true`.
 5. The forwarder the harness runs: a hook script under `crates/atm/scripts/`
    or an extension. It must honour `ATM_SOCKET` (default `/tmp/atm.sock`),
    as `atm-hook` and `atm-codex-hook` do. `extensions/pi-atm` is

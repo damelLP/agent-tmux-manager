@@ -1,0 +1,8 @@
+d41 pending from=project/worker kind=plan class=changes_intent
+  title: Approve list interface
+  context: Choose the smaller shape
+  context: Next line
+  attach: plan.md
+  option: yes (recommended)
+  option: no
+1 pending, 0 provisional

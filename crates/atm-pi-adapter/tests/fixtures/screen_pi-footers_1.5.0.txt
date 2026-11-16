@@ -1,0 +1,19 @@
+Synthetic: rendered from pi 1.5.0's footer.js; no real capture
+$0.000 (sub) 0.0%/272k (auto)                                                                               model • high
+W1.2k CH0.0% $0.000 (sub) 0.0%/272k (auto)                                                                  model • high
+↑15 $0.000 (sub) 0.0%/272k (auto)                                                                           model • high
+↓12 $0.000 (sub) 0.0%/272k (auto)                                                                           model • high
+$0.000 (sub) ?/272k (auto)                                                                                  model • high
+$0.000 (sub) 0.0%/272k (auto)                                                                       model • thinking off
+$0.000 (sub) 0.0%/272k (auto)                                                                                      model
+0.0%/272k (auto)                                                                                            model • high
+$1.230 0.0%/272k (auto)                                                                                     model • high
+$0.000 (sub) 0.0%/272k                                                                                      model • high
+$0.000 (sub) 0.0%/272k (auto)                                                                    (provider) model • high
+$0.000 (sub) 0.0%/272k (auto)                                                          model • high → routed-model • low
+0.0%/272k (auto)                                                                                                no-model
+$0.000 (sub) 0....
+$0.000 (sub) 0.0%/272k (auto)
+$0.000 (sub) 105.0%/272k (auto)                                                                             model • high
+$0.000 (sub) 0.0%/272k (auto) • xp                                                                          model • high
+$0.000 (sub) 0.0%/0 (auto)                                                                                  model • high

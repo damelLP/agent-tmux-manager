@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   /tmp/u8a-fixture/cwd/claude    
+
+
+❯ [m-c-u5-1] reply with the word ok
+
+● ok
+
+✻ Cogitated for 1s · done 11:24
+
+❯ /clear
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✽ Sketching… (running SessionEnd hook · 0s)
+  ⎿  Tip: Hit shift+tab to cycle between manual mode, auto-accept edit mode, and plan mode
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ auto mode on (shift+tab to cycle)

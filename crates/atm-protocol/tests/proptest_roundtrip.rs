@@ -344,6 +344,26 @@ fn arb_message_type() -> impl Strategy<Value = MessageType> {
         // Connect { client_id: Option<String> }
         proptest::option::of(arb_tricky_string())
             .prop_map(|client_id| MessageType::Connect { client_id }),
+        // Request { id, method, params, from_pane }
+        (
+            arb_tricky_string(),
+            arb_tricky_string(),
+            arb_finite_json_value(),
+            proptest::option::of(arb_tricky_string()),
+        )
+            .prop_map(|(id, method, params, from_pane)| MessageType::Request {
+                id,
+                method,
+                params,
+                from_pane,
+            }),
+        // Watch { topics, cursor }
+        (
+            proptest::collection::vec(arb_tricky_string(), 0..4),
+            any::<u64>()
+        )
+            .prop_map(|(topics, cursor)| MessageType::Watch { topics, cursor }),
+        Just(MessageType::Unwatch),
         // StatusUpdate { data: Value }
         arb_finite_json_value().prop_map(|data| MessageType::StatusUpdate { data }),
         // HookEvent { data: Value }
@@ -386,12 +406,38 @@ fn arb_client_message() -> impl Strategy<Value = ClientMessage> {
 fn arb_daemon_message() -> impl Strategy<Value = DaemonMessage> {
     prop_oneof![
         // Connected
-        (arb_protocol_version(), arb_tricky_string()).prop_map(|(protocol_version, client_id)| {
-            DaemonMessage::Connected {
-                protocol_version,
-                client_id,
-            }
-        }),
+        (
+            arb_protocol_version(),
+            arb_tricky_string(),
+            proptest::collection::vec(arb_tricky_string(), 0..4),
+        )
+            .prop_map(|(protocol_version, client_id, methods)| {
+                DaemonMessage::Connected {
+                    protocol_version,
+                    client_id,
+                    methods,
+                }
+            }),
+        // Both exclusive Response payloads share the response wire tag.
+        (arb_tricky_string(), arb_finite_json_value())
+            .prop_map(|(id, result)| DaemonMessage::response_ok(id, result)),
+        (
+            arb_tricky_string(),
+            arb_tricky_string(),
+            arb_tricky_string()
+        )
+            .prop_map(|(id, code, message)| DaemonMessage::response_err(id, &code, &message)),
+        // Event { topic, seq, ts, kind, body }
+        (
+            arb_tricky_string(),
+            any::<u64>(),
+            arb_timestamp_string(),
+            arb_tricky_string(),
+            arb_finite_json_value(),
+        )
+            .prop_map(|(topic, seq, ts, kind, body)| DaemonMessage::event(
+                topic, seq, ts, kind, body
+            )),
         // Rejected
         (arb_tricky_string(), arb_protocol_version()).prop_map(|(reason, protocol_version)| {
             DaemonMessage::Rejected {
@@ -557,6 +603,30 @@ fn message_type_strategy_covers_every_variant() {
 #[test]
 fn daemon_message_strategy_covers_every_variant() {
     assert_covers_every_variant(arb_daemon_message());
+}
+
+#[test]
+fn daemon_message_strategy_covers_both_response_payloads() {
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig::default(),
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
+    let strategy = arb_daemon_message();
+    let mut saw_result = false;
+    let mut saw_error = false;
+    for _ in 0..256 {
+        let message = strategy.new_tree(&mut runner).expect("generate").current();
+        let json = serde_json::to_value(message).expect("serialize");
+        if json.get("type").and_then(Value::as_str) == Some("response") {
+            saw_result |= json.get("result").is_some();
+            saw_error |= json.get("error").is_some();
+        }
+    }
+    assert!(
+        saw_result,
+        "daemon strategy must generate a response result"
+    );
+    assert!(saw_error, "daemon strategy must generate a response error");
 }
 
 #[test]

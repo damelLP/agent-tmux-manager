@@ -1,0 +1,41 @@
+Captured: claude 2.1.325, 2026-11-14, P1 sealed private tmux capture-pane -p -e -N; sanitized.
+
+[38;5;246m[48;5;237m❯ [38;5;231mC1_SINGLE "double" 'single' café[39m                                                                                      
+
+[38;5;231m[49m●[39m SEALED_REPLY_21                                                                                                       
+                                                                                                                        
+[38;5;246m✻[39m [38;5;246mCooked for 0s · done 4:33 PM[39m                                                                                          
+
+[38;5;246m[48;5;237m❯ [38;5;231mC1_FIRST "double"[39m                                                                                                     
+                                                                                                                        
+  [38;5;231mC1_THIRD 'single' café[39m                                                                                                
+[49m                                                                                                                        
+[38;5;231m●[39m SEALED_REPLY_23                                                                                                       
+                                                                                                                        
+[38;5;246m✻[39m [38;5;246mSautéed for 0s · done 4:33 PM[39m                                                                                         
+
+[38;5;246m[48;5;237m❯ [38;5;231mC4_EXISTING_DRAFT:C4_PASTED[39m                                                                                           
+
+[38;5;231m[49m●[39m SEALED_REPLY_25                                                                                                       
+                                                                                                                        
+[38;5;246m✻[39m [38;5;246mCogitated for 0s · done 4:33 PM[39m                                                                                       
+
+[38;5;246m[48;5;237m❯ [38;5;231mC1_ATM_FIRST[39m                                                                                                          
+                                                                                                                        
+  [38;5;231m"quoted" 'last'[39m                                                                                                       
+[49m                                                                                                                        
+[38;5;231m●[39m SEALED_REPLY_27                                                                                                       
+                                                                                                                        
+[38;5;246m✻[39m [38;5;246mCogitated for 0s · done 4:33 PM[39m                                                                                       
+
+[38;5;246m[48;5;237m❯ [38;5;231mC2_RUNNING_TURN[39m                                                                                                       
+
+[38;5;246m❯ C2_QUEUED_ONE[39m                                                                                                         
+[49m                                                                                                                        
+[38;5;174m*[39m [38;5;174mMe[38;5;216mtam[38;5;174morphosing… [38;5;246m(running UserPromptSubmit hook · 0s)[39m                                                                  
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [7m[39mP[0;2mress up to edit queued messages[0m                                                                                      
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸[39m [38;5;246mmanual[39m [38;5;246mmode[39m [38;5;246mon[39m                                                            [38;5;211m✘[39m [38;5;211mAuto-update[39m [38;5;211mfailed[39m [38;5;211m·[39m [38;5;211mRun[39m [1m[38;5;211mclaude[0m [1m[38;5;211mdoctor[0m  
+

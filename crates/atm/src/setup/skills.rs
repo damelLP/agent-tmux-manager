@@ -1,4 +1,4 @@
-//! The atm skills (`atm-coordinate`, `atm-implement`): embedded at compile
+//! The atm skills (`atm-coordinate`, `atm-implement`, `atm-lead`, `atm-member`): embedded at compile
 //! time from `assets/atm-skills/` and written as plain skill folders into a
 //! harness's own skills folder. Setup edits no settings for them: Claude
 //! Code 2.1.316, pi 0.73.1 and codex-cli 0.163.0 each load a skill folder
@@ -20,7 +20,7 @@ use super::{io_err, Result, SetupError};
 /// Each skill's folder name and `SKILL.md`. The folder name must equal the
 /// `name` in its frontmatter: Claude Code keys a skill on its folder, pi
 /// and Codex on `name`.
-const SKILLS: [(&str, &str); 2] = [
+const SKILLS: [(&str, &str); 4] = [
     (
         "atm-coordinate",
         include_str!("../../assets/atm-skills/atm-coordinate/SKILL.md"),
@@ -29,14 +29,26 @@ const SKILLS: [(&str, &str); 2] = [
         "atm-implement",
         include_str!("../../assets/atm-skills/atm-implement/SKILL.md"),
     ),
+    (
+        "atm-lead",
+        include_str!("../../assets/atm-skills/atm-lead/SKILL.md"),
+    ),
+    (
+        "atm-member",
+        include_str!("../../assets/atm-skills/atm-member/SKILL.md"),
+    ),
 ];
 
 /// `assets/atm-skills/shared/`: each file's path inside a skill folder and
 /// its content. Files under `scripts/` are installed executable.
-const SHARED: [(&str, &str); 4] = [
+const SHARED: [(&str, &str); 5] = [
     (
         "references/atm-commands.md",
         include_str!("../../assets/atm-skills/shared/references/atm-commands.md"),
+    ),
+    (
+        "references/atm-named-agents.md",
+        include_str!("../../assets/atm-skills/shared/references/atm-named-agents.md"),
     ),
     (
         "scripts/atm-wait",

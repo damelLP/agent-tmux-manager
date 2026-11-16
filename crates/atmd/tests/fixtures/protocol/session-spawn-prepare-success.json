@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"prepare","method":"session.spawn_prepare","from_pane":"%7","params":{"target_pane":null,"cwd":null,"fallback_cwd":"/fallback"}},"response":{"type":"response","id":"prepare","result":{"target_pane":"%7","cwd":"/from/pane","caller_pane_missing":true}},"ignore":[]}

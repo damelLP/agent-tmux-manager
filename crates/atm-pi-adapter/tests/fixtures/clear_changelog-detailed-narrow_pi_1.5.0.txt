@@ -1,0 +1,60 @@
+ [38;5;5m- [39mFixed terminal titles containing     
+   control characters being able to     
+   inject terminal escape sequences,    
+   and pi-messages streams accepting    
+   invalid content-block indices        
+ [38;5;5m- [39mFixed fullscreen double-click        
+   selection splitting paths and tokens 
+   at [38;5;5m~[39m, [38;5;5m.[39m, [38;5;5m\[39m, and [38;5;5m+[39m; word characters   
+   now match iTerm2's defaults ([4m[38;5;4m#10980[0;2m  
+[0m   [2m(https://github.com/earendil-works/p 
+[0m   [2mi/issues/10980)[0m) 
+ [38;5;5m- [39mFixed display math wider than the    
+   content area being split apart by    
+   line wrapping; it now falls back to  
+   raw LaTeX ([4m[38;5;4m#11483[0;2m                    
+[0m   [2m(https://github.com/earendil-works/p 
+[0m   [2mi/issues/11483)[0m) 
+ [38;5;5m- [39mFixed styled words ending exactly at 
+   the wrap width adding a leading      
+   space on the next line, and          
+   strikethrough leaking into           
+   wrapped-line padding ([4m[38;5;4m#10925[0;2m         
+[0m   [2m(https://github.com/earendil-works/p 
+[0m   [2mi/issues/10925)[0m) 
+ [38;5;5m- [39mFixed [38;5;5m/tree[39m branch summaries         
+   including failed assistant replies   
+   and original content that context    
+   edits had hidden or replaced.        
+   Summaries now honor the same context 
+   edits as live requests and           
+   compaction ([4m[38;5;4m#11602[0;2m                   
+[0m   [2m(https://github.com/earendil-works/p 
+[0m   [2mi/issues/11602)[0m) 
+
+ [1m[38;5;3m### Removed[0m        
+
+ [38;5;5m- [39mRemoved the native OS [38;5;5msandbox/[39m       
+   extension example and its            
+   dependency. Use the [4m[38;5;4mGondolin example[0;2m 
+[0m   [2m                                     
+[0m   [2m(https://github.com/earendil-works/p 
+[0m   [2mi/tree/v1.5.0/packages/coding-agent/ 
+[0m   [2mexamples/extensions/gondolin/)[0m or    
+   the [4m[38;5;4mcontainerization guide[0;2m           
+[0m   [2m(https://github.com/earendil-works/p 
+[0m   [2mi/blob/v1.5.0/packages/coding-agent/ 
+[0m   [2mdocs/containerization.md)[0m.           
+
+[38;5;4m────────────────────────────────────────
+
+[39m [38;5;3mWarning: tmux extended-keys is off.    
+[39m [38;5;3mModified Enter keys may not work. Add  
+[39m [38;5;3m`set -g extended-keys on` to           
+[39m [38;5;3m~/.tmux.conf and restart tmux.[39m         
+
+[38;5;4m────────────────────────────────────────
+[7m[39m [0m         
+[38;5;4m────────────────────────────────────────
+[2m[39m/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxx/chan...
+0.0%/500k (auto)       gpt-6.1-sol • low

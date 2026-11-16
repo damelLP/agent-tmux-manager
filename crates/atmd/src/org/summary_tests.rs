@@ -1,0 +1,405 @@
+use super::*;
+use atm_core::{AgentType, Model, SessionDomain};
+use chrono::TimeZone;
+
+fn now() -> DateTime<Utc> {
+    Utc.timestamp_opt(1_700_000_000, 0).unwrap()
+}
+fn view(id: &str, cost: f64, prompt: Option<&str>) -> SessionView {
+    let mut v = SessionView::from_domain_at(
+        &SessionDomain::new(
+            SessionId::new(id),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        ),
+        now(),
+    );
+    v.started_at = now().to_rfc3339();
+    v.harness = "pi".into();
+    v.cost_usd = cost;
+    v.first_prompt = prompt.map(str::to_owned);
+    v.tmux_pane = Some("%10".into());
+    v
+}
+
+#[test]
+fn threshold_is_five_cents_since_last_summary_not_last_update() {
+    let first = from_view(&view("s", 0.0, None)).unwrap();
+    let mut entry = Entry::new(first.clone(), None);
+    assert!(entry.due(false));
+    entry.saved = Some(first);
+    entry.update(from_view(&view("s", 0.03, None)).unwrap());
+    assert!(!entry.due(false));
+    entry.update(from_view(&view("s", 0.049999, None)).unwrap());
+    assert!(!entry.due(false));
+    assert!(
+        entry.due(true),
+        "clean shutdown must persist exact dirty cost"
+    );
+    entry.update(from_view(&view("s", 0.05, None)).unwrap());
+    assert!(entry.due(false));
+}
+
+// Synthetic replay of the M1 trial facts (pi 1.5.0, 2026-11-14), not a raw
+// harness capture: summaries at start/first prompt, 359 microdollars at restart.
+// A turn-status trigger, ignored flush flag, or lowered material-cost threshold
+// would change this result. No wall-clock waits or observer scheduling assumptions.
+#[test]
+fn m1_turn_end_under_material_cost_waits_for_shutdown_flush() {
+    use atm_core::SessionStatus;
+
+    let mut live = view("m1-trial", 0.0, None);
+    let mut entry = Entry::new(from_view(&live).unwrap(), None);
+    assert!(entry.due(false), "seq 3: initial session facts are due");
+    entry.saved = Some(entry.latest.clone());
+
+    live.first_prompt = Some("Reply with one word".into());
+    live.status = SessionStatus::Working;
+    entry.update(from_view(&live).unwrap());
+    assert!(entry.due(false), "seq 5: first prompt is due");
+    entry.saved = Some(entry.latest.clone());
+
+    live.cost_usd = 0.000359;
+    live.status = SessionStatus::Idle;
+    entry.update(from_view(&live).unwrap());
+    assert_eq!(entry.latest.cost, Some(Money::from_microdollars(359)));
+    assert!(!entry.due(false), "turn end is not session end or $0.05");
+    assert!(entry.latest.ended.is_none());
+    assert!(entry.due(true), "seq 6: clean restart flushes exact cost");
+    let persisted = entry.latest.clone();
+
+    // Restart defaults must not erase the flushed cost; a second turn changing
+    // only working/idle status adds no summary (seq 7 is control.sent).
+    let mut resumed = Entry::new(
+        from_view(&view("m1-trial", 0.0, None)).unwrap(),
+        Some(&persisted),
+    );
+    assert!(!resumed.due(false));
+    for status in [SessionStatus::Working, SessionStatus::Idle] {
+        live.status = status;
+        resumed.update(from_view(&live).unwrap());
+        assert!(!resumed.due(false));
+        assert!(
+            !resumed.due(true),
+            "unchanged facts need no duplicate flush"
+        );
+        assert_eq!(resumed.latest.cost, Some(Money::from_microdollars(359)));
+        assert!(resumed.latest.ended.is_none());
+    }
+}
+
+#[test]
+fn first_prompt_model_pane_and_end_bypass_cost_threshold() {
+    for change in 0..4 {
+        let first = from_view(&view("s", 0.0, None)).unwrap();
+        let mut entry = Entry::new(first.clone(), Some(&first));
+        let mut next = first.clone();
+        match change {
+            0 => next.first_prompt = Some("first".into()),
+            1 => next.model = Some("new model".into()),
+            2 => next.pane = Some("%11".into()),
+            _ => next.ended = Some(now()),
+        }
+        entry.update(next);
+        assert!(entry.due(false));
+    }
+}
+
+#[test]
+fn restart_defaults_preserve_facts_then_live_cost_can_decrease_to_zero() {
+    let mut recovered = from_view(&view("s", 1.25, Some("original"))).unwrap();
+    recovered.model = Some("fixture".into());
+    let mut live = from_view(&view("s", 0.0, None)).unwrap();
+    live.started = now() + chrono::Duration::seconds(60);
+    live.pane = None;
+    let mut entry = Entry::new(live, Some(&recovered));
+    assert_eq!(entry.latest, recovered);
+    assert!(!entry.due(true));
+    entry.update(from_view(&view("s", 1.26, Some("later prompt"))).unwrap());
+    assert_eq!(entry.latest.first_prompt.as_deref(), Some("original"));
+    assert_eq!(entry.latest.started, now());
+    assert!(!entry.due(false));
+    entry.update(from_view(&view("s", 0.0, None)).unwrap());
+    assert_eq!(entry.latest.cost, Some(Money::from_microdollars(0)));
+    assert!(entry.due(false));
+}
+
+#[test]
+fn pending_ids_are_never_summaries_and_bad_time_is_not_invented() {
+    assert!(from_view(&view("pending-123", 9.0, None)).is_none());
+    let mut invalid = view("s", 0.0, None);
+    invalid.started_at = "not a timestamp".into();
+    assert!(from_view(&invalid).is_none());
+}
+
+// Drive the observer at its actual wakeups, so a queue refusal is processed
+// while the actor remains stalled, without a delay or scheduler-speed assumption.
+#[tokio::test(start_paused = true)]
+async fn full_actor_queue_keeps_dirty_summary_for_retry() {
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+    };
+    use tokio::sync::{mpsc, watch, Semaphore};
+    struct Signal(Semaphore);
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.0.add_permits(1);
+        }
+    }
+    let signal = Arc::new(Signal(Semaphore::new(0)));
+    let waker = Waker::from(signal.clone());
+    let (requests, receive) = mpsc::channel(64);
+    let (health, status) = watch::channel(Ok(0));
+    let (committed, _) = broadcast::channel(1024);
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let mut entered = Some(entered);
+    let release = Arc::new(Semaphore::new(0));
+    let gate = release.clone();
+    let cancel = CancellationToken::new();
+    let mut seq = 0;
+    let actor = tokio::spawn(super::super::actor::run(
+        OrgState::default(),
+        receive,
+        health,
+        committed.clone(),
+        cancel.clone(),
+        move |_| {
+            seq += 1;
+            let seq = seq;
+            let entered = entered.take();
+            let gate = gate.clone();
+            async move {
+                if let Some(entered) = entered {
+                    entered.send(()).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                }
+                Ok(seq)
+            }
+        },
+    ));
+    let org = OrgHandle {
+        requests,
+        health: status,
+        committed,
+        reads: None,
+    };
+    let registry = crate::registry::spawn_registry();
+    let (events, receive) = broadcast::channel(8);
+    let stop = CancellationToken::new();
+    let mut observer = Box::pin(run(registry.clone(), org.clone(), receive, stop.clone()));
+    assert!(observer
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    signal.0.acquire().await.unwrap().forget(); // startup snapshot reply
+    assert!(observer
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    let caller = org.clone();
+    let stalled = tokio::spawn(async move {
+        caller
+            .execute(
+                OrgCommand::ControlSent(atm_org::ControlAudit {
+                    pane: "%1".into(),
+                    action: serde_json::json!({}),
+                }),
+                now(),
+            )
+            .await
+    });
+    entry.await.unwrap();
+    // Keep every queue slot occupied until after the observer handles refusal.
+    let permits: Vec<_> = org.requests.reserve_many(64).await.unwrap().collect();
+    assert_eq!(org.requests.capacity(), 0);
+    let live = view("retry", 0.01, Some("original"));
+    events
+        .send(SessionEvent::Updated {
+            session: Box::new(live),
+        })
+        .unwrap();
+    while let Ok(permit) = signal.0.try_acquire() {
+        permit.forget();
+    }
+    assert!(observer
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    signal.0.acquire().await.unwrap().forget(); // rejected execute task completed
+    assert!(
+        matches!(
+            observer.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ),
+        "one full-queue refusal stopped the summary observer"
+    );
+    drop(permits);
+    release.add_permits(1);
+    stalled.await.unwrap().unwrap();
+    // Flush is the next attempt; no time is spent waiting for the retry clock.
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(60), observer)
+        .await
+        .unwrap();
+    let state = org.snapshot().await.unwrap();
+    let summary = state.session_summary(&SessionId::new("retry")).unwrap();
+    assert_eq!(summary.first_prompt.as_deref(), Some("original"));
+    assert_eq!(summary.cost, Some(Money::from_microdollars(10_000)));
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_flush_fits_stop_budget_after_connection_drain() {
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(std::future::pending());
+    let observer = SummaryObserver { stop, task };
+    // The flush has a 2 s budget independent of preceding shutdown drains.
+    // Allow 1 s of virtual-time margin; all I/O is in-memory and time is paused.
+    tokio::time::timeout(Duration::from_secs(3), observer.finish())
+        .await
+        .unwrap();
+}
+
+async fn next_summary(watch: &mut crate::org::EventWatch) -> SessionSummary {
+    let record = tokio::time::timeout(Duration::from_secs(60), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match atm_org::OrgEvent::from_parts(&record.kind, &record.body)
+        .unwrap()
+        .unwrap()
+    {
+        atm_org::OrgEvent::SessionSummary(summary) => summary,
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn registry_death_does_not_invent_session_end_on_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let org_cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
+    let registry_cancel = CancellationToken::new();
+    let (registry, tasks) = crate::registry::spawn_registry_with_cancel(registry_cancel.clone());
+    let observer = SummaryObserver::spawn(registry.clone(), org.clone());
+    let mut watch = org.watch(vec!["session".into()], 0).unwrap();
+    registry
+        .register(SessionDomain::new(
+            SessionId::new("live"),
+            AgentType::GeneralPurpose,
+            Model::Unknown,
+        ))
+        .await
+        .unwrap();
+    assert!(next_summary(&mut watch).await.ended.is_none());
+    registry_cancel.cancel();
+    tasks.actor.await.unwrap();
+    for task in tasks.maintenance {
+        task.await.unwrap();
+    }
+    assert!(!registry.is_connected());
+    observer.finish().await;
+    assert!(
+        org.snapshot()
+            .await
+            .unwrap()
+            .session_summary(&SessionId::new("live"))
+            .unwrap()
+            .ended
+            .is_none(),
+        "registry death is not an empty live registry"
+    );
+    org_cancel.cancel();
+}
+
+#[tokio::test]
+async fn same_run_resume_keeps_first_prompt_and_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let registry = crate::registry::spawn_registry();
+    let observer = SummaryObserver::spawn(registry.clone(), org.clone());
+    let mut watch = org.watch(vec!["session".into()], 0).unwrap();
+    let id = SessionId::new("resumed");
+    let mut first = SessionDomain::new(id.clone(), AgentType::GeneralPurpose, Model::Unknown);
+    first.started_at = now();
+    first.first_prompt = Some("original".into());
+    registry.register(first).await.unwrap();
+    assert_eq!(
+        next_summary(&mut watch).await.first_prompt.as_deref(),
+        Some("original")
+    );
+    registry.remove(id.clone()).await.unwrap();
+    assert!(next_summary(&mut watch).await.ended.is_some());
+    let mut resumed = SessionDomain::new(id.clone(), AgentType::GeneralPurpose, Model::Unknown);
+    resumed.started_at = now() + chrono::Duration::hours(1);
+    resumed.first_prompt = Some("later prompt".into());
+    registry.register(resumed).await.unwrap();
+    let summary = next_summary(&mut watch).await;
+    assert_eq!(summary.first_prompt.as_deref(), Some("original"));
+    assert_eq!(summary.started, now());
+    assert!(summary.ended.is_none());
+    observer.finish().await;
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn observer_lag_resync_and_shutdown_flush_exact_cost_without_disabling_org() {
+    let dir = tempfile::tempdir().unwrap();
+    let org = OrgHandle::open(dir.path().to_owned(), CancellationToken::new()).await;
+    let registry = crate::registry::spawn_registry();
+    let mut domain = SessionDomain::new(
+        SessionId::new("live"),
+        AgentType::GeneralPurpose,
+        Model::Unknown,
+    );
+    domain.harness = Harness::Pi;
+    domain.first_prompt = Some("Read note.txt and reply.".into());
+    registry.register(domain).await.unwrap();
+    let mut watch = org.watch(vec!["session".into()], 0).unwrap();
+    let (tx, rx) = broadcast::channel(1);
+    // Force lag before the observer starts, then require a real registry snapshot.
+    for _ in 0..3 {
+        tx.send(SessionEvent::Registered {
+            session_id: SessionId::new("lost"),
+            agent_type: AgentType::GeneralPurpose,
+        })
+        .unwrap();
+    }
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(run(registry.clone(), org.clone(), rx, stop.clone()));
+    let baseline = next_summary(&mut watch).await;
+    assert_eq!(baseline.session_id, SessionId::new("live"));
+    assert_eq!(baseline.cost, Some(Money::from_microdollars(0)));
+    assert!(org.status().is_ok());
+    // Publish a below-threshold update through the real registry.
+    registry
+        .update_from_status_line(
+            SessionId::new("live"),
+            None,
+            atm_core::StatusLineData {
+                cost_usd: 0.01065,
+                ..Default::default()
+            },
+            Harness::Pi,
+        )
+        .await
+        .unwrap();
+    stop.cancel();
+    task.await.unwrap();
+    let state = org.snapshot().await.unwrap();
+    let summary = state.session_summary(&SessionId::new("live")).unwrap();
+    assert_eq!(summary.cost, Some(Money::from_microdollars(10650)));
+    assert_eq!(
+        summary.first_prompt.as_deref(),
+        Some("Read note.txt and reply.")
+    );
+    assert!(
+        summary.ended.is_none(),
+        "daemon shutdown is not session end"
+    );
+}

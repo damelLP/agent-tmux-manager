@@ -19,14 +19,30 @@
 //! # Check daemon status
 //! atmd status
 //! ```
+//!
+//! `stop` observes process exit, including unreaped zombies, not PID/socket-file
+//! removal. It reports progress once after 5 seconds and gives up after 75 seconds
+//! from signaling, without killing the daemon or removing its state. The stages
+//! of a shutdown and their bounds are defined once, in `atmd::server::stop`
+//! (66 s nominal: 2 s for connections, 62 s from the stop of reserved work to
+//! the end of control and its audits, 2 s for concurrent summary/raw flushes).
+//! Blocking I/O, including Tokio blocking-pool work at runtime drop, can outlast
+//! that allowance. A stop timeout leaves the daemon potentially still shutting
+//! down; successful exit does not promise every pending write was persisted.
+//! Known limit (unverified in a filtered runtime): if seccomp denies pidfd_open
+//! with EPERM, stop fails before signaling. Only ENOSYS enables the old-kernel
+//! numeric-PID fallback; a seccomp denial does not.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -38,7 +54,7 @@ use atmd::discovery::DiscoveryService;
 use atmd::monitor::spawn_monitor_task;
 use atmd::notify::{parse_notify_command, spawn_notifier, NotifyConfig};
 use atmd::registry::{spawn_registry_with_cancel, supervise_actor};
-use atmd::server::{DaemonServer, DEFAULT_SOCKET_PATH};
+use atmd::server::{methods::MethodServices, DaemonServer, DEFAULT_SOCKET_PATH};
 
 /// ATM daemon - coding-agent session manager
 #[derive(Parser, Debug)]
@@ -62,30 +78,37 @@ enum Command {
     Status,
 }
 
-fn pid_file_path() -> PathBuf {
-    let state_dir = dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("atm");
+// Keep PID/log defaults aligned with crates/atm/src/daemon.rs, not the
+// eventlog resolver: its relative-XDG/HOME fallback deliberately differs.
+fn resolve_daemon_state_dir(
+    override_dir: Option<PathBuf>,
+    default_state_dir: Option<PathBuf>,
+) -> PathBuf {
+    override_dir.unwrap_or_else(|| {
+        default_state_dir
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("atm")
+    })
+}
+
+fn pid_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("atmd.pid")
 }
 
-fn log_file_path() -> PathBuf {
-    let state_dir = dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("atm");
+fn log_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("atm.log")
 }
 
-fn read_pid() -> Option<u32> {
-    let path = pid_file_path();
+fn read_pid(state_dir: &Path) -> Option<u32> {
+    let path = pid_file_path(state_dir);
     let mut file = File::open(&path).ok()?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).ok()?;
     contents.trim().parse().ok()
 }
 
-fn write_pid() -> Result<()> {
-    let path = pid_file_path();
+fn write_pid(state_dir: &Path) -> Result<()> {
+    let path = pid_file_path(state_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("Failed to create state directory")?;
     }
@@ -94,19 +117,40 @@ fn write_pid() -> Result<()> {
     Ok(())
 }
 
-fn remove_pid_file() {
-    let path = pid_file_path();
+fn remove_pid_file(state_dir: &Path) {
+    let path = pid_file_path(state_dir);
     let _ = fs::remove_file(path);
 }
 
+fn proc_stat_has_exited(stat: &[u8]) -> bool {
+    // comm may contain spaces, ')' and truncated UTF-8; use its final delimiter.
+    let mut parts = stat.rsplitn(2, |&byte| byte == b')');
+    let (Some(fields), Some(_)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let mut fields = fields
+        .split(u8::is_ascii_whitespace)
+        .filter(|f| !f.is_empty());
+    match fields.next() {
+        Some(b"X" | b"x") => true,
+        // The leader is Z as soon as it exits, while the group's other threads
+        // may still be exiting: only num_threads (field 20) == 1 is all of it.
+        Some(b"Z") => fields.nth(16) == Some(b"1".as_slice()),
+        _ => false,
+    }
+}
+
 fn is_process_running(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    let path = PathBuf::from(format!("/proc/{pid}"));
+    // An exited process retains procfs until reaped. If its state cannot be
+    // read or recognized, keep the old, conservative existence answer.
+    path.exists() && !fs::read(path.join("stat")).is_ok_and(|stat| proc_stat_has_exited(&stat))
 }
 
 /// Read-only: `stop` and `status` call this without the lock, so a stale
 /// PID file is left for the next lock holder's write_pid() to replace.
-fn is_daemon_running() -> Option<u32> {
-    if let Some(pid) = read_pid() {
+fn is_daemon_running(state_dir: &Path) -> Option<u32> {
+    if let Some(pid) = read_pid(state_dir) {
         if is_process_running(pid) {
             return Some(pid);
         }
@@ -175,25 +219,176 @@ fn exit_already_running(pid: Option<u32>) -> ! {
     process::exit(1);
 }
 
-fn stop_daemon(pid: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result != 0 {
-            bail!("Failed to send SIGTERM to process {pid}");
+// Keep the candidate kit's process-exit policy aligned (scripts/atm_candidate.py).
+// The daemon's own stop budget plus margin (atmd::server::stop). The kit's
+// STOP_WAIT_TIMEOUT and the README state the same number; a test compares them.
+// NOT a hard bound on daemon blocking I/O.
+const STOP_WAIT_TIMEOUT: Duration = atmd::server::stop::STOP_WAIT;
+const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopWaitAction {
+    Stopped,
+    Progress,
+    Wait(Duration),
+    TimedOut,
+}
+
+fn stop_wait_action(elapsed: Duration, exited: bool, reported: bool) -> StopWaitAction {
+    if exited {
+        StopWaitAction::Stopped
+    } else if elapsed >= STOP_WAIT_TIMEOUT {
+        StopWaitAction::TimedOut
+    } else if !reported && elapsed >= STOP_PROGRESS_AFTER {
+        StopWaitAction::Progress
+    } else {
+        let next = if reported {
+            STOP_WAIT_TIMEOUT
+        } else {
+            STOP_PROGRESS_AFTER
+        };
+        StopWaitAction::Wait(next.saturating_sub(elapsed))
+    }
+}
+
+fn wait_for_exit(
+    pid: u32,
+    mut wait: impl FnMut(Duration) -> std::io::Result<bool>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut progress: impl FnMut(),
+) -> Result<()> {
+    let mut reported = false;
+    loop {
+        // Check exit even at the deadline; never infer it from elapsed time.
+        let exited = wait(Duration::ZERO)?;
+        match stop_wait_action(elapsed(), exited, reported) {
+            StopWaitAction::Stopped => return Ok(()),
+            StopWaitAction::Progress => {
+                progress();
+                reported = true;
+            }
+            StopWaitAction::Wait(duration) => {
+                if wait(duration)? {
+                    return Ok(());
+                }
+            }
+            StopWaitAction::TimedOut => bail!(
+                "Daemon (PID {pid}) did not exit within {} seconds; it may still be shutting down.",
+                STOP_WAIT_TIMEOUT.as_secs()
+            ),
         }
     }
-    #[cfg(not(unix))]
-    {
-        bail!("Stop command is only supported on Unix systems");
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> std::io::Result<Option<OwnedFd>> {
+    // SAFETY: pidfd_open takes a PID and flags, no pointers.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if fd >= 0 {
+        // SAFETY: the syscall returned a new, uniquely owned descriptor.
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
     }
-    Ok(())
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOSYS) {
+        Ok(None) // Old kernels retain T6's conservative zombie-aware polling.
+    } else {
+        Err(error)
+    }
+}
+
+fn wait_for_process(
+    pid: u32,
+    pidfd: Option<&OwnedFd>,
+    duration: Duration,
+) -> std::io::Result<bool> {
+    if let Some(fd) = pidfd {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: poll points to one initialized descriptor, kept alive by fd.
+        if unsafe { libc::poll(&mut poll, 1, millis) } < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::other("Cannot observe daemon pidfd"));
+        }
+        // HUP is also an exited process: the parent has already reaped it.
+        Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+    } else {
+        if is_process_running(pid) && !duration.is_zero() {
+            std::thread::sleep(duration.min(Duration::from_millis(100)));
+        }
+        Ok(!is_process_running(pid))
+    }
+}
+
+fn stop_daemon(pid: u32) -> Result<()> {
+    let numeric_pid = i32::try_from(pid).context("Invalid daemon PID")?;
+    if numeric_pid <= 0 {
+        bail!("Invalid daemon PID {pid}");
+    }
+    #[cfg(target_os = "linux")]
+    let pidfd = match open_pidfd(pid) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+        Err(error) => return Err(error).context("Failed to open daemon pidfd"),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let pidfd: Option<OwnedFd> = None;
+    let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let result = if let Some(fd) = &pidfd {
+        // SAFETY: the owned pidfd pins this process; null siginfo uses SIGTERM.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                libc::SIGTERM,
+                0usize,
+                0,
+            ) as i32
+        }
+    } else {
+        // SAFETY: validated positive PID; old-kernel compatibility only.
+        unsafe { libc::kill(numeric_pid, libc::SIGTERM) }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = unsafe { libc::kill(numeric_pid, libc::SIGTERM) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("Failed to send SIGTERM to process {pid}"));
+        }
+    }
+    wait_for_exit(
+        pid,
+        |duration| wait_for_process(pid, pidfd.as_ref(), duration),
+        || started.elapsed(),
+        || println!("Daemon is still stopping; waiting for shutdown to finish..."),
+    )
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let command = args.command.unwrap_or(Command::Start { daemon: false });
+    // Freeze relative overrides before daemonize changes cwd, but keep the
+    // established dirs fallback byte-identical when no override is supplied.
+    let override_dir = env::var("ATM_STATE_DIR")
+        .ok()
+        .filter(|state| !state.is_empty())
+        .map(std::path::absolute)
+        .transpose()
+        .context("Failed to resolve the daemon state directory")?;
+    let state_dir = resolve_daemon_state_dir(override_dir, dirs::state_dir());
 
     match command {
         Command::Start { daemon } => {
@@ -211,48 +406,44 @@ fn main() -> Result<()> {
             // taken before daemonize() so a losing `atmd start -d` exits 1 in
             // the foreground; the daemonized child inherits the locked file.
             let Some(_lock) = lock_daemon(&socket_path)? else {
-                exit_already_running(read_pid().filter(|&pid| is_process_running(pid)));
+                exit_already_running(read_pid(&state_dir).filter(|&pid| is_process_running(pid)));
             };
 
             // Under the lock, so only the holder ever replaces a stale PID file.
-            if let Some(pid) = is_daemon_running() {
+            if let Some(pid) = is_daemon_running(&state_dir) {
                 exit_already_running(Some(pid));
             }
 
+            // Resolve before daemonize changes cwd. Persistence opens only
+            // afterward: event-log lock descriptors must not cross the fork.
+            let eventlog_state_dir = std::path::absolute(atmd::eventlog::state_dir())
+                .context("Failed to resolve the event-log state directory")?;
             if daemon {
-                daemonize()?;
+                daemonize(&state_dir)?;
             }
 
-            write_pid()?;
+            write_pid(&state_dir)?;
 
-            let result = run_daemon(socket_path);
+            let result = run_daemon(socket_path, eventlog_state_dir);
 
-            remove_pid_file();
+            remove_pid_file(&state_dir);
 
             result
         }
         Command::Stop => {
-            if let Some(pid) = is_daemon_running() {
+            if let Some(pid) = is_daemon_running(&state_dir) {
                 println!("Stopping daemon (PID {pid})...");
                 stop_daemon(pid)?;
 
-                for _ in 0..50 {
-                    if !is_process_running(pid) {
-                        println!("Daemon stopped.");
-                        return Ok(());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-
-                eprintln!("Daemon did not stop within 5 seconds.");
-                process::exit(1);
+                println!("Daemon stopped.");
+                Ok(())
             } else {
                 println!("Daemon is not running.");
                 Ok(())
             }
         }
         Command::Status => {
-            if let Some(pid) = is_daemon_running() {
+            if let Some(pid) = is_daemon_running(&state_dir) {
                 println!("Daemon is running (PID {pid})");
 
                 let socket_path = env::var("ATM_SOCKET")
@@ -272,10 +463,10 @@ fn main() -> Result<()> {
     }
 }
 
-fn daemonize() -> Result<()> {
+fn daemonize(state_dir: &Path) -> Result<()> {
     use daemonize::Daemonize;
 
-    let log_path = log_file_path();
+    let log_path = log_file_path(state_dir);
 
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).context("Failed to create log directory")?;
@@ -317,7 +508,7 @@ fn open_log(log_path: &Path) -> std::io::Result<File> {
 }
 
 #[tokio::main]
-async fn run_daemon(socket_path: PathBuf) -> Result<()> {
+async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
@@ -350,23 +541,54 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     let (registry, registry_tasks) = spawn_registry_with_cancel(registry_cancel.clone());
     info!("Session registry started");
 
+    // These locks/writers are opened only after daemonization. Independent
+    // detached startup means one broken stream cannot disable the other.
+    let org_cancel = CancellationToken::new();
+    let (org, raw) = tokio::join!(
+        atmd::org::OrgHandle::open(state_dir.clone(), org_cancel.clone()),
+        atmd::org::RawHandle::open(state_dir.clone()),
+    );
+    let summaries = atmd::org::SummaryObserver::spawn(registry.clone(), org.clone());
+
     // Subscribed before discovery, so the notifier sees every session.
-    let _notify_handle = notify_config().await.map(|config| {
-        // Only the program: the arguments may hold a webhook URL or topic.
-        let program = config.command.first().cloned().unwrap_or_default();
-        let delay_secs = config.delay_secs;
-        info!(
-            program,
-            delay_secs, "Running [notify] when a session needs input"
-        );
-        let delay = std::time::Duration::from_secs(delay_secs);
-        spawn_notifier(
-            registry.subscribe(),
-            config.command,
-            delay,
-            cancel_token.clone(),
-        )
-    });
+    let message_notify_cancel = cancel_token.child_token();
+    let config = read_startup_config(atm_tui::setup::atm_config_path()).await;
+    // The server starts the message service on this policy. An invalid one
+    // leaves the message methods unavailable with this reason.
+    if let Err(reason) = &config.delivery {
+        warn!(%reason, "Invalid delivery configuration; message delivery is unavailable");
+    }
+    let (_notify_handle, message_notify_handle) = config
+        .notify
+        .unwrap_or_else(|reason| {
+            warn!(%reason, "Notifications are off");
+            None
+        })
+        .map(|config| {
+            // Only the program: the arguments may hold a webhook URL or topic.
+            let program = config.command.first().cloned().unwrap_or_default();
+            let delay_secs = config.delay_secs;
+            info!(
+                program,
+                delay_secs, "Running [notify] when a session needs input"
+            );
+            let delay = std::time::Duration::from_secs(delay_secs);
+            let attention = spawn_notifier(
+                registry.subscribe(),
+                config.command.clone(),
+                delay,
+                cancel_token.clone(),
+            );
+            let messages = atmd::org::message_notify::spawn_message_notifier(
+                org.clone(),
+                config,
+                message_notify_cancel.clone(),
+            )
+            .map_err(|error| warn!(%error, "Owner message notifications unavailable"))
+            .ok();
+            (Some(attention), messages)
+        })
+        .unwrap_or((None, None));
 
     let discovery = DiscoveryService::new(registry.clone());
     let discovery_result = discovery.discover().await;
@@ -381,7 +603,14 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     let _monitor_handle = spawn_monitor_task(cancel_token.clone());
     info!("Process monitor started");
 
-    let server = DaemonServer::new(&socket_path, registry, cancel_token);
+    let mut services = MethodServices::new(registry);
+    services.state_dir = state_dir;
+    services.org = org;
+    services.raw = raw.clone();
+    services.delivery_policy = Some(config.delivery);
+    // An invalid section never leaves the reminder on with guessed settings.
+    services.reminder = reminder_from(config.reminder);
+    let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
 
@@ -390,7 +619,19 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     let (server_result, registry_result) = tokio::join!(
         async {
             let result = server.run().await;
-            // Connections have drained (or the server failed to start)
+            message_notify_cancel.cancel();
+            if let Some(task) = message_notify_handle {
+                if let Err(error) = task.await {
+                    warn!(%error, "Owner message notifier stopped unexpectedly");
+                }
+            }
+            // Connections drained: preserve exact last live cost before
+            // cancelling either actor. Flush failures never hold shutdown.
+            let (_, raw_result) = tokio::join!(summaries.finish(), raw.flush());
+            if let Err(error) = raw_result {
+                warn!(%error, "Raw capture flush incomplete");
+            }
+            org_cancel.cancel();
             registry_cancel.cancel();
             result
         },
@@ -412,20 +653,63 @@ async fn run_daemon(socket_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// The `[notify]` section of atm's `config.toml`, read once at start. A
-/// missing file or section turns notifications off, and so, with a
-/// warning, does a config that can't be read or parsed.
-async fn notify_config() -> Option<NotifyConfig> {
-    let path = atm_tui::setup::atm_config_path()?;
-    let text = match read_config(path.clone(), CONFIG_READ_TIMEOUT).await {
-        Ok(text) => text?,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "Cannot read config; notifications are off");
-            return None;
-        }
+/// One file read, with independent section results. Invalid delivery settings
+/// must reach runtime startup as an error, never as a default policy.
+struct StartupConfig {
+    notify: Result<Option<NotifyConfig>, String>,
+    delivery: Result<atm_org::delivery::DeliveryPolicy, String>,
+    /// `None` when `[reminder]` turns the reminder off.
+    reminder: Result<Option<atm_org::reminder::ReminderSettings>, String>,
+}
+
+async fn read_startup_config(path: Option<PathBuf>) -> StartupConfig {
+    let text = match path {
+        Some(path) => read_config(path, CONFIG_READ_TIMEOUT).await,
+        None => Ok(None),
     };
-    parse_notify_command(&text).unwrap_or_else(|e| {
-        warn!(path = %path.display(), error = %e, "Invalid config; notifications are off");
+    parse_startup_config(text)
+}
+
+fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
+    #[derive(Default, serde::Deserialize)]
+    struct DeliverySection {
+        #[serde(default)]
+        delivery: atm_org::delivery::DeliveryPolicy,
+    }
+
+    match text {
+        Ok(text) => {
+            let text = text.unwrap_or_default();
+            StartupConfig {
+                notify: parse_notify_command(&text).map_err(|error| error.to_string()),
+                delivery: toml::from_str::<DeliverySection>(&text)
+                    .map(|config| config.delivery)
+                    // TOML errors quote arbitrary config values (including secrets).
+                    .map_err(|_| {
+                        "invalid config: malformed TOML or invalid [delivery] settings".into()
+                    }),
+                reminder: atmd::org::task_reminder::parse_reminder_settings(&text),
+            }
+        }
+        Err(error) => {
+            let reason = format!("cannot read config: {error}");
+            StartupConfig {
+                notify: Err(reason.clone()),
+                delivery: Err(reason.clone()),
+                reminder: Err(reason),
+            }
+        }
+    }
+}
+
+/// The reminder's settings for the server. A section that could not be read
+/// never leaves the reminder on with guessed settings: it is off, with the
+/// reason logged.
+fn reminder_from(
+    config: Result<Option<atm_org::reminder::ReminderSettings>, String>,
+) -> Option<atm_org::reminder::ReminderSettings> {
+    config.unwrap_or_else(|reason| {
+        warn!(%reason, "Invalid reminder configuration; task reminders are off");
         None
     })
 }
@@ -486,6 +770,441 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // A spawned child inherits flock fds until exec. Keep process creation from
+    // overlapping tests that require immediate lock release when a File drops.
+    static LOCK_AND_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Captured: Linux 7.2.14 procfs, 2026-11-14, a leader that called
+    // pthread_exit while one worker slept, under a parent that does not reap.
+    // Read before and after the worker exited; the process's pidfd became
+    // readable only after, when num_threads (field 20) dropped to 1.
+    const ZOMBIE_LEADER_LIVE_THREAD: &str = "614980 (z) Z 614974 614970 614970 0 -1 4227084 78 0 0 0 0 0 0 0 20 0 2 0 58947771 0 0 18446744073709551615 0 0 0 0 0 0 2147221247 0 0 0 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0";
+    const ZOMBIE_WHOLE_GROUP: &str = "614980 (z) Z 614974 614970 614970 0 -1 4227084 81 0 0 0 0 0 0 0 20 0 1 0 58947771 0 0 18446744073709551615 0 0 0 0 0 0 2147221247 0 0 1 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0";
+
+    /// The captured whole-group line with another name, state and thread count.
+    fn stat(comm: &str, state: &str, threads: &str) -> String {
+        let (_, fields) = ZOMBIE_WHOLE_GROUP.rsplit_once(')').unwrap();
+        let mut fields: Vec<&str> = fields.split_whitespace().collect();
+        fields[0] = state;
+        fields[17] = threads;
+        format!("614980 ({comm}) {}", fields.join(" "))
+    }
+
+    // The leader turns Z the moment it exits, while the group's other threads
+    // may still be exiting; stop reported success in that window under load.
+    #[test]
+    fn zombie_leader_has_not_exited_while_other_threads_live() {
+        assert!(!proc_stat_has_exited(ZOMBIE_LEADER_LIVE_THREAD.as_bytes()));
+        assert!(proc_stat_has_exited(ZOMBIE_WHOLE_GROUP.as_bytes()));
+        for threads in ["2", "17", "0", "-1", "one"] {
+            assert!(
+                !proc_stat_has_exited(stat("atmd", "Z", threads).as_bytes()),
+                "num_threads {threads}"
+            );
+        }
+    }
+
+    // Counting zombies as running breaks stop; counting stopped tasks as dead
+    // would let startup ignore a still-live daemon's PID.
+    #[test]
+    fn proc_stat_distinguishes_exited_from_live_and_stopped_states() {
+        for (state, exited) in [
+            ("Z", true),
+            ("X", true),
+            ("x", true),
+            ("R", false),
+            ("S", false),
+            ("D", false),
+            ("T", false),
+            ("t", false),
+            ("I", false),
+            ("?", false),
+        ] {
+            assert_eq!(
+                proc_stat_has_exited(stat("atmd", state, "1").as_bytes()),
+                exited,
+                "state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn proc_stat_state_follows_the_last_name_delimiter() {
+        for (stat, exited) in [
+            (stat("name with spaces", "Z", "1"), true),
+            (stat("(name) with spaces", "X", "1"), true),
+            (stat("name) Z still name", "S", "1"), false),
+            (stat("name\nwith ) parentheses", "x", "1"), true),
+        ] {
+            assert_eq!(proc_stat_has_exited(stat.as_bytes()), exited, "{stat:?}");
+        }
+    }
+
+    // Synthetic: captured whole-group fields with the invalid UTF-8 comm
+    // reproduced by PR_SET_NAME truncation on Linux 7.2.14 (2026-11-14).
+    #[test]
+    fn proc_stat_accepts_non_utf8_comm_without_changing_exit_rules() {
+        for (state, threads, exited) in [
+            ("Z", "1", true),
+            ("Z", "2", false),
+            ("Z", "", false),
+            ("X", "2", true),
+            ("x", "", true),
+            ("S", "1", false),
+        ] {
+            let mut line = b"614980 (name) bad utf8\xe2)".to_vec();
+            let text = stat("atmd", state, threads);
+            line.extend_from_slice(text.rsplit_once(')').unwrap().1.as_bytes());
+            assert_eq!(
+                proc_stat_has_exited(&line),
+                exited,
+                "state {state}, threads {threads}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_or_unknown_proc_stat_does_not_prove_exit() {
+        for stat in [
+            "",
+            "123 (atmd Z 1 2 3",
+            "123 (atmd)",
+            "123 (atmd)   \n",
+            "123 (atmd) unknown 1 2 3",
+            "123 (atmd) Zombie 1 2 3",
+            // A zombie without its thread count does not prove the group exited.
+            "123 (atmd) Z 1 2 3",
+        ] {
+            assert!(!proc_stat_has_exited(stat.as_bytes()), "{stat:?}");
+        }
+    }
+
+    #[test]
+    fn pid_and_log_state_use_the_override_or_legacy_fallback() {
+        for (override_dir, default_dir, expected) in [
+            (Some("/candidate"), Some("/state"), "/candidate"),
+            (None, Some("/state"), "/state/atm"),
+            (None, None, "/tmp/atm"),
+        ] {
+            let state = resolve_daemon_state_dir(
+                override_dir.map(PathBuf::from),
+                default_dir.map(PathBuf::from),
+            );
+            assert_eq!(state, PathBuf::from(expected));
+            assert_eq!(
+                pid_file_path(&state),
+                PathBuf::from(format!("{expected}/atmd.pid"))
+            );
+            assert_eq!(
+                log_file_path(&state),
+                PathBuf::from(format!("{expected}/atm.log"))
+            );
+        }
+    }
+
+    #[test]
+    fn unset_override_keeps_legacy_state_bytes_including_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        for default in [
+            dirs::state_dir(),
+            Some(PathBuf::from(std::ffi::OsString::from_vec(
+                b"/state/\xff".to_vec(),
+            ))),
+            Some(PathBuf::from("relative-home/.local/state")),
+            None,
+        ] {
+            let legacy = default
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("atm");
+            assert_eq!(
+                resolve_daemon_state_dir(None, default).as_os_str(),
+                legacy.as_os_str()
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_config_defaults_when_absent() {
+        for text in [None, Some(""), Some("[notify]\ncommand=['true']\n")] {
+            let config = parse_startup_config(Ok(text.map(str::to_owned)));
+            assert_eq!(
+                config.delivery.unwrap(),
+                atm_org::delivery::DeliveryPolicy::default()
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_config_uses_existing_duration_shape() {
+        let config = parse_startup_config(Ok(Some("[delivery]\nstable_idle={secs=1,nanos=0}\nguard_poll_interval={secs=0,nanos=1000000}\n".into())));
+        let policy = config.delivery.unwrap();
+        assert_eq!(
+            policy.settings().stable_idle,
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            policy.settings().guard_poll_interval,
+            std::time::Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn delivery_config_rejects_unknown_key() {
+        let config = parse_startup_config(Ok(Some("[delivery]\nunknown='SECRET'".into())));
+        let error = config.delivery.unwrap_err();
+        assert!(error.contains("config"));
+        assert!(!error.contains("SECRET"));
+    }
+
+    #[test]
+    fn delivery_config_invalid_values_never_fall_back() {
+        for text in [
+            "[delivery]\nstable_idle={secs=0,nanos=0}",
+            "[delivery]\nstable_idle='SECRET'",
+            "[delivery]\nretry_delays=[{secs=2,nanos=0},{secs=1,nanos=0}]",
+            "[delivery",
+        ] {
+            let error = parse_startup_config(Ok(Some(text.into())))
+                .delivery
+                .unwrap_err();
+            assert!(error.contains("config"));
+            assert!(!error.contains("SECRET"));
+        }
+        let config = parse_startup_config(Ok(Some(
+            "[notify]\ncommand=['true']\n[delivery]\nunknown=1".into(),
+        )));
+        assert!(config.notify.unwrap().is_some());
+        assert!(config.delivery.is_err());
+        let config = parse_startup_config(Ok(Some("[notify]\nunknown=1".into())));
+        assert!(config.notify.is_err());
+        assert!(config.delivery.is_ok());
+    }
+
+    #[test]
+    fn reminder_config_is_one_section_among_the_others() {
+        use atm_org::reminder::ReminderSettings;
+        let read = |text: &str| parse_startup_config(Ok(Some(text.into())));
+        let after = |secs| {
+            Ok(Some(ReminderSettings {
+                delay: std::time::Duration::from_secs(secs),
+            }))
+        };
+        // On after a minute when the file or the section is missing.
+        assert_eq!(parse_startup_config(Ok(None)).reminder, after(60));
+        assert_eq!(read("[notify]\ncommand=['true']\n").reminder, after(60));
+        assert_eq!(read("[reminder]\nenabled=false").reminder, Ok(None));
+        // Each section's mistake is its own.
+        let config = read("[notify]\ncommand=['true']\n[reminder]\nunknown='SECRET'");
+        let error = config.reminder.unwrap_err();
+        assert!(error.contains("[reminder]") && !error.contains("SECRET"));
+        assert!(config.notify.unwrap().is_some());
+        assert!(config.delivery.is_ok());
+        let config = read("[delivery]\nunknown=1\n[reminder]\ndelay_secs=5");
+        assert!(config.delivery.is_err());
+        assert_eq!(config.reminder, after(5));
+        // A file that cannot be read turns reminders off, with the reason.
+        let config = parse_startup_config(Err(anyhow::anyhow!("config read timed out")));
+        assert!(config.reminder.unwrap_err().contains("timed out"));
+    }
+
+    #[test]
+    fn an_invalid_or_unreadable_reminder_config_leaves_reminders_off() {
+        use atm_org::reminder::ReminderSettings;
+        let started =
+            |text: Result<Option<String>>| reminder_from(parse_startup_config(text).reminder);
+        let read = |text: &str| started(Ok(Some(text.into())));
+        // What the daemon hands the server: on by default, or as the file says.
+        assert_eq!(started(Ok(None)), Some(ReminderSettings::default()));
+        let five = ReminderSettings {
+            delay: std::time::Duration::from_secs(5),
+        };
+        assert_eq!(read("[reminder]\ndelay_secs=5"), Some(five));
+        assert_eq!(read("[reminder]\nenabled=false"), None);
+        // Never on with guessed settings.
+        for text in [
+            "[reminder]\nunknown=1",
+            "[reminder]\ndelay_secs=0",
+            "[reminder]\ndelay_secs='soon'",
+            "[reminder",
+        ] {
+            assert_eq!(read(text), None, "{text:?}");
+        }
+        assert_eq!(started(Err(anyhow::anyhow!("config read timed out"))), None);
+    }
+
+    #[test]
+    fn config_read_failure_disables_delivery() {
+        let config = parse_startup_config(Err(anyhow::anyhow!("config read timed out")));
+        assert!(config.notify.is_err());
+        assert!(config.delivery.unwrap_err().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn notify_and_delivery_share_one_file_read() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("fifo path");
+        // A fork could briefly retain another test thread's flock after it drops the file.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        // One writer/open only: a second config read would wait forever.
+        let writer = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+                file.write_all(b"[notify]\ncommand=['true']\ndelay_secs=2\n[delivery]\nstable_idle={secs=1,nanos=0}\n").unwrap();
+            }
+        });
+        let config = read_startup_config(Some(path)).await;
+        writer.join().unwrap();
+        let notify = config.notify.unwrap().unwrap();
+        assert_eq!(notify.command, ["true"]);
+        assert_eq!(notify.delay_secs, 2);
+        assert_eq!(
+            config.delivery.unwrap().settings().stable_idle,
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    /// One number for how long a stop is waited for, and one for how long a
+    /// shutdown nominally takes: the kit and the documents follow the daemon.
+    #[test]
+    fn stop_wait_is_stated_once() {
+        let wait = STOP_WAIT_TIMEOUT.as_secs();
+        let nominal = atmd::server::stop::NOMINAL.as_secs();
+        let kit = include_str!("../../scripts/atm_candidate.py");
+        assert!(
+            kit.contains(&format!("\nSTOP_WAIT_TIMEOUT = {wait}\n")),
+            "scripts/atm_candidate.py waits another time than {wait} s"
+        );
+        for (name, text) in [
+            ("README.md", include_str!("../../README.md")),
+            (
+                "scripts/atm-candidate.md",
+                include_str!("../../scripts/atm-candidate.md"),
+            ),
+        ] {
+            assert!(text.contains(&format!("up to {wait} seconds")), "{name}");
+            assert!(text.contains(&format!("{nominal} seconds")), "{name}");
+        }
+    }
+
+    #[test]
+    fn stop_wait_progress_once_and_exit_wins_at_deadline() {
+        use StopWaitAction::*;
+        for (millis, exited, reported, expected) in [
+            (
+                4_999,
+                false,
+                false,
+                Wait(std::time::Duration::from_millis(1)),
+            ),
+            (5_000, false, false, Progress),
+            (5_001, false, false, Progress),
+            (5_000, false, true, Wait(std::time::Duration::from_secs(70))),
+            (
+                74_999,
+                false,
+                true,
+                Wait(std::time::Duration::from_millis(1)),
+            ),
+            (75_000, false, true, TimedOut),
+            (75_000, false, false, TimedOut),
+            (0, true, false, Stopped),
+            (5_000, true, false, Stopped),
+            (75_000, true, true, Stopped),
+            (80_000, true, true, Stopped),
+        ] {
+            assert_eq!(
+                stop_wait_action(std::time::Duration::from_millis(millis), exited, reported),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn stop_waits_for_exit_after_progress_without_repeating_it() {
+        use std::{cell::Cell, time::Duration};
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut progress = Vec::new();
+        wait_for_exit(
+            123,
+            |wait| {
+                elapsed.set((elapsed.get() + wait).min(Duration::from_secs(6)));
+                Ok(elapsed.get() == Duration::from_secs(6))
+            },
+            || elapsed.get(),
+            || progress.push(elapsed.get()),
+        )
+        .unwrap();
+        assert_eq!(progress, [Duration::from_secs(5)]);
+        assert_eq!(elapsed.get(), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn stop_timeout_names_still_live_pid_at_seventy_five_seconds() {
+        use std::{cell::Cell, time::Duration};
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut progress = Vec::new();
+        let error = wait_for_exit(
+            123,
+            |wait| {
+                elapsed.set(elapsed.get() + wait);
+                Ok(false)
+            },
+            || elapsed.get(),
+            || progress.push(elapsed.get()),
+        )
+        .unwrap_err();
+        assert_eq!(elapsed.get(), Duration::from_secs(75));
+        assert_eq!(progress, [Duration::from_secs(5)]);
+        let message = error.to_string();
+        assert!(message.contains("PID 123"), "{message}");
+        assert!(message.contains("75 seconds"), "{message}");
+        assert!(message.contains("still be shutting down"), "{message}");
+    }
+
+    #[test]
+    fn failed_exit_probe_is_not_success() {
+        let error = wait_for_exit(
+            123,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            || std::time::Duration::ZERO,
+            || panic!("must not report progress after a failed probe"),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_exit_observation_survives_reaping() {
+        let _guard = LOCK_AND_SPAWN.lock().unwrap();
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let fd = open_pidfd(pid)
+            .unwrap()
+            .expect("Linux test requires pidfds");
+        assert!(child.wait().unwrap().success());
+        assert!(wait_for_process(pid, Some(&fd), Duration::ZERO).unwrap());
+        assert!(wait_for_process(pid, None, Duration::ZERO).unwrap());
+        assert!(!wait_for_process(std::process::id(), None, Duration::ZERO).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_accepts_exit_before_pidfd_open_and_rejects_nonpositive_pids() {
+        let absent = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        stop_daemon(absent).unwrap();
+        assert!(stop_daemon(0).is_err());
+        assert!(stop_daemon(u32::MAX).is_err());
+    }
+
     fn socket_in(dir: &Path) -> PathBuf {
         dir.join("run").join("atmd.sock")
     }
@@ -537,6 +1256,7 @@ mod tests {
 
     #[test]
     fn test_daemon_lock_is_exclusive_until_dropped() {
+        let _guard = LOCK_AND_SPAWN.lock().unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
         // The socket's parent doesn't exist yet, as on a fresh runtime dir.
         let socket = socket_in(dir.path());
@@ -549,6 +1269,7 @@ mod tests {
 
     #[test]
     fn test_daemon_lock_takes_a_read_only_lock_file() {
+        let _guard = LOCK_AND_SPAWN.lock().unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = socket_in(dir.path());
         drop(lock_daemon(&socket).expect("lock"));

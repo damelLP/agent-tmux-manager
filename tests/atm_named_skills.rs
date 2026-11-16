@@ -158,6 +158,40 @@ fn named_skill_references_resolve_in_the_installed_layout() {
     }
 }
 
+// Break caught: shipped instructions still demand a duplicate answer or conceal the conditional recovery boundary.
+// This is a distribution/recipe contract, not a model-compliance evaluation.
+#[test]
+fn named_skills_use_automatic_verdict_answers_without_duplicate_send() {
+    let lead = document("atm-lead");
+    let (_, l4) = lead.split_once("- **[L4]").unwrap();
+    let (l4, _) = l4.split_once("## Decide,").unwrap();
+    let normalized = l4.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("Non-final verdicts automatically queue one task-correlated `answer`"),
+        "missing automatic verdict answer guidance"
+    );
+    assert!(normalized.contains("do not send a duplicate"));
+    assert!(normalized.contains("re-reads the current task state"));
+    let reference = fs::read_to_string(source().join("shared").join(REFERENCE)).unwrap();
+    assert!(!reference.contains("no automatic assignee notification"));
+    assert!(!reference.contains("verdicts do not notify the assignee"));
+    let (_, recipe) = reference.split_once("### Durable-task recipe\n").unwrap();
+    let (recipe, _) = recipe.split_once("## Decision requests").unwrap();
+    let (automatic, recovery) = recipe.split_once("**Conditional recovery only:**").unwrap();
+    let automatic = automatic.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(automatic.contains("verdict automatically queues one task-correlated `answer`"));
+    assert!(automatic.contains("accepted result is final"));
+    assert!(!automatic.contains("atm msg send --to project/member --kind answer"));
+    assert!(recovery.contains("atm msg send --to project/member --kind answer"));
+    assert!(recovery.contains("authorized diagnostics"));
+    assert!(recovery.contains("before resending"));
+    let (_, record) = reference.split_once("### L4\n").unwrap();
+    let (record, _) = record.split_once("\n### L5").unwrap();
+    assert!(record.contains("automatic answer"));
+    assert!(record.contains("re-read"));
+    assert!(record.contains("**Not verified:**"));
+}
+
 // Break caught: a distributed entry example is too large for the recorded
 // Claude slash-command boundary or names a different skill. This checks the
 // example size, not the unverified current-harness paste boundary itself.

@@ -103,13 +103,13 @@ if [ -n "$TMUX_PANE_ID" ]; then
     DATA_MSG=$(jq -c --arg type "$MSG_TYPE" --argjson pid "$CLAUDE_PID" --arg tmux_pane "$TMUX_PANE_ID" '{
         "protocol_version": {"major": 1, "minor": 0},
         "type": $type,
-        "data": (. + {pid: $pid, tmux_pane: $tmux_pane})
+        "data": (del(.last_assistant_message) + {pid: $pid, tmux_pane: $tmux_pane})
     }' <<< "$input" 2>/dev/null)
 else
     DATA_MSG=$(jq -c --arg type "$MSG_TYPE" --argjson pid "$CLAUDE_PID" '{
         "protocol_version": {"major": 1, "minor": 0},
         "type": $type,
-        "data": (. + {pid: $pid})
+        "data": (del(.last_assistant_message) + {pid: $pid})
     }' <<< "$input" 2>/dev/null)
 fi
 

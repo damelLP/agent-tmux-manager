@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use crate::server::methods::{CallerId, CallerPane};
-use atm_org::{TaskCreated, TaskMeasure};
+use atm_org::{TaskCreated, TaskMeasure, TaskVerdict, TaskVerdictGiven};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +54,445 @@ fn assign(_: TaskActor) -> TaskCommand {
             who: Address::Owner,
             lead: false,
         },
+    }
+}
+
+fn owner_caller() -> CallContext {
+    CallContext {
+        from_pane: None,
+        ..caller()
+    }
+}
+fn verdict(by: TaskActor, verdict: TaskVerdict) -> TaskCommand {
+    TaskCommand::Verdict {
+        task_id: "t3".parse().unwrap(),
+        verdict,
+        review_task: None,
+        note: None,
+        by,
+    }
+}
+async fn verdict_org() -> (tempfile::TempDir, OrgHandle, CancellationToken) {
+    let rig = org().await;
+    for command in [
+        assign(TaskActor {
+            who: Address::Owner,
+            lead: false,
+        }),
+        TaskCommand::Submit {
+            task_id: "t3".parse().unwrap(),
+            what: TaskSubmission::Plan,
+            files: vec![],
+            by: TaskActor {
+                who: "p/worker".parse().unwrap(),
+                lead: false,
+            },
+        },
+    ] {
+        rig.1
+            .execute(OrgCommand::Task(command), chrono::Utc::now())
+            .await
+            .unwrap();
+    }
+    rig
+}
+fn verdict_snapshot(wanted: TaskState, assigned: bool) -> OrgState {
+    let mut state = OrgState::default();
+    let now = chrono::Utc::now();
+    for (seq, event) in [
+        OrgEvent::ProjectRegistered {
+            project_id: "p".parse().unwrap(),
+            root: "/p".into(),
+        },
+        OrgEvent::AgentAdopted {
+            agent_id: "p/worker".parse().unwrap(),
+            pane: "%1".into(),
+            session_id: None,
+        },
+        OrgEvent::TaskCreated(created("Work".into())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state.apply(seq as u64 + 1, now, &event).unwrap();
+    }
+    if assigned {
+        state
+            .apply(
+                4,
+                now,
+                &OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+                    task_id: "t3".parse().unwrap(),
+                    agent_id: "p/worker".parse().unwrap(),
+                    by: Address::Owner,
+                }),
+            )
+            .unwrap();
+    }
+    state
+        .apply(
+            5,
+            now,
+            &OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+                task_id: "t3".parse().unwrap(),
+                state: wanted,
+                reason: None,
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    state
+}
+fn verdict_fact(verdict: TaskVerdict) -> TaskVerdictGiven {
+    TaskVerdictGiven {
+        task_id: "t3".parse().unwrap(),
+        verdict,
+        review_task: None,
+        note: None,
+        by: Address::Owner,
+    }
+}
+
+// Break caught: answer copies an oversized note/stale files, loses review access, or guesses an assignee.
+#[test]
+fn verdict_answer_reads_note_and_review_by_reference() {
+    for (choice, state_kind, word) in [
+        (TaskVerdict::Accepted, TaskState::Working, "accepted"),
+        (
+            TaskVerdict::ChangesRequested,
+            TaskState::ChangesRequested,
+            "changes_requested",
+        ),
+    ] {
+        for reviewed in [false, true] {
+            for note in [None, Some("Checked é🙂".into()), Some("é".repeat(8192))] {
+                let mut state = verdict_snapshot(state_kind, true);
+                let now = chrono::Utc::now();
+                let mut review = created("Review".into());
+                review.kind = TaskKind::Review;
+                review.judges = Some("t3".parse().unwrap());
+                state.apply(6, now, &OrgEvent::TaskCreated(review)).unwrap();
+                for seq in 7..87 {
+                    state
+                        .apply(
+                            seq,
+                            now,
+                            &OrgEvent::TaskAttached(atm_org::TaskAttached {
+                                task_id: if seq < 47 { "t3" } else { "t6" }.parse().unwrap(),
+                                by: Address::Owner,
+                                file: atm_org::TaskFile {
+                                    path: format!("evidence-{seq}.md"),
+                                    kind: TaskFileKind::Report,
+                                    note: None,
+                                },
+                            }),
+                        )
+                        .unwrap();
+                }
+                let mut fact = verdict_fact(choice);
+                fact.note = note;
+                fact.review_task = reviewed.then(|| "t6".parse().unwrap());
+                let answer = notification(&OrgEvent::TaskVerdict(fact), &state)
+                    .unwrap()
+                    .expect("missing verdict answer");
+                let mut body = format!("Task t3 verdict recorded: {word}.\nRe-read the current task and verdict note before acting: atm task get t3\nResume only as its current state and approved brief allow.");
+                if reviewed {
+                    body.push_str("\nReview evidence: atm task get t6");
+                }
+                assert_eq!(
+                    answer,
+                    MessageContent {
+                        from: Address::Owner,
+                        to: "p/worker".parse().unwrap(),
+                        kind: MessageKind::Answer,
+                        body,
+                        attachments: vec![],
+                        task: Some("t3".parse().unwrap()),
+                    }
+                );
+                validate_send(&SendParams {
+                    to: answer.to,
+                    kind: answer.kind,
+                    body: answer.body,
+                    attachments: answer.attachments,
+                    task: answer.task,
+                })
+                .unwrap();
+            }
+        }
+        assert!(matches!(
+            notification(
+                &OrgEvent::TaskVerdict(verdict_fact(choice)),
+                &verdict_snapshot(state_kind, false)
+            ),
+            Err(TaskError::Internal(_))
+        ));
+    }
+    for state in [
+        TaskState::Open,
+        TaskState::Assigned,
+        TaskState::Waiting,
+        TaskState::Blocked,
+        TaskState::Submitted,
+        TaskState::InReview,
+        TaskState::Accepted,
+        TaskState::Cancelled,
+        TaskState::Unknown,
+    ] {
+        for choice in [
+            TaskVerdict::Accepted,
+            TaskVerdict::ChangesRequested,
+            TaskVerdict::Unknown,
+        ] {
+            assert!(notification(
+                &OrgEvent::TaskVerdict(verdict_fact(choice)),
+                &verdict_snapshot(state, true)
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+    for (choice, state) in [
+        (TaskVerdict::Accepted, TaskState::ChangesRequested),
+        (TaskVerdict::ChangesRequested, TaskState::Working),
+        (TaskVerdict::Unknown, TaskState::Working),
+    ] {
+        assert!(notification(
+            &OrgEvent::TaskVerdict(verdict_fact(choice)),
+            &verdict_snapshot(state, true)
+        )
+        .unwrap()
+        .is_none());
+    }
+}
+
+// Break caught: composition uses the pre-command snapshot, or reports None as an enqueue error.
+#[tokio::test]
+async fn superseded_verdict_snapshot_does_not_emit_stale_wake() {
+    use crate::{eventlog::Envelope, org::Request};
+    use tokio::sync::{broadcast, watch};
+    for choice in [TaskVerdict::Accepted, TaskVerdict::ChangesRequested] {
+        let eligible = if choice == TaskVerdict::Accepted {
+            TaskState::Working
+        } else {
+            TaskState::ChangesRequested
+        };
+        for state_kind in [
+            eligible,
+            TaskState::Submitted,
+            TaskState::InReview,
+            TaskState::Waiting,
+            TaskState::Blocked,
+            TaskState::Assigned,
+            TaskState::Open,
+            TaskState::Cancelled,
+            TaskState::Accepted,
+            TaskState::Unknown,
+        ] {
+            let (requests, mut receive) = mpsc::channel(8);
+            let (_health, health) = watch::channel(Ok(5));
+            let (committed, _) = broadcast::channel(8);
+            let org = OrgHandle {
+                requests,
+                health,
+                committed,
+                reads: None,
+            };
+            let mut call = tokio::spawn(execute_mutation(
+                org,
+                owner_caller(),
+                move |by| verdict(by, choice),
+                |content| async move {
+                    assert_eq!(content.to.to_string(), "p/worker");
+                    Ok(MessageId::new(99))
+                },
+            ));
+            let Request::Snapshot(reply) = receive.recv().await.unwrap() else {
+                panic!("expected identity snapshot")
+            };
+            reply
+                .send(verdict_snapshot(TaskState::Submitted, true))
+                .unwrap();
+            let Request::Execute { reply, now, .. } = receive.recv().await.unwrap() else {
+                panic!("expected verdict")
+            };
+            let event = OrgEvent::TaskVerdict(verdict_fact(choice));
+            reply
+                .send(Ok(vec![Envelope {
+                    seq: 6,
+                    ts: now,
+                    kind: event.kind().into(),
+                    body: event.to_body(),
+                }]))
+                .unwrap();
+            let request = tokio::select! {
+                request = receive.recv() => request,
+                result = &mut call => panic!("missing verdict answer composition: {:?}", result.unwrap().unwrap()),
+            };
+            let Some(Request::Snapshot(reply)) = request else {
+                panic!("missing verdict answer composition: no fresh post-verdict snapshot")
+            };
+            // A reassignment is represented by Assigned, not the old Working snapshot.
+            reply.send(verdict_snapshot(state_kind, true)).unwrap();
+            let result = serde_json::to_value(call.await.unwrap().unwrap()).unwrap();
+            assert_eq!(result["changed"], true);
+            if state_kind == eligible {
+                assert_eq!(
+                    result["notification"],
+                    serde_json::json!({"status":"queued","message_id":"m99"})
+                );
+            } else {
+                assert_eq!(result["notification"], serde_json::Value::Null);
+            }
+        }
+    }
+}
+
+// Break caught: enqueue failure hides/undoes a committed verdict or calls its answer a report.
+#[tokio::test]
+async fn verdict_enqueue_failure_preserves_committed_state() {
+    for (choice, wanted) in [
+        (TaskVerdict::Accepted, TaskState::Working),
+        (TaskVerdict::ChangesRequested, TaskState::ChangesRequested),
+    ] {
+        let (_dir, org, cancel) = verdict_org().await;
+        let result = execute_mutation(
+            org.clone(),
+            owner_caller(),
+            move |by| verdict(by, choice),
+            |_| async {
+                Err(TaskError::Organisation(OrgServiceError::Unavailable(
+                    "unknown append outcome".into(),
+                )))
+            },
+        )
+        .await
+        .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["changed"], true);
+        assert_eq!(
+            result["notification"]["status"], "unconfirmed",
+            "missing verdict answer enqueue"
+        );
+        assert_eq!(result["notification"]["error"]["code"], "unavailable");
+        assert!(result["notification"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("task t3 committed; automatic answer enqueue was not confirmed"));
+        let state = org.snapshot().await.unwrap();
+        assert_eq!(state.task(&"t3".parse().unwrap()).unwrap().state, wanted);
+        assert_eq!(state.messages().count(), 0);
+        cancel.cancel();
+    }
+}
+
+// Break caught: dropping/timing out a verdict waiter drops its retained enqueue or permit.
+#[tokio::test]
+async fn verdict_worker_retains_enqueue_after_waiter_loss() {
+    for choice in [TaskVerdict::Accepted, TaskVerdict::ChangesRequested] {
+        for timeout in [false, true] {
+            let (_dir, org, cancel) = verdict_org().await;
+            let tasks = TaskHandle::new(org.clone());
+            let workers = tasks.workers.clone();
+            let (entered, entry) = oneshot::channel();
+            let (release, gate) = oneshot::channel();
+            let (done, finished) = oneshot::channel();
+            let sender = org.clone();
+            let call = tokio::spawn(async move {
+                tasks
+                    .run(execute_mutation(
+                        tasks.org.clone(),
+                        owner_caller(),
+                        move |by| verdict(by, choice),
+                        move |content| async move {
+                            entered.send(()).unwrap();
+                            gate.await.unwrap();
+                            let result = enqueue(sender, content).await;
+                            done.send(()).unwrap();
+                            result
+                        },
+                    ))
+                    .await
+            });
+            entry.await.expect("missing verdict answer enqueue");
+            if timeout {
+                // Only an in-memory enqueue gate is pending; real log I/O is complete.
+                tokio::time::pause();
+                assert!(matches!(call.await.unwrap(), Err(TaskError::Timeout)));
+                tokio::time::resume();
+            } else {
+                call.abort();
+                assert!(call.await.unwrap_err().is_cancelled());
+            }
+            assert!(workers.clone().try_acquire_many_owned(64).is_err());
+            release.send(()).unwrap();
+            finished.await.unwrap();
+            drop(workers.acquire_many_owned(64).await.unwrap());
+            let state = org.snapshot().await.unwrap();
+            assert_eq!(
+                state.task(&"t3".parse().unwrap()).unwrap().state,
+                if choice == TaskVerdict::Accepted {
+                    TaskState::Working
+                } else {
+                    TaskState::ChangesRequested
+                }
+            );
+            let messages: Vec<_> = state.messages().collect();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content.kind, MessageKind::Answer);
+            assert_eq!(messages[0].content.task.as_ref().unwrap().to_string(), "t3");
+            cancel.cancel();
+        }
+    }
+}
+
+// Break caught: replay fabricates a lost verdict wake or duplicates an already committed answer.
+#[tokio::test]
+async fn verdict_prefix_and_answer_replay_do_not_fabricate_messages() {
+    for complete in [false, true] {
+        let (dir, org, cancel) = verdict_org().await;
+        if complete {
+            let sender = org.clone();
+            let result = execute_mutation(
+                org.clone(),
+                owner_caller(),
+                |by| verdict(by, TaskVerdict::Accepted),
+                move |content| enqueue(sender, content),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result.notification, Some(Notification::Queued { .. })),
+                "missing verdict answer"
+            );
+        } else {
+            let (entered, entry) = oneshot::channel();
+            let call = tokio::spawn(execute_mutation(
+                org.clone(),
+                owner_caller(),
+                |by| verdict(by, TaskVerdict::Accepted),
+                |_| async move {
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<MessageId, TaskError>>().await
+                },
+            ));
+            entry.await.expect("missing verdict answer enqueue");
+            call.abort();
+            assert!(call.await.unwrap_err().is_cancelled());
+        }
+        let before = org.snapshot().await.unwrap();
+        assert_eq!(
+            before.task(&"t3".parse().unwrap()).unwrap().state,
+            TaskState::Working
+        );
+        assert_eq!(before.messages().count(), usize::from(complete));
+        let next = tempfile::tempdir().unwrap();
+        copy(dir.path(), next.path());
+        cancel.cancel();
+        let stop = CancellationToken::new();
+        let reopened = OrgHandle::open(next.path().into(), stop.clone()).await;
+        assert_eq!(reopened.snapshot().await.unwrap(), before);
+        stop.cancel();
     }
 }
 

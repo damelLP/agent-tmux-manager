@@ -52,6 +52,15 @@ fn fixture_jq() -> Option<PathBuf> {
 
 /// `tree` is ordered outermost to innermost; each pair is (comm, label).
 fn run_hook(tree: &[(&str, &str)], input: &Value, jq: &Path) -> Capture {
+    run_hook_with_pane(tree, input, jq, None)
+}
+
+fn run_hook_with_pane(
+    tree: &[(&str, &str)],
+    input: &Value,
+    jq: &Path,
+    pane: Option<&str>,
+) -> Capture {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -119,7 +128,7 @@ exit "$rc"
     }
     // Keep jq's runtime environment, but isolate shell startup and the hook's
     // ambient debug/tmux settings. ATM_SOCKET and fixture variables are replaced.
-    let output = command
+    command
         .env_remove("BASH_ENV")
         .env_remove("ENV")
         .env_remove("TMUX")
@@ -133,7 +142,11 @@ exit "$rc"
         .env("ATM_TEST_HOOK", HOOK)
         .env("ATM_TEST_INPUT", input_path)
         .env("ATM_TEST_PIDS", &pid_path)
-        .env("ATM_TEST_MESSAGES", &messages_path)
+        .env("ATM_TEST_MESSAGES", &messages_path);
+    if let Some(pane) = pane {
+        command.env("TMUX_PANE", pane);
+    }
+    let output = command
         .output()
         .expect("run real process tree with timeout");
     assert!(output.status.success(), "{output:?}");
@@ -369,4 +382,115 @@ fn claude_at_sixteenth_ancestor_is_out_of_range() {
     let labels: Vec<_> = (0..15).map(|i| format!("shell-{i}")).collect();
     tree.extend(labels.iter().map(|label| ("sh", label.as_str())));
     assert_pid(&tree, None);
+}
+
+fn assert_projection(input: &Value, message_type: &str, jq: &Path, pane: Option<&str>) {
+    let capture = run_hook_with_pane(&[("claude", "session")], input, jq, pane);
+    assert_eq!(capture.messages.len(), 2);
+    assert_eq!(capture.messages[0]["type"], "connect");
+    let frame = &capture.messages[1];
+    assert_eq!(frame["type"], message_type);
+    assert_eq!(frame["protocol_version"], json!({"major": 1, "minor": 0}));
+    assert!(
+        frame["data"].get("last_assistant_message").is_none(),
+        "unread assistant text must not be forwarded (pane={pane:?})"
+    );
+    let bytes = serde_json::to_vec(frame).unwrap().len() + 1;
+    assert!(
+        bytes <= 1_048_576,
+        "frame including newline is {bytes} bytes"
+    );
+    let mut expected = input.clone();
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("last_assistant_message");
+    expected["pid"] = json!(capture.pids["session"]);
+    if let Some(pane) = pane {
+        expected["tmux_pane"] = json!(pane);
+    }
+    assert_eq!(frame["data"], expected);
+}
+
+#[test]
+fn large_stop_drops_unread_assistant_text() {
+    let Some(jq) = fixture_jq() else {
+        return;
+    };
+    // Captured: Claude Code 2.1.325, 2026-11-14, U5 private Unix proxy;
+    // source and sanitization are documented in support/stand_in/README.md.
+    let stop: Value = include_str!("support/stand_in/fixtures/claude_2.1.325.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|frame| frame["data"]["hook_event_name"] == "Stop")
+        .unwrap();
+    let mut input = stop["data"].clone();
+    // Synthetic: enlarge only the unread text to exceed atmd's line cap, and
+    // add nonempty background/cron metadata to guard against losing counts.
+    input["last_assistant_message"] = json!("x".repeat(1_100_000));
+    input["background_tasks"] = json!([{"id": "shell-test", "type": "shell", "status": "running"}]);
+    input["session_crons"] = json!([{"id": "cron-test"}]);
+    input["stop_hook_active"] = json!(true);
+    for pane in [None, Some("%7")] {
+        assert_projection(&input, "hook_event", &jq, pane);
+    }
+}
+
+#[test]
+fn failure_and_subagent_stops_drop_only_top_level_assistant_text() {
+    let Some(jq) = fixture_jq() else {
+        return;
+    };
+    // Captured: Claude Code 2.1.310, 2026-10-25 (failure) and 2026-10-24
+    // (subagent), sealed fake-API TUI; see atm-claude-adapter's crate docs.
+    for (text, event) in [
+        (
+            include_str!(
+                "../crates/atm-claude-adapter/tests/fixtures/claude_stop_failure_2.1.310.jsonl"
+            ),
+            "StopFailure",
+        ),
+        (
+            include_str!(
+                "../crates/atm-claude-adapter/tests/fixtures/claude_tui_session_2.1.310.jsonl"
+            ),
+            "SubagentStop",
+        ),
+    ] {
+        let mut input = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|raw| raw["hook_event_name"] == event)
+            .unwrap();
+        assert!(input.get("last_assistant_message").is_some());
+        // Synthetic: a nested same-name field must survive the top-level
+        // projection, as must all captured identity, error and child metadata.
+        input["projection_probe"] = json!({"last_assistant_message": "retain nested text"});
+        for pane in [None, Some("%7")] {
+            assert_projection(&input, "hook_event", &jq, pane);
+        }
+    }
+}
+
+#[test]
+fn tool_and_status_frames_keep_their_payloads() {
+    let Some(jq) = fixture_jq() else {
+        return;
+    };
+    // Captured: Claude Code 2.1.325, 2026-11-14, U5/P1 private Unix proxy;
+    // these are individual templates, not a continuous captured flow.
+    for frame in include_str!("support/stand_in/fixtures/claude_2.1.325.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|frame| {
+            frame["type"] == "status_update" || frame["data"]["hook_event_name"] == "PostToolUse"
+        })
+    {
+        let mut input = frame["data"].clone();
+        // Synthetic: unknown and nested fields must be forwarded unchanged.
+        input["projection_probe"] = json!({"extra": true, "last_assistant_message": "nested"});
+        for pane in [None, Some("%7")] {
+            assert_projection(&input, frame["type"].as_str().unwrap(), &jq, pane);
+        }
+    }
 }

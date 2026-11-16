@@ -122,6 +122,44 @@ impl Rig {
         })
         .await;
     }
+    async fn verdict_ready(&self, what: TaskSubmission, reviewed: bool) -> Option<atm_org::TaskId> {
+        self.assign().await;
+        self.run(TaskCommand::Submit {
+            task_id: "t6".parse().unwrap(),
+            what,
+            files: vec![],
+            by: actor("project/worker"),
+        })
+        .await;
+        if !reviewed {
+            return None;
+        }
+        let mut review = created("Independent review");
+        review.kind = atm_org::TaskKind::Review;
+        review.judges = Some("t6".parse().unwrap());
+        self.run(TaskCommand::Create(review)).await;
+        let review: atm_org::TaskId = format!("t{}", self.org.status().unwrap()).parse().unwrap();
+        self.run(TaskCommand::Assign {
+            task_id: review.clone(),
+            agent_id: "project/reviewer".parse().unwrap(),
+            by: actor("owner"),
+        })
+        .await;
+        self.run(TaskCommand::Submit {
+            task_id: review.clone(),
+            what: TaskSubmission::Result,
+            files: vec![],
+            by: actor("project/reviewer"),
+        })
+        .await;
+        self.run(TaskCommand::StartReview {
+            task_id: "t6".parse().unwrap(),
+            review_task: review.clone(),
+            by: actor("owner"),
+        })
+        .await;
+        Some(review)
+    }
     async fn call(
         &self,
         pane: Option<&str>,
@@ -335,6 +373,107 @@ async fn automatic_messages_name_task_and_preserve_actor_files_and_noops() {
         json!({"task_id":"t6","changed":false,"notification":null})
     );
     assert_eq!(rig.snapshot().await, state);
+}
+
+// Break caught: non-final verdicts strand a member or lose actor/task/review attribution.
+#[tokio::test]
+async fn nonfinal_verdicts_queue_one_actor_signed_answer() {
+    for (what, verdict, wanted_state) in [
+        (TaskSubmission::Plan, "accepted", TaskState::Working),
+        (
+            TaskSubmission::Plan,
+            "changes_requested",
+            TaskState::ChangesRequested,
+        ),
+        (
+            TaskSubmission::Result,
+            "changes_requested",
+            TaskState::ChangesRequested,
+        ),
+    ] {
+        for reviewed in [false, true] {
+            for (pane, from) in [(None, "owner"), (Some("%1"), "project/lead")] {
+                let rig = Rig::new().await;
+                let review = rig.verdict_ready(what, reviewed).await;
+                let result = rig
+                    .ok(
+                        pane,
+                        "task.verdict",
+                        json!({
+                            "task_id":"t6", "verdict":verdict, "review_task":review,
+                            "note":"Checked é🙂; read the evidence",
+                        }),
+                    )
+                    .await;
+                assert_eq!(result["changed"], true);
+                assert_eq!(
+                    result["notification"]["status"], "queued",
+                    "missing verdict answer: {result}"
+                );
+                let id = result["notification"]["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let state = rig.snapshot().await;
+                let task = state.task(&"t6".parse().unwrap()).unwrap();
+                assert_eq!(task.state, wanted_state);
+                assert_eq!(task.submission, None);
+                assert_eq!(
+                    task.reason.as_deref(),
+                    Some("Checked é🙂; read the evidence")
+                );
+                let mut body = format!("Task t6 verdict recorded: {verdict}.\nRe-read the current task and verdict note before acting: atm task get t6\nResume only as its current state and approved brief allow.");
+                if let Some(review) = &review {
+                    body.push_str(&format!("\nReview evidence: atm task get {review}"));
+                    assert_eq!(state.task(review).unwrap().state, TaskState::Accepted);
+                }
+                assert_eq!(
+                    serde_json::to_value(&state.message(&id).unwrap().content).unwrap(),
+                    json!({
+                        "from":from,"to":"project/worker","kind":"answer","body":body,
+                        "attachments":[],"task":"t6",
+                    })
+                );
+                assert_eq!(
+                    state.messages().count(),
+                    1,
+                    "secondary review must not wake its reviewer"
+                );
+            }
+        }
+    }
+}
+
+// Break caught: repeated verdicts duplicate wakes, or final acceptance/review bookkeeping wakes seats.
+#[tokio::test]
+async fn verdict_noops_finals_and_review_closure_do_not_duplicate_answers() {
+    for (verdict, expected_messages) in [("changes_requested", 1), ("accepted", 0)] {
+        let rig = Rig::new().await;
+        let review = rig.verdict_ready(TaskSubmission::Result, true).await;
+        let params = json!({"task_id":"t6","verdict":verdict,"review_task":review});
+        let first = rig.ok(Some("%1"), "task.verdict", params.clone()).await;
+        assert_eq!(first["changed"], true);
+        if expected_messages == 0 {
+            assert_eq!(first["notification"], Value::Null);
+        } else {
+            assert_eq!(
+                first["notification"]["status"], "queued",
+                "missing verdict answer"
+            );
+        }
+        let before = rig.snapshot().await;
+        assert_eq!(before.messages().count(), expected_messages);
+        assert_eq!(
+            before.task(review.as_ref().unwrap()).unwrap().state,
+            TaskState::Accepted
+        );
+        assert_eq!(
+            rig.ok(Some("%1"), "task.verdict", params).await,
+            json!({"task_id":"t6","changed":false,"notification":null})
+        );
+        assert_eq!(rig.snapshot().await, before);
+    }
 }
 
 // Break caught: a seat containing "lead" gains authority over a task it did not create.

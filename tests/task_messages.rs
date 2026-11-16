@@ -126,6 +126,118 @@ fn assigned_brief_and_submitted_report_travel_through_guarded_pi_references() {
     rig.test.rig.close();
 }
 
+// Break caught: a verdict loses its wake, interrupts a running turn, or types the body instead of a reference.
+#[test]
+fn verdict_answer_waits_for_turn_end_then_delivers_one_reference() {
+    for (verdict, wanted) in [
+        ("accepted", "working"),
+        ("changes_requested", "changes_requested"),
+    ] {
+        let mut rig = MessageRig::start(Confirmation::Generous);
+        let lead = rig.ready_agent("lead", StandInMode::Pi);
+        let worker = rig.ready_agent("worker", StandInMode::Pi);
+        let mut watch = rig.watch();
+        let created = rig
+            .call(
+                "task.create",
+                json!({
+                    "title":"Plan stop", "measure":{"kind":"mechanical","command":"check"},
+                    "files":[{"path":"brief.md","kind":"brief"}],
+                }),
+                Some(&lead.pane),
+            )
+            .unwrap();
+        let id = created["task_id"].as_str().unwrap();
+        let assigned = rig
+            .call(
+                "task.assign",
+                json!({"task_id":id,"agent_id":worker.id}),
+                Some(&lead.pane),
+            )
+            .unwrap();
+        let brief = assigned["notification"]["message_id"].as_str().unwrap();
+        watch.wait(
+            "brief delivered before the plan turn",
+            about("msg.delivered", brief),
+        );
+        rig.finish_turn(&worker.pane);
+        rig.hold_turn(&worker.pane);
+        let cursor = rig.test.rig.event_cursor(&worker.pane);
+        let screen = rig.test.rig.capture_styled(&worker.pane);
+        rig.call(
+            "task.submit",
+            json!({"task_id":id,"what":"plan","files":[{"path":"plan.md","kind":"plan"}]}),
+            Some(&worker.pane),
+        )
+        .unwrap();
+        let result = rig
+            .call(
+                "task.verdict",
+                json!({"task_id":id,"verdict":verdict,"note":"Read the canonical note"}),
+                Some(&lead.pane),
+            )
+            .unwrap();
+        assert_eq!(
+            result["notification"]["status"], "queued",
+            "missing verdict answer: {result}"
+        );
+        let message = result["notification"]["message_id"].as_str().unwrap();
+        watch.wait("verdict answer durable enqueue", |e| {
+            e["kind"] == "msg.sent" && e["body"]["task"] == id && e["body"]["kind"] == "answer"
+        });
+        // The runtime's observed busy reason is the decision fence, not elapsed time.
+        rig.test
+            .rig
+            .wait("runtime observed the held member turn", || {
+                let entry = rig.inbox_entry(Some(&worker.pane), None, message);
+                entry["delivery"]["phase"] == "waiting"
+                    && entry["delivery"]["reason"] == "session is busy"
+            });
+        rig.assert_untouched(&worker.pane, cursor, &screen);
+        watch.catch_up(&rig);
+        assert!(watch
+            .all(about("msg.delivery_attempted", message))
+            .is_empty());
+        assert_eq!(
+            rig.call("task.get", json!({"task_id":id}), Some(&worker.pane))
+                .unwrap()["task"]["state"],
+            wanted
+        );
+        rig.finish_turn(&worker.pane);
+        watch.wait(
+            "answer delivered after member turn end",
+            about("msg.delivered", message),
+        );
+        rig.test.rig.wait_event(&worker.pane, cursor, |e| {
+            e["kind"] == "accepted" && e["text"] == reference(message)
+        });
+        assert_eq!(
+            rig.accepted_since(&worker.pane, cursor),
+            [reference(message)]
+        );
+        let inbox = rig.inbox_entry(Some(&worker.pane), None, message);
+        assert_eq!(
+            inbox["content"],
+            json!({
+                "from":lead.id,"to":worker.id,"kind":"answer","task":id,"attachments":[],
+                "body":format!("Task {id} verdict recorded: {verdict}.\nRe-read the current task and verdict note before acting: atm task get {id}\nResume only as its current state and approved brief allow."),
+            })
+        );
+        assert_eq!(inbox["read_at"], Value::Null);
+        watch.catch_up(&rig);
+        assert_eq!(
+            watch
+                .all(|e| e["kind"] == "msg.sent"
+                    && e["body"]["task"] == id
+                    && e["body"]["kind"] == "answer")
+                .len(),
+            1
+        );
+        rig.finish_turn(&worker.pane);
+        rig.test.rig.close();
+    }
+}
+
 // Break caught: assignment types into an existing draft or rolls back because delivery is held.
 #[test]
 fn draft_holds_automatic_brief_without_reverting_task_or_typing_into_editor() {

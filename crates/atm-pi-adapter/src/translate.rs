@@ -1019,6 +1019,92 @@ mod tests {
     }
 
     #[test]
+    fn empty_context_bodies_keep_captured_usage_and_identity() {
+        // Synthetic: remove only context/turn_end bodies from the real capture.
+        // Captured: pi 0.73.1, 2026-10-24, private TUI socket tap and local
+        // fake provider; see the crate docs. The envelope is unchanged.
+        let mut samples = Vec::new();
+        for line in include_str!("../tests/fixtures/pi_session_cost_0.73.1.jsonl").lines() {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            let mut data = envelope["data"].clone();
+            if !matches!(data["event"].as_str(), Some("context" | "turn_end")) {
+                continue;
+            }
+            data["payload"] = serde_json::json!({});
+            let raw = frame(data);
+            assert_eq!(
+                raw.session_id.as_deref(),
+                Some("01a16f5b-6c34-7238-80bd-c31c15009fe9")
+            );
+            assert_eq!(raw.pid, Some(1_613_778));
+            assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
+            let events = raw.to_lifecycle_events();
+            let [LifecycleEvent::ContextUpdate {
+                tokens,
+                current_tokens,
+                context_window_size,
+                cost_usd,
+            }, model] = events.as_slice()
+            else {
+                panic!("expected usage and model, got {events:?}");
+            };
+            assert_eq!(
+                model,
+                &LifecycleEvent::ProviderModelChange {
+                    provider: Some("atmfake".into()),
+                    model: Some("fake-b".into()),
+                }
+            );
+            samples.push((*tokens, *current_tokens, *context_window_size, *cost_usd));
+        }
+        assert_eq!(
+            samples,
+            [
+                (Some(0), Some(6), Some(32_000), Some(0.0)),
+                (Some(1020), Some(1025), Some(32_000), Some(0.0033)),
+                (Some(1020), Some(1025), Some(32_000), Some(0.0033)),
+                (Some(2225), Some(1205), Some(32_000), Some(0.006975)),
+                (Some(2225), Some(1207), Some(32_000), Some(0.006975)),
+                (Some(3430), Some(1205), Some(32_000), Some(0.01065)),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_agent_end_bodies_keep_captured_working_end() {
+        // Synthetic: thin agent_end bodies only; the rest is a real capture.
+        // Captured: pi 0.73.1, 2026-10-24, same method as the test above.
+        let mut ends = 0;
+        for line in include_str!("../tests/fixtures/pi_session_cost_0.73.1.jsonl").lines() {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            let mut data = envelope["data"].clone();
+            if data["event"] != "agent_end" {
+                continue;
+            }
+            data["payload"] = serde_json::json!({});
+            let raw = frame(data);
+            assert_eq!(
+                raw.to_lifecycle_events(),
+                [
+                    LifecycleEvent::WorkingEnd,
+                    LifecycleEvent::ProviderModelChange {
+                        provider: Some("atmfake".into()),
+                        model: Some("fake-b".into()),
+                    },
+                ]
+            );
+            assert_eq!(
+                raw.session_id.as_deref(),
+                Some("01a16f5b-6c34-7238-80bd-c31c15009fe9")
+            );
+            assert_eq!(raw.pid, Some(1_613_778));
+            assert_eq!(raw.tmux_pane.as_deref(), Some("%0"));
+            ends += 1;
+        }
+        assert_eq!(ends, 2);
+    }
+
+    #[test]
     fn captured_new_session_translates() {
         // Captured: pi 0.73.1, 2026-10-24, set up as for
         // captured_tool_run_translates, then `/new` and `/quit` with no

@@ -43,8 +43,8 @@ const DEBUG = process.env.ATM_DEBUG === "1";
  * `context` and `turn_end` are the exceptions: they fire per provider
  * request, before it and after its reply, and their frames carry pi's
  * session totals (`usageSnapshot`), which drive the TUI's cost +
- * context-percentage display. So we *do* forward them despite the
- * higher payload cost (see the inline note on `context` below).
+ * context-percentage display. Their conversation bodies are omitted;
+ * the envelope carries everything the adapter reads.
  */
 const FORWARDED_EVENTS = [
 	"session_start",
@@ -57,14 +57,8 @@ const FORWARDED_EVENTS = [
 	"input",
 	"session_before_compact",
 	// `context` frames carry the session totals and the window that
-	// drive the TUI's cost + context-percentage display. NOTE: pi
-	// attaches the full conversation snapshot (every assistant
-	// message), so this is the largest payload we forward — tens to
-	// hundreds of KB per fire on long sessions. The daemon-side
-	// translator reads only the envelope (older pi-atm: the latest
-	// `usage.{cost.total, totalTokens}`), but the wire payload is
-	// *not* small. The bounded outbox + drop-oldest in send() exists
-	// precisely for this case.
+	// drive the TUI's cost + context-percentage display. The full
+	// conversation stays in pi: atmd reads the envelope's usage/model.
 	"context",
 	// `turn_end` fires after each reply is saved, including a turn's
 	// last, which no later `context` would count. Sent with its
@@ -102,7 +96,7 @@ let reconnectScheduled = false;
  * `highWaterMark` — i.e. `socket.write()` returned `false` and we
  * haven't yet seen the `'drain'` event.
  *
- * Without this, large `context` payloads against a slow atmd reader
+ * Without this, large event payloads against a slow atmd reader
  * silently grow Node's heap (write() always succeeds in the API
  * sense; the buffering happens inside Node). Honouring the
  * write-result keeps backpressure scoped to the bounded outbox
@@ -132,19 +126,16 @@ function flushOutboxTo(sock: net.Socket): void {
  * Bounded FIFO of outgoing event lines waiting for a usable socket.
  *
  * The cap exists so that an extended atmd outage in a long pi session
- * doesn't grow this array without limit. Pi context events can be
- * tens to hundreds of KB and fire frequently; an unbounded buffer
- * would let one wedged daemon eat the pi process's heap.
+ * doesn't grow this array without limit. Other event bodies, such as
+ * tool results, can still be large; this cap bounds event count, not bytes.
  *
  * Drop-oldest: when full, the *oldest* queued line is discarded so
  * the most recent state survives. Recent events are more useful for
- * "what is this session doing now" than stale ones from minutes ago,
- * and atmd's discovery scan reseeds the live registry on reconnect
- * regardless of what we managed to deliver.
+ * "what is this session doing now" than stale ones from minutes ago.
+ * Delivery remains best-effort: reconnect does not acknowledge or replay
+ * frames already written.
  *
- * 256 is a small cap by design — at peak event rates this is seconds
- * of buffering, enough to ride out an atmd restart but not enough to
- * accumulate megabytes during a real outage.
+ * 256 bounds the number of events retained during an outage.
  */
 const OUTBOX_MAX = 256;
 const outbox: string[] = [];
@@ -267,8 +258,8 @@ function send(envelope: unknown): void {
 			// `socket.write` returns `false` when the internal buffer
 			// is past `highWaterMark`. Subsequent writes still
 			// "succeed" but spill into Node's heap; the convention is
-			// to stop writing until `'drain'` fires. With pi's large
-			// `context` payloads against a slow atmd reader, ignoring
+			// to stop writing until `'drain'` fires. With large event
+			// payloads against a slow atmd reader, ignoring
 			// this would let one wedged daemon eat the pi process's
 			// heap.
 			if (!activeSocket.write(line)) {
@@ -537,9 +528,9 @@ export default function (pi: ExtensionAPI): void {
 				const counted = eventName === "context" || eventName === "turn_end";
 				const envelope = buildEnvelope(
 					eventName,
-					// atmd reads nothing in turn_end's payload, the turn's
-					// reply and tool results, which can be large.
-					eventName === "turn_end" ? {} : withPickedModels(eventName, payload),
+					// Usage/model are in the envelope; these conversation
+					// bodies can exceed atmd's line limit and are not read.
+					counted || eventName === "agent_end" ? {} : withPickedModels(eventName, payload),
 					cachedSessionId,
 					model,
 					counted ? usageSnapshot(ctxAny) : undefined,

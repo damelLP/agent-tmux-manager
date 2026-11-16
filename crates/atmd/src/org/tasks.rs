@@ -16,6 +16,7 @@ use crate::server::methods::{CallContext, MethodError};
 use atm_org::{
     Address, AgentId, MessageContent, MessageId, MessageKind, OrgCommand, OrgEvent, OrgState, Task,
     TaskActor, TaskCommand, TaskCost, TaskFileKind, TaskId, TaskKind, TaskState, TaskSubmission,
+    TaskVerdict,
 };
 use atm_protocol::ResponseError;
 use serde::{Deserialize, Serialize};
@@ -204,6 +205,31 @@ pub fn notification(
                 files,
             )
         }
+        OrgEvent::TaskVerdict(verdict) => {
+            let t = task(state, &verdict.task_id)?;
+            // Coalesce against current state, not an exact-at-verdict snapshot:
+            // a later same-state/reassignment cycle cannot be distinguished here.
+            let what = match (verdict.verdict, t.state) {
+                (TaskVerdict::Accepted, TaskState::Working) => "accepted",
+                (TaskVerdict::ChangesRequested, TaskState::ChangesRequested) => "changes_requested",
+                _ => return Ok(None),
+            };
+            let agent = t.agent_id.as_ref().ok_or_else(|| {
+                TaskError::Internal(format!("task {} has no assignee for verdict answer", t.id))
+            })?;
+            let mut body = format!("Task {} verdict recorded: {what}.\nRe-read the current task and verdict note before acting: atm task get {}\nResume only as its current state and approved brief allow.", t.id, t.id);
+            if let Some(review) = &verdict.review_task {
+                body.push_str(&format!("\nReview evidence: atm task get {review}"));
+            }
+            (
+                t.id.clone(),
+                verdict.by.clone(),
+                Address::Agent(agent.clone()),
+                MessageKind::Answer,
+                body,
+                Vec::new(),
+            )
+        }
         _ => return Ok(None),
     };
     Ok(Some(MessageContent {
@@ -299,10 +325,12 @@ where
         changed: !events.is_empty(),
         notification: None,
     };
-    if let Some(envelope) = events
-        .first()
-        .filter(|e| matches!(e.kind.as_str(), "task.assigned" | "task.submitted"))
-    {
+    if let Some(envelope) = events.first().filter(|e| {
+        matches!(
+            e.kind.as_str(),
+            "task.assigned" | "task.submitted" | "task.verdict"
+        )
+    }) {
         let sent = async {
             let event = OrgEvent::from_parts(&envelope.kind, &envelope.body)
                 .map_err(|e| TaskError::Internal(e.to_string()))?
@@ -310,19 +338,26 @@ where
                     TaskError::Internal("committed task event was not recognized".into())
                 })?;
             let state = org.snapshot().await?;
-            let content = notification(&event, &state)?
-                .ok_or_else(|| TaskError::Internal("task notification was not composed".into()))?;
-            send(content).await
+            let Some(content) = notification(&event, &state)? else {
+                return Ok(None);
+            };
+            send(content).await.map(Some)
         }
         .await;
-        result.notification = Some(match sent {
-            Ok(message_id) => Notification::Queued { message_id },
+        result.notification = match sent {
+            Ok(Some(message_id)) => Some(Notification::Queued { message_id }),
+            Ok(None) => None,
             Err(error) => {
+                let kind = match envelope.kind.as_str() {
+                    "task.assigned" => "brief",
+                    "task.submitted" => "report",
+                    _ => "answer",
+                };
                 let mut error = MethodError::from(error).0;
-                error.message = format!("task {} committed; automatic {} enqueue was not confirmed: {}; inspect the task and inbox before resending", result.task_id, if envelope.kind == "task.assigned" { "brief" } else { "report" }, error.message);
-                Notification::Unconfirmed { error }
+                error.message = format!("task {} committed; automatic {kind} enqueue was not confirmed: {}; inspect the task and inbox before resending", result.task_id, error.message);
+                Some(Notification::Unconfirmed { error })
             }
-        });
+        };
     }
     Ok(result)
 }

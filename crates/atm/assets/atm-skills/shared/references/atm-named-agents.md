@@ -13,6 +13,8 @@ build/help and private-daemon CLI tests. A source inspection is not a new test
 run; neither contract tests nor historical captures verify this wording.
 Verdict-answer contracts were checked at `06c12c07` with sealed task/message
 stand-in tests; their current-state coalescing limit is recorded below.
+Task-invalidation contract tests cover ownership, withdrawal, linked live reviews
+and guarded delivery; these are model-free checks, not skill-compliance trials.
 
 ## Commands, not a second protocol
 
@@ -57,8 +59,10 @@ atm task create 'Build the change' \
   --measure '{"kind":"mechanical","command":"cargo test --workspace"}' \
   --file '{"path":"/absolute/brief.md","kind":"brief","note":null}'
 atm task assign t41 project/member
-# Assigned member: inspect the state first, including after a verdict answer.
+# Assigned member: inspect state AND agent_id against atm me, even after an answer.
+# If final/not yours: stop obsolete work; no submit/resume/clear from a Note alone.
 atm task get t41
+# Reviewers also get their judges task before continuing any review.
 # Keep submitted/in_review unchanged and await the verdict. Withdraw submitted
 # only on an explicit authorized request; in_review cannot return to working.
 # From assigned/working/waiting/blocked/changes_requested, if work may proceed:
@@ -80,7 +84,9 @@ An absent intent file permits legacy creation; that is not approval to invent
 a judge or edit intent. Paths are literal, not uploaded or checked for existence.
 Task commands require full `project/name` addresses, without bare-name lookup.
 
-For L4: review and verdict require a submitted target. A reviewed result needs
+For L4: get current task state/assignee before expensive review; an old Report
+can have been withdrawn or superseded. Review and verdict require a submitted
+target. A reviewed result needs
 a submitted independent review (unless Owner accepts); an owner measure needs
 Owner. The assigned agent never accepts its own task:
 
@@ -116,9 +122,53 @@ between the verdict and snapshot cannot be distinguished and may yield a stale
 answer. Always re-read the current state before acting; never withdraw a new
 submission or resume final work because of an older answer.
 
+Automatic invalidation Notes are deliberately narrow:
+
+| Change | Audience |
+|---|---|
+| Reassign or reopen/unassign | Actual former holder, not the earlier identity snapshot's holder |
+| Cancel | Retained holder, only while the task is still cancelled |
+| Another actor revokes assigned work | Creator as well (system creator routes to Owner) |
+| Submitted -> Working | Creator of the withdrawn submission, not every work start; old Report remains |
+| Parent leaves its linked review | Holder of that linked live review, only while still held, judging this parent and no longer current |
+
+Notes are signed by the actor, correlated to the affected task (review Notes to
+R), have no attachments, and point to current task/assignee commands. They never
+copy arbitrary titles/reasons/verdict notes/files. The review Note names both T
+and R; it can be sent even after T is Accepted, but no resume answer is sent to
+a final primary holder or an already submitted/closed review. There is no
+automatic review-state change, child discovery/cascade, or final reopening.
+Actor/self Notes and duplicate (recipient, task) audiences are omitted.
+
+The worker attempts at most three sends in order: legacy Brief/Report/Answer,
+former holder, creator, linked live reviewer (not all apply together). `queued`
+means every planned enqueue was confirmed and exposes the primary ID, otherwise
+the first Note ID. Any failure yields `unconfirmed` with the first failed send's
+error code, all failed audiences and known queued IDs; remaining sends are still
+attempted and queued messages are not rolled back or automatically retried.
+
+Delivery is ordinary guarded inbox-reference delivery: these Notes do not
+interrupt a running turn, bypass focus/drafts, resume work, clear a seat, or
+promise an immediate stop. Check current `agent_id` against `atm me` and state
+at work boundaries; stop obsolete work when final or not yours. A reviewer also
+reads its `judges` task before continuing. Urgent stand-down needs separate
+authorized coordination, not an interruption claim about `task set-state`.
+
+Only the actor's before-image is atomic. Fresh post-state coalescing suppresses
+a loss Note if its holder regained the task, a review Note if that review is
+current again, and a withdrawal Note after a new submission. Same-state cycles
+and changes after that snapshot remain limits; receipt interpretation and
+real-harness stopping/resumption are **not verified**.
+
+Do not duplicate automatic notices. `waiting`/`blocked` reasons are not questions:
+send an explicit question for actionable help, or a decision request for owner
+choices. Explicitly communicate actionable late files and unlinked review changes;
+attaching arbitrary files, ordinary work starts, and review starts do not wake
+these audiences automatically.
+
 **Conditional recovery only:** On `notification: unconfirmed`, a timeout or an
-apparently missing answer, inspect the task and obtain authorized diagnostics
-for the assignee's inbox before resending. A named lead cannot read another
+apparently missing notification, inspect the task and obtain authorized diagnostics
+for the affected inboxes, checking all known queued IDs before resending. A named lead cannot read another
 agent's inbox; ask the authorized manager/Owner. Do not resend for an intentional
 final/superseded-state null, or merely because a queued answer is held by a busy
 turn, focus or editor guard. If investigation confirms a missing enqueue and a
@@ -315,11 +365,14 @@ interactive question/plan-approval dialogs.
 
 ### M2
 
-Get the canonical assigned task and branch on state. Keep submitted/in_review
-unchanged pending verdict; withdraw submitted only on an explicit authorized
+Get the canonical assigned task, check agent_id against me, and branch on state.
+Stop obsolete work when final or not yours; a Note alone never resumes/clears.
+Reviewers also read the judges task. Guarded invalidation does not interrupt
+running work. Keep submitted/in_review unchanged pending verdict; withdraw submitted only on an explicit authorized
 request (in_review cannot return to working). From assigned/working/waiting/
 blocked/changes_requested, mark working only when authorized work can proceed;
-use waiting/blocked with a reason when stopping that work.
+use waiting/blocked with a reason when stopping that work. Send an explicit
+question/decision request when those states require help; reasons are not wakes.
 **Why:** Durable state survives a restart; submitted-to-working retracts the submission.
 **Source:** `crates/atm-org/src/task.rs` transitions; `crates/atmd/src/org/task_reminder_tests.rs`; real chunk-7 pi task capture, 2026-11-15.
 **Checked:** 2026-11-15; harness: pi 1.5.2; model: gpt-6.1-sol low; get/work/submit exercised. Other state contracts inspected at 30475a20 on 2026-11-16.
@@ -408,8 +461,11 @@ blindly or drive raw tmux around the guards.
 
 ### L4
 
-Read report/evidence, require independent review when the measure calls for it,
-then accept/request changes. A non-final verdict queues an automatic answer to
+Get current task state/assignee before expensive review, then read current
+report/evidence, require independent review when the measure calls for it,
+and accept/request changes. Do not duplicate automatic invalidation Notes;
+coordinate actionable late files/unlinked reviews explicitly, without claiming
+immediate interruption. A non-final verdict queues an automatic answer to
 the current assignee under the coalescing rule above; do not also send one.
 The assignee must re-read current state before resuming. Only investigate/repair
 a missing enqueue conditionally; an accepted plan is not a finished task or clear
@@ -417,7 +473,7 @@ boundary, and final acceptance/review closure has no resume answer.
 **Why:** Verdict authority/measures constrain acceptance; answers retain ordinary delivery guards, and a later task state can supersede the wake.
 **Source:** `crates/atm-org/src/task.rs` Reviews and measures; `crates/atmd/src/org/tasks.rs::notification` and `execute_mutation`; `crates/atmd/src/org/task_worker_tests.rs`; `crates/atmd/tests/tasks.rs`; `tests/task_messages.rs`; `tests/atm_task.rs`.
 **Checked:** 2026-11-16 source and sealed task RPC/worker/private-daemon message/restart/CLI tests at 06c12c07; harness: N/A (model-free pi stand-in); model: N/A. Actual verdict answers, guarded references and final/no-op silence checked, not skill behavior.
-**Not verified:** New-skill review quality/plan handling and real-harness verdict resumption; billed evaluation deferred. Same-state/reassignment cycles beyond current-state coalescing are not exact-at-verdict routing.
+**Not verified:** New-skill review quality/plan handling, invalidation compliance and real-harness verdict resumption/stopping; billed evaluation deferred. Same-state/reassignment cycles beyond current-state coalescing are not exact-at-verdict routing.
 
 ### L5
 

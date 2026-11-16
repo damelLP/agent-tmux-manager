@@ -268,7 +268,7 @@ wrapped rows; a draft imitating dialog action words conservatively holds too.
 
 A synthetic draft ending in a full-width rule plus an empty row must not read
 Empty. In Styled input every earlier same-width rule must belong to a complete
-update notice with its captured faint-label proof (see below). An otherwise
+update notice with its captured faint-label or bold-title proof (see below). An otherwise
 valid startup region never excuses an unexplained rule. Plain retains its
 legacy startup-only exception: it cannot supply that attribute proof. Other
 historical full-width rules remain ambiguous and conservatively refuse.
@@ -326,6 +326,7 @@ normalization or path substitution. They contain only private run-dir paths.
 | `rehearsal` | Independent short-turn refusal at 150 columns, header scrolled off |
 | `startup_224x16`, `startup_224x12`, `startup_120x16`, `startup_80x16`, `startup_60x20`, `startup_40x20` | Separate real startup-only processes; clipped/wrapped header and complete update |
 | `startup_224x48` | Full-header startup with update, after fd was installed |
+| `startup_dark`, `startup_light` | Built-in dark/light themes, 224x48, bold title and colored nonfaint labels; no input or prompt |
 | `startup_fd_status` | First 224x48 startup, fd downloading/installed status plus update |
 | `offline-wide`, `offline-narrow` | No update notice, 224x48 / 40x40 |
 | `resources-wide`, `resources-narrow` | Loaded context, skill and prompt, 224x48 / 40x40 |
@@ -342,7 +343,12 @@ Cause: the update's full-width rules equal the editor lower border. Requiring
 *all history* to be startup-only made an idle editor Unknown after a short turn,
 with a cropped header, or even after fd download status. Styled now accounts for
 **every** colliding rule individually: only a complete `Update Available` notice,
-with the observed faint New-version and Changelog labels, can explain it.
+with either the observed faint New-version and Changelog labels or a bold
+`Update Available` title, can explain it. Every non-whitespace title character
+must be bold; a single styled glyph is insufficient. Built-in `dark`/`light`
+captures have colored, nonfaint labels and need the title proof. These verbatim
+fixtures map to the separate real `startup-dark`/`startup-light` captures from
+the same sealed theme probe; no model call occurred.
 Instruction wrapping at 40 columns is reconstructed only inside that complete
 notice. Decoded UTF-8 offsets include retained padding; Unicode history does not
 shift the attribute proof. Other borders, unsupported escapes, popups and missing
@@ -364,7 +370,7 @@ terminal input was used to make clear succeed.
 Known limits intentionally remain refused: condensed/expanded unread core and
 extension changelogs, package-update notices, Update Available with a release
 note, experimental first-time setup and startup dialogs. Their appearance is
-not an empty-editor proof. Custom themes without the captured faint labels and
+not an empty-editor proof. Custom themes without either captured style proof and
 arbitrary custom UI imitating both chrome and styles remain unsupported. No
 text-only exception or submitting Enter is inferred from a notice match.
 
@@ -372,5 +378,8 @@ Synthetic regressions cover staged `/new` exactness, running/typed/dialog
 editors, a valid notice plus an unexplained pasted rule, nonfaint notice-shaped
 drafts, missing bounds/labels/attributes, damaged footer/ANSI and varied values
 or history length. Restoring the old guard makes the real positive fail; changing
-all-rule coverage to any-rule, or dropping faint proof, admits unsafe composers
-and fails the dedicated negatives. No new model turn was needed for this fix.
+all-rule coverage to any-rule, or dropping both style proofs, admits unsafe
+composers and fails the dedicated negatives. Bold titles do not excuse a draft,
+running turn, dialog, malformed notice or unexplained extra rule. Removing the
+bold-title path makes the real built-in-theme regressions fail. No new model
+turn was needed for this fix.

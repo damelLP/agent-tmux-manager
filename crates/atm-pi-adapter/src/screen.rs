@@ -8,8 +8,9 @@
 //!
 //! Captured: pi 1.5.0, 2026-11-15, sealed private-tmux startup/short-turn captures.
 //! Captured: pi 1.5.2, 2026-11-15, sealed private-tmux offline/resource startups.
-//! Historical update-notice rules require complete chrome and faint labels, not
-//! startup-only history. Unknown notices and unexplained pasted rules still refuse.
+//! Historical update-notice rules require complete chrome plus faint labels or
+//! a bold title (also captured with built-in dark/light themes), not startup-only
+//! history. Unknown notices and unexplained pasted rules still refuse.
 //!
 //! Pi has no native tool approvals, but extension/core dialogs replace the editor.
 //! Recognized select/input/editor hints and the reload box report Other with
@@ -143,7 +144,8 @@ fn update_rules(history: &[&str], lower: &str, screen: &StyledScreen) -> bool {
     rows.split(|(line, _)| line.trim().is_empty())
         .filter(|block| block.iter().any(|(line, _)| *line == lower))
         .all(|block| {
-            let [(upper, _), (title, _), message @ .., changelog, (bottom, _)] = block else {
+            let [(upper, _), (title, title_offset), message @ .., changelog, (bottom, _)] = block
+            else {
                 return false;
             };
             let text = message
@@ -166,8 +168,10 @@ fn update_rules(history: &[&str], lower: &str, screen: &StyledScreen) -> bool {
                     changelog.0.trim(),
                     bottom.trim(),
                 ])
-                && message.first().is_some_and(faint)
-                && faint(changelog)
+                && ((message.first().is_some_and(faint) && faint(changelog))
+                    || title.char_indices().all(|(i, c)| {
+                        c.is_whitespace() || screen.bold_at(title_offset + i) == Some(true)
+                    }))
         })
 }
 

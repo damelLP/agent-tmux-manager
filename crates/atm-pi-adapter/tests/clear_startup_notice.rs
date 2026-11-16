@@ -90,6 +90,102 @@ fn captured_update_notice_is_not_an_editor_border() {
     }
 }
 
+// Captured: pi 1.5.0, 2026-11-15, sealed private tmux capture-pane -p -e -N.
+// Built-in themes, no input/prompt; bold title but neither label is faint.
+#[test]
+fn builtin_theme_update_notices_keep_editor_facts() {
+    for text in [
+        capture!("startup_dark", "1.5.0"),
+        capture!("startup_light", "1.5.0"),
+    ] {
+        let decoded = StyledScreen::parse(text).unwrap();
+        assert_eq!(
+            decoded.bold_at(decoded.text().find("Update Available").unwrap()),
+            Some(true)
+        );
+        for label in ["New version", "Changelog:"] {
+            assert_eq!(
+                decoded.faint_at(decoded.text().find(label).unwrap()),
+                Some(false)
+            );
+        }
+        let result = editor(text, InputState::Empty, TurnState::NotRunning);
+        assert!(safe(&result));
+        assert_eq!(result.facts.fresh_editor, FreshEditorEvidence::Present);
+        assert!(!result.conversation);
+        // Synthetic: a clipped header and multibyte history must not shift styles
+        // or require startup-only history to recognize the same notice/editor.
+        let clipped = format!(
+            " Transcript 日本語 🦀\n\n{}",
+            text.lines().skip(5).collect::<Vec<_>>().join("\n")
+        );
+        let result = editor(&clipped, InputState::Empty, TurnState::NotRunning);
+        assert!(safe(&result));
+        assert_eq!(result.facts.fresh_editor, FreshEditorEvidence::Unknown);
+    }
+}
+
+#[test]
+fn bold_notice_does_not_authorize_an_unsafe_editor() {
+    for text in [
+        capture!("startup_dark", "1.5.0"),
+        capture!("startup_light", "1.5.0"),
+    ] {
+        // Synthetic: retain the real bold notice, change only the active editor.
+        let result = editor(
+            &draft(text, "do not clear this draft"),
+            InputState::Draft,
+            TurnState::NotRunning,
+        );
+        assert!(!safe(&result));
+        let result = observe(&draft(
+            text,
+            "Choose a model\nselect to submit · esc cancel",
+        ));
+        assert!(!safe(&result));
+        assert_ne!(result.facts.dialog, DialogState::None);
+        let (upper, _, width) = bounds(text);
+        let border = "─".repeat(width);
+        let working = format!("── ⠋ Working {}", "─".repeat(width - 13));
+        let mut lines: Vec<_> = text.lines().map(str::to_owned).collect();
+        lines[upper] = lines[upper].replace(&border, &working);
+        let result = editor(&lines.join("\n"), InputState::Empty, TurnState::Running);
+        assert!(!safe(&result));
+        let pasted_rule = draft(text, &format!("draft\n{border}\n"));
+        assert_eq!(observe(&pasted_rule).facts, Default::default());
+    }
+}
+
+#[test]
+fn notice_requires_faint_labels_or_a_bold_title() {
+    // Synthetic: faint labels still prove the captured notice without bold.
+    let faint_only = POST_TURN.replace("\x1b[1m", "\x1b[22m");
+    assert_ne!(faint_only, POST_TURN);
+    assert!(safe(&editor(
+        &faint_only,
+        InputState::Empty,
+        TurnState::NotRunning
+    )));
+    for text in [
+        capture!("startup_dark", "1.5.0"),
+        capture!("startup_light", "1.5.0"),
+    ] {
+        // Synthetic: complete startup text is not a Styled attribute fallback.
+        for changed in [
+            text.replace("\x1b[1m", "\x1b[22m"),
+            text.replace("Update Available", "Other notice"),
+            text.replace(" is available. Run ", " is released. Run "),
+            text.replace("Changelog:", "Release log:"),
+            // A single bold glyph is not the captured bold title.
+            text.replace("Update Available", "U\x1b[22mpdate Available"),
+        ] {
+            assert_ne!(changed, text);
+            assert_eq!(observe(&changed).facts, Default::default());
+            assert_eq!(observe(&changed).dialog, ControlDialog::Unknown);
+        }
+    }
+}
+
 // Captured: pi 1.5.0, 2026-11-15, sealed private tmux offline/resource startups.
 // Captured: pi 1.5.2, 2026-11-15, sealed private tmux offline/resource startups.
 // Both: wide/narrow capture-pane -p -e -N; no input or prompt.
@@ -193,7 +289,7 @@ fn every_prior_rule_needs_notice_proof() {
         assert_eq!(observe(&draft(POST_TURN, &body)).facts, Default::default());
     }
     // Synthetic: actual editor upper border imitates the top of a copied notice.
-    // Its text is nonfaint, unlike pi's rendered labels. Text-only proof is unsafe.
+    // Its text is nonfaint and nonbold. Text-only notice proof is unsafe.
     let body = format!(" Update Available\n New version 1.5.2 is available. Run pi update\n Changelog: https://pi.dev/changelog\n{border}\n\n{border}\n");
     let counterfeit = draft(STARTUP, &body);
     assert_eq!(observe(&counterfeit).facts, Default::default());
@@ -201,13 +297,17 @@ fn every_prior_rule_needs_notice_proof() {
 
 #[test]
 fn damaged_notice_or_editor_stays_unknown() {
-    // Synthetic: broken notice chrome, missing faint proof or unsupported control.
+    // Synthetic: broken chrome, missing both style proofs or unsupported control.
     for changed in [
         POST_TURN.replace("Update Available", "Other notice"),
         POST_TURN.replace(" is available. Run ", " is released. Run "),
         POST_TURN.replace("Changelog: ", "Release log: "),
-        POST_TURN.replace("\x1b[2mNew version", "\x1b[22mNew version"),
-        POST_TURN.replace("\x1b[2mChangelog:", "\x1b[22mChangelog:"),
+        POST_TURN
+            .replace("\x1b[2mNew version", "\x1b[22mNew version")
+            .replace("\x1b[1m", "\x1b[22m"),
+        POST_TURN
+            .replace("\x1b[2mChangelog:", "\x1b[22mChangelog:")
+            .replace("\x1b[1m", "\x1b[22m"),
         POST_TURN.replace("0.7%/500k", "unknown footer"),
         format!("{POST_TURN}\x1b[8m"),
         format!("{POST_TURN}\x1b["),

@@ -75,7 +75,7 @@ It also refreshes four ATM skill folders for each detected harness, writes tmux 
 
 Codex launches through ATM require codex-cli **0.158.0 or later** for `--no-daemon`; ATM adds the required argument.
 
-The pi integration in 0.4.0 keeps the existing forwarder. The final-idle/settled-event forwarder update is **not included**; this release does not introduce its newer-pi requirement. See [known limits and not yet](#known-limits-and-not-yet).
+The pi integration in **0.4.1 includes** the final-idle/settled-event forwarder update. Use **pi 1.5.2 or later** (1.5.2 tested), as required by [pi-atm](extensions/pi-atm/README.md#forwarded-events). It forwards `agent_settled` (introduced in **pi 0.80.4**) instead of `agent_end`; without `agent_settled`, pi rows can remain Working after every turn. Follow [Upgrade](#upgrade) before refreshing the forwarder.
 
 ## Named-agent/project quick start
 
@@ -129,15 +129,15 @@ After a successful start/clear, ATM queues `[mN] New session: run the shell comm
 1. Quit **every** ATM TUI/sidebar and stop other callers that could autostart the daemon. Save important agent context and avoid upgrading during a start, clear or message delivery.
 2. Run `atmd stop` with the **existing installation and environment**. Wait for confirmed exit; a timeout does not mean it is safe to swap binaries. An open TUI or another CLI caller can start it again.
 3. Preserve the existing state directory and configuration. Replace `atm` and `atmd` together using one install route. Do not erase the organisation log to make an older binary start.
-4. Run the newly installed `atm setup` to refresh embedded hooks, pi extension and skills, and complete [setup verification](#verify-harness-setup) before proceeding. Check the pi package/registration before restarting pi, and approve Codex hooks if prompted. Existing ATM config and custom Claude statusLine are preserved, but ATM-owned skill folders are replaced.
-5. Start `atmd start -d` from the intended environment, reopen sidebars, and check `atmd status`, `atm list`, `atm status`, `atm agent list` and the inbox. For source-checkout deployments use the [rollout tools](#source-checkout-rollout) below instead of manually copying over a running pair.
+4. Run the newly installed `atm setup` to refresh embedded hooks, pi extension and skills, and complete [setup verification](#verify-harness-setup) before proceeding. Check the pi package/registration before restarting pi, and approve Codex hooks if prompted. Existing ATM config and custom Claude statusLine are preserved, but ATM-owned skill folders are replaced. Setup does not restart the daemon; an old running `atmd` ignores the new pi settlement events.
+5. Start `atmd start -d` from the intended environment, then start new pi sessions to load the refreshed extension. Reopen sidebars, and check `atmd status`, `atm list`, `atm status`, `atm agent list` and the inbox. For source-checkout deployments use the [rollout tools](#source-checkout-rollout) below instead of manually copying over a running pair.
 
 Protocol **1.1** retains major-1 hook compatibility, including the existing 1.0 hook frames. That is not a promise that an old daemon has the new commands, or that an older binary can replay newer persistent state. A restart cannot recover historical data that an older release only kept in memory; some session metadata returns only on the harness's next event. Back up important persistent state while the daemon is stopped before trying a downgrade.
 
 ## Known limits and not yet
 
 - **Pi clear:** `atm agent clear` works with pi's **Update Available** notice on built-in themes. With a custom theme whose notice ATM cannot recognise (neither faint labels nor a bold title), clear still refuses safely; dismiss the notice or type `/new` by hand. A refused clear is not a fresh session.
-- **Pi turn completion:** the final-idle forwarder update is not in 0.4.0. The existing event stream can leave a working/idle row out of step with the harness; inspect the pane rather than treating a status label as proof that a turn has settled.
+- **Pi turn completion:** 0.4.1 reports final idle through `agent_settled`, but idle input consumed by a later extension handler can still leave a row Working without an agent run. The input idle correction is deferred because it double-counted turns and could loop automatic handover. Inspect the pane rather than treating a status label as proof that a turn has settled.
 - **Named skills and automation:** `atm-lead`/`atm-member` remain drafts, unevaluated for model compliance. Role metadata and `atm me` do not load a skill, and setup does not enable automatic handover. Keep human review and the documented guards.
 - **Not yet:** a review digest, a drift scheduler and the remaining end-to-end coordination acceptance work are deferred to **0.5.0**. The implemented commands are available now; they are not a guarantee of unattended operation.
 
@@ -823,6 +823,12 @@ Set those variables to your reviewed deployment's values; there is no implicit l
 Exit **0** means the selected pair passed the rollout checks, **1** a refusal (read whether it restarted the unchanged build), **2** usage, **3** a checked rollback, **4** `NEEDS YOU`. A `down` agent can still have a live pane and pass the checks: inspect warnings, not just the exit code. Rollback swaps binaries and managed setup assets, **not** organisation state or arbitrary configuration; compatibility with an older daemon remains a separate check. The pair replacement is not atomic across both files, and concurrent installers/autostarts are outside the tools' lock. Detailed recovery, the explicit `--rollback` command, protected-file reporting and limits: [promotion and rollout](scripts/atm-promotion.md).
 
 ## Changelog
+
+### 0.4.1
+
+- Includes the pi final-idle forwarder and manual compaction outcomes. Use **pi 1.5.2 or later** (1.5.2 tested); `agent_settled` first shipped in **pi 0.80.4**. The forwarder now sends `agent_settled`, not the low-level `agent_end` that can precede continuation or recovery.
+- Follow [Upgrade](#upgrade): stop the old daemon and wait for exit, replace `atm` and `atmd` together, run the new `atm setup`, start the new daemon, then start new pi sessions. An old running daemon ignores the new settlement events.
+- Extension-consumed idle input can still leave a pi row Working; the input idle correction remains deferred to avoid double-counted turns and automatic-handover loops.
 
 ### 0.4.0
 

@@ -9,6 +9,7 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "pi adapter for ATM — translates pi (https://pi.dev) extension events into vendor-neutral LifecycleEvent"
+readme = "../../README.md"
 
 [dependencies]
 atm-core = { workspace = true }

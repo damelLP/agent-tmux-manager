@@ -464,10 +464,16 @@ fn a_corrupt_backup_lets_uninstall_finish_and_stays_in_place() {
         ".pi/agent/packages/pi-atm",
         ".claude/skills/atm-coordinate",
         ".claude/skills/atm-implement",
+        ".claude/skills/atm-lead",
+        ".claude/skills/atm-member",
         ".pi/agent/skills/atm-coordinate",
         ".pi/agent/skills/atm-implement",
+        ".pi/agent/skills/atm-lead",
+        ".pi/agent/skills/atm-member",
         ".codex/skills/atm-coordinate",
         ".codex/skills/atm-implement",
+        ".codex/skills/atm-lead",
+        ".codex/skills/atm-member",
     ] {
         assert!(!home.join(artifact).exists(), "{artifact} left: {stdout}");
     }

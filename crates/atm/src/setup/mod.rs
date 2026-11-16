@@ -23,7 +23,7 @@
 //!   approval of non-managed hooks — `setup_codex` prints the `/hooks`
 //!   instruction for this. codex-cli 0.163.0 also asks at startup
 //!   ("Hooks need review"), and `/hooks` still exists.
-//! - **The atm skills** (`atm-coordinate`, `atm-implement`): plain skill
+//! - **The atm skills** (`atm-coordinate`, `atm-implement`, `atm-lead`, `atm-member`): plain skill
 //!   folders in each detected harness's skills folder (`~/.claude/skills/`,
 //!   `~/.pi/agent/skills/`, `~/.codex/skills/`), with no settings entry.
 //!   Setup replaces them whole each run; see `skills.rs`.

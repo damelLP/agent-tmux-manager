@@ -7,6 +7,10 @@ disable-model-invocation: true
 
 # atm implementer
 
+**Legacy unnamed-pane workflow.** For a bound named member use
+[atm-member](../atm-member/SKILL.md) instead; do not mix its durable task/message
+protocol with this screen-report loop. Both skills remain installed.
+
 A coordinator agent sent you one task through atm. When your turn ends it
 reads your screen with `atm peek`, so the end of every turn is your report.
 

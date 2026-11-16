@@ -136,7 +136,7 @@ Protocol **1.1** retains major-1 hook compatibility, including the existing 1.0 
 
 ## Known limits and not yet
 
-- **Pi clear:** `atm agent clear` refuses on a pi seat showing pi's **Update Available** notice; dismiss it or type `/new` by hand. A refused clear is not a fresh session.
+- **Pi clear:** `atm agent clear` works with pi's **Update Available** notice on built-in themes. With a custom theme that does not render the notice title bold, it still refuses safely; dismiss the notice or type `/new` by hand. A refused clear is not a fresh session.
 - **Pi turn completion:** the final-idle forwarder update is not in 0.4.0. The existing event stream can leave a working/idle row out of step with the harness; inspect the pane rather than treating a status label as proof that a turn has settled.
 - **Named skills and automation:** `atm-lead`/`atm-member` remain drafts, unevaluated for model compliance. Role metadata and `atm me` do not load a skill, and setup does not enable automatic handover. Keep human review and the documented guards.
 - **Not yet:** a review digest, a drift scheduler and the remaining end-to-end coordination acceptance work are deferred to **0.5.0**. The implemented commands are available now; they are not a guarantee of unattended operation.
@@ -846,6 +846,7 @@ Adds daemon-backed, named-agent coordination alongside the existing tmux dashboa
 - Claude setup preserves an existing custom `statusLine`; forward its stdin to `atm-hook` for ATM context/model/cost. Uninstall keeps custom commands and removes/restores only an exact ATM-generated entry.
 - Codex launches add required `--no-daemon` arguments and require codex-cli **0.158.0 or later**. Remove redundant raw overrides, make wrappers forward required arguments, and approve hooks with `/hooks` after setup.
 - pi context/turn-end/agent-end frames omit unneeded conversation bodies while retaining envelope identity/model/usage. This is not a universal frame-size cap, heartbeat or final-idle fix; 0.4.0 retains the existing forwarder.
+- `atm agent clear` now works with pi's **Update Available** notice on built-in themes. Clear still refuses safely if a custom theme does not render the notice title bold.
 - Message admission refuses an unconfirmed pending process row for a known real-session agent. A successful `queued` receipt still is not delivery confirmation; inspect identity and inbox rather than blindly resending.
 - Immediate input and daemon control share reservation checks. `atm send` refuses synchronized panes, disabled input, unsafe controls, copy mode and dialogs, but can merge an existing draft. `atm reply -y/-n` can wait without rechecking the released screen.
 - Coordinator pane tags survive harness restart/clear and appear in JSON session listings and the TUI. Dashboard, workspaces, layouts, popup picker, notifications and immediate controls remain available.
@@ -866,7 +867,7 @@ For an upgrade, save context, quit every TUI/sidebar and caller that could autos
 
 Major-1 hook frames remain compatible with protocol 1.1, but new RPC methods need the matching daemon. Rollback does not undo organisation state or arbitrary configuration; an interrupted non-atomic pair swap needs explicit recovery before restart. Older-state compatibility remains a separate check.
 
-**Known pi limit:** `atm agent clear` refuses while pi shows its **Update Available** notice; dismiss it or type `/new` by hand. The final-idle forwarder update is not included in 0.4.0. Named-skill compliance, review digest, drift scheduler and remaining end-to-end coordination acceptance are not completed by this release; see [known limits and not yet](#known-limits-and-not-yet).
+**Known pi limit:** `atm agent clear` works with pi's **Update Available** notice on built-in themes, but still refuses safely if a custom theme does not render the notice title bold. The final-idle forwarder update is not included in 0.4.0. Named-skill compliance, review digest, drift scheduler and remaining end-to-end coordination acceptance are not completed by this release; see [known limits and not yet](#known-limits-and-not-yet).
 
 A receipt confirms acceptance of a reference, not model reading/compliance or task completion. Local pane attribution is not authentication against hostile same-user clients. Task usage is observed accounting, not billing; budgets only notify. External notifications are best effort. Rollout checks can pass with a down agent's pane still alive: read warnings, not just the exit code. Real-harness rollout smoke remains unverified; `--real` can start billed turns.
 

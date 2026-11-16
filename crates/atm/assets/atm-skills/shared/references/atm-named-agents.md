@@ -11,6 +11,8 @@ Contract records were inspected at `30475a20` on 2026-11-16 unless noted below.
 Decision CLI contracts were rechecked from merged `bb07ce9b` source with a sealed
 build/help and private-daemon CLI tests. A source inspection is not a new test
 run; neither contract tests nor historical captures verify this wording.
+Verdict-answer contracts were checked at `06c12c07` with sealed task/message
+stand-in tests; their current-state coalescing limit is recorded below.
 
 ## Commands, not a second protocol
 
@@ -93,22 +95,44 @@ atm task verdict t41 accepted --review-task t63 --note 'Checked the measure'
 atm task verdict t41 changes_requested --note 'Missing regression coverage'
 ```
 
-After accepting a **plan** or requesting changes, the lead sends one answer to
-wake the assignee; an accepted result is final and does not need this resume step:
+After accepting a **plan** or requesting changes, verdict automatically queues one
+task-correlated `answer` to the current assignee; do not send a duplicate. An
+accepted result is final and needs no resume answer; closing a named review task
+also sends no separate answer to its reviewer. The answer is signed by the verdict
+actor, not system. It has no attachments: read the current verdict note/files
+with `task get`, and follow its review-task reference when present.
+
+```sh
+# Assignee: after the verdict answer, re-read state and follow M2 above.
+atm task get t41
+```
+
+This is current-state coalescing, not an exact-at-verdict receipt. The daemon
+composes from a fresh post-commit snapshot: accepted + working, or
+changes_requested + changes_requested, queues an answer. A final or superseding
+submitted/in_review/waiting/blocked/assigned/open/unknown state yields
+`notification: null`, not a failed enqueue. Same-state or reassignment cycles
+between the verdict and snapshot cannot be distinguished and may yield a stale
+answer. Always re-read the current state before acting; never withdraw a new
+submission or resume final work because of an older answer.
+
+**Conditional recovery only:** On `notification: unconfirmed`, a timeout or an
+apparently missing answer, inspect the task and obtain authorized diagnostics
+for the assignee's inbox before resending. A named lead cannot read another
+agent's inbox; ask the authorized manager/Owner. Do not resend for an intentional
+final/superseded-state null, or merely because a queued answer is held by a busy
+turn, focus or editor guard. If investigation confirms a missing enqueue and a
+resume is still appropriate, send one correlated recovery answer:
 
 ```sh
 atm msg send --to project/member --kind answer --task t41 \
   --body 'Verdict recorded for t41; re-read atm task get t41 before resuming.'
-# Assignee: re-read state, then follow the M2 state branches above.
-atm task get t41
 ```
 
-The answer is not a duplicate submission report. Unlike assign/submit, verdicts
-have **no automatic assignee notification**; reminders depend on turn-end
-observations, not just a later verdict. Automatic verdict wake-up is a candidate
-follow-up; real-harness execution of this manual loop is **not verified**.
+This conditional repair replaces the unconditional manual wake from `91a9f52e`.
+Real-harness execution and new-skill compliance remain **not verified**.
 
-Creation/assignment/submission and message enqueue are separate durable writes.
+Task mutation and its automatic message enqueue are separate durable writes.
 `queued mN` is not delivery. `notification: unconfirmed`, a connection error or
 a mutation timeout does not mean rollback: inspect `task get`, task pages and
 your own inbox before recovery. Do not blindly submit or send again. Restart
@@ -385,14 +409,15 @@ blindly or drive raw tmux around the guards.
 ### L4
 
 Read report/evidence, require independent review when the measure calls for it,
-then accept/request changes. After plan acceptance or changes requested, send one
-task-correlated answer to the assignee, who re-reads state before resuming. This
-wake-up is not a duplicate submission report; an accepted plan is not a finished
-task or clear boundary.
-**Why:** Verdict authority/measures constrain acceptance; verdicts do not notify the assignee.
-**Source:** `crates/atm-org/src/task.rs` Reviews and measures; `crates/atmd/src/org/tasks.rs::execute_mutation`; `crates/atmd/src/org/task_reminder.rs::Watch::observe`; `tests/atm_task.rs`; legacy `evals/atm-skills/atm-coordinate/done-plan-no-clear/` scenario (not run for this change).
-**Checked:** 2026-11-16 source inspection at 30475a20; harness: N/A (model-free verdict contract); model: N/A. Legacy scenario result/version not recorded here.
-**Not verified:** New-skill review quality/plan handling and real-harness verdict wake-up; billed evaluation deferred. Automatic assignee notification on task.verdict is absent, a candidate follow-up.
+then accept/request changes. A non-final verdict queues an automatic answer to
+the current assignee under the coalescing rule above; do not also send one.
+The assignee must re-read current state before resuming. Only investigate/repair
+a missing enqueue conditionally; an accepted plan is not a finished task or clear
+boundary, and final acceptance/review closure has no resume answer.
+**Why:** Verdict authority/measures constrain acceptance; answers retain ordinary delivery guards, and a later task state can supersede the wake.
+**Source:** `crates/atm-org/src/task.rs` Reviews and measures; `crates/atmd/src/org/tasks.rs::notification` and `execute_mutation`; `crates/atmd/src/org/task_worker_tests.rs`; `crates/atmd/tests/tasks.rs`; `tests/task_messages.rs`; `tests/atm_task.rs`.
+**Checked:** 2026-11-16 source and sealed task RPC/worker/private-daemon message/restart/CLI tests at 06c12c07; harness: N/A (model-free pi stand-in); model: N/A. Actual verdict answers, guarded references and final/no-op silence checked, not skill behavior.
+**Not verified:** New-skill review quality/plan handling and real-harness verdict resumption; billed evaluation deferred. Same-state/reassignment cycles beyond current-state coalescing are not exact-at-verdict routing.
 
 ### L5
 

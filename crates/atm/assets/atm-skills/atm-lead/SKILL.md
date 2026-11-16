@@ -77,11 +77,13 @@ not successful model evaluations or permission to activate unattended operation.
 - **[L4](references/atm-named-agents.md#l4)** Read report/evidence and judge
   against the approved measure. Use an independent submitted review task when
   required, then accept or request changes; never accept your own assigned
-  work. After accepting a plan or requesting changes, send one task-correlated
-  `answer` to the assignee, who re-reads the task state before resuming. This
-  wake-up is not a duplicate submission report. An accepted plan resumes work,
-  not clears the seat or finishes the task.
-  *Why: verdicts change task state but do not automatically notify the assignee.*
+  work. Non-final verdicts automatically queue one task-correlated `answer`;
+  do not send a duplicate. The assignee re-reads the current task state before
+  resuming. Follow S6 and the reference's conditional recovery recipe for an
+  uncertain/missing enqueue; current-state coalescing can suppress a stale wake.
+  An accepted plan resumes work, not clears the seat or finishes the task.
+  *Why: answers reuse guarded delivery; queued is not delivered or permission to
+  ignore a newer task state.*
 
 The linked reference supplies one durable-task lifecycle and the message-only
 fallback. Submission already queues a report; questions still need their own

@@ -1,5 +1,10 @@
 # atm command reference for coordinators
 
+This is the legacy pane-control reference for `atm-coordinate` and
+`atm-implement`. Bound named agents use `atm-lead`/`atm-member` and the
+[named-agent reference](atm-named-agents.md); do not apply the pane/waiter
+loop to their durable task/message workflow.
+
 The commands a coordinator uses to drive implementers, with what each one
 refuses and what to do instead. It follows atm's code after #119, #145, #154,
 #158 and #163 (`src/bin/atm/cli.rs`, `src/bin/atm/spawn.rs`). Run
@@ -14,7 +19,12 @@ for the agent's role, memory path and unread messages, not a personal skill.
 
 ## Targets: use the pane
 
-Commands that target an agent take a session id prefix or a tmux pane id (`%12`).
+The immediate controls below take a session id prefix or a tmux pane id (`%12`).
+This is not the addressing rule for `atm agent`, `atm msg` or `atm task`.
+Named lifecycle/message commands support project-scoped bare names; task agent
+addresses must be full `project/name` IDs.
+
+Commands that target a session take a session id prefix or a tmux pane id (`%12`).
 **Use the pane id.** A pane stays the same for an implementer's whole life,
 but its session id doesn't:
 
@@ -243,14 +253,14 @@ network_access = true
 ```
 
 That also lets the coordinator's other commands reach the network. Approving
-each `atm` call to run outside the sandbox is the narrower option. An
-implementer never runs `atm`, so it needs neither.
+each `atm` call to run outside the sandbox is the narrower option. A legacy
+pane-driven implementer never runs `atm`, so it needs neither; a named member
+uses the socket for `me`, inbox and task/report commands too.
 
 ## Not in atm yet
 
 | Planned | Today |
 |---|---|
-| `atm name` and targets by name (#118) | keep a name-to-pane table in your notes and handover |
 | `atm profile show <name>` (#147) | `scripts/atm-profile <name>` |
 
 ## Scripts in this skill

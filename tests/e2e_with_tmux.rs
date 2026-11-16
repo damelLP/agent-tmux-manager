@@ -1044,8 +1044,10 @@ async fn scenario_control_server_identity_and_start_directory(env: &E2eEnv) {
     }
     assert_eq!(env.tmux.list_panes().await.unwrap().len(), before);
 
-    // Stop between split and type: pane_current_path must already be the
-    // caller directory, not a later typed `cd` or the daemon's working dir.
+    // Stop between split and type: the pane must start in the caller directory,
+    // not a later typed `cd` or the daemon's working dir. On tmux 3.4/3.6a,
+    // pane_start_path is stored before fork; pane_current_path can still report
+    // the inherited cwd while the child does systemd setup (tmux/tmux#4719).
     let cwd = tempfile::tempdir().unwrap();
     let mut client = Client::connect(&env.daemon.socket_path);
     client.send(ClientMessage::connect(Some("cwd-test".into())));
@@ -1060,10 +1062,12 @@ async fn scenario_control_server_identity_and_start_directory(env: &E2eEnv) {
         } => result["pane"].as_str().unwrap().to_owned(),
         other => panic!("split response: {other:?}"),
     };
-    assert_eq!(
-        env.tmux.get_pane_cwd(&pane).await.unwrap().as_deref(),
-        cwd.path().to_str()
-    );
+    let start_path = tmux_run_capture(
+        env.tmux_server.label(),
+        &["display-message", "-p", "-t", &pane, "#{pane_start_path}"],
+    )
+    .expect("query pane start path");
+    assert_eq!(start_path.trim(), cwd.path().to_str().unwrap());
     env.tmux.kill_pane(&pane).await.unwrap();
 }
 

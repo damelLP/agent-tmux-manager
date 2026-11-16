@@ -1,0 +1,37 @@
+Captured: Claude Code 2.1.325, 2026-11-16, sealed loopback-only private tmux 3.8 capture-pane -p -e -N; local canned Messages SSE.
+
+[38;5;174m▗▟[38;5;16m[48;5;174m▂[38;5;174m[48;5;16m███[38;5;16m[48;5;174m▂[38;5;174m[48;5;16m█[49m▄[39m  [1mClaude Code[0m [38;5;246mv2.1.325[39m                         
+[38;5;174m ▜[48;5;16m█████[49m█▘[39m  [38;5;246mHaiku 5.5 · API Usage Billing[39m                
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/xxxxxxxxxxxxxxxxxxx/native-low/home[39m     
+
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/clear[39m                                                
+
+[38;5;246m❯ [38;5;231msurvey turn 1[39m                                         
+
+[38;5;231m[49m●[39m Neutral fixture response 1.                           
+
+[38;5;246m✻[39m [38;5;246mWorked for 0s · done 3:08 PM[39m                          
+
+[38;5;246m[48;5;237m❯ [38;5;231msurvey turn 2[39m                                         
+
+[38;5;231m[49m●[39m Neutral fixture response 2.                           
+
+[38;5;246m✻[39m [38;5;246mChurned for 0s · done 3:08 PM[39m                         
+
+
+
+
+
+
+
+
+
+
+
+                                    [38;5;246m◐ medium · /effort[39m  
+[38;5;244m────────────────────────────────────────────────────────
+[39m❯ check the captured suggestion after resizing the      
+  terminal to a narrow width                            
+[38;5;244m────────────────────────────────────────────────────────
+[39m  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m                  

@@ -23,6 +23,7 @@ fn run_shell_arg(path: &std::path::Path, args: &[&str]) -> String {
 /// `bind-key`, which parse it: inside tmux's double quotes `'` is literal,
 /// `\`, `"` and `$` (an environment variable) need a `\`, and a newline is
 /// written `\n` because tmux drops the spaces after a raw one.
+#[cfg(test)]
 fn run_shell_command(path: &std::path::Path, args: &[&str]) -> String {
     run_shell_command_from_arg(&run_shell_arg(path, args))
 }
@@ -52,6 +53,30 @@ fn effective_tmux_socket(socket: &Option<String>) -> Option<String> {
             .ok()
             .filter(|s| !s.is_empty())
     })
+}
+
+/// Namespace scripts by their baked-in socket routing, not just the session.
+/// Hex preserves arbitrary labels in one lossless filesystem component.
+fn workspace_script_path(
+    base: &std::path::Path,
+    socket: Option<&str>,
+    session_name: &str,
+    kind: &str,
+) -> std::path::PathBuf {
+    let namespace = socket.map_or_else(
+        || "implicit".to_string(),
+        |label| {
+            format!(
+                "label-{}",
+                label
+                    .bytes()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        },
+    );
+    base.join(namespace)
+        .join(format!("{kind}-{session_name}.sh"))
 }
 
 /// Builds a tmux client for workspace orchestration.
@@ -132,25 +157,33 @@ async fn install_resize_hooks<C>(
 where
     C: TmuxClient + ?Sized,
 {
-    let tmux_prefix = tmux_shell_prefix(effective_tmux_socket(socket));
+    let socket = effective_tmux_socket(socket);
+    let tmux_prefix = tmux_shell_prefix(socket.clone());
     let script_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("atm");
-    std::fs::create_dir_all(&script_dir)?;
-    let script_path = script_dir.join(format!("resize-sidebar-{session_name}.sh"));
+    let script_path = workspace_script_path(
+        &script_dir,
+        socket.as_deref(),
+        session_name,
+        "resize-sidebar",
+    );
+    std::fs::create_dir_all(script_path.parent().unwrap_or(&script_dir))?;
     std::fs::write(
         &script_path,
         format!(
             "#!/bin/sh\n\
-             W=$({tmux} display-message -p '#{{window_width}}')\n\
+             # Exit silently: an empty target would resolve to the current window.\n\
+             [ -n \"$1\" ] || exit 0\n\
+             W=$({tmux} display-message -p -t \"$1\" '#{{window_width}}')\n\
              S=$((W * {pct} / 100))\n\
              [ $S -lt {min} ] && S={min}\n\
              [ $S -gt {max} ] && S={max}\n\
-             for p in $({tmux} list-panes -F '#{{pane_id}}:#{{@atm-sidebar}}:#{{pane_width}}:#{{@atm-sidebar-tries}}'); do\n\
+             for p in $({tmux} list-panes -t \"$1\" -F '#{{pane_id}}:#{{@atm-sidebar}}:#{{pane_width}}:#{{@atm-sidebar-tries}}'); do\n\
                id=${{p%%:*}}; n=${{p##*:}}\n\
                case $p in\n\
                  *:1:$S:*) [ -n \"$n\" ] && {tmux} set-option -pu -t \"$id\" @atm-sidebar-tries;;\n\
-                 *:1:*) if [ \"$1\" = hook ]; then\n\
+                 *:1:*) if [ \"$2\" = hook ]; then\n\
                      [ \"${{n:-0}}\" -ge 5 ] && continue\n\
                      {tmux} set-option -p -t \"$id\" @atm-sidebar-tries $((${{n:-0}} + 1))\n\
                    fi\n\
@@ -168,7 +201,12 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
-    let hook_cmd = run_shell_command(&script_path, &[]);
+    // The hook/keybinding queue has its window even when child tmux calls
+    // would resolve current through a different client or leaked TMUX_PANE.
+    let hook_cmd = run_shell_command_from_arg(&format!(
+        "{} '#{{window_id}}'",
+        run_shell_arg(&script_path, &[])
+    ));
     tmux_run(
         client,
         &[
@@ -184,7 +222,10 @@ where
     // sidebar) to 30%. The script's own resize-pane re-fires this hook, so in
     // `hook` mode it stops after 5 tries that don't reach the target width
     // (e.g. a window too small to fit it); reaching the target resets the count.
-    let pane_hook_cmd = run_shell_command(&script_path, &["hook"]);
+    let pane_hook_cmd = run_shell_command_from_arg(&format!(
+        "{} '#{{window_id}}' hook",
+        run_shell_arg(&script_path, &[])
+    ));
     tmux_run(
         client,
         &[
@@ -230,7 +271,7 @@ where
         client,
         &[
             "split-window",
-            "-hb",
+            "-fhb",
             "-t",
             target_pane,
             "-l",
@@ -267,12 +308,18 @@ async fn install_new_window_hook<C>(
 where
     C: TmuxClient + ?Sized,
 {
-    let tmux_prefix = tmux_shell_prefix(effective_tmux_socket(socket));
+    let socket = effective_tmux_socket(socket);
+    let tmux_prefix = tmux_shell_prefix(socket.clone());
     let script_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("atm");
-    std::fs::create_dir_all(&script_dir)?;
-    let script_path = script_dir.join(format!("inject-sidebar-{session_name}.sh"));
+    let script_path = workspace_script_path(
+        &script_dir,
+        socket.as_deref(),
+        session_name,
+        "inject-sidebar",
+    );
+    std::fs::create_dir_all(script_path.parent().unwrap_or(&script_dir))?;
     std::fs::write(
         &script_path,
         format!(
@@ -598,11 +645,24 @@ pub(super) async fn cmd_workspace_attach(session: Option<String>, isolate: bool)
     install_new_window_hook(&client, &socket_name, &session_name).await?;
 
     // 6. Run the resize script once to correct sidebar widths before attaching
-    let script_path = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("atm")
-        .join(format!("resize-sidebar-{session_name}.sh"));
-    let _ = tmux_run(&client, &["run-shell", &run_shell_arg(&script_path, &[])]).await;
+    let script_path = workspace_script_path(
+        &dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("atm"),
+        effective_tmux_socket(&socket_name).as_deref(),
+        &session_name,
+        "resize-sidebar",
+    );
+    for window in windows_output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        let _ = tmux_run(
+            &client,
+            &["run-shell", &run_shell_arg(&script_path, &[window])],
+        )
+        .await;
+    }
 
     // 7. Attach
     exec_attach(&socket_name, &session_name)
@@ -612,6 +672,34 @@ pub(super) async fn cmd_workspace_attach(session: Option<String>, isolate: bool)
 mod shell_quote_tests {
     use super::{run_shell_arg, run_shell_command};
     use std::path::Path;
+
+    #[test]
+    fn script_paths_keep_socket_labels_distinct_and_lossless() {
+        let base = Path::new("data/atm");
+        for (socket, namespace) in [
+            (None, "implicit"),
+            (Some("implicit"), "label-696d706c69636974"),
+            (Some(""), "label-"),
+            (Some("a/b"), "label-612f62"),
+            (Some("a_b"), "label-615f62"),
+            (Some("a\\b"), "label-615c62"),
+            (Some(".."), "label-2e2e"),
+            (Some("#'\"/"), "label-2327222f"),
+            (Some("é"), "label-c3a9"),
+        ] {
+            let want = base.join(namespace).join("resize-sidebar-same.sh");
+            for _ in 0..2 {
+                assert_eq!(
+                    super::workspace_script_path(base, socket, "same", "resize-sidebar"),
+                    want
+                );
+            }
+            assert_eq!(
+                super::workspace_script_path(base, socket, "same", "inject-sidebar"),
+                base.join(namespace).join("inject-sidebar-same.sh")
+            );
+        }
+    }
 
     #[test]
     fn run_shell_arg_quotes_each_word_and_doubles_hash() {
@@ -722,14 +810,28 @@ mod has_session_tests {
                 _ => None,
             })
             .collect();
-        let script = |name: &str| data_home.path().join("atm").join(name);
+        let script = |name: &str| {
+            data_home
+                .path()
+                .join("atm/label-61746d2d6d792e70726f6a")
+                .join(name)
+        };
         let resize = script("resize-sidebar-my.proj.sh");
         assert_eq!(
             commands,
             vec![
-                super::run_shell_command(&resize, &[]),
-                super::run_shell_command(&resize, &["hook"]),
-                super::run_shell_command(&resize, &[]),
+                super::run_shell_command_from_arg(&format!(
+                    "{} '#{{window_id}}'",
+                    super::run_shell_arg(&resize, &[])
+                )),
+                super::run_shell_command_from_arg(&format!(
+                    "{} '#{{window_id}}' hook",
+                    super::run_shell_arg(&resize, &[])
+                )),
+                super::run_shell_command_from_arg(&format!(
+                    "{} '#{{window_id}}'",
+                    super::run_shell_arg(&resize, &[])
+                )),
                 super::run_shell_command_from_arg(&format!(
                     "{} '#{{window_id}}'",
                     super::run_shell_arg(&script("inject-sidebar-my.proj.sh"), &[])

@@ -108,7 +108,7 @@ main() {
         warn "$INSTALL_DIR is not in your PATH"
         echo ""
         echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        printf '  export PATH=%q:"$PATH"\n' "$INSTALL_DIR"
         echo ""
     fi
 

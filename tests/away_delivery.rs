@@ -17,8 +17,14 @@ use support::{about, reference, Confirmation, MessageRig, Recipient, Watch};
 
 /// The next system message to the seat: its id, after its body was checked,
 /// its reference line reached the stand-in and nothing else was typed.
-fn told(rig: &MessageRig, watch: &mut Watch, seat: &Recipient, kind: &str, body: &str) -> String {
-    let cursor = rig.test.rig.event_cursor(&seat.pane);
+fn told(
+    rig: &MessageRig,
+    watch: &mut Watch,
+    seat: &Recipient,
+    cursor: u64,
+    kind: &str,
+    body: &str,
+) -> String {
     let record = watch.wait("a message to the seat", |e| {
         e["kind"] == "msg.sent" && e["body"]["to"] == seat.id
     });
@@ -84,14 +90,33 @@ fn a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart() {
     assert!(since.is_string());
     assert!(status(&rig).ends_with(" away\n"), "{:?}", status(&rig));
 
-    // The agent asks; the daemon takes it for the owner and tells the agent.
-    let decision = rig
-        .call(
-            "decision.request",
-            json!({"kind":"plan","title":"Which interface","context":"Private question","options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true}),
-            Some(&seat.pane),
-        )
-        .unwrap()["decision_id"]
+    // The agent asks through the CLI; the existing daemon policy takes it.
+    let cursor = rig.test.rig.event_cursor(&seat.pane);
+    let decision = rig.atm_json(
+        Some(&seat.pane),
+        &[
+            "decisions",
+            "request",
+            "--kind",
+            "plan",
+            "--title",
+            "Which interface",
+            "--context",
+            "Private question",
+            "--option",
+            "yes",
+            "--option",
+            "no",
+            "--recommended",
+            "yes",
+            "--may-be-undone",
+            "true",
+            "--changes-intent",
+            "true",
+            "--format",
+            "json",
+        ],
+    )["decision_id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -103,7 +128,7 @@ fn a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart() {
         json!({"decision_id":decision,"option":"yes","by":"system"})
     );
     let notice_body = format!("Decision {decision} taken provisionally: yes\nThe owner is away. Finish your task in progress on this option. Start nothing further on it: a task built on it names {decision} in rests_on and waits until the owner has seen {decision}.");
-    let notice = told(&rig, &mut watch, &seat, "answer", &notice_body);
+    let notice = told(&rig, &mut watch, &seat, cursor, "answer", &notice_body);
     assert_eq!(
         rig.inbox_entry(Some(&seat.pane), None, &notice)["content"]["body"],
         notice_body.as_str()
@@ -176,12 +201,14 @@ fn a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart() {
 
     // The owner's answer lifts the hold.
     let mut watch = rig.watch();
+    let cursor = rig.test.rig.event_cursor(&seat.pane);
     let answer = rig.atm_json(None, &["decide", &decision, "yes", "--format", "json"]);
     assert_eq!(answer["decision"]["status"], "resolved");
     told(
         &rig,
         &mut watch,
         &seat,
+        cursor,
         "answer",
         &format!("Decision {decision} resolved: yes\nStanding rule: no"),
     );
@@ -194,5 +221,117 @@ fn a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart() {
         about("msg.delivered", &format!("m{}", brief["seq"])),
     );
     rig.finish_turn(&seat.pane);
+    rig.test.rig.close();
+}
+
+// Break caught: CLI facts change the away classification, skip kind guards, or undo provisional work.
+#[test]
+fn cli_decision_classes_and_withdraw_reask_follow_the_away_policy() {
+    let mut rig = MessageRig::start(Confirmation::Generous);
+    let seat = rig.ready_agent("worker", StandInMode::Claude);
+    rig.atm_json(None, &["away", "--format", "json"]);
+    let mut watch = rig.watch();
+    let mut waiting = None;
+    for (kind, undone, recommended, class, status) in [
+        ("plan", "true", true, "detail", "taken_provisionally"),
+        ("plan", "false", true, "irreversible", "pending"),
+        ("action", "true", true, "detail", "pending"),
+        ("plan", "true", false, "detail", "pending"),
+    ] {
+        let cursor = rig.test.rig.event_cursor(&seat.pane);
+        let mut args = vec![
+            "decisions",
+            "request",
+            "--kind",
+            kind,
+            "--title",
+            "CLI away question",
+            "--option",
+            "yes",
+            "--option",
+            "no",
+            "--may-be-undone",
+            undone,
+            "--changes-intent",
+            "false",
+            "--format",
+            "json",
+        ];
+        if recommended {
+            args.extend(["--recommended", "yes"]);
+        }
+        let result = rig.atm_json(Some(&seat.pane), &args);
+        assert_eq!(
+            result.as_object().unwrap().len(),
+            1,
+            "creation reports an ID, not inferred policy state"
+        );
+        let id = result["decision_id"].as_str().unwrap().to_owned();
+        let (message_kind, body) = if status == "taken_provisionally" {
+            ("answer", format!("Decision {id} is yours to decide: recorded as yes, your recommended option.\nThe owner is away and sees it when he is back."))
+        } else if !recommended {
+            ("note", format!("Decision {id} waits for the owner: he is away, and it has no recommended option.\nTo have it handled while he is away, withdraw it and ask again with a recommended option."))
+        } else {
+            ("note", format!("Decision {id} waits for the owner: he is away, and it cannot be undone or reaches outside.\nOnly work that depends on it waits. Carry on with other work."))
+        };
+        told(&rig, &mut watch, &seat, cursor, message_kind, &body);
+        let entry = rig
+            .call("decision.get", json!({"id":id}), Some(&seat.pane))
+            .unwrap();
+        assert_eq!(entry["decision"]["class"], class);
+        assert_eq!(entry["decision"]["status"], status);
+        if status == "taken_provisionally" {
+            assert_eq!(entry["decision"]["provisional"]["by"], seat.id);
+            let out = rig.atm(Some(&seat.pane), &["decisions", "withdraw", &id]);
+            assert_eq!(out.status.code(), Some(1));
+            assert!(out.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("cannot withdraw decision"));
+        } else {
+            assert_eq!(entry["decision"]["provisional"], Value::Null);
+        }
+        if !recommended {
+            waiting = Some(id);
+        }
+    }
+    let waiting = waiting.unwrap();
+    assert_eq!(
+        rig.atm_json(
+            Some(&seat.pane),
+            &["decisions", "withdraw", &waiting, "--format", "json"]
+        )["changed"],
+        true
+    );
+    let cursor = rig.test.rig.event_cursor(&seat.pane);
+    let replacement = rig.atm_json(
+        Some(&seat.pane),
+        &[
+            "decisions",
+            "request",
+            "--kind",
+            "plan",
+            "--title",
+            "CLI away question",
+            "--option",
+            "yes",
+            "--option",
+            "no",
+            "--may-be-undone",
+            "true",
+            "--changes-intent",
+            "false",
+            "--recommended",
+            "yes",
+            "--format",
+            "json",
+        ],
+    );
+    let id = replacement["decision_id"].as_str().unwrap();
+    assert_ne!(id, waiting);
+    told(&rig, &mut watch, &seat, cursor, "answer", &format!("Decision {id} is yours to decide: recorded as yes, your recommended option.\nThe owner is away and sees it when he is back."));
+    let entry = rig
+        .call("decision.get", json!({"id":id}), Some(&seat.pane))
+        .unwrap();
+    assert_eq!(entry["decision"]["status"], "taken_provisionally");
+    assert_eq!(entry["decision"]["provisional"]["by"], seat.id);
     rig.test.rig.close();
 }

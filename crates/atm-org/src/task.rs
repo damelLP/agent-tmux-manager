@@ -179,7 +179,7 @@ pub enum TaskMeasure {
     Unknown,
 }
 
-/// Fields only: nothing in this crate reads a budget.
+/// Optional limits evaluated by [`crate::budget`]; crossing never stops work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskBudget {
     #[serde(default, with = "crate::event::optional_money")]
@@ -711,6 +711,7 @@ impl OrgState {
         }
         let changed = match command {
             TaskCommand::Create(body) => {
+                crate::budget::validate_budget(body.budget.as_ref())?;
                 nonempty("title", &body.title)?;
                 files_named(&body.files)?;
                 match &body.measure {

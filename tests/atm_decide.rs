@@ -161,6 +161,35 @@ async fn exchange(
 fn list_params() -> Value {
     json!({"statuses":null,"after":null,"limit":100,"count_only":false})
 }
+fn request_args() -> Vec<&'static str> {
+    vec![
+        "decisions",
+        "request",
+        "--kind",
+        "plan",
+        "--title",
+        "Approve this plan",
+        "--option",
+        "yes",
+        "--option",
+        "no",
+        "--may-be-undone",
+        "true",
+        "--changes-intent",
+        "true",
+    ]
+}
+fn request_params() -> Value {
+    json!({"kind":"plan","title":"Approve this plan","context":"","files":[],"options":["yes","no"],"recommended":null,"may_be_undone":true,"changes_intent":true,"deadline":null})
+}
+fn withdrawn(changed: bool) -> Value {
+    let mut decision = list()["decisions"][0].clone();
+    decision["status"] = json!("withdrawn");
+    decision["closed_at"] = json!("2026-01-15T12:01:00Z");
+    decision["withdrawal"] =
+        json!({"decision_id":"d41","by":"project/worker","reason":"superseded"});
+    json!({"decision":decision,"changed":changed})
+}
 
 // Break caught: absent commands, wrong request fields, or dropped future JSON.
 #[tokio::test]
@@ -383,6 +412,383 @@ fn real_cli_rule_command_appends_once_through_a_private_daemon() {
     rig.test.rig.close();
 }
 
+// Break caught: missing/defaulted request fields, altered exact strings, or an extra post-request RPC.
+#[tokio::test]
+async fn decisions_request_preserves_defaults_exact_values_and_raw_json() {
+    let output = exchange(
+        &request_args(),
+        "decision.request",
+        request_params(),
+        json!({"result":{"decision_id":"d41"}}),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"d41 requested\n");
+    let mut args = request_args();
+    args.extend(["--format", "json"]);
+    let raw = json!({"decision_id":"d41","future":{"keep":"é\u{009b}\u{007f}\u{001b}","null":null,"integer":9007199254740993_u64}});
+    let output = exchange(
+        &args,
+        "decision.request",
+        request_params(),
+        json!({"result":raw}),
+        true,
+        false,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        raw
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout)
+        .chars()
+        .any(|c| matches!(c, '\u{009b}' | '\u{007f}' | '\u{001b}')));
+
+    let args = [
+        "decisions",
+        "request",
+        "--kind",
+        "policy",
+        "--title",
+        "  Approve é  ",
+        "--context",
+        "  first\n\n雪 \"quoted\"\n",
+        "--option",
+        " Keep shape ",
+        "--option=-value",
+        "--recommended",
+        " Keep shape ",
+        "--attach",
+        "not a file",
+        "--attach",
+        "../brief",
+        "--may-be-undone",
+        "false",
+        "--changes-intent",
+        "false",
+        "--deadline",
+        "2099-01-01T01:00:00+01:00",
+    ];
+    let params = json!({"kind":"policy","title":"  Approve é  ","context":"  first\n\n雪 \"quoted\"\n","files":["not a file","../brief"],"options":[" Keep shape ","-value"],"recommended":" Keep shape ","may_be_undone":false,"changes_intent":false,"deadline":"2099-01-01T00:00:00Z"});
+    let output = exchange(
+        &args,
+        "decision.request",
+        params,
+        json!({"result":{"decision_id":"d41"}}),
+        true,
+        false,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"d41 requested\n");
+    // Cardinality is the daemon's policy, not a second CLI validator.
+    let mut args = request_args();
+    args.drain(8..10);
+    let mut params = request_params();
+    params["options"] = json!(["yes"]);
+    let output = exchange(
+        &args,
+        "decision.request",
+        params,
+        json!({"error":{"code":"invalid_params","message":"options must contain 2 to 32 entries"}}),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("options must contain 2 to 32 entries")
+    );
+}
+
+// Break caught: missing reason/null, invented success state or dropped additive JSON facts.
+#[tokio::test]
+async fn decisions_withdraw_preserves_reason_and_reports_changed_or_unchanged() {
+    for changed in [true, false] {
+        let raw = withdrawn(changed);
+        let out = exchange(
+            &["decisions", "withdraw", "d41"],
+            "decision.withdraw",
+            json!({"id":"d41","reason":null}),
+            json!({"result":raw}),
+            true,
+            false,
+        )
+        .await;
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            out.stdout,
+            if changed {
+                b"d41 withdrawn\n".as_slice()
+            } else {
+                b"d41 withdrawn (unchanged)\n".as_slice()
+            }
+        );
+        let mut raw = withdrawn(changed);
+        raw["future"] = json!({"keep":"é\u{009b}","null":null});
+        let out = exchange(
+            &[
+                "decisions",
+                "withdraw",
+                "d41",
+                "--reason",
+                "  superseded\n雪 \u{001b} ",
+                "--format",
+                "json",
+            ],
+            "decision.withdraw",
+            json!({"id":"d41","reason":"  superseded\n雪 \u{001b} "}),
+            json!({"result":raw}),
+            true,
+            false,
+        )
+        .await;
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), raw);
+        assert!(!String::from_utf8_lossy(&out.stdout).contains('\u{009b}'));
+    }
+}
+
+// Break caught: a new mutation hides refusals, retries, accepts malformed success, or swallows write failure.
+#[tokio::test]
+async fn decision_mutation_failures_never_report_success_or_retry() {
+    for (args, method, params, result) in [
+        (
+            request_args(),
+            "decision.request",
+            request_params(),
+            json!({"decision_id":"d41"}),
+        ),
+        (
+            vec!["decisions", "withdraw", "d41"],
+            "decision.withdraw",
+            json!({"id":"d41","reason":null}),
+            withdrawn(true),
+        ),
+    ] {
+        for code in [
+            "invalid_params",
+            "refused",
+            "not_found",
+            "unavailable",
+            "timeout",
+        ] {
+            for format in ["text", "json"] {
+                let mut args = args.clone();
+                args.extend(["--format", format]);
+                let message = format!("server {code}");
+                let out = exchange(
+                    &args,
+                    method,
+                    params.clone(),
+                    json!({"error":{"code":code,"message":message}}),
+                    true,
+                    false,
+                )
+                .await;
+                assert_eq!(out.status.code(), Some(1), "{out:?}");
+                assert!(out.stdout.is_empty());
+                assert_eq!(
+                    String::from_utf8(out.stderr).unwrap(),
+                    format!("Error: {message}\n")
+                );
+            }
+        }
+        let out = exchange(&args, method, params.clone(), json!({}), false, false).await;
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("daemon is too old"));
+        let malformed = if method == "decision.request" {
+            vec![
+                json!({}),
+                json!({"decision_id":"d01"}),
+                json!({"decision_id":41}),
+            ]
+        } else {
+            vec![
+                json!({}),
+                json!({"decision":result["decision"]}),
+                resolved(),
+            ]
+        };
+        for result in malformed {
+            let out = exchange(
+                &args,
+                method,
+                params.clone(),
+                json!({"result":result}),
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            assert!(out.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("invalid decision result"),
+                "{out:?}"
+            );
+        }
+        for format in ["text", "json"] {
+            let mut args = args.clone();
+            args.extend(["--format", format]);
+            let out = exchange(
+                &args,
+                method,
+                params.clone(),
+                json!({"result":result}),
+                true,
+                true,
+            )
+            .await;
+            assert_eq!(out.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("No space left on device"),
+                "{out:?}"
+            );
+        }
+    }
+}
+
+// Break caught: fake peers hide caller attribution, withdrawal authority, or persistence errors.
+#[cfg(target_os = "linux")]
+#[test]
+fn real_cli_requests_and_withdrawals_use_pane_authority_and_survive_restart() {
+    use delivery_support::{Confirmation, MessageRig};
+    let mut rig = MessageRig::start(Confirmation::Generous);
+    let seat = rig.ready_agent("worker", stand_in::StandInMode::Claude);
+    let other = rig.ready_agent("other", stand_in::StandInMode::Claude);
+    let mut args = request_args();
+    args.extend([
+        "--context",
+        "  exact\n雪\n",
+        "--attach",
+        "not a file",
+        "--attach",
+        "../brief",
+        "--format",
+        "json",
+    ]);
+    let refused = rig.atm(None, &args);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("only a named agent may request"));
+    let mut watch = rig.watch();
+    let id = rig.atm_json(Some(&seat.pane), &args)["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let decision = rig
+        .call("decision.get", json!({"id":id}), Some(&seat.pane))
+        .unwrap();
+    assert_eq!(decision["decision"]["request"]["requester"], seat.id);
+    assert_eq!(decision["decision"]["request"]["context"], "  exact\n雪\n");
+    assert_eq!(
+        decision["decision"]["request"]["files"],
+        json!(["not a file", "../brief"])
+    );
+    assert_eq!(decision["decision"]["class"], "changes_intent");
+    assert_eq!(decision["decision"]["status"], "pending");
+    assert_eq!(
+        rig.call("decision.get", json!({"id":id}), Some(&other.pane))
+            .unwrap_err()
+            .0,
+        "refused"
+    );
+    assert_eq!(
+        rig.atm_json(Some(&other.pane), &["decisions", "--format", "json"])["pending_count"],
+        0
+    );
+    assert_eq!(
+        rig.atm_json(Some(&seat.pane), &["decisions", "--format", "json"])["decisions"][0]["id"],
+        id
+    );
+    let withdraw = [
+        "decisions",
+        "withdraw",
+        &id,
+        "--reason",
+        "superseded",
+        "--format",
+        "json",
+    ];
+    let refused = rig.atm(Some(&other.pane), &withdraw);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused.stdout.is_empty());
+    let first = rig.atm_json(Some(&seat.pane), &withdraw);
+    assert_eq!(first["changed"], true);
+    assert_eq!(first["decision"]["status"], "withdrawn");
+    assert_eq!(first["decision"]["withdrawal"]["by"], seat.id);
+    assert_eq!(first["decision"]["withdrawal"]["reason"], "superseded");
+    let repeat = rig.atm_json(
+        Some(&seat.pane),
+        &[
+            "decisions",
+            "withdraw",
+            &id,
+            "--reason",
+            "different",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(repeat["changed"], false);
+    assert_eq!(repeat["decision"], first["decision"]);
+    assert_eq!(rig.atm_json(None, &withdraw)["changed"], false);
+    let second = rig.atm_json(Some(&seat.pane), &args)["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let owner = rig.atm_json(
+        None,
+        &["decisions", "withdraw", &second, "--format", "json"],
+    );
+    assert_eq!(owner["changed"], true);
+    assert_eq!(owner["decision"]["withdrawal"]["by"], "owner");
+    assert_eq!(owner["decision"]["withdrawal"]["reason"], Value::Null);
+    watch.catch_up(&rig);
+    assert_eq!(watch.all(|e| e["kind"] == "decision.requested").len(), 2);
+    for id in [&id, &second] {
+        assert_eq!(
+            watch
+                .all(|e| e["kind"] == "decision.requested" && format!("d{}", e["seq"]) == *id)
+                .len(),
+            1
+        );
+        assert_eq!(
+            watch
+                .all(|e| e["kind"] == "decision.withdrawn" && e["body"]["decision_id"] == *id)
+                .len(),
+            1
+        );
+    }
+    rig.hold_turn(&seat.pane);
+    rig.test.rig.restart_daemon();
+    rig.finish_turn(&seat.pane);
+    assert_eq!(
+        rig.call("decision.get", json!({"id":id}), Some(&seat.pane))
+            .unwrap()["decision"],
+        first["decision"]
+    );
+    assert_eq!(
+        rig.call("decision.get", json!({"id":second}), None)
+            .unwrap()["decision"],
+        owner["decision"]
+    );
+    assert_eq!(rig.atm_json(Some(&seat.pane), &withdraw)["changed"], false);
+    assert_eq!(
+        rig.atm_json(
+            None,
+            &["decisions", "withdraw", &second, "--format", "json"]
+        )["changed"],
+        false
+    );
+    rig.test.rig.close();
+}
+
 #[tokio::test]
 async fn decision_cli_argument_errors_do_not_contact_a_daemon() {
     for args in [
@@ -391,6 +797,11 @@ async fn decision_cli_argument_errors_do_not_contact_a_daemon() {
         vec!["decide", "d01", "yes"],
         vec!["decisions", "--all", "--status", "pending"],
         vec!["decisions", "--status", "future"],
+        vec!["decisions", "request"],
+        vec!["decisions", "withdraw"],
+        vec!["decisions", "withdraw", "d01"],
+        vec!["decisions", "withdraw", "d41", "--all"],
+        vec!["decisions", "--format", "json", "withdraw", "d41"],
     ] {
         let dir = tempfile::tempdir().unwrap();
         let out = command(dir.path(), &args)

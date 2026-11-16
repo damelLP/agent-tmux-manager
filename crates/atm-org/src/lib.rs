@@ -190,6 +190,7 @@
 
 pub mod auto_handover;
 mod away;
+pub mod budget;
 mod command;
 mod config;
 mod cost;

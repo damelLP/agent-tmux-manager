@@ -271,7 +271,7 @@ enum Command {
     Task(task::TaskArgs),
     /// Record the owner's answer to a decision
     Decide(decide::DecideArgs),
-    /// List pending and provisional decisions
+    /// List, request or withdraw durable decisions
     Decisions(decide::DecisionsArgs),
     /// Tell the daemon you will not answer: agents go on under the away rules
     Away(away::SwitchArgs),

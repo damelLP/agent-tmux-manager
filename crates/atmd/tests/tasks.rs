@@ -361,6 +361,229 @@ async fn ownership_changes_notify_previous_holder() {
     }
 }
 
+// Break caught: every Working start wakes the creator, or a withdrawn Report remains actionable without invalidation.
+#[tokio::test]
+async fn withdrawal_is_not_every_work_start() {
+    for (creator, to) in [
+        ("owner", "owner"),
+        ("system", "owner"),
+        ("project/lead", "project/lead"),
+        ("project/worker", "project/worker"),
+    ] {
+        let rig = Rig::new().await;
+        let mut body = created("Withdrawn report");
+        body.creator = creator.parse().unwrap();
+        rig.run(TaskCommand::Create(body)).await;
+        let id = format!("t{}", rig.org.status().unwrap());
+        rig.run(TaskCommand::Assign {
+            task_id: id.parse().unwrap(),
+            agent_id: "project/worker".parse().unwrap(),
+            by: actor("owner"),
+        })
+        .await;
+        let working = json!({"task_id":id,"state":"working"});
+        assert_eq!(
+            rig.ok(Some("%2"), "task.set_state", working.clone()).await["notification"],
+            Value::Null
+        );
+        assert_eq!(
+            rig.ok(Some("%2"), "task.set_state", working.clone()).await["notification"],
+            Value::Null
+        );
+        let submitted = rig
+            .ok(
+                Some("%2"),
+                "task.submit",
+                json!({"task_id":id,"files":[{"path":"old-report.md","kind":"report"}]}),
+            )
+            .await;
+        let report_id = submitted["notification"]["message_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let report = rig.snapshot().await.message(&report_id).unwrap().clone();
+        let result = rig.ok(Some("%2"), "task.set_state", working.clone()).await;
+        let state = rig.snapshot().await;
+        assert_eq!(
+            state.message(&report_id).unwrap(),
+            &report,
+            "withdrawal must not rewrite the old Report"
+        );
+        assert_eq!(
+            state.task(&id.parse().unwrap()).unwrap().state,
+            TaskState::Working
+        );
+        if creator == "project/worker" {
+            assert_eq!(result["notification"], Value::Null);
+            assert_eq!(state.messages().count(), 1);
+        } else {
+            assert_eq!(
+                result["notification"]["status"], "queued",
+                "missing withdrawal notice: {result}"
+            );
+            let note = state
+                .message(
+                    &result["notification"]["message_id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&note.content).unwrap(),
+                json!({
+                    "from":"project/worker","to":to,"kind":"note","task":id,"attachments":[],
+                    "body":format!("Task {id} changed: submission_withdrawn.\nInspect current state and assignee: atm task get {id}\nDo not continue obsolete work or resume/clear on this note alone."),
+                })
+            );
+            assert_eq!(state.messages().count(), 2);
+        }
+        assert_eq!(
+            rig.ok(Some("%2"), "task.set_state", working).await["notification"],
+            Value::Null
+        );
+        assert_eq!(rig.snapshot().await, state);
+    }
+}
+
+// Break caught: a displaced live review keeps working, or final primary/secondary closure gets a resume wake.
+#[tokio::test]
+async fn displaced_live_review_gets_invalidation_not_resume() {
+    for outcome in [
+        "cancelled",
+        "accepted",
+        "changes_requested",
+        "plan_accepted",
+    ] {
+        let rig = Rig::new().await;
+        rig.assign().await;
+        rig.run(TaskCommand::Submit {
+            task_id: "t6".parse().unwrap(),
+            what: if outcome == "plan_accepted" {
+                TaskSubmission::Plan
+            } else {
+                TaskSubmission::Result
+            },
+            files: vec![],
+            by: actor("project/worker"),
+        })
+        .await;
+        let mut body = created("Live review");
+        body.kind = atm_org::TaskKind::Review;
+        body.judges = Some("t6".parse().unwrap());
+        rig.run(TaskCommand::Create(body)).await;
+        let review = format!("t{}", rig.org.status().unwrap());
+        rig.run(TaskCommand::Assign {
+            task_id: review.parse().unwrap(),
+            agent_id: "project/reviewer".parse().unwrap(),
+            by: actor("owner"),
+        })
+        .await;
+        rig.run(TaskCommand::SetState {
+            task_id: review.parse().unwrap(),
+            state: TaskState::Working,
+            reason: None,
+            by: actor("project/reviewer"),
+        })
+        .await;
+        rig.run(TaskCommand::StartReview {
+            task_id: "t6".parse().unwrap(),
+            review_task: review.parse().unwrap(),
+            by: actor("owner"),
+        })
+        .await;
+        let before_review = rig
+            .snapshot()
+            .await
+            .task(&review.parse().unwrap())
+            .unwrap()
+            .clone();
+        let (method, params) = if outcome == "cancelled" {
+            (
+                "task.set_state",
+                json!({"task_id":"t6","state":"cancelled"}),
+            )
+        } else {
+            (
+                "task.verdict",
+                json!({"task_id":"t6","verdict":if outcome == "plan_accepted" { "accepted" } else { outcome },"note":"not copied"}),
+            )
+        };
+        let result = rig.ok(Some("%1"), method, params.clone()).await;
+        assert_eq!(
+            result["notification"]["status"], "queued",
+            "missing displaced review invalidation: {result}"
+        );
+        let state = rig.snapshot().await;
+        assert_eq!(
+            state.task(&review.parse().unwrap()).unwrap(),
+            &before_review,
+            "never cancel/close the live review automatically"
+        );
+        assert_eq!(
+            state.task(&"t6".parse().unwrap()).unwrap().review_task,
+            None
+        );
+        let review_notes: Vec<_> = state
+            .messages()
+            .filter(|m| {
+                m.content
+                    .task
+                    .as_ref()
+                    .is_some_and(|t| t.to_string() == review)
+            })
+            .collect();
+        assert_eq!(review_notes.len(), 1, "missing linked live reviewer Note");
+        assert_eq!(
+            serde_json::to_value(&review_notes[0].content).unwrap(),
+            json!({
+                "from":"project/lead","to":"project/reviewer","kind":"note","task":review,"attachments":[],
+                "body":format!("Task t6 changed: review_superseded.\nInspect current state and assignee: atm task get t6\nDo not continue obsolete work or resume/clear on this note alone.\nReview task: atm task get {review}; re-check the judged task above before continuing."),
+            })
+        );
+        let primary: Vec<_> = state
+            .messages()
+            .filter(|m| {
+                m.content
+                    .task
+                    .as_ref()
+                    .is_some_and(|t| t.to_string() == "t6")
+            })
+            .collect();
+        assert_eq!(
+            primary.len(),
+            if outcome == "accepted" {
+                0
+            } else if outcome == "cancelled" {
+                2
+            } else {
+                1
+            }
+        );
+        if matches!(outcome, "changes_requested" | "plan_accepted") {
+            assert_eq!(primary[0].content.kind, atm_org::MessageKind::Answer);
+        }
+        if outcome == "plan_accepted" {
+            assert_eq!(
+                rig.call(Some("%1"), method, params)
+                    .await
+                    .unwrap_err()
+                    .0
+                    .code,
+                "conflict"
+            );
+        } else {
+            assert_eq!(
+                rig.ok(Some("%1"), method, params).await["notification"],
+                Value::Null
+            );
+        }
+        assert_eq!(rig.snapshot().await, state);
+    }
+}
+
 // Break caught: a task method absent from actual wire dispatch, or schema/result drift.
 #[tokio::test]
 async fn all_nine_methods_success_and_refusal_wire_fixtures() {

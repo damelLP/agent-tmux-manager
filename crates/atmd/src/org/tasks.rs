@@ -264,31 +264,73 @@ fn transition_notices(
         OrgEvent::TaskStateChanged(e) => match e.state {
             TaskState::Open => (&e.task_id, &e.by, "open"),
             TaskState::Cancelled => (&e.task_id, &e.by, "cancelled"),
+            TaskState::Working => (&e.task_id, &e.by, "submission_withdrawn"),
             _ => return Ok(Vec::new()),
         },
+        OrgEvent::TaskVerdict(e) => (&e.task_id, &e.by, "review_superseded"),
         _ => return Ok(Vec::new()),
     };
     let before = before
         .ok_or_else(|| TaskError::Internal(format!("task {id} missing mutation before-image")))?;
     let now = task(current, id)?;
     let mut notes = Vec::new();
-    let revoked = before.agent_id.as_ref().is_some_and(|old| {
-        if change == "cancelled" {
-            now.state == TaskState::Cancelled
-        } else {
-            now.agent_id.as_ref() != Some(old)
-        }
-    });
+    let revoked = matches!(change, "assigned" | "open" | "cancelled")
+        && before.agent_id.as_ref().is_some_and(|old| {
+            if change == "cancelled" {
+                now.state == TaskState::Cancelled
+            } else {
+                now.agent_id.as_ref() != Some(old)
+            }
+        });
     if revoked {
         if let Some(old) = &before.agent_id {
             notes.push(notice(id, by, Address::Agent(old.clone()), change));
         }
+    }
+    let withdrawn = change == "submission_withdrawn"
+        && before.state == TaskState::Submitted
+        && now.state == TaskState::Working
+        && now.agent_id == before.agent_id;
+    if withdrawn && now.agent_id.is_none() {
+        return Err(TaskError::Internal(format!(
+            "task {id} has no assignee for withdrawal"
+        )));
+    }
+    if revoked || withdrawn {
         let creator = if before.creator == Address::System {
             Address::Owner
         } else {
             before.creator.clone()
         };
         notes.push(notice(id, by, creator, change));
+    }
+    if before.state == TaskState::InReview {
+        let review_id = before
+            .review_task
+            .as_ref()
+            .ok_or_else(|| TaskError::Internal(format!("task {id} missing prior review link")))?;
+        if now.review_task.as_ref() != Some(review_id) {
+            let review = task(current, review_id)?;
+            if review.kind == TaskKind::Review
+                && review.judges.as_ref() == Some(id)
+                && matches!(
+                    review.state,
+                    TaskState::Assigned
+                        | TaskState::Working
+                        | TaskState::Waiting
+                        | TaskState::Blocked
+                        | TaskState::ChangesRequested
+                )
+            {
+                if let Some(agent) = &review.agent_id {
+                    let mut note =
+                        notice(id, by, Address::Agent(agent.clone()), "review_superseded");
+                    note.body.push_str(&format!("\nReview task: atm task get {review_id}; re-check the judged task above before continuing."));
+                    note.task = Some(review_id.clone());
+                    notes.push(note);
+                }
+            }
+        }
     }
     notes.retain(|n| &n.to != by);
     Ok(notes)

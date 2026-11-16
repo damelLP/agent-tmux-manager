@@ -441,6 +441,385 @@ async fn notice_only_prefix_and_completed_replay_do_not_fabricate_messages() {
     }
 }
 
+fn invalidation_context(
+    base: u64,
+    review_state: TaskState,
+    assigned: bool,
+    related: bool,
+) -> (OrgState, TaskId, TaskId) {
+    let mut state = verdict_snapshot(TaskState::Working, true);
+    let now = chrono::Utc::now();
+    let id: TaskId = format!("t{base}").parse().unwrap();
+    let review: TaskId = format!("t{}", base + 4).parse().unwrap();
+    let mut work = created("é".repeat(512));
+    work.files = (0..40)
+        .map(|n| atm_org::TaskFile {
+            path: format!("old-{n}.md"),
+            kind: TaskFileKind::Report,
+            note: Some("é".repeat(8192)),
+        })
+        .collect();
+    state
+        .apply(base, now, &OrgEvent::TaskCreated(work))
+        .unwrap();
+    state
+        .apply(
+            base + 1,
+            now,
+            &OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+                task_id: id.clone(),
+                agent_id: "p/worker".parse().unwrap(),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    state
+        .apply(
+            base + 2,
+            now,
+            &OrgEvent::TaskSubmitted(atm_org::TaskSubmitted {
+                task_id: id.clone(),
+                what: TaskSubmission::Result,
+                files: vec![],
+                by: "p/worker".parse().unwrap(),
+            }),
+        )
+        .unwrap();
+    state
+        .apply(
+            base + 3,
+            now,
+            &OrgEvent::AgentAdopted {
+                agent_id: "p/reviewer".parse().unwrap(),
+                pane: "%2".into(),
+                session_id: None,
+            },
+        )
+        .unwrap();
+    let mut body = created("Review".into());
+    body.kind = TaskKind::Review;
+    body.judges = Some(if related {
+        id.clone()
+    } else {
+        "t3".parse().unwrap()
+    });
+    state
+        .apply(base + 4, now, &OrgEvent::TaskCreated(body))
+        .unwrap();
+    if assigned {
+        state
+            .apply(
+                base + 5,
+                now,
+                &OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+                    task_id: review.clone(),
+                    agent_id: "p/reviewer".parse().unwrap(),
+                    by: Address::Owner,
+                }),
+            )
+            .unwrap();
+    }
+    state
+        .apply(
+            base + 6,
+            now,
+            &OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+                task_id: review.clone(),
+                state: review_state,
+                reason: Some("é".repeat(8192)),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    state
+        .apply(
+            base + 7,
+            now,
+            &OrgEvent::TaskReviewStarted(atm_org::TaskReviewStarted {
+                task_id: id.clone(),
+                review_task: review.clone(),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    (state, id, review)
+}
+
+// Break caught: historical files/Unicode reasons overflow Notes, or superseded/current/unrelated work is woken.
+#[test]
+fn invalidation_bounds_and_supersession() {
+    for base in [20, u64::MAX - 100] {
+        let (mut state, id, review) = invalidation_context(base, TaskState::Working, true, true);
+        let before = state.task(&id).unwrap().clone();
+        let event = OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+            task_id: id.clone(),
+            state: TaskState::Cancelled,
+            reason: Some("🙂".repeat(4096)),
+            by: Address::Owner,
+        });
+        state.apply(base + 8, chrono::Utc::now(), &event).unwrap();
+        let notes = notifications(&event, Some(&before), &state).unwrap();
+        assert_eq!(notes.len(), 2, "missing bounded live-review notice");
+        assert_eq!(notes[0].task, Some(id.clone()));
+        assert_eq!(notes[1].task, Some(review.clone()));
+        for note in &notes {
+            assert!(note.body.len() < 512);
+            assert!(note.attachments.is_empty());
+            assert!(!note.body.contains('é') && !note.body.contains('🙂'));
+            assert!(note.body.contains(&format!("atm task get {id}")));
+            validate_send(&SendParams {
+                to: note.to.clone(),
+                kind: note.kind,
+                body: note.body.clone(),
+                attachments: note.attachments.clone(),
+                task: note.task.clone(),
+            })
+            .unwrap();
+        }
+        assert!(notes[1].body.contains(&format!("atm task get {review}")));
+        // Restoring the exact linked review suppresses its obsolete invalidation.
+        state
+            .apply(
+                base + 9,
+                chrono::Utc::now(),
+                &OrgEvent::TaskReviewStarted(atm_org::TaskReviewStarted {
+                    task_id: id,
+                    review_task: review,
+                    by: Address::Owner,
+                }),
+            )
+            .unwrap();
+        assert!(notifications(&event, Some(&before), &state)
+            .unwrap()
+            .is_empty());
+    }
+    for review_state in [
+        TaskState::Open,
+        TaskState::Assigned,
+        TaskState::Working,
+        TaskState::Waiting,
+        TaskState::Blocked,
+        TaskState::ChangesRequested,
+        TaskState::Submitted,
+        TaskState::Accepted,
+        TaskState::Cancelled,
+        TaskState::Unknown,
+    ] {
+        for assigned in [false, true] {
+            for related in [false, true] {
+                let (mut state, id, review) =
+                    invalidation_context(20, review_state, assigned, related);
+                let before = state.task(&id).unwrap().clone();
+                let event = OrgEvent::TaskVerdict(TaskVerdictGiven {
+                    task_id: id.clone(),
+                    verdict: TaskVerdict::Accepted,
+                    review_task: None,
+                    note: Some("é".repeat(8192)),
+                    by: Address::Owner,
+                });
+                state.apply(28, chrono::Utc::now(), &event).unwrap();
+                let messages = notifications(&event, Some(&before), &state).unwrap();
+                let live = matches!(
+                    review_state,
+                    TaskState::Assigned
+                        | TaskState::Working
+                        | TaskState::Waiting
+                        | TaskState::Blocked
+                        | TaskState::ChangesRequested
+                );
+                assert_eq!(
+                    messages.len(),
+                    usize::from(live && assigned && related),
+                    "review {review_state:?}, assigned={assigned}, related={related}"
+                );
+                if let Some(note) = messages.first() {
+                    assert_eq!(note.task.as_ref(), Some(&review));
+                    assert_eq!(note.kind, MessageKind::Note);
+                }
+                // A still-current linked R must never be called superseded.
+                let mut current = state.clone();
+                current
+                    .apply(
+                        29,
+                        chrono::Utc::now(),
+                        &OrgEvent::TaskReviewStarted(atm_org::TaskReviewStarted {
+                            task_id: id.clone(),
+                            review_task: review.clone(),
+                            by: Address::Owner,
+                        }),
+                    )
+                    .unwrap();
+                assert!(notifications(&event, Some(&before), &current)
+                    .unwrap()
+                    .is_empty());
+                // An unlinked child that judges T is not discovered by a scan.
+                let mut unlinked = before.clone();
+                unlinked.review_task = None;
+                unlinked.state = TaskState::Submitted;
+                assert!(notifications(&event, Some(&unlinked), &state)
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
+    let mut state = verdict_snapshot(TaskState::Working, true);
+    state
+        .apply(
+            6,
+            chrono::Utc::now(),
+            &OrgEvent::AgentAdopted {
+                agent_id: "p/next".parse().unwrap(),
+                pane: "%2".into(),
+                session_id: None,
+            },
+        )
+        .unwrap();
+    let before = state.task(&"t3".parse().unwrap()).unwrap().clone();
+    let event = OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+        task_id: before.id.clone(),
+        agent_id: "p/next".parse().unwrap(),
+        by: Address::Owner,
+    });
+    state.apply(7, chrono::Utc::now(), &event).unwrap();
+    state
+        .apply(
+            8,
+            chrono::Utc::now(),
+            &OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+                task_id: before.id.clone(),
+                agent_id: "p/worker".parse().unwrap(),
+                by: Address::Owner,
+            }),
+        )
+        .unwrap();
+    assert!(notifications(&event, Some(&before), &state)
+        .unwrap()
+        .iter()
+        .all(|m| m.kind != MessageKind::Note));
+    let mut state = verdict_snapshot(TaskState::Submitted, true);
+    let before = state.task(&"t3".parse().unwrap()).unwrap().clone();
+    let withdrawal = OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+        task_id: before.id.clone(),
+        state: TaskState::Working,
+        reason: None,
+        by: "p/worker".parse().unwrap(),
+    });
+    state.apply(6, chrono::Utc::now(), &withdrawal).unwrap();
+    assert_eq!(
+        notifications(&withdrawal, Some(&before), &state)
+            .unwrap()
+            .len(),
+        1,
+        "missing withdrawal notice"
+    );
+    let working = state.task(&before.id).unwrap().clone();
+    assert!(notifications(&withdrawal, Some(&working), &state)
+        .unwrap()
+        .is_empty());
+    state
+        .apply(
+            7,
+            chrono::Utc::now(),
+            &OrgEvent::TaskSubmitted(atm_org::TaskSubmitted {
+                task_id: before.id.clone(),
+                what: TaskSubmission::Result,
+                files: vec![],
+                by: "p/worker".parse().unwrap(),
+            }),
+        )
+        .unwrap();
+    assert!(notifications(&withdrawal, Some(&before), &state)
+        .unwrap()
+        .is_empty());
+}
+
+// Break caught: missing committed context guesses a recipient or silently reports no notification.
+#[tokio::test]
+async fn missing_invalidation_context_is_explicitly_unconfirmed() {
+    use crate::{
+        eventlog::Envelope,
+        org::{Request, TaskCommit},
+    };
+    use tokio::sync::{broadcast, watch};
+    for missing_before in [false, true] {
+        let (requests, mut receive) = mpsc::channel(8);
+        let (_health, health) = watch::channel(Ok(5));
+        let (committed, _) = broadcast::channel(8);
+        let org = OrgHandle {
+            requests,
+            health,
+            committed,
+            reads: None,
+        };
+        let (before_state, _, _) = invalidation_context(20, TaskState::Working, true, true);
+        let before = before_state.task(&"t20".parse().unwrap()).cloned();
+        let call = tokio::spawn(execute_mutation(
+            org,
+            owner_caller(),
+            |by| TaskCommand::SetState {
+                task_id: "t20".parse().unwrap(),
+                state: TaskState::Cancelled,
+                reason: None,
+                by,
+            },
+            |_| async { panic!("must not guess a notification audience") },
+        ));
+        let Request::Snapshot(reply) = receive.recv().await.unwrap() else {
+            panic!("identity snapshot")
+        };
+        reply.send(before_state.clone()).unwrap();
+        let Request::Execute { reply, now, .. } = receive.recv().await.unwrap() else {
+            panic!("mutation")
+        };
+        let event = OrgEvent::TaskStateChanged(atm_org::TaskStateChanged {
+            task_id: "t20".parse().unwrap(),
+            state: TaskState::Cancelled,
+            reason: None,
+            by: Address::Owner,
+        });
+        reply
+            .send(Ok(TaskCommit {
+                before: if missing_before { None } else { before },
+                events: vec![Envelope {
+                    seq: 28,
+                    ts: now,
+                    kind: event.kind().into(),
+                    body: event.to_body(),
+                }],
+            }))
+            .unwrap();
+        let Request::Snapshot(reply) = receive.recv().await.unwrap() else {
+            panic!("post-commit snapshot")
+        };
+        let mut current = if missing_before {
+            before_state
+        } else {
+            // Preserve T but omit the linked R from the supplied snapshot.
+            let mut current = verdict_snapshot(TaskState::Working, true);
+            current
+                .apply(20, now, &OrgEvent::TaskCreated(created("Work".into())))
+                .unwrap();
+            current
+        };
+        current.apply(28, now, &event).unwrap();
+        reply.send(current).unwrap();
+        let result = serde_json::to_value(call.await.unwrap().unwrap()).unwrap();
+        assert_eq!(result["changed"], true);
+        assert_eq!(
+            result["notification"]["status"], "unconfirmed",
+            "missing context must be explicit"
+        );
+        assert_eq!(
+            result["notification"]["error"]["code"],
+            if missing_before {
+                "internal"
+            } else {
+                "not_found"
+            }
+        );
+    }
+}
+
 // Break caught: answer copies an oversized note/stale files, loses review access, or guesses an assignee.
 #[test]
 fn verdict_answer_reads_note_and_review_by_reference() {

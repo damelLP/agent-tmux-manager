@@ -33,6 +33,40 @@ fn plain(text: &str) -> String {
 }
 
 #[test]
+fn captured_clear_context_hint_preserves_control_and_conversation() {
+    for fixture in [
+        include_str!(
+            "fixtures/screen_styled_s1_sugg2-native-high-hint-only-after-three-turns_2.1.325.txt"
+        ),
+        include_str!(
+            "fixtures/screen_styled_s1_sugg2-drawn-high-hint-only-after-three-turns_2.1.325.txt"
+        ),
+        include_str!("fixtures/screen_styled_s1_sugg2-native-high-hint-only-80_2.1.325.txt"),
+        include_str!("fixtures/screen_styled_s1_sugg2-drawn-high-hint-only-160_2.1.325.txt"),
+        include_str!("fixtures/screen_styled_s1_sugg2-native-high-hint-and-suggestion_2.1.325.txt"),
+        include_str!("fixtures/screen_styled_s1_sugg2-drawn-high-hint-and-suggestion_2.1.325.txt"),
+    ] {
+        let control = observe(fixture);
+        assert_eq!(control.dialog, ControlDialog::None);
+        assert_eq!(control.facts.input, InputState::Empty);
+        assert_eq!(control.facts.turn, TurnState::NotRunning);
+        assert_eq!(control.facts.dialog, atm_core::DialogState::None);
+        assert_eq!(control.facts.fresh_editor, FreshEditorEvidence::Unknown);
+        assert!(control.conversation);
+    }
+    for fixture in [
+        include_str!("fixtures/screen_styled_s1_sugg2-native-high-typed-home-control_2.1.325.txt"),
+        include_str!("fixtures/screen_styled_s1_sugg2-drawn-high-typed-home-control_2.1.325.txt"),
+    ] {
+        let control = observe(fixture);
+        assert_eq!(control.dialog, ControlDialog::None);
+        assert_eq!(control.facts.input, InputState::Draft);
+        assert_eq!(control.facts.turn, TurnState::NotRunning);
+        assert!(control.conversation);
+    }
+}
+
+#[test]
 fn captured_completion_verifies_editor_and_selected_command() {
     let menu = body(capture!("B-clear-001-120x40"));
     assert_eq!(

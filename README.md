@@ -824,6 +824,12 @@ Exit **0** means the selected pair passed the rollout checks, **1** a refusal (r
 
 ## Changelog
 
+### 0.4.2
+
+- **Claude screen reading:** recognises the exact right-aligned `new task? /clear to save N tokens` hint and single-row dim suggestions under the drawn cursor, restoring message delivery, `atm agent clear` and adopt on those screens. Unrecognised layouts still hold.
+- **Workspaces:** new sidebars span existing window splits; sidebar resizes act on the window that changed, not whichever window a client is viewing; same-name workspaces on different tmux socket labels no longer share hook scripts. Run `atm workspace attach` once in an existing workspace to refresh the hooks.
+- **Installer:** when the install directory is not on PATH, the suggested `export PATH=...` line names that directory.
+
 ### 0.4.1
 
 - Includes the pi final-idle forwarder and manual compaction outcomes. Use **pi 1.5.2 or later** (1.5.2 tested); `agent_settled` first shipped in **pi 0.80.4**. The forwarder now sends `agent_settled`, not the low-level `agent_end` that can precede continuation or recovery.

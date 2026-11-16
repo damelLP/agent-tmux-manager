@@ -39,10 +39,23 @@
 //! offline captures above had it off. A suggestion row is then faint in every
 //! non-space cell: the startup `Try "…"`, and the free-text suggestion Claude
 //! shows after a turn. Such a single row is Empty whatever its text. Typed text
-//! was never faint, including the placeholder's own text and its first letter,
-//! and typing removed the suggestion, so a row with a plain or inverse cell
-//! beside faint ones stays Unknown. Not captured: a suggestion after a turn under
-//! the drawn cursor (stays Unknown), and one that wraps to a second row (Draft).
+//! was never faint, including the placeholder's own text and its first letter;
+//! typing removed the startup placeholder. Mixed rows remain Unknown.
+//!
+//! Captured: Claude Code 2.1.325, 2026-11-16, sealed loopback-only private tmux
+//! 3.8 capture-pane -p -e -N with canned Messages SSE; capture root anonymized.
+//! Both native and drawn cursor modes were verified.
+//! A drawn free-text suggestion has an inverse,
+//! non-faint first glyph and a nonempty wholly faint, non-inverse suffix. That
+//! single-row proof also reads Empty, never a staged draft. At 56 columns both
+//! fullscreen and classic truncate long suggestions with an ellipsis; a real
+//! two-row ghost remains unverified and every multiline editor stays Draft.
+//! The same sealed capture also establishes the right-aligned `new task? /clear
+//! to save N tokens` contextual hint at 80/116/160 columns in both cursor modes.
+//! Only its exact shape and two-cell right margin directly above the upper rule
+//! are chrome, not turn evidence. Typed drafts stay Draft; a spinner or unknown
+//! transcript tail above the hint still decides the turn. First-turn auto-mode
+//! prose, other notices and extra footer rows remain unsupported.
 //!
 //! Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e,
 //! custom statusLine. At 80, 116 and 160 columns a custom status line occupies
@@ -306,12 +319,18 @@ fn editor_facts(
         InputState::Draft
     } else if input.is_empty()
         || styled.zip(offset).is_some_and(|(screen, offset)| {
-            // Native cursor: nothing is drawn inverse, and a suggestion, whatever
-            // its text, is faint in every cell. Typed text is never faint.
+            // Native suggestions are wholly faint. A drawn cursor replaces only
+            // the first glyph; a nonempty faint suffix must still prove the ghost.
             let mut cells = input
                 .char_indices()
                 .filter(|(_, c)| !c.is_whitespace())
                 .peekable();
+            if cells.peek().is_some_and(|(i, _)| *i == 0)
+                && screen.inverse_at(offset) == Some(true)
+                && screen.faint_at(offset) == Some(false)
+            {
+                let _ = cells.next();
+            }
             cells.peek().is_some()
                 && cells.all(|(i, _)| {
                     screen.faint_at(offset + i) == Some(true)
@@ -324,20 +343,6 @@ fn editor_facts(
         || (styled.is_some() && input == "Press up to edit queued messages")
     {
         match styled.zip(offset) {
-            Some((screen, offset))
-                if screen.inverse_at(offset) == Some(true)
-                    && screen.faint_at(offset) == Some(false)
-                    && input
-                        .char_indices()
-                        .skip(1)
-                        .filter(|(_, c)| !c.is_whitespace())
-                        .all(|(i, _)| {
-                            screen.faint_at(offset + i) == Some(true)
-                                && screen.inverse_at(offset + i) == Some(false)
-                        }) =>
-            {
-                InputState::Empty
-            }
             Some((screen, offset))
                 if input
                     .char_indices()
@@ -357,10 +362,13 @@ fn editor_facts(
     } else {
         InputState::Draft
     };
-    // The captured native-update failure is a right-aligned chrome row directly
-    // above the border, not active progress. No other history row is skipped here.
+    // Only captured, exactly aligned notices immediately above the border are
+    // chrome. The remaining transcript still decides running/idle/unknown.
     let history_end = match lines.get(..top)?.last().zip(lines.get(top)) {
-        Some((line, border)) if auto_update_failure_notice(line, border.chars().count()) => {
+        Some((line, border))
+            if auto_update_failure_notice(line, border.chars().count())
+                || clear_context_notice(line, border.chars().count()) =>
+        {
             top.saturating_sub(1)
         }
         _ => top,
@@ -411,6 +419,27 @@ fn editor_facts(
     facts.dialog = DialogState::None;
     facts.fresh_editor = fresh_editor;
     Some((facts, draft.filter(|_| input == InputState::Draft)))
+}
+
+fn clear_context_notice(line: &str, columns: usize) -> bool {
+    if !line.starts_with("  ") || line.chars().count().checked_add(2) != Some(columns) {
+        return false;
+    }
+    let Some(count) = line
+        .trim_start_matches(' ')
+        .strip_prefix("new task? /clear to save ")
+        .and_then(|s| s.strip_suffix(" tokens"))
+    else {
+        return false;
+    };
+    let count = count.strip_suffix(['k', 'm', 'b', 't']).unwrap_or(count);
+    let (whole, fraction) = count
+        .split_once('.')
+        .map_or((count, None), |(whole, fraction)| (whole, Some(fraction)));
+    !whole.is_empty()
+        && !whole.starts_with('0')
+        && whole.bytes().all(|c| c.is_ascii_digit())
+        && fraction.is_none_or(|f| matches!(f.as_bytes(), [b'1'..=b'9']))
 }
 
 fn auto_update_failure_notice(line: &str, columns: usize) -> bool {

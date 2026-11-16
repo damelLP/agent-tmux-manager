@@ -2295,10 +2295,10 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     // An older hook line or a hand-run script may omit the window argument.
     // Keep a client attached so an empty target would resolve to its window.
     let _client = ControlClient::attach(create_tmux.label(), &create_session_name);
-    let script = create_data_dir
-        .path()
-        .join("atm")
-        .join(format!("inject-sidebar-{create_session_name}.sh"));
+    let script = single_workspace_script(
+        create_data_dir.path(),
+        &format!("inject-sidebar-{create_session_name}.sh"),
+    );
     let pane_set = || {
         tmux_stdout(
             create_tmux.label(),
@@ -2378,6 +2378,48 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
         "expected 3 windows in the simulated workspace, got {pre_attach_window_count}"
     );
 
+    // Attach must span the window, not only the first pane: cover a single
+    // pane, a top/bottom split and a 2x2 grid at a known geometry.
+    for (index, pane) in pre_attach_panes.iter().enumerate() {
+        tmux_stdout(
+            attach_tmux.label(),
+            &[
+                "resize-window",
+                "-t",
+                &pane.pane_id,
+                "-x",
+                "180",
+                "-y",
+                "85",
+            ],
+        );
+        if index == 0 {
+            continue;
+        }
+        let below = tmux_stdout(
+            attach_tmux.label(),
+            &[
+                "split-window",
+                "-vd",
+                "-t",
+                &pane.pane_id,
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ],
+        );
+        if index == 2 {
+            for target in [&pane.pane_id, below.trim()] {
+                tmux_stdout(attach_tmux.label(), &["split-window", "-hd", "-t", target]);
+            }
+        }
+    }
+    let content_panes = tmux_attach_client
+        .list_panes()
+        .await
+        .expect("split content panes");
+    assert_eq!(content_panes.len(), 7);
+
     let attach_output = command_output(
         Command::new(&env.atm_path)
             .args(["workspace", "attach", &attach_session_name, "--isolate"])
@@ -2422,6 +2464,40 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
         );
     }
 
+    for sidebar in post_attach_panes.iter().filter(|pane| pane.is_sidebar) {
+        assert_eq!(
+            tmux_stdout(
+                attach_tmux.label(),
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &sidebar.pane_id,
+                    "#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}:#{window_height}"
+                ],
+            )
+            .trim(),
+            "0:0:28:85:85",
+            "sidebar must cover the full height of an already split window"
+        );
+    }
+    for pane in &content_panes {
+        assert!(post_attach_panes
+            .iter()
+            .any(|after| after.pane_id == pane.pane_id));
+        let left: u32 = tmux_stdout(
+            attach_tmux.label(),
+            &["display-message", "-p", "-t", &pane.pane_id, "#{pane_left}"],
+        )
+        .trim()
+        .parse()
+        .expect("content pane left");
+        assert!(
+            left >= 29,
+            "content pane must not extend underneath the sidebar"
+        );
+    }
+
     // Verify both hooks attach is responsible for are installed on the
     // session (the divergence with create lives here: create installs
     // only `after-resize-window`).
@@ -2440,63 +2516,80 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
          note in cmd_workspace) should be present; got: {installed_hooks}"
     );
 
-    // Attach runs the resize script once before attaching. Skew the current
-    // window's sidebar with its after-resize-pane hook parked (it skips a
-    // sidebar at its 5-try cap), so only that one-off run can fix it.
-    let current_sidebar = tmux_run_capture(
+    // Every non-current window must be corrected on reattach, not the
+    // attached client's unrelated session. Park hooks at their retry cap so
+    // command completion, not a delayed hook, proves the one-off correction.
+    let other_session = format!("attach-other-{}", std::process::id());
+    let other_pane = tmux_stdout(
         attach_tmux.label(),
         &[
-            "list-panes",
-            "-t",
-            &format!("={attach_session_name}:"),
+            "new-session",
+            "-d",
+            "-s",
+            &other_session,
+            "-P",
             "-F",
-            "#{@atm-sidebar} #{pane_id}",
+            "#{pane_id}",
         ],
     )
-    .expect("list the current window's panes")
-    .lines()
-    .find_map(|line| line.strip_prefix("1 ").map(str::to_string))
-    .expect("the current window has a sidebar");
-    let read_sidebar = |format: &str| {
-        tmux_run_capture(
+    .trim()
+    .to_string();
+    let _client = ControlClient::attach(attach_tmux.label(), &other_session);
+    let other_geometry = || {
+        tmux_stdout(
             attach_tmux.label(),
-            &["display-message", "-p", "-t", &current_sidebar, format],
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &other_pane,
+                "#{pane_id}:#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}",
+            ],
         )
-        .expect("read the current sidebar")
-        .trim()
-        .parse::<u32>()
-        .expect("a number")
     };
-    let expected_width = (read_sidebar("#{window_width}") * 16 / 100).clamp(20, 40);
-    tmux_run_capture(
-        attach_tmux.label(),
-        &[
-            "set-option",
-            "-p",
-            "-t",
-            &current_sidebar,
-            "@atm-sidebar-tries",
-            "5",
-        ],
-    )
-    .expect("park the after-resize-pane hook");
-    tmux_run_capture(
-        attach_tmux.label(),
-        &[
-            "resize-pane",
-            "-t",
-            &current_sidebar,
-            "-x",
-            &(expected_width + 10).to_string(),
-        ],
-    )
-    .expect("skew the current sidebar");
+    let other_before = other_geometry();
+    let sidebars: Vec<_> = post_attach_panes
+        .iter()
+        .filter(|pane| pane.is_sidebar)
+        .collect();
+    for sidebar in &sidebars {
+        tmux_stdout(
+            attach_tmux.label(),
+            &[
+                "set-option",
+                "-p",
+                "-t",
+                &sidebar.pane_id,
+                "@atm-sidebar-tries",
+                "5",
+            ],
+        );
+        tmux_stdout(
+            attach_tmux.label(),
+            &["resize-pane", "-t", &sidebar.pane_id, "-x", "38"],
+        );
+        assert_eq!(
+            tmux_stdout(
+                attach_tmux.label(),
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &sidebar.pane_id,
+                    "#{pane_width}"
+                ]
+            )
+            .trim(),
+            "38"
+        );
+    }
 
     // Idempotency: running attach a second time must NOT add another
     // sidebar to any window. The production code keys off `@atm-sidebar`.
     let attach_output_2 = command_output(
         Command::new(&env.atm_path)
             .args(["workspace", "attach", &attach_session_name, "--isolate"])
+            .env("TMUX_PANE", &other_pane)
             .env("ATM_NO_ATTACH", "1")
             .env("XDG_DATA_HOME", attach_data_dir.path())
             .env("XDG_STATE_HOME", &env.daemon.state_dir)
@@ -2507,20 +2600,218 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
         "second attach failed: stderr={}",
         String::from_utf8_lossy(&attach_output_2.stderr)
     );
+    for sidebar in &sidebars {
+        assert_eq!(
+            tmux_stdout(attach_tmux.label(), &["display-message", "-p", "-t", &sidebar.pane_id, "#{pane_width}"]).trim(),
+            "28",
+            "reattach must resize every explicitly attached window, not the client's current window"
+        );
+    }
     assert_eq!(
-        read_sidebar("#{pane_width}"),
-        expected_width,
-        "attach should run the resize script once before attaching"
+        other_geometry(),
+        other_before,
+        "reattach must leave the other session untouched"
     );
 
     let final_panes = list_panes_with_sidebar_marker(attach_tmux.label())
         .expect("list panes after second attach");
+    assert_eq!(
+        final_panes
+            .iter()
+            .filter(|pane| pane.pane_id != other_pane)
+            .map(|pane| &pane.pane_id)
+            .collect::<std::collections::HashSet<_>>(),
+        post_attach_panes
+            .iter()
+            .map(|pane| &pane.pane_id)
+            .collect::<std::collections::HashSet<_>>(),
+        "reattach must preserve every content and sidebar pane"
+    );
     let final_sidebar_count = final_panes.iter().filter(|p| p.is_sidebar).count();
     assert_eq!(
         final_sidebar_count, 3,
         "second attach should be a no-op for already-injected windows, \
          but ended up with {final_sidebar_count} sidebars"
     );
+}
+
+/// Resize hooks and prefix-R must use their window, even when a different
+/// workspace is current and the server environment leaks its TMUX_PANE.
+async fn scenario_workspace_resize_targets_window(env: &E2eEnv) {
+    let label = PrivateTmux::fresh_label();
+    let data = awkward_data_dir();
+    let tmux = PrivateTmux::start_with_label_session_env(
+        &label,
+        "resize-alpha",
+        [("ATM_SOCKET", env.daemon.socket_path.as_os_str())],
+    );
+    let beta_shell = tmux_stdout(
+        &label,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "resize-beta",
+            "-P",
+            "-F",
+            "#{pane_id}",
+        ],
+    )
+    .trim()
+    .to_string();
+    for session in ["resize-alpha", "resize-beta"] {
+        tmux_stdout(
+            &label,
+            &[
+                "resize-window",
+                "-t",
+                &format!("={session}:"),
+                "-x",
+                "180",
+                "-y",
+                "85",
+            ],
+        );
+        let output = command_output(
+            Command::new(&env.atm_path)
+                .args(["workspace", "attach", session])
+                .env("ATM_TMUX_SOCKET", &label)
+                .env("ATM_NO_ATTACH", "1")
+                .env("ATM_SOCKET", &env.daemon.socket_path)
+                .env("XDG_DATA_HOME", data.path())
+                .env("XDG_STATE_HOME", &env.daemon.state_dir),
+        );
+        assert!(output.status.success(), "attach {session}: {output:?}");
+    }
+    let sidebar = |session: &str| {
+        tmux_stdout(
+            &label,
+            &[
+                "list-panes",
+                "-t",
+                &format!("={session}:"),
+                "-F",
+                "#{@atm-sidebar} #{pane_id}",
+            ],
+        )
+        .lines()
+        .find_map(|line| line.strip_prefix("1 ").map(str::to_string))
+        .expect("workspace sidebar")
+    };
+    let alpha = sidebar("resize-alpha");
+    let beta = sidebar("resize-beta");
+    tmux_stdout(&label, &["select-pane", "-t", &beta_shell]);
+    let mut client = ControlClient::attach(&label, "resize-beta");
+    tmux_stdout(&label, &["set-environment", "-g", "TMUX_PANE", &beta_shell]);
+    let beta_geometry =
+        || {
+            tmux_stdout(&label, &["list-panes", "-t", "=resize-beta:", "-F",
+        "#{pane_id}:#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}:#{pane_active}"])
+        };
+    let before = beta_geometry();
+    let width = || {
+        tmux_stdout(
+            &label,
+            &["display-message", "-p", "-t", &alpha, "#{pane_width}"],
+        )
+    };
+    tmux_stdout(&label, &["resize-window", "-t", &alpha, "-x", "240"]);
+    assert_eq!(
+        width().trim(),
+        "38",
+        "resize-window must correct the triggering window"
+    );
+    assert_eq!(
+        beta_geometry(),
+        before,
+        "resize-window must not change the other workspace"
+    );
+    tmux_stdout(&label, &["resize-pane", "-t", &alpha, "-x", "50"]);
+    assert_eq!(
+        width().trim(),
+        "38",
+        "resize-pane must correct the triggering window"
+    );
+    assert_eq!(
+        beta_geometry(),
+        before,
+        "resize-pane must not change the other workspace"
+    );
+
+    // Prefix-R runs outside hook mode and repairs a sidebar even at its cap.
+    tmux_stdout(
+        &label,
+        &["set-option", "-p", "-t", &alpha, "@atm-sidebar-tries", "5"],
+    );
+    tmux_stdout(&label, &["resize-pane", "-t", &alpha, "-x", "50"]);
+    assert_eq!(
+        width().trim(),
+        "50",
+        "hook must stay parked at its retry cap"
+    );
+    let keys = tmux_stdout(&label, &["list-keys", "-T", "prefix"]);
+    let command = keys
+        .lines()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some("bind-key")
+                && words.next() == Some("-T")
+                && words.next() == Some("prefix")
+                && words.next() == Some("R"))
+            .then(|| words.collect::<Vec<_>>().join(" "))
+        })
+        .expect("prefix-R command");
+    client.child.stdin.as_mut().expect("control stdin").write_all(
+        format!("switch-client -t '=resize-alpha:'\n{command}\ndisplay-message -p resize-key-done\n").as_bytes()
+    ).expect("run prefix-R in its client's queue");
+    client
+        .until(|line| line.trim() == "resize-key-done")
+        .expect("prefix-R completion");
+    assert_eq!(
+        width().trim(),
+        "38",
+        "prefix-R must resize its client's window"
+    );
+    assert_eq!(
+        beta_geometry(),
+        before,
+        "prefix-R must not follow leaked TMUX_PANE"
+    );
+
+    // Empty -t falls back to current on both supported tmux versions. Leave
+    // that other pane deliberately skewed so removing the guard changes it.
+    let pane_set = || {
+        tmux_stdout(&label, &["list-panes", "-a", "-F",
+        "#{pane_id}:#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}:#{@atm-sidebar-tries}"])
+    };
+    let script = single_workspace_script(data.path(), "resize-sidebar-resize-alpha.sh");
+    let mut changed = Vec::new();
+    for args in [&[][..], &[""][..]] {
+        tmux_stdout(
+            &label,
+            &["set-option", "-p", "-t", &beta, "@atm-sidebar-tries", "5"],
+        );
+        tmux_stdout(&label, &["resize-pane", "-t", &beta, "-x", "38"]);
+        let before = pane_set();
+        let output = command_output(
+            Command::new(&script)
+                .args(args)
+                .env("TMUX_PANE", &beta_shell),
+        );
+        assert!(
+            output.status.success() && output.stdout.is_empty() && output.stderr.is_empty(),
+            "{args:?}: {output:?}"
+        );
+        if pane_set() != before {
+            changed.push(format!("{args:?}"));
+        }
+    }
+    assert!(
+        changed.is_empty(),
+        "resize without a window changed panes: {changed:?}"
+    );
+    drop(client);
+    drop(tmux);
 }
 
 /// Scenario 5c — `atm workspace attach` with no name auto-picks the most
@@ -3608,6 +3899,243 @@ async fn atm_atmd_tmux_end_to_end() {
     scenario_tui_capture_preview_filter(&env).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn workspace_resize_uses_triggering_window() {
+    let Some(env) = E2eEnv::try_setup().await else {
+        return;
+    };
+    scenario_workspace_resize_targets_window(&env).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn workspace_scripts_do_not_cross_tmux_sockets() {
+    let Some(env) = E2eEnv::try_setup().await else {
+        return;
+    };
+    for reverse in [false, true] {
+        let data = awkward_data_dir();
+        let session = format!("shared-{}-{}", std::process::id(), u8::from(reverse));
+        let labels = [PrivateTmux::fresh_label(), format!("atm-{session}")];
+        let servers: Vec<_> = labels
+            .iter()
+            .map(|label| {
+                PrivateTmux::start_with_label_session_env(
+                    label,
+                    &session,
+                    [("ATM_SOCKET", env.daemon.socket_path.as_os_str())],
+                )
+            })
+            .collect();
+        let install = |index: usize| {
+            let mut command = Command::new(&env.atm_path);
+            command.args(["workspace", "attach", &session]);
+            if index == 1 {
+                command.arg("--isolate");
+            }
+            let output = command_output(
+                command
+                    .env("ATM_TMUX_SOCKET", &labels[index])
+                    .env("ATM_NO_ATTACH", "1")
+                    .env("ATM_SOCKET", &env.daemon.socket_path)
+                    .env("XDG_DATA_HOME", data.path())
+                    .env("XDG_STATE_HOME", &env.daemon.state_dir),
+            );
+            assert!(output.status.success(), "attach socket {index}: {output:?}");
+        };
+        let state = |index: usize| {
+            tmux_stdout(&labels[index], &["list-panes", "-a", "-F",
+            "#{window_id}:#{pane_id}:#{@atm-sidebar}:#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}:#{pane_active}"])
+        };
+        let new_window = |index: usize| {
+            tmux_stdout(
+                &labels[index],
+                &[
+                    "new-window",
+                    "-d",
+                    "-t",
+                    &format!("={session}:"),
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                ],
+            )
+            .trim()
+            .to_string()
+        };
+        let sidebar_count = |index: usize, window: &str| {
+            tmux_stdout(
+                &labels[index],
+                &["list-panes", "-t", window, "-F", "#{@atm-sidebar}"],
+            )
+            .lines()
+            .filter(|line| *line == "1")
+            .count()
+        };
+        for label in &labels {
+            tmux_stdout(
+                label,
+                &[
+                    "resize-window",
+                    "-t",
+                    &format!("={session}:"),
+                    "-x",
+                    "180",
+                    "-y",
+                    "85",
+                ],
+            );
+        }
+        let [first, second] = if reverse { [1, 0] } else { [0, 1] };
+        install(first);
+        let filenames = [
+            format!("inject-sidebar-{session}.sh"),
+            format!("resize-sidebar-{session}.sh"),
+        ];
+        let original_scripts: Vec<_> = filenames
+            .iter()
+            .map(|name| {
+                let paths = workspace_script_paths(data.path(), name);
+                assert_eq!(paths.len(), 1);
+                let path = paths.into_iter().next().expect("installed script");
+                let content = std::fs::read_to_string(&path).expect("script contents");
+                (path, content)
+            })
+            .collect();
+        install(second);
+
+        // Both servers deliberately have the same numeric window IDs. A
+        // window argument alone cannot save a script overwritten for another socket.
+        let second_window = new_window(second);
+        let second_before = state(second);
+        let first_window = new_window(first);
+        assert_eq!(
+            first_window, second_window,
+            "matching server-local window IDs"
+        );
+        assert_eq!(
+            sidebar_count(first, &first_window),
+            1,
+            "new sidebar must stay on its own socket"
+        );
+        assert_eq!(
+            state(second),
+            second_before,
+            "new-window must not add a sidebar to the other socket"
+        );
+        let first_next = new_window(first);
+        let first_before = state(first);
+        let second_next = new_window(second);
+        assert_eq!(first_next, second_next);
+        assert_eq!(sidebar_count(second, &second_next), 1);
+        assert_eq!(
+            state(first),
+            first_before,
+            "reverse new-window must not touch the first socket"
+        );
+
+        for (path, content) in &original_scripts {
+            assert_eq!(
+                std::fs::read_to_string(path).expect("original retained script"),
+                *content,
+                "second install must not overwrite the first script"
+            );
+        }
+        for filename in &filenames {
+            assert_eq!(
+                workspace_script_paths(data.path(), filename).len(),
+                2,
+                "same-name scripts need separate socket namespaces"
+            );
+        }
+        let injection_paths = workspace_script_paths(data.path(), &filenames[0]);
+        let first_path = &original_scripts[0].0;
+        let second_path = injection_paths
+            .iter()
+            .find(|path| *path != first_path)
+            .expect("second socket's script");
+        for (index, path) in [(first, first_path), (second, second_path)] {
+            let namespace = path
+                .parent()
+                .expect("script namespace")
+                .file_name()
+                .expect("namespace name")
+                .to_str()
+                .expect("namespace UTF-8");
+            assert!(tmux_stdout(
+                &labels[index],
+                &["show-hooks", "-t", &format!("={session}:")]
+            )
+            .contains(&format!("/{namespace}/")));
+        }
+        for (index, label) in labels.iter().enumerate() {
+            let sidebar = tmux_stdout(
+                label,
+                &[
+                    "list-panes",
+                    "-t",
+                    &format!("={session}:@0"),
+                    "-F",
+                    "#{@atm-sidebar} #{pane_id}",
+                ],
+            )
+            .lines()
+            .find_map(|line| line.strip_prefix("1 ").map(str::to_string))
+            .expect("original sidebar");
+            let other_before = state(1 - index);
+            tmux_stdout(label, &["resize-window", "-t", &sidebar, "-x", "240"]);
+            assert_eq!(
+                tmux_stdout(
+                    label,
+                    &["display-message", "-p", "-t", &sidebar, "#{pane_width}"]
+                )
+                .trim(),
+                "38",
+                "resize hook must use its own socket's script"
+            );
+            assert_eq!(
+                state(1 - index),
+                other_before,
+                "resize must not touch the other socket"
+            );
+            tmux_stdout(
+                label,
+                &[
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &sidebar,
+                    "@atm-sidebar-tries",
+                    "5",
+                ],
+            );
+            tmux_stdout(label, &["resize-pane", "-t", &sidebar, "-x", "50"]);
+            install(index);
+            assert_eq!(
+                tmux_stdout(
+                    label,
+                    &["display-message", "-p", "-t", &sidebar, "#{pane_width}"]
+                )
+                .trim(),
+                "38",
+                "reattach must find its own resize script"
+            );
+            assert_eq!(
+                state(1 - index),
+                other_before,
+                "reattach must not touch the other socket"
+            );
+        }
+        for filename in &filenames {
+            assert_eq!(
+                workspace_script_paths(data.path(), filename).len(),
+                2,
+                "reattach must reuse stable script paths"
+            );
+        }
+        drop(servers);
+    }
+}
+
 #[derive(Debug)]
 struct PaneEntry {
     window_id: String,
@@ -3654,6 +4182,31 @@ fn awkward_data_dir() -> TempDir {
         .prefix("atm data 'q\" $HOME #S ")
         .tempdir()
         .expect("create workspace data tempdir")
+}
+
+fn single_workspace_script(data: &Path, filename: &str) -> PathBuf {
+    let mut paths = workspace_script_paths(data, filename);
+    assert_eq!(paths.len(), 1, "one installed {filename}");
+    paths.pop().expect("installed workspace script")
+}
+
+/// Find generated artifacts without duplicating the production path encoder.
+/// Accept the old flat layout too, so the routing regression can run RED.
+fn workspace_script_paths(data: &Path, filename: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(data.join("atm")).expect("workspace script base") {
+        let entry = entry.expect("script entry");
+        let path = if entry.file_type().expect("script entry type").is_dir() {
+            entry.path().join(filename)
+        } else {
+            entry.path()
+        };
+        if path.file_name() == Some(std::ffi::OsStr::new(filename)) && path.is_file() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
 }
 
 struct ControlClient {

@@ -720,6 +720,366 @@ fn above_completion_preserves_legacy_draft_facts() {
     }
 }
 
+const SUGG2_TEXT: &str =
+    "check the captured suggestion after resizing the terminal to a narrow width";
+const SUGG2_DRAWN: &str = capture!("s1_sugg2-drawn-low-suggestion");
+const SUGG2_DRAWN_ROW: &str = "\x1b[7mc\x1b[0;2mheck the captured suggestion after resizing the terminal to a narrow width\x1b[0m";
+
+#[test]
+fn captured_drawn_cursor_suggestions_are_empty_and_never_staged() {
+    for text in [
+        SUGG2_DRAWN,
+        capture!("s1_sugg2-drawn-low-narrow-truncated-suggestion"),
+        capture!("s1_sugg2-drawn-low-classic-suggestion"),
+        capture!("s1_sugg2-native-low-suggestion"),
+        capture!("s1_sugg2-native-low-narrow-truncated-suggestion"),
+        capture!("s1_sugg2-native-low-classic-suggestion"),
+    ] {
+        check(
+            text,
+            facts(
+                InputState::Empty,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        let control = screen::observe_control_screen(body(ScreenInput::Styled(text)), None);
+        assert_eq!(
+            control.dialog,
+            atm_core::harness_control::ControlDialog::None
+        );
+        assert!(control.conversation);
+        for expected in [SUGG2_TEXT, "/clear"] {
+            assert_eq!(
+                staged_draft_matches(ScreenInput::Styled(text), expected),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn drawn_suggestion_mutations_never_hide_authored_text() {
+    assert!(SUGG2_DRAWN.contains(SUGG2_DRAWN_ROW));
+    // Synthetic: change the captured cursor/suffix evidence, not the editor frame.
+    for row in [
+        "c\x1b[2mheck the suggestion\x1b[0m",
+        "\x1b[2;7mc\x1b[0;2mheck the suggestion\x1b[0m",
+        "\x1b[7mc\x1b[0;2mheck \x1b[7mthe\x1b[27m suggestion\x1b[0m",
+        "\x1b[7mc\x1b[0;2mheck the\x1b[0m suggestion",
+        "check \x1b[2mthe\x1b[0m suggestion",
+        " \x1b[7mc\x1b[0;2mheck the suggestion\x1b[0m",
+        "\u{a0}\x1b[7mc\x1b[0;2mheck the suggestion\x1b[0m",
+        // The cursor is over leading padding, not the first non-space glyph.
+        "\x1b[7m \x1b[0mc\x1b[2mheck the suggestion\x1b[0m",
+        "\x1b[2;7mx\x1b[0m",
+    ] {
+        let text = SUGG2_DRAWN.replace(SUGG2_DRAWN_ROW, row);
+        assert_eq!(
+            observe_screen(ScreenInput::Styled(&text), None).input,
+            InputState::Unknown,
+            "{row:?}"
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&text), SUGG2_TEXT),
+            None,
+            "{row:?}"
+        );
+    }
+    // Synthetic: identical visible text without faint styling is authored input,
+    // including a single glyph under a drawn cursor and non-ASCII typed text.
+    for (row, expected) in [
+        (SUGG2_TEXT, SUGG2_TEXT),
+        ("\x1b[7mc\x1b[0mheck the captured suggestion after resizing the terminal to a narrow width", SUGG2_TEXT),
+        ("\x1b[7mx\x1b[0m", "x"),
+        ("\x1b[7m界\x1b[0mé typed", "界é typed"),
+    ] {
+        let text = SUGG2_DRAWN.replace(SUGG2_DRAWN_ROW, row);
+        assert_eq!(observe_screen(ScreenInput::Styled(&text), None).input, InputState::Draft, "{row:?}");
+        assert_eq!(staged_draft_matches(ScreenInput::Styled(&text), expected), Some(true), "{row:?}");
+    }
+    // Synthetic: filtering whitespace must not make a vacuous suffix prove empty.
+    for row in ["\u{a0}", "\u{3000}", "\x1b[7mx\x1b[0m   "] {
+        let text = SUGG2_DRAWN.replace(SUGG2_DRAWN_ROW, row);
+        assert_eq!(
+            observe_screen(ScreenInput::Styled(&text), None).input,
+            InputState::Draft,
+            "{row:?}"
+        );
+    }
+    // Synthetic: UTF-8 character starts, not byte-count cursor coordinates.
+    let unicode = SUGG2_DRAWN.replace(SUGG2_DRAWN_ROW, "\x1b[7m界\x1b[0;2mé suggestion\x1b[0m");
+    assert_eq!(
+        observe_screen(ScreenInput::Styled(&unicode), None).input,
+        InputState::Empty
+    );
+    assert_eq!(
+        staged_draft_matches(ScreenInput::Styled(&unicode), "界é suggestion"),
+        None
+    );
+    // Synthetic: a second row remains a draft even when both rows look faint.
+    let multi = SUGG2_DRAWN.replace(
+        SUGG2_DRAWN_ROW,
+        &format!("{SUGG2_DRAWN_ROW}\n  \x1b[2mcontinued\x1b[0m"),
+    );
+    assert_eq!(
+        observe_screen(ScreenInput::Styled(&multi), None).input,
+        InputState::Draft
+    );
+    assert_eq!(
+        staged_draft_matches(ScreenInput::Styled(&multi), SUGG2_TEXT),
+        None
+    );
+}
+
+const SUGG2_HINT: &str = capture!("s1_sugg2-native-high-hint-only-after-three-turns");
+
+#[test]
+fn captured_clear_context_hint_does_not_mask_turn_completion() {
+    for text in [
+        SUGG2_HINT,
+        capture!("s1_sugg2-native-high-hint-only-80"),
+        capture!("s1_sugg2-native-high-hint-only-160"),
+        capture!("s1_sugg2-drawn-high-hint-only-after-three-turns"),
+        capture!("s1_sugg2-drawn-high-hint-only-80"),
+        capture!("s1_sugg2-drawn-high-hint-only-160"),
+        capture!("s1_sugg2-native-high-hint-and-suggestion"),
+        capture!("s1_sugg2-drawn-high-hint-and-suggestion"),
+    ] {
+        check(
+            text,
+            facts(
+                InputState::Empty,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        for expected in ["/clear", SUGG2_TEXT] {
+            assert_eq!(
+                staged_draft_matches(ScreenInput::Styled(text), expected),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn clear_hint_preserves_real_typed_drafts_and_unknown_tails() {
+    for text in [
+        capture!("s1_sugg2-native-high-typed-control"),
+        capture!("s1_sugg2-native-high-typed-home-control"),
+        capture!("s1_sugg2-drawn-high-typed-control"),
+        capture!("s1_sugg2-drawn-high-typed-home-control"),
+    ] {
+        check(
+            text,
+            facts(
+                InputState::Draft,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(text), "literal typed draft"),
+            Some(true)
+        );
+        for expected in ["/clear", SUGG2_TEXT] {
+            assert_eq!(
+                staged_draft_matches(ScreenInput::Styled(text), expected),
+                Some(false)
+            );
+        }
+    }
+    for text in [
+        capture!("s1_sugg2-native-high-hint-only"),
+        capture!("s1_sugg2-drawn-high-hint-only"),
+    ] {
+        // The real first-turn auto-mode explanation still follows the done row.
+        check(
+            text,
+            facts(
+                InputState::Empty,
+                TurnState::Unknown,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+    }
+    for text in [
+        capture!("s1_sugg2-native-low-wrapped-typed-control"),
+        capture!("s1_sugg2-drawn-low-wrapped-typed-control"),
+    ] {
+        check(
+            text,
+            facts(
+                InputState::Draft,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(text), SUGG2_TEXT),
+            None
+        );
+    }
+    for text in [
+        capture!("s1_sugg2-native-low-classic-narrow-truncated-suggestion"),
+        capture!("s1_sugg2-drawn-low-classic-narrow-truncated-suggestion"),
+        capture!("s1_sugg2-native-low-classic-wrapped-typed-control"),
+        capture!("s1_sugg2-drawn-low-classic-wrapped-typed-control"),
+    ] {
+        // The extra effort row below the classic footer is still unsupported.
+        check(text, ScreenFacts::default());
+        assert_eq!(
+            screen::observe_control_screen(body(ScreenInput::Styled(text)), None).dialog,
+            atm_core::harness_control::ControlDialog::Unknown
+        );
+    }
+    for text in [
+        capture!("s1_sugg2-native-low-typed-control"),
+        capture!("s1_sugg2-drawn-low-typed-control"),
+    ] {
+        // Ctrl+U left a first-row draft and an unsupported above-border Ctrl+Y notice.
+        let observed = observe_screen(ScreenInput::Styled(text), None);
+        assert_eq!(observed.input, InputState::Draft);
+        assert_eq!(observed.turn, TurnState::Unknown);
+    }
+}
+
+fn sugg2_hint_row(text: &str) -> &str {
+    text.lines()
+        .find(|row| row.contains("new task? /clear to save"))
+        .unwrap_or_else(|| panic!("missing clear-context hint in fixture"))
+}
+
+fn sugg2_aligned_hint(count: &str) -> String {
+    format!(
+        "{:>114}",
+        format!("new task? /clear to save {count} tokens")
+    )
+}
+
+#[test]
+fn clear_hint_compact_values_preserve_input() {
+    // Synthetic: keep the real 116-column slot/alignment while varying its value.
+    let text = custom_status_plain(SUGG2_HINT);
+    for count in ["100k", "355k", "1.2m", "999", "1b", "2.3t"] {
+        let changed = text.replace(sugg2_hint_row(&text), &sugg2_aligned_hint(count));
+        check(
+            &changed,
+            facts(
+                InputState::Empty,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        // The same hint-looking text, actually authored in the editor, is a draft.
+        let literal = format!("new task? /clear to save {count} tokens");
+        let draft = changed.replace("❯\u{a0}", &format!("❯\u{a0}{literal}"));
+        check(
+            &draft,
+            facts(
+                InputState::Draft,
+                TurnState::NotRunning,
+                FreshEditorEvidence::Unknown,
+            ),
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&draft), &literal),
+            Some(true)
+        );
+        assert_eq!(
+            staged_draft_matches(ScreenInput::Styled(&draft), "/clear"),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn clear_hint_mutations_never_manufacture_idle() {
+    let text = custom_status_plain(SUGG2_HINT);
+    let hint = sugg2_hint_row(&text);
+    // Synthetic: noncanonical/unrecognized values cannot hide unknown history.
+    for count in [
+        "0",
+        "01k",
+        "+155k",
+        "-155k",
+        "1.0m",
+        "1.23m",
+        "155K",
+        "1e5",
+        "1,000k",
+        "NaN",
+        "155k extra",
+    ] {
+        let changed = text.replace(hint, &sugg2_aligned_hint(count));
+        assert_eq!(
+            observe_screen(ScreenInput::Styled(&changed), None).turn,
+            TurnState::Unknown,
+            "{count}"
+        );
+    }
+    // Synthetic: location, shape and frame bounds are not optional notice metadata.
+    for (why, changed) in [
+        ("wrong prose", text.replace("new task?", "new work?")),
+        (
+            "wrong command",
+            text.replace("/clear to save", "/other to save"),
+        ),
+        ("wrong unit", text.replace("155k tokens", "155k items ")),
+        (
+            "right margin three",
+            text.replace(hint, hint.trim_end_matches(' ').strip_prefix(' ').unwrap()),
+        ),
+        (
+            "right margin one",
+            text.replace(hint, &format!(" {}", hint.trim_end_matches(' '))),
+        ),
+        ("no indentation", text.replace(hint, hint.trim())),
+        ("displaced hint", text.replace(hint, &format!("{hint}\n"))),
+        (
+            "second hint",
+            text.replace(hint, &format!("{hint}\n{hint}")),
+        ),
+        (
+            "unknown tail",
+            text.replace(hint, &format!("{hint}\nUnknown active operation")),
+        ),
+        ("missing upper rule", text.replacen(&"─".repeat(116), "", 1)),
+        ("unknown footer", text.replace("cycle)", "changed)")),
+    ] {
+        assert_ne!(changed, text, "{why}");
+        assert_eq!(
+            observe_screen(ScreenInput::Styled(&changed), None).turn,
+            TurnState::Unknown,
+            "{why}"
+        );
+        assert_ne!(
+            staged_draft_matches(ScreenInput::Styled(&changed), "/clear"),
+            Some(true),
+            "{why}"
+        );
+    }
+    let done = text
+        .lines()
+        .rev()
+        .find(|row| row.contains(" · done "))
+        .unwrap();
+    let at = text.rfind(done).unwrap();
+    for (status, expected) in [
+        ("✻ Generating…", TurnState::Running),
+        ("Unknown active operation", TurnState::Unknown),
+    ] {
+        // Synthetic: a valid hint must never replace the actual status decision.
+        let mut changed = text.clone();
+        changed.replace_range(at..at + done.len(), status);
+        assert_eq!(
+            observe_screen(ScreenInput::Styled(&changed), None).turn,
+            expected
+        );
+    }
+}
+
 // Native-cursor rendering: Claude shows the terminal's own cursor and draws no
 // inverse cell, so a suggestion row is faint from its first cell on.
 const NATIVE_FRESH: &str = capture!("s1_native-fresh-placeholder");

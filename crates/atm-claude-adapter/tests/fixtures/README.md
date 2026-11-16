@@ -233,6 +233,78 @@ in the control observer. The manual queued staged check remains None. The queued
 frame's captured editor row is also transplanted into supported auto chrome in
 a labelled Synthetic test. A match alone never proves what Enter will do.
 
+## Post-turn suggestions in both cursor modes (stage 1)
+
+Captured: Claude Code 2.1.325, 2026-11-16, sealed loopback-only private tmux
+3.8 `capture-pane -p -e -N` with local canned Messages SSE; capture root anonymized.
+The fixture `screen_styled_s1_sugg2-<case>_2.1.325.txt` maps to raw
+`claude-<case>_2.1.325.styled-N`. Only full or clipped private run-root prefixes
+become equal-width generic `/tmp/xxx…` or `/…/xxx…` prefixes; all other captured
+bytes, including suffixes, escapes and grid padding, are unchanged apart from
+its provenance line. No owner config, credentials, skills, plugins or external
+network were available.
+Response/suggestion text and usage came from the local stub; the real CLI
+rendered every captured row.
+
+| Case | Renderer / columns | Cursor | Input / turn |
+|---|---|---|---|
+| native-low-suggestion | fullscreen / 116 | native | Empty / NotRunning |
+| drawn-low-suggestion | fullscreen / 116 | drawn | Empty / NotRunning |
+| native-low-narrow-truncated-suggestion | fullscreen / 56 | native | Empty / NotRunning |
+| drawn-low-narrow-truncated-suggestion | fullscreen / 56 | drawn | Empty / NotRunning |
+| native-low-classic-suggestion | classic / 116 | native | Empty / NotRunning |
+| drawn-low-classic-suggestion | classic / 116 | drawn | Empty / NotRunning |
+
+All six have a conversation, no control dialog and unknown fresh evidence;
+none stages any command. Cursor sidecars report native `cursor_flag=1` with
+`CLAUDE_CODE_NATIVE_CURSOR=1`, drawn `0` in clean config without that flag.
+Cursor coordinates are not parser inputs. Drawn suggestions have an inverse,
+non-faint first glyph and a **nonempty** faint/non-inverse suffix; native
+suggestions are faint throughout. Classic spaces between faint words may be
+plain. A lone inverse typed glyph, mixed text or a cursor after leading plain
+whitespace is not that proof. Synthetic mutations in `tests/styled_screen.rs`
+pin those boundaries and non-ASCII byte offsets.
+
+The 75-character suggestion truncates with `…` at 56 columns in both cursor
+modes and both renderers; no genuine two-row ghost was obtained. Actually
+pasted/wrapped text is not a suggestion. Narrow classic's extra footer row
+and deleted-text notices remain unsupported rather than guessed idle.
+
+### Clear-context hints and real draft controls
+
+Captured: Claude Code 2.1.325, 2026-11-16, the same sealed loopback-only private
+tmux 3.8 `capture-pane -p -e -N` and local canned Messages SSE; capture root anonymized.
+These files use the same `screen_styled_s1_sugg2-<case>_2.1.325.txt` mapping and
+only the equal-width run-root substitutions described above. Each row below has
+both `native-` and `drawn-` variants, with cursor flags recorded independently
+as 1 and 0 respectively.
+
+| Case after cursor prefix | Columns | Input / turn |
+|---|---|---|
+| high-hint-only-after-three-turns | 116 | Empty / NotRunning |
+| high-hint-only-80 | 80 | Empty / NotRunning |
+| high-hint-only-160 | 160 | Empty / NotRunning |
+| high-hint-and-suggestion | 116 | Empty / NotRunning |
+| high-typed-control | 116 | Draft / NotRunning |
+| high-typed-home-control | 116 | Draft / NotRunning |
+| high-hint-only | 116 | Empty / Unknown (first-turn auto-mode explanation follows done) |
+| low-wrapped-typed-control | 56 | Draft / NotRunning, staging None |
+| low-classic-narrow-truncated-suggestion | 56 | all Unknown (extra effort row below footer) |
+| low-classic-wrapped-typed-control | 56 | all Unknown (same unsupported footer) |
+| low-typed-control | 116 | Draft / Unknown (above-border Ctrl+Y notice; native header also partial) |
+
+The hint reads `new task? /clear to save 155k tokens`: usage is a synthetic API
+input, not real token consumption. Its idle threshold was injected as zero;
+no sleep produced the state. Only this exact adjacent right-aligned chrome,
+with its two-cell right margin, is excluded from turn evidence. The existing
+spinner/done/unknown-tail reader still decides activity; hint text is never
+input evidence. The high typed controls stage `literal typed draft` exactly
+and refuse `/clear`; suggestion and multirow frames never stage a command.
+All ordinary high frames retain conversation evidence and no control dialog,
+but none establishes freshness. First-turn auto-mode prose, extra footers and
+the deleted-text notice stay closed. Synthetic mutations pin compact-number
+shape, position, alignment, active progress and authored hint-looking text.
+
 ## Native-cursor fixtures (stage 1)
 
 `screen_styled_s1_native-<state>_2.1.325.txt`. Bytes are unchanged; the first
@@ -257,17 +329,18 @@ status line silenced for the launch):
 | `typed-abc` | `abc` typed | Draft | NotRunning | Unknown |
 | `same-text-draft-home` | the placeholder's own text typed, cursor moved to its start | Draft | NotRunning | Unknown |
 
-In all five tmux reported a visible cursor (`cursor_flag=1`): Claude shows the
-terminal's cursor and draws no inverse cell. The same sealed check found the
+In the three sealed captures tmux reported a visible cursor (`cursor_flag=1`):
+Claude shows the terminal's cursor and draws no inverse cell. Cursor sidecars
+were not recorded for the two rehearsal captures. The same sealed check found the
 placeholder row unchanged with no tmux client, with a focused one, after a
 terminal focus-out and focus-in, with the classic renderer, and without the
 launching shell's `CLAUDE*` variables. The U5b and P1 captures above came from
 offline clean configurations, where Claude draws its own inverse cursor.
 
-Not captured, and so not read as Empty: a suggestion after a turn under the
-drawn cursor (Unknown), and a suggestion that wraps to a second row (Draft).
-A status-line row between the editor and the footer also remains Unknown.
-Synthetic mutations are labelled in `tests/styled_screen.rs`.
+The later suggestion captures below establish the drawn-cursor case too.
+A genuine wrapped suggestion remains uncaptured; every two-row editor stays Draft.
+Custom status-line support is described above; unrelated footer layouts still
+refuse. Synthetic mutations are labelled in `tests/styled_screen.rs`.
 
 The original text fixtures are the 15 distinct frames among 48 raw U5 Claude
 screens (40 rows, 120 columns). The additional coordinator and U5b frames are

@@ -111,6 +111,35 @@
 //! no capture. `Synthetic:` marks the tests and examples whose shapes
 //! or values no capture produced.
 //!
+//! ## Conversation bodies and busy-row limits
+//!
+//! pi-atm sends empty payloads for `context`, `turn_end` and `agent_end`.
+//! Context usage/model come from the envelope; `agent_end` needs no body
+//! to become `WorkingEnd`. Legacy full-body frames still translate.
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed SDK session with a scripted local
+//! reply (no model call), events and outgoing Unix-socket frames measured.
+//! Seeded conversation text and the scripted reply were each 1,100,000
+//! characters: pi's raw context, turn-end and agent-end events each exceeded
+//! 1 MiB. Before thinning, context and agent-end wire frames exceeded atmd's
+//! 1 MiB line limit too; turn-end was already trimmed. The envelope carries
+//! the usage snapshot without those bodies.
+//!
+//! Synthetic: the same day's private-atmd probe fed the original extension
+//! an oversized agent-end callback. The daemon closed that connection and
+//! kept Working; an end sent during reconnect backoff was lost too. A small
+//! end after reconnect restored Idle. This is not attribution of a live
+//! stale-row incident, nor a general size bound on other event bodies.
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed SDK session, an input handler
+//! consumed an interactive input, original pi-atm and a private real atmd.
+//! Pi emitted session-start and input, but no agent-start or agent-end:
+//! pi was idle while atmd showed Working. No model was called. Payload
+//! thinning cannot fix an event that never fires. Pi 1.5.2 also distinguishes
+//! low-level `agent_end` from final `agent_settled`; pi-atm still forwards
+//! only the former. Heartbeat, restart resynchronization and final-idle
+//! semantics are unchanged. Neither probe verified the reported live cause.
+//!
 //! ## Cost and tokens
 //!
 //! pi prices each reply on its own: an assistant message's `usage`

@@ -7,6 +7,7 @@
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Style {
+    bold: bool,
     faint: bool,
     inverse: bool,
 }
@@ -83,6 +84,12 @@ impl StyledScreen {
         &self.text
     }
 
+    /// Read bold at a decoded UTF-8 character start; LF, non-boundary and invalid offsets give None.
+    #[must_use]
+    pub fn bold_at(&self, byte_offset: usize) -> Option<bool> {
+        self.style_at(byte_offset).map(|s| s.bold)
+    }
+
     /// Read faint at a decoded UTF-8 character start; LF, non-boundary and invalid offsets give None.
     #[must_use]
     pub fn faint_at(&self, byte_offset: usize) -> Option<bool> {
@@ -118,11 +125,15 @@ impl Style {
         while let Some(value) = values.next() {
             match value {
                 0 => *self = Self::default(),
+                1 => self.bold = true,
                 2 => self.faint = true,
                 7 => self.inverse = true,
-                22 => self.faint = false,
+                22 => {
+                    self.bold = false;
+                    self.faint = false;
+                }
                 27 => self.inverse = false,
-                1 | 3 | 23 | 30..=37 | 39 | 40..=47 | 49 | 90..=97 | 100..=107 => {}
+                3 | 23 | 30..=37 | 39 | 40..=47 | 49 | 90..=97 | 100..=107 => {}
                 38 | 48 => {
                     let count = match values.next() {
                         Some(5) => 1,
@@ -233,6 +244,69 @@ mod tests {
         assert_eq!(s.inverse_at(3), Some(true));
         for i in [1, 2, 4, 5, 6, usize::MAX] {
             assert_eq!(s.inverse_at(i), None);
+        }
+    }
+
+    #[test]
+    fn bold_state_and_intensity_resets() {
+        let s = StyledScreen::parse(
+            "\x1b[1mA\x1b[2mB\x1b[22mC\x1b[1;2mD\x1b[0mE\x1b[1mF\x1b[mG\x1b[22;1mH\x1b[1;22mI\x1b[2;1mJ",
+        )
+        .unwrap();
+        assert_eq!(s.text(), "ABCDEFGHIJ");
+        for (offset, bold, faint) in [
+            (0, true, false),
+            (1, true, true),
+            (2, false, false),
+            (3, true, true),
+            (4, false, false),
+            (5, true, false),
+            (6, false, false),
+            (7, true, false),
+            (8, false, false),
+            (9, true, true),
+        ] {
+            assert_eq!(s.bold_at(offset), Some(bold));
+            assert_eq!(s.faint_at(offset), Some(faint));
+        }
+    }
+
+    #[test]
+    fn bold_ignores_color_components() {
+        let s = StyledScreen::parse(
+            "\x1b[38;2;1;2;7;48;5;1mA\x1b[1;38;5;22mB\x1b[48;2;22;0;0mC\x1b[39;49mD",
+        )
+        .unwrap();
+        assert_eq!(s.text(), "ABCD");
+        for (offset, bold) in [(0, false), (1, true), (2, true), (3, true)] {
+            assert_eq!(s.bold_at(offset), Some(bold));
+        }
+    }
+
+    #[test]
+    fn bold_uses_character_starts_and_survives_line_breaks() {
+        let s = StyledScreen::parse("\x1b[1m界é \nZ\x1b[22m!").unwrap();
+        assert_eq!(s.text(), "界é \nZ!");
+        for offset in [0, 3, 5, 7] {
+            assert_eq!(s.bold_at(offset), Some(true));
+        }
+        assert_eq!(s.bold_at(8), Some(false));
+        for offset in [1, 2, 4, 6, 9, usize::MAX] {
+            assert_eq!(s.bold_at(offset), None);
+        }
+    }
+
+    #[test]
+    fn osc8_preserves_bold_label() {
+        for end in ["\x07", "\x1b\\"] {
+            let s = StyledScreen::parse(&format!(
+                "\x1b[1m\x1b]8;id=x;https://example.test{end}link\x1b]8;;{end}X",
+            ))
+            .unwrap();
+            assert_eq!(s.text(), "linkX");
+            for offset in 0..5 {
+                assert_eq!(s.bold_at(offset), Some(true));
+            }
         }
     }
 

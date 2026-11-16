@@ -296,6 +296,61 @@ fn every_prior_rule_needs_notice_proof() {
 }
 
 #[test]
+fn notice_does_not_hide_an_earlier_working_border() {
+    // Synthetic: prepend a real 120-column notice to the captured Working editor
+    // and insert a queued draft, nonfaint full-width rule and cursor/staged row.
+    // This is a parser refusal probe, not proof that live paste can render it.
+    let running = include_str!("fixtures/screen_styled_p1_C2-steer-one-held-120x40_1.5.0.txt")
+        .split_once('\n')
+        .unwrap()
+        .1;
+    editor(running, InputState::Empty, TurnState::Running);
+    let startup = capture!("startup_120x16", "1.5.0");
+    let decoded = plain(startup);
+    let rules: Vec<_> = decoded
+        .lines()
+        .enumerate()
+        .filter(|(_, row)| row.starts_with("──"))
+        .map(|(i, _)| i)
+        .collect();
+    let notice = startup
+        .lines()
+        .skip(rules[0])
+        .take(rules[1] - rules[0] + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (_, _, width) = bounds(running);
+    assert_eq!(width, 120);
+    let border = "─".repeat(width);
+    let results = ["", "MSG"].map(|staged| {
+        let without_notice = draft(
+            running,
+            &format!("keep this unfinished\n{border}\n{staged}"),
+        );
+        // Observe, but do not require a fix for, deferred notice-free crrv-C M1.
+        let control = observe(&without_notice);
+        eprintln!(
+            "notice-free {staged:?}: {:?}; staged {:?}",
+            control.facts,
+            staged_draft_matches(ScreenInput::Styled(&without_notice), "MSG")
+        );
+        let with_notice = format!("{notice}\n\n{without_notice}");
+        let result = observe(&with_notice);
+        let matched = staged_draft_matches(ScreenInput::Styled(&with_notice), "MSG");
+        eprintln!(
+            "notice-bearing {staged:?}: {:?}; staged {matched:?}",
+            result.facts
+        );
+        (result, matched)
+    });
+    for (result, matched) in results {
+        assert_eq!(result.facts, Default::default());
+        assert_eq!(result.dialog, ControlDialog::Unknown);
+        assert_eq!(matched, None);
+    }
+}
+
+#[test]
 fn damaged_notice_or_editor_stays_unknown() {
     // Synthetic: broken chrome, missing both style proofs or unsupported control.
     for changed in [

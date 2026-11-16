@@ -142,7 +142,7 @@ fn update_rules(history: &[&str], lower: &str, screen: &StyledScreen) -> bool {
         })
         .collect();
     rows.split(|(line, _)| line.trim().is_empty())
-        .filter(|block| block.iter().any(|(line, _)| *line == lower))
+        .filter(|block| block.iter().any(|(line, _)| line.starts_with("──")))
         .all(|block| {
             let [(upper, _), (title, title_offset), message @ .., changelog, (bottom, _)] = block
             else {
@@ -192,7 +192,7 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
         facts.dialog = DialogState::Other;
         return Some((facts, None));
     }
-    // Every earlier matching rule needs its own rendered-notice proof: a pasted
+    // Every earlier border needs its own rendered-notice proof: a pasted
     // rule can masquerade as the editor top, even after otherwise valid startup.
     let history = lines.get(..top)?;
     if history.contains(lower)

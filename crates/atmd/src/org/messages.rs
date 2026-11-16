@@ -873,6 +873,8 @@ impl MessageHandle {
                 }
                 let from = caller_address(&service.view()?.state, &caller)?;
                 if let Address::Agent(id) = &p.to {
+                    // Admission must include lifecycle changes committed since startup.
+                    service.rt.history.folded(service.rt.org.status()?).await?;
                     if let Some(agent) = service.agent(id)?.filter(|agent| {
                         agent.status == AgentStatus::Ready
                             && agent.session_id.as_ref().is_some_and(|id| !id.is_pending())

@@ -436,6 +436,108 @@ async fn discovery_row(rig: &Rig) -> tempfile::TempDir {
     cwd
 }
 
+// Dropping the pre-admission fold fence must falsely refuse the delayed twin.
+#[tokio::test]
+async fn send_after_completed_clear_with_delayed_fold_enqueues_once() {
+    send_after_completed_clear(true).await;
+}
+
+#[tokio::test]
+async fn send_after_completed_clear_with_current_fold_enqueues_once() {
+    send_after_completed_clear(false).await;
+}
+
+async fn send_after_completed_clear(delay_fold: bool) {
+    let mut rig = Rig::build_registry(true, None, crate::registry::spawn_registry()).await;
+    for command in [
+        OrgCommand::RegisterProject {
+            project_id: "demo".parse().unwrap(),
+            root: "/demo".into(),
+            move_root: false,
+        },
+        OrgCommand::Adopt {
+            agent_id: worker(),
+            pane: "%1".into(),
+            session_id: Some("s1".into()),
+        },
+    ] {
+        guarded(rig.org.execute(command, utc())).await.unwrap();
+    }
+    rig.relay();
+    rig.folded(rig.org.status().unwrap()).await;
+    let _cwd = discovery_row(&rig).await;
+    // A lazy-session clear has returned, but its message fold is held back.
+    for command in [
+        OrgCommand::Clear { agent_id: worker() },
+        OrgCommand::EditorReady { agent_id: worker() },
+    ] {
+        guarded(rig.org.execute(command, utc())).await.unwrap();
+    }
+    let state = guarded(rig.org.snapshot()).await.unwrap();
+    let current = state.agent(&worker()).unwrap();
+    assert_eq!(current.status, atm_org::AgentStatus::Ready);
+    assert_eq!(current.session_id, None);
+    assert_eq!(current.excluded_session_id, Some("s1".into()));
+    assert_eq!(
+        rig.messages
+            .service()
+            .unwrap()
+            .agent(&worker())
+            .unwrap()
+            .unwrap()
+            .session_id,
+        Some("s1".into())
+    );
+    let before = rig.org.status().unwrap();
+    if !delay_fold {
+        rig.relay();
+        rig.folded(before).await;
+    }
+    let mut committed = rig.org.committed.subscribe();
+    let handle = rig.messages.clone();
+    let sending = handle.send(note(Address::Agent(worker()), "after clear"), owner());
+    tokio::pin!(sending);
+    if delay_fold {
+        // Poll through admission before opening the fold barrier: the fixed
+        // code waits for the cursor; the old code clones the stale binding.
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(sending.as_mut(), cx))
+        })
+        .await;
+        assert!(first.is_pending(), "send bypassed the held fold: {first:?}");
+        assert_eq!(rig.org.status().unwrap(), before);
+        rig.relay();
+        rig.folded(before).await;
+    }
+    let sent = guarded(async {
+        tokio::select! {
+            result = &mut sending => panic!("completed clear left Ready-unbound, but send returned before its append fold: {result:?}"),
+            event = committed.recv() => {
+                assert_eq!(event.unwrap().kind, "msg.sent");
+                rig.relay();
+                sending.await.unwrap()
+            }
+        }
+    })
+    .await;
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+    let inbox = rig
+        .inbox(
+            owner(),
+            InboxParams {
+                recipient: Some(Address::Agent(worker())),
+                ..page()
+            },
+        )
+        .await;
+    assert_eq!(ids(&inbox), [sent.message_id.seq()]);
+    let entry = &inbox.messages[0];
+    assert_eq!(entry.content.from, Address::Owner);
+    assert_eq!(entry.content.body, "after clear");
+    assert_eq!(entry.status, DeliveryStatus::Queued);
+    assert_eq!(entry.delivery.attempt, 0);
+}
+
 // Removing the preflight, or moving it after append, must fail this test.
 #[tokio::test]
 async fn send_to_discovery_only_bound_recipient_is_refused_before_append() {
@@ -507,6 +609,52 @@ fn registry_channel() -> (
     let (send, receive) = mpsc::channel(4);
     let (events, _) = broadcast::channel(4);
     (crate::registry::RegistryHandle::new(send, events), receive)
+}
+
+// A held current-cursor fold uses the ordinary budget without any append.
+#[tokio::test(start_paused = true)]
+async fn send_admission_fold_timeout_never_appends() {
+    let (registry, _receive) = registry_channel();
+    let mut rig = Rig::build_registry(true, None, registry).await;
+    for command in [
+        OrgCommand::RegisterProject {
+            project_id: "demo".parse().unwrap(),
+            root: "/demo".into(),
+            move_root: false,
+        },
+        OrgCommand::Adopt {
+            agent_id: worker(),
+            pane: "%1".into(),
+            session_id: None,
+        },
+    ] {
+        guarded(rig.org.execute(command, utc())).await.unwrap();
+    }
+    let before = rig.org.status().unwrap();
+    let handle = rig.messages.clone();
+    let sending = handle.send(note(Address::Agent(worker()), "held fold"), owner());
+    tokio::pin!(sending);
+    let first = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(sending.as_mut(), cx))
+    })
+    .await;
+    assert!(first.is_pending(), "send bypassed the held fold: {first:?}");
+    tokio::time::advance(std::time::Duration::from_secs(8)).await;
+    let result = std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(sending.as_mut(), cx);
+        assert!(
+            result.is_ready(),
+            "admission fold exceeded the ordinary budget"
+        );
+        result
+    })
+    .await;
+    assert!(matches!(result, Err(MessageError::Timeout)), "{result:?}");
+    assert_eq!(rig.org.status().unwrap(), before);
+    rig.relay();
+    rig.folded(before).await;
+    let state = guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(state.messages().count(), 0);
 }
 
 // A lost registry answer cannot turn into permission to enqueue.

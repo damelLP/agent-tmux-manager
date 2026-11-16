@@ -405,7 +405,21 @@ Intent, standing rules, rubric files and their admission/append judges are on th
 
 ## Decisions
 
-Named agents raise questions through `decision.request`; the owner answers from an **unbound** shell:
+Named agents raise durable questions from their **bound agent pane**:
+
+```sh
+atm decisions request --kind plan --title 'Approve this plan' \
+  --option yes --option no --recommended yes \
+  --may-be-undone true --changes-intent true \
+  --context 'Choose the smaller interface' --attach /path/to/plan.md
+atm decisions withdraw d41 --reason 'Superseded'
+```
+
+`--kind` and `--title` are required; repeat `--option` for 2–32 distinct options. Both `--may-be-undone true|false` and `--changes-intent true|false` are required valued flags, with **no assumed safety facts**. The daemon derives the class and applies the existing [away policy](#away). Context defaults to empty, attachments to an empty list, and recommendation/deadline to null. Repeat `--attach` for literal paths: nothing is read, uploaded or canonicalized; use absolute paths across worktrees. Optional `--deadline` takes a future RFC3339 timestamp (offsets normalize to UTC); the daemon checks its time, and storing it does not start an expiry timer. No requester/by/from override is supported.
+
+Request text output is `d41 requested`, a receipt of creation, **not** approval, a Pending-state guarantee, or notification delivery. Away handling may already have taken it provisionally. Withdrawal is allowed only for a **Pending** decision, by its requester or the owner; provisional/final decisions cannot be withdrawn. Repeating an authorized withdrawal reports `(unchanged)` and preserves the original withdrawal facts, even if a different reason is supplied.
+
+List visible requests, or answer as the owner from a genuinely **unbound** shell:
 
 ```sh
 atm decisions                         # pending + taken provisionally
@@ -416,7 +430,9 @@ atm decide d41 yes 'Use the smaller interface'
 atm decide d41 yes 'Always use this shape' --rule --format json
 ```
 
-IDs are `d` plus the request event's sequence (`d41`, not `d041`). Options and notes are exact strings: quote multiword values; there is no trimming or case folding. `--format json` preserves the complete daemon result, including additive fields; text escapes terminal controls. `--all` conflicts with `--status`. Request creation and withdrawal are API methods, not extra CLI commands.
+IDs are `d` plus the request event's sequence (`d41`, not `d041`). Options, context, recommendations, notes and reasons are exact strings: quote multiword values; there is no trimming or case folding (`--option=-value` accepts a leading hyphen). `--format json` preserves the complete daemon result, including additive fields/nulls; text escapes terminal controls. Put mutation format after the subcommand: `atm decisions request … --format json` or `atm decisions withdraw d41 --format json`. Parent/list flags cannot be combined with mutations; `--all` conflicts with `--status` on lists.
+
+A timeout, disconnect, invalid result or output-write failure is **not rollback**. Inspect `atm decisions --all` and your inbox before retrying: every accepted request creates a new ID, and the CLI never retries automatically. Request/withdraw use the existing API below; no extra manual question message is needed.
 
 An agent pane sees its own requests; an unbound owner caller sees all. Pending and provisional decisions remain on the default list, with separate `pending_count` and `provisional_count` totals. Counts cover the caller's scope, not just the page or status filter. `atm status` independently asks for the global **Pending-only** count, even from an agent pane: nonzero adds `N decisions`, zero adds nothing, and missing/unavailable/bad aggregate data adds `? decisions` plus a diagnostic without hiding session or unread counts. A provisional decision is not counted as pending; it remains in `atm decisions`.
 

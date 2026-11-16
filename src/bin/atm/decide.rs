@@ -2,9 +2,11 @@
 use super::msg::{escaped, output, MessageFormat};
 use anyhow::{bail, Context, Result};
 use atmd::org::decisions::{
-    DecisionId, DecisionStatus, ListParams, ListResult, MutationResult, ResolveParams,
+    DecisionId, DecisionKind, DecisionStatus, ListParams, ListResult, MutationResult,
+    RequestParams, RequestResult, ResolveParams, WithdrawParams,
 };
-use clap::Args;
+use chrono::{DateTime, Utc};
+use clap::{Args, Subcommand};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     io::{self, Write},
@@ -23,7 +25,10 @@ pub struct DecideArgs {
     format: MessageFormat,
 }
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct DecisionsArgs {
+    #[command(subcommand)]
+    action: Option<DecisionsAction>,
     #[arg(long, conflicts_with = "statuses")]
     all: bool,
     #[arg(long = "status", value_parser = parse_status)]
@@ -34,6 +39,58 @@ pub struct DecisionsArgs {
     limit: u16,
     #[arg(long, value_enum, default_value = "text")]
     format: MessageFormat,
+}
+#[derive(Debug, Subcommand)]
+enum DecisionsAction {
+    /// Request the owner's decision from a named agent pane; prints an ID, not approval
+    Request {
+        #[arg(long, value_parser = parse_request_kind)]
+        kind: DecisionKind,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        context: String,
+        /// Literal path, not read or uploaded; repeat for each attachment
+        #[arg(long = "attach")]
+        files: Vec<String>,
+        /// Exact option string; repeat for 2–32 distinct options
+        #[arg(long = "option", required = true)]
+        options: Vec<String>,
+        #[arg(long)]
+        recommended: Option<String>,
+        #[arg(long, action = clap::ArgAction::Set, required = true)]
+        may_be_undone: bool,
+        #[arg(long, action = clap::ArgAction::Set, required = true)]
+        changes_intent: bool,
+        /// Future RFC3339 timestamp; the daemon checks time, with no expiry timer
+        #[arg(long, value_parser = parse_deadline)]
+        deadline: Option<DateTime<Utc>>,
+        /// Place after request; listing flags cannot be combined with a mutation
+        #[arg(long, value_enum, default_value = "text")]
+        format: MessageFormat,
+    },
+    /// Withdraw a pending decision as its requester or owner; provisional choices cannot be withdrawn
+    Withdraw {
+        id: DecisionId,
+        #[arg(long)]
+        reason: Option<String>,
+        /// Place after withdraw; listing flags cannot be combined with a mutation
+        #[arg(long, value_enum, default_value = "text")]
+        format: MessageFormat,
+    },
+}
+fn parse_request_kind(text: &str) -> std::result::Result<DecisionKind, String> {
+    match serde_json::from_value(serde_json::Value::String(text.into())) {
+        Ok(DecisionKind::Unknown) | Err(_) => {
+            Err("expected action, hire, budget, policy, plan or dialog".into())
+        }
+        Ok(kind) => Ok(kind),
+    }
+}
+fn parse_deadline(text: &str) -> std::result::Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|error| error.to_string())
 }
 fn parse_status(text: &str) -> std::result::Result<DecisionStatus, String> {
     serde_json::from_value(serde_json::Value::String(text.into())).map_err(|_| {
@@ -177,7 +234,61 @@ fn render_list(result: &ListResult, out: &mut impl Write) -> Result<()> {
     }
     Ok(())
 }
+async fn cmd_decision_action(action: DecisionsAction) -> Result<()> {
+    let (raw, format, text) = match action {
+        DecisionsAction::Request {
+            kind,
+            title,
+            context,
+            files,
+            options,
+            recommended,
+            may_be_undone,
+            changes_intent,
+            deadline,
+            format,
+        } => {
+            let (result, raw): (RequestResult, _) = request(
+                "decision.request",
+                RequestParams {
+                    kind,
+                    title,
+                    context,
+                    files,
+                    options,
+                    recommended,
+                    may_be_undone,
+                    changes_intent,
+                    deadline,
+                },
+            )
+            .await?;
+            (raw, format, format!("{} requested", result.decision_id))
+        }
+        DecisionsAction::Withdraw { id, reason, format } => {
+            let (result, raw): (MutationResult, _) =
+                request("decision.withdraw", WithdrawParams { id, reason }).await?;
+            let decision = &result.decision.decision;
+            if decision.status != DecisionStatus::Withdrawn {
+                bail!("invalid decision result from daemon: decision is not withdrawn");
+            }
+            (
+                raw,
+                format,
+                format!(
+                    "{} withdrawn{}",
+                    decision.id,
+                    if result.changed { "" } else { " (unchanged)" }
+                ),
+            )
+        }
+    };
+    output(&raw, format, &text, &mut io::stdout().lock())
+}
 pub async fn cmd_decisions(args: DecisionsArgs) -> Result<()> {
+    if let Some(action) = args.action {
+        return cmd_decision_action(action).await;
+    }
     let statuses = if args.all {
         Some(vec![
             DecisionStatus::Pending,
@@ -225,4 +336,151 @@ pub(super) async fn pending_count() -> Result<(usize, bool)> {
         bail!("invalid decision aggregate result from daemon");
     }
     Ok((result.pending_count, result.away))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Args;
+    use clap::Parser;
+
+    fn request_args<'a>(kind: &'a str, undone: &'a str, intent: &'a str) -> Vec<&'a str> {
+        vec![
+            "atm",
+            "decisions",
+            "request",
+            "--kind",
+            kind,
+            "--title",
+            "Approve this plan",
+            "--option",
+            "yes",
+            "--option",
+            "no",
+            "--may-be-undone",
+            undone,
+            "--changes-intent",
+            intent,
+        ]
+    }
+
+    // Break caught: commands disappear from discovery or valid policy facts cannot be expressed.
+    #[test]
+    fn decisions_request_and_withdraw_have_help_and_parse() {
+        for kind in ["action", "hire", "budget", "policy", "plan", "dialog"] {
+            for undone in ["true", "false"] {
+                for intent in ["true", "false"] {
+                    let args = request_args(kind, undone, intent);
+                    assert!(Args::try_parse_from(&args).is_ok(), "{args:?}");
+                }
+            }
+        }
+        for args in [
+            vec!["atm", "decisions"],
+            vec!["atm", "decisions", "--all", "--format", "json"],
+            vec![
+                "atm",
+                "decisions",
+                "--status",
+                "resolved",
+                "--after",
+                "d4",
+                "--limit",
+                "2",
+            ],
+            vec!["atm", "decisions", "withdraw", "d41"],
+            vec![
+                "atm",
+                "decisions",
+                "withdraw",
+                "d41",
+                "--reason",
+                "superseded",
+                "--format",
+                "json",
+            ],
+        ] {
+            assert!(Args::try_parse_from(&args).is_ok(), "{args:?}");
+        }
+        for action in ["request", "withdraw"] {
+            assert_eq!(
+                Args::try_parse_from(["atm", "decisions", action, "--help"])
+                    .unwrap_err()
+                    .kind(),
+                clap::error::ErrorKind::DisplayHelp,
+            );
+        }
+    }
+
+    // Break caught: a missing fact defaults into delegation, or a listing flag is silently ignored.
+    #[test]
+    fn decision_mutations_require_explicit_facts_and_reject_mixed_list_flags() {
+        let valid = request_args("plan", "true", "true");
+        let mut bad = Vec::new();
+        for flag in [
+            "--kind",
+            "--title",
+            "--option",
+            "--may-be-undone",
+            "--changes-intent",
+        ] {
+            let mut args = valid.clone();
+            while let Some(index) = args.iter().position(|value| *value == flag) {
+                args.drain(index..index + 2);
+            }
+            bad.push(args);
+        }
+        for (flag, value) in [
+            ("--kind", "unknown"),
+            ("--kind", "future"),
+            ("--kind", "Plan"),
+            ("--may-be-undone", "yes"),
+            ("--changes-intent", "0"),
+        ] {
+            let mut args = valid.clone();
+            let index = args.iter().position(|value| *value == flag).unwrap();
+            args[index + 1] = value;
+            bad.push(args);
+        }
+        for extra in [
+            vec!["--deadline", "tomorrow"],
+            vec!["--deadline", "2099-01-01"],
+            vec!["--format", "xml"],
+            vec!["--requester", "owner"],
+            vec!["--by", "owner"],
+            vec!["--from", "owner"],
+            vec!["--may-be-undone"],
+            vec!["--changes-intent"],
+        ] {
+            let mut args = valid.clone();
+            args.extend(extra);
+            bad.push(args);
+        }
+        for id in ["d01", "m1", "d-1", "d18446744073709551616"] {
+            bad.push(vec!["atm", "decisions", "withdraw", id]);
+        }
+        bad.push(vec!["atm", "decisions", "withdraw"]);
+        for mutation in [valid, vec!["atm", "decisions", "withdraw", "d41"]] {
+            for flags in [
+                vec!["--all"],
+                vec!["--status", "pending"],
+                vec!["--after", "d4"],
+                vec!["--limit", "2"],
+            ] {
+                let mut before = vec!["atm", "decisions"];
+                before.extend(&flags);
+                before.extend(&mutation[2..]);
+                bad.push(before);
+                let mut after = mutation.clone();
+                after.extend(flags);
+                bad.push(after);
+            }
+            let mut before = vec!["atm", "decisions", "--format", "json"];
+            before.extend(&mutation[2..]);
+            bad.push(before);
+        }
+        for args in bad {
+            let error = Args::try_parse_from(&args).expect_err(&format!("accepted {args:?}"));
+            assert_eq!(error.exit_code(), 2, "{args:?}: {error}");
+        }
+    }
 }
